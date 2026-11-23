@@ -942,12 +942,13 @@ func TestTheRefusalNamesTheFittedCap(t *testing.T) {
 	}
 }
 
-// While the operator's A2A_SESSION_CLUSTER_VIEW is on, defaultRoute: session
-// does not engage: an explicit session routes to platform on both
-// containers, at maxSessions, and the condition says why. Off, it is
-// session. (An unset field is platform either way, and writes nothing:
+// The operator's A2A_SESSION_CLUSTER_VIEW doesn't hold the session route off:
+// since 2026-11-20 the cluster view is on by default for the session route
+// (#6538), so an explicit session routes to session on both containers with
+// the view on, and the cap is fitted to TASKS as with it off. Off, it is
+// session too. (An unset field is platform either way, and writes nothing:
 // TestTheDefaultPlatformRouteDoesNothingNew.)
-func TestTheClusterViewHoldsTheSessionDefaultOff(t *testing.T) {
+func TestTheClusterViewDoesNotHoldTheSessionRouteOff(t *testing.T) {
 	ctx := context.Background()
 	for _, route := range []*string{ptr.To(agentv1alpha1.DefaultRouteSession)} {
 		t.Run(ptr.Deref(route, "unset"), func(t *testing.T) {
@@ -957,15 +958,15 @@ func TestTheClusterViewHoldsTheSessionDefaultOff(t *testing.T) {
 			}, tasksAt(110))
 			r.resolveA2ASessionCap(ctx, agent, nil)
 			gateway, platformAgent := renderedDefaultRoutes(t, agent, nil)
-			if gateway != agentv1alpha1.DefaultRoutePlatform || platformAgent != agentv1alpha1.DefaultRoutePlatform {
-				t.Errorf("with the cluster view on: gateway %q, platform agent %q; both want platform", gateway, platformAgent)
+			if gateway != agentv1alpha1.DefaultRouteSession || platformAgent != agentv1alpha1.DefaultRouteSession {
+				t.Errorf("with the cluster view on: gateway %q, platform agent %q; both want session", gateway, platformAgent)
 			}
-			if gatewayEnv(t, agent, "A2A_MAX_SESSIONS") != "10" {
-				t.Errorf("A2A_MAX_SESSIONS = %q with the view on, want maxSessions", gatewayEnv(t, agent, "A2A_MAX_SESSIONS"))
+			if gatewayEnv(t, agent, "A2A_MAX_SESSIONS") != "4" {
+				t.Errorf("A2A_MAX_SESSIONS = %q with the view on, want the cap fitted to a TASKS 110 wide (4)", gatewayEnv(t, agent, "A2A_MAX_SESSIONS"))
 			}
 			c := meta.FindStatusCondition(storedCapAgent(t, cl, agent).Status.Conditions, sessionCapFittedConditionType)
-			if c == nil || c.Reason != sessionCapClusterViewReason || !strings.Contains(c.Message, a2aSessionClusterViewEnvVar) || !strings.Contains(c.Message, "#6483") {
-				t.Errorf("SessionCapFitted = %+v, want %s naming the flag and its retirement issue", c, sessionCapClusterViewReason)
+			if c == nil || c.Reason != sessionCapNarrowReason {
+				t.Errorf("SessionCapFitted = %+v, want %s: the view changes nothing about the fit", c, sessionCapNarrowReason)
 			}
 		})
 	}

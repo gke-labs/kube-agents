@@ -5482,15 +5482,13 @@ func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
 // (which the hermes-bridge sidecar copies) all come from here, so the two
 // cannot disagree.
 func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
-	// The session pods' temporary cluster view (A2A_SESSION_CLUSTER_VIEW)
-	// widens what a session pod reaches. While it is on, a plain turn stays
-	// with the platform agent whatever the field says, explicit `session`
-	// included, so turning the default on never silently widens what a plain
-	// turn reaches (SessionCapFitted says why; its retirement is
-	// gke-labs/kube-agents#6483).
+	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't hold
+	// the route off: since 2026-11-20 the view is on by default for the
+	// session route (gke-labs/kube-agents#6538), so an explicit `session`
+	// routes to session with the view on or off.
 	// A CRD that prunes status.effectiveSessionCap can't keep the cap the
-	// session route renders from, so that install stays on platform too.
-	if a2aSessionClusterViewEnabled(agent) || a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession ||
+	// session route renders from, so that install stays on platform.
+	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession ||
 		a2aSessionCapPrunedHeld(agent) {
 		return agentv1alpha1.DefaultRoutePlatform
 	}

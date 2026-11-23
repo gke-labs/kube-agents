@@ -99,10 +99,6 @@ const (
 	// sessionCapWaitingReason: the bus's width has not been read yet, so
 	// the provision Job waits and routing stays as it was.
 	sessionCapWaitingReason = "WaitingOnBusWidth"
-	// sessionCapClusterViewReason: the operator's A2A_SESSION_CLUSTER_VIEW is
-	// on, so defaultRoute: session does not engage and plain turns stay
-	// with the platform agent (resolveA2ADefaultRoute).
-	sessionCapClusterViewReason = "SessionClusterViewOn"
 	// sessionCapPrunedReason: the served PlatformAgent CRD drops
 	// status.effectiveSessionCap, so the session route can't keep its cap,
 	// and plain conversations stay with platform until the CRD is updated.
@@ -125,9 +121,6 @@ const (
 	sessionCapRemedy = "the cap stays fitted until TASKS is widened: on a one-server bus, setting " +
 		"spec.harness.tuning.busReplicas to 3 widens it and keeps its history; on any bus, a new value on the " +
 		"PlatformAgent's " + a2aBusReshapeAnnotation + " annotation recreates it at the rendered width, keeping its messages"
-	sessionCapClusterViewMessage = "the operator's " + a2aSessionClusterViewEnvVar + " is on, so the session pods' temporary cluster view is still rendered " +
-		"and spec.harness.tuning.defaultRoute: session is not engaged: plain conversations stay with platform, " +
-		"so the session route never widens what a plain turn reaches; the view's retirement is tracked in gke-labs/kube-agents#6483"
 	sessionCapNarrowMessage = "the TASKS stream has room for fewer sessions than spec.harness.tuning.maxSessions on the session route, " +
 		"and a stream's max_consumers cannot change once it exists, so the session cap is fitted to it (status.effectiveSessionCap); " +
 		sessionCapRemedy
@@ -367,11 +360,6 @@ func (r *PlatformAgentReconciler) sessionCapStatusPruned(agent *agentv1alpha1.Pl
 // is the stored one), and the Warning's text ("" for none). Only on the
 // session route: resolveA2ASessionCap does not call it on platform.
 func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*int, *metav1.Condition, string) {
-	if a2aSessionClusterViewEnabled(agent) {
-		// The cluster view holds the session route off (resolveA2ADefaultRoute):
-		// platform routing at maxSessions, and no fit.
-		return nil, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapClusterViewReason, sessionCapClusterViewMessage), ""
-	}
 	stored := agent.Status.EffectiveSessionCap
 	configured := resolveA2AMaxSessions(agent)
 	width, present, known := r.a2aTasksLiveWidth(ctx, agent, stored != nil)

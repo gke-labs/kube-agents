@@ -10185,10 +10185,8 @@ spec:
                             and keeps its history, and on any bus a new value on the
                             kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
                             rendered width. On an existing install, until the operator has read the bus's
-                            width once, the provision Job waits. While the operator's
-                            A2A_SESSION_CLUSTER_VIEW is on, `session` routes to `platform`, so the
-                            session route never widens what a plain turn reaches. On `platform`
-                            none of this applies.
+                            width once, the provision Job waits. On `platform` none of this
+                            applies.
                           enum:
                             - session
                             - platform
@@ -12650,9 +12648,8 @@ spec:
                     conversations go to `platform`. Read off the bus's monitoring
                     endpoint, at most every five minutes once set; a pass that cannot read
                     it keeps the value here. Written only where
-                    spec.harness.tuning.defaultRoute is `session`, and not while the
-                    operator's A2A_SESSION_CLUSTER_VIEW is on or before the operator has
-                    read an existing install's bus once. On `platform`, which an unset
+                    spec.harness.tuning.defaultRoute is `session`, and not before the
+                    operator has read an existing install's bus once. On `platform`, which an unset
                     field means, a value an earlier opt-in left is cleared.
                   type: integer
                 effectiveSizingTier:
