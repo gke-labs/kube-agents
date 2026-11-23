@@ -621,6 +621,21 @@ class DetectorWordingTests(unittest.TestCase):
         )
         self.assertIn("1. [new] id=b members=a,b", bundle.card["thread_context"])
 
+    def test_the_tables_next_issue_is_the_member_its_severity_count_comes_from(self):
+        # One issue is shown; the next one has a major member ranked ahead of its critical one.
+        rows = [
+            finding(id="a"),
+            finding(id="b", check_slug="keys", object="reporting", severity="major", title="reporting mounts a viewer key"),
+            finding(id="c", check_slug="keys", object="billing", severity="critical", title="billing mounts an editor key"),
+        ]
+        bundle = nudge.build_nudge(plan_for(rows, added={"critical": 1}), 2, False, rows=rows)
+        # The table counts the issue as critical, so the cell beside the count names the critical member,
+        # as the list above the table does.
+        self.assertEqual(
+            bundle.card["fold"]["table"]["rows"], [["prod", "1", "0", "0", "payments/billing: mounts an editor key"]]
+        )
+        self.assertIn("- critical · payments/billing on prod — mounts an editor key (2 objects)", bundle.card["fold"]["text"])
+
     def test_the_fallback_opens_on_a_bold_headline(self):
         rows = self.issue_rows()
         text = nudge.compose(plan_for(rows, added={"critical": 2}), 2, daily=True, rows=rows)

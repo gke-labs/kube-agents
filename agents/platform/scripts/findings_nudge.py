@@ -747,7 +747,8 @@ def _queue_fold(
         sev = _best_severity(members)
         if sev == CRITICAL_SEVERITY:
             remaining_critical += 1
-        top = members[0]
+        # The member the count's severity comes from, as a row and a list line take theirs.
+        top = next((row for row in members if row.get("severity") == sev), members[0])
         cluster = cluster_label(top, ambiguous) or UNSCOPED_CLUSTER
         bucket = by_cluster.setdefault(
             cluster,
