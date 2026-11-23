@@ -911,6 +911,18 @@ var canceledReasonShown = map[string]bool{
 	"tier-ended": true, // dispatch.ReasonTierEnded (#5850)
 }
 
+// canceledTerminalTokens are the canceled terminals' own tokens, which the
+// chat notice leaves bare (canceledReasonShown names the ones it explains)
+// but a scheduled run's record still carries.
+var canceledTerminalTokens = map[string]bool{
+	"canceled-by-request":     true,
+	"canceled-before-start":   true,
+	"canceled-while-orphaned": true,
+	// A run the operator or a parent stopped (dispatch.ReasonStopped, and
+	// the gateway's own stop in stoptree.go).
+	"stopped": true,
+}
+
 // noticeWithReason joins a notice's prefix to the reason's text: bare when
 // there is none, after a dash when it came out of the executors' shape, and
 // after a colon when it was plain text already.
@@ -1473,15 +1485,6 @@ func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID strin
 		}
 	}
 	return g.client.TasksGet(ctx, addressee, taskID)
-}
-
-// canceledTerminalTokens are the canceled terminals' own tokens, which the
-// chat notice leaves bare (canceledReasonShown names the ones it explains)
-// but a scheduled run's record still carries.
-var canceledTerminalTokens = map[string]bool{
-	"canceled-by-request":     true,
-	"canceled-before-start":   true,
-	"canceled-while-orphaned": true,
 }
 
 // runReasonToken is the token a scheduled run's record carries for a

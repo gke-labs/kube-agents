@@ -115,6 +115,13 @@ var ErrScheduleGatewayUnavailable = errors.New("the gateway did not accept the s
 // cap: the slot is counted and dropped, never retried.
 var ErrScheduleRateLimited = errors.New("the gateway refused the submission under the trigger's rate cap")
 
+// runReasonShape is the CRD's pattern for a run's Reason, the gateway's own
+// token alphabet (reasonToken: letters, digits, '.', '_', '-'). The gateway sends
+// only tokens from its reason tables, all of this shape
+// (TestRunReasonTokensFitTheOperatorsPattern pins that across the modules);
+// anything else is dropped here rather than failing the status write.
+var runReasonShape = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
 // ScheduleSubmission is one run, as the reconciler hands it to the gateway.
 type ScheduleSubmission struct {
 	IdempotencyKey string
@@ -641,13 +648,6 @@ func knownOutcome(outcome string) string {
 	}
 	return agentv1alpha1.AgentScheduleOutcomeFailed
 }
-
-// runReasonShape is the CRD's pattern for a run's Reason, the gateway's own
-// token alphabet (reasonToken: letters, digits, '.', '_', '-'). The gateway sends
-// only tokens from its reason tables, all of this shape
-// (TestRunReasonTokensFitTheOperatorsPattern pins that across the modules);
-// anything else is dropped here rather than failing the status write.
-var runReasonShape = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 // knownReason is reason when it has the CRD's shape, else empty.
 func knownReason(reason string) string {

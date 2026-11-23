@@ -32,6 +32,7 @@ func TestRunReasonToken(t *testing.T) {
 		{"a known bare token", "reason: worker-evicted", "worker-evicted"},
 		{"a detail-shown token", "reason: verifier-refused - the cluster is out of scope", "verifier-refused"},
 		{"a canceled terminal's own token", "reason: canceled-by-request", "canceled-by-request"},
+		{"a stopped run", "reason: stopped - the operator stopped the run", "stopped"},
 		{"a canceled token the notice explains", "reason: tier-ended - an administrator ended the drain", "tier-ended"},
 		{"a script run's end", "reason: script-timeout - exceeded 300s", "script-timeout"},
 		{"a refused delegation", "reason: delegation-refused - the target is not allowed", "delegation-refused"},
