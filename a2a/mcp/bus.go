@@ -163,8 +163,8 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 // ProfileSupervisorHealth is the profile supervisor gate this server runs
 // with, for the health probe's answer (WithProfileSupervisorHealth): the
 // cutoff (empty when unset) and where it came from (lib.CutoffSource*),
-// whether the operator's profile names are loaded, and how many five-token
-// messages the gate has refused.
+// whether the operator's profile names are loaded and when they were last
+// read, and how many five-token messages the gate has refused.
 func (b *NATSBus) ProfileSupervisorHealth() ProfileSupervisorHealth {
 	g := b.cfg.ProfileSupervisorGate
 	h := ProfileSupervisorHealth{Source: g.Source, NamesLoaded: g.Names.Loaded(), Drops: b.client.ProfileSupervisorDrops()}
@@ -174,15 +174,22 @@ func (b *NATSBus) ProfileSupervisorHealth() ProfileSupervisorHealth {
 	if !g.Cutoff.IsZero() {
 		h.Cutoff = g.Cutoff.UTC().Format(time.RFC3339)
 	}
+	if at := g.Names.LoadedAt(); !at.IsZero() {
+		h.NamesLoadedAt = at.UTC().Format(time.RFC3339)
+	}
 	return h
 }
 
 // ProfileSupervisorHealth is the gate's part of the health probe's answer.
+// NamesLoadedAt is when the profile names file was last read, changed or
+// not, absent when never: it is re-read every 30 seconds, so a time that
+// stops moving is reads failing and the names last read kept.
 type ProfileSupervisorHealth struct {
-	Cutoff      string `json:"cutoff,omitempty"`
-	Source      string `json:"source"`
-	NamesLoaded bool   `json:"profileNamesLoaded"`
-	Drops       int64  `json:"drops"`
+	Cutoff        string `json:"cutoff,omitempty"`
+	Source        string `json:"source"`
+	NamesLoaded   bool   `json:"profileNamesLoaded"`
+	NamesLoadedAt string `json:"profileNamesLoadedAt,omitempty"`
+	Drops         int64  `json:"drops"`
 }
 
 // Events is the server's listener on its conversations' posts.

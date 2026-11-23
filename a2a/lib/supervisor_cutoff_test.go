@@ -1,11 +1,15 @@
 package lib
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -298,12 +302,11 @@ func cutoffAddressee(profile bool) string {
 
 // A five-token terminal published on a profile's task after the cutoff with
 // a Nats-Time-Stamp header of its own, set before the cutoff, is refused on
-// the replay and on the direct get, with and without allow_direct. On a
-// direct get the server appends its own Nats-Time-Stamp after the
-// publisher's, so the read sees two and takes neither: the time is unknown,
-// and an unknown time is refused. The direct get's own Time field, which the
-// client parses from the first header, is the forged one, which is why the
-// read doesn't use it.
+// the replay and on the direct get, with and without allow_direct. A direct
+// get takes no time from its headers at all (storedTimeOf): its own Time
+// field, which the client parses from the first stamp, is the forged one.
+// The read takes the server's time from a consumer instead, which is after
+// the cutoff.
 func TestAForgedStoredTimeDoesNotPassTheCutoff(t *testing.T) {
 	for _, direct := range []bool{true, false} {
 		t.Run(map[bool]string{true: "allow_direct", false: "no allow_direct"}[direct], func(t *testing.T) {
@@ -497,12 +500,12 @@ func TestAcceptSupervisorEventAsksTheProfileNames(t *testing.T) {
 }
 
 // The env reads absent and empty as unset, an RFC3339 time as the cutoff,
-// and anything else as latched at the process's start, with an Error line
-// naming the variable and the source saying so: a value that's there at all
-// is the operator saying the install latched.
+// and anything else as latched at the unix epoch, with an Error line naming
+// the variable and the source saying so: a value that's there at all is the
+// operator saying the install latched.
 func TestProfileSupervisorCutoffFromEnv(t *testing.T) {
 	want := time.Date(2026, 11, 23, 12, 10, 0, 0, time.UTC)
-	start := time.Date(2026, 11, 23, 15, 0, 0, 0, time.UTC)
+	start := MalformedCutoff
 	for _, c := range []struct {
 		value   string
 		want    time.Time
@@ -523,7 +526,7 @@ func TestProfileSupervisorCutoffFromEnv(t *testing.T) {
 				return c.value
 			}
 			return ""
-		}, start, log)
+		}, log)
 		if !got.Cutoff.Equal(c.want) || got.Source != c.source {
 			t.Errorf("%q: cutoff = %v (%s), want %v (%s)", c.value, got.Cutoff, got.Source, c.want, c.source)
 		}
@@ -570,14 +573,13 @@ func TestProfileSupervisorGateFromEnv(t *testing.T) {
 	t.Cleanup(cancel)
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))
-	start := time.Now()
 
-	if g := ProfileSupervisorGateFromEnv(ctx, getenv, start, log); !g.Cutoff.IsZero() || g.Names != nil || g.Source != CutoffSourceUnset {
+	if g := ProfileSupervisorGateFromEnv(ctx, getenv, log); !g.Cutoff.IsZero() || g.Names != nil || g.Source != CutoffSourceUnset {
 		t.Errorf("unset: %+v, want no cutoff and no names", g)
 	}
 
 	env[EnvProfileSupervisorCutoff] = "2026-11-23T12:10:00Z"
-	g := ProfileSupervisorGateFromEnv(ctx, getenv, start, log)
+	g := ProfileSupervisorGateFromEnv(ctx, getenv, log)
 	if g.Names != nil || !strings.Contains(buf.String(), "no profile names file") {
 		t.Errorf("a cutoff with no names file: names %+v, log %q", g.Names, buf.String())
 	}
@@ -587,7 +589,7 @@ func TestProfileSupervisorGateFromEnv(t *testing.T) {
 
 	env[EnvProfileNamesFile] = path
 	buf.Reset()
-	g = ProfileSupervisorGateFromEnv(ctx, getenv, start, log)
+	g = ProfileSupervisorGateFromEnv(ctx, getenv, log)
 	if g.Names.Loaded() || !g.Names.Has("anything") || !strings.Contains(buf.String(), "level=ERROR") {
 		t.Errorf("an unreadable file: loaded %v, log %q; want fail closed at Error", g.Names.Loaded(), buf.String())
 	}
@@ -595,7 +597,7 @@ func TestProfileSupervisorGateFromEnv(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"profiles":["fleet-audit"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	g = ProfileSupervisorGateFromEnv(ctx, getenv, start, log)
+	g = ProfileSupervisorGateFromEnv(ctx, getenv, log)
 	if !g.Names.Loaded() || !g.Names.Has("fleet-audit") || g.Names.Has("cto-otter-1a2b") {
 		t.Errorf("loaded file: loaded %v, fleet-audit %v, cto-otter-1a2b %v", g.Names.Loaded(), g.Names.Has("fleet-audit"), g.Names.Has("cto-otter-1a2b"))
 	}
@@ -611,5 +613,266 @@ func TestProfileSupervisorGateFromEnv(t *testing.T) {
 	}
 	if _, err := g.Names.load(path); err == nil || !g.Names.Has("cto-otter-1a2b") || g.Names.Has("other") {
 		t.Errorf("a garbled file: %v; want an error and the names last read kept", err)
+	}
+}
+
+// publishHeaderBlock publishes data on subject over the raw client protocol
+// with hdr as its header block, byte for byte: nats.go's header encoding
+// would refuse or clean what a raw HPUB can carry. It waits for the server's
+// PONG, so the publish has been processed, then for the stream to hold it.
+func publishHeaderBlock(t *testing.T, url, subject, hdr string, data []byte) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(url, "nats://"), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	rd := bufio.NewReader(conn)
+	if line, err := rd.ReadString('\n'); err != nil || !strings.HasPrefix(line, "INFO ") {
+		t.Fatalf("server greeting %q: %v", line, err)
+	}
+	var b strings.Builder
+	b.WriteString(`CONNECT {"verbose":false,"pedantic":false,"headers":true,"protocol":1}` + "\r\n")
+	fmt.Fprintf(&b, "HPUB %s %d %d\r\n%s%s\r\nPING\r\n", subject, len(hdr), len(hdr)+len(data), hdr, data)
+	if _, err := conn.Write([]byte(b.String())); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for {
+		line, err := rd.ReadString('\n')
+		if err != nil {
+			t.Fatalf("waiting for PONG: %v", err)
+		}
+		if strings.HasPrefix(line, "-ERR") {
+			t.Fatalf("server refused the publish: %s", line)
+		}
+		if strings.HasPrefix(line, "PONG") {
+			break
+		}
+	}
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the raw publish stored", func() bool {
+		st, err := js.Stream(testCtx(t), TasksStream)
+		if err != nil {
+			return false
+		}
+		info, err := st.Info(testCtx(t), jetstream.WithSubjectFilter(subject))
+		return err == nil && info.State.Subjects[subject] > 0
+	})
+}
+
+// blankLineStampBlock is a header block that ends itself early: the headers a
+// direct get's reply needs, a Nats-Time-Stamp of the publisher's own set to
+// at, then a blank line, then one more header so the block still ends as the
+// server expects. The server appends its own headers after the last line;
+// the client's parse stops at the blank line and never sees them.
+func blankLineStampBlock(subject string, at time.Time) string {
+	return "NATS/1.0\r\n" +
+		"Nats-Stream: " + TasksStream + "\r\n" +
+		"Nats-Subject: " + subject + "\r\n" +
+		"Nats-Sequence: 1\r\n" +
+		"Nats-Time-Stamp: " + at.UTC().Format(time.RFC3339Nano) + "\r\n" +
+		"\r\n" +
+		"X-Pad: 1\r\n\r\n"
+}
+
+// The forgery the header count couldn't catch (H1 on #6885): a five-token
+// terminal on a profile's task, published after the cutoff with a blank line
+// inside its own header block and a Nats-Time-Stamp before the cutoff ahead
+// of it. A direct get on a stream with allow_direct shows the client exactly
+// one stamp, the forged one, and the read must still refuse it: the direct
+// get gives no time, and the consumer read that replaces it gives the
+// server's. The replay refuses it too, and the task with nothing else reads
+// as no task on every path.
+func TestABlankLineInTheHeaderBlockDoesNotPassTheCutoff(t *testing.T) {
+	s := startServer(t)
+	url := clientURL(s)
+	provisionCutoffTasksStream(t, url, true)
+	cutoff := time.Now().Add(-time.Minute)
+	subject := TaskSupervisorSubject(cutoffProfileName, "task-blank")
+	forged := cutoff.Add(-time.Hour)
+	publishHeaderBlock(t, url, subject, blankLineStampBlock(subject, forged), cutoffEnvelope(t, "gateway", "task-blank", StateFailed, true))
+	c := cutoffReader(t, url, cutoff, NewProfileNames(cutoffProfileName))
+	ctx := testCtx(t)
+
+	// The forgery reaches the client as one stamp, the publisher's.
+	_, js := c.conn()
+	st, err := js.Stream(ctx, TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := st.GetLastMsgForSubject(ctx, subject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stamps := raw.Header.Values(jetstream.TimeStampHeaer); len(stamps) != 1 || !raw.Time.Equal(forged) {
+		t.Fatalf("direct get: stamps %v, Time %v; want the forged time alone (the server no longer hides its own?)", stamps, raw.Time)
+	}
+
+	heads, err := c.TaskReplayHeads(ctx, nil, cutoffProfileName, "task-blank")
+	if err != nil || len(heads) != 0 {
+		t.Errorf("TaskReplayHeads: %+v, %v; want none", heads, err)
+	}
+	if empty, err := c.TaskReplayEmpty(ctx, nil, cutoffProfileName, "task-blank"); err != nil || !empty {
+		t.Errorf("TaskReplayEmpty: %v, %v; want empty", empty, err)
+	}
+	if _, err := c.TasksGet(ctx, cutoffProfileName, "task-blank"); !isTaskNotFoundErr(err) {
+		t.Errorf("replay: %v, want TaskNotFound", err)
+	}
+	if c.ProfileSupervisorDrops() < 3 {
+		t.Errorf("drops = %d, want one per read", c.ProfileSupervisorDrops())
+	}
+}
+
+// A five-token terminal the dispatcher wrote before the cutoff is still a
+// profile task's terminal on the direct-get reads: the direct get gives no
+// time, so that one subject is read again on a consumer, and the server's
+// time from its metadata is before the cutoff. Only that subject opens a
+// consumer: a session's five-token subject and the events subject don't.
+func TestAPreCutoffFiveTokenTerminalIsReadThroughTheConsumer(t *testing.T) {
+	s := startServer(t)
+	url := clientURL(s)
+	provisionCutoffTasksStream(t, url, true)
+	publishRaw(t, url, TaskSupervisorSubject(cutoffProfileName, "task-old"), cutoffEnvelope(t, DispatcherSession, "task-old", StateFailed, true))
+	publishRaw(t, url, TaskEventsSubject(cutoffSessionName, "task-sess"), cutoffEnvelope(t, cutoffSessionName, "task-sess", StateWorking, false))
+	publishRaw(t, url, TaskSupervisorSubject(cutoffSessionName, "task-sess"), cutoffEnvelope(t, "gateway", "task-sess", StateFailed, true))
+	time.Sleep(20 * time.Millisecond)
+	cutoff := time.Now()
+	c := cutoffReader(t, url, cutoff, NewProfileNames(cutoffProfileName))
+	ctx := testCtx(t)
+	_, js := c.conn()
+	consumers := func() int {
+		st, err := js.Stream(ctx, TasksStream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := st.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.State.Consumers
+	}
+
+	if _, err := c.TaskReplayHeads(ctx, nil, cutoffSessionName, "task-sess"); err != nil {
+		t.Fatal(err)
+	}
+	if n := consumers(); n != 0 {
+		t.Errorf("a session task's read opened %d consumers, want none", n)
+	}
+
+	heads, err := c.TaskReplayHeads(ctx, nil, cutoffProfileName, "task-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heads) != 1 || heads[0].StoredAt.IsZero() || !heads[0].StoredAt.Before(cutoff) {
+		t.Fatalf("heads %+v; want the pre-cutoff terminal with the server's time", heads)
+	}
+	if env, err := ParseEnvelope(heads[0].Data); err != nil || !IsFinalStatus(env) {
+		t.Errorf("head %q: %v; want the terminal", heads[0].Data, err)
+	}
+	if empty, err := c.TaskReplayEmpty(ctx, nil, cutoffProfileName, "task-old"); err != nil || empty {
+		t.Errorf("TaskReplayEmpty: %v, %v; want the terminal found", empty, err)
+	}
+	if n := consumers(); n != 2 {
+		t.Errorf("two profile reads opened %d consumers, want one each", n)
+	}
+	if c.ProfileSupervisorDrops() != 0 {
+		t.Errorf("a pre-cutoff terminal counted %d drops", c.ProfileSupervisorDrops())
+	}
+}
+
+// A malformed cutoff refuses every five-token terminal on a profile task,
+// however old: the cutoff is the unix epoch, the same on every restart, so a
+// terminal stored before the reader started is refused as one stored after.
+// A session's is still taken.
+func TestAMalformedCutoffRefusesEveryFiveTokenTerminalOnAProfile(t *testing.T) {
+	s := startServer(t)
+	url := clientURL(s)
+	provisionCutoffTasksStream(t, url, true)
+	publishRaw(t, url, TaskSupervisorSubject(cutoffProfileName, "task-1"), cutoffEnvelope(t, DispatcherSession, "task-1", StateFailed, true))
+	publishRaw(t, url, TaskSupervisorSubject(cutoffSessionName, "task-1"), cutoffEnvelope(t, "gateway", "task-1", StateFailed, true))
+	time.Sleep(20 * time.Millisecond)
+	getenv := func(string) string { return "not a time" }
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	setting := ProfileSupervisorCutoffFromEnv(getenv, log)
+	if again := ProfileSupervisorCutoffFromEnv(getenv, log); !again.Cutoff.Equal(setting.Cutoff) || !setting.Cutoff.Equal(MalformedCutoff) {
+		t.Fatalf("malformed cutoff %v then %v; want the epoch both times", setting.Cutoff, again.Cutoff)
+	}
+	c := cutoffReader(t, url, setting.Cutoff, NewProfileNames(cutoffProfileName))
+	ctx := testCtx(t)
+	if _, err := c.TasksGet(ctx, cutoffProfileName, "task-1"); !isTaskNotFoundErr(err) {
+		t.Errorf("replay of the profile's: %v, want its pre-start terminal refused", err)
+	}
+	if heads, err := c.TaskReplayHeads(ctx, nil, cutoffProfileName, "task-1"); err != nil || len(heads) != 0 {
+		t.Errorf("direct gets of the profile's: %+v, %v; want none", heads, err)
+	}
+	if task, err := c.TasksGet(ctx, cutoffSessionName, "task-1"); err != nil || !task.Final {
+		t.Errorf("the session's: %+v, %v; want its terminal", task, err)
+	}
+}
+
+// LoadedAt moves on every read of the names file, changed or not, and stands
+// still while reads fail: a reader's health shows names gone stale.
+func TestProfileNamesLoadedAtStopsWhenReadsFail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	p := &ProfileNames{}
+	if !p.LoadedAt().IsZero() {
+		t.Fatal("a set never loaded has a load time")
+	}
+	if err := os.WriteFile(path, []byte(`{"profiles":["fleet-audit"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.load(path); err != nil {
+		t.Fatal(err)
+	}
+	first := p.LoadedAt()
+	if first.IsZero() {
+		t.Fatal("a loaded set has no load time")
+	}
+	time.Sleep(5 * time.Millisecond)
+	if changed, err := p.load(path); err != nil || changed {
+		t.Fatalf("an unchanged re-read: changed %v, %v", changed, err)
+	}
+	second := p.LoadedAt()
+	if !second.After(first) {
+		t.Errorf("an unchanged re-read left the load time at %v", second)
+	}
+	if err := os.WriteFile(path, []byte(`garbled`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if _, err := p.load(path); err == nil {
+		t.Fatal("a garbled file read")
+	}
+	if !p.LoadedAt().Equal(second) || !p.Has("fleet-audit") {
+		t.Errorf("after a failed read: load time %v (was %v), names kept %v", p.LoadedAt(), second, p.Has("fleet-audit"))
+	}
+}
+
+// A stored header block the client can't parse at all makes the direct get
+// fail, so the read errors rather than answering: every caller takes a
+// failed read as the task still running, the safe side.
+func TestAnUnparseableHeaderBlockFailsTheRead(t *testing.T) {
+	s := startServer(t)
+	url := clientURL(s)
+	provisionCutoffTasksStream(t, url, true)
+	cutoff := time.Now().Add(-time.Minute)
+	subject := TaskSupervisorSubject(cutoffProfileName, "task-garbled")
+	publishHeaderBlock(t, url, subject, "garbage\r\n\r\n", cutoffEnvelope(t, "gateway", "task-garbled", StateFailed, true))
+	c := cutoffReader(t, url, cutoff, NewProfileNames(cutoffProfileName))
+	ctx := testCtx(t)
+	if heads, err := c.TaskReplayHeads(ctx, nil, cutoffProfileName, "task-garbled"); err == nil {
+		t.Errorf("TaskReplayHeads: %+v with no error; want the read to fail", heads)
+	}
+	if empty, err := c.TaskReplayEmpty(ctx, nil, cutoffProfileName, "task-garbled"); err == nil {
+		t.Errorf("TaskReplayEmpty: %v with no error; want the read to fail", empty)
 	}
 }

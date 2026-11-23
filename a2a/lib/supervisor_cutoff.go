@@ -30,10 +30,15 @@ import (
 //     exactly when its name is in that file, the same names nats.conf denies
 //     the gateway the supervisor subjects of.
 //
-// The time a message was stored is the JetStream server's: a consumer
-// delivery's metadata, or on a direct get, the one Nats-Time-Stamp the server
-// adds (storedTimeOf). A time that can't be read that way is unknown, and an
-// unknown time is refused where it would decide.
+// The time a message was stored is the JetStream server's, and only where
+// the server alone writes it: a consumer delivery's metadata, or the API's
+// JSON reply to a message get without allow_direct (storedTimeOf). Never a
+// direct get's headers: the server appends its Nats-Time-Stamp after the
+// publisher's own header block, and a publisher can end that block early with
+// a blank line of its own, so the client's header parse stops there and sees
+// only what the publisher wrote. A time that can't be read from the server is
+// unknown, and an unknown time is refused where it would decide; the direct
+// gets re-read that one subject on a consumer first (taskReplayHeads).
 
 // EnvProfileSupervisorCutoff names the time after which a reader stops taking
 // a five-token supervisor message as a profile task's terminal: RFC3339,
@@ -55,7 +60,7 @@ const (
 	// CutoffSourceEnv is the operator's value, as rendered.
 	CutoffSourceEnv = "env"
 	// CutoffSourceMalformed is a value that does not parse, read as latched
-	// at the process's start (ProfileSupervisorCutoffFromEnv).
+	// at the unix epoch (ProfileSupervisorCutoffFromEnv).
 	CutoffSourceMalformed = "malformed"
 )
 
@@ -66,15 +71,21 @@ type ProfileSupervisorCutoffSetting struct {
 	Source string
 }
 
+// MalformedCutoff is the cutoff a reader takes when
+// EnvProfileSupervisorCutoff does not parse: the unix epoch, before anything
+// on the bus was stored.
+var MalformedCutoff = time.Unix(0, 0).UTC()
+
 // ProfileSupervisorCutoffFromEnv reads EnvProfileSupervisorCutoff through
 // getenv. Absent or empty is unset: unlatched. A value that does not parse as
 // RFC3339 fails closed: the operator renders the variable only once the
 // install has latched, so a value that is there at all says the install is
-// latched, and the reader takes start, its own start time, as the cutoff. A
-// five-token terminal stored before the process started is still read, one
-// stored after is not. It is logged at Error, and Source says so for the
-// reader's health signal.
-func ProfileSupervisorCutoffFromEnv(getenv func(string) string, start time.Time, log *slog.Logger) ProfileSupervisorCutoffSetting {
+// latched, and the reader takes MalformedCutoff, the unix epoch, as the
+// cutoff. Every five-token terminal on a profile task is then refused,
+// whenever it was stored, and the answer is the same on every restart (a
+// cutoff taken from the process's own start would move with each one). It is
+// logged at Error, and Source says so for the reader's health signal.
+func ProfileSupervisorCutoffFromEnv(getenv func(string) string, log *slog.Logger) ProfileSupervisorCutoffSetting {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -84,9 +95,9 @@ func ProfileSupervisorCutoffFromEnv(getenv func(string) string, start time.Time,
 	}
 	cutoff, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		log.Error("profile supervisor cutoff does not parse as RFC3339; reading the install as latched at this process's start",
-			"env", EnvProfileSupervisorCutoff, "value", raw, "cutoff", start, "err", err)
-		return ProfileSupervisorCutoffSetting{Cutoff: start, Source: CutoffSourceMalformed}
+		log.Error("profile supervisor cutoff does not parse as RFC3339; refusing every five-token supervisor terminal on a profile task",
+			"env", EnvProfileSupervisorCutoff, "value", raw, "cutoff", MalformedCutoff, "err", err)
+		return ProfileSupervisorCutoffSetting{Cutoff: MalformedCutoff, Source: CutoffSourceMalformed}
 	}
 	log.Info("profile supervisor cutoff set: a five-token supervisor terminal on a profile task stored after it is not read",
 		"env", EnvProfileSupervisorCutoff, "cutoff", cutoff)
@@ -120,6 +131,9 @@ type ProfileNames struct {
 	names  map[string]bool
 	loaded bool
 	raw    []byte
+	// loadedAt is when the file was last read and parsed, changed or not:
+	// zero before the first, and standing still while re-reads fail.
+	loadedAt time.Time
 }
 
 // NewProfileNames is a loaded set holding names.
@@ -163,7 +177,7 @@ func (p *ProfileNames) set(names []string, raw []byte) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.names, p.loaded, p.raw = m, true, raw
+	p.names, p.loaded, p.raw, p.loadedAt = m, true, raw, time.Now()
 }
 
 // Has reports whether name is a profile's. A nil set, or one never loaded,
@@ -191,6 +205,19 @@ func (p *ProfileNames) Loaded() bool {
 	return p.loaded
 }
 
+// LoadedAt is when the names were last read from their file, whether or not
+// they changed: zero when never loaded (and for NewProfileNames, its creation
+// time). A set whose reads have started failing keeps its names and this time
+// stops moving, so a caller can tell names gone stale from names current.
+func (p *ProfileNames) LoadedAt() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.loadedAt
+}
+
 // Len is how many names the set holds; zero when not loaded.
 func (p *ProfileNames) Len() int {
 	if p == nil {
@@ -209,9 +236,12 @@ func (p *ProfileNames) load(path string) (changed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	p.mu.RLock()
+	p.mu.Lock()
 	same := p.loaded && bytes.Equal(raw, p.raw)
-	p.mu.RUnlock()
+	if same {
+		p.loadedAt = time.Now()
+	}
+	p.mu.Unlock()
 	if same {
 		return false, nil
 	}
@@ -280,11 +310,11 @@ type ProfileSupervisorGate struct {
 // ProfileSupervisorGateFromEnv reads the cutoff and, when one is set, starts
 // the profile names (StartProfileNames). A cutoff with no names file is
 // logged at Error: every addressee then reads as a profile.
-func ProfileSupervisorGateFromEnv(ctx context.Context, getenv func(string) string, start time.Time, log *slog.Logger) ProfileSupervisorGate {
+func ProfileSupervisorGateFromEnv(ctx context.Context, getenv func(string) string, log *slog.Logger) ProfileSupervisorGate {
 	if log == nil {
 		log = slog.Default()
 	}
-	g := ProfileSupervisorGate{ProfileSupervisorCutoffSetting: ProfileSupervisorCutoffFromEnv(getenv, start, log)}
+	g := ProfileSupervisorGate{ProfileSupervisorCutoffSetting: ProfileSupervisorCutoffFromEnv(getenv, log)}
 	if g.Cutoff.IsZero() {
 		return g
 	}
@@ -350,6 +380,27 @@ func (c *Client) IsProfileAddressee(addressee string) bool {
 	return c.opts.profileNames.Has(addressee)
 }
 
+// ProfileNamesLoaded reports whether this client's profile names have been
+// read (ProfileNames.Loaded). False with a cutoff set is the fail-closed
+// state, where every addressee reads as a profile: a refusal made then may
+// not be the one the names would make once read, so a reader that would
+// discard what it refused (the gateway's relay) holds it instead.
+func (c *Client) ProfileNamesLoaded() bool {
+	return c.opts.profileNames.Loaded()
+}
+
+// storedTimeDecides reports whether the gate's answer on subject turns on a
+// stored time the read doesn't have: a cutoff set, the five-token supervisor
+// form, a profile's addressee, and storedAt zero. Only then is the server's
+// time worth a second read (taskReplayHeads).
+func (c *Client) storedTimeDecides(subject string, storedAt time.Time) bool {
+	if c.opts.profileSupervisorCutoff.IsZero() || !storedAt.IsZero() {
+		return false
+	}
+	addressee, ok := fiveTokenSupervisorAddressee(subject)
+	return ok && c.IsProfileAddressee(addressee)
+}
+
 // AcceptSupervisorEvent is AcceptsSupervisorEvent under this client's cutoff
 // and profile names, the addressee read off the subject, counting each
 // refusal (ProfileSupervisorDrops). Nothing a caller holds about the task
@@ -381,30 +432,23 @@ type ReplayHead struct {
 	StoredAt time.Time
 }
 
-// storedTimeOf is when the server stored msg, from what the server itself
-// said, or zero when that can't be told. A stream message read without
+// storedTimeOf is when the server stored msg, from what only the server
+// writes, or zero when that can't be told. A stream message read without
 // direct get carries the time in the API's JSON reply, which only the server
 // writes. A direct get carries it as a Nats-Time-Stamp header the server
-// appends to the stored message's own headers; a publisher can put a header
-// of that name on its message first, and nats.go reads the first. So on a
-// direct get the time is taken only when the header has exactly one value,
-// the server's; a message that carried its own has two, and its time is
-// unknown. direct is whether the read was a direct get: the stream's
-// allow_direct, which is what the client checks to choose
-// (jetstream.Stream.CachedInfo).
+// appends to the stored message's own header block, and that block is the
+// publisher's: a blank line inside it ends the block for the client's parse
+// (nats.go readMIMEHeader stops at the first), so every header the server
+// appends after it, its time included, is hidden, and the publisher's own
+// Nats-Time-Stamp is the only one left. Counting the values doesn't tell the
+// two apart. So a direct get gives no time at all, and its time is unknown.
+// direct is whether the read was a direct get: the stream's allow_direct,
+// which is what the client checks to choose (jetstream.Stream.CachedInfo).
 func storedTimeOf(msg *jetstream.RawStreamMsg, direct bool) time.Time {
-	if !direct {
-		return msg.Time
-	}
-	stamps := msg.Header.Values(jetstream.TimeStampHeaer)
-	if len(stamps) != 1 {
+	if direct {
 		return time.Time{}
 	}
-	at, err := time.Parse(time.RFC3339Nano, stamps[0])
-	if err != nil {
-		return time.Time{}
-	}
-	return at
+	return msg.Time
 }
 
 // directGets reports whether stream answers GetLastMsgForSubject with a direct
@@ -428,18 +472,28 @@ func (c *Client) tasksStream(ctx context.Context, stream jetstream.Stream) (jets
 }
 
 // TaskReplayHeads reads the newest message on each of the task's replay
-// subjects (TaskReplaySubjects) with a direct get, opening no consumer, and
-// returns those the read takes (AcceptSupervisorEvent, on the server's stored
-// time: storedTimeOf), in subject order. No heads is the task having nothing
-// in the retention window, the answer the replay gives as TaskNotFound.
-// stream is the TASKS handle, or nil for the call to fetch it. An error is
-// the read failing, not the subjects being empty.
+// subjects (TaskReplaySubjects) with a direct get, and returns those the read
+// takes (AcceptSupervisorEvent, on the server's stored time: storedTimeOf), in
+// subject order. No heads is the task having nothing in the retention window,
+// the answer the replay gives as TaskNotFound. stream is the TASKS handle, or
+// nil for the call to fetch it. An error is the read failing, not the subjects
+// being empty.
+//
+// A direct get gives no stored time (storedTimeOf), and the time decides only
+// one subject: the five-token supervisor subject on a profile's addressee,
+// with a cutoff set. That subject alone, when it holds a message, is read
+// again on a short consumer (lastBySubject), whose delivery metadata the
+// server writes, so a terminal the dispatcher wrote before the cutoff still
+// counts. Every other subject opens no consumer, as before. After the latch
+// the dispatcher writes the six-token form, so that subject holds a message
+// only for a task that ended before the cutoff, or one somebody wrote after
+// it, which is refused.
 //
 // It sees only the newest message per subject. A profile task's five-token
 // subject whose newest message is refused can hold an older one stored
-// before the cutoff, which the replay folds; the direct get reads that
-// subject as empty. Only a second five-token terminal for the same profile
-// task does that (one written by a rolled-back dispatcher's fallback after a
+// before the cutoff, which the replay folds; this read takes that subject as
+// empty. Only a second five-token terminal for the same profile task does
+// that (one written by a rolled-back dispatcher's fallback after a
 // pre-latch one), and the reading it gives, not final, is the conservative
 // one for the callers that use it (a busy count, a no-first-event notice).
 func (c *Client) TaskReplayHeads(ctx context.Context, stream jetstream.Stream, addressee, taskID string) ([]ReplayHead, error) {
@@ -469,16 +523,84 @@ func (c *Client) taskReplayHeads(ctx context.Context, stream jetstream.Stream, a
 			continue
 		}
 		if err != nil {
+			// A stored header block the client can't parse at all (one
+			// with no NATS/1.0 line, say) leaves the direct get without the
+			// headers it needs, so it fails here and the whole read errors.
+			// That is the safe side: every caller takes a failed read as
+			// the task still running (the busy count keeps it, the notice
+			// and the steer stay quiet), so it is left as is.
 			return nil, fmt.Errorf("newest message on %s: %w", subject, err)
 		}
-		storedAt := storedTimeOf(msg, direct)
+		data, storedAt := msg.Data, storedTimeOf(msg, direct)
+		if c.storedTimeDecides(subject, storedAt) {
+			if data, storedAt, err = c.lastBySubject(ctx, subject); err != nil {
+				return nil, err
+			}
+		}
 		if !c.AcceptSupervisorEvent(subject, storedAt) {
 			continue
 		}
-		heads = append(heads, ReplayHead{Subject: subject, Data: msg.Data, StoredAt: storedAt})
+		heads = append(heads, ReplayHead{Subject: subject, Data: data, StoredAt: storedAt})
 		if first {
 			break
 		}
 	}
 	return heads, nil
+}
+
+// lastBySubjectWait bounds the consumer read lastBySubject makes. The
+// message was there a moment ago, so the delivery is one round trip; a
+// read that takes longer than this has failed.
+const lastBySubjectWait = 2 * time.Second
+
+// lastBySubject reads the newest message on subject through an ephemeral
+// pull consumer that delivers the last message per subject, and returns its
+// data and the stored time from the delivery's metadata, which the server
+// writes (the reply subject, not the message's headers). It is the time the
+// direct get can't give (storedTimeOf).
+//
+// The consumer is the replay's kind, made with the grant the replay uses:
+// CONSUMER.CREATE on TASKS under any name, MSG.NEXT on one, both held by the
+// gateway and the MCP server (a2aGatewayJetStreamGrants and
+// consoleMCPIdentity in the operator). It is not deleted, for the reason
+// EphemeralConsumerInactiveThreshold gives: neither holds CONSUMER.DELETE on
+// TASKS. It is reaped by that same threshold, and it is a plain pull
+// consumer, not an ordered one, because an ordered consumer's fetch resets
+// it, and the reset deletes the consumer it replaces.
+//
+// A message gone between the direct get and this read (aged out, or a
+// subject purged) is the read failing, not the subject being empty: a caller
+// takes it as it takes any failed read.
+func (c *Client) lastBySubject(ctx context.Context, subject string) ([]byte, time.Time, error) {
+	_, js := c.conn()
+	cons, err := js.CreateConsumer(ctx, TasksStream, jetstream.ConsumerConfig{
+		FilterSubject:     subject,
+		DeliverPolicy:     jetstream.DeliverLastPerSubjectPolicy,
+		AckPolicy:         jetstream.AckNonePolicy,
+		InactiveThreshold: EphemeralConsumerInactiveThreshold,
+		MemoryStorage:     true,
+		Replicas:          1,
+	})
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("consumer on %s for its stored time: %w", subject, err)
+	}
+	wait := lastBySubjectWait
+	if deadline, ok := ctx.Deadline(); ok {
+		wait = min(wait, time.Until(deadline))
+	}
+	if wait <= 0 {
+		return nil, time.Time{}, fmt.Errorf("stored time of %s: %w", subject, context.DeadlineExceeded)
+	}
+	msg, err := cons.Next(jetstream.FetchMaxWait(wait))
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("stored time of %s: %w", subject, err)
+	}
+	meta, err := msg.Metadata()
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("stored time of %s: %w", subject, err)
+	}
+	if msg.Subject() != subject {
+		return nil, time.Time{}, fmt.Errorf("stored time of %s: the consumer delivered %s", subject, msg.Subject())
+	}
+	return msg.Data(), meta.Timestamp, nil
 }

@@ -533,12 +533,19 @@ leave open:
   supervisor subjects of), never from the gateway's session record, `.in` traffic, the
   console's status lines or the directory. The gateway's Role writes no ConfigMap but its
   home-channel record and cannot write its own Deployment, and the MCP server has no API
-  access. A reader with a cutoff and no readable names takes every addressee as a profile. The
-  stored time is the server's: a consumer delivery's metadata, or on a direct get the one
-  `Nats-Time-Stamp` header the server adds; a message carrying a header of that name of its
-  own has an unknown time, and is refused where the time would decide. A cutoff that doesn't
-  parse is taken as the reader's start time, logged at Error, and shown on the gateway's
-  `profile_supervisor_cutoff_timestamp_seconds` series and the MCP server's `/healthz`. The terminal never goes on `.events`, which stays
+  access. A reader whose names file has never been read takes every addressee as a profile;
+  the file is re-read every 30 seconds, and a later read that fails keeps the names last read.
+  The stored time is the server's, and only where the server alone writes it: a consumer
+  delivery's metadata, or the API's JSON reply to a message get on a stream without
+  `allow_direct`. Never a direct get's headers: the server appends its `Nats-Time-Stamp` after
+  the publisher's own header block, and a blank line inside that block ends it for the
+  client's parse, hiding the server's stamp behind a forged one. A direct get therefore gives
+  no time; the gateway's busy count and empty read re-read a profile task's five-token subject
+  on a short `DeliverLastPerSubject` consumer for its time, and a time that can't be read is
+  unknown and refused where it would decide. A cutoff that doesn't parse is taken as the Unix
+  epoch, so every five-token terminal on a profile task is refused; it is logged at Error and
+  shown on the gateway's `profile_supervisor_cutoff_timestamp_seconds` series and the MCP
+  server's `/healthz`. The terminal never goes on `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,

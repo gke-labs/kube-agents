@@ -1,11 +1,13 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // The gate-2 pair (#5301): a profile named like a session token, and a
@@ -41,6 +44,12 @@ type cutoffRig struct {
 
 func startCutoffRig(t *testing.T, cutoff time.Time) *cutoffRig {
 	t.Helper()
+	return startCutoffRigNames(t, cutoff, lib.NewProfileNames(cutoffProfileAddressee))
+}
+
+// startCutoffRigNames is startCutoffRig with the profile names given.
+func startCutoffRigNames(t *testing.T, cutoff time.Time, names *lib.ProfileNames) *cutoffRig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -51,7 +60,7 @@ func startCutoffRig(t *testing.T, cutoff time.Time) *cutoffRig {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)),
-		lib.WithProfileSupervisorCutoff(cutoff), lib.WithProfileNames(lib.NewProfileNames(cutoffProfileAddressee)))
+		lib.WithProfileSupervisorCutoff(cutoff), lib.WithProfileNames(names))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,10 +609,10 @@ func TestTheRelaysTerminalReplayTakesTheCutoff(t *testing.T) {
 
 // The gate a gateway runs with shows on its metrics listener, not only in a
 // log line: the cutoff as a timestamp by its source, whether the profile
-// names are loaded, and the drops. A malformed value shows as the malformed
-// source, at the process's start; an unset one as 0 under unset.
+// names are loaded and when they were last read, and the drops. A malformed
+// value shows as the malformed source at the unix epoch; an unset one as 0
+// under unset. Names never loaded show a load time of 0.
 func TestTheProfileSupervisorGateShowsOnTheMetricsListener(t *testing.T) {
-	start := time.Date(2026, 11, 23, 15, 0, 0, 0, time.UTC)
 	for _, c := range []struct {
 		value, source, cutoff string
 		names                 *lib.ProfileNames
@@ -611,15 +620,16 @@ func TestTheProfileSupervisorGateShowsOnTheMetricsListener(t *testing.T) {
 	}{
 		{"", lib.CutoffSourceUnset, "0", nil, "0"},
 		{"2026-11-23T12:10:00Z", lib.CutoffSourceEnv, unixText(time.Date(2026, 11, 23, 12, 10, 0, 0, time.UTC)), lib.NewProfileNames("fleet-audit"), "1"},
-		{"not a time", lib.CutoffSourceMalformed, unixText(start), &lib.ProfileNames{}, "0"},
+		{"not a time", lib.CutoffSourceMalformed, "0", &lib.ProfileNames{}, "0"},
 	} {
-		setting := lib.ProfileSupervisorCutoffFromEnv(func(string) string { return c.value }, start, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		setting := lib.ProfileSupervisorCutoffFromEnv(func(string) string { return c.value }, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		m := NewMetrics()
 		m.SetProfileSupervisorGate(lib.ProfileSupervisorGate{ProfileSupervisorCutoffSetting: setting, Names: c.names}, func() int64 { return 7 })
 		_, body := scrape(t, http.MethodGet, startMetricsServer(t, m)+MetricsPath)
 		for _, want := range []string{
 			fmt.Sprintf(`kubeagents_a2a_gateway_profile_supervisor_cutoff_timestamp_seconds{source=%q} %s`, c.source, c.cutoff),
 			"kubeagents_a2a_gateway_profile_names_loaded " + c.loaded,
+			"kubeagents_a2a_gateway_profile_names_last_load_timestamp_seconds " + loadedAtText(c.names),
 			"kubeagents_a2a_gateway_profile_supervisor_drops_total 7",
 		} {
 			if !strings.Contains(body, want) {
@@ -629,7 +639,216 @@ func TestTheProfileSupervisorGateShowsOnTheMetricsListener(t *testing.T) {
 	}
 }
 
+// loadedAtText is the names' last load time as the metrics listener writes
+// it, 0 when never loaded.
+func loadedAtText(names *lib.ProfileNames) string {
+	if at := names.LoadedAt(); !at.IsZero() {
+		return unixText(at)
+	}
+	return "0"
+}
+
 // unixText is at in seconds as the metrics listener writes a gauge.
 func unixText(at time.Time) string {
 	return strconv.FormatFloat(float64(at.UnixNano())/float64(time.Second), 'g', -1, 64)
+}
+
+// allowDirect turns on allow_direct on the rig's TASKS stream, as the
+// provision script creates it, so the gateway's reads are DIRECT.GET.
+func (r *cutoffRig) allowDirect(t *testing.T) {
+	t.Helper()
+	nc, err := connectTest(r.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	st, err := js.Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := st.CachedInfo().Config
+	cfg.AllowDirect = true
+	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// publishBlankLineForgery publishes data on subject over the raw protocol
+// with a header block a blank line ends early: the headers a direct get
+// needs and a Nats-Time-Stamp of the publisher's own set to at, then the
+// blank line. The server appends its own headers after the block's last
+// line, where the client's header parse never reaches. It returns once the
+// stream holds it.
+func publishBlankLineForgery(t *testing.T, url, subject string, at time.Time, data []byte) {
+	t.Helper()
+	hdr := "NATS/1.0\r\nNats-Stream: " + lib.TasksStream + "\r\nNats-Subject: " + subject + "\r\nNats-Sequence: 1\r\n" +
+		"Nats-Time-Stamp: " + at.UTC().Format(time.RFC3339Nano) + "\r\n\r\nX-Pad: 1\r\n\r\n"
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(url, "nats://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	rd := bufio.NewReader(conn)
+	if line, err := rd.ReadString('\n'); err != nil || !strings.HasPrefix(line, "INFO ") {
+		t.Fatalf("server greeting %q: %v", line, err)
+	}
+	msg := fmt.Sprintf("CONNECT {\"verbose\":false,\"pedantic\":false,\"headers\":true,\"protocol\":1}\r\nHPUB %s %d %d\r\n%s%s\r\nPING\r\n",
+		subject, len(hdr), len(hdr)+len(data), hdr, data)
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		line, err := rd.ReadString('\n')
+		if err != nil {
+			t.Fatalf("waiting for PONG: %v", err)
+		}
+		if strings.HasPrefix(line, "-ERR") {
+			t.Fatalf("server refused the publish: %s", line)
+		}
+		if strings.HasPrefix(line, "PONG") {
+			break
+		}
+	}
+	nc, err := connectTest(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the forgery stored", func() bool {
+		st, err := js.Stream(context.Background(), lib.TasksStream)
+		if err != nil {
+			return false
+		}
+		info, err := st.Info(context.Background(), jetstream.WithSubjectFilter(subject))
+		return err == nil && info.State.Subjects[subject] > 0
+	})
+}
+
+// H1 on #6885: on a stream with allow_direct, a five-token terminal on a
+// profile task, published after the cutoff with a blank line inside its own
+// header block and a stamp before the cutoff ahead of it, is not the task's
+// terminal on the busy count and is not a first event for the no-first-event
+// notice. The direct get shows the client one stamp, the forged one; the
+// reads take the server's time from a consumer instead.
+func TestABlankLineForgeryPassesNeitherTheBusyCountNorTheEmptyRead(t *testing.T) {
+	r := startCutoffRig(t, time.Now().Add(-time.Minute))
+	r.allowDirect(t)
+	ctx := context.Background()
+	forged := r.cutoff.Add(-time.Hour)
+	env := func(taskID string) []byte {
+		data, err := json.Marshal(supervisorTerminalEnvelope(t, taskID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	// The busy count: a running task with a forged terminal is still running.
+	const running = "task-blank-running"
+	r.cutoffWorking(t, cutoffProfileAddressee, running)
+	publishBlankLineForgery(t, r.url, lib.TaskSupervisorSubject(cutoffProfileAddressee, running), forged, env(running))
+	empty, final, err := (&busyTasksStream{g: r.g}).readTask(ctx, cutoffProfileAddressee, running)
+	if err != nil || empty || final {
+		t.Errorf("busy readTask: empty %v, final %v, %v; want running", empty, final, err)
+	}
+	active := &ActiveTask{TaskID: running, SubmittedAt: time.Now().Add(-2 * r.g.cfg.FirstEventGrace)}
+	if r.g.busyTaskLeftOut(ctx, &busyTasksStream{g: r.g}, active, cutoffProfileAddressee, time.Now()) {
+		t.Error("the busy count left the running task out on the forged terminal")
+	}
+
+	// The empty read: a forged terminal alone is not a first event.
+	const silent = "task-blank-silent"
+	publishBlankLineForgery(t, r.url, lib.TaskSupervisorSubject(cutoffProfileAddressee, silent), forged, env(silent))
+	if empty, err := r.g.taskStreamEmpty(ctx, cutoffProfileAddressee, silent); err != nil || !empty {
+		t.Errorf("taskStreamEmpty: %v, %v; want empty", empty, err)
+	}
+	if empty, err := r.g.client.TaskReplayEmpty(ctx, nil, cutoffProfileAddressee, silent); err != nil || !empty {
+		t.Errorf("TaskReplayEmpty: %v, %v; want empty", empty, err)
+	}
+	if heads, err := r.g.client.TaskReplayHeads(ctx, nil, cutoffProfileAddressee, running); err != nil || len(heads) != 1 {
+		t.Errorf("TaskReplayHeads: %d heads, %v; want the working event alone", len(heads), err)
+	}
+	if r.client.ProfileSupervisorDrops() < 3 {
+		t.Errorf("drops = %d, want one per read", r.client.ProfileSupervisorDrops())
+	}
+}
+
+// With allow_direct, a five-token terminal the dispatcher wrote before the
+// cutoff still ends a profile task on the busy count and is still a first
+// event: the direct get gives no time, and the consumer read gives the
+// server's, before the cutoff.
+func TestAPreCutoffTerminalStillEndsAProfileTaskOnTheDirectReads(t *testing.T) {
+	r := startCutoffRig(t, time.Now().Add(time.Hour))
+	r.allowDirect(t)
+	ctx := context.Background()
+	const taskID = "task-pre-cutoff"
+	r.cutoffWorking(t, cutoffProfileAddressee, taskID)
+	r.publishGatewayFiveToken(t, cutoffProfileAddressee, taskID)
+	empty, final, err := (&busyTasksStream{g: r.g}).readTask(ctx, cutoffProfileAddressee, taskID)
+	if err != nil || empty || !final {
+		t.Errorf("busy readTask: empty %v, final %v, %v; want final", empty, final, err)
+	}
+	const alone = "task-pre-cutoff-alone"
+	r.publishGatewayFiveToken(t, cutoffProfileAddressee, alone)
+	if empty, err := r.g.taskStreamEmpty(ctx, cutoffProfileAddressee, alone); err != nil || empty {
+		t.Errorf("taskStreamEmpty: %v, %v; want the terminal found", empty, err)
+	}
+	if r.client.ProfileSupervisorDrops() != 0 {
+		t.Errorf("a pre-cutoff terminal counted %d drops", r.client.ProfileSupervisorDrops())
+	}
+}
+
+// nakDelivery is stampedDelivery counting give-backs.
+type nakDelivery struct {
+	stampedDelivery
+	naks  int
+	delay time.Duration
+}
+
+func (d *nakDelivery) Nak(delay time.Duration) error { d.naks++; d.delay = delay; return nil }
+
+// While the profile names are not loaded every addressee reads as a profile,
+// so the relay's refusal may be a session task's terminal the names would
+// take. It is given back to the stream, not acked, and not rendered; once
+// the names are loaded the same refusal is settled.
+func TestTheRelayHoldsARefusalMadeBeforeTheNamesAreLoaded(t *testing.T) {
+	t.Parallel()
+	r := startCutoffRigNames(t, time.Now().Add(-time.Minute), &lib.ProfileNames{})
+	after := r.cutoff.Add(30 * time.Second)
+	conv := "discord:cut/unloaded"
+	r.putRecord(t, cutoffRecord(conv, cutoffSessionAddressee, cutoffSessionTask, false))
+	subject := lib.TaskSupervisorSubject(cutoffSessionAddressee, cutoffSessionTask)
+	env := supervisorTerminalEnvelope(t, cutoffSessionTask)
+	d := &nakDelivery{stampedDelivery: stampedDelivery{fakeDelivery: fakeDelivery{env: env, subj: subject, seq: 701}, at: after}}
+	r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}})
+	if d.acks != 0 || d.naks != 1 || d.delay != profileNamesHoldDelay {
+		t.Errorf("acks %d, naks %d after %v; want given back once after %v", d.acks, d.naks, d.delay, profileNamesHoldDelay)
+	}
+	if got := r.terminalsFor(cutoffSessionTask); len(got) != 0 {
+		t.Errorf("a held event was rendered: %+v", got)
+	}
+	if held := logRecords(t, r.logs, "relay: five-token supervisor event held; the profile names are not loaded, so every task reads as a profile's"); len(held) != 1 {
+		t.Errorf("hold log = %+v, want one line", held)
+	}
+
+	loaded := startCutoffRig(t, time.Now().Add(-time.Minute))
+	profConv := "discord:cut/loaded"
+	loaded.putRecord(t, cutoffRecord(profConv, cutoffProfileAddressee, cutoffProfileTask, true))
+	profSubject := lib.TaskSupervisorSubject(cutoffProfileAddressee, cutoffProfileTask)
+	profEnv := supervisorTerminalEnvelope(t, cutoffProfileTask)
+	pd := &nakDelivery{stampedDelivery: stampedDelivery{fakeDelivery: fakeDelivery{env: profEnv, subj: profSubject, seq: 702}, at: loaded.cutoff.Add(30 * time.Second)}}
+	loaded.g.relayBatch(profConv, []relayItem{{env: profEnv, subject: profSubject, d: pd}})
+	if pd.acks != 1 || pd.naks != 0 {
+		t.Errorf("with the names loaded: acks %d, naks %d; want settled once", pd.acks, pd.naks)
+	}
 }

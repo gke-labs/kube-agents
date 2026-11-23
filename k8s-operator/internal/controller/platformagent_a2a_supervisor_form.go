@@ -180,9 +180,16 @@ func buildA2AProfileNamesConfigMap(agent *agentv1alpha1.PlatformAgent, names []s
 // applyA2AProfileNames renders the profile names ConfigMap once the install
 // has latched, and nothing before: an unlatched install's readers mount
 // nothing and read nothing. Once rendered it is kept current every pass.
-func (r *PlatformAgentReconciler) applyA2AProfileNames(ctx context.Context, agent *agentv1alpha1.PlatformAgent, names []string) error {
+// namesErr is the error the names came with (dispatcherGrantNamesErr): with
+// one, nothing is applied and the pass fails, so the ConfigMap keeps the names
+// last rendered. Rendering an empty list instead would tell both readers that
+// no addressee is a profile, which is the gate failing open.
+func (r *PlatformAgentReconciler) applyA2AProfileNames(ctx context.Context, agent *agentv1alpha1.PlatformAgent, names []string, namesErr error) error {
 	if _, ok := a2aProfileSupervisorLatchedAt(agent); !ok {
 		return nil
+	}
+	if namesErr != nil {
+		return fmt.Errorf("failed to render the profile names for the supervisor cutoff; keeping the ConfigMap as it is: %w", namesErr)
 	}
 	cm, err := buildA2AProfileNamesConfigMap(agent, names)
 	if err != nil {

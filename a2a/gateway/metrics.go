@@ -123,13 +123,16 @@ const (
 	// The profile supervisor gate a reader runs with (#5301), so it shows
 	// outside the log line: the cutoff as a timestamp, by where it came from
 	// (lib.CutoffSource*), 0 when unset; whether the operator's profile
-	// names are loaded; and the five-token messages the gate refused.
-	profileCutoffName = "profile_supervisor_cutoff_timestamp_seconds"
-	profileCutoffHelp = "The profile supervisor cutoff this gateway runs with, in seconds since the unix epoch, 0 when unset; source is env (the operator's value), malformed (a value that did not parse, read as latched at the process's start) or unset."
-	profileNamesName  = "profile_names_loaded"
-	profileNamesHelp  = "1 when the operator's profile names file is loaded, 0 when it is not; with a cutoff set and no names loaded, every addressee reads as a profile."
-	profileDropsName  = "profile_supervisor_drops_total"
-	profileDropsHelp  = "Five-token supervisor messages this gateway's reads refused as a profile task's terminal; one message read three times counts three."
+	// names are loaded, and when they were last read; and the five-token
+	// messages the gate refused.
+	profileCutoffName      = "profile_supervisor_cutoff_timestamp_seconds"
+	profileCutoffHelp      = "The profile supervisor cutoff this gateway runs with, in seconds since the unix epoch, 0 when unset; source is env (the operator's value), malformed (a value that did not parse, read as the unix epoch, so every five-token terminal on a profile task is refused) or unset."
+	profileNamesName       = "profile_names_loaded"
+	profileNamesHelp       = "1 when the operator's profile names file is loaded, 0 when it is not; with a cutoff set and no names loaded, every addressee reads as a profile."
+	profileNamesLoadedName = "profile_names_last_load_timestamp_seconds"
+	profileNamesLoadedHelp = "When this gateway last read the operator's profile names file, changed or not, in seconds since the unix epoch, 0 when never; it is re-read every 30 seconds, so a value that stops moving is reads failing and the names last read kept."
+	profileDropsName       = "profile_supervisor_drops_total"
+	profileDropsHelp       = "Five-token supervisor messages this gateway's reads refused as a profile task's terminal; one message read three times counts three."
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -337,16 +340,18 @@ type profileGateSource struct {
 // profileGateCollector serves the profile supervisor gate series: nothing
 // until SetProfileSupervisorGate has run.
 type profileGateCollector struct {
-	m      *Metrics
-	cutoff *prometheus.Desc
-	names  *prometheus.Desc
-	drops  *prometheus.Desc
+	m           *Metrics
+	cutoff      *prometheus.Desc
+	names       *prometheus.Desc
+	namesLoaded *prometheus.Desc
+	drops       *prometheus.Desc
 }
 
 // Describe sends the gate series' Descs.
 func (c *profileGateCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cutoff
 	ch <- c.names
+	ch <- c.namesLoaded
 	ch <- c.drops
 }
 
@@ -366,6 +371,11 @@ func (c *profileGateCollector) Collect(ch chan<- prometheus.Metric) {
 		loaded = 1
 	}
 	ch <- prometheus.MustNewConstMetric(c.names, prometheus.GaugeValue, loaded)
+	loadedAt := 0.0
+	if at := src.gate.Names.LoadedAt(); !at.IsZero() {
+		loadedAt = float64(at.UnixNano()) / float64(time.Second)
+	}
+	ch <- prometheus.MustNewConstMetric(c.namesLoaded, prometheus.GaugeValue, loadedAt)
 	var drops int64
 	if src.drops != nil {
 		drops = src.drops()
@@ -573,10 +583,11 @@ func NewMetrics() *Metrics {
 		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
 	}
 	gate := &profileGateCollector{
-		m:      m,
-		cutoff: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, profileCutoffName), profileCutoffHelp, []string{labelSource}, nil),
-		names:  prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, profileNamesName), profileNamesHelp, nil, nil),
-		drops:  prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, profileDropsName), profileDropsHelp, nil, nil),
+		m:           m,
+		cutoff:      prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, profileCutoffName), profileCutoffHelp, []string{labelSource}, nil),
+		names:       prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, profileNamesName), profileNamesHelp, nil, nil),
+		namesLoaded: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, profileNamesLoadedName), profileNamesLoadedHelp, nil, nil),
+		drops:       prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, profileDropsName), profileDropsHelp, nil, nil),
 	}
 	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.gchatAPIDuration, m.gchatRateLimited, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges, gate)
 	for _, outcome := range metricsChatOutcomes {

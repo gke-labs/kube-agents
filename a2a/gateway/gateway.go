@@ -3830,7 +3830,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// the task, which is a pod still starting or nothing at all, so no reply
 	// is promised. A read that fails keeps the route's line. The read is
 	// direct gets (taskStreamEmpty), not a replay, so a steer opens no
-	// consumer.
+	// consumer, but for the one taskStreamEmpty names.
 	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
 	noFirstEvent := emptyErr == nil && empty
 	if noFirstEvent {

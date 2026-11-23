@@ -7949,8 +7949,8 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// from once latched (#5301): the same names as the bus's per-profile
 	// deny below, from the same call. Optional on both pods, so ordering
 	// against their Deployments doesn't matter.
-	gateProfiles, _ := dispatcherGrantNames(agent, profiles, draining)
-	if err := r.applyA2AProfileNames(ctx, agent, gateProfiles); err != nil {
+	gateProfiles, _, gateErr := dispatcherGrantNamesErr(agent, profiles, draining)
+	if err := r.applyA2AProfileNames(ctx, agent, gateProfiles, gateErr); err != nil {
 		return state, err
 	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)

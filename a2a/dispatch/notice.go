@@ -58,10 +58,10 @@ const (
 	// terminal on the bus, on a latched install (#5301): its six-token
 	// terminal was refused by the server's permissions until
 	// DroppedTerminalGiveUp, or taken as a duplicate of a message that isn't
-	// it and taken as a duplicate again under a fresh id (giveUpTerminal). The dispatcher can't write it on the task (the
-	// write is what failed); it keys the Error log and the health line's
-	// supervisorGiveUps, and the gateway reads it as one plain line wherever
-	// a settle names it.
+	// it and taken as a duplicate again under a fresh id (giveUpTerminal).
+	// The dispatcher can't write it on the task (the write is what failed);
+	// it keys the Error log and the health line's supervisorGiveUps. Nothing
+	// delivers it to the gateway yet, so no conversation hears it (#6884).
 	ReasonTerminalUnpublished = "terminal-unpublished"
 )
 

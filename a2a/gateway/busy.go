@@ -281,16 +281,17 @@ func (b *busyTasksStream) handle(ctx context.Context) (jetstream.Stream, error) 
 }
 
 // readTask reads the newest message on each of a task's replay subjects
-// (lib.TaskReplaySubjects) with a direct get, and no consumer, so a count
-// over many records opens no ephemeral consumer on TASKS. empty is nothing on
+// (lib.TaskReplaySubjects) with a direct get, so a count over many records
+// opens no ephemeral consumer on TASKS; the one exception is a profile task's
+// five-token supervisor subject on a latched gateway, whose stored time a
+// direct get can't give and a short consumer reads (lib.TaskReplayHeads). empty is nothing on
 // either subject in the retention window, the question the replay answers
 // with TaskNotFound; any message the replay would fold is a message here.
 // final is a terminal status as the newest message on either: the executor
 // writes nothing after its terminal, and the supervisor subject
 // carries only terminals. An error is the read failing, not the subjects
 // being empty. A five-token supervisor message the cutoff refuses on a
-// profile's addressee is not read here, as the replay does not fold it
-// (lib.TaskReplayHeads).
+// profile's addressee is not read here, as the replay does not fold it.
 func (b *busyTasksStream) readTask(ctx context.Context, addressee, taskID string) (empty, final bool, err error) {
 	stream, err := b.handle(ctx)
 	if err != nil {

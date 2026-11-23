@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/nats-io/nats.go"
 
@@ -236,7 +235,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// The profile supervisor gate (#5301): the cutoff and the profile names,
 	// both unset until the operator renders them from the latched profile
 	// supervisor form. A malformed cutoff reads as latched at this start.
-	gate := lib.ProfileSupervisorGateFromEnv(ctx, os.Getenv, time.Now(), log)
+	gate := lib.ProfileSupervisorGateFromEnv(ctx, os.Getenv, log)
 	client, err := lib.Connect(ctx, cfg.NATSURL, append([]lib.ClientOption{
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),

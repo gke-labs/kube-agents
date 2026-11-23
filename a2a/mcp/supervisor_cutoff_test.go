@@ -384,7 +384,6 @@ func TestTheHealthProbeShowsTheProfileSupervisorGate(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte("tok\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	start := time.Date(2026, 11, 23, 15, 0, 0, 0, time.UTC)
 	for _, c := range []struct {
 		value string
 		names *lib.ProfileNames
@@ -392,9 +391,9 @@ func TestTheHealthProbeShowsTheProfileSupervisorGate(t *testing.T) {
 	}{
 		{"", nil, ProfileSupervisorHealth{Source: lib.CutoffSourceUnset}},
 		{"2026-11-23T12:10:00Z", lib.NewProfileNames("fleet-audit"), ProfileSupervisorHealth{Cutoff: "2026-11-23T12:10:00Z", Source: lib.CutoffSourceEnv, NamesLoaded: true}},
-		{"garbled", &lib.ProfileNames{}, ProfileSupervisorHealth{Cutoff: "2026-11-23T15:00:00Z", Source: lib.CutoffSourceMalformed}},
+		{"garbled", &lib.ProfileNames{}, ProfileSupervisorHealth{Cutoff: "1970-01-01T00:00:00Z", Source: lib.CutoffSourceMalformed}},
 	} {
-		setting := lib.ProfileSupervisorCutoffFromEnv(func(string) string { return c.value }, start, nil)
+		setting := lib.ProfileSupervisorCutoffFromEnv(func(string) string { return c.value }, nil)
 		b := dialGate(t, url, lib.ProfileSupervisorGate{ProfileSupervisorCutoffSetting: setting, Names: c.names})
 		srv := mustServer(t)
 		h := Handler(srv, tokenFile, nil, WithProfileSupervisorHealth(b.ProfileSupervisorHealth))
@@ -406,6 +405,10 @@ func TestTheHealthProbeShowsTheProfileSupervisorGate(t *testing.T) {
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("%q: %v (%s)", c.value, err, rec.Body.String())
+		}
+		// When the names were last read, which only loaded names have.
+		if at := c.names.LoadedAt(); !at.IsZero() {
+			c.want.NamesLoadedAt = at.UTC().Format(time.RFC3339)
 		}
 		if body.Status != "ok" || body.Gate != c.want {
 			t.Errorf("%q: health = %+v, want gate %+v", c.value, body, c.want)

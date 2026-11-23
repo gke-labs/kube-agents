@@ -163,6 +163,10 @@ const (
 	kvRetryAttempts = 3
 	kvRetryPause    = 200 * time.Millisecond
 	requeueDelay    = 2 * time.Second
+	// profileNamesHoldDelay is how long a five-token supervisor event the
+	// relay refused while the profile names were not loaded waits before it
+	// comes back: the names file is re-read every 30 seconds.
+	profileNamesHoldDelay = 30 * time.Second
 )
 
 // relayMaxAckPending caps the events the relay holds unrendered on its
@@ -340,12 +344,17 @@ func (g *Gateway) retryAck(item relayItem) {
 // requeueDelay, for a try that may succeed then; an item that didn't come
 // off the durable is requeued in memory instead.
 func (g *Gateway) giveBackLater(item relayItem) {
+	g.giveBackAfter(item, requeueDelay)
+}
+
+// giveBackAfter is giveBackLater after delay.
+func (g *Gateway) giveBackAfter(item relayItem, delay time.Duration) {
 	if item.d == nil {
 		sessionKey := g.sessionForTask(g.runCtx, item.env.TaskID)
 		go func() {
 			select {
 			case <-g.runCtx.Done():
-			case <-time.After(requeueDelay):
+			case <-time.After(delay):
 				if sessionKey != "" {
 					g.events.enqueue(sessionKey, item)
 				}
@@ -357,7 +366,7 @@ func (g *Gateway) giveBackLater(item relayItem) {
 		// Stopping: the subscription's stop gives it back in stream order.
 		return
 	}
-	if err := item.d.Nak(requeueDelay); err != nil {
+	if err := item.d.Nak(delay); err != nil {
 		g.log.Warn("relay: give-back failed", "taskId", item.env.TaskID, "err", err)
 	}
 }
@@ -574,8 +583,21 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			// metadata didn't give (#5301): the dispatcher writes a profile
 			// task's terminal on the six-token form by then, so this one
 			// is not the task's. Profile-ness is the operator's profile
-			// names, never this record. Settled, never rendered and
-			// never a wake; the client counts it.
+			// names, never this record. Never rendered and never a wake;
+			// the client counts it.
+			//
+			// Settled only once the names are loaded. Before then every
+			// addressee reads as a profile (lib.ProfileNames.Has), so the
+			// refusal may be a session task's terminal the names would
+			// take; an ack would lose it for good. It is given back to
+			// the stream instead, and read again once the names are in.
+			if !g.client.ProfileNamesLoaded() {
+				g.log.Log(g.runCtx, firstDeliveryLevel(item), "relay: five-token supervisor event held; the profile names are not loaded, so every task reads as a profile's",
+					"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
+					"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
+				g.giveBackAfter(item, profileNamesHoldDelay)
+				continue
+			}
 			g.log.Warn("relay: five-token supervisor event on a profile task, stored after the cutoff, dropped",
 				"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
 				"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())

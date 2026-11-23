@@ -512,11 +512,13 @@ func noFirstEventPastGrace(active *ActiveTask, streamEmpty bool, grace time.Dura
 // subjects in the retention window. It is the test the replay makes before
 // it opens a consumer (TasksGet answers TaskNotFound exactly when this
 // answers true, but for the case lib.TaskReplayHeads names), made with
-// direct gets and no consumer, so a caller that only needs to know whether
-// the task has a first event does not spend one of the TASKS stream's
-// consumer slots on a five-second ephemeral. A five-token supervisor message
-// the cutoff refuses on a profile's addressee is not a first event here
-// either. It stops at the first message it takes, events first, so a task
+// direct gets, so a caller that only needs to know whether the task has a
+// first event does not spend one of the TASKS stream's consumer slots on a
+// five-second ephemeral. The exception is a profile task's five-token
+// supervisor subject on a latched gateway: a direct get can't give its
+// stored time, so it is read on one such consumer (lib.TaskReplayHeads). A
+// five-token supervisor message the cutoff refuses on a profile's addressee
+// is not a first event here either. It stops at the first message it takes, events first, so a task
 // with a first event costs one direct get, as before the cutoff; one with
 // none costs three, bounded by the three replay subjects. An error is the
 // read failing, not the subjects being empty.

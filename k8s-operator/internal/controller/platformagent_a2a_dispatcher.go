@@ -597,11 +597,20 @@ func dispatchReservesShortfall0(agent *agentv1alpha1.PlatformAgent, ceiling, chi
 
 // dispatcherGrantNames are the profiles the dispatch config lists and every
 // durable under them, in its order: the names the dispatcher's grants
-// enumerate.
+// enumerate. A config that doesn't render gives none
+// (dispatcherGrantNamesErr says why).
 func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (names, durables []string) {
+	names, durables, _ = dispatcherGrantNamesErr(agent, profiles, draining)
+	return names, durables
+}
+
+// dispatcherGrantNamesErr is dispatcherGrantNames with the render's error,
+// for a caller to whom no names is not a safe answer (the profile names file:
+// applyA2AProfileNames).
+func dispatcherGrantNamesErr(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (names, durables []string, err error) {
 	cfg, err := desiredDispatchConfigDraining(agent, profiles, draining)
 	if err != nil {
-		return nil, nil
+		return nil, nil, err
 	}
 	for _, p := range cfg.Profiles {
 		names = append(names, p.Name)
@@ -609,7 +618,7 @@ func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 			durables = append(durables, d.Name)
 		}
 	}
-	return names, durables
+	return names, durables, nil
 }
 
 // a2aDispatchConfig is lib.DispatchConfig as this module renders it; the

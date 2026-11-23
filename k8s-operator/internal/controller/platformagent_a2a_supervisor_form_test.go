@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -501,14 +502,14 @@ func TestTheProfileNamesAreTheBusDenysNames(t *testing.T) {
 	r, cl, _ := a2aGateTestReconciler(t, agent)
 	ctx := context.Background()
 	key := client.ObjectKey{Namespace: agent.Namespace, Name: a2aProfileNamesName(agent)}
-	if err := r.applyA2AProfileNames(ctx, agent, names); err != nil {
+	if err := r.applyA2AProfileNames(ctx, agent, names, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Get(ctx, key, &corev1.ConfigMap{}); err == nil {
 		t.Error("an unlatched install wrote the profile names")
 	}
 	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
-	if err := r.applyA2AProfileNames(ctx, agent, names); err != nil {
+	if err := r.applyA2AProfileNames(ctx, agent, names, nil); err != nil {
 		t.Fatal(err)
 	}
 	var got corev1.ConfigMap
@@ -517,6 +518,36 @@ func TestTheProfileNamesAreTheBusDenysNames(t *testing.T) {
 	}
 	if got.Data[a2aProfileNamesKey] != cm.Data[a2aProfileNamesKey] {
 		t.Errorf("applied %q, want %q", got.Data[a2aProfileNamesKey], cm.Data[a2aProfileNamesKey])
+	}
+}
+
+// A names render that failed applies nothing and fails the pass: the
+// ConfigMap keeps the names last written rather than taking an empty list,
+// which would tell both readers no addressee is a profile.
+func TestAFailedNamesRenderKeepsTheNamesLastWritten(t *testing.T) {
+	agent := a2aTestAgent()
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: a2aProfileNamesName(agent)}
+	if err := r.applyA2AProfileNames(ctx, agent, nil, errors.New("render failed")); err == nil {
+		t.Fatal("a failed render applied with no error")
+	}
+	if err := cl.Get(ctx, key, &corev1.ConfigMap{}); err == nil {
+		t.Error("a failed render wrote a profile names ConfigMap")
+	}
+	if err := r.applyA2AProfileNames(ctx, agent, []string{"fleet-audit"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.applyA2AProfileNames(ctx, agent, nil, errors.New("render failed")); err == nil {
+		t.Fatal("a failed render applied with no error")
+	}
+	var got corev1.ConfigMap
+	if err := cl.Get(ctx, key, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Data[a2aProfileNamesKey] != `{"profiles":["fleet-audit"]}`+"\n" {
+		t.Errorf("after a failed render the names are %q, want the names last written", got.Data[a2aProfileNamesKey])
 	}
 }
 
