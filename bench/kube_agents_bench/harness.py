@@ -127,7 +127,12 @@ Environment:
         gateway's own first-event grace plus a margin, learned from a read
         of the fresh conversation before the POST, and a budget below the
         floor is refused before anything is started
-        (:func:`~kube_agents_bench.inject_transport.check_budget`). There is
+        (:func:`~kube_agents_bench.inject_transport.check_budget`). A turn
+        the gateway queued at the session cap (#6882) waits in line before
+        this budget starts, for up to
+        :data:`~kube_agents_bench.inject_transport.QUEUED_START_WAIT_SECONDS`
+        (a status turn no longer than its own turn budget), and is then taken
+        out of the line and classified as infrastructure. There is
         no variable for "how long before I decide nobody took this": that
         window is the gateway's, and the harness reads it off the read
         route. At the deadline nothing is sent -- one more read classifies
@@ -373,9 +378,6 @@ _INJECT_TOKEN_SECRET_SUFFIX = "-a2a-inject"
 _INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a credential
 # The gateway container's A2A_MAX_SESSIONS, which is the session cap the
 # gateway runs with (session_cap.py reads it before filling the cap).
-# How long the session-cap ask waits, in all, for its fillers' tasks to be
-# working: a cold session pod's start, once per filler, run one after another.
-_SESSION_CAP_FILLER_WAIT = 600.0
 _SESSION_CAP_JSONPATH = (
     'jsonpath={.spec.template.spec.containers[?(@.name=="gateway")].env[?(@.name=="A2A_MAX_SESSIONS")].value}'
 )
@@ -2908,6 +2910,50 @@ def _infra_failure(detail: str) -> AgentResult:
     )
 
 
+def _queued_wait(opening: bool, budget: float) -> float:
+    """How long a turn the gateway queued at the session cap is followed
+    before it is given up on: the line's backstop for the opening turn, whose
+    budget starts when its task does; never more than its own budget for a
+    status turn, which the delegation wait holds to its turn timeout."""
+    if opening:
+        return inject.QUEUED_START_WAIT_SECONDS
+    return min(inject.QUEUED_START_WAIT_SECONDS, budget)
+
+
+def _transport_retrying(
+    call: Callable[[], Any],
+    *,
+    what: str,
+    respawn: Callable[..., None],
+    on_failure: Callable[[inject.InjectUnavailable], None] | None = None,
+) -> Any:
+    """``call()``, retried through a respawned tunnel on a transport failure.
+
+    The inject transport's one retry loop: up to
+    :data:`_MAX_TRANSPORT_FAILURES` attempts in all, a failure the retry set
+    does not cover raised at once, a standby's Retry-After waited first, and
+    ``respawn(reset=True, after_standby=...)`` before each retry (a respawn
+    that fails is counted, not raised: the ceiling ends it). ``on_failure``
+    sees each failure before it is counted.
+    """
+    failures = 0
+    while True:
+        try:
+            return call()
+        except inject.InjectUnavailable as exc:
+            if on_failure is not None:
+                on_failure(exc)
+            failures += 1
+            _log.warning("inject: %s failed in transport (%d/%d): %s", what, failures, _MAX_TRANSPORT_FAILURES, exc)
+            if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
+                raise
+            _wait_retry_after(exc)
+            try:
+                respawn(reset=True, after_standby=exc.retry_after is not None)
+            except RuntimeError as pf_exc:
+                _log.warning("inject: port-forward respawn failed before retry: %s", pf_exc)
+
+
 def _forward_inject_door(
     local_port: int,
     agent_service: str,
@@ -3007,6 +3053,7 @@ def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bo
         if timed_out and settled is not None and settled.fold.child_addressees is not None:
             exchange.fold.child_addressees = settled.fold.child_addressees
     return timed_out, stop_pending
+
 
 def _stop_word(task: inject.InjectTask, stop_pending: bool) -> str:
     """How the stray was bounded, for the record.
@@ -3630,7 +3677,9 @@ class KubeAgentsHarness(AgentHarness):
                 return AgentResult.errored(
                     f"{session_cap.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
                 )
-            return self._execute_session_cap(prompt)
+            result = self._execute_session_cap(prompt)
+            _fold_worker_total(result.tokens)
+            return result
         if transport == TRANSPORT_INJECT:
             result = self._execute_inject(prompt)
             _fold_worker_total(result.tokens)
@@ -3658,21 +3707,30 @@ class KubeAgentsHarness(AgentHarness):
         door, send the ask on one more, and read its queued notice, the task
         the queued turn starts and its answer off that conversation.
 
-        The install's cap is read first, off the gateway Deployment; above
-        the directive's ``max-cap``, unreadable, or never filled (the ask
-        started at once), the run is infrastructure; so is a filler whose
-        task is not working before the ask goes. The gateway refusing the
-        ask at the cap is graded: :data:`session_cap.QUEUED_ENTRY` fails with
-        the refusal as the output, beside the conversation's own entries.
-        Every record carries the fillers' lifecycle entries first, which is
-        the evidence scoring's liveness rung reads that executors ran in the
-        repetition, the refusal's included. A task the queued turn started
-        is bounded and classified as the inject transport's are
-        (:func:`_bound_stray`, :func:`_inject_infrastructure`). The tunnel is
-        the inject transport's (:func:`_forward_inject_door`), established
-        once with its retry; a transport failure after that is
-        infrastructure, with no resend. Every filler is cancelled (a queued
-        one taken out of the line) before the run ends.
+        Infrastructure, before the ask is sent: a cap above the directive's
+        ``max-cap`` or unreadable, a budget below the gateway's floor
+        (``AGENT_INJECT_TIMEOUT``, refused as the inject transport refuses
+        it), a filler the gateway queued (something else holds the cap), a
+        filler not working inside :func:`session_cap.filler_wait`, or one no
+        longer running when the ask goes (the cap is no longer full).
+        Infrastructure after it: an ask that started at once, any refusal
+        other than the cap's own, and anything once the ask is queued that
+        is not a started task (the gateway's refusal of the queued turn, its
+        restart, the line's bound running out), as well as a failure to
+        cancel a filler, which leaves the cap held.
+
+        Graded red: the ask's POST refused with the cap's own text.
+        :data:`session_cap.QUEUED_ENTRY` fails with the refusal as the
+        output, beside the conversation's entries and the fillers' lifecycle
+        entries, which are the evidence scoring's liveness rung reads that
+        executors ran in the repetition. Graded otherwise: a task the queued
+        turn started, bounded and classified as the inject transport's are
+        (:func:`_bound_stray`, :func:`_inject_infrastructure`), its record
+        opening with the same fillers' entries. The tunnel, its retry and
+        the respawn between the waits' retries are the inject transport's
+        (:func:`_forward_inject_door`, :func:`_transport_retrying`). Every
+        filler is cancelled before the run ends, and a queued turn given up
+        on is taken out of the line (:meth:`inject.InjectTask.leave_line`).
         """
         try:
             ask = session_cap.parse(prompt)
@@ -3699,68 +3757,90 @@ class KubeAgentsHarness(AgentHarness):
         assert cap is not None
 
         base_url = os.environ.get("AGENT_INJECT_URL")
-        if not base_url:
+        own_tunnel = not base_url
+
+        def _tunnel(reset: bool, after_standby: bool = False) -> None:
+            if own_tunnel:
+                _forward_inject_door(local_port, agent_service, service, reset=reset, after_standby=after_standby)
+
+        if own_tunnel:
             failures = 0
             while True:
                 try:
-                    _forward_inject_door(local_port, agent_service, service, reset=False)
+                    _tunnel(reset=False)
                     break
                 except RuntimeError as exc:
                     failures += 1
                     if failures >= _MAX_TRANSPORT_FAILURES:
                         return _infra_failure(f"the inject tunnel failed to establish {failures} times running; last: {exc}")
             base_url = f"http://127.0.0.1:{local_port}"
+        assert base_url
 
         run_id, case_id, repetition = _inject_identity()
         _write_eval_run(_eval_run_record(run_id, case_id, repetition))
         conversation = inject.conversation_key(run_id, case_id, repetition)
         message_id = inject.message_id(run_id, case_id, repetition)
         identity: dict[str, Any] = {"run_id": run_id, "case_id": case_id, "repetition": repetition, "message_id": message_id}
+        directive = session_cap.DIRECTIVE
 
         fillers: list[inject.InjectTask] = []
         released: set[str] = set()
+        # Fillers whose task cancel was not published after a retry: their
+        # workers may still hold the cap.
+        unreleased: list[str] = []
+        # The fillers' own lifecycle, as the reads showed it: the evidence
+        # that executors ran in this repetition, which every graded record
+        # of it carries (a refusal at the cap included, which has no task of
+        # its own; scoring's liveness rung reads it).
+        filler_events: list[dict[str, Any]] = []
 
         def _release_fillers() -> None:
-            """Cancel every filler's task, or take a queued filler out of
-            the line (a cancel naming no task on its conversation), once
-            each. Best effort: InjectTask.cancel logs what did not land."""
+            """Cancel every filler's task once, retrying one whose cancel
+            was not published and recording it in ``unreleased`` if it
+            still was not; a queued filler is taken out of the line."""
             for filler in fillers:
-                if filler.conversation not in released:
-                    released.add(filler.conversation)
+                if filler.conversation in released:
+                    continue
+                released.add(filler.conversation)
+                if not filler.task_id:
+                    filler.leave_line()
+                    continue
+                for _ in range(2):
                     filler.cancel(filler.task_id, settle=0)
+                    if filler.cancel_sent:
+                        break
+                else:
+                    unreleased.append(filler.task_id)
 
-        # The fillers' own lifecycle, as the reads showed it: the evidence
-        # that executors ran in this repetition, which every record of it
-        # carries (a refusal at the cap included, which has no task of its
-        # own; scoring's liveness rung reads it).
-        filler_events: list[dict[str, Any]] = []
+        def _unreleased_note() -> str:
+            if not unreleased:
+                return ""
+            return f"; no cancel was published for filler task(s) {', '.join(unreleased)}, so they may still hold the cap"
 
         def _recorded(result: AgentResult) -> AgentResult:
             result.trajectory[:0] = filler_events
             result.metadata["session_cap"] = cap
+            if unreleased:
+                result.metadata["fillers_unreleased"] = list(unreleased)
             return result
 
-        def _gateway_answer(task: inject.InjectTask, detail: str = "") -> AgentResult:
-            """The graded record of an ask the gateway answered without a
-            task: the conversation as it stands (the refusal post among it)
-            and the queue's entry, failed, with the refusal as the output."""
-            body = task._poll("", 0, 0, probe=False)
-            fold = inject.Fold("")
-            for e in body.get("entries") or []:
-                fold.apply(e)
-            refusal = task.line_refusal or session_cap.refused_at_cap(fold.entries)
-            entry = session_cap.assess(fold.entries, "", detail)
-            return _recorded(
-                AgentResult(
-                    output=refusal,
-                    trajectory=[entry, *fold.trajectory],
-                    errors=[],
-                    metadata={"transport": TRANSPORT_INJECT, "conversation": task.conversation, **identity},
-                )
-            )
-
+        task = inject.InjectTask(
+            base_url=base_url, conversation=conversation, prompt=ask.prompt, token=token,
+            author=author, message_id=message_id,
+        )
         try:
-            deadline = time.monotonic() + _SESSION_CAP_FILLER_WAIT
+            # Refused before anything is started, as the inject transport
+            # refuses it: the read is of a fresh key and mints nothing.
+            task.preflight()
+            inject.check_budget(timeout, task.first_event_grace)
+        except inject.BudgetBelowFloor as exc:
+            return AgentResult.errored(f"AGENT_INJECT_TIMEOUT: {exc}")
+        except inject.InjectUnavailable as exc:
+            return _infra_failure(f"{directive}: the inject door could not be reached: {exc}")
+
+        task_id = ""
+        try:
+            deadline = time.monotonic() + session_cap.filler_wait(ask.hold_seconds)
             for i in range(cap):
                 filler = inject.InjectTask(
                     base_url=base_url,
@@ -3773,11 +3853,13 @@ class KubeAgentsHarness(AgentHarness):
                 fillers.append(filler)
                 filler.submit()
                 if filler.refusal == inject.REFUSAL_QUEUED:
-                    # Something else holds a slot already: the cap is full.
-                    break
+                    return _infra_failure(
+                        f"{directive}: filler {i} on {filler.conversation} was queued, so something other than "
+                        f"this run's fillers holds the cap of {cap}; the ask was not sent"
+                    )
                 if not filler.task_id:
                     return _infra_failure(
-                        f"{session_cap.DIRECTIVE}: filler {i} on {filler.conversation} started nothing "
+                        f"{directive}: filler {i} on {filler.conversation} started nothing "
                         f"({filler.refusal_text}): {filler.note}"
                     )
                 # Working before the ask goes: a worker still starting holds
@@ -3787,48 +3869,83 @@ class KubeAgentsHarness(AgentHarness):
                 if fold.final or not fold.started:
                     how = f"ended {fold.terminal}" if fold.final else "was not working"
                     return _infra_failure(
-                        f"{session_cap.DIRECTIVE}: filler {i}'s task {filler.task_id} on {filler.conversation} "
-                        f"{how} within {_SESSION_CAP_FILLER_WAIT:.0f}s, so the cap was not held by busy workers"
+                        f"{directive}: filler {i}'s task {filler.task_id} on {filler.conversation} "
+                        f"{how} within {session_cap.filler_wait(ask.hold_seconds):.0f}s, so the cap was not held "
+                        "by busy workers"
                     )
                 for event in fold.trajectory:
                     filler_events.append({**event, "args": {**event["args"], "conversation": filler.conversation}})
+            # Read again right before the ask: the first filler has been
+            # running longest, and one that ended has freed its slot.
+            for filler in fillers:
+                if not filler.still_running(filler.task_id):
+                    return _infra_failure(
+                        f"{directive}: filler task {filler.task_id} on {filler.conversation} was no longer running "
+                        "when the ask was to be sent, so the cap was no longer full; the ask was not sent"
+                    )
 
-            task = inject.InjectTask(
-                base_url=base_url, conversation=conversation, prompt=ask.prompt, token=token,
-                author=author, message_id=message_id,
-            )
-            task.preflight()
             task_id = task.submit()
             if task_id:
                 task.cancel(task_id, settle=0)
                 return _infra_failure(
-                    f"{session_cap.DIRECTIVE}: the cap of {cap} never filled, so the ask started at once "
+                    f"{directive}: the cap of {cap} never filled, so the ask started at once "
                     f"(task {task_id}); a filler's task ended before it was sent"
                 )
             if task.refusal != inject.REFUSAL_QUEUED:
-                answered = _gateway_answer(task)
-                if not answered.output:
+                # The one graded red: the POST answered with the cap's own
+                # refusal and no task. Any other answer is not the queue's.
+                fold = inject.Fold("")
+                for e in task._poll("", 0, 0, probe=False).get("entries") or []:
+                    fold.apply(e)
+                refusal = session_cap.refused_at_cap(fold.entries)
+                if task.refusal != inject.REFUSAL_NO_TASK or not refusal:
                     return _infra_failure(
-                        f"{session_cap.DIRECTIVE}: {task.refusal_text}, on {task.conversation}: {task.note}"
+                        f"{directive}: {task.refusal_text}, on {task.conversation}, and not with the cap's "
+                        f"refusal: {task.note}"
                     )
-                return answered
+                return _recorded(
+                    AgentResult(
+                        output=refusal,
+                        trajectory=[session_cap.assess(fold.entries, ""), *fold.trajectory],
+                        errors=[],
+                        metadata={"transport": TRANSPORT_INJECT, "conversation": task.conversation, **identity},
+                    )
+                )
 
             # Queued, as it should be. Free the workers, then follow the turn.
             _release_fillers()
-            task_id = task.await_queued_start(time.monotonic() + inject.QUEUED_START_WAIT_SECONDS)
+            task_id = _transport_retrying(
+                lambda: task.await_queued_start(time.monotonic() + inject.QUEUED_START_WAIT_SECONDS),
+                what=f"queued turn on {task.conversation}",
+                respawn=_tunnel,
+            )
             if not task_id:
-                if task.line_refusal:
-                    return _gateway_answer(task, f"the gateway posted {task.line_refusal!r} instead")
+                task.leave_line()
                 return _infra_failure(
-                    f"{session_cap.DIRECTIVE}: {task.refusal_text}: no task within "
-                    f"{inject.QUEUED_START_WAIT_SECONDS:.0f}s of the fillers' cancel, on {task.conversation}"
+                    f"{directive}: {task.refusal_text}, on "
+                    f"{task.conversation}; the queue posted its notice, and whether a freed worker went to "
+                    f"another conversation can't be told{_unreleased_note()}"
                 )
-            exchange = task.await_terminal(task_id, deadline=time.monotonic() + timeout)
+            budget_end = time.monotonic() + timeout
+            exchange = _transport_retrying(
+                lambda: task.await_terminal(task_id, deadline=budget_end),
+                what=f"exchange on {task.conversation}",
+                respawn=_tunnel,
+            )
             identity["inject_only"] = task.inject_only
             identity["backend"] = task.backend
             timed_out, stop_pending = _bound_stray(task, exchange)
         except inject.InjectUnavailable as exc:
-            return _infra_failure(f"{session_cap.DIRECTIVE}: the inject door could not be reached: {exc}")
+            # A queued turn this side can no longer follow is taken out of
+            # the line, or the gateway starts it later with nobody watching.
+            left = ""
+            if not task_id and task.refusal == inject.REFUSAL_QUEUED:
+                left = "; the queued turn was taken out of the line" if task.leave_line() else (
+                    "; the cancel that would take the queued turn out of the line could not be sent"
+                )
+            elif task_id and not task.cancel_sent:
+                task.cancel(task_id, settle=0)
+            return _infra_failure(f"{directive}: the inject door could not be reached: {exc}{left}")
         finally:
             _release_fillers()
         infrastructure = _inject_infrastructure(task, exchange, timeout, timed_out, stop_pending)
@@ -3836,6 +3953,8 @@ class KubeAgentsHarness(AgentHarness):
             return infrastructure
         result = _graded_inject_result(task, exchange, identity, timeout, timed_out, stop_pending)
         result.trajectory.insert(0, session_cap.assess(exchange.fold.entries, task_id))
+        if unreleased:
+            result.errors.append(_unreleased_note().lstrip("; "))
         return _recorded(result)
 
     def _execute_card_wait(self, prompt: str) -> AgentResult:
@@ -4521,7 +4640,11 @@ class KubeAgentsHarness(AgentHarness):
         a task it could not put on the bus, or, on the read's fold, the
         supervisor's word about an executor that died or never ran; a
         submission the door refused, because the principal map does not carry
-        the author or because the gateway could not publish it; a failed
+        the author or because the gateway could not publish it; a turn the
+        gateway queued at the session cap that started no task inside the
+        line's backstop or that the gateway refused (it is taken out of the
+        line, InjectTask.leave_line; one that starts is followed to its task
+        and classified as any other); a failed
         terminal carrying one of the executors' own reasons (bridge-shutdown,
         spawn-failed and the rest of :data:`inject.INFRASTRUCTURE_REASONS`),
         a rejected one, or a canceled-before-start; and a deadline the read
@@ -4677,86 +4800,78 @@ class KubeAgentsHarness(AgentHarness):
             is already running and the floor is not the operator's to set
             there.
             """
-            failures = 0
             # Set once the POST is first accepted and kept across transport
             # retries: a retry that respawned the tunnel rejoins the same
             # wait, so two dropped polls late in a task cannot triple its
             # budget.
             deadline: float | None = None
-            while True:
-                try:
-                    if not task.task_id:
-                        task.preflight()
-                        floor = inject.budget_floor(task.first_event_grace)
-                        if opening:
-                            inject.check_budget(budget, task.first_event_grace)
-                        elif budget < floor:
-                            budget = floor
-                    posted = time.monotonic()
-                    task_id = task.submit()
-                    if not task_id and task.refusal == inject.REFUSAL_QUEUED:
-                        # Every session worker was busy and the gateway
-                        # queued the turn, as it queues a chat user's: the
-                        # task it starts when one frees is on the same
-                        # conversation. The budget is the task's, so its
-                        # clock starts at the start, not in the line.
-                        task_id = task.await_queued_start(time.monotonic() + inject.QUEUED_START_WAIT_SECONDS)
-                        posted = time.monotonic()
-                    if deadline is None:
-                        deadline = time.monotonic() + budget
-                        if opening and task_id and not opening_post_lost:
-                            opening_accepted.append(posted)
+
+            def attempt() -> inject.Exchange:
+                nonlocal budget, deadline
+                if not task.task_id:
+                    task.preflight()
+                    floor = inject.budget_floor(task.first_event_grace)
+                    if opening:
+                        inject.check_budget(budget, task.first_event_grace)
+                    elif budget < floor:
+                        budget = floor
+                posted = time.monotonic()
+                task_id = task.submit()
+                if not task_id and task.refusal == inject.REFUSAL_QUEUED:
+                    # Every session worker was busy and the gateway
+                    # queued the turn, as it queues a chat user's: the
+                    # task it starts when one frees is on the same
+                    # conversation. The opening's budget is the task's, so
+                    # its clock starts at the start, not in the line; a
+                    # status turn's wait in line is bounded by its own
+                    # turn budget. A turn given up on is taken out of the
+                    # line, or it would start a task nobody waits for.
+                    task_id = task.await_queued_start(time.monotonic() + _queued_wait(opening, budget))
                     if not task_id:
-                        # The door started nothing and said why. No agent saw
-                        # the prompt, so this is the run class rather than an
-                        # answer: an author the principal map does not carry
-                        # or a submission the gateway could not publish, both
-                        # of them a broken install.
-                        if not opening:
-                            # A status turn hands the refusal back as an
-                            # outcome rather than raising, because the
-                            # delegation wait's own retry is what has to see
-                            # it: each of its turns carries a fresh message
-                            # id, so the door's dedupe is not answering, and
-                            # an exhausted wait must end as infrastructure
-                            # rather than as an appended error the judge
-                            # grades (_DelegationTransportExhausted).
-                            return inject.Exchange(
-                                inject.Fold(""),
-                                inject.OUTCOME_NOT_ACCEPTED,
-                                task.conversation,
-                                "",
-                            )
-                        # The opening turn is not retried at all: the door
-                        # answers a repeat of the same message id with the
-                        # same refusal, so a retry cannot change it.
-                        raise _TransportError(
-                            f"{task.refusal_text}, on "
-                            f"{task.conversation}: {task.note}",
-                            retryable=False,
+                        task.leave_line()
+                    posted = time.monotonic()
+                if deadline is None:
+                    deadline = time.monotonic() + budget
+                    if opening and task_id and not opening_post_lost:
+                        opening_accepted.append(posted)
+                if not task_id:
+                    # The door started nothing and said why. No agent saw
+                    # the prompt, so this is the run class rather than an
+                    # answer: an author the principal map does not carry
+                    # or a submission the gateway could not publish, both
+                    # of them a broken install.
+                    if not opening:
+                        # A status turn hands the refusal back as an
+                        # outcome rather than raising, because the
+                        # delegation wait's own retry is what has to see
+                        # it: each of its turns carries a fresh message
+                        # id, so the door's dedupe is not answering, and
+                        # an exhausted wait must end as infrastructure
+                        # rather than as an appended error the judge
+                        # grades (_DelegationTransportExhausted).
+                        return inject.Exchange(
+                            inject.Fold(""),
+                            inject.OUTCOME_NOT_ACCEPTED,
+                            task.conversation,
+                            "",
                         )
-                    return task.await_terminal(task_id, deadline=deadline, on_poll=on_poll)
-                except inject.InjectUnavailable as exc:
-                    if opening and deadline is None and task.unanswered_post:
-                        opening_post_lost.append(True)
-                    failures += 1
-                    _log.warning(
-                        "inject: exchange on %s failed in transport (%d/%d): %s",
-                        task.conversation,
-                        failures,
-                        _MAX_TRANSPORT_FAILURES,
-                        exc,
+                    # The opening turn is not retried at all: the door
+                    # answers a repeat of the same message id with the
+                    # same refusal, so a retry cannot change it.
+                    raise _TransportError(
+                        f"{task.refusal_text}, on "
+                        f"{task.conversation}: {task.note}",
+                        retryable=False,
                     )
-                    if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
-                        raise
-                    _wait_retry_after(exc)
-                    try:
-                        _tunnel(reset=True, after_standby=exc.retry_after is not None)
-                    except RuntimeError as pf_exc:
-                        # Counted, not raised: the ceiling above ends it.
-                        _log.warning(
-                            "inject: port-forward respawn failed before retry: %s", pf_exc
-                        )
+                return task.await_terminal(task_id, deadline=deadline, on_poll=on_poll)
+
+            def note_failure(exc: inject.InjectUnavailable) -> None:
+                if opening and deadline is None and task.unanswered_post:
+                    opening_post_lost.append(True)
+
+            return _transport_retrying(
+                attempt, what=f"exchange on {task.conversation}", respawn=_tunnel, on_failure=note_failure
+            )
 
         def _abandon(task: inject.InjectTask) -> str:
             """Cancel a task the transport gave up on, and say what happened.
@@ -4778,6 +4893,16 @@ class KubeAgentsHarness(AgentHarness):
             the conversation recovers it when the transport allows.
             """
             task_id = task.task_id or task.recover_task_id()
+            if not task_id and task.refusal == inject.REFUSAL_QUEUED:
+                # Queued at the session cap and given up on: the gateway
+                # keeps the turn and would start it later with nobody
+                # watching, so it is taken out of the line.
+                if task.leave_line():
+                    return "; the turn the gateway queued started no task, and a cancel took it out of the line"
+                return (
+                    "; the turn the gateway queued started no task, and the cancel that would take it out "
+                    "of the line could not be sent (see the log), so it may still start one"
+                )
             if not task_id:
                 if not task.unanswered_post:
                     # Refused, or never sent: every POST was answered without

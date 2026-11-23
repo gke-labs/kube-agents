@@ -32,12 +32,21 @@ def test_an_ordinary_ask_is_not_a_session_cap_ask():
 
 def test_the_directive_strips_off_and_defaults():
     got = session_cap.parse(f"{DIRECTIVE}\n{ASK}")
-    assert got == session_cap.CapAsk(prompt=ASK, max_cap=2, hold_seconds=240)
+    assert got == session_cap.CapAsk(prompt=ASK, max_cap=2, hold_seconds=session_cap.DEFAULT_HOLD_SECONDS)
+
+
+def test_the_hold_outlasts_the_fillers_wait():
+    """Filler 0 must still be busy when the last filler starts: the default
+    hold is the shared filler wait plus a margin, and any hold's wait is the
+    hold less that margin."""
+    assert session_cap.DEFAULT_HOLD_SECONDS == session_cap.FILLER_WAIT_SECONDS + session_cap.HOLD_MARGIN_SECONDS
+    assert session_cap.filler_wait(session_cap.DEFAULT_HOLD_SECONDS) == session_cap.FILLER_WAIT_SECONDS
+    assert session_cap.filler_wait(session_cap.MIN_HOLD_SECONDS) > 0
 
 
 def test_the_fields_can_be_named():
-    got = session_cap.parse(f"{DIRECTIVE} max-cap=3 hold=60\n{ASK}")
-    assert (got.max_cap, got.hold_seconds) == (3, 60)
+    got = session_cap.parse(f"{DIRECTIVE} max-cap=3 hold=300\n{ASK}")
+    assert (got.max_cap, got.hold_seconds) == (3, 300)
 
 
 @pytest.mark.parametrize(
@@ -47,6 +56,7 @@ def test_the_fields_can_be_named():
         f"{DIRECTIVE} max-cap=0",
         f"{DIRECTIVE} max-cap=9",
         f"{DIRECTIVE} hold=5",
+        f"{DIRECTIVE} hold=60",
         f"{DIRECTIVE} hold=soon",
         f"{DIRECTIVE} max-cap=1 max-cap=2",
         f"{DIRECTIVE} later",
@@ -225,36 +235,51 @@ def test_an_install_above_the_cap_is_infrastructure_before_anything_is_sent(monk
 
 
 _RealInjectTask = inject.InjectTask
-
-
-def _status(state: str, final: bool) -> dict[str, Any]:
-    return {"name": inject.EVENT_ENTRY_STATUS, "args": {"state": state, "final": final}, "result": None, "status": "completed"}
+RESTART = "🚦 not started: the gateway restarted while this conversation waited for a session worker — send it again"
+COUNT_FAILED = "⚠️ not started: can't count the running session workers right now — try again in a moment"
 
 
 class _FakeTask(_RealInjectTask):
     """InjectTask with its network scripted: fillers start and work at once;
     the ask does what the scenario says. Every instance is kept, for the
-    assertions. The rest (refusal_text, cancel_sent, ...) is the real one's."""
+    assertions. The rest (refusal_text, ...) is the real one's.
+
+    Scenarios: ``queued`` (the ask is queued, then started and answered),
+    ``refused`` (the POST answered with the cap's refusal), ``other-refusal``
+    (the POST answered with another "not started"), ``line-refused`` and
+    ``restart`` (queued, then the gateway's refusal or restart post),
+    ``line-timeout`` (queued, never started), ``line-drop`` (the door goes
+    away while the queued turn is followed), ``started`` (the ask started at
+    once), ``never-started`` and ``deadline`` (the queued turn's task ends so).
+    Knobs: ``filler_works``, ``filler_queued``, ``filler_running`` (the read
+    right before the ask), ``cancel_publishes``."""
 
     made: ClassVar[list[_FakeTask]] = []
     scenario: ClassVar[str] = "queued"
     filler_works: ClassVar[bool] = True
+    filler_queued: ClassVar[bool] = False
+    filler_running: ClassVar[bool] = True
+    cancel_publishes: ClassVar[bool] = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cancels: list[str] = []
+        self.left: int = 0
         self.filler = "-fill-" in self.conversation
         _FakeTask.made.append(self)
 
     def preflight(self):
-        return None
+        self.first_event_grace = 60.0
 
     def submit(self):
         if self.filler:
+            if _FakeTask.filler_queued:
+                self.refusal = inject.REFUSAL_QUEUED
+                return ""
             self.task_id = f"fill-task-{len(_FakeTask.made)}"
         elif _FakeTask.scenario == "started":
             self.task_id = "ask-task"
-        elif _FakeTask.scenario == "refused":
+        elif _FakeTask.scenario in ("refused", "other-refusal"):
             self.refusal = inject.REFUSAL_NO_TASK
         else:
             self.refusal = inject.REFUSAL_QUEUED
@@ -262,11 +287,19 @@ class _FakeTask(_RealInjectTask):
 
     def cancel(self, task_id="", *, settle=None):
         self.cancels.append(task_id)
-        self.cancel_sent = bool(task_id)
+        self.cancel_sent = bool(task_id) and (_FakeTask.cancel_publishes or not self.filler)
+
+    def leave_line(self):
+        self.left += 1
+        self.left_line = True
+        return True
+
+    def still_running(self, task_id):
+        return _FakeTask.filler_running
 
     def _poll(self, task_id, after, budget, *, probe=True):
-        if _FakeTask.scenario == "line-refused":
-            return {"entries": [entry(1, "post", text=NOTICE), entry(2, "post", text=REFUSAL)]}
+        if _FakeTask.scenario == "other-refusal":
+            return {"entries": [entry(1, "post", text=COUNT_FAILED)]}
         return {"entries": [entry(1, "post", text=REFUSAL)]}
 
     def await_working(self, task_id, deadline):
@@ -281,8 +314,13 @@ class _FakeTask(_RealInjectTask):
         if _FakeTask.scenario == "line-refused":
             self.line_refusal = REFUSAL
             return ""
+        if _FakeTask.scenario == "restart":
+            self.line_refusal = RESTART
+            return ""
         if _FakeTask.scenario == "line-timeout":
             return ""
+        if _FakeTask.scenario == "line-drop":
+            raise inject.InjectUnavailable("connection refused", retryable=False)
         self.task_id = "ask-task"
         return self.task_id
 
@@ -301,13 +339,30 @@ class _FakeTask(_RealInjectTask):
         return inject.Exchange(fold, inject.OUTCOME_TERMINAL, self.conversation, task_id)
 
 
+def _reset_fake():
+    _FakeTask.made = []
+    _FakeTask.scenario = "queued"
+    _FakeTask.filler_works = True
+    _FakeTask.filler_queued = False
+    _FakeTask.filler_running = True
+    _FakeTask.cancel_publishes = True
+
+
 @pytest.fixture
 def fake_tasks(monkeypatch):
-    _FakeTask.made = []
-    _FakeTask.filler_works = True
+    _reset_fake()
     _inject_env(monkeypatch, "2")
     monkeypatch.setattr(inject, "InjectTask", _FakeTask)
     return _FakeTask
+
+
+def _run():
+    return harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
+
+
+def _infra(result) -> str:
+    assert result.errors and result.errors[0].startswith(harness.INFRA_FAILURE_MARKER), result.errors
+    return result.errors[0]
 
 
 def _queued_entry(result):
@@ -318,46 +373,64 @@ def _ask(fake_tasks):
     return next(t for t in fake_tasks.made if not t.filler)
 
 
+def _fillers(fake_tasks):
+    return [t for t in fake_tasks.made if t.filler]
+
+
 def test_a_queued_ask_is_answered_and_the_fillers_released(fake_tasks):
-    fake_tasks.scenario = "queued"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
+    got = _run()
     assert not got.errors, got.errors
     assert _queued_entry(got)["status"] == "completed", _queued_entry(got)
     assert "PINEAPPLE" in got.output
-    fillers = [t for t in fake_tasks.made if t.filler]
-    assert len(fillers) == 2 and all(len(t.cancels) == 1 for t in fillers)
+    assert len(_fillers(fake_tasks)) == 2 and all(len(t.cancels) == 1 for t in _fillers(fake_tasks))
     assert _ask(fake_tasks).cancels == [], "a task that ended is not cancelled"
 
 
-def test_every_record_opens_with_the_fillers_lifecycle(fake_tasks):
-    fake_tasks.scenario = "queued"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
+def test_every_graded_record_opens_with_the_fillers_lifecycle(fake_tasks):
+    got = _run()
     working = [e for e in got.trajectory if e["name"] == inject.EVENT_ENTRY_STATUS and e["args"].get("conversation")]
-    assert {e["args"]["conversation"] for e in working} == {t.conversation for t in fake_tasks.made if t.filler}
+    assert {e["args"]["conversation"] for e in working} == {t.conversation for t in _fillers(fake_tasks)}
     assert any(e["args"]["state"] == inject.STATE_WORKING for e in working)
 
 
+def test_a_sub_floor_budget_is_refused_before_anything_is_sent(fake_tasks, monkeypatch):
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "5")
+    got = _run()
+    assert "AGENT_INJECT_TIMEOUT" in " ".join(got.errors)
+    assert _fillers(fake_tasks) == []
+
+
+def test_a_queued_filler_is_infrastructure_before_the_ask_and_leaves_the_line(fake_tasks):
+    fake_tasks.filler_queued = True
+    reason = _infra(_run())
+    assert "was queued" in reason and "the ask was not sent" in reason
+    assert _ask(fake_tasks).refusal == ""  # built, never submitted
+    assert _fillers(fake_tasks)[0].left == 1
+
+
 def test_a_filler_that_never_works_is_infrastructure_before_the_ask(fake_tasks):
-    fake_tasks.scenario = "queued"
     fake_tasks.filler_works = False
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
-    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "was not working" in got.errors[0]
-    assert not [t for t in fake_tasks.made if not t.filler], "the ask was sent"
-    assert all(t.cancels for t in fake_tasks.made if t.filler)
+    assert "was not working" in _infra(_run())
+    assert _ask(fake_tasks).refusal == ""
+    assert all(t.cancels for t in _fillers(fake_tasks))
+
+
+def test_a_filler_no_longer_running_before_the_ask_is_infrastructure(fake_tasks):
+    fake_tasks.filler_running = False
+    reason = _infra(_run())
+    assert "no longer full" in reason
+    assert _ask(fake_tasks).refusal == ""
 
 
 def test_an_ask_task_no_executor_took_is_cancelled_and_infrastructure(fake_tasks):
     fake_tasks.scenario = "never-started"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
-    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "no executor took task ask-task" in got.errors[0]
+    assert "no executor took task ask-task" in _infra(_run())
     assert _ask(fake_tasks).cancels == ["ask-task"]
 
 
 def test_an_ask_task_at_its_budget_is_cancelled_and_graded_as_the_timeout(fake_tasks):
     fake_tasks.scenario = "deadline"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
+    got = _run()
     assert not (got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)), got.errors
     assert any("did not reach a terminal state" in e for e in got.errors)
     assert _ask(fake_tasks).cancels == ["ask-task"]
@@ -365,35 +438,84 @@ def test_an_ask_task_at_its_budget_is_cancelled_and_graded_as_the_timeout(fake_t
 
 def test_an_ask_refused_at_the_cap_is_graded_red(fake_tasks):
     fake_tasks.scenario = "refused"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
+    got = _run()
     assert not got.errors
     assert got.output == REFUSAL
     assert _queued_entry(got)["status"] == "error"
     assert any(e["name"] == inject.EVENT_ENTRY_POST and e["result"] == REFUSAL for e in got.trajectory)
-    assert all(t.cancels for t in fake_tasks.made if t.filler)
+    assert all(t.cancels for t in _fillers(fake_tasks))
 
 
-def test_a_queued_turn_the_gateway_refused_is_graded_red_with_its_words(fake_tasks):
-    fake_tasks.scenario = "line-refused"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
-    assert not got.errors
-    assert got.output == REFUSAL
-    assert REFUSAL in _queued_entry(got)["result"]
+def test_another_not_started_at_the_post_is_infrastructure(fake_tasks):
+    fake_tasks.scenario = "other-refusal"
+    assert "not with the cap's refusal" in _infra(_run())
 
 
-def test_a_queued_turn_that_never_started_is_infrastructure_naming_the_bound(fake_tasks):
+@pytest.mark.parametrize(("scenario", "words"), [("line-refused", REFUSAL), ("restart", RESTART)])
+def test_a_refusal_after_the_queue_is_infrastructure_in_the_gateways_words(fake_tasks, scenario, words):
+    fake_tasks.scenario = scenario
+    reason = _infra(_run())
+    assert words in reason and "line's bound" not in reason
+    assert _ask(fake_tasks).left == 1
+
+
+def test_a_queued_turn_that_never_started_is_infrastructure_naming_the_bound_and_leaves_the_line(fake_tasks):
     fake_tasks.scenario = "line-timeout"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
-    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "did not start inside the line's bound" in got.errors[0]
+    assert "did not start inside the line's bound" in _infra(_run())
+    assert _ask(fake_tasks).left == 1
+
+
+def test_a_door_lost_while_following_the_queued_turn_takes_it_out_of_the_line(fake_tasks):
+    fake_tasks.scenario = "line-drop"
+    reason = _infra(_run())
+    assert "could not be reached" in reason and "taken out of the line" in reason
+    assert _ask(fake_tasks).left == 1
+
+
+def test_a_filler_cancel_not_published_is_retried_and_recorded(fake_tasks):
+    fake_tasks.cancel_publishes = False
+    got = _run()
+    assert all(len(t.cancels) == 2 for t in _fillers(fake_tasks))
+    assert got.metadata["fillers_unreleased"] == [t.task_id for t in _fillers(fake_tasks)]
+    assert any("may still hold the cap" in e for e in got.errors)
+
+
+def test_a_filler_cancel_not_published_rides_on_a_later_infrastructure(fake_tasks):
+    fake_tasks.cancel_publishes = False
+    fake_tasks.scenario = "line-timeout"
+    assert "may still hold the cap" in _infra(_run())
 
 
 def test_an_ask_that_started_at_once_is_infrastructure(fake_tasks):
     fake_tasks.scenario = "started"
-    got = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE}\n{ASK}")
-    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "never filled" in got.errors[0]
-    assert all(t.cancels for t in fake_tasks.made if t.filler)
+    assert "never filled" in _infra(_run())
+    assert all(t.cancels for t in _fillers(fake_tasks))
+
+
+def test_the_waits_retry_through_a_respawned_tunnel(fake_tasks, monkeypatch):
+    """The queued wait and the terminal wait go through the inject
+    transport's retry: a dropped read is retried, not the end of the run."""
+    calls = {"n": 0}
+    real = _FakeTask.await_terminal
+
+    def flaky(self, task_id, *, deadline, on_poll=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise inject.InjectUnavailable("dropped")
+        return real(self, task_id, deadline=deadline, on_poll=on_poll)
+
+    monkeypatch.setattr(_FakeTask, "await_terminal", flaky)
+    monkeypatch.setattr(harness, "_wait_retry_after", lambda exc: None)
+    got = _run()
+    assert not got.errors, got.errors
+    assert calls["n"] == 2
+
+
+def test_the_session_cap_result_folds_the_worker_total(fake_tasks, monkeypatch):
+    folded: list[Any] = []
+    monkeypatch.setattr(harness, "_fold_worker_total", lambda tokens: folded.append(tokens))
+    _run()
+    assert len(folded) == 1
 
 
 # --- the refusal's wording (InjectTask.refusal_text) -------------------------
@@ -492,8 +614,7 @@ def test_an_ordinary_prompt_is_not_an_unknown_directive():
 
 def _refusal_trajectory(monkeypatch) -> list[dict[str, Any]]:
     """The trajectory the harness records for an ask refused at the cap."""
-    _FakeTask.made = []
-    _FakeTask.filler_works = True
+    _reset_fake()
     _FakeTask.scenario = "refused"
     _inject_env(monkeypatch, "2")
     monkeypatch.setattr(inject, "InjectTask", _FakeTask)
@@ -549,3 +670,41 @@ def test_await_working_reads_until_the_task_works(monkeypatch):
     fold = _task().await_working("t-1", time.monotonic() + 60)
     assert fold.started and not fold.final
     assert [e["args"]["state"] for e in fold.trajectory] == ["submitted", "working"]
+
+
+# --- the ordinary inject path's queued turn --------------------------------
+
+
+def test_a_status_turns_wait_in_line_is_bounded_by_its_budget():
+    assert harness._queued_wait(False, 90.0) == 90.0
+    assert harness._queued_wait(False, 10_000.0) == inject.QUEUED_START_WAIT_SECONDS
+    assert harness._queued_wait(True, 90.0) == inject.QUEUED_START_WAIT_SECONDS
+
+
+def test_leave_line_cancels_naming_no_task_once(monkeypatch):
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr(inject, "_request", lambda url, timeout, token, payload=None: sent.append((url, payload)) or {})
+    task = _task()
+    assert task.leave_line() and task.leave_line()
+    assert len(sent) == 1
+    url, payload = sent[0]
+    assert url.endswith(inject.CANCEL_SUFFIX) and "taskId" not in payload
+    assert payload["messageId"].endswith(inject.LEAVE_LINE_MESSAGE_ID_SUFFIX)
+
+
+def test_leave_line_says_when_the_door_did_not_answer(monkeypatch):
+    def down(*a, **k):
+        raise inject.InjectUnavailable("refused")
+
+    monkeypatch.setattr(inject, "_request", down)
+    task = _task()
+    assert task.leave_line() is False and task.left_line is False
+
+
+def test_still_running_reads_the_record(monkeypatch):
+    def probe(**fields):
+        return {"entries": [], "probe": {"active": True, "taskId": "t-1", "executorState": "working", **fields}}
+
+    for body, want in [(probe(), True), (probe(final=True, executorState="completed"), False), (probe(active=False), False)]:
+        monkeypatch.setattr(inject, "_request", lambda *a, _b=body, **k: _b)
+        assert _task().still_running("t-1") is want

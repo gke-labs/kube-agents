@@ -163,6 +163,10 @@ KEY_SEPARATOR = "/"
 # Appended to the backend message id of a cancel, so the ingress log shows
 # which submission the cancel belongs to and still tells the two apart.
 CANCEL_MESSAGE_ID_SUFFIX = "-cancel"
+# The same for the cancel that takes a queued turn out of the session-cap
+# line (InjectTask.leave_line), so the door's dedupe never answers a later
+# cancel naming a task with it.
+LEAVE_LINE_MESSAGE_ID_SUFFIX = "-leave-line"
 
 # The submit body's ``intent`` (``injectRequest.Intent``): absent for a typed
 # message, or ``confirm``, which submits the turn as a confirmed change (the
@@ -607,10 +611,13 @@ PROBE_BOUND_SECONDS = 60.0
 PROBES_PER_POLL = 2
 
 # How long a turn the gateway queued at the session cap is waited on for its
-# task to start: the gateway's own bound on a wait in line
-# (sessionCapWaitMax in a2a/gateway/session_cap_queue.go, five minutes), past
-# which it posts the cap's refusal instead, plus a margin for the retry that
-# follows a freed slot.
+# task to start: the gateway's bound on a wait in line (sessionCapWaitMax in
+# a2a/gateway/session_cap_queue.go, five minutes) plus a margin for the retry
+# that follows a freed slot. The gateway enforces its bound only when a
+# waiter reaches the head of the line and tries for a slot (capKeepOrGiveUp,
+# on retryCapHead's retry), so a waiter further back can wait longer than
+# five minutes; this bound is the harness's backstop, after which it takes
+# the turn out of the line itself (InjectTask.leave_line).
 QUEUED_START_WAIT_SECONDS = 5 * 60 + 60.0
 # What the gateway's queued notice carries, whatever its place in line
 # (sessionQueuedNotice in a2a/gateway/session_cap_queue.go). Read only to keep
@@ -1553,6 +1560,9 @@ class InjectTask:
         self.queued_after = 0
         self.queued_notice = ""
         self.line_refusal = ""
+        # Whether the door answered the cancel that takes this turn out of
+        # the session-cap line (leave_line).
+        self.left_line = False
 
     def preflight(self) -> Probe:
         """Read the conversation before anything is started.
@@ -1668,6 +1678,42 @@ class InjectTask:
                 self.note,
             )
         return self.task_id
+
+    def leave_line(self) -> bool:
+        """Take a turn the gateway queued at the session cap out of its line.
+
+        The cancel route naming no task, which on a conversation with a
+        parked turn is the stop that removes it (routeParked in
+        a2a/gateway/session_cap_queue.go). Sent for a queued turn this side
+        gave up on, which the gateway would otherwise start later with
+        nobody watching. Once: returns whether the door answered, and a
+        later call returns the same without sending again. Best effort; a
+        failure is logged.
+        """
+        if self.left_line:
+            return True
+        url = self.base_url + CONVERSATIONS_PATH + urllib.parse.quote(self.conversation, safe="") + CANCEL_SUFFIX
+        payload: dict[str, Any] = {"author": self.author}
+        if self.message_id:
+            payload["messageId"] = self.message_id + LEAVE_LINE_MESSAGE_ID_SUFFIX
+        try:
+            _request(url, SUBMIT_TIMEOUT_SECONDS, self.token, payload)
+        except InjectUnavailable as exc:
+            _log.warning("inject: could not take the queued turn on %s out of the line: %s", self.conversation, exc)
+            return False
+        self.left_line = True
+        _log.info("inject: took the queued turn on %s out of the line", self.conversation)
+        return True
+
+    def still_running(self, task_id: str) -> bool:
+        """One read: whether the record still holds ``task_id`` as its
+        active task and the stream shows it not ended.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        probe = Probe.from_body(self._poll(task_id, 0, 0))
+        return probe is not None and probe.could_look and probe.concerns(task_id) and not probe.final
 
     def await_working(self, task_id: str, deadline: float) -> Fold:
         """Read ``task_id``'s lifecycle until an executor has it working,

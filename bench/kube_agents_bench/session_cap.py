@@ -30,9 +30,14 @@ are cancelled before the run ends.
 The harness records :data:`QUEUED_ENTRY` (:func:`assess`): ``completed`` when
 the conversation shows the queued notice, then the task the queued turn
 started, then a post of that task's; ``error`` otherwise. A gateway that
-refuses the turn at the cap instead (``🚦 not started``, no task, no answer)
-is the red this case exists for: the entry is ``error`` with the refusal,
-graded rather than set aside. The answer itself is graded by the case.
+refuses the ask's POST at the cap instead (the cap's own ``🚦 not started:
+N session workers are already running (cap N)``, no task, no answer) is the
+red this case exists for: the entry is ``error`` with the refusal, graded
+rather than set aside. Nothing else is graded red: any other refusal, and
+anything the gateway says after it has queued the turn (it gave up on the
+wait, it restarted), is infrastructure, because by then the queue did its
+part and whether a freed worker went to another conversation can't be told.
+The answer itself is graded by the case.
 
 WHAT IT NEEDS. A session cap of at most ``max-cap`` (default
 :data:`DEFAULT_MAX_CAP`), so filling it costs a few session pods rather than
@@ -40,9 +45,10 @@ the shipped ten, and the session route, which the ``/session`` asks reach on
 either front door. The case cannot set the cap itself: an install whose cap
 is above ``max-cap`` (or whose cap cannot be read) is reported as
 infrastructure, naming the cap it found, before anything is sent. So is a run
-where the cap never filled (a filler's task ended before the ask was sent, so
-the ask started at once, with no notice): that is the fillers' failure to
-hold the cap, not the queue's. The bench has no "not applicable" class for a
+where the cap was not held by working fillers: a filler queued (something
+else holds the cap), one not working inside the fillers' wait, one no longer
+running when the ask goes, or an ask that started at once. That is the
+fillers' failure to hold the cap, not the queue's. The bench has no "not applicable" class for a
 case-level precondition, which is why infrastructure is the honest answer.
 
 It runs on the inject transport only.
@@ -60,11 +66,14 @@ __all__ = [
     "DEFAULT_MAX_CAP",
     "DIRECTIVE",
     "FILLER_PROMPT",
+    "FILLER_WAIT_SECONDS",
     "GATEWAY_DEFAULT_MAX_SESSIONS",
+    "HOLD_MARGIN_SECONDS",
     "QUEUED_ENTRY",
     "CapAsk",
     "assess",
     "filler_prompt",
+    "filler_wait",
     "is_session_cap_ask",
     "parse",
     "parse_cap",
@@ -82,12 +91,16 @@ HOLD_FIELD = "hold="
 DEFAULT_MAX_CAP = 2
 MAX_MAX_CAP = 4
 #: How long each filler keeps its worker busy, in seconds, and the bounds a
-#: directive may set. Long enough to outlast a cold session pod's start and
-#: the ask's POST; the harness cancels the fillers once the ask is queued, so
-#: a run does not wait it out.
-DEFAULT_HOLD_SECONDS = 240
-MIN_HOLD_SECONDS = 30
-MAX_HOLD_SECONDS = 600
+#: directive may set. The fillers start one after another, each waited on
+#: until it is working, inside one shared wait (:func:`filler_wait`): the hold
+#: is that wait plus :data:`HOLD_MARGIN_SECONDS`, so the first filler is still
+#: busy when the last one starts and the ask goes. The harness cancels the
+#: fillers once the ask is queued, so a run does not wait the hold out.
+HOLD_MARGIN_SECONDS = 120
+FILLER_WAIT_SECONDS = 600
+DEFAULT_HOLD_SECONDS = FILLER_WAIT_SECONDS + HOLD_MARGIN_SECONDS
+MIN_HOLD_SECONDS = HOLD_MARGIN_SECONDS + 60
+MAX_HOLD_SECONDS = 1800
 #: What each filler conversation asks. ``/session`` opens a session pod on
 #: either front door; the ``sleep`` keeps its task, and so the pod, busy, so
 #: the cap cannot evict it to make room.
@@ -105,7 +118,11 @@ QUEUED_ENTRY = "harness_session_cap_queued"
 # conversation tells them apart (a2a/gateway/session_cap_queue.go, spawn.go).
 # Matched loosely, emphasis aside: the wording is the gateway's to change.
 _QUEUED = re.compile(r"\bqueued\b", re.IGNORECASE)
-_NOT_STARTED = re.compile(r"\bnot started\b", re.IGNORECASE)
+# The cap's refusal alone (refuseAtSessionCap in a2a/gateway/spawn.go:
+# "🚦 not started: N session workers are already running (cap N). ..."), not
+# the gateway's other "not started" lines (a count that failed, a wait for the
+# cap check, a capability or a previous task it could not handle, a restart).
+_CAP_REFUSAL = re.compile(r"not started: \d+ session workers? (?:is|are) already running \(cap \d+\)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -161,6 +178,13 @@ def _whole(field: str, value: str | None, default: int, floor: int, ceiling: int
     return int(value)
 
 
+def filler_wait(hold_seconds: int) -> float:
+    """How long the harness waits, in all, for the fillers to be working:
+    the hold less its margin, so the first is still busy when the last
+    starts."""
+    return float(hold_seconds - HOLD_MARGIN_SECONDS)
+
+
 def filler_prompt(hold_seconds: int) -> str:
     """The ask each filler conversation sends."""
     return FILLER_PROMPT.format(hold=hold_seconds)
@@ -194,10 +218,12 @@ def precondition(cap: int | None, max_cap: int) -> str:
 
 
 def refused_at_cap(entries: Iterable[Mapping[str, Any]]) -> str:
-    """The gateway's cap refusal among a conversation's posts, or ``""``."""
+    """The gateway's cap refusal among a conversation's posts, or ``""``.
+    Only the cap's own refusal counts; any other "not started" is not the
+    queue's red."""
     for entry in entries:
         text = str(entry.get("text") or "")
-        if entry.get("kind") == "post" and _NOT_STARTED.search(text):
+        if entry.get("kind") == "post" and _CAP_REFUSAL.search(text):
             return text
     return ""
 
