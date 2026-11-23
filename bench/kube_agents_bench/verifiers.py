@@ -9714,8 +9714,9 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     from an older image, with no key, is read by ``finished_at`` alone -- has
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
-    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``,
+    which fails any other value and meets a required ``null``), has, for each
+    ``required_finding_phrases`` entry, a finding
     in its ``document`` whose id contains it, and has no finding whose id
     contains a ``forbidden_finding_phrases`` entry (the silent half of a case
     that plants a look-alike the check must leave alone), and, for each
@@ -9741,7 +9742,8 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
     # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
     # replaces the run's start as the lower bound, with no skew allowance: the
-    # fire and the envelope are stamped by the same pod. Unreadable is an error.
+    # fire and the envelope are stamped on one install, and the run opens only
+    # after a cron tick has claimed the mark. Unreadable is an error.
     since_state_file: str | None = None
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
@@ -9766,7 +9768,9 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
             if fired is None:
                 return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
-            # No skew: the fire and the envelope are stamped by the same pod.
+            # No skew: the fire is stamped in the agent container and the envelope
+            # where `finish` ran, on one install, and the run opens only after a
+            # cron tick has claimed the mark.
             since = fired
         envelopes: list[dict[str, Any]] = []
         read_any = False

@@ -38,3 +38,6 @@ gitops-drift-out-of-band-triage
 upgrades-rollout-family-held-by-canary-gate
 # Added 2026-11-10 when the case joined the nightly (#5261): the shortest chain then.
 first-install-hello-filed
+# fleet-audit-scheduled-run-files-the-finding: one real scheduled compliance
+# audit the stack fires and waits out, 1200s, into the shortest chain at the time.
+fleet-audit-scheduled-run-files-the-finding

@@ -324,6 +324,7 @@ def test_an_answer_without_it_is_not(answer):
 
 
 NEW_CASE = REPO / "bench" / "tasks" / "fleet-audit-unchanged-manifest-skips-synthesis" / "task.yaml"
+SCHEDULED_RUN_CASE = REPO / "bench" / "tasks" / "fleet-audit-scheduled-run-files-the-finding" / "task.yaml"
 
 
 def _verify_envelope(root, **fields):
@@ -357,6 +358,19 @@ def test_a_required_envelope_key_the_envelope_lacks_fails(root):
     result = _verify_envelope(root, required_envelope={"precheck": "unchanged"})
     assert result.status == "fail"
     assert "precheck is None, not 'unchanged'" in result.reason
+
+
+def test_a_required_null_passes_an_envelope_that_lacks_the_key(root):
+    _store_with(root, {"scheduled": True}, STARTED + timedelta(minutes=12))
+    result = _verify_envelope(root, required_envelope={"scheduled": True, "precheck": None})
+    assert result.status == "pass", result.reason
+
+
+def test_a_required_null_fails_an_envelope_that_carries_the_key(root):
+    _store_with(root, {"scheduled": True, "precheck": "unchanged"}, STARTED + timedelta(minutes=12))
+    result = _verify_envelope(root, required_envelope={"scheduled": True, "precheck": None})
+    assert result.status == "fail"
+    assert "precheck is 'unchanged', not None" in result.reason
 
 
 def test_required_envelope_is_checked_before_the_finding_phrases(root):
@@ -454,6 +468,18 @@ def test_the_unchanged_manifest_case_declares_the_check():
     assert isinstance(node, AuditReportStoredVerifier)
     assert node.required_envelope == {"precheck": "unchanged"}
     assert node.since_state_file == "/opt/data/.bench-unchanged-manifest-digest.json"
+    assert node.status is None
+
+
+def test_the_scheduled_run_case_declares_the_check():
+    """A scheduled run that was not closed from a stored document, clocked from the stack's fire."""
+    spec = yaml.safe_load(SCHEDULED_RUN_CASE.read_text())["verification_spec"]
+    check = next(entry for entry in spec if entry["name"] == "the-scheduled-run-stored-the-planted-finding")
+    node = parse_node(check["check"])
+    assert isinstance(node, AuditReportStoredVerifier)
+    assert node.required_envelope == {"scheduled": True, "precheck": None}
+    assert node.required_finding_phrases == ["debug-binding"]
+    assert node.since_state_file == "/opt/data/.bench-audit-chat-report.json"
     assert node.status is None
 
 

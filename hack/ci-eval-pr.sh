@@ -4918,6 +4918,12 @@ unit_cost_hint() {
     # waits out: a full audit on an image without the gate, a collector and a
     # precheck with it. Unmeasured; priced at the band plus the plant.
     fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
+    # One real scheduled compliance audit the stack fires and waits out, with
+    # the stream's stored report and digest record moved aside, so a full
+    # audit every time. The fired run took 11 to 13 minutes on two dev
+    # installs; unmeasured on a lane. Priced as the case above, over
+    # compliance-rbac-overgrant's requested run.
+    fleet-audit-scheduled-run-files-the-finding) echo 1200 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     # The same full audit after a plant that waits eleven minutes, so that

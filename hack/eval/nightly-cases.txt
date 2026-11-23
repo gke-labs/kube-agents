@@ -1261,6 +1261,20 @@
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
 
+# A scheduled audit run, started the way the schedule starts it and not by a
+# request, stores the finding of a planted defect. Every other case that
+# grades a finding asks for the audit in its prompt, which is an on-demand
+# run. prebuilt/audit-chat-report moves the compliance-audit stream's stored
+# report and digest record aside, fires the stream's real cron job and waits
+# for it, so the turn is a one-line answer and the grade reads the store with
+# the stack's fire time as its clock. Fixture: rbac-overgrant. A tofu case,
+# so it holds the infra lock; its stack carries one full compliance audit,
+# priced with compliance-rbac-overgrant's 1000s plus the fire and the wait;
+# the fired run took 11 to 13 minutes on two dev installs and is unmeasured
+# on a lane. Listed in nightly-main-b.txt, the shortest stack chain when the
+# case landed.
+./tasks/fleet-audit-scheduled-run-files-the-finding/task.yaml
+
 # A scheduled audit over a fleet that did not change since the last scheduled
 # run is closed by `audit_report.py precheck` from that run's stored findings
 # document, with no document drafted by hand (gke-labs/kube-agents#4724).
