@@ -165,9 +165,49 @@ def parse(prompt: str) -> CapAsk | None:
     ask = rest.strip()
     if not ask:
         raise ValueError(f"{DIRECTIVE} needs the ask on the lines after it")
-    if not ask.startswith("/session"):
-        raise ValueError(f"{DIRECTIVE}: the ask must open a session (/session ...), or the cap never applies to it")
+    if not _opens_a_session(ask):
+        raise ValueError(
+            f"{DIRECTIVE}: the ask must open a session with a request (/session <ask>), or the gateway starts "
+            f"no task and the cap never applies to it; got {ask.splitlines()[0]!r}"
+        )
     return CapAsk(prompt=ask, max_cap=max_cap, hold_seconds=hold)
+
+
+#: The gateway's /session arguments that start no task (a2a/lib/chattext/commands.go:
+#: IsSessionOff and stopWords), compared after its Normalize.
+_SESSION_NO_TASK = frozenset({"off", "stop", "cancel", "abort"})
+
+
+def _normalize(text: str) -> str:
+    """chattext.Normalize: lower case, letters and digits kept, apostrophes and other
+    punctuation dropped, runs of whitespace one space."""
+    out: list[str] = []
+    last_space = True
+    for ch in text.strip().lower():
+        if "a" <= ch <= "z" or "0" <= ch <= "9":
+            out.append(ch)
+            last_space = False
+        elif ch == "'":
+            last_space = False
+        elif ch in " \t\n":
+            if not last_space:
+                out.append(" ")
+            last_space = True
+    return "".join(out).strip()
+
+
+def _opens_a_session(ask: str) -> bool:
+    """Whether the gateway's sessionCommand would start a task for ask: the word /session
+    (case-insensitive, then whitespace or the end; chattext.slashWord), followed by a request
+    that is neither empty, "off", nor a stop word (a2a/gateway/gateway.go sessionCommand)."""
+    text = ask.strip()
+    if not text.startswith("/"):
+        return False
+    word, _, rest = text[1:].partition(next((c for c in text[1:] if c.isspace()), "\0"))
+    if word.lower() != "session":
+        return False
+    rest = rest.strip()
+    return bool(rest) and _normalize(rest) not in _SESSION_NO_TASK
 
 
 def _whole(field: str, value: str | None, default: int, floor: int, ceiling: int) -> int:

@@ -708,3 +708,31 @@ def test_still_running_reads_the_record(monkeypatch):
     for body, want in [(probe(), True), (probe(final=True, executorState="completed"), False), (probe(active=False), False)]:
         monkeypatch.setattr(inject, "_request", lambda *a, _b=body, **k: _b)
         assert _task().still_running("t-1") is want
+
+
+@pytest.mark.parametrize(
+    "ask, starts",
+    [
+        ("/session Reply with PINEAPPLE", True),
+        ("/SESSION do it", True),
+        ("/session\tgo", True),
+        ("/session", False),
+        ("/session   ", False),
+        ("/session off", False),
+        ("/session Stop!", False),
+        ("/session cancel", False),
+        ("/session abort", False),
+        ("/sessionx go", False),
+        ("session go", False),
+    ],
+)
+def test_parse_accepts_only_an_ask_the_gateway_would_start_as_a_session_task(ask, starts):
+    """The gateway's sessionCommand starts a task only for /session (any case, then
+    whitespace) with a request that isn't empty, off or a stop word. An ask it wouldn't
+    start fails in parse, naming the problem, before any filler is opened."""
+    prompt = f"{session_cap.DIRECTIVE} max-cap=2\n{ask}"
+    if starts:
+        assert session_cap.parse(prompt).prompt == ask.strip()
+    else:
+        with pytest.raises(ValueError, match="open a session with a request"):
+            session_cap.parse(prompt)
