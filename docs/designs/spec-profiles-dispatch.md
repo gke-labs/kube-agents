@@ -179,8 +179,9 @@ its budget function; until it exists, a fixed conservative default behind a knob
 3. **Fan-out with a wait.** A profile can start several child tasks and wait on their
    results. **Each child gets a fresh root grant, minted by the gateway** for the child's
    profile. It is not an attenuated copy of the parent's grant. The gateway enforces the
-   narrowing when it mints: the child's tier equals the parent's (and the child's profile must
-   allow it), and the child's scope must lie inside the parent's. The gateway stays the only
+   narrowing when it mints: the child's tier equals the parent's, or is `read` with no trigger below an `unattended`
+   parent, whose child's profile must also list `unattended` (#6744) (and the child's profile must
+   allow its tier), and the child's scope must lie inside the parent's. The gateway stays the only
    publisher of submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and the
    ancestor-chain rule in [Scale rules](#scale-rules) applies (only a chain's head nests its own
    profile, once; no profile repeats otherwise). Entries a broker adds to a grant chain never change

@@ -58,6 +58,10 @@ type ProfileWorkerConfig struct {
 	// task leaves in its config reaches the next. Empty runs the harness as
 	// configured, which only tests do.
 	PersonaDir string
+	// RequirePersonaIntegrity refuses a persona that carries no build-time
+	// content manifest (lib.EnvPersonaIntegrity). A manifest that is
+	// present is checked either way.
+	RequirePersonaIntegrity bool
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
 	// Relay is how the rendered persona's MCP servers reach the broker's
@@ -149,7 +153,7 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		return err
 	}
 	if pw.PersonaDir != "" {
-		if w.persona, err = renderPersona(pw); err != nil {
+		if w.persona, err = renderPersona(pw, cfg.Logger); err != nil {
 			return err
 		}
 		logPersonaWarnings(cfg.Logger, w.persona)
@@ -191,16 +195,19 @@ type profileWorker struct {
 // renderPersona loads the profile's persona and renders it for the harness.
 // It runs once: the persona is the image's and doesn't change under a
 // running pod, and a persona that doesn't load stops the worker before it
-// takes a task.
-func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
+// takes a task. That includes a persona whose files don't match its
+// build-time content manifest, and, under RequirePersonaIntegrity, one with
+// no manifest. Which of verified or unverified it loaded as is logged.
+func renderPersona(pw ProfileWorkerConfig, log *slog.Logger) (*persona.Output, error) {
 	adapter, err := render.For(pw.Harness)
 	if err != nil {
 		return nil, err
 	}
-	p, err := persona.Load(pw.PersonaDir)
+	p, err := persona.LoadWithOptions(pw.PersonaDir, persona.Options{RequireIntegrity: pw.RequirePersonaIntegrity})
 	if err != nil {
 		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
 	}
+	logPersonaIntegrity(log, pw.PersonaDir, p)
 	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay})
 	if err != nil {
 		return nil, fmt.Errorf("rendering the persona: %w", err)
@@ -209,6 +216,30 @@ func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// logPersonaIntegrity says whether the persona's files were checked against
+// its build-time manifest. Unverified is a warning: the persona loaded, but
+// nothing showed its files are the ones its build produced.
+func logPersonaIntegrity(log *slog.Logger, dir string, p *persona.Persona) {
+	if p.Integrity == persona.IntegrityVerified {
+		log.Info("persona files match their build-time manifest", "dir", dir, "files", p.IntegrityFiles)
+		return
+	}
+	log.Warn("persona integrity unverified: it carries no build-time manifest", "dir", dir, "manifest", persona.IntegrityManifestFile)
+}
+
+// ParsePersonaIntegrity reads lib.EnvPersonaIntegrity: empty is false,
+// lib.PersonaIntegrityRequired is true, and anything else is an error, so
+// a misspelt value stops the worker rather than leave the check off.
+func ParsePersonaIntegrity(v string) (bool, error) {
+	switch v {
+	case "":
+		return false, nil
+	case lib.PersonaIntegrityRequired:
+		return true, nil
+	}
+	return false, fmt.Errorf("%s=%q: the only value is %q", lib.EnvPersonaIntegrity, v, lib.PersonaIntegrityRequired)
 }
 
 // logPersonaWarnings logs what rendering left out of the persona: a broker
