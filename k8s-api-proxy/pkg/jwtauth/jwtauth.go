@@ -24,6 +24,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/certreload"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
 )
 
@@ -92,6 +93,13 @@ type Config struct {
 	// HTTPClient fetches the key set; a client with a 10s timeout when nil. Its redirects are
 	// refused unless they stay on https.
 	HTTPClient *http.Client
+	// CAFile, when set, is a PEM bundle of the root CAs the key set's server is verified
+	// against instead of the system roots. It is re-read when it changes, so a rotated CA is
+	// trusted from the next connection without a restart; a changed bundle that cannot be
+	// loaded is logged and the previous one kept. The file must load when NewAuthenticator
+	// is called. The fetch then speaks HTTP/1.1 only and uses no HTTP proxy. It cannot be combined with an
+	// HTTPClient that sets its own Transport.
+	CAFile string
 	// KeySetTTL is how long a fetched key set is reused; one hour when zero.
 	KeySetTTL time.Duration
 	// Now returns the current time; time.Now when nil. For tests.
@@ -147,6 +155,16 @@ func NewAuthenticator(cfg Config) (k8sapiproxy.CallerAuthenticator, error) {
 		client = &copied
 	}
 	client.CheckRedirect = secureRedirectPolicy(client.CheckRedirect)
+	if cfg.CAFile != "" {
+		if client.Transport != nil {
+			return nil, errors.New("jwtauth: Config.CAFile cannot be combined with Config.HTTPClient.Transport")
+		}
+		roots, err := certreload.NewCAPool(cfg.CAFile, certreload.Options{})
+		if err != nil {
+			return nil, fmt.Errorf("jwtauth: Config.CAFile: %w", err)
+		}
+		client.Transport = roots.Transport(nil)
+	}
 	ttl := cfg.KeySetTTL
 	if ttl <= 0 {
 		ttl = defaultKeySetTTL

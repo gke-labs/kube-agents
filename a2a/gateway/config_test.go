@@ -299,6 +299,36 @@ func TestFromEnvTaskDeadline(t *testing.T) {
 	}
 }
 
+// TestFromEnvKubectlCostTier: A2A_KUBECTL_COST_TIER, which the operator
+// forwards normalised, reaches KubectlCostTier only as a plain lowercase tier
+// name; anything else is dropped, and the session pod's admission charges its
+// default tier.
+func TestFromEnvKubectlCostTier(t *testing.T) {
+	setBaseEnv(t)
+	for raw, want := range map[string]string{
+		"":                      "",
+		"fleet":                 "fleet",
+		" fleet-2\n":            "fleet-2",
+		"Fleet":                 "",
+		"2fleet":                "",
+		"-fleet":                "",
+		"fleet_x":               "",
+		"../fleet":              "",
+		"fl\u00e9et":            "",
+		strings.Repeat("a", 32): strings.Repeat("a", 32),
+		strings.Repeat("a", 33): "",
+	} {
+		t.Setenv("A2A_KUBECTL_COST_TIER", raw)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.KubectlCostTier != want {
+			t.Errorf("A2A_KUBECTL_COST_TIER=%q: KubectlCostTier = %q, want %q", raw, cfg.KubectlCostTier, want)
+		}
+	}
+}
+
 // TestFromEnvResolvedScopeConfigMap: A2A_RESOLVED_SCOPE_CONFIGMAP, which the
 // operator sets on the gateway, reaches ResolvedScopeConfigMap beside the
 // other scope and credential fields; absent leaves it empty, which keeps a
