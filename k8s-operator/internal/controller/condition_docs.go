@@ -171,8 +171,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    hostPathDroppedConditionType,
-		Written: "Only after a pass that rendered the Pod template around a `hostPath` on `spec.deployment.extraVolumes` or `.sidecarVolumes`",
-		Meaning: "`status: True`, `Reason: HostPathVolumeDropped`. The render leaves the named `hostPath` entries and every mount naming them out of the Pod template the operator applies, and the message lists them by field and index. Not `Degraded`: the Pod runs without them. [What `VolumesDropped` reports](#what-volumesdropped-reports) says which passes write it and which leave it as it stands. Remove the entries to clear it.",
+		Written: "Only after a pass that rendered the Pod template around a `hostPath` on `spec.deployment.extraVolumes` or `.sidecarVolumes`, or a volume or mount that would hand a container the credential proxy's watcher token",
+		Meaning: "`status: True`, `Reason: HostPathVolumeDropped` or `WatcherTokenVolumeDropped`. The render leaves the named `hostPath` or watcher-token entries and every mount naming them out of the Pod template the operator applies, and the message lists them by field and index. Not `Degraded`: the Pod runs without them. [What `VolumesDropped` reports](#what-volumesdropped-reports) says which passes write it and which leave it as it stands. Remove the entries to clear it.",
 	},
 	{
 		Type:    replicasLimitedConditionType,
