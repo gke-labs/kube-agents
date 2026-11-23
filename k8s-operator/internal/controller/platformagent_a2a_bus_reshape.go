@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,6 +37,13 @@ const a2aBusReshapeConsumedAnnotation = "kubeagents.x-k8s.io/a2a-reshape-consume
 // reasonA2ABusReshapeNotStarted is the Event for a reshape request that
 // started nothing, and why.
 const reasonA2ABusReshapeNotStarted = "A2ABusReshapeNotStarted"
+
+// The refusal for a served CRD that drops status.busMigration, from
+// busReshapeRefusal and from a start the CRD dropped.
+const (
+	busReshapePrunedKind    = "pruned"
+	busReshapePrunedRefusal = "the served PlatformAgent CRD drops status.busMigration, so a run started here would be lost; apply this release's CRD, then restart the operator"
+)
 
 // busReshapeRunSuffix is the part of a reshape run's ID that records the
 // request it answered: "-r" and the first 8 hex of the nonce's SHA-256. The
@@ -135,18 +143,32 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 			return "the last bus migration failed and waits for a person (retry or abandon it first)", "failed", false
 		}
 	}
+	refusedForWidth := false
 	if !busProvisioned(agent) {
-		return "the bus is not provisioned yet", "unprovisioned", false
+		if refusedForWidth = r.busProvisionRefusedOnlyForWidth(ctx, agent); !refusedForWidth {
+			return "the bus is not provisioned yet", "unprovisioned", false
+		}
 	}
 	if busMigrationImage() == "" {
 		return "this operator was deployed without OPERATOR_IMAGE, which runs the reshape's work", "image", false
 	}
 	if r.busMigrationStatusPruned(agent) {
-		return "the served PlatformAgent CRD drops status.busMigration, so a run started here would be lost; apply this release's CRD, then restart the operator", "pruned", false
+		return busReshapePrunedRefusal, busReshapePrunedKind, false
 	}
 	streams, err := r.a2aBusStreamState(ctx, agent)
 	if err != nil {
 		return "TASKS's width could not be read (" + err.Error() + ")", "unreadable", false
+	}
+	if refusedForWidth {
+		// The Job's exit 2 says the script reached its last gate; the bus
+		// itself is the proof: every stream and bucket the Job creates is
+		// there. A shell error can exit 2 too, and then something is
+		// missing.
+		for _, name := range a2aProvisionedStreams {
+			if _, ok := streams[name]; !ok {
+				return "the bus is not provisioned yet (" + name + " is missing)", "unprovisioned", false
+			}
+		}
 	}
 	tasks, ok := streams["TASKS"]
 	if !ok {
@@ -163,6 +185,41 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 		return over, "over-cap", false
 	}
 	return "", "", false
+}
+
+// busProvisionRefusedOnlyForWidth reports a bus whose current provision Job
+// (this render's name, this CR's, not being deleted) failed by its
+// podFailurePolicy: the script's exit 2, which by its own convention is
+// only the closing max_consumers gate, reached once every stream and bucket
+// exists and the one limit is short. busReshapeRefusal also checks the bus
+// holds every stream, since a shell error can exit 2 as well. That is the state a reshape
+// fixes, so it counts as provisioned for one, though BusProvisioned is not
+// set: a reshape given up before its clear (or whose rollback put a narrow
+// TASKS back) drops the condition, and the provision Job that runs next
+// refuses the narrow TASKS, so the condition would never come back and no
+// reshape could start (#6598). A Job failed any other way (its backoff
+// spent: the bus down, a stream missing) is not this, and refuses as before.
+func (r *PlatformAgentReconciler) busProvisionRefusedOnlyForWidth(ctx context.Context, agent *agentv1alpha1.PlatformAgent) bool {
+	var jobs batchv1.JobList
+	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
+		a2aComponentLabel: a2aProvisionComponent,
+		labelInstance:     instanceLabel(agent.Namespace, agent.Name),
+	}); err != nil {
+		return false
+	}
+	current := buildA2AProvisionJob(agent).Name
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if job.Name != current || !metav1.IsControlledBy(job, agent) || job.DeletionTimestamp != nil {
+			continue
+		}
+		for _, c := range job.Status.Conditions {
+			if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue && c.Reason == batchv1.JobReasonPodFailurePolicy {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // maybeStartBusReshape starts a reshape when the annotation asks for one
@@ -185,18 +242,38 @@ func (r *PlatformAgentReconciler) maybeStartBusReshape(ctx context.Context, agen
 		return nil
 	}
 	if refusal != "" {
-		key, seen := client.ObjectKeyFromObject(agent), nonce+"/"+kind
-		if prev, ok := r.busReshapeRefused.Load(key); !ok || prev != seen {
-			r.busReshapeRefused.Store(key, seen)
-			r.recordEvent(agent, corev1.EventTypeNormal, reasonA2ABusReshapeNotStarted,
-				fmt.Sprintf("%s=%s starts no TASKS reshape: %s", a2aBusReshapeAnnotation, nonce, refusal))
-		}
+		r.refuseBusReshape(agent, nonce, kind, refusal)
 		return nil
 	}
 	if err := r.persistBusMigrationStart(ctx, agent, func() { startBusReshape(agent, running, nonce, metav1.Now()) }); err != nil {
 		return err
 	}
+	// Recorded only for a run the API server kept: on a served CRD that
+	// drops status.busMigration the write came back without it, the run is
+	// gone (persistBusMigrationStart put the old record back), and a record
+	// here would read the request as answered with nothing to show for it.
+	// This pass refuses it, naming the CRD, as every later pass would
+	// (#6600): nothing else asks for a pass soon, since no run is under way,
+	// so waiting for the next one could leave the request unanswered until
+	// the periodic resync (#6692).
+	if run := agent.Status.BusMigration; run == nil || busMigrationLeg(run.Leg) != busMigrationReshape || !strings.HasSuffix(run.RunID, busReshapeRunSuffix(nonce)) {
+		r.refuseBusReshape(agent, nonce, busReshapePrunedKind, busReshapePrunedRefusal)
+		return nil
+	}
 	return r.recordBusReshapeConsumed(ctx, agent, nonce)
+}
+
+// refuseBusReshape records the Normal A2ABusReshapeNotStarted Event for a
+// refused request, once per nonce and kind of reason from this operator
+// process.
+func (r *PlatformAgentReconciler) refuseBusReshape(agent *agentv1alpha1.PlatformAgent, nonce, kind, refusal string) {
+	key, seen := client.ObjectKeyFromObject(agent), nonce+"/"+kind
+	if prev, ok := r.busReshapeRefused.Load(key); ok && prev == seen {
+		return
+	}
+	r.busReshapeRefused.Store(key, seen)
+	r.recordEvent(agent, corev1.EventTypeNormal, reasonA2ABusReshapeNotStarted,
+		fmt.Sprintf("%s=%s starts no TASKS reshape: %s", a2aBusReshapeAnnotation, nonce, refusal))
 }
 
 // startBusReshape records a reshape run at the count the bus runs, its ID

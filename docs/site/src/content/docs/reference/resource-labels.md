@@ -19,7 +19,7 @@ The set has two values by design. The A2A stack's controller output carries
 `kubeagents.x-k8s.io/a2a-component` label. So the A2A stack is one query of its own
 (`-l app.kubernetes.io/part-of=a2a-next`), and `-l app.kubernetes.io/part-of=kube-agents` keeps
 meaning the rest of the install. The second selector alone misses
-the bus, the callout, the verifier, the console and the gateway.
+the bus, the callout, the verifier, the console, the MCP server, the profile dispatcher, and the gateway.
 
 ## The label contract
 

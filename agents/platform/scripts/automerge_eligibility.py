@@ -1,31 +1,34 @@
-"""The no-pdb fix's file format, for the credential broker.
+"""Whether a pull request adds exactly a recipe's generated fix, for the credential broker.
 
-The fleet audit writes one fix in code rather than through the model: a
-PodDisruptionBudget for a workload with none (`no-pdb`), fully determined by the
-workload's selector. Before the broker may mark such a pull request as one a
-pipeline could merge without a review, it has to establish what the pull request
-adds itself, because nothing the sandbox reports can be trusted for that:
+A fix recipe writes its fix in code (`fix_recipes/<kind>/fix.py`). Before the
+broker may mark such a pull request as one a pipeline could merge without a
+review, it has to establish what the pull request adds itself, because nothing
+the sandbox reports can be trusted for that:
 
-- `render_budget` is byte for byte what `audit_report._pdb_manifest` writes, and
-  `parse_budget` accepts a file only when it holds fields the generator can
-  write and re-rendering them gives the same bytes, so a file anyone edited or
-  wrote by hand is not the generated fix.
-- `added_file_from_diff` and `path_fits`: the pull request adds that one file,
-  under its own name, in its cluster's own tree, and changes nothing else.
+- `verify_added_manifest`: the diff adds one file and changes nothing else
+  (`added_file_from_diff`); the file is printable ASCII; and the recipe's own
+  `generate`, re-run here on the inputs the file names (`read_inputs`), gives
+  the same bytes. One generator serves the audit and the broker, so a file
+  anyone edited or wrote by hand is not the generated fix.
+- `path_fits`: the file sits under the generated name, in its cluster's own
+  tree.
+- `regenerates_from`: once the broker has read the cluster, the file is also
+  byte for byte what the generator writes from that read (the workload's live
+  selector) in place of what the file says.
 - `PRACTICE_LABEL` and `AUTOMERGE_LABEL` are the labels, which only the broker
   writes (`vcs_broker.VcsBroker.proposal_practice_label`):
   `reserved_label_refusal` is how every caller-reachable verb refuses them.
 
-`fleet-audit/scripts/test_broker_budget_parity.py` holds the format to the
-audit's. Stdlib only: the credential-proxy image ships this directory and
-nothing from the fleet-audit skill.
+Stdlib only: the credential-proxy image ships this directory (with
+`fix_recipes/`) and nothing from the fleet-audit skill.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, NamedTuple
+
+from fix_recipes import registry
 
 #: The labels the broker puts on a fix pull request it judged eligible: the
 #: first while `KUBEAGENTS_AUTOMERGE` is `practice`, which nothing acts on, the
@@ -46,48 +49,37 @@ LABEL_DESCRIPTIONS = {
 LABEL_WRITE_FIELDS = ("labels", "labelsAdd", "labelsRemove")
 #: The fix type the rules file names (`automation_rules.KNOWN_FIX_TYPES`).
 FIX_TYPE = "no-pdb"
-#: The workloads a budget can count through their scale subresource, and so the
-#: only ones a generated budget is written for.
-BUDGET_TARGET_KINDS = ("Deployment", "StatefulSet")
-SELECTOR_KEYS = ("matchLabels", "matchExpressions")
-
-#: What the generator can write in each field (`audit_report.KUBERNETES_NAME_PATTERN`,
-#: `audit_report.FINDING_ID_RE`); a file naming anything else is not its output.
-KUBERNETES_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
-FINDING_ID = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?")
-CLUSTER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*")
-
-BUDGET_SUFFIX = "-pdb"
 # The per-cluster tree of the reference GitOps layout, `clusters/<name>/`.
 CLUSTER_TREE_ROOT = "clusters"
-_HEADER = re.compile(
-    r"# (?P<cluster>[^\n]*): no-pdb on (?P<object>[A-Za-z]+/[^\s()]+) \((?P<finding_id>[^\n()]*)\)\n"
-)
-_BODY = re.compile(
-    r"apiVersion: policy/v1\n"
-    r"kind: PodDisruptionBudget\n"
-    r"metadata:\n"
-    r"  name: (?P<name>[^\n]+)\n"
-    r"  namespace: (?P<namespace>[^\n]+)\n"
-    r"spec:\n"
-    r"  maxUnavailable: 1\n"
-    r"  selector: (?P<selector>\{[^\n]*\})\n"
-)
-
 _DIFF_HEADER = re.compile(r"diff --git a/(?P<a>[^\s\"]+) b/(?P<b>[^\s\"]+)")
 _HUNK = re.compile(r"@@ -0,0 \+1(?:,(?P<count>\d+))? @@")
 _NO_NEWLINE = "\\ No newline at end of file"
+#: The largest added file read, the rules file's cap (`automation_rules.MAX_FILE_BYTES`).
+MAX_ADDED_FILE_BYTES = 64 * 1024
 
 
-class Budget(NamedTuple):
-    """What a generated budget file names."""
+class AddedManifest(NamedTuple):
+    """A pull request's one added file, proven to be `kind`'s generated fix."""
 
-    cluster: str
-    object: str
-    finding_id: str
+    kind: str
+    path: str
     name: str
-    namespace: str
-    selector: dict
+    candidate: dict
+    finding_id: str
+    text: str
+
+    # What a recipe's `checks(change, live)` reads (`fix_recipes/<kind>/checks.py`).
+    @property
+    def object(self) -> str:
+        return str(self.candidate.get("object") or "")
+
+    @property
+    def namespace(self) -> str:
+        return str(self.candidate.get("namespace") or "")
+
+    @property
+    def selector(self) -> dict:
+        return self.candidate.get("pod_selector") or {}
 
 
 def reserved_label_refusal(verb: str, payload: Any) -> str | None:
@@ -116,66 +108,6 @@ def reserved_label_refusal(verb: str, payload: Any) -> str | None:
             "and no request may add, remove or create them."
         )
     return None
-
-
-def render_budget(cluster: str, obj: str, namespace: str, selector: dict, finding_id: str) -> tuple[str, str]:
-    """`(name, text)` of the budget the audit writes for `obj`'s `no-pdb` finding.
-
-    `maxUnavailable: 1` and the workload's `spec.selector` verbatim. The
-    caller has already refused a selector or a name this cannot write safely
-    (`audit_report._pdb_unbuildable_reason`).
-    """
-    name = f"{obj.partition('/')[2]}{BUDGET_SUFFIX}"
-    # JSON is YAML, so the selector is written exactly as it was read.
-    text = (
-        f"# {cluster}: {FIX_TYPE} on {obj} ({finding_id})\n"
-        "apiVersion: policy/v1\n"
-        "kind: PodDisruptionBudget\n"
-        "metadata:\n"
-        f"  name: {name}\n"
-        f"  namespace: {namespace}\n"
-        "spec:\n"
-        "  maxUnavailable: 1\n"
-        f"  selector: {json.dumps(selector, sort_keys=True)}\n"
-    )
-    return name, text
-
-
-def parse_budget(text: str) -> Budget | None:
-    """What a generated budget file names, or None unless re-rendering it
-    gives the same bytes: one budget, `maxUnavailable: 1`, nothing else."""
-    header = _HEADER.match(text)
-    body = _BODY.fullmatch(text, header.end()) if header else None
-    if body is None:
-        return None
-    try:
-        selector = json.loads(body["selector"])
-    except json.JSONDecodeError:
-        return None
-    # An empty selector selects every pod in the namespace; the generator
-    # refuses one (`audit_report._pdb_unbuildable_reason`), so it is never its output.
-    if not _selector_shaped(selector) or not any(selector.get(key) for key in SELECTOR_KEYS):
-        return None
-    budget = Budget(
-        header["cluster"], header["object"], header["finding_id"], body["name"], body["namespace"], selector
-    )
-    kind, _, obj_name = budget.object.partition("/")
-    # Only what the generator can write: a carriage return, or any byte past
-    # printable ASCII, could end a line for a YAML reader and carry a second
-    # document through a byte-exact round trip.
-    if not all(c == "\n" or " " <= c <= "~" for c in text):
-        return None
-    if not (
-        KUBERNETES_NAME.fullmatch(budget.name)
-        and KUBERNETES_NAME.fullmatch(budget.namespace)
-        and KUBERNETES_NAME.fullmatch(obj_name)
-        and kind in BUDGET_TARGET_KINDS
-        and FINDING_ID.fullmatch(budget.finding_id)
-        and CLUSTER_NAME.fullmatch(budget.cluster)
-    ):
-        return None
-    name, rendered = render_budget(budget.cluster, budget.object, budget.namespace, selector, budget.finding_id)
-    return budget if rendered == text and name == budget.name else None
 
 
 def added_file_from_diff(diff: Any) -> tuple[str, str] | None:
@@ -220,33 +152,54 @@ def added_file_from_diff(diff: Any) -> tuple[str, str] | None:
     return path, "\n".join(line[1:] for line in body) + ("\n" if newline else "")
 
 
-def _selector_shaped(selector: Any) -> bool:
-    """Whether `selector` is a LabelSelector's shape: string labels, and
-    expressions with a string key and operator and a list of string values."""
-    if not isinstance(selector, dict) or set(selector) - set(SELECTOR_KEYS):
-        return False
-    labels = selector.get("matchLabels", {})
-    expressions = selector.get("matchExpressions", [])
-    if not isinstance(labels, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in labels.items()):
-        return False
-    return isinstance(expressions, list) and all(
-        isinstance(e, dict)
-        and isinstance(e.get("key"), str)
-        and isinstance(e.get("operator"), str)
-        and isinstance(e.get("values", []), list)
-        and all(isinstance(v, str) for v in e.get("values", []))
-        for e in expressions
-    )
+def verify_added_manifest(kind: str, diff: Any, *, check_path: bool = True) -> AddedManifest | None:
+    """The one file `diff` adds, when it is byte for byte `kind`'s generated fix, else None.
+
+    The recipe reads the inputs the file names (`read_inputs`, untrusted) and
+    `generate` is re-run on them here; the file is the fix only when the
+    output is the same bytes and the same name. Anything but printable ASCII
+    and newlines is refused first: a carriage return or a byte past ASCII can
+    end a line for a YAML reader and carry a second document through a
+    byte-exact round trip. `check_path=False` leaves `path_fits` to a caller
+    that reports a misplaced file in words of its own.
+    """
+    added = added_file_from_diff(diff)
+    if added is None:
+        return None
+    path, text = added
+    if len(text.encode()) > MAX_ADDED_FILE_BYTES or not all(c == "\n" or " " <= c <= "~" for c in text):
+        return None
+    fix = registry.generator(kind)
+    read = fix.read_inputs(text)
+    if read is None:
+        return None
+    candidate, finding_id = read
+    built = fix.generate(candidate, finding_id)
+    if built is None or built[1] != text:
+        return None
+    name = built[0]
+    if check_path and not path_fits(path, name, str(candidate.get("cluster") or "")):
+        return None
+    return AddedManifest(kind, path, name, candidate, finding_id, text)
 
 
-def path_fits(path: str, budget: Budget) -> bool:
-    """Whether the file's path can hold `budget`: named for it, under no
-    dot-directory, and inside its cluster's own tree of the reference layout,
-    `clusters/<name>/`, by the cluster's short name, the last segment of
-    `project/location/name`. A shared directory could be applied to every
-    cluster. The tree is matched by short name only, so a repository whose
-    layout reuses one short name for two clusters cannot be told apart here."""
+def regenerates_from(fix: AddedManifest, read: dict) -> bool:
+    """Whether `fix`'s file is byte for byte what its recipe generates when the
+    inputs the broker read itself (`read`, for example the workload's live
+    `pod_selector`) replace the ones the file names."""
+    built = registry.generator(fix.kind).generate({**fix.candidate, **read}, fix.finding_id)
+    return built == (fix.name, fix.text)
+
+
+def path_fits(path: str, name: str, cluster: str) -> bool:
+    """Whether the file's path can hold the fix `name` for `cluster`: named
+    for it, under no dot-directory, and inside its cluster's own tree of the
+    reference layout, `clusters/<name>/`, by the cluster's short name, the last
+    segment of `project/location/name`. A shared directory could be applied to
+    every cluster. The tree is matched by short name only, so a repository
+    whose layout reuses one short name for two clusters cannot be told apart
+    here."""
     parts = path.split("/")
-    if parts[-1] != f"{budget.name}.yaml" or any(part.startswith(".") or not part for part in parts):
+    if parts[-1] != f"{name}.yaml" or any(part.startswith(".") or not part for part in parts):
         return False
-    return len(parts) > 2 and parts[0] == CLUSTER_TREE_ROOT and parts[1] == budget.cluster.rsplit("/", 1)[-1]
+    return len(parts) > 2 and parts[0] == CLUSTER_TREE_ROOT and parts[1] == cluster.rsplit("/", 1)[-1]

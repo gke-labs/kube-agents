@@ -99,10 +99,13 @@ Five behaviours worth knowing before the first run:
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
   node pool of one `e2-standard-4` per zone, autoscaling to two. The module's
-  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it; the
-  installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
-  `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
-  is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
+  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it;
+  `install.sh` writes none of the explicit `standard_*` or `gvisor_*` inputs, and sets or offers
+  `TF_VAR_sizing_profile=fleet` on a fresh Standard install with 25 or more visible clusters when
+  runtime sizing is `auto` or `fleet` and `TF_VAR_sizing_profile` / `TF_VAR_standard_machine_type`
+  are unset (and accepts an exported `TF_VAR_sizing_profile`). Set other inputs as `TF_VAR_` lines in
+  `install.env`, which Terraform reads where the generated tfvars
+  is silent, and keep them there for every later run: `lifecycle.sh` refuses an apply that would
   resize a pool no sizing input asked to resize (the pool's own explicit input, or, for an attribute
   no explicit input decided at the last apply, a profile other than the one that apply recorded),
   the shape a lost line would otherwise plan. Pass
@@ -160,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it updates only the keys listed in [The install configuration](scripts/installer/README.md#the-install-configuration-installenv)) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and, for GitHub only, Cloud KMS key creation for GitHub App private key signing).
@@ -643,8 +646,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
 - **The A2A stack**: every install runs it. The operator renders the NATS bus, the A2A gateway,
-  the auth callout, the capability verifier, the A2A console and the `hermes-bridge` container in
-  front of the agent, whatever the `PlatformAgent`'s deprecated `spec.mode` says
+  the auth callout, the capability verifier, the A2A console, the MCP server, the profile
+  dispatcher and the `hermes-bridge` container in front of the agent, whatever the
+  `PlatformAgent`'s deprecated `spec.mode` says
   ([the upgrade guide](docs/site/src/content/docs/install/upgrade.md#moving-to-the-a2a-stack)
   covers an install made before the stack was unconditional). An install that mirrors its
   third-party images (`--third-party-registry-prefix`) pulls the bus's four images from the
@@ -1164,7 +1168,7 @@ AGENT_NAME="$(kubectl get platformagents -n kubeagents-system -o jsonpath='{.ite
   kubectl rollout restart deployment/"${AGENT_NAME}-gateway" statefulset/"${AGENT_NAME}-shell" -n kubeagents-system
 ```
 
-Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
+Vertex AI needs no entry here: `MODEL_PROVIDER=vertex_ai` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
 
 ### Step 3: Build & Push the Operator Image
@@ -1206,6 +1210,7 @@ at nothing and the policies silently inert:
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
 kubectl apply -f config/admission/a2a-dispatcher-job-policy.yaml
+kubectl apply -f config/admission/agentschedule-builtin-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
@@ -1580,7 +1585,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
   - `files:write` is not needed: the gateway's manifest does not have it, and the gateway uploads no file. An app made from the `hermes slack manifest` output has both `app_mention` and `files:write`; they can stay.
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
-  - On the gateway, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)). The message shortcut also needs the `commands` scope and a `features.shortcuts` entry ([Slack app setup](docs/site/src/content/docs/install/slack-app.md)).
+  - On the gateway, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the gateway's manifest carries. An app made from the `hermes slack manifest` output has them too; one generated with `--no-assistant` lacks `assistant:write` and `assistant_thread_started`. Without these scopes and events the answers still arrive, and only the reactions, the answered line, Working… and the prompts go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)). The message shortcut also needs the `commands` scope and a `features.shortcuts` entry ([Slack app setup](docs/site/src/content/docs/install/slack-app.md)).
   - For the complete manifest and its event subscriptions, see the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-the-a2a-gateway) page. Its manifest is short enough to paste into Slack's **Create New App → From a manifest** dialog. `./scripts/installer/print_instructions_slack.sh` prints the gateway's checklist and the page's address.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). The A2A gateway answers an unlisted user once with a notice naming their member ID. An empty allowlist admits all members in the workspace. The A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list, unless the list names that member as `T…:U…` (their workspace ID, a colon, their member ID). See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace:** The A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens, Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or Slack is turned off. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.

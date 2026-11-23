@@ -31,6 +31,7 @@ from credential_proxy import CredentialProxyHandler, Policy
 from test_credential_proxy_profile import CASES, DOC, POD, POD_UID, PROFILE_SA, VALID, _RecordingExecutor
 
 AUDIT_REPORT_PATH = Path(__file__).resolve().parents[1] / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
+REPORT_STATUS_PATH = AUDIT_REPORT_PATH.with_name("report_status.py")
 LISTENER_PATH = Path(__file__).resolve().parent / "audit_report_store.py"
 
 REPORT = CASES["a report credential: unattended, a builtin schedule trigger, no target"]
@@ -1142,6 +1143,35 @@ class StoreKeyTest(unittest.TestCase):
                     relative = self.audit_report.reports_dir_for("x", repo).relative_to(root / "x")
                     expected = "/".join(relative.parts)
                     self.assertEqual(urllib.parse.quote(expected, safe=""), credential_proxy.report_store_key(repo))
+
+    def test_the_clients_key_is_the_brokers(self):
+        """report_status.broker_store_key, which the fleet-audit scripts send,
+        against report_store_key, which the broker checks a write's key with."""
+        spec = importlib.util.spec_from_file_location("report_status_for_routes_test", REPORT_STATUS_PATH)
+        report_status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(report_status)
+        for repo in ("acme/gitops", "Acme/GitOps", "github.com/acme/gitops", "GitHub.com/Acme/GitOps",
+                     "ghe.example.com/Acme/GitOps", "GHE.example.com/acme/gitops/extra",
+                     "gitlab.com/group/sub/repo", "gitlab.com/Acme/infra", "git.example.org/a/b/c/d",
+                     "no_forge/local", "my.org/repo"):
+            with self.subTest(repo=repo):
+                self.assertEqual(credential_proxy.report_store_key(repo), report_status.broker_store_key(repo))
+        for repo in ("acme", "acme/../x", "a/b/c", "acme/", "/acme", "acme/gi tops", ""):
+            with self.subTest(repo=repo):
+                self.assertIsNone(credential_proxy.report_store_key(repo))
+                with self.assertRaises(ValueError):
+                    report_status.broker_store_key(repo)
+        self.assertEqual(credential_proxy.AUDIT_REPORTS_PREFIX, report_status.AUDIT_REPORTS_ROUTE)
+        # The header rules report_status restates stdlib-only (#6097).
+        import credential_proxy_client  # noqa: PLC0415
+
+        self.assertEqual(credential_proxy_client.AUDIT_REPORTS_ROUTE, report_status.AUDIT_REPORTS_ROUTE)
+        self.assertEqual(credential_proxy_client.BROKER_URL_ENV, report_status.BROKER_URL_ENV)
+        self.assertEqual(credential_proxy_client.TASK_TOKEN_FILE_ENV, report_status.TASK_TOKEN_FILE_ENV)
+        self.assertEqual(credential_proxy_client.TASK_CREDENTIAL_HEADER, report_status.TASK_CREDENTIAL_HEADER)
+        self.assertEqual(credential_proxy_client.MAX_TASK_CREDENTIAL_BYTES, report_status.MAX_TASK_CREDENTIAL_BYTES)
+        self.assertEqual(credential_proxy_client._TASK_CREDENTIAL_SHAPE.pattern, report_status._TASK_CREDENTIAL_SHAPE.pattern)
+        self.assertEqual(credential_proxy.TASK_CREDENTIAL_HEADER, report_status.TASK_CREDENTIAL_HEADER)
 
     def test_spellings(self):
         key = credential_proxy.report_store_key

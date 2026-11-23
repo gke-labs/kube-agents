@@ -11298,9 +11298,15 @@ spec:
                           description: Enabled toggles the Microsoft Teams integration.
                           type: boolean
                         homeChannel:
-                          description:
-                            HomeChannel is the default channel ID for scheduled
-                            messages.
+                          description: |-
+                            HomeChannel is the Teams conversation the agent's proactive posts go
+                            to: on the Hermes path the default conversation for scheduled
+                            messages; with the gateway's Teams backend armed (the operator's
+                            A2A_TEAMS_BACKEND switch), the home its chat.notify route posts alerts
+                            and reports into. A conversation id: "19:..." (a channel ends in
+                            @thread.tacv2, a group or meeting chat in @thread.v2) or "a:..." (a
+                            personal chat), never a thread (no ";messageid="); the gateway refuses
+                            any other shape, and only a channel home threads its posts.
                           type: string
                         homeChannelName:
                           description:
@@ -12320,13 +12326,15 @@ spec:
                           backend:
                             description: |-
                               Backend is the surface the person writes from: one whose requester is
-                              one verified person. The a2a door isn't one: its callers name
-                              themselves under a shared token.
+                              one verified person. The a2a door's eval class isn't one: its callers
+                              name themselves under a shared token; its Google and Entra sign-in
+                              classes are.
                             enum:
                               - gchat
                               - slack
                               - discord
                               - a2a-google
+                              - a2a-entra
                             type: string
                           tier:
                             description: Tier is the name of an interactive-mode Tier.
@@ -12337,6 +12345,7 @@ spec:
                             description: |-
                               User is the person's id on that backend: their email on Google Chat
                               (compared without case) and on a2a-google (as their Google token
+                              carries it), their Entra object id on a2a-entra (as their Entra token
                               carries it), their user id on Slack or Discord.
                             maxLength: 128
                             minLength: 1
@@ -12647,6 +12656,13 @@ spec:
                         Provider is the LiteLLM provider slug, the text before the first "/" of the
                         default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
                       type: string
+                    reasoningEffort:
+                      description: |-
+                        ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+                        the default model's entry, as typed: low, medium or high from the chart, or
+                        whatever a hand-edited config says. Absent when the entry states none, so the
+                        model thinks at its own default, and absent while the served CRD predates it.
+                      type: string
                   type: object
                 lastReconcileTime:
                   description:
@@ -12762,8 +12778,10 @@ spec:
                     capacityBytes:
                       description: |-
                         CapacityBytes is the size of the filesystem on the agent's data volume,
-                        as the gateway pod's event watcher last read it. Absent when the watcher
-                        is disabled or the operator has no current reading from it.
+                        as the gateway pod's event watcher last read it. Absent before the first
+                        poll, while the watcher is disabled, after two polls in a row with no
+                        fleet reading (including k8s_event_watcher_watch_set_ready below 1), or
+                        when a ready watcher answers without the volume metric.
                       format: int64
                       type: integer
                     freeBytes:
@@ -12948,12 +12966,12 @@ spec:
                         events: the k8s_event_watcher_cluster_up series at 1, whose informer
                         has completed its initial list. The difference from ClustersRegistered
                         is the number of clusters silently unwatched, a stuck informer, a 403
-                        on the events list, or a stopped one. A 0 is a reading, and the normal
-                        one while the watcher starts, so read a fall alongside the pod's age.
-                        Absent on the same terms as ClustersRegistered: one poll in which no
-                        gateway replica could be read leaves both where they were, and a
-                        second in a row clears both, because the operator then has no current
-                        reading and an absent field says so.
+                        on the events list, or a stopped one. Once the watch set is ready
+                        (k8s_event_watcher_watch_set_ready at 1), a 0 is a reading and normal
+                        until informers finish their initial list, so read a drop alongside
+                        the pod's age. Absent on the same terms as ClustersRegistered: one poll
+                        without a current fleet reading leaves both where they were, and two
+                        in a row clear both because the operator has no current reading.
                       format: int64
                       type: integer
                     clustersRegistered:
@@ -12970,11 +12988,15 @@ spec:
                         stands. A gauge, not a counter: it falls on a removal or after such a
                         restart. Absent when the operator has no
                         current reading: before the first poll, while the event watcher is
-                        disabled, and after two polls in a row in which no gateway replica
-                        could be read, whether its listener failed, its pod was not running, or
-                        the operator could not reach it; the CR's events and the gateway pod's
-                        state say which. A 0 is a reading: the watcher answered and exports no
-                        series.
+                        disabled, or after two polls in a row without a current fleet
+                        reading. That includes a listener failure, a pod not running, an
+                        unreachable gateway, or a restarting watcher still building its
+                        initial watch set (k8s_event_watcher_watch_set_ready below 1). Check
+                        the CR's events, the gateway pod's state, and the watcher's logs or
+                        k8s_event_watcher_watch_set_ready metric to see which applies; a
+                        startup hold writes no CR event. A 0 is a reading once k8s_event_watcher_watch_set_ready reaches 1, or from
+                        an older watcher without that gauge: the watcher answered with no
+                        cluster series.
                       format: int64
                       type: integer
                     eventsIngestedTotal:
@@ -13074,7 +13096,8 @@ spec:
                         person's last message ages out of the window. A 0 is a reading. Absent
                         until the first reading, after two polls in a row without one, while a
                         chat platform the install enables is served through Hermes (Microsoft
-                        Teams), and while the served CRD
+                        Teams, unless the operator arms the gateway's Teams backend), and
+                        while the served CRD
                         predates the field. Moves neither LastActiveTime nor
                         LastHumanActiveTime.
                       format: int64

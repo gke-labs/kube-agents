@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1027,5 +1028,28 @@ func TestARequestWhileStoppingIsARetry(t *testing.T) {
 	}
 	if retries != 2 {
 		t.Fatalf("%d stopping refusals marked retry, want 2 (the new request and the queued one)", retries)
+	}
+}
+
+// A card's report posted into a chat thread is kept under the thread's key
+// with no task named, for the reply under it; a note without the report
+// mark is not kept, and a post into a key every top-level message shares
+// (a thread-less DM) is not a thread, so it is not kept either.
+func TestAChatThreadReportIsKeptUnderItsKeyAlone(t *testing.T) {
+	conv := &fakeConversations{contexts: map[string]string{"slack:C1/1699.1": "ctx-1", "slack:dm/D1": "ctx-2"}}
+	n := newTestSlackNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(conv)
+	for _, req := range []lib.NotifyRequest{
+		{Text: "np-quartz-7 is at 92%", Conversation: "slack:C1/1699.1", ContextID: "ctx-1", Report: true},
+		{Text: "⏳ reading pod state", Conversation: "slack:C1/1699.1", ContextID: "ctx-1"},
+		{Text: "a report in a DM", Conversation: "slack:dm/D1", ContextID: "ctx-2", Report: true},
+	} {
+		if got := serveJSON(t, n, req); got.Error != "" || got.MessageID == "" {
+			t.Fatalf("reply = %+v, want a post for %q", got, req.Text)
+		}
+	}
+	want := []string{"slack:C1/1699.1  np-quartz-7 is at 92%"}
+	if !reflect.DeepEqual(conv.kept, want) {
+		t.Fatalf("kept = %q, want %q", conv.kept, want)
 	}
 }

@@ -587,6 +587,35 @@ func TestATaskWaitFoldsOnlyAfterAStatusUpdate(t *testing.T) {
 	}
 }
 
+// A status-update the cutoff screen held is taken when the task's kind is
+// settled, which is after it was read. The wait checks for the task's end
+// then, as it does for a status-update it took at once.
+func TestAHeldStatusUpdateTakenLaterIsCheckedForTheTasksEnd(t *testing.T) {
+	url, _ := testBus(t)
+	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
+	ref := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-held"}
+	payload := mustJSON(t, lib.StatusUpdate{TaskID: ref.TaskID, ContextID: "ctx-" + ref.TaskID,
+		Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
+	terminal, err := lib.NewStatusUpdateEnvelope(fakeGateway, ref.TaskID, "ctx-"+ref.TaskID, "corr-"+ref.TaskID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &taskWatch{ref: ref,
+		screen:  &cutoffScreen{b: b, cutoff: b.client.ProfileSupervisorCutoff(), ref: ref, settled: true},
+		doubted: []doubtedEvent{{subject: lib.TaskSupervisorSubject(ref.Addressee, ref.TaskID), storedAt: time.Now(), env: terminal}}}
+	if _, final := w.ended(); final {
+		t.Fatal("the task ended on an event the watch has not taken")
+	}
+	w.resolveDoubts(t.Context())
+	if len(w.events) != 1 {
+		t.Fatalf("the watch holds %d events after its doubts were resolved, want the terminal", len(w.events))
+	}
+	task, final := w.ended()
+	if !final || task.State != lib.StateFailed {
+		t.Fatalf("the held terminal did not end the task once it was taken: %+v final=%v", task, final)
+	}
+}
+
 // A turn that hands its work to kanban cards completes with its
 // acknowledgement, and send_message returns at once rather than following
 // the handoff as if a wake task were coming: the cards report over the

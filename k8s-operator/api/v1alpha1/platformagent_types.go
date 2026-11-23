@@ -96,14 +96,16 @@ type PlatformAgentTiersSpec struct {
 // TierMember maps one person on one chat backend to a tier.
 type TierMember struct {
 	// Backend is the surface the person writes from: one whose requester is
-	// one verified person. The a2a door isn't one: its callers name
-	// themselves under a shared token.
-	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a-google
+	// one verified person. The a2a door's eval class isn't one: its callers
+	// name themselves under a shared token; its Google and Entra sign-in
+	// classes are.
+	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a-google;a2a-entra
 	// +required
 	Backend string `json:"backend"`
 
 	// User is the person's id on that backend: their email on Google Chat
 	// (compared without case) and on a2a-google (as their Google token
+	// carries it), their Entra object id on a2a-entra (as their Entra token
 	// carries it), their user id on Slack or Discord.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=128
@@ -496,7 +498,14 @@ type TeamsSpec struct {
 	// +optional
 	AllowAllUsers *bool `json:"allowAllUsers,omitempty"`
 
-	// HomeChannel is the default channel ID for scheduled messages.
+	// HomeChannel is the Teams conversation the agent's proactive posts go
+	// to: on the Hermes path the default conversation for scheduled
+	// messages; with the gateway's Teams backend armed (the operator's
+	// A2A_TEAMS_BACKEND switch), the home its chat.notify route posts alerts
+	// and reports into. A conversation id: "19:..." (a channel ends in
+	// @thread.tacv2, a group or meeting chat in @thread.v2) or "a:..." (a
+	// personal chat), never a thread (no ";messageid="); the gateway refuses
+	// any other shape, and only a channel home threads its posts.
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
 
