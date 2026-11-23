@@ -3,7 +3,7 @@
 # and updates a ConfigMap or Lease hundreds of times a second; other
 # controllers that run in Pods share its API priority level and can see added
 # latency or 429 when the level is over its concurrency. Three documented
-# behaviours carry the claim. client-go, `rest.Config`
+# behaviours carry the claim (pages read 2026-11-19). client-go, `rest.Config`
 # field `QPS`: "If it's zero, the created RESTClient will use DefaultQPS: 5.
 # Setting this to a negative value will disable client-side ratelimiting
 # unless `Ratelimiter` is also set."
@@ -23,15 +23,18 @@
 # every client, and fair queuing limits what one controller takes from the
 # others.
 # A live test (2026-11-20, GKE Standard 1.35.8, one run) agrees with these
-# bounds and did not reach the failure: 40 loops patched a ConfigMap with no
-# client-side limit for 150 seconds. At GKE's own `workload-low` level (25
-# seats) 1879 writes succeeded, about 12 a second, and none got 429; a second
-# service account of the same level got no error, and its median request time
-# rose from 0.021 s to 0.108 s; a new Deployment was ready in 13 s during the
-# flood. In a level of the test's own with 1 seat the flooder got 429 on 6961
-# of 10094 requests, and the second account still got none. Not tested:
-# hundreds of writes a second, a flood that fills GKE's own level, etcd over
-# hours, Autopilot.
+# bounds: 40 loops patched a ConfigMap with no client-side limit for 150
+# seconds. In the first phase, with GKE's own settings (`workload-low` has 25
+# seats; which level served the two accounts was not read), 1879 of 1882
+# writes succeeded, about 12 a second, 3 got no HTTP answer and none got 429;
+# a second service account got no error, and its median request time rose from
+# 0.021 s to 0.108 s; a new Deployment was ready in 13 s during the flood. In
+# the second phase, with both accounts in a level of the test's own with 1
+# seat, the flooder got 429 on 6961 of 10094 requests; the second account got
+# none, and its median rose to 0.098 s. So the second account was slowed about
+# fivefold in both phases and refused in neither. Not reached: 429 at GKE's
+# own level, and hundreds of writes a second. Not tested: etcd over hours,
+# Autopilot.
 # A declared gap: expected_fail until the
 # check lands (gke-labs/kube-agents#5412, which proposes
 # `apiserver-configmap-lease-write-storm`). Nothing is planted today: the
@@ -41,11 +44,16 @@
 # its role and flips the marker in the same diff. A zero is not the shape:
 # by the source above a QPS of 0 is the default limit of 5, so a check that
 # names `--kube-api-qps=0` names a limited client.
-# #5412 spells the planned arguments `--qps=0 --burst=0`. A negative QPS alone
-# is not the fault: controller-runtime sets it for each controller built on it
-# ("Disable client-side ratelimer by default, we can rely on API priority and
-# fairness", `pkg/client/config/config.go`, v0.25.2), with no argument for a
-# check to read; the fault is the write rate.
+# #5412 spells the planned arguments `--qps=0 --burst=0 --sync-period=20ms`
+# and says that the API server answers 429 "to every other client"; its text
+# predates this header, and where they differ this header is the newer one. A
+# negative QPS is also what controller-runtime v0.25.2, the version this
+# repository pins, sets when its config loader finds no QPS set ("Disable
+# client-side ratelimer by default, we can rely on API priority and fairness",
+# `GetConfigWithContext` in `pkg/client/config/config.go`), so a controller
+# can run with the client-side limit off and no argument for a check to read.
+# Whether a check on arguments is then worth a finding is a question for
+# #2581's owners, who plan the check.
 # The flag is spelled as
 # kube-controller-manager spells it ("--kube-api-qps float Default: 20 QPS to
 # use while talking with kubernetes apiserver",

@@ -21,8 +21,9 @@
 # (https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#nfs-mount-table-exhaustion,
 # read 2026-11-23; not tested). The upgrade readiness rule
 # `known-issues-matrix` names a cluster whose control-plane version, or whose
-# upgrade target, is in those versions, from `known_issues.json`; it reads
-# versions, not mounts.
+# upgrade target, is in those versions, from `known_issues.json`; it reads no
+# mounts and no node pool's version, so a cluster with a fixed control plane
+# and an affected pool is not named.
 # The GCE compute collector reads serial consoles, MIG counters, sole-tenant
 # groups and snapshots and no DaemonSet or node mount count; no other stream
 # reads them on a schedule. Nothing is planted. A fixture for (A) is possible:
