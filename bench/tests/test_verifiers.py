@@ -9231,8 +9231,12 @@ def test_the_checked_webhooks_route_is_the_failclosed_case_route():
         _CHECKED_GATE_LINE + "\n" + "seeded-d/gmp-operator.gmp-system.monitoring.googleapis.com: kind: webhook; backend: ready",
         # slot b's other planted dead gate, where the fleet has it, with its backend missing
         "\n".join([_CHECKED_GATE_LINE, _checked_line("seeded-crd-gate", "missing"), _CHECKED_LIVE_LINE]),
+        # a planted dead gate by its Service name with its backend missing: the forbids are for
+        # another value only
+        "\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-admission-gate", "missing"), _checked_line("nonexistent-crd-gate", "missing"), _CHECKED_LIVE_LINE]),
         # a real name that starts with a digit, or with a refused word and a dot: the refusal is
-        # for a whole segment, not for the start of a name
+        # for a segment that is a refused word or a number, alone or before a hyphen or a space,
+        # not for a start that goes on with a letter or a dot
         _CHECKED_GATE_LINE + "\n" + _checked_line("1password.example.com", "ready"),
         _CHECKED_GATE_LINE + "\n" + _checked_line("each.example.com", "ready"),
     ],
@@ -9257,7 +9261,7 @@ def test_the_checked_webhooks_lines_accepted(text):
         # slot b's other planted dead gate written as ready, by configuration, webhook or Service
         (_CHECKED_GATE_LINE + "\n" + _checked_line("seeded-crd-gate", "ready"), "fail", "fail"),
         (_CHECKED_GATE_LINE + "\n" + _checked_line("crd-gate.seeded.invalid", "ready"), "fail", "fail"),
-        (_CHECKED_GATE_LINE + "\n" + _checked_line("nonexistent-crd-gate", "ready"), "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("nonexistent-crd-gate", "ready"), "fail", "fail"),
         # a ready line of another kind, and a webhook whose backend is not ready
         (_CHECKED_GATE_LINE + "\n" + _checked_line("inference-server", "ready", kind="pdb"), "pass", "fail"),
         (_CHECKED_GATE_LINE + "\n" + _checked_line("warden-validating", "missing"), "pass", "fail"),
@@ -9269,6 +9273,10 @@ def test_the_checked_webhooks_lines_accepted(text):
         # objective's second forbid
         ("\n".join([_CHECKED_GATE_LINE, _checked_line("seeded-crd-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
         ("\n".join([_CHECKED_GATE_LINE, _checked_line("crd-gate.seeded.invalid", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        # either planted dead gate written as ready by its Service name beside a true ready line:
+        # the second objective passes on the true line, so the gate objective's forbids refuse it
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-crd-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-admission-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
         # a count in the line form, the nearest thing an answer with no names can write: a word for
         # the rest or a number in the place of the name, with or without the word webhooks
         (_CHECKED_GATE_LINE + "\nseeded-a/others: kind webhook; backend: ready", "pass", "fail"),

@@ -15,8 +15,10 @@
 #   - the planted gate's line (its configuration seeded-fail-closed-gate or its webhook
 #     gate.seeded.invalid) says `backend: missing`; the forbid is the gate with any other value,
 #     and slot b's other planted dead gate (seeded-crd-gate, role readiness-crd-webhook) with any
-#     other value where an answer names it. That gate is not required: a fleet that does not carry
-#     the role has no such webhook, and the case does not list the role;
+#     other value where an answer names it. The forbid reads each gate by its configuration, its
+#     webhook or its Service, so a dead gate written as ready by its Service name beside a true
+#     ready line fails here. That gate is not required: a fleet that does not carry the role has
+#     no such webhook, and the case does not list the role;
 #   - at least one webhook line says `backend: ready`, on a line that names none of slot b's
 #     planted dead gates and whose object ends in a name after a slash, so the common forms of a
 #     line with no name ("all other webhooks", a number in the place of the name, the prompt's
@@ -75,7 +77,9 @@ fixtures:
 
 verification_spec:
   # The planted gate, by its configuration or its webhook: its backend is missing. Neither name is
-  # in the prompt, so the line is the agent having read the gate from the run.
+  # in the prompt, so the line is the agent having read the gate from the run. The forbids also
+  # read the Service name of each planted dead gate: the second objective passes on one true ready
+  # line, so these are the only refusal of a dead gate written as ready beside it.
   - name: the-gate-line-says-its-backend-is-missing
     role: objective
     # assert, not the converge default: the transcript is immutable once the run ends.
@@ -88,8 +92,8 @@ verification_spec:
       any_of_patterns:
         - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; backend: missing\s*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; backend: (?!missing\s*$)'
-        - '(?m)^[^\n]*(?<![a-z0-9.-])(?:seeded-crd-gate|crd-gate\.seeded\.invalid)(?![a-z0-9-])[^\n]*; backend: (?!missing\s*$)'
+        - '(?m)^[^\n]*(?<![a-z0-9-])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n]*; backend: (?!missing\s*$)'
+        - '(?m)^[^\n]*(?<![a-z0-9.-])(?:seeded-crd-gate|crd-gate\.seeded\.invalid|nonexistent-crd-gate)(?![a-z0-9-])[^\n]*; backend: (?!missing\s*$)'
 
   # A webhook whose backend answered is named: a line whose object ends in a name after a slash
   # (the configuration, or the configuration and the webhook), whose kind field has the word
