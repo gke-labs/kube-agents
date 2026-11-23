@@ -294,13 +294,19 @@ def _stream_state(root: str, audit_id: str) -> tuple[str, str | None]:
     """The stream's liveness and stream-level error, as `streams` reports
     them: the same projection, so `runs` and a refusal cannot disagree with
     it about a lease, and an `error` liveness always comes with its reason."""
+    liveness, error, _ = _stream_state_and_shadow(root, audit_id)
+    return liveness, error
+
+
+def _stream_state_and_shadow(root: str, audit_id: str) -> tuple[str, str | None, bool]:
+    """`_stream_state`, and whether the projection reads the stream as a shadow run's."""
     try:
         stream = report_status.project_stream(
             root, report_status.scratch_root(), audit_id, time.time()
         )
     except (OSError, ValueError, OverflowError) as exc:
-        return "error", f"the stream could not be projected: {_oneline(exc)}"
-    return stream["liveness"], stream.get("error")
+        return "error", f"the stream could not be projected: {_oneline(exc)}", False
+    return stream["liveness"], stream.get("error"), report_status.stream_is_shadow(stream)
 
 
 def _liveness(root: str, audit_id: str) -> dict:
@@ -761,7 +767,13 @@ def cmd_runs(args: argparse.Namespace) -> dict:
     # sibling repository's corrupt store, a stray directory, an unreadable
     # lease -- and a lease that makes liveness `running` does not clear it.
     # The ring still lists; the error makes the exit 2, as it does there.
-    liveness, error = _stream_state(root, args.stream)
+    liveness, error, shadow = _stream_state_and_shadow(root, args.stream)
+    if shadow and not args.include_shadow:
+        raise QueryError(
+            f"{args.stream} is a shadow run's stream: a canary's results, not a live "
+            "audit's. Answer from the live audit's stream instead.",
+            shadow=True,
+        )
     return {
         "root": root,
         "audit_id": args.stream,

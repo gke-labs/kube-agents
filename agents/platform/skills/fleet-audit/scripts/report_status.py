@@ -99,13 +99,22 @@ LATEST_KEYS = (
     "collect_s",
 )
 
-# A shadow run's envelope carries this (audit_report.SHADOW_KEY, #5623): its
-# stream is a canary's, not a live audit's, so readers hide it unless asked.
+# A shadow run's envelope carries this (#5623; audit_report.py's shadow runs,
+# `finish --store-only`): its stream is a canary's, not a live audit's, so
+# readers hide it unless asked. The writer's contract is what makes reading
+# the newest envelope enough: a shadow run writes only to a stream of its
+# own (the schedule's name, or `<audit>-shadow`) and never to a live audit's,
+# which its writer refuses, so a stream's newest envelope says what the
+# whole stream is.
 SHADOW_KEY = "shadow"
 
 
 def stream_is_shadow(stream: dict) -> bool:
-    """Whether a projected stream is a shadow run's: its newest envelope in any repository says so."""
+    """Whether a projected stream is a shadow run's: its newest envelope in any repository says so.
+
+    A stream whose envelopes can't be read can't be told apart, and stays in
+    as unreadable: unknown is never clean.
+    """
     return any(
         isinstance(entry, dict) and (entry.get("latest") or {}).get(SHADOW_KEY) is True
         for entry in (stream.get("repos") or {}).values()
