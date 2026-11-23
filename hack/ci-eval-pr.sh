@@ -1509,8 +1509,8 @@ LEDGER_RESET_MINT_RETRY_DELAY=2
 # (start_ledger_token_renewal): well inside the hour an installation token
 # lasts, with room for the mint's own retry ladder.
 LEDGER_TOKEN_RENEW_SECONDS=2400
-# The renewer's sleep step. Short, so the sleep a stopped renewer leaves
-# behind ends within seconds rather than holding the unit's output open.
+# The renewer's sleep step. Short, so a renewer whose unit was killed before
+# its stop notices within seconds rather than holding the job's output open.
 LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
@@ -1675,8 +1675,15 @@ start_ledger_token_renewal() { # <label> <file>
   (
     waited=0
     failures=0
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
+    # a TERM to arrive ahead of.
+    napping=""
+    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
@@ -1703,6 +1710,15 @@ start_ledger_token_renewal() { # <label> <file>
   LEDGER_TOKEN_RENEWER=$!
 }
 
+# Ends the renewer and removes the file. The renewer traps TERM, and bash runs a
+# trap only once the foreground command returns, so the wait below outlasts the
+# one command under way and the renewer runs nothing after it: the rm is final.
+# Killed outright, the renewer would leave that command running to write a live
+# token after the rm. A mint under way here is abandoned after its current
+# command (a mint call or a retry sleep), which leaves mint_ledger_token's
+# diagnostics file behind. The GitOps write token's mint is one command
+# substitution, so its whole retry ladder finishes first and its token is
+# dropped unwritten.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
@@ -1782,8 +1798,15 @@ start_gitops_write_token() { # <label> <file>
   (
     waited=0
     failures=0
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
+    # a TERM to arrive ahead of.
+    napping=""
+    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
@@ -1808,7 +1831,8 @@ start_gitops_write_token() { # <label> <file>
   echo "GitOps write token (${label}): minted from App ${EVAL_LEDGER_APP_ID}, narrowed to ${EVAL_LEDGER_REPO} and contents, pull_requests and issues write, in ${file}"
 }
 
-# Ends the renewer and removes the file. A developer's own
+# Ends the renewer, as stop_ledger_token_renewal does and for its reason, and
+# removes the file. A developer's own
 # TF_VAR_bench_gitops_write_token_file (start_gitops_write_token minted nothing) stays as
 # the environment set it.
 stop_gitops_write_token() { # <file>
@@ -4896,6 +4920,10 @@ unit_cost_hint() {
     fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
+    # The same full audit after a plant that waits eleven minutes, so that
+    # the failed pulls it plants are older than the check's ten (3.28).
+    # Unmeasured: the audit band plus the wait.
+    obtainability-image-pull-failing) echo 1600 ;;
     # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
     # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
     # kustomize case runs in the second phase (writes_alone), so its hint
@@ -5152,7 +5180,7 @@ unit_delegation_timeout() {
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
-    obtainability-planted-orphan-service) echo 3000 ;;
+    obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
     fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;

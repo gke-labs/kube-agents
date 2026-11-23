@@ -39,6 +39,13 @@ const (
 	// that reservation key on.
 	A2ABusTokenAudience = "a2a-bus"
 
+	// WatcherTokenAudience is the audience the gateway's watchers present to
+	// the credential proxy for the watcher role.
+	WatcherTokenAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	// WatcherTokenVolumeName is the reserved volume name the operator projects
+	// the watcher token under for the agent-api-auth container alone.
+	WatcherTokenVolumeName = "watcher-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
+
 	// The suffixes that build the names of the bus objects the operator
 	// renders off the PlatformAgent's own name. Here for the same reason as
 	// the audience: the webhook has to recognise the Secrets that carry bus
@@ -333,12 +340,12 @@ func IsSensitiveEnvVar(name string) bool {
 // The watchers' broker token is the second member, in either mode: it is
 // projected into the gateway's agent-api-auth container alone, and any other
 // container holding it holds the broker's watcher role (every fleet cluster's
-// events and named objects). The controller's watcherTokenSourceNames strips
-// it, and any volume projecting its audience under another name, at render;
-// this is the name half's admission message. The source half is render-only.
+// events and named objects). BusCredentialRoutes below is the source half of
+// both reservations, and the controller's watcherTokenSourceNames strips both
+// halves at render and reports them on VolumesDropped.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token":                  {},
-	"watcher-credential-proxy-token": {},
+	"a2a-bus-token":        {},
+	WatcherTokenVolumeName: {},
 }
 
 // ReservedVolumePrefixes lists volume name prefixes reserved for operator-managed
@@ -349,7 +356,7 @@ var ReservedVolumePrefixes = []string{
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
-// used to reach the bus credential without naming the reserved volume.
+// used to reach the bus or watcher credential without naming the reserved volume.
 type BusCredentialRouteKind string
 
 const (
@@ -357,6 +364,10 @@ const (
 	// audience is A2ABusTokenAudience: a valid bus token for the pod's
 	// ServiceAccount, under whatever volume name the CR chose.
 	BusCredentialRouteAudience BusCredentialRouteKind = "audience"
+	// BusCredentialRouteWatcherAudience is a projected serviceAccountToken source
+	// whose audience is WatcherTokenAudience: a valid watcher-role token for the
+	// credential proxy, under whatever volume name the CR chose.
+	BusCredentialRouteWatcherAudience BusCredentialRouteKind = "watcher-audience"
 	// BusCredentialRouteSecret is a volume that mounts one of the Secrets the
 	// operator renders with a bus credential in it (A2ACredentialSecretNames),
 	// either as a `secret` volume or as a projected `secret` source.
@@ -436,8 +447,13 @@ func BusCredentialRoutes(v corev1.Volume, agentName string) []BusCredentialRoute
 	}
 	if v.Projected != nil {
 		for i, src := range v.Projected.Sources {
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == A2ABusTokenAudience {
-				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+			if src.ServiceAccountToken != nil {
+				switch src.ServiceAccountToken.Audience {
+				case A2ABusTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+				case WatcherTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteWatcherAudience, Source: i})
+				}
 			}
 			if src.Secret != nil && isCredential(src.Secret.Name) {
 				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i, Secret: src.Secret.Name})
@@ -2790,8 +2806,10 @@ type StorageStatus struct {
 	Bound bool `json:"bound,omitempty"`
 
 	// CapacityBytes is the size of the filesystem on the agent's data volume,
-	// as the gateway pod's event watcher last read it. Absent when the watcher
-	// is disabled or the operator has no current reading from it.
+	// as the gateway pod's event watcher last read it. Absent before the first
+	// poll, while the watcher is disabled, after two polls in a row with no
+	// fleet reading (including k8s_event_watcher_watch_set_ready below 1), or
+	// when a ready watcher answers without the volume metric.
 	// +optional
 	CapacityBytes *int64 `json:"capacityBytes,omitempty"`
 
@@ -3599,11 +3617,15 @@ type AgentUsageStatus struct {
 	// stands. A gauge, not a counter: it falls on a removal or after such a
 	// restart. Absent when the operator has no
 	// current reading: before the first poll, while the event watcher is
-	// disabled, and after two polls in a row in which no gateway replica
-	// could be read, whether its listener failed, its pod was not running, or
-	// the operator could not reach it; the CR's events and the gateway pod's
-	// state say which. A 0 is a reading: the watcher answered and exports no
-	// series.
+	// disabled, or after two polls in a row without a current fleet
+	// reading. That includes a listener failure, a pod not running, an
+	// unreachable gateway, or a restarting watcher still building its
+	// initial watch set (k8s_event_watcher_watch_set_ready below 1). Check
+	// the CR's events, the gateway pod's state, and the watcher's logs or
+	// k8s_event_watcher_watch_set_ready metric to see which applies; a
+	// startup hold writes no CR event. A 0 is a reading once k8s_event_watcher_watch_set_ready reaches 1, or from
+	// an older watcher without that gauge: the watcher answered with no
+	// cluster series.
 	// +optional
 	ClustersRegistered *int64 `json:"clustersRegistered,omitempty"`
 
@@ -3611,12 +3633,12 @@ type AgentUsageStatus struct {
 	// events: the k8s_event_watcher_cluster_up series at 1, whose informer
 	// has completed its initial list. The difference from ClustersRegistered
 	// is the number of clusters silently unwatched, a stuck informer, a 403
-	// on the events list, or a stopped one. A 0 is a reading, and the normal
-	// one while the watcher starts, so read a fall alongside the pod's age.
-	// Absent on the same terms as ClustersRegistered: one poll in which no
-	// gateway replica could be read leaves both where they were, and a
-	// second in a row clears both, because the operator then has no current
-	// reading and an absent field says so.
+	// on the events list, or a stopped one. Once the watch set is ready
+	// (k8s_event_watcher_watch_set_ready at 1), a 0 is a reading and normal
+	// until informers finish their initial list, so read a drop alongside
+	// the pod's age. Absent on the same terms as ClustersRegistered: one poll
+	// without a current fleet reading leaves both where they were, and two
+	// in a row clear both because the operator has no current reading.
 	// +optional
 	ClustersMonitored *int64 `json:"clustersMonitored,omitempty"`
 

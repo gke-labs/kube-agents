@@ -266,6 +266,7 @@ NUMBER_WORDS = {
             "twenty-five",
             "twenty-six",
             "twenty-seven",
+            "twenty-eight",
         )
     )
 }

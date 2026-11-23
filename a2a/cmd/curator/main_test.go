@@ -315,6 +315,28 @@ func TestDaemonStatusEndpoints(t *testing.T) {
 	_, _ = io.Copy(io.Discard, hResp.Body)
 	_ = hResp.Body.Close()
 
+	mResp, err := httpClient.Get("http://" + addr + "/metrics")
+	if err != nil || mResp.StatusCode != http.StatusOK {
+		t.Fatalf("/metrics failed: resp=%+v err=%v", mResp, err)
+	}
+	mBytes, rErr := io.ReadAll(mResp.Body)
+	_ = mResp.Body.Close()
+	if rErr != nil {
+		t.Fatalf("read /metrics body: %v", rErr)
+	}
+	mText := string(mBytes)
+	for _, series := range []string{
+		"kubeagents_curator_outcomes_total",
+		"kubeagents_curator_records",
+		"kubeagents_curator_graduations_total",
+		"kubeagents_curator_queries_total",
+		"process_start_time_seconds",
+	} {
+		if !strings.Contains(mText, series) {
+			t.Errorf("/metrics output missing %q:\n%s", series, mText)
+		}
+	}
+
 	cancel()
 	select {
 	case dErr := <-done:
@@ -416,4 +438,3 @@ func TestRunCheckOverseerCapsLLMFindingsAtWarnAndDreamSubcommand(t *testing.T) {
 		t.Fatalf("expected DEC-2026-041 in demoted_drifted, got %+v", dreamRep)
 	}
 }
-

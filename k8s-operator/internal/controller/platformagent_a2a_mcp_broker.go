@@ -172,9 +172,9 @@ func withA2AMCPBrokerAccess(agent *agentv1alpha1.PlatformAgent, spec corev1.PodS
 //
 // There is no egress half: no NetworkPolicy selects the MCP pod for egress
 // (its fence, buildA2AMCPNetworkPolicy, is ingress-only), so its egress is
-// already open, as the A2A gateway's is for the same broker. An egress
-// policy naming only the broker would default-deny the pod's DNS and bus
-// traffic.
+// already open. An egress policy naming only the broker would default-deny
+// the pod's DNS and bus traffic; the A2A gateway's egress policy
+// (buildA2AGatewayEgressPolicy) admits the broker beside both of those.
 func a2aMCPBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
 	if !a2aMCPBrokerEnabled(agent) {
 		return nil

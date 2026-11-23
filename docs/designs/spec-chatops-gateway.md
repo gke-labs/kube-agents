@@ -317,7 +317,11 @@ after the restart. Each earlier turn's answer posts as it completes; the result 
 last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
 child is checked against the target's list first (rule `delegation.child-steer`);
 refused, it is not published, its author is not recorded, and the room is told the
-target is not reachable from here.
+target is not reachable from here. A steer into a running task that holds `ChangeRequested` (one a
+structured confirm started, or its child or wake) is refused from every door (rule
+`steer-change-requested`): it is not published, its author is not recorded, and the room is
+told to stop the task and confirm again. That covers an `input-required` answer and a choice
+click too, since both arrive as steers.
 
 **The busy notice.** The gateway tells a person when their turn is going to wait, on the
 turn's own status line. Once a fixed-route turn's task is on the bus, the gateway counts the
@@ -965,7 +969,8 @@ released from the serialization at the conversation's next turn once it is older
 first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
 conversation saying so. Both subjects, not just `…events`: the fold reads them together,
 and assertion 9 exists because a task whose only event is its supervisor's terminal is not
-empty. That release publishes no terminal: age alone is not
+empty, unless that terminal is a five-token one on a profile task stored after the
+install's `A2A_PROFILE_SUPERVISOR_CUTOFF`, which is not folded, so the task is empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
@@ -3134,7 +3139,10 @@ submission as a `replyTo` part, `spec-a2a-payloads.md`, and the relayed report a
 `chat.console.<token>.in`, or to `chat.console.<token>.confirm` for a click on a confirm button
 (added 10/30): the same frame, which the adapter delivers with the confirm intent, so its task is
 submitted with `TaskParameters.ChangeRequested`. The subject is the only route to the confirm: a
-frame on `.in` with `kind` `confirm` is dropped as an unknown kind. The adapter posts the gateway's
+frame on `.in` with `kind` `confirm` is dropped as an unknown kind. A frame on `.in` while such a
+task runs is not steered into it: the console's human and its MCP server publish there as the same
+author, so the gateway refuses every steer into a change-requested task and tells the tab to stop
+it and confirm again. The adapter posts the gateway's
 own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
 protocol, and the payload spec's agreement rules do not apply to it. Each task's end goes out
@@ -3474,7 +3482,11 @@ which reads the gateway's inbound-message counter. Each armed door renders a cop
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every install now so that it is not (decided
-10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+10/6 on #2473). It is Ingress-only. The gateway's own dials are governed by a second policy,
+`<name>-a2a-gateway-egress` (#6553), which renders and goes with the fence: cluster DNS, the
+bus's client port, the broker's port, the Kubernetes API server, and TCP 443 except to private,
+link-local and shared addresses, for Slack, Discord and the A2A door's token check. Google Chat
+reaches Google through the broker's relay.
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
 once the gateway has bound its event relay and 503 until then, with the reason as the body
