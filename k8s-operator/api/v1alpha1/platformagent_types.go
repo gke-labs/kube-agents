@@ -498,7 +498,14 @@ type TeamsSpec struct {
 	// +optional
 	AllowAllUsers *bool `json:"allowAllUsers,omitempty"`
 
-	// HomeChannel is the default channel ID for scheduled messages.
+	// HomeChannel is the Teams conversation the agent's proactive posts go
+	// to: on the Hermes path the default conversation for scheduled
+	// messages; with the gateway's Teams backend armed (the operator's
+	// A2A_TEAMS_BACKEND switch), the home its chat.notify route posts alerts
+	// and reports into. A conversation id: "19:..." (a channel ends in
+	// @thread.tacv2, a group or meeting chat in @thread.v2) or "a:..." (a
+	// personal chat), never a thread (no ";messageid="); the gateway refuses
+	// any other shape, and only a channel home threads its posts.
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
 

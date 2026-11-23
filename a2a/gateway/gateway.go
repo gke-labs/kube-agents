@@ -406,6 +406,11 @@ type Gateway struct {
 	// case preserved: Slack member ids compare exactly).
 	slackAllowed  map[string]bool
 	slackAllowAll bool
+	// teamsAllowed and teamsAllowAll gate the teams backend's identity the
+	// way gchatAllowed does Chat's: the Entra object id is the principal,
+	// compared lowercased, and the allowlist is the whole verification config.
+	teamsAllowed  map[string]bool
+	teamsAllowAll bool
 	// a2aGoogleAllowed gates the A2A door's Google-verified callers
 	// (Config.A2ADoorAllowedUsers, lowercased at build). Empty admits
 	// nobody; there is no allow-all.
@@ -507,14 +512,14 @@ func New(o Options) (*Gateway, error) {
 		// render looks exactly the same, and the difference between the
 		// two must not be silence.
 		if o.Config.A2ADoorArmed() {
-			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair or Chat relay is armed, " +
+			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 				"so nothing but the two doors and the console can reach this install (the read route still reports inject-only)")
 		} else {
-			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
+			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 				"so nothing but the eval door can reach this install (inject-only)")
 		}
 	} else if backend == a2aBackend {
-		log.Warn("the gateway is running on the A2A door alone: no Discord token, Slack pair or Chat relay is armed, " +
+		log.Warn("the gateway is running on the A2A door alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 			"so nothing but the A2A door and the console can reach this install")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
@@ -600,6 +605,15 @@ func New(o Options) (*Gateway, error) {
 			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
 		}
 	}
+	teamsAllowed := map[string]bool{}
+	for _, u := range o.Config.TeamsAllowedUsers {
+		if u = strings.TrimSpace(u); u != "" {
+			teamsAllowed[strings.ToLower(u)] = true
+		}
+	}
+	if o.Config.TeamsRelayURL != "" && len(teamsAllowed) == 0 && !o.Config.TeamsAllowAllUsers {
+		log.Warn("teams allowlist is empty and allow-all is off; every inbound Teams message will be dropped at verification")
+	}
 	slackAllowed := map[string]bool{}
 	for _, u := range o.Config.SlackAllowedUsers {
 		if u = strings.TrimSpace(u); u != "" {
@@ -676,6 +690,8 @@ func New(o Options) (*Gateway, error) {
 		tierMembers:      tierMembers,
 		slackAllowed:     slackAllowed,
 		slackAllowAll:    o.Config.SlackAllowAllUsers,
+		teamsAllowed:     teamsAllowed,
+		teamsAllowAll:    o.Config.TeamsAllowAllUsers,
 		a2aGoogleAllowed: a2aGoogleAllowed,
 		a2aEntraAllowed:  a2aEntraAllowed,
 		droppedNotices:   map[string]bool{},
@@ -1891,7 +1907,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// switch's default branch, which only a nil or detached active task
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
-	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID)
+	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID, g.profileRead(rec, active.TaskID, addressee))
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
@@ -2349,7 +2365,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			}
 		}
 	}
-	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read)
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read, g.profileRead(rec, read, addressee))
 	// What the fold shows about a delegate request, for the hand-off rule
 	// below; nil when the read found nothing to fold.
 	var foldEvidence *delegateEvidence
@@ -2476,7 +2492,7 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 	for i, link := range links {
 		folded := readTask
 		if link.ID != read {
-			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID, g.profileRead(rec, link.ID, link.Addressee))
 			switch {
 			case err == nil:
 				folded = t
@@ -2751,6 +2767,13 @@ func conversationIsOwnThread(backend, conversation string) bool {
 	case slackBackend:
 		_, threadTS, ok := slackChannelThread(conversation)
 		return ok && threadTS != ""
+	case teamsBackend:
+		// A channel thread carries its ;messageid= suffix. A bare channel id
+		// names the whole channel, and a personal or group chat has no
+		// threads: every message there shares one key, so the generic
+		// wording (sessionOnAck) is the true one.
+		id, ok := strings.CutPrefix(conversation, teamsKeyPrefix)
+		return ok && strings.Contains(id, teamsThreadToken)
 	}
 	return false
 }
@@ -3432,12 +3455,16 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// (promptFromMessage) frames this one; the a2a-worker (textFromParts),
 	// which runs session pods and profile tasks, does not read it yet; the
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
+	// A chat thread's kept reports are forgotten once this turn is on the
+	// bus (below), not here: a publish that fails leaves them for the retry.
+	var threadReportRead uint64
 	if ts.Role == "" {
-		if report, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+		if report, seq, ok := g.relayedReport(rec, ts.ReplyTo); ok {
 			if part, err := lib.PushedReportPart(report); err != nil {
 				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
 			} else {
 				extra = append(extra, part)
+				threadReportRead = seq
 			}
 		}
 	}
@@ -3609,6 +3636,13 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 		return "", false
 	}
+	if threadReportRead > 0 {
+		// The turn under the thread's newest report is on the bus: the
+		// reports through the one it read are forgotten, so the next turn
+		// there is not under a report it was not about; one kept during the
+		// publish stays, at the cap too.
+		g.reports.forgetThrough(rec.Key, threadReportRead)
+	}
 
 	// The submission is on the subject now, which is the first moment
 	// anything can be said to have been handed to an executor. An observer
@@ -3689,6 +3723,14 @@ var steerRefusalWhy = map[string]string{
 	lib.SteerReasonNoResume:   "this agent's executor can't continue a session, so follow-ups run on the api executor only",
 }
 
+// ruleSteerChangeRequested names the refusal of a steer into a task that
+// holds ChangeRequested (steerTask), and noticeSteerChangeRequested is what
+// its conversation is told.
+const (
+	ruleSteerChangeRequested   = "steer-change-requested"
+	noticeSteerChangeRequested = "⚠️ not sent: the running task is making a confirmed change, and what it's asked to do can't change while it runs. Stop it, then send what you want as a new confirm."
+)
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
@@ -3716,6 +3758,20 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
 			return
 		}
+	}
+	// A task that holds ChangeRequested was started by a person's
+	// structured confirm and may write. A steer would change what it is
+	// asked to do while it runs, and the gateway can't tell who on a door
+	// sent it (the console's human and its MCP server share one author), so
+	// no steer reaches it from any door: the requester stops the task and
+	// confirms again (#5884). A confirm is already refused while a task
+	// runs (noticeConfirmWhileRunning). Before the author is recorded, as
+	// for the checks below.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.ChangeRequested {
+		g.log.Warn("steer refused", "rule", ruleSteerChangeRequested, "taskId", active.TaskID, "conversation", rec.Key,
+			"steerBackend", author.Backend, "steerAuthor", author.Subject)
+		g.post(rec.Key, noticeSteerChangeRequested)
+		return
 	}
 	// A profile task's grant was minted once, at its authors' tier: a steer
 	// from someone at another tier is refused, before the author is
@@ -3766,6 +3822,14 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.post(rec.Key, noticeSteerNotSent)
 		return
 	}
+	// A message steered into a chat thread's running task is the human
+	// talking in the thread to the session already at work there: the
+	// thread's kept reports are forgotten, so they do not ride a later,
+	// unrelated opening turn (pushedReports). A report kept since that task
+	// opened is not carried either; the executor's own lookup serves it.
+	if lib.ThreadKeyedConversation(rec.Key) {
+		g.reports.forget(rec.Key)
+	}
 	// The steer is on the stream, and what happens next is the route's
 	// contract (spec: gateway-authored posts): a session worker absorbs it at
 	// its next turn boundary if the task is still running; the fixed-route
@@ -3777,7 +3841,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// is promised. A read that fails keeps the route's line. The read is
 	// direct gets (taskStreamEmpty), not a replay, so a steer opens no
 	// consumer.
-	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	empty, emptyErr := g.taskStreamEmpty(ctx, rec, active.TaskID)
 	noFirstEvent := emptyErr == nil && empty
 	if noFirstEvent {
 		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
@@ -3927,7 +3991,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 // payoff the payload spec's replay rule promises.
 func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) {
 	active := rec.ActiveTask
-	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
+	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID, g.profileRead(rec, active.TaskID, rec.Addressee))
 	if err != nil {
 		if _, ok := err.(*lib.A2AError); ok {
 			g.post(rec.Key, "📭 no events on the stream for this task yet")

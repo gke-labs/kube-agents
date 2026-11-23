@@ -79,7 +79,9 @@ gateway's `incident_context` hook. The bridge makes the hook's by-thread read in
 message with no row and the Google Chat first-reply recovery, do not run on the `api`
 executor): when the submission carries no `pushedReport` part (the A2A gateway relays a report
 it posted into a conversation; `a2a/docs/hermes-bridge.md`; a relayed scheduled report is a
-home-channel thread post the gateway does not keep, so the by-thread read still serves it),
+home-channel thread post the gateway does not keep, so the by-thread read still serves it, except
+for the one opening turn after a card's report posted into that thread, which carries the card's
+report instead),
 before the task's first turn it tries the row a console reply names with its
 `replyTo` part (`<key>#<task>`, `a2a/docs/hermes-bridge.md`), then looks the
 conversation's thread up in the same table, and the row the kanban notifier stores for
@@ -642,18 +644,23 @@ the report's last line, which the notice must not be.
 ## Which platforms a report is posted to
 
 Every chat platform the install has enabled, resolved by
-`session_kv_server.enabled_chat_platforms`. Three sources, most specific first,
-and consulted **per platform** so that one naming Slack cannot hide a Google Chat
-another knows about: the operator's managed scope
+`session_kv_server.enabled_chat_platforms`. A platform the A2A gateway routes
+(`chat_notify.routes`, from `A2A_NOTIFY_PLATFORM` and `A2A_NOTIFY_CONVERSATIONS`)
+counts first, whatever the files say, because the gateway holds its backend. Then
+three sources, most specific first, consulted **per platform** so that one naming
+Slack cannot hide a Google Chat another knows about: the operator's managed scope
 (`/etc/hermes/config.yaml`, which carries `platforms.<p>.enabled` as explicit
 booleans and therefore settles it outright on a deployed pod), then `CONFIG_PATH`
 — `/opt/data/config.yaml`, the front door's own writable file rather than a named
 profile's — then per-platform environment signals for an install neither file
-describes.
+describes. Microsoft Teams is route-only (`ROUTE_ONLY_PLATFORMS`): the gateway's
+Teams backend, armed by the operator's `A2A_TEAMS_BACKEND` switch, is a
+destination; the Hermes Teams platform never was one here (its cron delivery is
+`deliver: teams`), and no file or environment signal makes it one.
 
 An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — an install with
-neither Google Chat nor Slack, or one whose home channel is malformed, which routes
+neither Google Chat nor Slack nor an armed Teams backend, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
 exists. The operator names every armed platform in `A2A_NOTIFY_CONVERSATIONS` and every
 armed platform with a home channel set on the CR in `A2A_NOTIFY_PLATFORM` (each a
