@@ -378,19 +378,29 @@ REPLAY_CACHE_FETCH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-
 # A directory in this checkout, for the commit it is at (_replay_checkout_commit).
 REPLAY_CHECKOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# get_cluster_credentials <cluster> [get-credentials flag...]
+# get_cluster_credentials <cluster> <region> <project>
 #
-# Runs `gcloud container clusters get-credentials` with the arguments given,
-# up to GKE_GET_CREDENTIALS_ATTEMPTS times while the failure is a 503
+# Runs `gcloud container clusters get-credentials` for the cluster, up to
+# GKE_GET_CREDENTIALS_ATTEMPTS times while the failure is a 503
 # (GKE_GET_CREDENTIALS_UNAVAILABLE_RE). Prints gcloud's stderr after every
 # attempt, and returns gcloud's own exit status for the last one. The `||`
 # keeps a failed attempt from ending a `set -e` caller before the retry.
+#
+# Every attempt chooses the endpoint again. gke_dns_endpoint_flag reads the
+# cluster from the same API and gives an empty flag when that read fails, so
+# a flag chosen during the outage could put the IP endpoint in the kubeconfig
+# of a cluster that needs the DNS one.
 get_cluster_credentials() {
+  local cluster=$1 region=$2 project=$3
   local attempt rc delay stderr_file
   stderr_file="$(mktemp)"
   for ((attempt = 1; attempt <= GKE_GET_CREDENTIALS_ATTEMPTS; attempt++)); do
     rc=0
-    gcloud container clusters get-credentials "$@" 2>"${stderr_file}" || rc=$?
+    gke_dns_endpoint_flag "${cluster}" "${region}" "${project}"
+    # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "${cluster}" --region "${region}" --project "${project}" --quiet \
+      $GKE_DNS_ENDPOINT_FLAG 2>"${stderr_file}" || rc=$?
     cat "${stderr_file}" >&2
     if [ "${rc}" -eq 0 ]; then
       break

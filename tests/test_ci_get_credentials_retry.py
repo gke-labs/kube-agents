@@ -13,7 +13,10 @@ These tests source the real `hack/ci-env.sh` under bash with `gcloud` and
 * a 503 on every attempt stops at the attempt limit with gcloud's exit status;
 * any other failure returns on the first attempt with gcloud's exit status;
 * gcloud's stderr is printed for every attempt;
-* the auth step of each CI script that sources ci-env.sh goes through the helper.
+* every attempt chooses the endpoint again, so an endpoint read that failed
+  during the outage does not decide the kubeconfig;
+* the host-cluster auth step of every CI script that sources ci-env.sh goes
+  through the helper.
 """
 
 import os
@@ -27,21 +30,36 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 HACK = REPO_ROOT / "hack"
 ENV_SCRIPT = HACK / "ci-env.sh"
-# Every script that sources ci-env.sh and authenticates to the host cluster.
-AUTH_SCRIPTS = ("ci-deploy.sh", "ci-eval-pr.sh", "ci-connection-test.sh", "ci-teardown.sh")
-# From the endpoint choice to the last argument of the call that follows it.
-AUTH_STEP_RE = re.compile(r'^gke_dns_endpoint_flag "\$(?:HOST_)?CLUSTER_NAME".*?\$GKE_DNS_ENDPOINT_FLAG', re.DOTALL | re.MULTILINE)
+# Each script that sources ci-env.sh and authenticates to the host cluster,
+# with the number of auth steps it has.
+AUTH_SCRIPTS = {"ci-deploy.sh": 1, "ci-eval-pr.sh": 1, "ci-connection-test.sh": 1, "ci-teardown.sh": 1, "ci-forge.sh": 2}
+# The helper call for the host cluster, without what the script does on failure.
+AUTH_STEP_RE = re.compile(
+    r'^\s*(get_cluster_credentials "\$\{?(?:HOST_)?CLUSTER_NAME\}?" "\$\{?REGION\}?" "\$\{?PROJECT_ID\}?")', re.MULTILINE
+)
+# A direct call for the host cluster: the single-shot form the helper replaces.
+DIRECT_CALL_RE = re.compile(r'^\s*gcloud container clusters get-credentials "\$\{?(?:HOST_)?CLUSTER_NAME\}?"', re.MULTILINE)
+HOST_CALL = "container clusters get-credentials platform-agent-host --region us-central1 --project kube-agents-evals --quiet"
 
 UNAVAILABLE = "ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=503, message=The service is currently unavailable."
 PERMISSION_DENIED = "ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=403, message=Permission denied on resource project."
 PROGRESS = "Fetching cluster endpoint and auth data."
 
 # Fails the first STUB_FAILURES get-credentials calls with STUB_ERROR and
-# STUB_EXIT, then succeeds. Any other gcloud call (the endpoint helper's
-# `--help` and `describe`) prints nothing and succeeds.
+# STUB_EXIT, then succeeds. For the endpoint helper it offers --dns-endpoint in
+# `--help`, and its `describe` fails STUB_DESCRIBE_FAILURES times, then answers
+# with a DNS endpoint that accepts external traffic.
 GCLOUD_STUB = """#!/usr/bin/env bash
 case "$*" in
-  *"get-credentials --help"*) exit 0 ;;
+  *"get-credentials --help"*) echo "--dns-endpoint"; exit 0 ;;
+  *"container clusters describe"*)
+    echo "$*" >> "${STUB_LOG}/describe.args"
+    if [ "$(wc -l < "${STUB_LOG}/describe.args")" -le "${STUB_DESCRIBE_FAILURES:-0}" ]; then
+      echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=503" >&2
+      exit 1
+    fi
+    printf 'gke-abc.us-central1.gke.goog\\tTrue\\n'
+    exit 0 ;;
   *"container clusters get-credentials"*) ;;
   *) exit 0 ;;
 esac
@@ -70,16 +88,14 @@ ATTEMPTS = _constant("GKE_GET_CREDENTIALS_ATTEMPTS")
 DELAY = _constant("GKE_GET_CREDENTIALS_RETRY_DELAY_SECONDS")
 
 
-def _auth_step(script):
-    match = AUTH_STEP_RE.search((HACK / script).read_text(encoding="utf-8"))
-    assert match is not None, f"the cluster auth step was not found in hack/{script}"
-    return match.group(0)
+def _auth_steps(script):
+    return AUTH_STEP_RE.findall((HACK / script).read_text(encoding="utf-8"))
 
 
 class GetCredentialsRetryTest(unittest.TestCase):
     maxDiff = None
 
-    def _run(self, body, failures=0, error=UNAVAILABLE, exit_code=1):
+    def _run(self, body, failures=0, error=UNAVAILABLE, exit_code=1, describe_failures=0):
         """Run `body` under bash after sourcing ci-env.sh.
 
         Returns (completed process, gcloud get-credentials calls, sleep arguments).
@@ -105,6 +121,7 @@ class GetCredentialsRetryTest(unittest.TestCase):
                 "STUB_FAILURES": str(failures),
                 "STUB_ERROR": error,
                 "STUB_EXIT": str(exit_code),
+                "STUB_DESCRIBE_FAILURES": str(describe_failures),
             }
             proc = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=60, check=False)
 
@@ -117,12 +134,12 @@ class GetCredentialsRetryTest(unittest.TestCase):
             return proc, lines("gcloud.args"), lines("sleep.args")
 
     def _helper(self, **kwargs):
-        return self._run('get_cluster_credentials "host" --region "r1" --project "p1" --quiet', **kwargs)
+        return self._run('get_cluster_credentials "host" "r1" "p1"', **kwargs)
 
     def test_a_call_that_succeeds_costs_one_call_and_no_wait(self):
         proc, calls, sleeps = self._helper()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(calls, ["container clusters get-credentials host --region r1 --project p1 --quiet"])
+        self.assertEqual(calls, ["container clusters get-credentials host --region r1 --project p1 --quiet --dns-endpoint"])
         self.assertEqual(sleeps, [])
         self.assertIn("kubeconfig entry generated", proc.stdout)
         self.assertIn(PROGRESS, proc.stderr)
@@ -170,7 +187,7 @@ class GetCredentialsRetryTest(unittest.TestCase):
     def test_a_caller_can_handle_the_last_failure_itself(self):
         # ci-teardown.sh ends its auth step in `|| { ...; exit 1; }`.
         proc, calls, _ = self._run(
-            'get_cluster_credentials "host" --quiet || { echo "HANDLED $?"; exit 9; }',
+            'get_cluster_credentials "host" "r1" "p1" || { echo "HANDLED $?"; exit 9; }',
             failures=ATTEMPTS + 5,
             exit_code=7,
         )
@@ -178,17 +195,31 @@ class GetCredentialsRetryTest(unittest.TestCase):
         self.assertEqual(len(calls), ATTEMPTS)
         self.assertIn("HANDLED 7", proc.stdout)
 
+    def test_an_endpoint_read_that_failed_in_the_outage_is_made_again(self):
+        # The first attempt runs with no endpoint flag: its describe got the 503 too.
+        proc, calls, _ = self._helper(failures=1, describe_failures=1)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        base = "container clusters get-credentials host --region r1 --project p1 --quiet"
+        self.assertEqual(calls, [base, f"{base} --dns-endpoint"])
+
     def test_the_auth_step_of_each_ci_script_survives_one_503(self):
-        for script in AUTH_SCRIPTS:
+        for script, steps in AUTH_SCRIPTS.items():
+            found = _auth_steps(script)
+            self.assertEqual(len(found), steps, f"auth steps through the helper in hack/{script}")
+            for step in found:
+                with self.subTest(script=script, step=step):
+                    proc, calls, sleeps = self._run(step, failures=1)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(calls, [f"{HOST_CALL} --dns-endpoint"] * 2)
+                    self.assertEqual(sleeps, [str(DELAY)])
+                    self.assertIn("STEP PASSED", proc.stdout)
+
+    def test_no_ci_script_that_sources_ci_env_calls_gcloud_directly_for_the_host_cluster(self):
+        sourcing = sorted(p.name for p in HACK.glob("*.sh") if 'ci-env.sh"' in p.read_text(encoding="utf-8"))
+        self.assertLessEqual(set(AUTH_SCRIPTS), set(sourcing), "an AUTH_SCRIPTS entry does not source ci-env.sh")
+        for script in sourcing:
             with self.subTest(script=script):
-                proc, calls, sleeps = self._run(_auth_step(script), failures=1)
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertEqual(
-                    calls,
-                    ["container clusters get-credentials platform-agent-host --region us-central1 --project kube-agents-evals --quiet"] * 2,
-                )
-                self.assertEqual(sleeps, [str(DELAY)])
-                self.assertIn("STEP PASSED", proc.stdout)
+                self.assertIsNone(DIRECT_CALL_RE.search((HACK / script).read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":
