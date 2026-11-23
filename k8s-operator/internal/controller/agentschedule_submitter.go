@@ -54,6 +54,13 @@ const (
 	scheduleDeliveryChat = "chat"
 	a2aStateCompleted    = "completed"
 	a2aStateCanceled     = "canceled"
+
+	// scriptRunTaskTextFormat is a script run's task text: the gateway
+	// requires one on every submission (lib.ValidateTriggerSubmit), and a
+	// script run's schedule has no prompt. No model reads it; it is what
+	// the run's task shows as its ask, worded as a record, not an
+	// instruction, should anything ever hand it to a model.
+	scriptRunTaskTextFormat = "Scheduled script run: %s (no model turn)."
 )
 
 // triggerSubmitWire is lib.TriggerSubmit.
@@ -75,6 +82,7 @@ type triggerClaimWire struct {
 	Name   string `json:"name"`
 	Origin string `json:"origin"`
 	Stream string `json:"stream,omitempty"`
+	Script string `json:"script,omitempty"`
 }
 
 // scheduleRefWire is lib.ScheduleRef.
@@ -285,11 +293,26 @@ func triggerSubmitFor(sub ScheduleSubmission) triggerSubmitWire {
 	if stream, ok := strings.CutPrefix(sub.TriggerName, triggerScheduleSource+"/"); ok && sub.Origin == agentv1alpha1.AgentScheduleOriginBuiltin {
 		w.Trigger.Stream = stream
 	}
+	// A built-in schedule's script rides on its trigger, which the gateway
+	// mints into the run's grant and authority (lib.TriggerClaim.Script).
+	// accept() keeps a script off any other schedule; a submission for one
+	// that got here anyway carries no script and no prompt, and the gateway
+	// refuses it.
+	if script := sched.Spec.Script; script != "" && sub.Origin == agentv1alpha1.AgentScheduleOriginBuiltin {
+		w.Trigger.Script = script
+		w.Prompt = fmt.Sprintf(scriptRunTaskTextFormat, script)
+	}
 	if d := sched.Spec.ActiveDeadlineSeconds; d != nil {
 		w.ActiveDeadlineSeconds = *d
 	}
 	if t := sched.Spec.MaxTurns; t != nil {
 		w.MaxTurns = *t
+	}
+	// A script run has no model turn, so skills and a turn cap mean nothing
+	// to it: they stay off the wire even if a schedule stored without the
+	// CRD's rule set them (accept() refuses that schedule too).
+	if w.Trigger.Script != "" {
+		w.Skills, w.MaxTurns = nil, 0
 	}
 	return w
 }
