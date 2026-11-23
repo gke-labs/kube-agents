@@ -1,5 +1,5 @@
 {
-  "source": "The pods of the two planted Deployments of bench/tasks/workload-image-streaming-token-iam-expiry and bench/tasks/workload-private-registry-pull-secret-expired, as the API server of a GKE Autopilot cluster on Kubernetes 1.35 returned them about five minutes after the plant (2026-11-19), cut to what the collector reads. Node names are replaced, and of the pod conditions only Initialized is kept.",
+  "source": "The pods of the two planted Deployments of bench/tasks/workload-image-pull-refused-node-identity and bench/tasks/workload-image-pull-refused-pull-secret, as the API server of a GKE Autopilot cluster on Kubernetes 1.35 returned them about five minutes after the plant (2026-11-19), cut to what the collector reads. Node names are replaced, and of the pod conditions only Initialized is kept.",
   "items": [
     {
       "kind": "Pod",
