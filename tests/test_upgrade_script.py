@@ -27,6 +27,7 @@ from tests.testing.common import (
     get_isolated_test_env,
     installer_report_env,
 )
+from tests.test_install_script import _HOST_TOOL_MARKER, _HOST_TOOL_PROBE
 from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
     create_mock_release_bundle_marker,
@@ -39,6 +40,12 @@ _UPGRADE_SH = _REPO_ROOT / "upgrade.sh"
 # run writes, which the upgrade skill and the site's upgrade page name.
 _REPORT_FILE_ENV = "KUBE_AGENTS_UPGRADE_REPORT_FILE"
 _REPORT_DEFAULT_FILE = "/tmp/kube-agents-upgrade-report.json"
+
+
+# The start of what upgrade.sh's main prints when a tool that it needs is not
+# on the PATH. A test whose PATH has no gcloud reads it as the sign that main
+# went on to its tool check.
+_TOOL_CHECK_REFUSAL = "Required CLI tool"
 
 
 class ReportFileTest(unittest.TestCase):
@@ -98,10 +105,25 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
         self.assertEqual(proc.stderr.count("Upgrade error encountered"), 1, proc.stderr)
         self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
 
+    def _run_upgrade_main_without_host_tools(self, args):
+        """main with no dry run, for a test of a refusal that comes before the
+        tool check. If the refusal did not stop main, it would go on with the
+        host's git to the check of the source ref, and past that check with the
+        host's gcloud, kubectl and helm. The PATH has none of them, and the
+        probe holds it."""
+        tools = tempfile.TemporaryDirectory()
+        self.addCleanup(tools.cleanup)
+        proc = self._run_upgrade_func(
+            f"{_HOST_TOOL_PROBE}main {args}",
+            env={"PATH": str(create_minimal_tools_bin(tools.name, exclude=("git",)))},
+        )
+        self.assertNotIn(_HOST_TOOL_MARKER, proc.stdout)
+        return proc
+
     def test_drop_undeclared_values_is_refused_with_a_full_upgrade(self):
         """A full upgrade renders the release from install.env, so there are no recorded values to drop."""
-        proc = self._run_upgrade_func(
-            "main --drop-undeclared-values --upgrade-mode=full --image-tag=0.3.0 --non-interactive"
+        proc = self._run_upgrade_main_without_host_tools(
+            "--drop-undeclared-values --upgrade-mode=full --image-tag=0.3.0 --non-interactive"
         )
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("--drop-undeclared-values applies to --upgrade-mode=operator and harness", proc.stdout)
@@ -110,8 +132,8 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
         """Only a full upgrade runs Terraform, so only it can destroy a node pool (#5824)."""
         for mode in ("harness", "operator"):
             with self.subTest(mode=mode):
-                proc = self._run_upgrade_func(
-                    f"main --allow-node-pool-destroy --upgrade-mode={mode} --image-tag=0.3.0 --non-interactive"
+                proc = self._run_upgrade_main_without_host_tools(
+                    f"--allow-node-pool-destroy --upgrade-mode={mode} --image-tag=0.3.0 --non-interactive"
                 )
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn("--allow-node-pool-destroy applies to --upgrade-mode=full", proc.stdout)
@@ -426,20 +448,31 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertIn("run its own ./upgrade.sh", piped.stdout + piped.stderr)
             self.assertNotIn("git fetch", piped.stdout + piped.stderr)
 
-    def _run_fixture_upgrade_func(self, repo_path, func_call):
+    def _run_fixture_upgrade_func(self, repo_path, func_call, env=None):
         """Source the fixture's own stamped copy of this branch's upgrade.sh and call a
         function, so script_checkout_dir names the fixture."""
         text = _UPGRADE_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
         (repo_path / "upgrade.sh").write_text(text)
         return subprocess.run(
             ["bash", "-c", f"KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; {func_call}"],
-            cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+            cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(overrides=env or {}),
         )
 
     def _run_fixture_upgrade_main(self, repo_path, args):
         """main from the fixture's own stamped copy: the load-time flag, the drop's wiring
-        and the exit arms, as an operator's run."""
-        return self._run_fixture_upgrade_func(repo_path, f"main {args}")
+        and the exit arms, as an operator's run.
+
+        One call has no dry run, so the PATH has the basic shell tools and
+        git, which the tag block asks, and no gcloud, kubectl or helm: a main
+        that goes past the tag block stops at its tool check on each host. No
+        pointer to an install.env, which main would judge before that check."""
+        tools = tempfile.TemporaryDirectory()
+        self.addCleanup(tools.cleanup)
+        return self._run_fixture_upgrade_func(
+            repo_path,
+            f"main {args}",
+            env={"PATH": str(create_minimal_tools_bin(tools.name)), "KUBE_AGENTS_INSTALL_ENV": ""},
+        )
 
     def test_main_from_a_release_line_checkout_past_its_stamp_asks_for_the_tag(self):
         """The composed path: the stamped copy computes the baked default at load, main
@@ -474,6 +507,8 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
 
             plan = self._run_fixture_upgrade_main(repo_path, "--non-interactive --plan")
+            # No dry run: with the tools on the PATH this run goes on to its sources.
+            self.assertIn(f"{_TOOL_CHECK_REFUSAL} 'gcloud' is not installed", plan.stdout + plan.stderr)
             self.assertIn("release line 0.2 at", plan.stdout)
             self.assertIn("reads the tag the install already serves", plan.stdout)
             self.assertNotIn("pass --image-tag", plan.stdout)
@@ -892,6 +927,12 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         lock_dir = tempfile.TemporaryDirectory(prefix="upgrade-pty-lock-")
         self.addCleanup(lock_dir.cleanup)
         lock_file = str(pathlib.Path(lock_dir.name) / "upgrade.lock")
+        # The whole script runs with no dry run. If the empty answer did not
+        # stop it, it would go on with the host's gcloud, kubectl and helm. The
+        # PATH has none of them, and the probe in front of the script holds it.
+        tools_dir = tempfile.TemporaryDirectory(prefix="upgrade-pty-tools-")
+        self.addCleanup(tools_dir.cleanup)
+        tools_bin = str(create_minimal_tools_bin(tools_dir.name, exclude=("git",)))
         pid, fd = pty.fork()
         if pid == 0:  # pragma: no cover - replaced by execve
             # os._exit, not an exception: a raise here would unwind inside a
@@ -900,9 +941,9 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
                 os.chdir(str(_REPO_ROOT))
                 os.execve(
                     "/bin/bash",
-                    ["bash", str(_UPGRADE_SH)],
+                    ["bash", "-c", f'{_HOST_TOOL_PROBE}exec "$BASH" "$0"', str(_UPGRADE_SH)],
                     {
-                        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                        "PATH": tools_bin,
                         "HOME": os.environ.get("HOME", "/tmp"),
                         "TERM": "dumb",
                         "KUBE_AGENTS_LOCK_FILE": lock_file,
@@ -914,7 +955,8 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         out = b""
         answered = False
         # A cap rather than a wait: if the guard ever regresses, the run does
-        # not hang the suite, it proceeds and this fails on the exit code.
+        # not hang the suite, it goes on to the tool check and this fails on
+        # the message.
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             ready, _, _ = select.select([fd], [], [], 0.5)
@@ -933,6 +975,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
             os.kill(pid, 9)
             self.fail("upgrade.sh did not exit within 30s of the empty answer")
         _, status = os.waitpid(pid, 0)
+        self.assertNotIn(_HOST_TOOL_MARKER.encode(), out)
         self.assertTrue(answered, "the tag prompt never appeared")
         return status, out.decode(errors="replace")
 
@@ -948,7 +991,9 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
     def test_it_stops_before_touching_the_install(self):
         """Nothing may run between the empty answer and the exit."""
         _, out = self._answer_prompt_with_enter()
-        for forbidden in ("get-credentials", "terraform", "helm"):
+        # The PATH has no gcloud, kubectl or helm, so a run that goes on stops
+        # at the tool check: its message is the sign that the run went on.
+        for forbidden in ("get-credentials", "terraform", "helm", _TOOL_CHECK_REFUSAL):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, out)
 

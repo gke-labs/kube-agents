@@ -79,6 +79,12 @@ const (
 	// dot-free DNS-1123 label, so any other name would be refused at every
 	// slot.
 	agentScheduleReasonInvalidName = "InvalidName"
+	// agentScheduleReasonProfileScriptUnknown: spec.script names a helper
+	// script the referenced profile's spec.scripts doesn't list. The
+	// dispatcher would refuse the run, so none is submitted; adding the
+	// script to the profile accepts the schedule (the profile watch
+	// re-queues it).
+	agentScheduleReasonProfileScriptUnknown = "ProfileScriptUnknown"
 )
 
 // The Submitted condition's reasons.
@@ -281,6 +287,27 @@ func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha
 	return agentv1alpha1.AgentScheduleOriginUser
 }
 
+// agentScheduleScriptProblem says why a schedule's prompt or script can't
+// run, or "" when they can. Exactly one of them is set, and a script sets
+// neither skills nor maxTurns, which the CRD's rules hold too; this is the
+// same check for an object stored without them. A script runs only on a
+// built-in schedule (agentScheduleOrigin): a helper script runs with no model
+// in the loop, so only the operator may pick one, and the gateway, dispatcher
+// and worker each check the script again. Whether the profile lists the
+// script is accept()'s check, once it has read the profile.
+func agentScheduleScriptProblem(sched *agentv1alpha1.AgentSchedule, origin string) string {
+	hasPrompt, hasScript := sched.Spec.Prompt != "", sched.Spec.Script != ""
+	switch {
+	case hasPrompt == hasScript:
+		return "exactly one of spec.prompt and spec.script must be set"
+	case hasScript && (len(sched.Spec.Skills) > 0 || sched.Spec.MaxTurns != nil):
+		return "spec.skills and spec.maxTurns apply to a model run; a script run takes neither"
+	case hasScript && origin != agentv1alpha1.AgentScheduleOriginBuiltin:
+		return fmt.Sprintf("spec.script names helper script %q, which only a built-in schedule the PlatformAgent renders may run", sched.Spec.Script)
+	}
+	return ""
+}
+
 // controlledByAPlatformAgent reports whether the schedule's controller
 // reference names a PlatformAgent, not only its uid: metav1.IsControlledBy
 // compares uids alone.
@@ -355,8 +382,9 @@ func (r *AgentScheduleReconciler) forgetNamespace(namespace string) {
 }
 
 // accept sets the Accepted condition: the schedule parses, and its profile
-// exists and allows the unattended tier. The gateway checks the tier again at
-// every submission, since a profile can change after this ran.
+// exists, allows the unattended tier, and lists the schedule's script if it
+// names one. The gateway checks the tier again at every submission, and the
+// dispatcher the script, since a profile can change after this ran.
 func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alpha1.AgentSchedule, pass *schedulePass) (cron.Schedule, *agentv1alpha1.PlatformAgent, bool, error) {
 	cond := metav1.Condition{Type: agentv1alpha1.AgentScheduleConditionAccepted, ObservedGeneration: sched.Generation}
 	sched.Status.ObservedGeneration = sched.Generation
@@ -394,7 +422,13 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		return nil, nil, false, nil
 	}
 	agent := &agents.Items[0]
-	if agentScheduleOrigin(sched, agent, r.builtinNames(agent)) != agentv1alpha1.AgentScheduleOriginBuiltin {
+	origin := agentScheduleOrigin(sched, agent, r.builtinNames(agent))
+	if msg := agentScheduleScriptProblem(sched, origin); msg != "" {
+		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, agentScheduleReasonInvalidSchedule, msg
+		meta.SetStatusCondition(&sched.Status.Conditions, cond)
+		return nil, nil, false, nil
+	}
+	if origin != agentv1alpha1.AgentScheduleOriginBuiltin {
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonUserDeferred
 		cond.Message = "only schedules the PlatformAgent renders run for now; user schedules wait on Track 7 (#5624)"
 		if sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin {
@@ -415,6 +449,11 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 	case !slices.Contains(profile.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended):
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonProfileDisallowed
 		cond.Message = fmt.Sprintf("AgentProfile %q does not allow the unattended tier", profile.Name)
+	case sched.Spec.Script != "" && !slices.ContainsFunc(profile.Spec.Scripts, func(s agentv1alpha1.AgentProfileScript) bool {
+		return s.Name == sched.Spec.Script
+	}):
+		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonProfileScriptUnknown
+		cond.Message = fmt.Sprintf("spec.script names helper script %q, which AgentProfile %q's spec.scripts does not list", sched.Spec.Script, profile.Name)
 	default:
 		cond.Status, cond.Reason = metav1.ConditionTrue, agentScheduleReasonValid
 		cond.Message = "the schedule parses and its profile allows the unattended tier"
