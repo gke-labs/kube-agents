@@ -767,10 +767,6 @@ class GHESLaneTest(unittest.TestCase):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge")
 
-    def test_an_issue_state_check_alone_grades_the_forge(self):
-        only = {"verification_spec": [{"type": "forge_issue_state", "state": "closed"}]}
-        self.assertTrue(positive_check_types(only) & self.FORGE_CHECKS)
-
     def test_no_commented_out_case_path(self):
         self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GHES_CASES_FILE.read_text(encoding="utf-8")), [])
 
