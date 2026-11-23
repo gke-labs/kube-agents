@@ -468,6 +468,17 @@ defects are the only ones in the fleet invisible to a log-analysis task, which i
 the only slot the presubmit may reuse; when it is absent or mid-maintenance, the
 presubmit provisions its own cluster rather than borrowing slot a or b.
 
+## Config Sync on seeded-a, per project
+
+`config-sync.tf` registers `seeded-a` to the project's fleet and turns on GKE-managed Config Sync
+for it, with no RootSync, for a project listed in `var.post_merge_sync_projects` and for no other.
+The list is empty by default, so a project plans and applies none of it until its pool steps are
+done: the reconciler holds `roles/gkehub.editor`, the project has
+`anthosconfigmanagement.googleapis.com`, and the post-merge fixture's deploy key is in its Secret
+Manager ([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) section 5.13). A pull
+request that adds a project to the list is the switch, reviewed like any fixture change; a dev
+fleet passes `-var 'post_merge_sync_projects=["<project>"]'`.
+
 ## A read-only credential for evaluations
 
 An eval run reads this fleet to check its fixtures survived. It has no business being
