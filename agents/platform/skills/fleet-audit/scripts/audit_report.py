@@ -3831,17 +3831,22 @@ def validate_audit_id(audit_id: str) -> str:
 
 # Shadow runs (#5623): a run beside the job it may replace, which writes its
 # report to the report store and nothing else: no ledger, no forge or git
-# write, no remediation, no chat. The runtime decides it, never the model:
-# the fleet-audit profile's worker exports the task's `dry_run` parameter as
-# SHADOW_TASK_ENV, which a scheduled canary's AgentSchedule sets. `--store-only`
-# on `start` and `finish` names it on the command line, and the two must agree
-# (`shadow_mode`). A run on a terminal with neither is not a shadow run.
+# write, no remediation, no chat. The task decides it, not the model's command
+# line: the worker exports a task's parameters as PROFILE_TASK_<NAME>, so a
+# task whose `dry_run` parameter is true (the fleet-audit profile declares it,
+# #6807, and a canary's AgentSchedule sets it) has SHADOW_TASK_ENV set.
+# `--store-only` on `start` and `finish` must agree with it (`shadow_mode`),
+# and `start` records the mode, so a run started as a shadow run ends as one
+# even with no runtime word (`run_is_shadow`). A run with neither is live.
 STORE_ONLY_FLAG = "--store-only"
 SHADOW_TASK_ENV = "PROFILE_TASK_DRY_RUN"
-# The schedule a dispatched task came from, which the worker exports when the
-# task carries a trigger: runtime-owned, never a task parameter
-# (a2a/worker-adapter). It names the shadow stream (`shadow_stream`).
-SHADOW_TRIGGER_STREAM_ENV = "PROFILE_TASK_TRIGGER_STREAM"
+# The schedule a dispatched task came from. The worker adapter will export it
+# when the task carries a trigger (a follow-up to #5623); until then it is
+# unset and a shadow run takes the fallback stream. It is outside the
+# PROFILE_TASK_ prefix the task's parameters use, so no parameter can set it.
+# It names the shadow stream (`shadow_stream`), which the broker requires to
+# be the trigger's stream for a profile's write.
+SHADOW_TRIGGER_STREAM_ENV = "PROFILE_TRIGGER_STREAM"
 # A shadow run with no schedule identity (one started by hand) writes to
 # `<audit>` plus this.
 SHADOW_STREAM_SUFFIX = "-shadow"
@@ -3852,16 +3857,51 @@ SHADOW_STREAM_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 SHADOW_KEY = "shadow"
 SHADOW_STREAM_KEY = "shadow_stream"
 SHADOW_SUMMARY_KEY = "shadow_summary"
+# The run record's mark that `start` began a shadow run.
+RUN_RECORD_SHADOW_KEY = "shadow"
+# What reads as "not a shadow run" in SHADOW_TASK_ENV; anything else set reads
+# as one, so a spelling the runtime didn't mean as false can't publish live.
+SHADOW_TASK_FALSE = frozenset({"false", "0", "no", "off"})
 # Why `precheck` closes nothing in a shadow run.
 PRECHECK_SHADOW_REASON = "a shadow run closes nothing from the live stream's stored document"
 
 
 def task_is_shadow() -> bool | None:
-    """What the runtime says: True or False when SHADOW_TASK_ENV is set, None when it isn't."""
+    """What the runtime says: True or False when SHADOW_TASK_ENV is set, None when it isn't.
+
+    Fails closed: only an explicit false (SHADOW_TASK_FALSE) is live.
+    """
     raw = os.environ.get(SHADOW_TASK_ENV)
     if raw is None or not raw.strip():
         return None
-    return raw.strip().lower() == "true"
+    return raw.strip().lower() not in SHADOW_TASK_FALSE
+
+
+def run_is_shadow(audit_id: str) -> bool | None:
+    """What this run's `start` recorded: True for a shadow run, False for a live one, None with no record."""
+    try:
+        record = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    return record.get(RUN_RECORD_SHADOW_KEY) is True
+
+
+def shadow_store_repo(audit_id: str) -> str:
+    """The store key a shadow run writes its stream under: the install's own.
+
+    The broker lets a profile write only to the key `finish` publishes to
+    (credential_proxy.report_write_permitted), so a shadow run uses the same
+    rule, read from the registered repositories with no forge call:
+    `NO_FORGE_REPO` with none, the one repository, or the gitops-role one;
+    several with none chosen is `NO_FORGE_REPO`, as the broker answers.
+    A list that can't be read raises: the run can't know where it may write.
+    """
+    try:
+        return resolve_repo_or_no_forge(audit_id)
+    except RuntimeError:
+        return NO_FORGE_REPO
 
 
 def shadow_mode(args: argparse.Namespace, command: str) -> bool:
@@ -3878,6 +3918,9 @@ def shadow_mode(args: argparse.Namespace, command: str) -> bool:
     flag = bool(getattr(args, "store_only", False))
     dry_run = bool(getattr(args, "dry_run", False))
     runtime = task_is_shadow()
+    # `finish` follows what its `start` recorded when the runtime is silent.
+    if runtime is None and command == "finish":
+        runtime = run_is_shadow(validate_audit_id(args.audit))
     if flag and dry_run:
         raise ValidationError(
             f"{STORE_ONLY_FLAG} and --dry-run: pass one. --dry-run writes nothing; "
@@ -3885,13 +3928,13 @@ def shadow_mode(args: argparse.Namespace, command: str) -> bool:
         )
     if runtime is True and not flag and not dry_run:
         raise ValidationError(
-            f"this task is a shadow run ({SHADOW_TASK_ENV}=true): `{command}` must pass "
+            f"this is a shadow run ({SHADOW_TASK_ENV}, or this run's `start`): `{command}` must pass "
             f"{STORE_ONLY_FLAG}, which writes the report to the store and nothing else."
         )
     if runtime is False and flag:
         raise ValidationError(
-            f"{STORE_ONLY_FLAG}: this task is not a shadow run ({SHADOW_TASK_ENV} is not "
-            "true), so it publishes as a live run; leave the flag out."
+            f"{STORE_ONLY_FLAG}: this run is live ({SHADOW_TASK_ENV} is false, or this "
+            "run's `start` was live), so it publishes as a live run; leave the flag out."
         )
     return flag
 
@@ -18887,6 +18930,7 @@ def write_run_record(
     searched: list[str] | None = None,
     sources: list[dict] | None = None,
     decision: LedgerDecision | None = None,
+    shadow: bool = False,
 ) -> str:
     """Record which repositories this run's declared-intent step must search.
 
@@ -18920,6 +18964,7 @@ def write_run_record(
                 RUN_RECORD_SEARCHED_KEY: list(searched or []),
                 RUN_RECORD_SOURCES_KEY: list(sources or []),
                 RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
+                **({RUN_RECORD_SHADOW_KEY: True} if shadow else {}),
                 **(
                     {
                         RUN_RECORD_UNREACHABLE_KEY: {"repo": unreachable[0], "reason": unreachable[1]},
@@ -22684,8 +22729,10 @@ def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> 
 
     opt_repo = getattr(args, "repo", None)
     if shadow:
-        # A shadow run asks the forge nothing: it runs the checks with no
-        # repository, as an install with no forge does, and keeps no chat report.
+        # A shadow run writes nothing to the forge and keeps no chat report: it
+        # runs the checks as an install with no forge does. The declared-intent
+        # search below still reads the context repositories, as a live run's
+        # does, so the two runs' findings compare.
         decision = LedgerDecision(NO_FORGE_REPO, LEDGER_STORE, False, None)
         log(f"SHADOW RUN: this run's report goes to the report store alone ({shadow_stream(audit_id)}).")
     else:
@@ -22737,7 +22784,7 @@ def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> 
     )
     declarations_path = write_declarations(audit_id, repo, declarations)
     write_run_record(
-        audit_id, repo, context, searched=searched, sources=sources, decision=decision
+        audit_id, repo, context, searched=searched, sources=sources, decision=decision, shadow=shadow
     )
 
     print(
@@ -24140,7 +24187,7 @@ def _previous_store_envelope(
     return None, False
 
 
-def previous_no_forge_record(audit_id: str) -> dict | None:
+def previous_no_forge_record(audit_id: str, store_repo: str = NO_FORGE_REPO) -> dict | None:
     """The envelope the previous run with no forge stored; None when unknowable.
 
     `{}` when the store holds no envelope for this key at all: the run is
@@ -24152,7 +24199,7 @@ def previous_no_forge_record(audit_id: str) -> dict | None:
     (`NOT_RECHECKED_KEY`) are in it.
     """
     envelope, known = _previous_store_envelope(
-        audit_id, NO_FORGE_REPO, NO_FORGE_STATUS, "a run with no forge"
+        audit_id, store_repo, NO_FORGE_STATUS, "a run with no forge"
     )
     if not known:
         return None
@@ -24541,6 +24588,7 @@ def _finish_without_forge(
     unreachable: tuple[str, str] | None = None,
     probe: str = REACHABILITY_PROBE_VERB,
     shadow_to: str | None = None,
+    shadow_repo: str | None = None,
 ) -> dict | None:
     """Keep a run on an install with no forge in the report store, and print its line.
 
@@ -24572,9 +24620,10 @@ def _finish_without_forge(
     `finish` would refuse is refused the same way, since validation runs
     before this.
 
-    `shadow_to` is a shadow run's stream (`shadow_stream`): the delta and the
-    baselines come from that stream's previous record and the envelope goes
-    there, marked `shadow` with the summary a live run would post, and
+    `shadow_to` is a shadow run's stream (`shadow_stream`) and `shadow_repo`
+    the install's store key (`shadow_store_repo`): the delta and the
+    baselines come from that stream's previous record under that key, and the
+    envelope goes there, marked `shadow` with the summary a live run would post, and
     nothing goes to chat. The store is a shadow run's only output, so a write
     that fails raises instead of returning None.
     """
@@ -24597,12 +24646,16 @@ def _finish_without_forge(
     # includes the not-re-checked entries: with no record, none are kept. It also
     # reads no scheduled baseline, so a scheduled diverted run says that the
     # change since the last scheduled run is unknown.
-    record = None if unreachable is not None else previous_no_forge_record(stream)
+    record = (
+        None
+        if unreachable is not None
+        else previous_no_forge_record(stream, store_repo=shadow_repo or NO_FORGE_REPO)
+    )
     previous_ids = (
         None if record is None else [str(fid) for fid in record.get("current_ids") or []]
     )
     marker = diverted_marker(unreachable)
-    store_repo = unreachable[0] if unreachable and unreachable[0] else NO_FORGE_REPO
+    store_repo = shadow_repo or (unreachable[0] if unreachable and unreachable[0] else NO_FORGE_REPO)
     delta_known = previous_ids is not None
     earlier = earlier_finish(audit_id, NO_FORGE_REPO, now)
     # A posture `finish` withheld is in the document, only not published,
@@ -25962,7 +26015,7 @@ def handle_precheck(args: argparse.Namespace) -> None:
         line[PRECHECK_REASON_KEY] = PRECHECK_NOT_SCHEDULED_REASON
     elif run_llm:
         line[PRECHECK_REASON_KEY] = reasons.get(verdict, verdict)
-    elif task_is_shadow():
+    elif task_is_shadow() or run_is_shadow(audit_id):
         # The stored document is the live stream's; a shadow run publishes
         # only through its own `finish --store-only`.
         line[PRECHECK_REASON_KEY] = PRECHECK_SHADOW_REASON + PRECHECK_CONTINUES_SUFFIX
@@ -26050,7 +26103,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # The shadow gate, here and not only in `handle_finish`: `precheck`'s
     # close calls this directly, and a shadow task must not publish live by
     # any path.
-    if task_is_shadow() and not args.dry_run and not getattr(args, "store_only", False):
+    if (task_is_shadow() or run_is_shadow(audit_id)) and not args.dry_run and not getattr(args, "store_only", False):
         raise ValidationError(
             f"this task is a shadow run ({SHADOW_TASK_ENV}=true): it publishes only with "
             f"{STORE_ONLY_FLAG}, which keeps the report in the store and nothing else."
@@ -26173,10 +26226,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # issue, and a dry run does not ask the forge for it. `_dry_run_repo`
     # gives the real run its resolved repository, and a dry run the same
     # repository on a best-effort basis.
-    # A shadow run reads its own stream, with no repository, so its wording
-    # never comes from the live stream's record or a forge lookup.
+    # A shadow run reads its own stream under the install's key, so its
+    # wording never comes from the live stream's record or a forge lookup.
+    shadow_repo = shadow_store_repo(audit_id) if store_only else None
     previous_document = (
-        previous_run_document(shadow_stream(audit_id), NO_FORGE_REPO)
+        previous_run_document(shadow_stream(audit_id), shadow_repo)
         if store_only
         else previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
     )
@@ -26259,6 +26313,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             timers=timer_payload,
             scheduled=scheduled,
             shadow_to=shadow_stream(audit_id),
+            shadow_repo=shadow_repo,
         )
 
     repo = repo_hint

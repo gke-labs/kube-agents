@@ -35191,8 +35191,9 @@ class TestShadowRun(BaseTestCase):
         self.addCleanup(patcher.stop)
         os.environ.pop(audit_report.SHADOW_TRIGGER_STREAM_ENV, None)
 
-    def shadow_store(self, stream=None):
-        return self.reports_dir / (stream or AUDIT + audit_report.SHADOW_STREAM_SUFFIX) / "no_forge" / "local"
+    def shadow_store(self, stream=None, repo="acme/gitops"):
+        # Under the install's own key, which the broker requires of a profile's write.
+        return Path(audit_report.reports_dir_for(stream or AUDIT + audit_report.SHADOW_STREAM_SUFFIX, repo))
 
     def start(self, *extra):
         code = self.run_main(["start", "--audit", AUDIT, *extra])
@@ -35277,6 +35278,46 @@ class TestShadowRun(BaseTestCase):
         Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
         self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run"]), 0, self.err)
         self.assertFalse(self.shadow_store().exists())
+
+    def test_with_no_repository_registered_it_writes_under_no_forge(self):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch(
+            "gitops_workspace._read_state_text", lambda key: ""
+        ):
+            self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue((self.shadow_store(repo=audit_report.NO_FORGE_REPO) / "latest.json").exists())
+
+    def test_a_run_started_as_a_shadow_run_ends_as_one_with_no_runtime_word(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        # `finish` without the flag would publish live: refused.
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        # And from `_finish` directly, as precheck's close calls it.
+        close = argparse.Namespace(audit=AUDIT, findings_file=path, repo=None, dry_run=False, scheduled=True)
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report._finish(close, AUDIT)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_a_live_start_refuses_a_store_only_finish(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        # A live run's record, as a live `start` leaves it.
+        self.record_run(audit=AUDIT)
+        self.assertIs(audit_report.run_is_shadow(AUDIT), False)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertNotEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, audit_report.STORE_ONLY_FLAG]), 0
+        )
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_the_runtime_word_fails_closed(self):
+        for value, want in (("true", True), ("1", True), ("yes", True), ("TRUE", True), ("false", False), ("0", False), ("", None)):
+            with self.subTest(value=value), patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: value}):
+                self.assertIs(audit_report.task_is_shadow(), want)
 
     def test_a_flag_without_the_runtime_is_a_shadow_run_started_by_hand(self):
         os.environ.pop(audit_report.SHADOW_TASK_ENV)
