@@ -1655,6 +1655,10 @@ KUBECTL_MUTATING_SUBVERBS: dict[str, frozenset[str]] = {
 }
 
 
+# A short-flag cluster carrying the help letter (`-hv=9`), which prints help.
+_SHORT_HELP_CLUSTER_RE = re.compile(r"\A-[A-Za-z]*h[A-Za-z]*(?:=|\Z)")
+
+
 def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
     """The verb words of a kubectl ``argv`` that tries a change, or None.
 
@@ -1664,6 +1668,13 @@ def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
     refused a write outright, whichever rule it is.
     """
     if not argv or argv[0] != "kubectl" or local_render(argv):
+        return None
+    own = argv[: argv.index("--")] if "--" in argv else argv
+    # The verb parser stops at the first flag it can't size, so `apply -f m.yaml
+    # view-last-applied` reads as `apply`, though kubectl skips the flag and
+    # runs the read. A help flag inside a short cluster (`-hv=9`) also only
+    # prints help. Neither is marked: a missed mark only lets the task run on.
+    if _LOCAL_RENDER_SUBCOMMAND in own[1:] or any(_SHORT_HELP_CLUSTER_RE.match(t) for t in own[1:]):
         return None
     verb, _ = _kubectl_verb_and_flag(argv)
     if not kubectl_verb_is_mutating(verb):

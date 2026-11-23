@@ -1512,9 +1512,11 @@ RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
 CALLER_PERMIT_REQUIRED_CODE = "CALLER_PERMIT_REQUIRED"
 # A refusal body's mark of a definitive write refusal: a write refused however
 # it is attempted, which a retry or another spelling cannot get through. Set on
-# the read-only rule's refusal of a mutating kubectl verb (read_only_refusal)
-# and on a profile task's permit-gated version-control write refused for want
-# of the permit. The in-pod client (credential_proxy_client.WRITE_REFUSAL_KEY)
+# a policy rule's refusal of a mutating kubectl verb that is not a local render
+# (command_policy.kubectl_definitive_write): the read-only rule's
+# (read_only_refusal) and, for a profile caller, the flag rule's. Never on a
+# busy, rate or timeout answer, nor on a version-control refusal, whose answer
+# is the patch the version-control skill gives. The in-pod client (credential_proxy_client.WRITE_REFUSAL_KEY)
 # records such a refusal for the profile worker, which stops the task at the
 # first one; every other refusal carries it false or not at all.
 WRITE_REFUSAL_KEY = "write_refusal"

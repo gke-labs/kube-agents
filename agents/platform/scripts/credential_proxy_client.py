@@ -255,9 +255,10 @@ SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
 LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
 POLICY_BLOCKED_CODES = frozenset({SECURITY_POLICY_BLOCKED_CODE, SESSION_BUDGET_EXCEEDED_CODE, LOOP_BREAKER_CODE})
 # A profile worker's out-of-band record of a definitive write refusal. The
-# broker marks such a refusal's body (credential_proxy.WRITE_REFUSAL_KEY): the
-# read-only rule refusing a mutating kubectl verb, or a profile task's
-# permit-gated version-control write refused for want of the permit. On a 403
+# broker marks such a refusal's body (credential_proxy.WRITE_REFUSAL_KEY): a
+# policy rule (the read-only rule, or a profile caller's flag rule) refusing a
+# mutating kubectl verb. Version-control refusals are never marked or recorded.
+# On a 403
 # carrying that mark, the client appends one JSON line to the file the worker
 # adapter names in REFUSAL_FILE_ENV (a file on the task's tmpfs, beside the
 # task token), and the adapter stops the task at the first record
@@ -1973,7 +1974,7 @@ def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
     Only a 403 whose body carries the broker's ``write_refusal`` mark as true
     is recorded; every other answer, and a call with REFUSAL_FILE_ENV unset,
     writes nothing. ``verb_words`` is the verb the broker resolved (an exec
-    refusal's ``verb``) or the version-control verb the call named. Never
+    refusal's ``verb``). Never
     raises: the record is the worker's signal, not the call's outcome.
     """
     if status != 403 or not isinstance(payload, dict) or payload.get(WRITE_REFUSAL_KEY) is not True:

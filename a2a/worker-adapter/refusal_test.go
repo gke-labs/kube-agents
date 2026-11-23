@@ -210,7 +210,7 @@ func assertCompleted(t *testing.T, out runOutcome, markerFile string) {
 
 // TestWriteRefusalRecordStopsTheHarness: the broker client's first record
 // stops the harness (its process is gone, it never reaches what follows) and
-// ends the task rejected, naming the record's rule and verb and nothing of
+// ends the task failed, naming the record's rule and verb and nothing of
 // the tool output.
 func TestWriteRefusalRecordStopsTheHarness(t *testing.T) {
 	const task = "task-refusal-1"

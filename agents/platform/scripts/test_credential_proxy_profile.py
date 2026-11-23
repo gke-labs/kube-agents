@@ -904,6 +904,10 @@ class ProfileRouteTest(unittest.TestCase):
         for argv in (
             ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"],
             ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml", "--output-watch-events"],
+            # The verb parser stops at -f, but kubectl runs view-last-applied, a read.
+            ["kubectl", "apply", "-f", "m.yaml", "view-last-applied"],
+            # A help letter in a short cluster only prints help.
+            ["kubectl", "delete", "pod", "x", "-hv=9"],
         ):
             with self.subTest(argv=argv):
                 self.executor.calls.clear()
