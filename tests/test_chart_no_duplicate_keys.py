@@ -1,4 +1,4 @@
-"""No rendered chart manifest carries the same mapping key twice.
+"""The rendered chart carries no mapping key twice, for the value sets below.
 
 A label written by hand above `include "kube-agents.labels"` renders the
 key twice in one mapping when the helper emits it too. PyYAML's default
@@ -7,7 +7,8 @@ loaders keep the last value and say nothing, so a render test that uses
 manifest.
 
 This test loads every rendered document with a loader that refuses a
-duplicate key, for the value sets below.
+duplicate key. It covers the value sets in `_VALUE_SETS` only: a template
+behind a toggle that no set turns on is not checked.
 
 Run: python3 -m unittest discover -s tests -p 'test_chart_no_duplicate_keys.py' -v
 """
@@ -36,11 +37,18 @@ _BOTH_PROFILES = [
     "--set", "profiles.cluster.enabled=true",
 ]
 # Each entry is one render. The name appears in the failure message.
+_OPTIONAL_COMPONENTS = [
+    "--set", "hindsight.enabled=true",
+    "--set", "platformAgent.mode=next",
+]
 _VALUE_SETS = {
     "defaults": [],
     "web console with environment": _WEB_CONSOLE_ENVIRONMENT,
     "web console with environment and both profiles": [
         *_WEB_CONSOLE_ENVIRONMENT, *_BOTH_PROFILES,
+    ],
+    "web console, both profiles, hindsight and next mode": [
+        *_WEB_CONSOLE_ENVIRONMENT, *_BOTH_PROFILES, *_OPTIONAL_COMPONENTS,
     ],
 }
 _RELEASE = "test-release"
@@ -54,6 +62,7 @@ _ENVIRONMENT_OBJECTS = [
     ("ServiceAccount", f"{_RELEASE}-web-console"),
 ]
 _INSTANCE_LABEL = "app.kubernetes.io/instance"
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 
 
 class DuplicateKeyError(yaml.YAMLError):
@@ -64,13 +73,17 @@ class _UniqueKeyLoader(yaml.SafeLoader):
     """SafeLoader that refuses a mapping with a repeated key."""
 
     def construct_mapping(self, node, deep=False):
+        # Keys are compared as written (resolved tag and text). A merge key
+        # or a composite key is left to SafeLoader.
         seen = set()
         for key_node, _ in node.value:
-            key = self.construct_object(key_node, deep=True)
+            if key_node.tag == _YAML_MERGE_TAG or not isinstance(key_node, yaml.ScalarNode):
+                continue
+            key = (key_node.tag, key_node.value)
             if key in seen:
                 mark = key_node.start_mark
                 raise DuplicateKeyError(
-                    f"duplicate key {key!r} at line {mark.line + 1}, column {mark.column + 1}"
+                    f"duplicate key {key_node.value!r} at line {mark.line + 1}, column {mark.column + 1}"
                 )
             seen.add(key)
         return super().construct_mapping(node, deep=deep)
@@ -79,8 +92,10 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 def _render(values):
     proc = subprocess.run(
         [_HELM, "template", _RELEASE, str(_CHART), *_REQUIRED, *values],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=False,
     )
+    if proc.returncode != 0:
+        raise AssertionError(f"helm template failed with {values}: {proc.stderr}")
     return proc.stdout
 
 
@@ -98,6 +113,10 @@ class UniqueKeyLoaderTest(unittest.TestCase):
     def test_refuses_a_repeated_key_in_a_nested_mapping(self):
         with self.assertRaises(DuplicateKeyError):
             _load_strict("metadata:\n  labels:\n    a: x\n    b: y\n    a: z\n")
+
+    def test_accepts_a_key_that_overrides_a_merged_one(self):
+        docs = _load_strict("base: &base\n  a: x\nuse:\n  <<: *base\n  a: y\n")
+        self.assertEqual(docs[0]["use"]["a"], "y")
 
     def test_accepts_the_same_key_in_two_mappings(self):
         docs = _load_strict("one:\n  a: x\ntwo:\n  a: x\n---\none:\n  a: x\n")
