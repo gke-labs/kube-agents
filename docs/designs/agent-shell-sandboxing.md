@@ -1103,12 +1103,15 @@ timeout outgrew the shell.
 
 A2A session Pods under the cluster view run kubectl against the kube-proxy too, in a container
 limited to `A2A_SESSION_MEMORY_LIMIT` (2 GiB by default) with no guard running. The worker image's
-wrapper execs the same admission there, with three settings from its environment: its state in a
-directory the session user owns (`KUBECTL_ADMIT_RUN_DIR`), the guard loaded only as a library for
-its memory figure and watermark (`KUBECTL_ADMIT_GUARD_PATH`), and `KUBECTL_ADMIT_ON_BUSY=run`.
-With `run`, every command the sandbox would refuse with exit 75 runs instead, unslotted, as it did
-before the admission, and the event log records it as `ran-busy`; only a read larger than one read
-may ever take is still refused, with exit 3. The tier comes from `KUBEAGENTS_KUBECTL_COST_TIER`,
+wrapper runs kubectl directly, with no admission, when the tier's largest read fits the Pod's memory
+limit (every default install), or for a command the admission never charges. Otherwise it execs
+the same admission, with three settings from its environment: its state in a directory the session
+user owns (`KUBECTL_ADMIT_RUN_DIR`), the guard loaded only as a library for its memory figure and
+watermark (`KUBECTL_ADMIT_GUARD_PATH`), and `KUBECTL_ADMIT_ON_BUSY=run`. With `run`, a command the
+Pod finds busy waits up to the admission's wait (`ADMIT_WAIT_SECONDS`), then runs anyway,
+unslotted, and the event log records it as `ran-busy`; it is never refused for being busy. Only a
+read larger than the Pod could ever hold is refused, with exit 3. The sandbox's wrapper unsets
+these three settings, so a sandbox session cannot use them. The tier comes from `KUBEAGENTS_KUBECTL_COST_TIER`,
 which the operator passes to the gateway and the gateway to each session Pod, both checking it is a
 plain lowercase word.
 

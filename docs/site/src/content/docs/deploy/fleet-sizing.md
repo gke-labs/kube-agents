@@ -106,9 +106,14 @@ whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER
 [`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
 
 The operator passes the tier to the shell sandbox and, under the session cluster view, to the
-session Pods the A2A gateway starts. Their kubectl runs the same admission against the Pod's own
-memory limit (`A2A_SESSION_MEMORY_LIMIT`, 2 GiB by default). A session Pod refuses only a read
-larger than it can ever hold; a read that finds it busy waits, then runs.
+session Pods the A2A gateway starts. On the `default` tier at the default session memory limit
+(2 GiB), their kubectl runs with no admission. On the `fleet` tier at that limit, a session Pod
+runs the admission against its own memory limit. It refuses a cluster-wide list that the fleet
+figures charge above what one read may take there, such as `kubectl get pods -A`, whatever the
+cluster's real size, as the shell does. Raise the session Pods' limit with
+[`harness.tuning.sessionResources.limits.memory`](/kube-agents/operator/platformagent-fields/#spec),
+or read per namespace or with a selector. A session Pod never refuses a read for being busy; it
+waits, then runs.
 
 Two more stacks add to the total:
 

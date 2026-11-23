@@ -101,6 +101,8 @@ ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
 COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
 # The wrapper below asks this first, and starts Python only when the context is not registered yet.
+# It then unsets the session pod's admission settings (session-kubectl.sh), so a sandbox session
+# keeps the sandbox's state directory, guard and refusals.
 COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexec/kubectl-context-registered
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
@@ -125,6 +127,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       '    ;;' \
       '  esac' \
       'fi' \
+      'unset KUBECTL_ADMIT_RUN_DIR KUBECTL_ADMIT_GUARD_PATH KUBECTL_ADMIT_ON_BUSY' \
       'exec python3 -I /usr/local/libexec/kubectl-admit "$@"' \
       >/usr/local/bin/kubectl && \
     chmod 0755 /usr/local/bin/kubectl && \

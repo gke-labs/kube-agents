@@ -40,7 +40,9 @@ environment: `KUBECTL_ADMIT_RUN_DIR` for the state, `KUBECTL_ADMIT_GUARD_PATH` f
 (loaded as a library; no guard runs there), and `KUBECTL_ADMIT_ON_BUSY=run`. With `run`, every
 command the sandbox refuses with exit 75 (slots full, queue full, lock busy, charge not fitting
 by the deadline, no process to spawn) runs instead, unslotted, as kubectl ran there before the
-admission, and the event log records it as `ran-busy`. Only exit 3 is still a refusal. The tier
+admission, and the event log records it as `ran-busy`. It first waits as it would in the
+sandbox: up to `ADMIT_WAIT_SECONDS` for a slot or for its charge to fit, or up to
+`LOCK_WAIT_SECONDS` for the lock; a flood runs at once. Only exit 3 is still a refusal. The tier
 is the tier file's when there is one, else `KUBEAGENTS_KUBECTL_COST_TIER` if it is a plain
 lowercase name, else `default`. Unset, each is the sandbox's.
 """

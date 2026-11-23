@@ -30,8 +30,7 @@
 #      forwards TERM, INT and HUP to it; either way its exit code is kubectl's.
 #      On a session pod it never refuses a command for being busy
 #      (KUBECTL_ADMIT_ON_BUSY=run); it refuses only a read larger than the pod
-#      could ever hold. A step that needs kubectl's exit code afterwards runs
-#      the admission as a child instead, only where that step can fire.
+#      could ever hold. No step follows kubectl in this script.
 # The wrapper exits with kubectl's code.
 #
 # Without KUBE_PROXY_URL, a broker URL sends kubectl to the broker (a profile

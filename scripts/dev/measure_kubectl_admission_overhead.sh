@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Time what the kubectl admission (deploy/sandbox/kubectl-admit.py) adds to a kubectl call,
-# and print p50 and p95 per case. Run it inside an A2A session pod under the cluster view
-# (KUBE_PROXY_URL set, so /usr/local/bin/kubectl execs the admission), or in the shell
-# sandbox, for example:
+# Time what the kubectl wrapper and its admission (deploy/sandbox/kubectl-admit.py) add to a
+# kubectl call, and print p50 and p95 per case. Run it inside the shell sandbox, where the
+# wrapper runs every command through the admission, or in an A2A session pod under the cluster
+# view (KUBE_PROXY_URL set). On a session pod the wrapper skips the admission for a command it
+# never charges, and for every command when the tier's largest read fits the pod's memory
+# limit (every default install). To time the admission itself there, run in a pod where the
+# tier does not fit (KUBEAGENTS_KUBECTL_COST_TIER=fleet on a 2Gi session pod, for example), or
+# call `python3 -I /usr/local/libexec/kubectl-admit` directly, with the three KUBECTL_ADMIT_*
+# settings session-kubectl.sh exports.
+# For example:
 #
 #   kubectl exec -n <ns> <session-pod> -- bash -s -- -n 50 < scripts/dev/measure_kubectl_admission_overhead.sh
 #
@@ -11,13 +17,17 @@
 #
 # Cases, each RUNS times after one untimed warm-up call:
 #   direct-version    /usr/local/libexec/kubectl version --client       (no wrapper, no admission)
-#   wrapper-version   kubectl version --client       (the admission's pass-through fast path)
+#   wrapper-version   kubectl version --client       (session pod: the wrapper's shell check, then
+#                     kubectl; sandbox: the admission's pass-through)
 #   direct-get-one    /usr/local/libexec/kubectl get ns NAMESPACE -o name
-#   wrapper-get-one   kubectl get ns NAMESPACE -o name   (slotted, uncharged: a slot, then exec)
+#   wrapper-get-one   kubectl get ns NAMESPACE -o name   (session pod: as wrapper-version; sandbox:
+#                     slotted, uncharged: a slot, then exec)
 #   direct-get-all    /usr/local/libexec/kubectl get namespaces -o name
-#   wrapper-get-all   kubectl get namespaces -o name     (charged: a slot, a reservation, a child)
+#   wrapper-get-all   kubectl get namespaces -o name     (session pod where the tier does not fit,
+#                     and sandbox: charged: a slot, a reservation, a child; where it fits, as
+#                     wrapper-version)
 #
-# The admission's overhead is a wrapper case less its direct case. The get cases reach the
+# The wrapper's overhead is a wrapper case less its direct case. The get cases reach the
 # API server through the kube-proxy, so their spread is mostly the network; run enough of
 # them for the p50s to settle. Nothing here changes cluster state. Each call's output is
 # discarded; a call that fails stops the script with its exit status.

@@ -225,10 +225,23 @@ class FastPathParityTest(unittest.TestCase):
         # a switch must not; otherwise the two could find different verbs.
         text = WRAPPER_SCRIPT.read_text(encoding="utf-8")
         body = text[text.index("uncharged() {"):text.index("\n}\n", text.index("uncharged() {"))]
-        arms = re.findall(r"((?:--?[\w-]+(?:\s*\|\s*\\?\s*)?)+)\)\s*(skip=1|;;)", body)
-        takes_value = {f for names, act in arms if act == "skip=1" for f in re.findall(r"--?[\w-]+", names)}
-        switches = {f for names, act in arms if act == ";;" for f in re.findall(r"--?[\w-]+", names)}
-        self.assertIn("--context", takes_value)
+        # Each case arm of plain flags, a bracket of short flags (-[olnLcsv]) included, with its body
+        # up to `;;`. An arm whose body sets skip=1 takes a value, whatever else it sets; an empty
+        # body is a switch. Arms with a glob (--*=*, -f?*) match no flag here.
+        arms = re.findall(r"((?:-[-\w\[\]]+(?:\s*\|\s*\\?\s*)?)+)\)((?:(?!;;).)*);;", body, re.S)
+
+        def flags(names: str) -> set[str]:
+            found = set()
+            for name in re.findall(r"-[-\w\[\]]+", names):
+                bracket = re.fullmatch(r"-\[(\w+)\]", name)
+                found |= {f"-{c}" for c in bracket.group(1)} if bracket else {name}
+            return found
+
+        takes_value = set().union(*(flags(names) for names, act in arms if re.search(r"\bskip=1\b", act)))
+        switches = set().union(*(flags(names) for names, act in arms if not act.strip()))
+        for flag in ("--context", "-o", "-l", "-n", "-L", "-c", "-s", "-v", "--raw", "-f", "--filename", "-k",
+                     "--kustomize"):
+            self.assertIn(flag, takes_value)
         self.assertIn("--no-headers", switches)
         self.assertLessEqual(takes_value, set(admit.VALUE_FLAGS))
         self.assertEqual(switches & (set(admit.VALUE_FLAGS) | set(admit.LONG_FLAG_SHORTHANDS)), set())

@@ -8,7 +8,7 @@ shared helpers two of them source live in the sibling [`../installer/`](../insta
 | Script                                     | What it does                                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `dev_rebuild_agent.sh`                     | Rebuilds the agent image and the two that follow its tag, and redeploys (see below)     |
-| `measure_kubectl_admission_overhead.sh`    | Times kubectl with and without the kubectl admission inside a pod; prints p50 and p95   |
+| `measure_kubectl_admission_overhead.sh`    | Times kubectl with and without its wrapper inside a pod; prints p50 and p95 (see below) |
 | `profile_kubectl_costs.py`                 | Profiles each fleet-wide `kubectl get` and writes `deploy/sandbox/kubectl-costs.json`   |
 | `profile_kubectl_costs_job.sh`             | Runs that profiler as a Job on a tier's reference cluster                               |
 | `repeat_under_load.sh`                     | Runs a new or changed test several times under CPU load; prints the PR body's line      |
@@ -24,6 +24,12 @@ dev tag, because the operator takes two sidecar images from the agent image on t
 `A2A_BRIDGE_IMAGE` or `CREDENTIAL_PROXY_IMAGE` set keeps that image for the sidecar. `kube-proxy`,
 the shell sandbox and the `a2a-*` images follow the operator's image, so a rebuild does not move
 them.
+
+`measure_kubectl_admission_overhead.sh` times the admission on every command in the shell
+sandbox. On a session pod the wrapper skips the admission for commands it never charges, and for
+every command when the tier fits the pod's memory limit. To time the admission there, run in a pod
+where the tier does not fit (`KUBEAGENTS_KUBECTL_COST_TIER=fleet` on a 2Gi pod, for example), or
+call `/usr/local/libexec/kubectl-admit` directly.
 
 `teardown_dev_01_gcp_artifact_registry.sh` asks before it deletes anything. `--no-confirm` (or
 `-y`) answers yes for an unattended run and `--dry-run` shows the delete without making it; a
