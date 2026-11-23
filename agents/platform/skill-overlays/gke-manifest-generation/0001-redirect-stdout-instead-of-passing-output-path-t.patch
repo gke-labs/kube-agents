@@ -3,7 +3,6 @@ Subject: Redirect stdout instead of passing output-path to gcloud
 Why: gcloud runs in the credential proxy's container, which refuses `--output-path`, so the step redirects stdout instead.
 Local-Issue: none (#723)
 Eval-Case: none (came with the migration to overlays, a byte-identical move)
-Upstream-Issue: none (specific to this repository)
 Retire-When: never; the credential proxy is this repository's
 
 diff --git a/SKILL.md b/SKILL.md
