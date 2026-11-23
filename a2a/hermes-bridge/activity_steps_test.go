@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -531,15 +532,15 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := scrubInlineSecrets(tc.in)
+			got := answerscrub.ScrubInline(tc.in)
 			for _, f := range tc.forbidden {
 				if strings.Contains(got, f) {
-					t.Fatalf("scrubInlineSecrets(%q) leaked %q in %q", tc.in, f, got)
+					t.Fatalf("answerscrub.ScrubInline(%q) leaked %q in %q", tc.in, f, got)
 				}
 			}
 			for _, w := range tc.wantSub {
 				if !strings.Contains(got, w) {
-					t.Fatalf("scrubInlineSecrets(%q) = %q, missing %q", tc.in, got, w)
+					t.Fatalf("answerscrub.ScrubInline(%q) = %q, missing %q", tc.in, got, w)
 				}
 			}
 		})
@@ -1181,11 +1182,11 @@ func TestAWorkersCardIDIsCapped(t *testing.T) {
 
 // A URL's password may hold a path character and is still scrubbed.
 func TestScrubCatchesAURLPasswordWithAPathCharacter(t *testing.T) {
-	got := scrubInlineSecrets("connect postgres://app:ab/cd+ef==@db-1:5432/prod failed")
+	got := answerscrub.ScrubInline("connect postgres://app:ab/cd+ef==@db-1:5432/prod failed")
 	if strings.Contains(got, "ab/cd") || !strings.Contains(got, "db-1:5432/prod") || !strings.Contains(got, "postgres://app:") {
 		t.Errorf("scrubbed = %q, want the password gone and the host kept", got)
 	}
-	if got := scrubInlineSecrets("see https://example.com/docs/page"); got != "see https://example.com/docs/page" {
+	if got := answerscrub.ScrubInline("see https://example.com/docs/page"); got != "see https://example.com/docs/page" {
 		t.Errorf("a URL with no credentials changed: %q", got)
 	}
 }
