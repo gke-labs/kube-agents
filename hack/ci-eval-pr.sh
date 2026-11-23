@@ -3365,6 +3365,8 @@ check_case_entries "${PRESUBMIT_CASES_FILE}" "${TASKS[@]}"
 # The presubmit's case ids, one per line, for the blocking roster's subset
 # check below -- taken before the tier switch can append the nightly.
 PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${ENTRY}")"; done)"
+# DO NOT MERGE: an evidence twin runs only the case under test (#6127).
+TASKS=("./tasks/session-recalls-context-after-idle-reap/task.yaml")
 
 # ─── The nightly tier (#1021, the catch-all; #1023/#1024 consume it) ─────────
 # The nightly periodic runs the FULL catalog (or one part of it, under
