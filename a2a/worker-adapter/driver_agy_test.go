@@ -290,7 +290,7 @@ func TestAnAgyDeniedTurnFailsTheTask(t *testing.T) {
 // The fixtures stay the dialect the decoder reads: every line is an agy
 // event, and each fixture ends in exactly one result per user message.
 func TestTheAgyFixturesAreAgyLines(t *testing.T) {
-	for _, name := range []string{"basic", "deny", "error", "timeout", "cache", "thinking"} {
+	for _, name := range []string{"basic", "deny", "error", "timeout", "cache", "thinking", "tool"} {
 		results := 0
 		for _, line := range agyFixture(t, name) {
 			var ln agyLine
@@ -301,7 +301,7 @@ func TestTheAgyFixturesAreAgyLines(t *testing.T) {
 				results++
 			}
 		}
-		if want := map[string]int{"cache": 2}[name]; results != max(want, 1) {
+		if want := map[string]int{"cache": 2, "tool": 2}[name]; results != max(want, 1) {
 			t.Errorf("%s: %d results", name, results)
 		}
 	}
@@ -365,5 +365,68 @@ func TestAnAgyResultWithoutUsageKeepsTheBaseline(t *testing.T) {
 	}
 	if u := results[2].Telemetry.usage; u.InputTokens != 70 || u.OutputTokens != 15 {
 		t.Errorf("turn three %+v, want its difference from turn one's (70 in, 15 out)", u)
+	}
+}
+
+// TestAnAgyToolStepThatSucceedsIsOneActivityInTwoTurns: tool.jsonl (agy
+// 1.5.13) is one stream carrying two user messages, so two turns. The first
+// turn runs one shell command, a single tool step (step_index 2) that goes
+// ACTIVE then DONE. It decodes to one activity for that step, not one per
+// state update, and to two turn results, one per user message; neither
+// result is a tool completion. This is the recorded DONE tool step that the
+// tool-result event (#6814) is checked against once it exists: exactly one
+// tool step reaches a terminal state here.
+func TestAnAgyToolStepThatSucceedsIsOneActivityInTwoTurns(t *testing.T) {
+	lines := agyFixture(t, "tool")
+	var userMessages, terminalToolSteps int
+	for _, line := range lines {
+		var raw struct {
+			Event      string `json:"event"`
+			StepUpdate struct {
+				StepType string `json:"step_type"`
+				State    string `json:"state"`
+			} `json:"step_update"`
+		}
+		if err := json.Unmarshal(line, &raw); err != nil {
+			t.Fatal(err)
+		}
+		su := raw.StepUpdate
+		if su.StepType == "user_input" && su.State == "DONE" {
+			userMessages++
+		}
+		if su.StepType == "tool" && (su.State == "DONE" || su.State == "ERROR") {
+			terminalToolSteps++
+		}
+	}
+	if userMessages != 2 || terminalToolSteps != 1 {
+		t.Fatalf("fixture has %d user messages and %d terminal tool steps, want 2 and 1", userMessages, terminalToolSteps)
+	}
+	d := agyDriver{}.NewDecoder()
+	var activities, turnResults int
+	for _, line := range lines {
+		evs, err := d.Decode(line)
+		if err != nil {
+			t.Fatalf("%s: %v", line, err)
+		}
+		for _, ev := range evs {
+			switch ev.Kind {
+			case EventActivity:
+				activities++
+				if ev.Tool != "run_command" {
+					t.Errorf("activity tool %q, want run_command", ev.Tool)
+				}
+			case EventResult:
+				turnResults++
+				if ev.Failed {
+					t.Errorf("turn result %d failed with %q", turnResults, ev.Token)
+				}
+			}
+		}
+	}
+	if activities != terminalToolSteps {
+		t.Errorf("%d activities for %d tool steps", activities, terminalToolSteps)
+	}
+	if turnResults != userMessages {
+		t.Errorf("%d turn results for %d user messages", turnResults, userMessages)
 	}
 }
