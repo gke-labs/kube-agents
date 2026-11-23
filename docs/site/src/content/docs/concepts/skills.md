@@ -29,7 +29,7 @@ agents/
 
 Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile. The [skill catalog](/kube-agents/skills/) lists each persona's skills.
 
-The GKE Support Agent's skills live in `agents/tse/skills/` and reach a pod only when the optional `tse` profile is enabled. On a `mode: next` install, applying the sample [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml) makes the operator set `KUBE_AGENTS_ENABLED_PROFILES=tse` on the gateway Deployment, and the entrypoint scaffolds `$HERMES_HOME/profiles/tse` from the image's `/opt/tse-template` on the next start ([AgentProfile CRD](/kube-agents/operator/agentprofile-crd/)).
+The GKE Support Agent's skills live in `agents/tse/skills/` and reach a pod only when the optional `tse` profile is enabled. Applying the sample [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml) makes the operator set `KUBE_AGENTS_ENABLED_PROFILES=tse` on the gateway Deployment, and the entrypoint scaffolds `$HERMES_HOME/profiles/tse` from the image's `/opt/tse-template` on the next start ([AgentProfile CRD](/kube-agents/operator/agentprofile-crd/)).
 
 Some skills are pure Markdown; others carry supporting files (helper scripts, YAML templates) in the same directory. The Hermes runtime discovers `SKILL.md` files automatically at startup.
 
@@ -67,7 +67,7 @@ Two ways a skill enters the model's context:
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
-  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at '/opt/data/profiles/platform/governance/compliance_audit_sop.md' — all 469 lines of it, before you run anything. Its seventeen checks are section 2, lines 90-397, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit`) in the foreground with the terminal tool's timeout: 600 (the foreground maximum), --workspace set to the workspace start returned and --out /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, run precheck on it, read the manifest the way section 2 says, and pass the same file to precheck and then to finish as --manifest-file (if the collector wrote none, section 2 says what to pass instead). This is a scheduled run, so pass --scheduled to precheck and finish (and to no other command): only a scheduled run can get silent_ok true, and only a scheduled run is closed by precheck when the collector finds the fleet unchanged since the last one. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at '/opt/data/profiles/platform/governance/compliance_audit_sop.md' — all 517 lines of it, before you run anything. Its twenty checks are section 2, lines 90-445, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit`) in the foreground with the terminal tool's timeout: 600 (the foreground maximum), --workspace set to the workspace start returned and --out /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, run precheck on it, read the manifest the way section 2 says, and pass the same file to precheck and then to finish as --manifest-file (if the collector wrote none, section 2 says what to pass instead). This is a scheduled run, so pass --scheduled to precheck and finish (and to no other command): only a scheduled run can get silent_ok true, and only a scheduled run is closed by precheck when the collector finds the fleet unchanged since the last one. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
   "skills": [
     "fleet-audit"
   ],
@@ -100,7 +100,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
 3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
 
-   The image build passes each `bash`, `sh`, `shell` and `zsh` block in the skill's `SKILL.md`, whole, to the Tirith command scanner the agent itself runs under. It fails on any block holding a command the scanner would refuse: call a program by its literal path, never through a shell variable. A block too long for the scanner to finish analysing fails the same way, so split a long block. It also fails on a shell block whose Markdown does not parse as one, such as a fence left unclosed inside a list item, since it cannot read that block. It reads every other Markdown file in the skill directory the same way, except under `scripts/`.
+   Call a program by its literal name or path, never through a shell variable.
 
    Keep each of those files, `SKILL.md` included, at most 40,000 characters: the agent opens them with `skill_view`, which returns a result over its own cap as a short preview and a file path instead. The 40,000 limit sits below that cap so each file comes back whole, and `make skills-check` fails a longer one. Put a long procedure's detail in `references/`, one file per step, and say in `SKILL.md` when to open each.
 
@@ -132,8 +132,6 @@ Reproducible and immutable: the skill ships inside the container.
      -t my-registry/kube-agents/platform-agent:v1.1.0 .
    docker push my-registry/kube-agents/platform-agent:v1.1.0
    ```
-
-   The build fails if a shell command in any Markdown file of the copied skill, outside `scripts/`, is one the agent's command scanner would refuse, as in step 3 of [Adding a new skill](#adding-a-new-skill).
 
 3. Point the `PlatformAgent` CR at the new image and apply it:
 

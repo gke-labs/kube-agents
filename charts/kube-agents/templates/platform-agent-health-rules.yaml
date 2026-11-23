@@ -7,7 +7,7 @@ by agent_namespace and agent; the ratios are recorded once and the alerts read
 the recorded series, so a dashboard and an alert see one number. Two alerts
 are the exceptions: the scrape alert reads `up`, and the Slack alert reads the
 A2A gateway's own connection gauge, by its scrape job, which only the replica
-holding a next-mode Slack install's socket serves (a gateway on another
+holding a Slack install's socket serves (a gateway on another
 backend, or a standby replica, serves no sample, so the alert never fires
 there). Neither carries the agent labels; the four rules below bind the
 alerts over the operator's gauges.
@@ -85,7 +85,7 @@ clears it. The cost is the young-series case: a new pod that has never
 connected can fire after `for` alone, which for a pod that never connected is
 true.
 */}}
-{{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
+{{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-curator-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
 {{- /* The exec tier's scrape job, while the tier renders: an exec tier no scrape reaches is as dark as a broker. */}}
 {{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
 {{- $jobs = append $jobs (printf "%s-credential-proxy-exec-tier-monitoring" $agent) }}

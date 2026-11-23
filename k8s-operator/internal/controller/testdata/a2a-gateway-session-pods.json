@@ -113,9 +113,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -300,9 +300,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -480,9 +480,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -694,6 +694,10 @@
               "value": "in-cluster"
             },
             {
+              "name": "KUBEAGENTS_KUBECTL_COST_TIER",
+              "value": "default"
+            },
+            {
               "name": "KUBE_PROXY_CA_FILE",
               "value": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
             }
@@ -705,9 +709,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [

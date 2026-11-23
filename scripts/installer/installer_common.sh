@@ -17,8 +17,8 @@
 # none of them inline, and a point of use reads its DEFAULT_* key rather than
 # repeating the value. The exception is a fallback that deliberately differs
 # from the fresh-install default because it describes an install that already
-# exists -- `${ENABLE_GVISOR:-false}` here and in install.sh's control panel,
-# each with the argument beside it. Precedence is
+# exists -- ENABLE_GVISOR, which resolve_existing_install_gvisor reads from the
+# live cluster for both this file and install.sh's control panel. Precedence is
 # install.defaults.env → an exported environment variable → install.env → a flag.
 # install.env is sourced with `set -a`, which is what puts it above the export.
 #
@@ -104,13 +104,55 @@ readonly LITELLM_BUDGET_MIN_USD="0.01"
 # ─── Data volume size ─────────────────────────────
 # The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
 # disk, which the admission webhook and the chart also take as the limit.
+readonly PLATFORM_AGENT_STORAGE_MI_PER_MI=1
+readonly PLATFORM_AGENT_STORAGE_MI_PER_GI=1024
+readonly PLATFORM_AGENT_STORAGE_MI_PER_TI=1048576
 readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
+
+# ─── Runtime & fleet sizing presets ───────────────
+# spec.deployment.sizingProfile accepted values and the cluster-count
+# thresholds where the operator's "auto" mode steps up to medium and fleet
+# (held equal to sizingMediumClusterThreshold and sizingFleetClusterThreshold in
+# k8s-operator/internal/controller/sizing_profile.go by
+# tests/test_sizing_profile_parity.py).
+readonly PLATFORM_AGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
+readonly PLATFORM_AGENT_SIZING_PROFILE_VALUES="small medium fleet auto"
+readonly CAI_GKE_CLUSTER_ASSET_TYPE="container.googleapis.com/Cluster"
+readonly SIZING_TIER_SMALL="small"
+readonly SIZING_TIER_MEDIUM="medium"
+readonly SIZING_TIER_FLEET="fleet"
+readonly SIZING_PROFILE_AUTO="auto"
+readonly GKE_CLUSTER_MODE_STANDARD="standard"
+readonly SIZING_SCAN_CONTEXT_INSTALL="install"
+readonly SIZING_SCAN_CONTEXT_UPGRADE="upgrade"
+readonly SIZING_SCAN_SKIP_FLAG="skip_scan"
+readonly SIZING_SCAN_PROJ_TMP_TEMPLATE="kube-agents-scan-proj.XXXXXX"
+readonly SIZING_SCAN_ASSET_TMP_TEMPLATE="kube-agents-scan-asset.XXXXXX"
+readonly SIZING_SCAN_CR_TMP_TEMPLATE="kube-agents-scan-cr.XXXXXX"
+readonly CRD_SIZING_PROFILE_JQ='[.spec.versions[]? | select(.storage == true or .served == true) | .schema.openAPIV3Schema.properties.spec.properties.deployment.properties.sizingProfile] | map(select(. != null)) | length > 0'
+readonly CRD_PROBE_SUPPORTED_RC=0
+readonly CRD_PROBE_MISSING_FIELD_RC=1
+readonly CRD_PROBE_UNREADABLE_RC=2
+readonly SIZING_MEDIUM_CLUSTER_THRESHOLD=10
+readonly SIZING_FLEET_CLUSTER_THRESHOLD=25
+readonly SIZING_SCAN_MAX_PROJECT_PROBES=50
+readonly SIZING_FLEET_STORAGE_SIZE_RECOMMENDATION="100Gi"
+readonly SIZING_FLEET_STORAGE_RECOMMENDATION_MI=102400
+readonly SIZING_AGENT_BASE_STORAGE_MI=8192
+readonly SIZING_AGENT_PER_PROFILE_MI=400
+readonly SIZING_SCAN_GCLOUD_CLUSTER_COLUMNS=3
+readonly SIZING_SCAN_LOC_REGEX='^[a-z]+-[a-z0-9-]+$'
+readonly SIZING_SCAN_ASSET_NAME_REGEX='^//container\.googleapis\.com/projects/([^/]+)/(?:locations|zones)/([^/]+)/clusters/([^/]+)$'
 # A GSA account id is 6-30 characters. A cluster name too long for
 # "<cluster>-minter" keeps this many of its characters, plus this many hex
 # characters of its hash (minter_derived_names).
 readonly MINTER_GSA_ID_MAX_LEN=30
 readonly MINTER_GSA_CLUSTER_PREFIX_LEN=18
 readonly MINTER_GSA_HASH_LEN=4
+# The platform names the home-channel warning uses, as the operator's
+# HomeChannelUnset condition spells them.
+readonly GATEWAY_HOME_CHANNEL_GCHAT_PLATFORM="Google Chat"
+readonly GATEWAY_HOME_CHANNEL_SLACK_PLATFORM="Slack"
 
 # ─── Release footprint summary ────────────────────
 # What install.sh's pre-flight summary prints about the cluster footprint and
@@ -127,6 +169,7 @@ readonly MINTER_GSA_HASH_LEN=4
 # `helm get notes` is the command that does.
 readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
 readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_SCHEMA_FILE="values.schema.json"
 readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
 readonly FOOTPRINT_PROBE_KEY="summary"
 readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
@@ -168,11 +211,11 @@ readonly FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN='-var-file|-var[=[:space:]]+
 # terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
 # one pair per line.
 readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.storage.size
+platform_agent_sizing_profile=platformAgent.deployment.sizingProfile
 memory_provider=platformAgent.harness.memory.provider
 hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
 web_console_enabled=webConsole.enabled
-enable_github_minter=githubMinter.enabled
-platform_agent_mode=platformAgent.mode"
+enable_github_minter=githubMinter.enabled"
 
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
@@ -299,19 +342,22 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
-# The A2A gateway Deployment that holds Slack under spec.mode next, and its
-# container.
+# The A2A gateway Deployment that holds Google Chat, and Slack when Google
+# Chat is off, and its container.
 # shellcheck disable=SC2034  # read by print_instructions_slack.sh
 readonly PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT="platform-agent-a2a-gateway"
 # shellcheck disable=SC2034  # read by print_instructions_slack.sh
 readonly PLATFORM_AGENT_A2A_GATEWAY_CONTAINER="gateway"
-# The operator's page for a spec.mode switch, which links the design document
-# (docs/designs/spec-mode-switch.md) for what the switch changes inside.
-readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode"
+# PLATFORM_AGENT_MODE in install.env once chose the PlatformAgent's spec.mode,
+# which picked between two component stacks. Every install runs the A2A stack
+# now, so the loaders read the key, say so once, and ignore it. The notice.
+readonly PLATFORM_AGENT_MODE_IGNORED_NOTICE="still sets PLATFORM_AGENT_MODE, which is no longer read: every install runs the A2A stack (the NATS bus and the A2A gateway in front of the agent). You may remove the key."
+# Whether note_ignored_platform_agent_mode_key has spoken this run.
+PLATFORM_AGENT_MODE_IGNORED_NOTED="false"
 # The Slack app setup page's allowlist section, which says how to find a
-# member ID; refuse_next_slack_gateway_settings points at it.
+# member ID; refuse_slack_gateway_settings points at it.
 readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
-# The same page's home channel section, which next_home_channel_unset_remedy
+# The same page's home channel section, which gateway_home_channel_unset_remedy
 # points at.
 readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#home-channel"
 # A Slack home channel the A2A gateway arms its notify route on: a public
@@ -330,6 +376,11 @@ readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
 # slack_home_channel_policy validation holds the same three values.
 readonly SLACK_HOME_CHANNEL_POLICY_AUTO="auto"
 readonly SLACK_HOME_CHANNEL_POLICY_MANUAL="manual"
+# spec.integration.googleChat.homeChannelPolicy takes the same two values on
+# the same terms; Terraform's google_chat_home_channel_policy validation holds
+# the same three.
+readonly GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO="$SLACK_HOME_CHANNEL_POLICY_AUTO"
+readonly GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL="$SLACK_HOME_CHANNEL_POLICY_MANUAL"
 # The prefix of a Google Chat space's resource name, the only home channel
 # form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
 # The gateway and the operator hold the same rule; keep the three in step
@@ -348,21 +399,11 @@ GO_TRIMSPACE_CHARS=(
   $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
 )
 readonly GO_TRIMSPACE_CHARS
-# What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
-# a field that is not there: a record that carries no platformAgent.mode, or a
-# CR with no spec.mode. Told apart from printing nothing, which means there is
-# no CR.
-readonly PLATFORM_AGENT_MODE_UNSET="unset"
 # How each of read_platform_agent_install_state's reads came out.
 readonly PLATFORM_AGENT_READ_OK="ok"
 readonly PLATFORM_AGENT_READ_NONE="none"
 readonly PLATFORM_AGENT_READ_FAILED="failed"
 readonly PLATFORM_AGENT_READ_NO_CONTEXT="no-context"
-# The front doors pass this to announce_platform_agent_mode_for_apply when
-# no confirmation stands between the notice and the apply (upgrade.sh's full
-# arm, the Day-2 menu's apply, install.sh -y), so the notice does not offer
-# "run again" as a way out of a run that will not wait for one.
-readonly PLATFORM_AGENT_MODE_NOTICE_UNGATED="ungated"
 # The composition's two Helm releases, by their Terraform type and name: the
 # front doors ask the state whether it manages one before deciding what a
 # cert-manager or kube-agents release already on the cluster means.
@@ -486,6 +527,17 @@ readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
 # gcloud's answer for a cluster that does not exist. Any other describe failure
 # (auth expiry, a 403, a network blip) is a cluster that could not be read.
 readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
+# gcloud's answer when the Kubernetes Engine API is off in the project it
+# names (reason SERVICE_DISABLED). A cluster cannot exist in such a project:
+# disabling the API deletes every cluster in it, and creating one needs it on.
+# So a refusal that names the target project is absence, which a fresh
+# project reaches on its first install; one that names another project (the
+# caller's quota project) says nothing about the target and stays unread.
+# The same grammar scripts/verify_ci_pool_project.py reads for the Gemini key
+# (GEMINI_KEY_SERVICE_DISABLED, GEMINI_KEY_DISABLED_IN); its tests pin the
+# project-extraction pattern equal to this one.
+readonly GKE_API_DISABLED_PATTERN="API has not been used in project [a-z0-9-]+ before or it is disabled|SERVICE_DISABLED"
+readonly GKE_API_DISABLED_PROJECT_PATTERN="API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -724,7 +776,7 @@ openai_compatible_cidr_refusal() {
   fi
   if [[ "$address" == *:* ]]; then
     local groups
-    if ! groups="$(ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
+    if ! groups="$(trap - ERR; ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
       printf "'%s' is not an IPv6 CIDR" "$cidr"
       return 0
     fi
@@ -827,7 +879,7 @@ validate_openai_compatible_inputs() {
     return 1
   fi
   local host_port host port
-  if ! host_port="$(openai_compatible_url_host_port "$api_base")"; then
+  if ! host_port="$(trap - ERR; openai_compatible_url_host_port "$api_base")"; then
     # Not echoed: the userinfo this refuses may be the key itself.
     print_error "OPENAI_COMPATIBLE_API_BASE is not an http:// or https:// URL with a host, an optional port from ${TCP_PORT_MIN} to ${TCP_PORT_MAX}, and no userinfo, query or fragment before the path (a key belongs in OPENAI_COMPATIBLE_API_KEY)."
     return 1
@@ -944,28 +996,80 @@ is_valid_redaction_ip_action() {
   [[ "${1:-}" =~ ^(mask|pseudonym|off)$ ]]
 }
 
-# PLATFORM_AGENT_MODE: the PlatformAgent CRD's spec.mode enum, which the
-# chart's platformAgent.mode and the composition's platform_agent_mode take too.
-is_valid_platform_agent_mode() {
-  [[ "${1:-}" =~ ^(today|next)$ ]]
-}
-
 # PLATFORM_AGENT_STORAGE_SIZE: a whole number of Mi, Gi or Ti above zero and at
 # most 64Ti, what the composition's platform_agent_storage_size validation
 # takes. The CRD's spec.storage.size takes any quantity; this is the narrower
 # subset a disk is sized in. A number with more digits than the limit in Mi is
 # over it in every unit, which keeps the multiply inside Bash's int64.
+_platform_agent_storage_unit_mi() {
+  case "${1:-}" in
+    Mi) printf '%s' "$PLATFORM_AGENT_STORAGE_MI_PER_MI" ;;
+    Gi) printf '%s' "$PLATFORM_AGENT_STORAGE_MI_PER_GI" ;;
+    Ti) printf '%s' "$PLATFORM_AGENT_STORAGE_MI_PER_TI" ;;
+    *) return 1 ;;
+  esac
+}
+
 is_valid_platform_agent_storage_size() {
   [[ "${1:-}" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || return 1
   local unit="${BASH_REMATCH[1]}" number mi_per_unit
   number="${1%"$unit"}"
   [ "${#number}" -le "${#PLATFORM_AGENT_STORAGE_SIZE_MAX_MI}" ] || return 1
-  case "$unit" in
-    Mi) mi_per_unit=1 ;;
-    Gi) mi_per_unit=1024 ;;
-    Ti) mi_per_unit=1048576 ;;
-  esac
+  mi_per_unit="$(_platform_agent_storage_unit_mi "$unit")" || return 1
   [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
+}
+
+# PLATFORM_AGENT_SIZING_PROFILE: one of small, medium, fleet, or auto.
+is_valid_platform_agent_sizing_profile() {
+  local value="${1:-}" item
+  for item in $PLATFORM_AGENT_SIZING_PROFILE_VALUES; do
+    [ "$value" = "$item" ] && return 0
+  done
+  return 1
+}
+
+# Maps a visible or live cluster count to the operator's sizing tier.
+sizing_tier_for_cluster_count() {
+  local count="${1:-0}"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  if [ "$count" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; then
+    printf '%s' "$SIZING_TIER_FLEET"
+  elif [ "$count" -ge "$SIZING_MEDIUM_CLUSTER_THRESHOLD" ]; then
+    printf '%s' "$SIZING_TIER_MEDIUM"
+  else
+    printf '%s' "$SIZING_TIER_SMALL"
+  fi
+}
+
+# Converts a whole Mi/Gi/Ti quantity to MiB (0 when empty or unparseable).
+storage_quantity_to_mi() {
+  local value="${1:-}" unit number mi_per_unit
+  [[ "$value" =~ ^([1-9][0-9]*)(Mi|Gi|Ti)$ ]] || { printf '0'; return 0; }
+  number="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]}"
+  mi_per_unit="$(_platform_agent_storage_unit_mi "$unit")" || { printf '0'; return 0; }
+  printf '%s' "$((number * mi_per_unit))"
+}
+
+# Checks whether the cluster's PlatformAgent CRD declares
+# spec.deployment.sizingProfile.
+# Returns: 0 = supported, 1 = CRD present without field, 2 = unreadable/absent.
+crd_supports_platform_agent_sizing_profile() {
+  command -v kubectl >/dev/null 2>&1 || return "$CRD_PROBE_UNREADABLE_RC"
+  command -v jq >/dev/null 2>&1 || return "$CRD_PROBE_UNREADABLE_RC"
+  local ctx_args=() expected_ctx=""
+  if [ -n "${PROJECT_ID:-}" ] && [ -n "${REGION:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
+    expected_ctx="$(gke_context_name)"
+    kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1 || return "$CRD_PROBE_UNREADABLE_RC"
+    ctx_args=(--context "$expected_ctx")
+  fi
+  local crd_json
+  crd_json="$(trap - ERR; kubectl ${ctx_args[@]+"${ctx_args[@]}"} get crd "$PLATFORM_AGENT_CRD_NAME" -o json --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" 2>/dev/null)" || return "$CRD_PROBE_UNREADABLE_RC"
+  [ -n "$crd_json" ] || return "$CRD_PROBE_UNREADABLE_RC"
+  if printf '%s' "$crd_json" | jq -e "$CRD_SIZING_PROFILE_JQ" >/dev/null 2>&1; then
+    return "$CRD_PROBE_SUPPORTED_RC"
+  fi
+  return "$CRD_PROBE_MISSING_FIELD_RC"
 }
 
 # The value of a top-level `key = value` assignment in a terraform.tfvars file,
@@ -981,7 +1085,8 @@ tfvars_scalar() {
 # Renders the chart's footprint summary for the install terraform.tfvars
 # describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
 # $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
-# the chart is not in the checkout, or the render refuses; the caller decides
+# the chart is not in the checkout, a step of the probe chart's build fails
+# (the probe directory is removed), or the render refuses; the caller decides
 # whether that is worth more than a warning.
 render_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
@@ -994,19 +1099,20 @@ render_footprint_summary() {
     echo "the chart at ${chart_dir} has no Chart.yaml or ${FOOTPRINT_HELPERS_TEMPLATE}" >&2
     return 1
   fi
-  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
+  probe_dir="$(trap - ERR; mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
   # Chart.yaml, values and files/footprint.yaml as they are; the helpers as the
   # only template beside the probe. values.schema.json comes too, so a value
   # the chart would refuse is refused here as well.
   cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
-  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  [ ! -f "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" ] || cp "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
   cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
-  mkdir -p "$probe_dir/templates"
-  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  mkdir -p "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE%/*}" || { rm -rf "$probe_dir"; return 1; }
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}" || { rm -rf "$probe_dir"; return 1; }
   # A ConfigMap, so the output is one YAML document helm's manifest sorter
   # reads; the block scalar keeps the summary's lines as they are.
   printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
-    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}" \
+    || { rm -rf "$probe_dir"; return 1; }
   local -a set_args=()
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue
@@ -1019,7 +1125,7 @@ render_footprint_summary() {
     set_args+=(--api-versions "$FOOTPRINT_AUTOPILOT_API_VERSION")
   fi
   local rendered rc=0
-  rendered="$(helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
+  rendered="$(trap - ERR; helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
   rm -rf "$probe_dir"
   if [ "$rc" -ne 0 ]; then
     printf '%s\n' "$rendered" >&2
@@ -1070,8 +1176,8 @@ print_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" summary err_file namespace notes_cmd
   namespace="$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_NAMESPACE_KEY")"
   notes_cmd="helm get notes ${KUBE_AGENTS_HELM_RELEASE} -n ${namespace:-$FOOTPRINT_NAMESPACE_PLACEHOLDER}"
-  err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
-  if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
+  err_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
+  if summary="$(trap - ERR; render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
     printf '%s\n' "$summary" | sed 's/^/      /'
     if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" = "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
       print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools whatever the pods request."
@@ -1086,13 +1192,7 @@ print_footprint_summary() {
   rm -f "$err_file"
 }
 
-# The PlatformAgent and its release, read once for the scope check and the
-# mode notice beside it. Each front door calls refuse_apply_over_undeclared_scope
-# and then announce_platform_agent_mode_for_apply against the same namespace,
-# with nothing applied in between, so the reads this fills are held for the
-# notice (PLATFORM_AGENT_READS_HELD_FOR) and the notice takes and clears them
-# instead of asking the cluster again. A run whose scope check did not run
-# (an install.sh --dry-run, a first install) has the notice read for itself.
+# The PlatformAgent and its release, read for the scope check.
 #
 # Fills, for $1 namespace:
 #   PLATFORM_AGENT_CR_READ      PLATFORM_AGENT_READ_OK, _NONE (no PlatformAgent
@@ -1102,26 +1202,20 @@ print_footprint_summary() {
 #                               nothing was asked)
 #   PLATFORM_AGENT_CR_JSON      the `kubectl get platformagents -o json` list
 #   PLATFORM_AGENT_RECORD_READ  _OK, _NONE (no release) or _FAILED; empty when
-#                               the CR read did not answer, or $2 is "cr-only"
+#                               the CR read did not answer
 #   PLATFORM_AGENT_RECORD_JSON  the latest revision's values ({} with no release)
 #   PLATFORM_AGENT_SERVED_JSON  the last served revision's values, only when
 #                               the latest did not serve (a failed or pending
 #                               upgrade); {} otherwise
-#   PLATFORM_AGENT_SERVED_REVISION  that revision's number, else empty
-#   PLATFORM_AGENT_SERVED_READ  _FAILED when the release history, or that
-#                               revision's values, could not be read, else
-#                               empty
 #   PLATFORM_AGENT_READ_ERROR   the failed read's stderr, on one line
 # A missing type and a missing release are answers, told apart from a read
 # that failed by kubectl's and helm's exit status and their own error text,
 # never by empty output. Caller has PROJECT_ID, REGION and CLUSTER_NAME set
 # (gke_context_name).
 read_platform_agent_install_state() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" scope="${2:-}" expected_ctx err_file served_rev history_json
-  PLATFORM_AGENT_READS_HELD_FOR="$namespace"
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" expected_ctx err_file served_rev history_json
   PLATFORM_AGENT_CR_READ="" PLATFORM_AGENT_CR_JSON="" PLATFORM_AGENT_RECORD_READ=""
-  PLATFORM_AGENT_RECORD_JSON="{}" PLATFORM_AGENT_SERVED_JSON="{}" PLATFORM_AGENT_SERVED_READ=""
-  PLATFORM_AGENT_SERVED_REVISION=""
+  PLATFORM_AGENT_RECORD_JSON="{}" PLATFORM_AGENT_SERVED_JSON="{}"
   PLATFORM_AGENT_READ_ERROR=""
   expected_ctx="$(gke_context_name)"
   if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
@@ -1143,10 +1237,6 @@ read_platform_agent_install_state() {
     return 0
   fi
   PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_OK"
-  if [ "$scope" = "cr-only" ]; then
-    rm -f "$err_file"
-    return 0
-  fi
   if ! PLATFORM_AGENT_RECORD_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
     if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
       PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_NONE"
@@ -1164,9 +1254,8 @@ read_platform_agent_install_state() {
   # what Helm diffs the next render against. On a healthy release the latest
   # revision is the one record, so a hand edit that happens to restore an
   # earlier scope is still a hand edit. A history that cannot be read, or
-  # parsed, is PLATFORM_AGENT_SERVED_READ failed: the scope check compares
-  # against the latest revision alone, but the mode notice, which picks one
-  # record, says it did not run rather than guess the latest served.
+  # parsed, names the failure in PLATFORM_AGENT_READ_ERROR: the scope check
+  # compares against the latest revision alone.
   if ! history_json="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")" \
     || ! served_rev="$(trap - ERR; printf '%s' "$history_json" | python3 -c '
 import json, sys
@@ -1178,174 +1267,35 @@ served = [] if latest is None or latest.get("status") in statuses else [
 ]
 print(max(served) if served else "")
 ' "$HELM_SERVED_REVISION_STATUSES" 2>>"$err_file")"; then
-    PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
     PLATFORM_AGENT_READ_ERROR="the release history did not answer: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     rm -f "$err_file"
     return 0
   fi
   rm -f "$err_file"
-  PLATFORM_AGENT_SERVED_REVISION="$served_rev"
   if [ -n "$served_rev" ]; then
     if ! PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null)"; then
       PLATFORM_AGENT_SERVED_JSON="{}"
-      PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
       PLATFORM_AGENT_READ_ERROR="revision ${served_rev}, the last one that served, did not answer"
     fi
   fi
 }
 
-# The held reads for $1 namespace when the scope check just made them, or
-# fresh ones; either way none are held afterwards, so a later call (the
-# menu's next apply) reads again.
-take_platform_agent_install_state() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
-  if [ -z "${PLATFORM_AGENT_READS_HELD_FOR:-}" ] || [ "$PLATFORM_AGENT_READS_HELD_FOR" != "$namespace" ]; then
-    read_platform_agent_install_state "$namespace" "${2:-}"
-  fi
-  PLATFORM_AGENT_READS_HELD_FOR=""
-}
-
-# The spec.mode of the one PlatformAgent in $1 (a `kubectl get -o json`
-# list), PLATFORM_AGENT_MODE_UNSET when it carries none, nothing when the
-# list is empty. The CR, not the record, is the mode the install runs: a mode
-# set by hand with kubectl is on the CR and in no record.
-platform_agent_mode_on_cr() {
-  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
-import json, sys
-items = (json.load(sys.stdin) or {}).get("items") or []
-if items:
-    sys.stdout.write((items[0].get("spec") or {}).get("mode") or sys.argv[1])
-' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
-}
-
-# The platformAgent.mode of $1 (a release's values as JSON),
-# PLATFORM_AGENT_MODE_UNSET when it records none.
-platform_agent_mode_in_values() {
-  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
-import json, sys
-values = json.load(sys.stdin) or {}
-sys.stdout.write((values.get("platformAgent") or {}).get("mode") or sys.argv[1])
-' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
-}
-
-# A mode as the operator reads it: an absent one is today.
-effective_platform_agent_mode() {
-  if [ "${1:-}" = "$PLATFORM_AGENT_MODE_UNSET" ]; then
-    printf '%s' "$DEFAULT_PLATFORM_AGENT_MODE"
-  else
-    printf '%s' "${1:-}"
-  fi
-}
-
-# The spec.mode the CR carries after a full apply of PLATFORM_AGENT_MODE: $1
-# the record's (the served revision's platformAgent.mode), $2 the live CR's,
-# $3 the key.
-# The composition renders "next" as mode: next and "today" as no field, and
-# Helm patches a custom resource from the difference between the served
-# render and the new one. So a render that changes the mode sets it, one
-# that drops a recorded mode removes it, and one the record already matches
-# changes nothing, leaving whatever the CR carries, a mode set by hand
-# included. The render is modelled from the key alone: a platformAgent.mode
-# in the composition's extra_helm_values is merged over it and wins, and is
-# not seen here (platform_agent_mode_extra_values_caveat says so).
-platform_agent_mode_after_apply() {
-  local record="${1:-}" live="${2:-}" key="${3:-}" rendered="$PLATFORM_AGENT_MODE_UNSET"
-  [ "$key" = "next" ] && rendered="$key"
-  if [ "$rendered" = "$record" ]; then
-    printf '%s' "$live"
-  else
-    printf '%s' "$rendered"
-  fi
-}
-
-# Said under every mode notice that names what an apply does: the
-# composition merges extra_helm_values over the document it computes from
-# PLATFORM_AGENT_MODE, so a platformAgent.mode set there decides, and the
-# installer cannot read it (it lives in a *.auto.tfvars or
-# TF_VAR_extra_helm_values, beside the tfvars the generator writes).
-platform_agent_mode_extra_values_caveat() {
-  print_info "This compares PLATFORM_AGENT_MODE in install.env with the cluster. A platformAgent.mode set through the composition's extra_helm_values wins over the key, and this check does not see it."
-}
-
-# Says what a full apply does to the install's spec.mode: $1 the record's
-# mode, $2 the live CR's, $3 what PLATFORM_AGENT_MODE resolves to now, $4
-# PLATFORM_AGENT_MODE_NOTICE_UNGATED when no confirmation follows. A
-# switch is a rollout of a different component stack, not a setting, and the
-# only trace of it in install.env is the one key someone edited, so the run
-# that applies it names it first. A key the apply cannot bring the CR to,
-# because the CR carries a mode set outside this installer, is named too.
-# Silent when either value is empty (no CR, no release: a first install),
-# and on a re-apply of the same mode. Sets PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
-# to true when it names a switch, so install.sh -y can refuse one nobody chose. A read that failed is not empty: the
-# front-door call says so itself (announce_platform_agent_mode_for_apply).
-# Caller defines print_warning / print_info.
-announce_platform_agent_mode_switch() {
-  local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
-  # Read by install.sh's -y refusal.
-  # shellcheck disable=SC2034
-  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
-  [ -n "$record" ] && [ -n "$live" ] || return 0
-  from="$(effective_platform_agent_mode "$live")"
-  to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
-  if [ "$from" = "$to" ]; then
-    if [ "$to" != "$key" ]; then
-      print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but the PlatformAgent carries spec.mode ${to}, set outside this installer, and this apply leaves it there: the release already renders ${key}, so Helm has no change to send."
-      print_info "To switch it, patch spec.mode on the CR, or apply once with PLATFORM_AGENT_MODE=${to} and then with ${key} (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
-      platform_agent_mode_extra_values_caveat
-    fi
-    return 0
-  fi
-  # shellcheck disable=SC2034
-  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
-  print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
-  if [ "$to" = "next" ]; then
-    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat, or Slack when it is the only chat platform enabled."
-  else
-    print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
-  fi
-  if [ "$route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ]; then
-    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. This run applies it without asking first: to keep spec.mode ${from}, stop it now (Ctrl-C) and set PLATFORM_AGENT_MODE=${from} in install.env. ./upgrade.sh --plan previews an apply without making it."
-  else
-    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. To keep spec.mode ${from}, set PLATFORM_AGENT_MODE=${from} in install.env and run again."
-  fi
-  platform_agent_mode_extra_values_caveat
-}
-
-# The retag modes' half: upgrade.sh --upgrade-mode=harness or operator moves
-# image tags on the release's recorded values and applies no tfvars, so the
-# CR keeps the mode it has whatever PLATFORM_AGENT_MODE says. Said when a full
-# upgrade would move it, rather than left for that upgrade to switch the
-# install without a word from this run. $1 the record's mode, $2 the live
-# CR's, $3 the key, $4 the upgrade mode. Silent when either is empty.
-note_platform_agent_mode_not_applied() {
-  local record="${1:-}" live="${2:-}" key="${3:-}" upgrade_mode="${4:-}" running full
-  [ -n "$record" ] && [ -n "$live" ] || return 0
-  running="$(effective_platform_agent_mode "$live")"
-  full="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
-  [ "$running" != "$full" ] || return 0
-  print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run re-tags the release's recorded values and leaves it at spec.mode ${running}."
-  print_info "A full upgrade applies the switch to ${full} (${PLATFORM_AGENT_MODE_SWITCH_DOC}). To stay on ${running}, set PLATFORM_AGENT_MODE=${running} in install.env."
-  platform_agent_mode_extra_values_caveat
-}
-
 # Whether Slack is consumed by the A2A gateway after this apply: the
 # operator's a2aSlackArmed (k8s-operator platformagent_a2a_manifests.go),
-# which is spec.mode next, Slack enabled and Google Chat not armed. Chat holds
-# the gateway when both are on, and Slack stays on the today path. $1 the
-# mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED.
+# which is Slack enabled. The gateway runs Google Chat beside it, so Chat
+# does not change the answer. $1 SLACK_ENABLED.
 slack_moves_to_a2a_gateway() {
-  [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
+  is_truthy "${1:-}"
 }
 
 # Whether Google Chat is consumed by the A2A gateway after this apply: the
 # operator's a2aChatArmed (k8s-operator platformagent_a2a_manifests.go),
-# spec.mode next with Google Chat enabled. $1 the mode the apply renders, $2
-# GOOGLE_CHAT_ENABLED.
+# Google Chat enabled. $1 GOOGLE_CHAT_ENABLED.
 google_chat_moves_to_a2a_gateway() {
-  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
+  is_truthy "${1:-}"
 }
 
-# The three checks behind refuse_next_slack_gateway_settings, one per
+# The three checks behind refuse_slack_gateway_settings, one per
 # setting, which the install.sh interview also uses to re-ask. Each prints
 # nothing for a setting that passes.
 #
@@ -1429,8 +1379,8 @@ slack_bot_token_has_separator() {
   return 1
 }
 
-# Three Slack settings that the today path accepts and the A2A gateway does
-# not. They are refused before the front door applies anything (#2812), and
+# Three Slack settings that the Hermes Slack platform accepts and the A2A
+# gateway does not. They are refused before the front door applies anything (#2812), and
 # only when Slack moves to the gateway (slack_moves_to_a2a_gateway). Every
 # failing setting is reported in one run. There is no email-to-ID lookup.
 #
@@ -1438,7 +1388,7 @@ slack_bot_token_has_separator() {
 #   The installer's prompt in 0.7 and 0.8 asked for "User IDs / Emails", and
 #   an email matches nobody, so that person is refused after the switch. A
 #   list of only emails is non-empty, so it does not fall back to allow-all.
-#   The today path (Hermes) never matched an email either.
+#   The Hermes Slack platform never matched an email either.
 # - SLACK_HOME_CHANNEL, when set, must be a channel id
 #   (SLACK_HOME_CHANNEL_ID_RE). With anything else, a DM (D...) or a user
 #   (U...), the gateway leaves its notify route unarmed, so proactive posts
@@ -1452,16 +1402,16 @@ slack_bot_token_has_separator() {
 #   recovered from the live Secret later, so the front doors call again
 #   after recovery.
 #
-# $1 the mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED,
-# $4 the allowlist, $5 the home channel, $6 the bot token. $7 is "flags"
-# when install.sh's flags can set them too, so the remedy names each flag.
-# $8 is SCOPE_CHECK_MODE_WARN for a run that applies nothing (upgrade.sh
-# --plan, install.sh --dry-run): it warns, as the scope check does, and
-# returns 0.
-refuse_next_slack_gateway_settings() {
-  local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
-  local emails bad_home count refused=false via keep_today say=print_error lead=""
-  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
+# $1 SLACK_ENABLED, $2 GOOGLE_CHAT_ENABLED (read by nothing here: the gateway
+# holds Slack with Chat or without), $3 the allowlist, $4 the home channel,
+# $5 the bot token. $6 is "flags" when install.sh's flags can set them too, so
+# the remedy names each flag. $7 is SCOPE_CHECK_MODE_WARN for a run that
+# applies nothing (upgrade.sh --plan, install.sh --dry-run): it warns, as the
+# scope check does, and returns 0.
+refuse_slack_gateway_settings() {
+  local allowlist="${3:-}" home="${4:-}" token="${5:-}" flags="${6:-}" mode="${7:-}"
+  local emails bad_home count refused=false via say=print_error lead=""
+  slack_moves_to_a2a_gateway "${1:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
     lead="An applying run would be refused: "
@@ -1469,31 +1419,26 @@ refuse_next_slack_gateway_settings() {
   emails="$(slack_allowlist_emails "$allowlist")"
   if [ -n "$emails" ]; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-allowed-users"
-    "$say" "${lead}SLACK_ALLOWED_USERS holds entries that look like emails: ${emails}. Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs exactly (such as U0123ABCD), so an email matches nobody and the person it names would be locked out after this apply."
-    print_info "Find each person's member ID in Slack: open their profile, choose ⋮ (More), then Copy member ID. Replace the emails with those IDs in ${via} and run again. Slack app setup for next: ${SLACK_ALLOWLIST_DOC}"
+    "$say" "${lead}SLACK_ALLOWED_USERS holds entries that look like emails: ${emails}. The A2A gateway matches this allowlist against Slack member IDs exactly (such as U0123ABCD), so an email matches nobody and the person it names would be locked out after this apply."
+    print_info "Find each person's member ID in Slack: open their profile, choose ⋮ (More), then Copy member ID. Replace the emails with those IDs in ${via} and run again. Slack app setup for the A2A gateway: ${SLACK_ALLOWLIST_DOC}"
     refused=true
   fi
   bad_home="$(slack_home_channel_not_an_id "$home")"
   if [ -n "$bad_home" ]; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-home-channel"
-    "$say" "${lead}SLACK_HOME_CHANNEL is '${bad_home}', which is not a Slack channel id (C... or G...). Under spec.mode next the A2A gateway does not arm its notify route with it, so the agent's proactive posts and every board card's report back stop."
+    "$say" "${lead}SLACK_HOME_CHANNEL is '${bad_home}', which is not a Slack channel id (C... or G...). The A2A gateway does not arm its notify route with it, so the agent's proactive posts and every board card's report back stop."
     print_info "Use the channel's id: in Slack, open the channel's details; the id is at the bottom of the About tab. Set it in ${via} and run again."
     refused=true
   fi
   count="$(slack_bot_token_list_count "$token")"
   if [ -n "$count" ]; then
-    via="install.env"; keep_today="PLATFORM_AGENT_MODE=today"
-    if [ "$flags" = "flags" ]; then
-      via="install.env or --slack-bot-token"
-      # A first install is next by default, so the flag is the way to stay on today.
-      keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
-    fi
-    "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. The A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
+    print_info "The gateway serves one Slack workspace: set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or turn Slack off (SLACK_ENABLED=false)."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
-    "$say" "${lead}SLACK_BOT_TOKEN holds one token with a comma or space left in it. Under spec.mode next the A2A gateway's Slack backend takes the value whole, and Slack refuses it, so that backend retries without end and nothing answers on Slack."
+    "$say" "${lead}SLACK_BOT_TOKEN holds one token with a comma or space left in it. The A2A gateway's Slack backend takes the value whole, and Slack refuses it, so that backend retries without end and nothing answers on Slack."
     print_info "Remove the comma or space from SLACK_BOT_TOKEN in ${via} and run again."
     refused=true
   fi
@@ -1501,59 +1446,89 @@ refuse_next_slack_gateway_settings() {
   return 0
 }
 
-# refuse_next_slack_gateway_settings on the exported keys: what install.env
+# refuse_slack_gateway_settings on the exported keys: what install.env
 # loaded, or what install.sh exported, plus a token the tfvars generator
-# recovered from the live Secret. $1 and $2 are the other's $7 and $8.
-refuse_next_slack_gateway_settings_from_env() {
-  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+# recovered from the live Secret. $1 and $2 are the other's $6 and $7.
+refuse_slack_gateway_settings_from_env() {
+  refuse_slack_gateway_settings \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
 }
 
-# Under spec.mode next the A2A gateway, not the agent, makes the agent's
+# The A2A gateway, not the agent, makes the agent's
 # proactive posts (alerts, drift reports, scheduled reports), and it arms them
 # only on a home channel. A reply in a conversation still arrives without one,
 # so an install with none looks healthy while every unprompted post is refused
-# by the gateway and kept for one digest (#3320). The front doors warn rather than refuse: some installs want chat
-# with no posts, and a CI install never posts. The operator reports the same
+# by the gateway and kept for one digest (#3320). With two platforms on the
+# gateway and one home set, the agent sends home posts to that home instead.
+# The front doors warn rather than refuse: some installs want chat with no
+# posts, and a CI install never posts. The operator reports the same
 # state as the HomeChannelUnset condition.
 #
-# The install.env key of the home channel the gateway's chat backend lacks,
-# or nothing: $1 the mode the apply renders, $2 SLACK_ENABLED, $3
-# GOOGLE_CHAT_ENABLED, $4 SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL.
-# The backend follows the operator: Chat holds the gateway when enabled, and
-# Slack only when Chat is not (slack_moves_to_a2a_gateway).
-next_home_channel_unset_key() {
+# The install.env keys of the home channels the gateway's chat backends lack,
+# one per line, Google Chat first as in the operator's condition, or nothing:
+# $1 SLACK_ENABLED, $2 GOOGLE_CHAT_ENABLED, $3 SLACK_HOME_CHANNEL, $4
+# GOOGLE_CHAT_HOME_CHANNEL. The backends follow the operator: the gateway
+# holds each platform that is enabled (google_chat_moves_to_a2a_gateway,
+# slack_moves_to_a2a_gateway).
+gateway_home_channel_unset_key() {
   local home
-  [ "${1:-}" = "next" ] || return 0
-  if is_truthy "${3:-}"; then
-    home="${5:-}"
-    home="$(trim_go_space "$home")"
-    [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
-    return 0
-  fi
-  if is_truthy "${2:-}"; then
+  if google_chat_moves_to_a2a_gateway "${2:-}"; then
     home="${4:-}"
     home="$(trim_go_space "$home")"
-    [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
+    [ -n "$home" ] || printf '%s\n' GOOGLE_CHAT_HOME_CHANNEL
+  fi
+  if slack_moves_to_a2a_gateway "${1:-}"; then
+    home="${3:-}"
+    home="$(trim_go_space "$home")"
+    [ -n "$home" ] || printf '%s\n' SLACK_HOME_CHANNEL
   fi
   return 0
 }
 
-# The warning for that key ($1), one line.
-next_home_channel_unset_message() {
-  local meanwhile="it refuses them and keeps them for one digest"
-  # Only the Chat key can have Slack beside it: Slack holds the gateway only
-  # with Chat off, so with the Slack key the posts are kept, never sent on.
-  if [ "${1:-}" = GOOGLE_CHAT_HOME_CHANNEL ]; then
-    meanwhile="${meanwhile} (or, with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel)"
+# The gateway platform that has a home channel, as the operator names it in
+# the HomeChannelUnset condition, or nothing: gateway_home_channel_unset_key's
+# four arguments. Google Chat first, as the agent picks where home posts go
+# (chat_notify.routed_platforms). A Chat home counts only as a space name, and
+# a Slack home only as a channel id: the gateway arms no route for anything
+# else (the operator's slackChannelID). It cannot see a Slack channel or a
+# Chat space the gateway learned from a mention, which only the cluster
+# records: with one learned, the warning for the other platform still says the
+# gateway keeps its posts, while the agent sends them to the learned home.
+# Called when a key is unset, so the platform it prints is the other one.
+gateway_home_channel_set_platform() {
+  local home
+  if google_chat_moves_to_a2a_gateway "${2:-}"; then
+    home="$(trim_go_space "${4:-}")"
+    if [ -n "$home" ] && [ -z "$(gchat_home_channel_not_a_space_name "$home")" ]; then
+      printf '%s' "$GATEWAY_HOME_CHANNEL_GCHAT_PLATFORM"
+      return 0
+    fi
   fi
-  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+  if slack_moves_to_a2a_gateway "${1:-}"; then
+    home="$(trim_go_space "${3:-}")"
+    if [ -n "$home" ] && [ -z "$(slack_home_channel_not_an_id "$home")" ]; then
+      printf '%s' "$GATEWAY_HOME_CHANNEL_SLACK_PLATFORM"
+    fi
+  fi
+  return 0
+}
+
+# The warning for one of those keys ($1), one line. $2 is
+# gateway_home_channel_set_platform's answer: the agent sends home posts to every
+# routed platform with a home channel, so with one set the posts go there, and
+# the gateway keeps them only when no platform has one.
+gateway_home_channel_unset_message() {
+  if [ -n "${2:-}" ]; then
+    printf '%s' "${1} is empty, and the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set they go to ${2}'s home channel meanwhile; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+    return 0
+  fi
+  printf '%s' "${1} is empty, and the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set it refuses them and keeps them for one digest; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
 }
 
 # What to set for that key ($1); $2 is "flags" when install.sh's flags can
 # set it too.
-next_home_channel_unset_remedy() {
+gateway_home_channel_unset_remedy() {
   local via="install.env"
   case "${1:-}" in
     SLACK_HOME_CHANNEL)
@@ -1562,42 +1537,50 @@ next_home_channel_unset_remedy() {
       ;;
     GOOGLE_CHAT_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
-      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space."
+      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space; or, under homeChannelPolicy auto (the default), mention the agent once, top-level, in the named space you want."
       ;;
   esac
 }
 
-# Set by warn_next_home_channel_unset, and again by install.sh from the mode
-# after the apply, so the front door's closing summary can say it again where
-# the reader of a non-interactive run's log will see it.
-NEXT_HOME_CHANNEL_UNSET_KEY=""
+# Set by warn_gateway_home_channel_unset, and again by install.sh after the
+# apply, so the front door's closing summary can say it again where the
+# reader of a non-interactive run's log will see it. One key per line.
+GATEWAY_HOME_CHANNEL_UNSET_KEY=""
+# Set beside it: gateway_home_channel_set_platform's answer for the same apply.
+GATEWAY_HOME_CHANNEL_SET_PLATFORM=""
 
-# Warns when the apply leaves the gateway's chat backend without a home
-# channel, and records the key for the closing summary. Takes
-# next_home_channel_unset_key's five arguments, then "flags" as $6. Never
+# Warns for each of the gateway's chat backends the apply leaves without a
+# home channel, and records the keys for the closing summary. Takes
+# gateway_home_channel_unset_key's four arguments, then "flags" as $5. Never
 # refuses.
-warn_next_home_channel_unset() {
-  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
-  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
-  print_warning "$(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${6:-}")"
+warn_gateway_home_channel_unset() {
+  local key
+  GATEWAY_HOME_CHANNEL_UNSET_KEY="$(gateway_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}")"
+  GATEWAY_HOME_CHANNEL_SET_PLATFORM="$(gateway_home_channel_set_platform "${1:-}" "${2:-}" "${3:-}" "${4:-}")"
+  for key in $GATEWAY_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "$(gateway_home_channel_unset_message "$key" "$GATEWAY_HOME_CHANNEL_SET_PLATFORM")"
+    print_info "$(gateway_home_channel_unset_remedy "$key" "${5:-}")"
+  done
   return 0
 }
 
-# warn_next_home_channel_unset on the exported keys; $1 is its $6.
-warn_next_home_channel_unset_from_env() {
-  warn_next_home_channel_unset "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+# warn_gateway_home_channel_unset on the exported keys; $1 is its $5.
+warn_gateway_home_channel_unset_from_env() {
+  warn_gateway_home_channel_unset \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
 }
 
-# The closing summary's block, when warn_next_home_channel_unset found the
-# key empty: printed last, so a non-interactive log ends on it. $1 "flags".
-print_next_home_channel_unset_summary() {
-  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
+# The closing summary's block, when warn_gateway_home_channel_unset found a key
+# empty: printed last, so a non-interactive log ends on it. $1 "flags".
+print_gateway_home_channel_unset_summary() {
+  local key
+  [ -n "$GATEWAY_HOME_CHANNEL_UNSET_KEY" ] || return 0
   echo ""
-  print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
+  for key in $GATEWAY_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "No home channel: proactive posts are not delivered there yet. $(gateway_home_channel_unset_message "$key" "$GATEWAY_HOME_CHANNEL_SET_PLATFORM")"
+    print_info "$(gateway_home_channel_unset_remedy "$key" "${1:-}")"
+  done
 }
 
 # Set by print_chat_setup_checklists: "true" when it printed a checklist.
@@ -1619,18 +1602,19 @@ print_chat_checklist_commands() {
   return 0
 }
 
-# The chat setup checklists after an apply, and the closing summary's key: $1
-# the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
-# and INSTALL_ENV_FILE are read from the environment the apply rendered from,
-# which every caller has exported by then; what the apply used wins over
-# install.env in the printers. Returns 0 whatever it printed, because the
-# front doors call it bare under set -e.
+# The chat setup checklists after an apply, and the closing summary's key.
+# The chat keys, NAMESPACE, PROJECT_NUMBER and INSTALL_ENV_FILE are read from
+# the environment the apply rendered from, which every caller has exported by
+# then; what the apply used wins over install.env in the printers. Returns 0
+# whatever it printed, because the front doors call it bare under set -e.
 # shellcheck disable=SC2034  # both globals are read by install.sh
 print_chat_setup_checklists() {
-  local mode="${1:-}" printers failed="false"
+  local printers failed="false"
   printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   CHAT_SETUP_CHECKLIST_PRINTED="false"
-  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
+  GATEWAY_HOME_CHANNEL_UNSET_KEY="$(gateway_home_channel_unset_key "${SLACK_ENABLED:-}" \
+    "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+  GATEWAY_HOME_CHANNEL_SET_PLATFORM="$(gateway_home_channel_set_platform "${SLACK_ENABLED:-}" \
     "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
   # --dry-run: a printer changes nothing, yet load_state would otherwise ask
   # for REGISTRY_PREFIX on a terminal when no file records it, and write it to
@@ -1638,22 +1622,18 @@ print_chat_setup_checklists() {
   if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
     echo ""
     KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
-      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode" \
       GCHAT_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-}" \
       GCHAT_STEPS_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}" \
       GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
       GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
       GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
-      GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
       bash "${printers}/print_instructions_gchat.sh" --dry-run || failed="true"
     CHAT_SETUP_CHECKLIST_PRINTED="true"
   fi
   if is_truthy "${SLACK_ENABLED:-}"; then
     echo ""
     KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
-      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode" \
       SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
-      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
       SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
       SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
       bash "${printers}/print_instructions_slack.sh" --dry-run || failed="true"
@@ -1664,121 +1644,6 @@ print_chat_setup_checklists() {
     print_chat_checklist_commands
   fi
   return 0
-}
-
-# Said when a read the notice needs failed, so the run does not go on as if
-# the notice had been weighed and found nothing to say. $1 what could not be
-# read, $2 the key, $3 namespace.
-_platform_agent_mode_unread() {
-  print_warning "The mode-switch check did not run: ${1}. This apply renders spec.mode from PLATFORM_AGENT_MODE=${2} in install.env whatever the PlatformAgent carries now, so if that differs it is a mode switch (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
-  print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
-}
-
-# The spec.mode the CR carries after this apply, for the chat checklists that
-# follow it: the key, unless the reads below show a CR the apply leaves on
-# another mode (platform_agent_mode_after_apply). A platformAgent.mode in the
-# composition's extra_helm_values is not followed: the installer cannot read
-# it (platform_agent_mode_extra_values_caveat).
-PLATFORM_AGENT_MODE_AFTER_APPLY=""
-
-# The front door's call, after the scope check beside it: $1 namespace, $2
-# the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
-# confirmation after the notice. Quiet where there is nothing to switch (a cluster the tfvars
-# generator found NOT_FOUND, so TFVARS_CLUSTER_EXISTS=false, which is every
-# first install: nothing is read, since a kubeconfig context left by an
-# earlier install of the same name points at an endpoint that is gone; no
-# PlatformAgent type, no CR, no release), loud where a read failed. Past that
-# guard the cluster exists, so a kubeconfig with no context for it (kubectl
-# absent, or a get-credentials that did not land on the --dry-run and
-# --generate-only routes the scope check skips) is a read that did not
-# happen, and is said with the scope check's remedy.
-# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh and upgrade.sh
-announce_platform_agent_mode_for_apply() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
-  # Read by install.sh's -y refusal.
-  # shellcheck disable=SC2034
-  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
-  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$key")"
-  if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
-    PLATFORM_AGENT_READS_HELD_FOR=""
-    return 0
-  fi
-  take_platform_agent_install_state "$namespace"
-  case "$PLATFORM_AGENT_CR_READ" in
-    "$PLATFORM_AGENT_READ_FAILED")
-      _platform_agent_mode_unread "the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
-      return 0
-      ;;
-    "$PLATFORM_AGENT_READ_NO_CONTEXT")
-      _platform_agent_mode_unread "the kubeconfig has no context '$(gke_context_name)' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})" "$key" "$namespace"
-      return 0
-      ;;
-    "$PLATFORM_AGENT_READ_OK") ;;
-    *) return 0 ;;
-  esac
-  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
-  [ -n "$live" ] || return 0
-  if [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_FAILED" ] || [ "$PLATFORM_AGENT_SERVED_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
-    _platform_agent_mode_unread "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
-    return 0
-  fi
-  [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
-  if [ -n "$PLATFORM_AGENT_SERVED_REVISION" ]; then
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
-  else
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
-  fi
-  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
-  announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
-}
-
-# After announce_platform_agent_mode_for_apply, from the reads it left:
-# succeeds unless they show that no install runs next, that is no cluster, no
-# PlatformAgent type, a CR on today, or, with the CR gone, no release or one
-# that records today (the next apply recreates the CR from it). A read that
-# failed or did not happen is not today. upgrade.sh refuses a keyless
-# install.env on this, since such a file renders today.
-platform_agent_install_may_run_next() {
-  local live record
-  [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ] && return 1
-  case "${PLATFORM_AGENT_CR_READ:-}" in
-    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
-    "$PLATFORM_AGENT_READ_OK") ;;
-    *) return 0 ;;
-  esac
-  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
-  if [ -n "$live" ]; then
-    [ "$(effective_platform_agent_mode "$live")" = "next" ]
-    return
-  fi
-  case "${PLATFORM_AGENT_RECORD_READ:-}" in
-    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
-    "$PLATFORM_AGENT_READ_OK") ;;
-    *) return 0 ;;
-  esac
-  [ "${PLATFORM_AGENT_SERVED_READ:-}" = "$PLATFORM_AGENT_READ_FAILED" ] && return 0
-  if [ -n "${PLATFORM_AGENT_SERVED_REVISION:-}" ]; then
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
-  else
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
-  fi
-  [ "$(effective_platform_agent_mode "$record")" = "next" ]
-}
-
-# upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
-# the upgrade mode, $4 RETAG_VALUES_JSON, the values the retag re-applies and
-# so the record a later full upgrade diffs against. Only the CR is read here.
-note_platform_agent_mode_for_retag() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live
-  read_platform_agent_install_state "$namespace" cr-only
-  PLATFORM_AGENT_READS_HELD_FOR=""
-  if [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
-    print_info "Whether a full upgrade would switch spec.mode was not checked: the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR}). This run leaves the mode where it is either way."
-    return 0
-  fi
-  [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
-  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
-  note_platform_agent_mode_not_applied "$(platform_agent_mode_in_values "${4:-}")" "$live" "${2:-}" "${3:-}"
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -2004,14 +1869,13 @@ load_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
-  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
-  # switch the install's component stack for one run, and the next run from a
-  # clean shell would switch it back and retire the A2A stack.
-  unset PLATFORM_AGENT_MODE
   # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
   # grow both data claims for one run, and the next run from a clean shell
   # would drop the field again, leaving claims larger than the CR says.
   unset PLATFORM_AGENT_STORAGE_SIZE
+  # The runtime sizing profile too: once install.env exists, only install.env
+  # (or an explicit front-door flag) sets it.
+  unset PLATFORM_AGENT_SIZING_PROFILE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub, and an inherited GITOPS_HOST would
@@ -2031,7 +1895,25 @@ load_install_env() {
   # shellcheck disable=SC1090
   . "$file"
   set +a
+  note_ignored_platform_agent_mode_key "$file"
   return 0
+}
+
+# PLATFORM_AGENT_MODE is read and ignored: a file from before every install
+# ran the A2A stack still assigns it, and a loader says so once rather than
+# refuse the file or apply anything from the key. Detected from the file, not
+# the variable, so a shell export says nothing; the variable is unset either
+# way, as the loaders do for every key only the file may set, so nothing
+# downstream can read it. $1 the install.env just loaded. Caller defines
+# print_info.
+note_ignored_platform_agent_mode_key() {
+  local file="${1:-}"
+  unset PLATFORM_AGENT_MODE
+  [ "$PLATFORM_AGENT_MODE_IGNORED_NOTED" != "true" ] || return 0
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?PLATFORM_AGENT_MODE=" "$file" 2>/dev/null || return 0
+  PLATFORM_AGENT_MODE_IGNORED_NOTED="true"
+  print_info "${file} ${PLATFORM_AGENT_MODE_IGNORED_NOTICE}"
 }
 
 # ─── install.env Persistence ──────────────────────────────────────────────────
@@ -2043,8 +1925,8 @@ load_install_env() {
 # any key here: "Save & Apply Configuration Changes" is an explicit instruction
 # to record a change, not the installer quietly overwriting an input. install.sh
 # itself writes only as scripts/installer/README.md ("install.env") lists: the
-# file on a first install, a chat key or PLATFORM_AGENT_MODE it lacks, and the
-# GitOps keys a run applies differently.
+# file on a first install, a chat key it lacks, and the GitOps keys a run
+# applies differently.
 #
 # No `export` keyword in the output: install.env is a dotenv, loaded with
 # `set -a`. The value is still %q-quoted, so spaces and quotes survive.
@@ -2602,6 +2484,20 @@ require_slack_home_channel_policy() {
   return 1
 }
 
+# GOOGLE_CHAT_HOME_CHANNEL_POLICY, on require_slack_home_channel_policy's
+# terms: it renders spec.integration.googleChat.homeChannelPolicy, whose CRD
+# enum accepts the same two spellings. $1 the value; $2 is "flags" when
+# install.sh's flag can set it too, so the remedy names it.
+require_google_chat_home_channel_policy() {
+  local value="${1:-}" via="install.env"
+  case "$value" in
+    "" | "$GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO" | "$GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL") return 0 ;;
+  esac
+  [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel-policy"
+  print_error "GOOGLE_CHAT_HOME_CHANNEL_POLICY is '${value}', which is not ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO} or ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL} (empty means ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.googleChat.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
+  return 1
+}
+
 # SCOPED_SA_POOL_MAX_ACCOUNTS is empty (the module's default) or a whole number
 # of at least one, or the run stops before a file is written and names the key:
 # the module's validation would name neither. No arithmetic, so no width to
@@ -3076,7 +2972,10 @@ print("true" if ((values.get("githubMinter") or {}).get("enabled") is True) else
 # absent): a live true the key does not record would be disarmed by the apply,
 # its members destroyed and the broker put on the ambient credential, so it
 # weighs like a cap off the default, an armed pool alone included. The members
-# list is derived from the scope and is not compared.
+# list is derived from the scope and is not compared. spec.hold, an operator's
+# pause, sits outside spec.scope and is not read here: no install.env key
+# carries it, the chart never renders it, and Helm's three-way patch leaves it
+# on the CR.
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -3088,9 +2987,6 @@ refuse_apply_over_undeclared_scope() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" mode="${2:-$SCOPE_CHECK_MODE_REFUSE}"
   local expected_ctx cr_json record_json served_json err_file verdict first_line
   expected_ctx="$(gke_context_name)"
-  # The reads stay held for the mode notice each front door calls next
-  # (announce_platform_agent_mode_for_apply), which takes them rather than
-  # asking the cluster the same questions again.
   read_platform_agent_install_state "$namespace"
   case "$PLATFORM_AGENT_CR_READ" in
     "$PLATFORM_AGENT_READ_NO_CONTEXT")
@@ -3269,10 +3165,12 @@ check_scope_container_access() {
   # Every probe below is called in a `||` list: the front doors run under
   # `set -eE` with an ERR trap, and a probe answering "denied" is an answer,
   # not an error, on the bare call upgrade.sh --plan makes as well as on the
-  # `|| exit 1` call the applying modes make.
+  # `|| exit 1` call the applying modes make. Each clears the ERR trap inside
+  # its substitution: bash 3.2 fires an inherited one there on the probe's
+  # non-zero return, before the `||` is consulted.
   if ! _scope_asset_api_enabled "$project"; then
     rc=0
-    constraint="$(_scope_policy_denying_asset_api "$project")" || rc=$?
+    constraint="$(trap - ERR; _scope_policy_denying_asset_api "$project")" || rc=$?
     if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
       failures+=("${SCOPE_ASSET_API} cannot be enabled in project '${project}': the effective organisation policy ${constraint} denies it, and the reconcile resolves a folder or organisation through that API. Ask the organisation's administrator for an exception, or declare explicit SCOPE_PROJECTS instead.")
     elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
@@ -3283,7 +3181,7 @@ check_scope_container_access() {
     undecided+=("whether ${identity} can set IAM policy on the declared containers (curl is not installed)")
   elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
-  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+  elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers ($(_scope_terraform_token_remedy))")
   else
     local IFS=$', \t\n'
@@ -3292,7 +3190,7 @@ check_scope_container_access() {
     for entry in $folders; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3302,7 +3200,7 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3312,7 +3210,7 @@ check_scope_container_access() {
     for entry in $organizations; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3322,7 +3220,7 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3439,11 +3337,12 @@ check_scope_export_sink_access() {
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (curl is not installed)")
   elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
-  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+  elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects ($(_scope_terraform_token_remedy))")
   else
     # Each probe is called in a `||` list: a denied answer is an answer, not
-    # an error, under the front doors' ERR trap. Globbing off around the
+    # an error, under the front doors' ERR trap, which each clears inside its
+    # substitution as the container preflight does. Globbing off around the
     # unquoted split, as the container preflight has it: an entry carrying a
     # glob character would otherwise be replaced by the files it matches.
     case "$-" in *f*) had_noglob=true ;; esac
@@ -3454,7 +3353,7 @@ check_scope_export_sink_access() {
         continue
       fi
       rc=0
-      reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         # The state is read on the first denial alone: a run with every
         # project granted never reads it.
@@ -3467,7 +3366,7 @@ check_scope_export_sink_access() {
           # it: the plan refreshes it, and a 403 or 404 above may mean the
           # project itself is not visible.
           rc=0
-          reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
+          reason="$(trap - ERR; _scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
           if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
             failures+=("${identity} cannot read this install's drift audit-log sink in project '${entry}' (${SCOPE_SINK_GET_PERMISSION}), or the project is not visible to it, and cannot create one (${SCOPE_SINK_CREATE_PERMISSION}); the plan reads the sink and would fail there, or the apply would at that project's read, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity, or ${SCOPE_SINK_READ_ROLE} there for an apply that leaves the sink as it is.")
           else
@@ -3613,7 +3512,7 @@ enable_scope_selector_apis() {
   [ -n "$(scope_selector_apis)" ] || return 0
   local project="${1:-${PROJECT_ID:-}}" missing rc=0 reason
   reason="$(scope_selector_apis_reason)"
-  missing="$(scope_selector_apis_missing "$project")" || rc=$?
+  missing="$(trap - ERR; scope_selector_apis_missing "$project")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     missing="$(scope_selector_apis)"
     print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan reads when it ${reason}, and which is idempotent..."
@@ -4159,15 +4058,20 @@ sys.exit(0)
 # ─── The minter's per-install names (#3504) ──────────────────────────────────
 # The token minter's key ring, key and GSA used to default to one fixed name
 # per project, so a second install that took the defaults adopted the first
-# install's App key. A new install now derives them from its cluster. An
-# install whose state already holds a minter keeps the names in its state: a
-# KMS key ring or key cannot be deleted, and renaming one plans a replacement
-# that would leave the old key and its versions behind.
+# install's App key. A new install now derives them from its cluster, and its
+# KSA too (#5282): Workload Identity's member names the project, namespace and
+# KSA but no cluster, so with one KSA name every install in a project could act
+# as every install's minter GSA. An install whose state already holds a
+# minter keeps the names in its state: a KMS key ring or key cannot be deleted,
+# and renaming one plans a replacement that would leave the old key and its
+# versions behind.
 
 # The names a new install derives from its cluster, separated by |: key ring,
-# key, GSA. A GSA id is 6-30 characters, so a cluster name too long for
+# key, GSA, KSA. A GSA id is 6-30 characters, so a cluster name too long for
 # "<cluster>-minter" keeps its first 18 characters and gains four hex
 # characters of its hash, which keeps two long names that share a prefix apart.
+# The KSA needs no such cut: a GKE cluster name is at most 40 characters, so
+# "<cluster>-github-minter" fits a 63-character DNS label.
 minter_derived_names() {
   local cluster=$1 gsa prefix hash
   gsa="${cluster}-minter"
@@ -4179,28 +4083,37 @@ minter_derived_names() {
     prefix="${prefix%-}"
     gsa="${prefix}-${hash}-minter"
   fi
-  printf '%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa"
+  printf '%s|%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa" "${cluster}-github-minter"
 }
 
-# The minter's key ring, key and GSA names as this install's state records
-# them (module.github_minter[0]), separated by |; a field the state doesn't
-# hold is empty, and all three are when there is no minter in state or no
-# state. tf_state_read's return code when the state could not be read.
+# The minter's key ring, key, GSA and KSA names as this install's state
+# records them (module.github_minter[0]; the KSA is the one its Workload
+# Identity member names), separated by |; a field the state doesn't hold is
+# empty, and all four are when there is no minter in state or no state.
+# tf_state_read's return code when the state could not be read.
 # shellcheck disable=SC2120
 tf_state_minter_names() {
   trap - ERR
   local state
   state=$(tf_state_read "$@") || return $?
   printf '%s' "$state" | python3 -c '
-import json, sys
+import json, re, sys
 try:
     doc = json.load(sys.stdin)
 except Exception:
     sys.exit(int(sys.argv[1]))
 want = {"google_kms_key_ring": "name", "google_kms_crypto_key": "name", "google_service_account": "account_id"}
 found = {}
+ksa = ""
 for r in doc.get("resources", []):
     if r.get("module") != "module.github_minter[0]" or r.get("mode") != "managed":
+        continue
+    if r.get("type") == "google_service_account_iam_member" and r.get("name") == "workload_identity":
+        for i in r.get("instances", []):
+            # serviceAccount:<project>.svc.id.goog[<namespace>/<ksa>]
+            m = re.search(r"\[[^/\]]+/([^\]]+)\]$", (i.get("attributes") or {}).get("member") or "")
+            if m:
+                ksa = m.group(1)
         continue
     attr = want.get(r.get("type"))
     if not attr or r.get("name") != "minter":
@@ -4209,7 +4122,7 @@ for r in doc.get("resources", []):
         value = (i.get("attributes") or {}).get(attr)
         if value:
             found[r["type"]] = value
-print("|".join(found.get(t, "") for t in want))
+print("|".join([found.get(t, "") for t in want] + [ksa]))
 ' "$TF_STATE_RC_UNREADABLE"
 }
 
@@ -4237,24 +4150,36 @@ minter_key_owner() {
   fi
 }
 
-# This install's default minter names, separated by |: key ring, key, GSA. An
-# install with a minter in its state gets the names it holds (a field the
-# state lacks falls back to the project-wide default it was created under). An
+# This install's default minter names, separated by |: key ring, key, GSA,
+# KSA. An install with a minter in its state gets the names it holds (a field
+# the state lacks falls back to the project-wide default it was created under). An
 # install with none gets the names derived from its cluster. When the state
 # can't be read, nothing can be said about which install this is, so it gets
 # the project-wide defaults an existing install was created with, and says so:
 # a new install there should set its names.
 minter_name_defaults() {
-  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa=""
+  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa="" ksa=""
   names="$(tf_state_minter_names "$project" "$cluster")" || rc=$?
   if [ "$rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
-    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME to names of its own." >&2
-    printf '%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME"
+    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}, KSA ${DEFAULT_GITHUB_MINTER_KSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY, GITHUB_MINTER_GSA_NAME and GITHUB_MINTER_KSA_NAME to names of its own." >&2
+    printf '%s|%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME" "$DEFAULT_GITHUB_MINTER_KSA_NAME"
     return 0
   fi
-  IFS='|' read -r ring key gsa <<<"$names"
-  if [ -n "${ring}${key}${gsa}" ]; then
-    printf '%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
+  IFS='|' read -r ring key gsa ksa <<<"$names"
+  if [ -n "${ring}${key}${gsa}${ksa}" ]; then
+    # A state with no binding yet is an apply that stopped partway. Its KSA is
+    # the derived one when its GSA is, since both came from one run's names:
+    # the shared default here would hand a new install the name #5282 exists
+    # to retire.
+    if [ -z "$ksa" ]; then
+      local derived_gsa derived_ksa
+      IFS='|' read -r _ _ derived_gsa derived_ksa <<<"$(minter_derived_names "$cluster")"
+      if [ -n "$gsa" ] && [ "$gsa" = "$derived_gsa" ]; then
+        ksa="$derived_ksa"
+      fi
+    fi
+    printf '%s|%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" \
+      "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}" "${ksa:-$DEFAULT_GITHUB_MINTER_KSA_NAME}"
     return 0
   fi
   minter_derived_names "$cluster"
@@ -4354,6 +4279,43 @@ check_service_account_ownership() {
   return 1
 }
 
+# Whether the install this state records runs the agent sandboxed, for
+# resolve_existing_install_gvisor when install.env is silent. Prints true when
+# the state holds the gVisor node pool (Standard) or the agent release renders
+# runtimeClassName gvisor (Autopilot's sandbox, which has no pool), false when
+# it holds the release without either, and nothing when there is no state to
+# read or no release in it: the caller decides what an unknown means.
+tf_state_runs_gvisor() {
+  local state
+  state=$(tf_state_read "$@") || return 0
+  printf '%s' "$state" | python3 -c '
+import json, re, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+release = None
+for res in doc.get("resources", []):
+    if res.get("mode") != "managed" or not res.get("instances"):
+        continue
+    if res.get("type") == "google_container_node_pool" and res.get("name") == "gvisor":
+        print("true")
+        sys.exit(0)
+    if res.get("type") == "helm_release" and res.get("name") == "kube_agents":
+        release = res
+if release is None:
+    sys.exit(0)
+values = (release["instances"][0].get("attributes") or {}).get("values") or []
+# The composition\x27s own document is the first; a later one is
+# extra_helm_values, where a runtimeClassName can belong to something else
+# (the shell sandbox). Within it, only the one under availability counts, and
+# the match stops at the next top-level key.
+pattern = re.compile(r"availability[\"\x27]?\s*:(?:(?!\n\S).)*?runtimeClassName[\"\x27]?\s*:\s*[\"\x27]?gvisor\b", re.S)
+first = values[0] if values and isinstance(values[0], str) else ""
+print("true" if pattern.search(first) else "false")
+'
+}
+
 # The image tag this install's Terraform state RECORDS, which is not the tag
 # the cluster is serving: the redeploy workflows move the running tag with
 # `helm upgrade` and never run Terraform. A drift plan needs this one, or every
@@ -4380,6 +4342,358 @@ value = (doc.get("outputs", {}).get("image_tag") or {}).get("value")
 if isinstance(value, str) and value:
     sys.stdout.write(value)
 '
+}
+
+# The Standard node-pool sizing_profile recorded in Terraform state (empty when
+# unset or unavailable).
+tf_state_sizing_profile() {
+  local state
+  state=$(tf_state_read) || return 0
+  printf '%s' "$state" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+value = (doc.get("outputs", {}).get("sizing_profile") or {}).get("value")
+if isinstance(value, str) and value:
+    sys.stdout.write(value)
+'
+}
+
+# Scans GKE clusters visible to this shell across PROJECT_ID, SCOPE_PROJECTS,
+# SCOPE_FOLDERS and SCOPE_ORGANIZATIONS (honoring SCOPE_EXCLUDE_PROJECTS and
+# SCOPE_EXCLUDE_CLUSTERS), and optionally folds in the live PlatformAgent's
+# status.usage cluster counters when $2 is "true". Best-effort: fails open if
+# gcloud or Cloud Asset API cannot be read so installs/upgrades never abort on
+# advisory telemetry.
+# Sets SIZING_SCAN_* and LIVE_CR_* globals.
+SIZING_SCAN_CLUSTER_COUNT=""
+SIZING_SCAN_GCLOUD_COUNT=""
+SIZING_SCAN_LIVE_CR_COUNT=""
+SIZING_SCAN_TIER=""
+SIZING_SCAN_SOURCE=""
+SIZING_SCAN_INCOMPLETE="false"
+LIVE_CR_SIZING_PROFILE=""
+LIVE_CR_EFFECTIVE_TIER=""
+LIVE_CR_STORAGE_SIZE=""
+LIVE_CR_EXPECTED_CLUSTER_PROFILES=""
+# shellcheck disable=SC2034  # read by upgrade.sh (--upgrade-mode=operator notice)
+LIVE_CR_PRESENT="false"
+
+scan_visible_clusters_in_scope() {
+  local project_id="${1:-${PROJECT_ID:-}}" include_host_cr="${2:-false}"
+  SIZING_SCAN_CLUSTER_COUNT=""
+  SIZING_SCAN_GCLOUD_COUNT=""
+  SIZING_SCAN_LIVE_CR_COUNT=""
+  SIZING_SCAN_TIER=""
+  SIZING_SCAN_SOURCE=""
+  SIZING_SCAN_INCOMPLETE="false"
+  SIZING_SCAN_INCOMPLETE_DETAIL=""
+  LIVE_CR_SIZING_PROFILE=""
+  LIVE_CR_EFFECTIVE_TIER=""
+  LIVE_CR_STORAGE_SIZE=""
+  LIVE_CR_EXPECTED_CLUSTER_PROFILES=""
+  # shellcheck disable=SC2034  # read by upgrade.sh (--upgrade-mode=operator notice)
+  LIVE_CR_PRESENT="false"
+
+  local probe_ok="0" probe_failed="0" scan_incomplete="false" projects_incomplete="false" scope_incomplete="false"
+  local gcloud_proj_file gcloud_asset_file cr_json_file parsed
+  gcloud_proj_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/${SIZING_SCAN_PROJ_TMP_TEMPLATE}")" || return 0
+  gcloud_asset_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/${SIZING_SCAN_ASSET_TMP_TEMPLATE}")" || { rm -f "$gcloud_proj_file"; return 0; }
+  cr_json_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/${SIZING_SCAN_CR_TMP_TEMPLATE}")" || { rm -f "$gcloud_proj_file" "$gcloud_asset_file"; return 0; }
+
+  if command -v gcloud >/dev/null 2>&1; then
+    local -a projects=()
+    local item seen_projects=""
+    for item in "$project_id" $(csv_list_items "${SCOPE_PROJECTS:-}"); do
+      [ -n "$item" ] || continue
+      case " ${seen_projects} " in
+        *" ${item} "*) continue ;;
+      esac
+      seen_projects="${seen_projects:+${seen_projects} }${item}"
+      projects+=("$item")
+    done
+
+    local probed=0 proj out loc c_name
+    for proj in "${projects[@]}"; do
+      if [ "$probed" -ge "$SIZING_SCAN_MAX_PROJECT_PROBES" ]; then
+        scan_incomplete="true"
+        projects_incomplete="true"
+        break
+      fi
+      probed=$((probed + 1))
+      if out="$(trap - ERR; gcloud container clusters list --project="$proj" --format="value(name,location)" 2>/dev/null)"; then
+        probe_ok=1
+        while IFS=$'\t' read -r c_name loc _; do
+          [ -n "$c_name" ] && [ -n "$loc" ] || continue
+          printf '%s\t%s\t%s\n' "$proj" "$loc" "$c_name" >> "$gcloud_proj_file"
+        done <<< "$out"
+      else
+        probe_failed=1
+        projects_incomplete="true"
+      fi
+    done
+
+    local folder org
+    for folder in $(csv_list_items "${SCOPE_FOLDERS:-}"); do
+      [ -n "$folder" ] || continue
+      if out="$(trap - ERR; gcloud asset search-all-resources --scope="folders/${folder}" --asset-types="$CAI_GKE_CLUSTER_ASSET_TYPE" --format="value(name)" 2>/dev/null)"; then
+        probe_ok=1
+        [ -z "$out" ] || printf '%s\n' "$out" >> "$gcloud_asset_file"
+      else
+        probe_failed=1
+        scan_incomplete="true"
+        scope_incomplete="true"
+      fi
+    done
+    for org in $(csv_list_items "${SCOPE_ORGANIZATIONS:-}"); do
+      [ -n "$org" ] || continue
+      if out="$(trap - ERR; gcloud asset search-all-resources --scope="organizations/${org}" --asset-types="$CAI_GKE_CLUSTER_ASSET_TYPE" --format="value(name)" 2>/dev/null)"; then
+        probe_ok=1
+        [ -z "$out" ] || printf '%s\n' "$out" >> "$gcloud_asset_file"
+      else
+        probe_failed=1
+        scan_incomplete="true"
+        scope_incomplete="true"
+      fi
+    done
+  fi
+
+  if [ -n "${SCOPE_SHARED_VPC_HOSTS:-}" ] || [ -n "${SCOPE_METRICS_SCOPES:-}" ]; then
+    scan_incomplete="true"
+    scope_incomplete="true"
+  fi
+
+  local has_cr_json="false"
+  if [ "$include_host_cr" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    local cr_ctx_ok="true" cr_ctx_args=() cr_ctx=""
+    if [ -n "${PROJECT_ID:-}" ] && [ -n "${REGION:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
+      cr_ctx="$(gke_context_name)"
+      if kubectl config get-contexts "$cr_ctx" >/dev/null 2>&1; then
+        cr_ctx_args=(--context "$cr_ctx")
+      else
+        cr_ctx_ok="false"
+      fi
+    fi
+    if [ "$cr_ctx_ok" = "true" ] && \
+       kubectl ${cr_ctx_args[@]+"${cr_ctx_args[@]}"} get crd "$PLATFORM_AGENT_CRD_NAME" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" >/dev/null 2>&1 && \
+       kubectl ${cr_ctx_args[@]+"${cr_ctx_args[@]}"} get platformagents -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" -o json --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" > "$cr_json_file" 2>/dev/null; then
+      has_cr_json="true"
+    fi
+  fi
+
+  parsed="$(python3 -c '
+import fnmatch, json, pathlib, re, sys
+
+proj_file, asset_file, cr_file = sys.argv[1:4]
+has_cr_json = sys.argv[4] == "true"
+probe_ok = sys.argv[5] == "1"
+host_project_id, host_project_number = sys.argv[6], sys.argv[7]
+excl_projects_raw, excl_clusters_raw = sys.argv[8], sys.argv[9]
+gcloud_cluster_col_count = int(sys.argv[10])
+loc_re = re.compile(sys.argv[11])
+asset_re = re.compile(sys.argv[12])
+
+def csv_tokens(raw):
+    return [t for t in re.split(r"[\s,]+", raw.strip()) if t]
+
+excl_projects = csv_tokens(excl_projects_raw)
+excl_clusters = set(csv_tokens(excl_clusters_raw))
+
+def canonical_project(tok):
+    if host_project_number and host_project_id and tok == host_project_number:
+        return host_project_id
+    return tok
+
+def is_excluded(proj, loc, name):
+    if any(fnmatch.fnmatchcase(proj, pat) for pat in excl_projects):
+        return True
+    return f"{proj}/{loc}/{name}" in excl_clusters
+
+clusters = set()
+for line in pathlib.Path(proj_file).read_text(encoding="utf-8").splitlines():
+    parts = line.split("\t")
+    if len(parts) != gcloud_cluster_col_count:
+        continue
+    proj, loc, name = (p.strip() for p in parts)
+    if not (proj and name and loc_re.match(loc)):
+        continue
+    proj = canonical_project(proj)
+    if not is_excluded(proj, loc, name):
+        clusters.add((proj, loc, name))
+
+for line in pathlib.Path(asset_file).read_text(encoding="utf-8").splitlines():
+    m = asset_re.match(line.strip())
+    if not m:
+        continue
+    proj, loc, name = m.group(1), m.group(2), m.group(3)
+    proj = canonical_project(proj)
+    if not is_excluded(proj, loc, name):
+        clusters.add((proj, loc, name))
+
+live_cr_count = ""
+cr_sizing = ""
+cr_tier = ""
+cr_storage = ""
+cr_expected = ""
+cr_present = "false"
+if has_cr_json:
+    try:
+        data = json.loads(pathlib.Path(cr_file).read_text(encoding="utf-8"))
+        items = data.get("items") or []
+        if items:
+            cr_present = "true"
+            item = items[0]
+            spec = item.get("spec") or {}
+            status = item.get("status") or {}
+            dep = spec.get("deployment") or {}
+            storage = spec.get("storage") or {}
+            usage = status.get("usage") or {}
+            if isinstance(dep.get("sizingProfile"), str):
+                cr_sizing = dep["sizingProfile"]
+            if isinstance(status.get("effectiveSizingTier"), str):
+                cr_tier = status["effectiveSizingTier"]
+            if isinstance(storage.get("size"), str):
+                cr_storage = storage["size"]
+            if isinstance(storage.get("expectedClusterProfiles"), int):
+                cr_expected = str(storage["expectedClusterProfiles"])
+            counts = []
+            for key in ("clustersRegistered", "clustersMonitored"):
+                val = usage.get(key)
+                if isinstance(val, int) and val >= 0:
+                    counts.append(val)
+            if counts:
+                live_cr_count = str(max(counts))
+    except Exception:
+        pass
+
+gcloud_count = str(len(clusters)) if probe_ok else ""
+best = ""
+if gcloud_count and live_cr_count:
+    best = str(max(int(gcloud_count), int(live_cr_count)))
+elif gcloud_count:
+    best = gcloud_count
+elif live_cr_count:
+    best = live_cr_count
+
+print(f"{best}|{gcloud_count}|{live_cr_count}|{cr_sizing}|{cr_tier}|{cr_storage}|{cr_expected}|{cr_present}")
+' "$gcloud_proj_file" "$gcloud_asset_file" "$cr_json_file" "$has_cr_json" "$probe_ok" "$project_id" "${PROJECT_NUMBER:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "$SIZING_SCAN_GCLOUD_CLUSTER_COLUMNS" "$SIZING_SCAN_LOC_REGEX" "$SIZING_SCAN_ASSET_NAME_REGEX" 2>/dev/null)" || parsed=""
+
+  rm -f "$gcloud_proj_file" "$gcloud_asset_file" "$cr_json_file"
+  [ -n "$parsed" ] || return 0
+
+  # shellcheck disable=SC2034  # LIVE_CR_PRESENT is read by upgrade.sh (--upgrade-mode=operator notice)
+  IFS='|' read -r SIZING_SCAN_CLUSTER_COUNT SIZING_SCAN_GCLOUD_COUNT SIZING_SCAN_LIVE_CR_COUNT \
+    LIVE_CR_SIZING_PROFILE LIVE_CR_EFFECTIVE_TIER LIVE_CR_STORAGE_SIZE LIVE_CR_EXPECTED_CLUSTER_PROFILES LIVE_CR_PRESENT <<< "$parsed"
+
+  if [ -n "$SIZING_SCAN_CLUSTER_COUNT" ]; then
+    SIZING_SCAN_TIER="$(sizing_tier_for_cluster_count "$SIZING_SCAN_CLUSTER_COUNT")"
+    if [ -n "$SIZING_SCAN_GCLOUD_COUNT" ] && [ -n "$SIZING_SCAN_LIVE_CR_COUNT" ]; then
+      SIZING_SCAN_SOURCE="${SIZING_SCAN_GCLOUD_COUNT} visible via gcloud, ${SIZING_SCAN_LIVE_CR_COUNT} in live PlatformAgent status.usage"
+    elif [ -n "$SIZING_SCAN_GCLOUD_COUNT" ]; then
+      SIZING_SCAN_SOURCE="discovered across configured GCP scope"
+    else
+      SIZING_SCAN_SOURCE="live PlatformAgent status.usage"
+    fi
+  fi
+  if [ "$scan_incomplete" = "true" ] || [ "$probe_failed" -gt 0 ]; then
+    SIZING_SCAN_INCOMPLETE="true"
+    if [ "$projects_incomplete" = "true" ] && [ "$scope_incomplete" = "true" ]; then
+      SIZING_SCAN_INCOMPLETE_DETAIL="listed SCOPE_PROJECTS targets or folder, organization, Shared VPC, or Metrics Scope targets"
+    elif [ "$projects_incomplete" = "true" ]; then
+      SIZING_SCAN_INCOMPLETE_DETAIL="listed SCOPE_PROJECTS targets (probe failure or >${SIZING_SCAN_MAX_PROJECT_PROBES} project cap)"
+    else
+      SIZING_SCAN_INCOMPLETE_DETAIL="some folder, organization, Shared VPC, or Metrics Scope targets"
+    fi
+  fi
+}
+
+# Prints cluster-count scan findings and actionable runtime / Standard node-pool /
+# storage recommendations across install.sh and upgrade.sh.
+# Args: <context: install|upgrade> <project_id> <cluster_mode> [create_cluster] [skip_scan]
+report_cluster_sizing_guidance() {
+  local context="${1:-$SIZING_SCAN_CONTEXT_INSTALL}" project_id="${2:-${PROJECT_ID:-}}" cluster_mode="${3:-}" create_cluster="${4:-false}" skip_scan="${5:-false}"
+  local include_cr="false"
+  if [ "$context" = "$SIZING_SCAN_CONTEXT_UPGRADE" ] || [ "$create_cluster" = "false" ]; then
+    include_cr="true"
+  fi
+
+  if [ "$skip_scan" != "$SIZING_SCAN_SKIP_FLAG" ]; then
+    scan_visible_clusters_in_scope "$project_id" "$include_cr"
+  fi
+  local configured_profile="${PLATFORM_AGENT_SIZING_PROFILE:-$DEFAULT_PLATFORM_AGENT_SIZING_PROFILE}"
+  local effective_storage="${PLATFORM_AGENT_STORAGE_SIZE:-${LIVE_CR_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}}"
+
+  if [ -n "$SIZING_SCAN_CLUSTER_COUNT" ]; then
+    local live_note=""
+    if [ -n "$LIVE_CR_SIZING_PROFILE" ] && [ "$LIVE_CR_SIZING_PROFILE" != "$configured_profile" ]; then
+      live_note="; live CR currently sets '${LIVE_CR_SIZING_PROFILE}'"
+    fi
+    print_info "Cluster sizing scan: ${SIZING_SCAN_CLUSTER_COUNT} cluster(s) in scope (${SIZING_SCAN_SOURCE}) -> recommended runtime tier '${SIZING_SCAN_TIER}' (spec.deployment.sizingProfile='${configured_profile}'${live_note})."
+    if [ "$SIZING_SCAN_INCOMPLETE" = "true" ]; then
+      local incomplete_detail="${SIZING_SCAN_INCOMPLETE_DETAIL:-some folder, organization, Shared VPC, or Metrics Scope targets}"
+      if [ "$configured_profile" = "$SIZING_PROFILE_AUTO" ]; then
+        print_info "Note: ${incomplete_detail} could not be enumerated yet; once registered, spec.deployment.sizingProfile='${SIZING_PROFILE_AUTO}' adjusts upward automatically where quota allows."
+      else
+        print_info "Note: ${incomplete_detail} could not be enumerated yet; visible count excludes unprobed targets (runtime profile is pinned at '${configured_profile}')."
+      fi
+    fi
+
+    if { [ "$configured_profile" = "$SIZING_TIER_SMALL" ] && [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_MEDIUM_CLUSTER_THRESHOLD" ]; } || \
+       { [ "$configured_profile" = "$SIZING_TIER_MEDIUM" ] && [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; }; then
+      print_warning "Configured PLATFORM_AGENT_SIZING_PROFILE='${configured_profile}' pins runtime pods below the '${SIZING_SCAN_TIER}' tier recommended for ${SIZING_SCAN_CLUSTER_COUNT} cluster(s)."
+      print_info "Omit PLATFORM_AGENT_SIZING_PROFILE (defaults to '${SIZING_PROFILE_AUTO}') or set PLATFORM_AGENT_SIZING_PROFILE='${SIZING_SCAN_TIER}' in install.env."
+    fi
+
+    local runtime_is_fleet="false"
+    if [ "$configured_profile" = "$SIZING_TIER_FLEET" ] || \
+       { [ "$configured_profile" = "$SIZING_PROFILE_AUTO" ] && [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; } || \
+       [ "$LIVE_CR_EFFECTIVE_TIER" = "$SIZING_TIER_FLEET" ]; then
+      runtime_is_fleet="true"
+    fi
+
+    if [ "$cluster_mode" = "$GKE_CLUSTER_MODE_STANDARD" ] && \
+       { [ "$runtime_is_fleet" = "true" ] || [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; }; then
+      local tf_node_profile="${TF_VAR_sizing_profile:-}"
+      if [ -z "$tf_node_profile" ] && [ "$create_cluster" != "true" ]; then
+        tf_node_profile="$(tf_state_sizing_profile 2>/dev/null || true)"
+      fi
+      if [ -z "${TF_VAR_standard_machine_type:-}" ] && [ "$tf_node_profile" != "$SIZING_TIER_FLEET" ]; then
+        if [ "$runtime_is_fleet" = "true" ]; then
+          local fleet_trigger="configured/live '${SIZING_TIER_FLEET}' runtime profile"
+          if [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ] && [ "$configured_profile" = "$SIZING_PROFILE_AUTO" ]; then
+            fleet_trigger="${SIZING_SCAN_CLUSTER_COUNT} cluster(s) trigger the '${SIZING_TIER_FLEET}' runtime tier"
+          fi
+          if [ "$create_cluster" = "true" ]; then
+            print_info "GKE Standard host recommendation: ${fleet_trigger}; set TF_VAR_sizing_profile=${SIZING_TIER_FLEET} (or >= 8 vCPU nodes such as e2-standard-8) so the credential proxy's 4 vCPU request schedules."
+          else
+            print_warning "GKE Standard fleet host note: ${fleet_trigger} (credential-proxy requests 4 vCPU), which does not fit on default '${SIZING_TIER_SMALL}' e2-standard-4 nodes."
+            print_info "Ensure a Standard node pool has >= 8 vCPU nodes (for example, set TF_VAR_sizing_profile=${SIZING_TIER_FLEET} in install.env alongside any explicit standard_*/gvisor_* inputs kept by guard_node_pool_shape; changing a pool's machine type replaces its nodes)."
+          fi
+        else
+          print_info "GKE Standard host note: ${SIZING_SCAN_CLUSTER_COUNT} cluster(s) sit in the '${SIZING_TIER_FLEET}' range (>= ${SIZING_FLEET_CLUSTER_THRESHOLD}), but runtime is pinned to '${configured_profile}'; raising to '${SIZING_PROFILE_AUTO}' or '${SIZING_TIER_FLEET}' later will require >= 8 vCPU Standard nodes (TF_VAR_sizing_profile=${SIZING_TIER_FLEET})."
+        fi
+      fi
+    fi
+
+    local storage_mi
+    storage_mi="$(storage_quantity_to_mi "$effective_storage")"
+    if [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ] && [ "$storage_mi" -gt 0 ] && [ "$storage_mi" -lt "$SIZING_FLEET_STORAGE_RECOMMENDATION_MI" ]; then
+      print_info "Storage sizing recommendation: at ${SIZING_SCAN_CLUSTER_COUNT} cluster(s), set PLATFORM_AGENT_STORAGE_SIZE=${SIZING_FLEET_STORAGE_SIZE_RECOMMENDATION} in install.env (current effective size: ${effective_storage})."
+    fi
+
+    local formula_mi crossover_profiles cr_expected="${LIVE_CR_EXPECTED_CLUSTER_PROFILES:-0}"
+    [[ "$cr_expected" =~ ^[0-9]+$ ]] || cr_expected=0
+    formula_mi=$((SIZING_AGENT_BASE_STORAGE_MI + SIZING_SCAN_CLUSTER_COUNT * SIZING_AGENT_PER_PROFILE_MI))
+    if [ "$storage_mi" -gt 0 ] && [ "$formula_mi" -gt "$storage_mi" ] && [ "$cr_expected" -lt "$SIZING_SCAN_CLUSTER_COUNT" ]; then
+      crossover_profiles=0
+      if [ "$storage_mi" -gt "$SIZING_AGENT_BASE_STORAGE_MI" ]; then
+        crossover_profiles=$(( (storage_mi - SIZING_AGENT_BASE_STORAGE_MI) / SIZING_AGENT_PER_PROFILE_MI ))
+      fi
+      print_info "Large-fleet storage recommendation: at ${SIZING_SCAN_CLUSTER_COUNT} cluster(s), the 8Gi + N x 400Mi provisioning formula passes ${effective_storage} (~${crossover_profiles} profiles); set spec.storage.expectedClusterProfiles=${SIZING_SCAN_CLUSTER_COUNT} on the PlatformAgent CR (or platformAgent.storage.expectedClusterProfiles=${SIZING_SCAN_CLUSTER_COUNT} via TF_VAR_extra_helm_values) to size the agent volume to 8Gi + N x 400Mi."
+    fi
+  fi
 }
 
 # The image tag an install is currently serving, read off the agent Deployment.
@@ -4862,6 +5176,28 @@ gke_describe_error_is_not_found() {
   grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN" <<<"${1:-}"
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the Kubernetes Engine API is disabled in the target project ($2, by id;
+# $3 its number when known), and in no other. Read as the cluster being
+# absent: nothing can exist there until the apply's google_project_service
+# turns the API on. A refusal that names only another project, or none, is
+# not this answer.
+gke_describe_error_is_api_disabled_for() {
+  local err="${1:-}" project_id="${2:-}" project_number="${3:-}"
+  grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$err" || return 1
+  local named
+  named="$(grep -oE "$GKE_API_DISABLED_PROJECT_PATTERN" <<<"$err" \
+    | sed -E 's/^API has not been used in project ([a-z0-9-]+) .*$/\1/; s#^consumer: projects/##' | sort -u)"
+  [ -n "$named" ] || return 1
+  local name
+  while IFS= read -r name; do
+    [ "$name" = "$project_id" ] && continue
+    [ -n "$project_number" ] && [ "$name" = "$project_number" ] && continue
+    return 1
+  done <<<"$named"
+  return 0
+}
+
 is_existing_cluster_network_policy_satisfied() {
   local project_id="$1" cluster_name="$2" region="$3"
   local create_cluster_flag="${4:-${TFVARS_CREATE_CLUSTER:-true}}"
@@ -4883,6 +5219,201 @@ is_existing_cluster_network_policy_satisfied() {
   return 0
 }
 
+
+# How much of kubectl's stderr a refused Secret read quotes back.
+readonly SECRET_READ_ERR_MAX_BYTES=400
+# The credentials install.env may not carry (PERSIST_SECRETS_ON_DISK=false),
+# which write_tfvars_from_state recovers from the live Secret.
+readonly RECOVERED_SECRET_KEYS="API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT"
+
+# recover_secret_keys_from_live_secret CONTEXT exports each RECOVERED_SECRET_KEYS
+# key the environment leaves empty from the live platform agent Secret, and
+# refuses to let a key the live Secret holds be written empty (#6126).
+#
+# One read of the whole Secret, not one per key: a per-key read that failed
+# (a timeout, a dropped connection, an RBAC denial) looked exactly like an
+# absent key, and Terraform then rendered that key empty over the live value.
+# Here only a key missing from a Secret that was read is absent. A Secret that
+# doesn't exist (NotFound: a first install onto an existing cluster) has
+# nothing to recover. Any other failure stops the run, naming the keys it
+# couldn't recover, unless each of them is set in the environment or named in
+# ALLOW_EMPTY_SECRET_KEYS (comma- or space-separated), the one way to accept
+# writing a key empty on purpose.
+#
+# Stopping is for the callers that APPLY, which opt in with
+# KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true beside KUBE_AGENTS_REQUIRE_MEMORY_ANSWER
+# (install.sh and upgrade.sh). A caller that doesn't, uninstall.sh, gets a
+# warning and goes on: a destroy has no use for the keys, and an install has
+# to keep a working way to remove itself.
+#
+# Returns 1 to stop the run; prints why on stderr.
+recover_secret_keys_from_live_secret() {
+  local ctx="$1"
+  local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  # Through :- first: bash 4+ under set -u rejects ${unset//,/ }.
+  local allow_raw="${ALLOW_EMPTY_SECRET_KEYS:-}"
+  local key missing=() allow=" ${allow_raw//[,$'\t']/ } "
+  LIVE_SECRET_NONEMPTY_KEYS=""
+  for key in $RECOVERED_SECRET_KEYS; do
+    [ -n "${!key:-}" ] || missing+=("$key")
+  done
+  # Every key already in the environment: nothing to read, so an operator
+  # whose RBAC can't read Secrets can still run by exporting the keys.
+  [ "${#missing[@]}" -gt 0 ] || return 0
+
+  local err_file secret_json read_rc=0
+  err_file="$(mktemp)"
+  # trap - ERR: install.sh runs an inherited ERR trap (set -E); a failed read
+  # is handled below, not by the trap. --request-timeout bounds a context
+  # whose cluster black-holes TCP.
+  secret_json="$(trap - ERR; kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "$ns" \
+    --context "$ctx" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+    -o json 2>"$err_file")" || read_rc=$?
+  local read_err
+  read_err="$(head -c "$SECRET_READ_ERR_MAX_BYTES" "$err_file" | tr '\n' ' ')"
+  rm -f "$err_file"
+
+  if [ "$read_rc" -ne 0 ]; then
+    # This Secret's own 404 only: kubectl prints (NotFound) for any 404,
+    # including a proxy or gateway in front of the API server.
+    if [[ "$read_err" == *"secrets \"${PLATFORM_AGENT_SECRET}\" not found"* ]]; then
+      return 0
+    fi
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret (${read_err:-exit ${read_rc}}); going on without its keys." >&2
+      return 0
+    fi
+    local unknown=()
+    for key in ${missing[@]+"${missing[@]}"}; do
+      [[ "$allow" == *" ${key} "* ]] || unknown+=("$key")
+    done
+    [ "${#unknown[@]}" -gt 0 ] || return 0
+    print_error "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret in '${ns}' to recover ${unknown[*]-}: ${read_err:-kubectl exited ${read_rc}}" >&2
+    print_error "Going on would write those keys empty over their live values. Re-run once the cluster answers, export the keys yourself, or name the ones to leave empty in ALLOW_EMPTY_SECRET_KEYS." >&2
+    return 1
+  fi
+
+  # KEY<TAB>value lines for the listed keys the Secret holds, decoded here so
+  # a value that isn't base64 fails the read rather than recovering garbage.
+  local decoded
+  if ! decoded="$(trap - ERR; printf '%s' "$secret_json" | python3 -c '
+import base64, json, sys
+keys = sys.argv[1].split()
+data = (json.load(sys.stdin).get("data") or {})
+for k in keys:
+    if k in data:
+        v = base64.b64decode(data[k], validate=True).decode()
+        if "\n" in v or "\t" in v:
+            sys.exit("value of %s holds a tab or newline" % k)
+        print(k + "\t" + v)
+' "${missing[*]-}")"; then
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on without them." >&2
+      return 0
+    fi
+    print_error "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on would write them empty." >&2
+    return 1
+  fi
+
+  local val
+  while IFS=$'\t' read -r key val; do
+    [ -n "$key" ] || continue
+    if [ -n "$val" ]; then
+      export "${key}=${val}"
+      LIVE_SECRET_NONEMPTY_KEYS="${LIVE_SECRET_NONEMPTY_KEYS} ${key}"
+      print_info "Recovered ${key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
+    fi
+  done <<<"$decoded"
+
+  return 0
+}
+
+# The guard, run just before the generator renders: a key the live Secret held
+# non-empty (LIVE_SECRET_NONEMPTY_KEYS, set by the recovery above) may only be
+# replaced by a non-empty value, unless ALLOW_EMPTY_SECRET_KEYS names it. It
+# checks the values as they will be rendered, so a later change between the
+# recovery and the render can't reopen #6126 without failing here.
+refuse_blanking_live_secret_keys() {
+  local allow_raw="${ALLOW_EMPTY_SECRET_KEYS:-}"
+  local key allow=" ${allow_raw//[,$'\t']/ } "
+  for key in ${LIVE_SECRET_NONEMPTY_KEYS:-}; do
+    if [ -z "${!key:-}" ] && [[ "$allow" != *" ${key} "* ]]; then
+      print_error "${key} is set in the live '${PLATFORM_AGENT_SECRET}' Secret but would be written empty; refusing. Name it in ALLOW_EMPTY_SECRET_KEYS to empty it on purpose." >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+# What ENABLE_GVISOR means for an install that already exists, read the same
+# way by every caller that re-renders one: the Terraform variables below and
+# install.sh's control panel. A set, non-empty ENABLE_GVISOR wins, from
+# install.env, the environment or a flag. With no key, the answer is what the
+# cluster runs, not a default: install.sh defaults a fresh install ON, and a
+# fallback of false here planned the destruction of a Standard install's
+# gVisor pool on the next upgrade whenever its install.env lacked the line.
+# The Terraform state answers first, for both shapes: the gVisor pool on
+# Standard, the agent release's runtimeClassName on Autopilot. With no state,
+# Standard lists its node pools; Autopilot has none to list and keeps the
+# sandbox, since a fresh install defaults it on and only an explicit
+# ENABLE_GVISOR="false" may turn it off. A cluster that does not exist yet has nothing
+# to read; install.sh exports its own default before reaching here, and
+# uninstall.sh exports false, so neither falls through to the probe.
+# Prints true or false on stdout; everything it says goes to stderr.
+resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mode]
+  local project="$1" cluster="$2" location="$3" mode="${4:-}"
+  if [ -n "${ENABLE_GVISOR:-}" ]; then
+    printf '%s' "$ENABLE_GVISOR"
+    return 0
+  fi
+  # The Terraform state first: it is what the apply will diff against, and it
+  # answers for both shapes (the pool on Standard, the release's
+  # runtimeClassName on Autopilot).
+  local recorded
+  recorded="$(tf_state_runs_gvisor "$project" "$cluster")"
+  if [ "$recorded" = "true" ]; then
+    print_info "install.env has no ENABLE_GVISOR; this install's Terraform state runs the agent sandboxed (gVisor), so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+    return 0
+  fi
+  # A state that holds the release and no sandbox answers for either shape: a
+  # live pool it does not record is not this install's to plan around.
+  if [ "$recorded" = "false" ]; then
+    printf 'false'
+    return 0
+  fi
+  if [ -z "$mode" ]; then
+    local autopilot
+    autopilot="$(trap - ERR; gcloud container clusters describe "$cluster" --location "$location" \
+      --project "$project" --format="value(autopilot.enabled)" 2>/dev/null || true)"
+    case "${autopilot//[[:space:]]/}" in
+      True|true) mode="autopilot" ;;
+      *) mode="standard" ;;
+    esac
+  fi
+  if [ "$mode" = "autopilot" ]; then
+    # No state to read. Autopilot has no pool to list, and a fresh install
+    # defaults the sandbox on (install.defaults.env DEFAULT_ENABLE_GVISOR), so
+    # the sandbox stays on: only an explicit ENABLE_GVISOR="false" turns it off.
+    print_warning "install.env has no ENABLE_GVISOR and this install's Terraform state could not be read or records no release, so this run keeps the agent sandboxed on Autopilot cluster '${cluster}'. If it runs on the standard runtime on purpose, add ENABLE_GVISOR=\"false\" to install.env." >&2
+    printf 'true'
+    return 0
+  fi
+  local pool="${GVISOR_POOL_NAME:-$DEFAULT_GVISOR_POOL_NAME}" pools rc=0
+  pools="$(trap - ERR; gcloud container node-pools list --cluster "$cluster" --location "$location" \
+    --project "$project" --format="value(name)" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    print_warning "install.env has no ENABLE_GVISOR, and the node pools of '${cluster}' could not be listed to tell whether it runs the gVisor pool '${pool}'. Reading it as off; the apply refuses to destroy a gVisor pool it finds in state. Add ENABLE_GVISOR=\"true\" or \"false\" to install.env to say which." >&2
+    printf 'false'
+    return 0
+  fi
+  if grep -Fxq "$pool" <<<"$pools"; then
+    print_info "install.env has no ENABLE_GVISOR; cluster '${cluster}' runs the gVisor pool '${pool}', so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -4973,7 +5504,18 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! gke_describe_error_is_not_found "$describe_err"; then
+    # The refusal may name the project by number; the front doors that reach
+    # this generator before main() exports PROJECT_NUMBER (the menu, upgrade,
+    # uninstall) resolve it here, and only for a refusal of that shape.
+    local probe_number="${PROJECT_NUMBER:-}"
+    if [ -z "$probe_number" ] && grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$describe_err"; then
+      probe_number="$(trap - ERR; gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
+    fi
+    if gke_describe_error_is_api_disabled_for "$describe_err" "${PROJECT_ID}" "${probe_number}"; then
+      # A fresh project: the Kubernetes Engine API is off, so no cluster can
+      # be there, and the apply enables the API before it creates one.
+      print_info "The Kubernetes Engine API is not enabled in project '${PROJECT_ID}' yet, so no cluster exists there; the apply enables it."
+    elif ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
@@ -5036,40 +5578,24 @@ write_tfvars_from_state() {
   # re-install must keep the live salt: regenerating it re-anonymises every
   # chat user, severing their past sessions from their future ones.
   #
-  # Only when kubectl's CURRENT context is this install's cluster (the name
-  # get-credentials writes — set just above for adoption, and by upgrade.sh
-  # and uninstall.sh before they generate). A stale context pointing at some
-  # other install would otherwise silently donate that environment's
-  # credentials to this one.
-  local secret_key secret_val
-  local expected_ctx
-  expected_ctx="$(gke_context_name)"
-  if command -v kubectl >/dev/null 2>&1 &&
-    [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
-      [ -z "${!secret_key:-}" ] || continue
-      # Every stage exits 0 on its own (|| true inside the substitution):
-      # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
-      # here — no cluster yet, stale context — must be a silent no-op, not a
-      # trap-and-abort the outer || can never see. --request-timeout bounds
-      # the other stale-context failure mode: a context whose cluster was
-      # just destroyed black-holes TCP instead of refusing, and eight keys
-      # times a hung connect stalls the install for minutes.
-      secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --context "$expected_ctx" \
-        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
-        -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
-      if [ -n "$secret_val" ]; then
-        export "${secret_key}=${secret_val}"
-        print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
-      fi
-    done
+  # Only when the probe above found the cluster: a confirmed-absent cluster
+  # has no Secret, and a kubeconfig context left behind by an uninstall would
+  # otherwise send the read to an endpoint that is gone and stop a fresh
+  # install. The read names this install's context, so it can only reach this
+  # cluster, whatever current-context says (get-credentials above is
+  # best-effort, and a shared kubeconfig can be switched underneath). A
+  # context that is missing then fails the read, which stops an applying run.
+  LIVE_SECRET_NONEMPTY_KEYS=""
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    recover_secret_keys_from_live_secret "$(gke_context_name)" || return 1
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
   # re-creatable infrastructure. Every other key the generator defaults --
-  # ENABLE_GVISOR, ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the
-  # rest -- names something Terraform can build again; this one names the
+  # ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the rest -- names
+  # something Terraform can build again (ENABLE_GVISOR, also read from the live
+  # install, does so for the sandbox rather than for data:
+  # resolve_existing_install_gvisor); this one names the
   # hindsight-postgresql StatefulSet and the volume holding the database. So it
   # is the one the generator goes and asks the cluster about when nobody told
   # it, rather than taking the project default.
@@ -5240,23 +5766,19 @@ write_tfvars_from_state() {
   # module for one there fails the plan. Deriving both from the probed
   # cluster_mode keeps --enable-gvisor=true meaning the same thing on either shape.
   #
-  # The fallback stays false even though a fresh install now defaults to the
-  # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
-  # calling this function, so the fallback here
-  # never decides a new install — it only decides the callers that read an
-  # install that already exists. uninstall.sh is the one that matters:
-  # install.env is optional there, and the documented `curl … | bash` teardown
-  # runs from a fresh clone that has none. Defaulting on for that caller would
-  # let the Autopilot version-floor check below abort a destroy, leaving an
-  # install with no working way to remove itself.
-  #
-  # The fallback only reaches the teardown that has no install.env, which is not
-  # the ordinary one — a teardown from the checkout that installed loads an
-  # install.env saying ENABLE_GVISOR="true". uninstall.sh therefore exports false
-  # itself before calling this, and the comment there is where that argument
-  # lives. Do not read the fallback as protecting the teardown on its own.
-  local gvisor_node_pool="false" agent_runtime_class=""
-  if is_truthy "${ENABLE_GVISOR:-false}"; then
+  # With no ENABLE_GVISOR, an existing cluster's own state decides
+  # (resolve_existing_install_gvisor, above), never a default in either
+  # direction. A cluster this run creates has none to read: install.sh exports
+  # its default before calling this, so the false below decides only a caller
+  # that brings neither, and uninstall.sh exports false itself so the
+  # Autopilot version-floor check below can never abort a teardown.
+  local gvisor_node_pool="false" agent_runtime_class="" gvisor_intent="false"
+  if [ "$cluster_exists" = "true" ]; then
+    gvisor_intent="$(resolve_existing_install_gvisor "${PROJECT_ID}" "${CLUSTER_NAME}" "${REGION}" "$cluster_mode")"
+  elif [ -n "${ENABLE_GVISOR:-}" ]; then
+    gvisor_intent="$ENABLE_GVISOR"
+  fi
+  if is_truthy "$gvisor_intent"; then
     agent_runtime_class="gvisor"
     if [ "$cluster_mode" = "standard" ]; then
       gvisor_node_pool="true"
@@ -5361,6 +5883,7 @@ write_tfvars_from_state() {
   # would name the variable after the interview, or after the Day-2 menu has
   # rewritten install.env. Every route to Terraform passes here.
   require_slack_home_channel_policy "${SLACK_HOME_CHANNEL_POLICY:-}" || return 1
+  require_google_chat_home_channel_policy "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: the chart refuses to render
   # openai_compatible without these, and upgrade.sh regenerates without
   # install.sh's interview.
@@ -5389,7 +5912,7 @@ write_tfvars_from_state() {
       return 1
     fi
     if [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
-      redaction_rules="$(hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
+      redaction_rules="$(trap - ERR; hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
     fi
   fi
   # The scoped service account pool, for the same reason: a misspelt switch
@@ -5424,19 +5947,18 @@ write_tfvars_from_state() {
     print_error "HELM_UPGRADE_INSTALL='${helm_upgrade_install}' is neither true nor false. Fix it in install.env."
     return 1
   fi
-  # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
-  # regenerate from install.env without install.sh's check, and the variable's
-  # validation would otherwise refuse it at plan, naming neither the key nor
-  # the file.
-  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
-  if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
-    print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
-    return 1
-  fi
-  # The data volume size, for the same reason.
+  # The data volume size, for the MODEL_MAX_TOKENS reason: upgrade.sh and the
+  # Day-2 menu regenerate from install.env without install.sh's check, and
+  # the variable's validation would otherwise refuse it at plan, naming
+  # neither the key nor the file.
   local platform_agent_storage_size="${PLATFORM_AGENT_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}"
   if ! is_valid_platform_agent_storage_size "$platform_agent_storage_size"; then
     print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
+    return 1
+  fi
+  local platform_agent_sizing_profile="${PLATFORM_AGENT_SIZING_PROFILE:-$DEFAULT_PLATFORM_AGENT_SIZING_PROFILE}"
+  if ! is_valid_platform_agent_sizing_profile "$platform_agent_sizing_profile"; then
+    print_error "PLATFORM_AGENT_SIZING_PROFILE='${platform_agent_sizing_profile}' must be one of small, medium, fleet, or auto (empty defaults to '${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE}'). Fix it in install.env, or on a first install, in the value this shell exports."
     return 1
   fi
   # Refused when the web console is on and the operator has accepted an
@@ -5474,6 +5996,7 @@ write_tfvars_from_state() {
   # Published for the front doors' ERR traps: the partial file below is mode
   # 600 and holds every secret this run was given, and it sits one character
   # from the real terraform.tfvars. Cleared after the mv succeeds.
+  refuse_blanking_live_secret_keys || { umask "$old_umask"; return 1; }
   TFVARS_TMP_FILE="${dest}.tmp"
   {
     echo "# Generated by the kube-agents installer from install.env — regenerated on every"
@@ -5488,6 +6011,8 @@ write_tfvars_from_state() {
     echo "agent_service_account_id         = $(hcl_str "${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")"
     echo "github_minter_service_account_id = $(hcl_str "${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")"
     echo "litellm_service_account_id       = $(hcl_str "${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")"
+    echo "# The minter's KSA, the other half of its Workload Identity binding."
+    echo "github_minter_ksa_name           = $(hcl_str "${GITHUB_MINTER_KSA_NAME:-$DEFAULT_GITHUB_MINTER_KSA_NAME}")"
     echo ""
     echo "# GKE database encryption. install.sh's existing-cluster step reads the"
     echo "# same two keys, so a create and an adoption encrypt with one key."
@@ -5542,13 +6067,13 @@ write_tfvars_from_state() {
       echo "alert_daily_limits = {}"
     fi
     echo ""
-    echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
-    echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
-    echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
-    echo ""
     echo "# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in"
     echo "# install.env). The composition passes the chart nothing for the default."
     echo "platform_agent_storage_size = $(hcl_str "$platform_agent_storage_size")"
+    echo ""
+    echo "# The PlatformAgent's spec.deployment.sizingProfile"
+    echo "# (PLATFORM_AGENT_SIZING_PROFILE in install.env, default auto)."
+    echo "platform_agent_sizing_profile = $(hcl_str "$platform_agent_sizing_profile")"
     echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."
@@ -5637,6 +6162,7 @@ write_tfvars_from_state() {
     echo "chat_subscription_name    = $(hcl_str "$chat_sub")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"
     echo "google_chat_home_channel  = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+    echo "google_chat_home_channel_policy = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}")"
     echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}")"
     echo ""
     echo "enable_slack            = $(hcl_bool "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}")"
@@ -5711,6 +6237,10 @@ write_tfvars_from_state() {
     # Read from install.env (or the environment) only: no flag or interview
     # question sets it, so install.sh exports nothing over it. See the variable.
     echo "helm_upgrade_install = $(hcl_bool "$helm_upgrade_install")"
+    echo ""
+    # The same: install.env (or the environment) only. Unset, or any spelling
+    # is_truthy does not take, renders false, the stop's default.
+    echo "card_stop_enabled = $(hcl_bool "${CARD_STOP_ENABLED:-}")"
     echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."

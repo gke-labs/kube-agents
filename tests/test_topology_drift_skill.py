@@ -12,7 +12,8 @@ nobody emits.
 
 `references/report-example.json` in each copy of the skill is a real document
 from leeway v0.1.5's own report collector (its `TestCollect_CauseAttribution`
-fixture plus three more clusters), with the bench fixture names replaced.
+fixture plus three more clusters), with the bench fixture names replaced; the
+document's shape is unchanged through v0.1.7.
 Regenerate it from leeway when the schema moves, and update VOCABULARY below
 from `pkg/leeway/{cause,intent,remediation,finding}.go` in the same change.
 """
@@ -33,10 +34,13 @@ SHARED_START = "<!-- shared:reading-start -->"
 SHARED_END = "<!-- shared:reading-end -->"
 FLEET_FIXTURES = REPO_ROOT / "docs/designs/fleet-fixtures.yaml"
 SANDBOX_DOCKERFILE = REPO_ROOT / "deploy/sandbox/Dockerfile"
-LEEWAY_VERSION = "v0.1.5"
+LEEWAY_VERSION = "v0.1.7"
 
-# leeway v0.1.5 (go-steer/leeway@349045c), pkg/leeway: the strings a report
-# carries in these fields. The kind inventory is frozen by leeway's schema;
+# leeway v0.1.7 (go-steer/leeway@8e06005), pkg/leeway: the strings a report
+# carries in these fields, apart from the one remediation kind v0.1.7 adds,
+# `platform_managed` (no yaml, no command, in place of a `manifest_patch` on a
+# workload the addon manager reconciles). The skills don't name it yet, so it
+# is left out here until they do, with an eval case. The kind inventory is frozen by leeway's schema;
 # the rest changes only with a leeway release.
 VOCABULARY = {
     "kind": {

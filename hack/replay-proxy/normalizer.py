@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Hex digits of the normalizer source hash kept in NORMALIZER_VERSION.
@@ -75,7 +75,8 @@ PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" +
 # `tool_call_id` still names the same call as the assistant's `id`. The
 # forwarded request is never modified; this is the key only.
 OPAQUE_KEY_RE = re.compile(r"signature|provider_specific_fields", re.I)
-OPAQUE_ALWAYS_KEYS = ("tool_call_id",)
+TOOL_CALL_ID_KEY = "tool_call_id"
+OPAQUE_ALWAYS_KEYS = (TOOL_CALL_ID_KEY,)
 # `id` is opaque only as the `id` of an item in a `tool_calls` list, whatever
 # the provider's prefix (`call_…` from Gemini through LiteLLM, `toolu_…` from
 # Claude). Any other string `id` -- a kanban card, a cluster, a resource --
@@ -125,6 +126,16 @@ LINE_BREAK = "\n"
 # A line that opens a JSON document, and an indented line continuing a warning.
 JSON_LINE_RE = re.compile(r"^[{\[]", re.M)
 CONTINUATION_PREFIXES = (" ", "\t")
+# Hermes' skill_view result lists a skill's files per support directory as
+# glob/rglob returns them, in directory order, which differs from pod to pod:
+# `linked_files` (tools/skills_tool.py `_skill_linked_files`) and, when the
+# asked-for file is missing, `available_files` (tools/skills_tool_plugin.py
+# `_available_skill_files`). Each group's list is sorted for the key
+# (sorted_skill_listings); nothing else in the result is reordered. Read only
+# in a tool message answering a skill_view call, found by its tool_call_id.
+TOOL_ROLE = "tool"
+SKILL_VIEW_TOOL = "skill_view"
+SKILL_LISTING_KEYS = ("linked_files", "available_files")
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -356,6 +367,32 @@ COMMIT_URL_RE = re.compile(r"/(?:blob|tree|commit|commits)/" + COMMIT_HEX)
 HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{" + str(COMMIT_MIN_HEX) + r",}(?![0-9A-Za-z])")
 # A run of hex with a letter in it: one with digits only is a number, not a commit.
 HEX_LETTER_RE = re.compile(r"[a-f]")
+# submit_suggestion's `prepare` says which closed or merged proposal last used
+# the branch name (agents/platform/skills/submit-suggestion/scripts/
+# submit_suggestion.py `clear_spent_branch`): "'<branch>' was the source of
+# <url>, which is closed. That proposal's last revision, <12 hex>, is not in
+# 'main', ..." and, when it deletes the branch, "Deleted the spent branch at
+# <12 hex>". Every eval run opens proposals of its own, so the number and the
+# revision are an earlier run's and differ between otherwise identical runs.
+# `clear_spent_branch`'s refusals name the revision as "The repository held
+# the branch at <12 hex>" and "The repository still holds the branch at <12
+# hex>". The number and revision are read only in those sentences, the number
+# in a GitHub (`/pull/<n>`) or GitLab (`/-/merge_requests/<n>`) proposal URL,
+# the forms the broker's proposals carry. A refusal also quotes the broker's own
+# error in parentheses, which can repeat the revision ("is at <12 hex>"), name
+# another revision or a proposal URL in other words; that text is left as
+# written, so two runs refused alike still key apart there (a miss, not a
+# wrong answer). The revision is bound as a commit. The
+# number gets a placeholder in the key and is never put back in an answer: it
+# is a bare number, and an unrelated `175` in an answer must not become this
+# run's. An answer that holds it with no digit beside it is not saved instead
+# (Mapping.answer_repeats_bare_number).
+SPENT_PROPOSAL_CLASS = "PULL"
+SPENT_PROPOSAL_RE = re.compile(r"was the source of https?://[^\s,]+/(?:pull|-/merge_requests)/(\d+)(?=, which is )")
+SPENT_REVISION_RE = re.compile(
+    r"(?:That proposal's last revision, |(?:held|holds) the branch at |Deleted the spent branch at )" + COMMIT_HEX)
+PROPOSAL_NUMBER_BEFORE = r"(?<!\d)"
+PROPOSAL_NUMBER_AFTER = r"(?!\d)"
 
 # (class, pattern, group): identifier classes in the order they are applied.
 # Longer, more specific shapes go first. `group` is the part replaced; the
@@ -366,6 +403,8 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
         r"\boperation-(1\d{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"), 1),
     (COMMIT_CLASS, COMMIT_RE, 1),
     (COMMIT_CLASS, COMMIT_URL_RE, 1),
+    (COMMIT_CLASS, SPENT_REVISION_RE, 1),
+    (SPENT_PROPOSAL_CLASS, SPENT_PROPOSAL_RE, 1),
     (EVAL_POOL_CLASS, EVAL_POOL_PROJECT_RE, 0),
     # The fleet audit's declared-intent clone directory, a Python tempfile name:
     # `declared-intent-` (CLONE_TMP_PREFIX in audit_report.py) and 8 random characters.
@@ -413,6 +452,82 @@ RECENT_WORK_ESCAPED_RE = re.compile(
     r"\\n\\n" + RECENT_WORK_ESCAPED_SECTION + r"(?=\\n|\Z|\")|" + RECENT_WORK_ESCAPED_SECTION + r"(?:\\n(?:\\n)?)?"
 )
 
+# Hermes ends its system prompt with a runtime environment block, from a probe
+# it runs in the terminal backend (hermes-agent v2026.9.14,
+# agent/prompt_builder.py `_format_backend_probe`): `  OS: <uname -s> <uname -r>`, then the user, home
+# and working directory. The kernel is that of the node the sandbox landed on,
+# so it differs between otherwise identical runs when a pool's nodes do (Nov 18:
+# 3 of 8 nightly shards on 6.12.110+, the rest and the replay lane on
+# 6.12.105+). The key holds a fixed token for it (runtime_kernel_fixed), in a
+# system message's block only: the same kernel in a tool result or a user
+# message is a node the agent may be reasoning about, and stays literal. The
+# token is bound to no value, so no answer is rewritten with it: an answer
+# rarely names a kernel, and then one it read in a tool result the key keeps.
+# Hermes takes the last heading as the block (split_runtime_boundary uses
+# rpartition: prose may quote the heading), so the match starts at the last
+# heading before the end marker. The block's other
+# lines are the same on every node (User, Home) or already keyed (Working
+# directory's card id).
+SYSTEM_ROLE = "system"
+TEXT_PART_FIELD = "text"
+RUNTIME_ENVIRONMENT_HEADING = "# Hermes runtime environment\n"
+RUNTIME_ENVIRONMENT_BLOCK_RE = re.compile(
+    re.escape(RUNTIME_ENVIRONMENT_HEADING) + r"(?:(?!" + re.escape(RUNTIME_ENVIRONMENT_HEADING) + r").)*?"
+    r"<!-- End Hermes runtime environment -->", re.S)
+RUNTIME_KERNEL_LINE_RE = re.compile(r"(?m)^(  OS: \S+ )\S+$")
+KERNEL_PLACEHOLDER = f"{OPEN}KERNEL{CLOSE}"
+
+# Hermes' read_file answers a missing file with `File not found: <path>` and,
+# when the directory holds names like it, `similar_files`: up to five picked
+# from an `ls` of the directory at that moment (hermes-agent v2026.9.14
+# tools/file_operations.py `_suggest_similar_files`; `ReadResult.to_dict` leaves
+# the key out when the list is empty). Whether another agent has written a file
+# there yet changes the list (`/opt/data/INVENTORY.md` listed in one run and
+# not yet in the next), so the key drops it (without_similar_files): only in a
+# not-found result, in a tool message answering a read_file call, found by its
+# tool_call_id. The model sometimes reads a listed file next (about one answer
+# in twenty after such a result, Nov 12 nightlies), so a file named in either
+# run's list never crosses runs (Mapping.answer_names_dropped_file): an answer
+# naming one of the recording's is not saved, and a saved answer naming one of
+# this run's is not served (replay_proxy lookup), since the answer may act on
+# the file being there, or on it not being there (`write_file INVENTORY.md`
+# would overwrite what another agent wrote).
+READ_FILE_TOOL = "read_file"
+READ_FILE_ERROR_KEY = "error"
+READ_FILE_NOT_FOUND_PREFIX = "File not found:"
+SIMILAR_FILES_KEY = "similar_files"
+# A dropped file's name counts in an answer where no word character, `.` or `-`
+# comes before it and no word character, `-`, or `.` and a word character
+# follows it (`config` is not `config.yaml`; a sentence's closing
+# `INVENTORY.md.` still counts). A JSON escape
+# (`\n`, `\t`, `\r`) also counts as a boundary before it: a tool call's
+# `arguments` is a JSON string, so a name starting a line of a `write_file`'s
+# content is written `...\nINVENTORY.md`, with a word character before it.
+DROPPED_FILE_BEFORE = r"(?:(?<![\w.-])|(?<=\\[ntr]))"
+DROPPED_FILE_AFTER = r"(?![\w-]|\.\w)"
+# The front door's kanban_create result carries `"queued": true, "queue":
+# {"running": N, "limit": M}` when the new card's class has no free dispatcher
+# slot at that moment, and neither key otherwise; being queued doesn't change the
+# card's status, and only a `ready` card can carry the fields
+# (deploy/docker/patches/kanban_priority.py `queue_fields`, empty inside a
+# worker). Whether a slot was free is what else was running, so the key drops
+# both (without_queue_fields): only from a JSON object holding `task_id` and
+# `subscribed`, in a tool message answering a kanban_create call, found by its
+# tool_call_id. The fields are machine-readable only: the thread hears about
+# the wait from the dispatcher's `queued` event, and in 9,780 front-door
+# answers after a create (4,281 queued) none mentioned a queue. `running` and
+# `limit` count like a dropped queued event's payload
+# (Mapping.answer_repeats_dropped_count). When the dropped `queued` was set, an
+# answer talking about a queue or a slot (QUEUE_WORDS_RE, QUEUE_SLOT_WORDS_RE)
+# is not saved either (Mapping.answer_talks_about_dropped_queue): served to a
+# run that had a free slot, it would tell the user of a wait that is not
+# happening, with or without a number.
+KANBAN_CREATE_TOOL = "kanban_create"
+KANBAN_CREATE_RESULT_KEYS = ("task_id", "subscribed")
+QUEUED_FIELD = "queued"
+QUEUE_FIELD = "queue"
+QUEUE_SLOT_WORDS_RE = re.compile(r"\bslots?\b|board is full|in use|waiting for a worker", re.I)
+
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["
 # Hash input encoding. A lone surrogate (`"\ud83d"`) is valid in a JSON string
@@ -437,8 +552,9 @@ DIGIT_RE = re.compile(r"\d")
 # Joins a mapping key's class scope and its value.
 MAPPING_KEY_SEPARATOR = "\0"
 # Classes keyed apart and never swapped into an answer by value: opaque fields,
-# bare numbers, and timestamp literals (swapped by their own patterns).
-UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, TIME_LITERAL_CLASS)
+# bare numbers, a spent proposal's number, and timestamp literals (swapped by
+# their own patterns).
+UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, SPENT_PROPOSAL_CLASS, TIME_LITERAL_CLASS)
 
 
 def token_class(token: str) -> str:
@@ -492,6 +608,38 @@ def warnings_last(text: str) -> str:
             return LINE_BREAK.join([text[opener.start(): end]] + before + after)
         return text
     return text
+
+
+def sorted_skill_listings(text: str) -> str:
+    """A skill_view result with each SKILL_LISTING_KEYS group's file list sorted; any other text as it is.
+
+    Returns `text` itself when nothing moved, so a result already in order keeps its exact text.
+    A result Hermes appended a notice to (the iteration-budget warning, toolguard guidance)
+    is JSON followed by text: its JSON is sorted and written in canonical form, so two pods'
+    copies key alike whichever needed the sort, and the appended text is kept as it is.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text
+        tail = text.lstrip()[end:]
+    if not isinstance(parsed, dict):
+        return text
+    moved = False
+    for key in SKILL_LISTING_KEYS:
+        groups = parsed.get(key)
+        if not isinstance(groups, dict):
+            continue
+        for group, files in groups.items():
+            if isinstance(files, list) and all(isinstance(f, str) for f in files) and files != sorted(files):
+                groups[group] = sorted(files)
+                moved = True
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail
+    return json.dumps(parsed, ensure_ascii=False) if moved else text
 
 
 def time_bucket(when: float, now: float) -> str:
@@ -588,6 +736,85 @@ def strip_recent_work(text: str) -> str:
     return RECENT_WORK_ESCAPED_RE.sub("", text)
 
 
+def kernel_fixed(text: str) -> str:
+    """`text` with the kernel on each runtime environment block's OS line as KERNEL_PLACEHOLDER."""
+    return RUNTIME_ENVIRONMENT_BLOCK_RE.sub(
+        lambda block: RUNTIME_KERNEL_LINE_RE.sub(lambda line: line.group(1) + KERNEL_PLACEHOLDER, block.group(0)), text)
+
+
+def runtime_kernel_fixed(message: Any) -> Any:
+    """`message`, with kernel_fixed applied to its content (a string or text parts) when it is a system message."""
+    if not (isinstance(message, dict) and message.get(ROLE_FIELD) == SYSTEM_ROLE):
+        return message
+    content = message.get(CONTENT_FIELD)
+    if isinstance(content, str):
+        fixed: Any = kernel_fixed(content)
+    elif isinstance(content, list):
+        fixed = [dict(part, **{TEXT_PART_FIELD: kernel_fixed(part[TEXT_PART_FIELD])})
+                 if isinstance(part, dict) and isinstance(part.get(TEXT_PART_FIELD), str) else part for part in content]
+    else:
+        return message
+    return message if fixed == content else dict(message, **{CONTENT_FIELD: fixed})
+
+
+def without_similar_files(text: str) -> Tuple[str, List[str]]:
+    """A read_file not-found result without its `similar_files`, and the files that list held; any other text as it is.
+
+    Returns `text` itself when it holds no list to drop. A result Hermes appended
+    a notice to (its tool-loop warning) is JSON followed by text: its JSON is
+    written in canonical form, with or without a list to drop, so two runs'
+    copies key alike, and the appended text is kept as it is.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text, []
+        tail = text.lstrip()[end:]
+    error = parsed.get(READ_FILE_ERROR_KEY) if isinstance(parsed, dict) else None
+    if not (isinstance(error, str) and error.startswith(READ_FILE_NOT_FOUND_PREFIX)):
+        return text, []
+    listed = parsed.pop(SIMILAR_FILES_KEY, None)
+    files = [f for f in listed if isinstance(f, str)] if isinstance(listed, list) else []
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail, files
+    if listed is None:
+        return text, files
+    return json.dumps(parsed, ensure_ascii=False), files
+
+
+def without_queue_fields(text: str) -> Tuple[str, bool, Any]:
+    """A kanban_create result without its `queued` and `queue`, whether it was queued, and the dropped `queue`.
+
+    Any other text comes back as it is, unqueued. Returns `text` itself when it
+    holds neither key and has no appended notice. Queued means a `queued` that is present and not `false`,
+    or a `queue` block at all: queue_fields writes only `true`, and anything
+    else it might write is read as a wait. A result Hermes appended a notice to
+    is written in canonical form and the notice kept, as without_similar_files does.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text, False, None
+        tail = text.lstrip()[end:]
+    if not (isinstance(parsed, dict) and all(k in parsed for k in KANBAN_CREATE_RESULT_KEYS)):
+        return text, False, None
+    held = QUEUED_FIELD in parsed or QUEUE_FIELD in parsed
+    queued_value = parsed.pop(QUEUED_FIELD, None)
+    queue = parsed.pop(QUEUE_FIELD, None)
+    queued = (queued_value is not None and queued_value is not False) or queue is not None
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail, queued, queue
+    if not held:
+        return text, False, None
+    return json.dumps(parsed, ensure_ascii=False), queued, queue
+
+
 @dataclass
 class Mapping:
     """Value <-> placeholder, numbered per class by first appearance."""
@@ -621,6 +848,14 @@ class Mapping:
     dropped_counts: set = field(default_factory=set)
     dropped_count_keys: set = field(default_factory=set)
     dropped_hex: set = field(default_factory=set)
+    # Spent proposals' numbers (SPENT_PROPOSAL_RE), which an answer must not
+    # hold as a number, and the file names of read_file's dropped
+    # `similar_files` (without_similar_files), which an answer must not name.
+    proposal_numbers: set = field(default_factory=set)
+    dropped_files: set = field(default_factory=set)
+    # Whether a kanban_create result the key dropped `queued` from was queued
+    # (without_queue_fields), which an answer must not talk about.
+    create_queued: bool = False
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -639,6 +874,8 @@ class Mapping:
                 self.to_value[token] = value
         if cls == NUMBER_CLASS:
             self.bare_numbers.add(value)
+        if cls == SPENT_PROPOSAL_CLASS:
+            self.proposal_numbers.add(value)
         if age:
             self.ages.add(value)
         return self.to_placeholder[key]
@@ -646,7 +883,8 @@ class Mapping:
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
                        set(self.comment_numbers), set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
-                       set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex))
+                       set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex),
+                       set(self.proposal_numbers), set(self.dropped_files), self.create_queued)
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -796,6 +1034,20 @@ class Mapping:
         return any(run.startswith(kept) or kept.startswith(run)
                    for run in HEX_RUN_RE.findall(text) for kept in self.dropped_hex)
 
+    def answer_names_dropped_file(self, text: str) -> bool:
+        """Whether an answer names, by its file name, a file a dropped read_file `similar_files` listed.
+
+        Read on the answer as written, not normalized: a name holding a bound
+        identifier (`kube-agents-evals-22-notes.md`) would otherwise be read
+        as its placeholder. By file name, so a relative path (`cat INVENTORY.md`) counts too.
+        """
+        return any(re.search(DROPPED_FILE_BEFORE + re.escape(name) + DROPPED_FILE_AFTER, text) for name in self.dropped_files)
+
+    def answer_talks_about_dropped_queue(self, text: str) -> bool:
+        """Whether an answer talks about a queue or a slot after a kanban_create result whose dropped `queued` was set."""
+        return self.create_queued and (QUEUE_WORDS_RE.search(text) is not None
+                                       or QUEUE_SLOT_WORDS_RE.search(text) is not None)
+
     @staticmethod
     def has_timestamp(text: str) -> bool:
         """Whether a normalized answer still holds a timestamp: one the request did not hold verbatim."""
@@ -841,6 +1093,10 @@ class Mapping:
             if re.search(r"(?<![A-Za-z0-9_])" + COMMENT_WORD + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER, text,
                          re.IGNORECASE):
                 return True
+        # Any length, anywhere: `PR #175`, `pull/175` and `proposal view 175` all name it.
+        for value in self.proposal_numbers:
+            if re.search(PROPOSAL_NUMBER_BEFORE + re.escape(value) + PROPOSAL_NUMBER_AFTER, text):
+                return True
         return self.answer_repeats_dropped_count(text)
 
     def answer_repeats_dropped_count(self, text: str) -> bool:
@@ -881,6 +1137,8 @@ class Normalizer:
         # Whether the message being walked is an assistant message (walk_message):
         # then text() also swaps bound values as Mapping.apply_to_answer does.
         self.in_answer = False
+        # The tool_call ids of the read_file calls walked so far (walk_message).
+        self.read_file_calls: Set[str] = set()
         # Per-request caches: a string's parsed JSON document (nested_json),
         # whether a string or container holds a time of day (timed), and a
         # string's TimeIndex, so each is computed once however often it is asked.
@@ -888,6 +1146,10 @@ class Normalizer:
         self.timed_strings: Dict[str, bool] = {}
         self.timed_containers: Dict[Tuple[int, Optional[str], bool], bool] = {}
         self.time_indexes: Dict[str, TimeIndex] = {}
+        # The tool_call ids of the skill_view calls walked so far (walk_message).
+        self.skill_view_calls: Set[str] = set()
+        # The tool_call ids of the kanban_create calls walked so far (walk_message).
+        self.kanban_create_calls: Set[str] = set()
 
     # -- structure ---------------------------------------------------------
     #
@@ -914,13 +1176,87 @@ class Normalizer:
         return obj
 
     def walk_message(self, message: Any) -> Any:
-        """Walk one request message; an assistant message's text also gets the answer-only swaps (text)."""
+        """Walk one request message; an assistant message's text also gets the answer-only swaps (text).
+
+        An assistant message's read_file and skill_view calls are noted, so the
+        tool message answering one is walked without a not-found's
+        `similar_files` (without_similar_files), or with its file listings
+        sorted (sorted_skill_listings); and its kanban_create calls, so the
+        result answering one is walked without `queued` and `queue`
+        (without_queue_fields).
+        """
         outer = self.in_answer
         self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
+        if self.in_answer:
+            self.note_read_file_calls(message)
+            self.note_skill_view_calls(message)
+            self.note_kanban_create_calls(message)
         try:
-            return self.walk(message)
+            return self.walk(self.queue_fields_dropped(self.similar_files_dropped(self.skill_listings_sorted(
+                runtime_kernel_fixed(message)))))
         finally:
             self.in_answer = outer
+
+    def note_read_file_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == READ_FILE_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.read_file_calls.add(call[ID_KEY])
+
+    def similar_files_dropped(self, message: Any) -> Any:
+        """`message`, without its content's `similar_files` when it is a noted read_file call's not-found result.
+
+        The file name of each dropped entry is noted for the answer guards (Mapping.answer_names_dropped_file).
+        """
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.read_file_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content, files = without_similar_files(message[CONTENT_FIELD])
+        self.mapping.dropped_files.update(name for name in (PurePosixPath(f).name for f in files) if name)
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
+    def note_skill_view_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == SKILL_VIEW_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.skill_view_calls.add(call[ID_KEY])
+
+    def skill_listings_sorted(self, message: Any) -> Any:
+        """`message`, with its content's file listings sorted when it is the result of a noted skill_view call."""
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.skill_view_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content = sorted_skill_listings(message[CONTENT_FIELD])
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
+    def note_kanban_create_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == KANBAN_CREATE_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.kanban_create_calls.add(call[ID_KEY])
+
+    def queue_fields_dropped(self, message: Any) -> Any:
+        """`message`, without its content's `queued` and `queue` when it is a noted kanban_create call's result.
+
+        A dropped `queue`'s counts are noted as a dropped queued event's are
+        (note_counts), and a queued result marks the mapping (Mapping.create_queued).
+        """
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.kanban_create_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content, queued, queue = without_queue_fields(message[CONTENT_FIELD])
+        self.note_counts(queue)
+        self.mapping.create_queued = self.mapping.create_queued or queued
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
 
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:
         """What `walk` swaps `obj` for whole (a placeholder or token), as a call, or None when it walks into it."""
@@ -977,6 +1313,7 @@ class Normalizer:
         self.mapping.ages |= other.ages
         self.mapping.dates |= other.dates
         self.mapping.today_dates |= other.today_dates
+        self.mapping.proposal_numbers |= other.proposal_numbers
 
     def note_counts(self, payload: Any, key: Optional[str] = None) -> None:
         """Every integer in a dropped event's payload, with the key it sat under (Mapping.answer_repeats_dropped_count)."""

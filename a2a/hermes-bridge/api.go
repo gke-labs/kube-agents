@@ -90,6 +90,14 @@ const (
 	// run it twice in the session, and "<taskId>/<envelopeId>" for a
 	// follow-up's, so it never replays the opening answer.
 	apiIdempotencyHeader = "Idempotency-Key"
+	// apiEvalRunHeader names the eval run, case and repetition a turn serves
+	// (`<run>/<case>/<rep>`). The bridge sends it only for an inject-door
+	// conversation, whose key the eval harness mints as exactly that triple
+	// behind apiInjectConversationPrefix; no other conversation carries it.
+	// The agent records it per session while KUBEAGENTS_EVAL_RUN_TAGS is on
+	// and ignores it otherwise (deploy/docker/patches/eval_run_tag.py).
+	apiEvalRunHeader            = "X-Kube-Agents-Eval-Run"
+	apiInjectConversationPrefix = "inject:"
 	// apiRateLimitedStatus is the status the server answers when it is
 	// already running its cap of concurrent turns
 	// (gateway.api_server.max_concurrent_runs), before the turn starts. It
@@ -143,6 +151,10 @@ var apiRateLimitedReasons = map[string]bool{"rate_limit": true, "billing": true}
 // session id: the server interpolates the id into a filename and refuses a
 // separator or "..", and the bus does not vouch for a contextId's shape.
 var apiSafeContextID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// apiEvalRunPattern is the tag's shape, as the agent and the replay proxy
+// hold it: a conversation key that is not one sends no header.
+var apiEvalRunPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}$`)
 
 // apiSessionID is the Hermes session a conversation's tasks share: the
 // contextId under apiSessionIDPrefix when it is path-safe, else a hash of
@@ -336,7 +348,8 @@ func apiTurnFailed(out *apiChatResponse) bool {
 // turn before it has answered.
 func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	taskID := run.origin.TaskID
-	prompt, ok := promptFromMessage(run.origin.Payload)
+	parts := messageParts(run.origin.Payload)
+	prompt, ok := promptFromParts(parts)
 	if !ok {
 		b.finalize(run, lib.StateRejected,
 			"reason: no-text-parts - the submission message carries nothing hermes can be asked", nil)
@@ -421,7 +434,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// The opening turn only: a follow-up runs in a session that has already
 	// read the report, and the hook this mirrors reads the thread once per
 	// message a person sends, which the opening turn is.
-	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, prompt)
+	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, parts, prompt)
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
@@ -444,7 +457,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		b.beginKanbanWait(sessionID)
 		defer func() {
 			if run.canceled.Load() && (act.cardsFiled.Load() || carriedCards) {
-				b.markSessionCanceled(sessionID)
+				b.markRunCanceled(run, sessionID)
 			}
 			b.endKanbanWait(sessionID)
 		}()
@@ -509,6 +522,26 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	}
 }
 
+// apiEvalRunTag is the eval run tag of an inject-door task, "" for any other.
+func apiEvalRunTag(env *lib.Envelope) string {
+	if env == nil {
+		return ""
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return ""
+	}
+	key := strings.TrimSpace(auth.Audience.Conversation)
+	if !strings.HasPrefix(key, apiInjectConversationPrefix) {
+		return ""
+	}
+	tag := strings.TrimPrefix(key, apiInjectConversationPrefix)
+	if !apiEvalRunPattern.MatchString(tag) {
+		return ""
+	}
+	return tag
+}
+
 // apiTurnKey is a turn's Idempotency-Key. The opening turn keeps the task
 // id, which is what a redelivered submission was always keyed on; a
 // follow-up adds its own envelope id, so it never replays the opening
@@ -551,6 +584,9 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	req.Header.Set(apiSessionKeyHeader, sessionID)
 	req.Header.Set(apiSessionIDHeader, sessionID)
 	req.Header.Set(apiIdempotencyHeader, key)
+	if tag := apiEvalRunTag(run.origin); tag != "" {
+		req.Header.Set(apiEvalRunHeader, tag)
+	}
 
 	if steer != nil {
 		run.mu.Lock()
@@ -625,8 +661,10 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// on its own. A 4xx ran nothing and publishes nothing.
 			b.publishTurnUsage(run, &apiChatResponse{}, took)
 		}
+		// A body or error tail can carry the answer's own bytes: scrubbed as
+		// an answer is (scrubAnswer), here and in the arms below.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if len(raw) > b.responseCap {
@@ -641,7 +679,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	var out apiChatResponse
 	if err := json.Unmarshal(raw, &out); err != nil || len(out.Choices) == 0 {
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreadable - HTTP %d; session: %s%s; body tail: %s",
-			resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if apiTurnFailed(&out) {
@@ -653,7 +691,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		// ahead of the failed terminal, as the worker adapter's does.
 		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, out.Hermes.Error), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if answer := out.Choices[0].Message.Content; opensWithUnstructuredReasoning(answer) {

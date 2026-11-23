@@ -2,7 +2,7 @@ Subject: Correct the validator commands and say what the validator checks
 
 Why: The agent runs validate_config.py from the skill's installed path, and upstream's commands use a path relative to the skill directory, pass --cluster-var "${var.cluster_name}" (bash rejects it as a bad substitution and the script never reads the value), and use a --file mode that prints no policy count; the text also credits the script with checks it does not make (PromQL grammar, label scoping) and omits the plan shape it reads, so a pass was read as proof it is not.
 Local-Issue: #2692
-Upstream-Issue: none filed yet
+Eval-Case: alert-config-terraform-promql-probe
 Retire-When: upstream's commands run as written from an install and its description matches validate_config.py
 
 diff --git a/SKILL.md b/SKILL.md

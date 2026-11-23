@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -87,6 +88,17 @@ HARNESS_ARGS = [
     "platformAgent.harness.location=us-central1",
 ]
 OPERATOR_OFF_ARGS = ["--set", "operator.enabled=false"]
+
+
+# The gateway's master key is generated on every render that finds no Secret
+# in a cluster (templates/litellm.yaml), so two renders differ in that one
+# value; it is masked before a byte-for-byte comparison.
+_MASTER_KEY_LINE = re.compile(r'^(\s*LITELLM_MASTER_KEY: )"sk-[A-Za-z0-9]+"$', re.MULTILINE)
+_MASTER_KEY_MASK = r'\1"<generated>"'
+
+
+def _masked(rendered: str) -> str:
+    return _MASTER_KEY_LINE.sub(_MASTER_KEY_MASK, rendered)
 
 
 def _helm_template(*extra_args: str, chart_dir: pathlib.Path = CHART_DIR, check: bool = True):
@@ -586,7 +598,7 @@ class ExistingProvidersUnchangedTest(unittest.TestCase):
             with self.subTest(name):
                 plain = _helm_template(*args, *HARNESS_ARGS).stdout
                 with_values = _helm_template(*args, *inert_args, *HARNESS_ARGS).stdout
-                self.assertEqual(plain, with_values)
+                self.assertEqual(_masked(plain), _masked(with_values))
 
     @unittest.skipUnless(os.environ.get(BASE_CHART_DIR_ENV), f"{BASE_CHART_DIR_ENV} is not set")
     def test_renders_match_the_base_chart_byte_for_byte(self) -> None:
@@ -595,7 +607,7 @@ class ExistingProvidersUnchangedTest(unittest.TestCase):
             with self.subTest(name):
                 current = _helm_template(*args, *HARNESS_ARGS).stdout
                 base = _helm_template(*args, *HARNESS_ARGS, chart_dir=base_chart).stdout
-                self.assertEqual(current, base)
+                self.assertEqual(_masked(current), _masked(base))
 
 
 

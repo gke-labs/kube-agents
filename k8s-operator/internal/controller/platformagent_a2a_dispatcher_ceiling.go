@@ -23,11 +23,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 	"sync"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -156,10 +154,11 @@ func dispatcherIdentityShare(agent *agentv1alpha1.PlatformAgent, base int, p *ag
 
 // a2aDispatchConfigShares is the dispatch config's size with no profiles,
 // and the bytes each of these profiles' entries adds to it, as
-// buildA2ADispatchConfigMapWith writes it (compact JSON). A profile that allows
-// unattended under Job mode carries its Job template; measured both with and
-// without image volumes, it is charged the larger, since which one the
-// cluster takes isn't known here. Each share is measured alone and charged
+// buildA2ADispatchConfigMapWith writes it (compact JSON): no durables and a
+// Job template referenced by its hash alone, which the dispatcher resolves
+// (#5479). Under Job mode every profile carries that reference (its
+// templates are per tier, #5646), whose hash is fixed-width, so which rendering the cluster
+// takes doesn't change its size. Each share is measured alone and charged
 // one more byte for the comma it takes in the array: exact for every entry
 // after the first, one over for the first, never under.
 func a2aDispatchConfigShares(agent *agentv1alpha1.PlatformAgent, profiles []*agentv1alpha1.AgentProfile) (base int, shares []int, err error) {
@@ -206,17 +205,17 @@ func (m dispatchConfigMeasure) bytes(entries []a2aDispatchProfile) (int, error) 
 	return len(body), err
 }
 
-// share is the bytes p's entry adds over base, with its comma.
+// share is the bytes p's entry adds over base, with its comma. Under Job
+// mode every profile takes a Job template reference (dispatchJobTemplates
+// renders one per live tier, #5646), one hash however many tiers. Only the
+// reference's hash is written, so a placeholder of the same width measures
+// it without rendering the templates.
 func (m dispatchConfigMeasure) share(base int, p *agentv1alpha1.AgentProfile) (int, error) {
-	var tmpl *corev1.PodTemplateSpec
-	if m.jobMode && slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
-		with, without := buildProfileJobTemplate(m.agent, p, true), buildProfileJobTemplate(m.agent, p, false)
-		tmpl = with
-		if a, b := jsonLen(with), jsonLen(without); b > a {
-			tmpl = without
-		}
+	entry := dispatchProfileEntry(m.agent, p, nil)
+	if m.jobMode {
+		entry.JobTemplateRef = &a2aDispatchJobTemplateRef{Hash: strings.Repeat("0", dispatchJobTemplateHashLength), PerTier: true}
 	}
-	n, err := m.bytes([]a2aDispatchProfile{dispatchProfileEntry(m.agent, p, tmpl)})
+	n, err := m.bytes([]a2aDispatchProfile{entry})
 	return n - base + 1, err
 }
 
@@ -236,8 +235,8 @@ type dispatcherCut struct {
 
 // dispatcherCutCache holds recent cuts by their inputs' fingerprint. Every
 // identity resolution makes the cut, and callers resolve many times a
-// reconcile, so without it each would rebuild and marshal every profile's Job
-// template again.
+// reconcile, so without it each would marshal every profile's entry and
+// grants again.
 var dispatcherCutCache = struct {
 	sync.Mutex
 	cuts map[string]dispatcherCut
@@ -286,9 +285,14 @@ func dispatcherCeilingCut(agent *agentv1alpha1.PlatformAgent, bound []*agentv1al
 	cfgBase := cfgUsed
 	cut = dispatcherCut{fit: len(bound)}
 	for i, p := range bound {
-		idShare, err := dispatcherIdentityShare(agent, idBase, p)
-		if err != nil {
-			return dispatcherCut{}, err
+		// With bucketed grants the entry is its fixed size, whatever the
+		// profile count (dispatcherMapEntry, #5381), so only the config's
+		// budget cuts, and the identity share isn't measured.
+		idShare := 0
+		if !a2aDispatcherBucketedGrants() {
+			if idShare, err = dispatcherIdentityShare(agent, idBase, p); err != nil {
+				return dispatcherCut{}, err
+			}
 		}
 		if idUsed+idShare > a2aDispatcherProfileBudget {
 			cut.fit, cut.limit = i, dispatcherCeilingLimitIdentity
@@ -395,7 +399,18 @@ func dispatcherCeilingStanding(agent *agentv1alpha1.PlatformAgent, profiles []ag
 // past the ceiling, in which case the dispatcher isn't run. Only meaningful
 // while the dispatcher is switched on.
 func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (condition metav1.Condition, over bool, err error) {
-	entry, n := a2aDispatcherMapEntry(agent, profiles, draining)
+	// The entry the map carries: with bucketed grants, its fixed size, and
+	// the profile count taken without building the unbucketed grant list
+	// that bucketing exists to avoid.
+	var entry a2aAuthMapIdentity
+	var n int
+	if a2aDispatcherBucketedGrants() {
+		// Held names are left out of the measure: a profile is held only
+		// until the bus loads its config, a few bytes each.
+		entry, n = dispatcherMapEntry(agent, profiles, draining, nil), len(profiles)+len(draining)
+	} else {
+		entry, n = a2aDispatcherMapEntry(agent, profiles, draining)
+	}
 	size, err := a2aAuthMapEntryBytes(entry)
 	if err != nil {
 		return metav1.Condition{}, false, fmt.Errorf("measuring the dispatcher's identity entry: %w", err)
@@ -439,7 +454,7 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = dispatcherCeilingReasonNear
 		condition.Message = fmt.Sprintf("the profile dispatcher's config for %d profiles is %d bytes, %d%% of the %d bytes one ConfigMap can hold; "+
-			"past it the operator binds no newer profiles (about 200 profiles that allow unattended under Job mode). Lifting the ceiling is %s",
+			"past it the operator binds no newer profiles. Lifting the ceiling is %s",
 			fit, configBytes, configPct, a2aDispatchConfigLimitBytes, dispatchConfigCeilingIssue)
 	case size >= a2aDispatcherWarnBytes:
 		condition.Status = metav1.ConditionTrue
@@ -486,3 +501,8 @@ func (r *PlatformAgentReconciler) syncDispatcherCeiling(ctx context.Context, age
 	}
 	return r.Status().Update(ctx, agent)
 }
+
+// a2aTaskSigningKeyPlaceholder stands in for the task-signing public key
+// where a Job template is measured rather than applied: an nkey public key
+// is 56 characters.
+var a2aTaskSigningKeyPlaceholder = strings.Repeat("C", 56)

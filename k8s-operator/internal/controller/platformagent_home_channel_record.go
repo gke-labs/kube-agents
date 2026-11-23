@@ -15,15 +15,15 @@ import (
 )
 
 // The home-channel record: under mode next the operator owns an empty
-// ConfigMap beside the A2A gateway. With Slack on the gateway,
-// spec.integration.slack.homeChannel empty and homeChannelPolicy auto, the
-// gateway learns the home channel from the first admitted mention in a
-// channel (a2a/gateway/slack_home_channel.go, armed by the
+// ConfigMap beside the A2A gateway. With Slack or Google Chat on the gateway,
+// that backend's homeChannel empty and its homeChannelPolicy auto, the
+// gateway learns the backend's home channel from the first admitted mention
+// in a channel or a space (a2a/gateway/home_channel.go, armed by the
 // A2A_HOME_CHANNEL_LEARN this operator renders) and patches it into the
-// record. The operator reads the record, admits it, and projects the home
-// channel it stands behind, "the CR, else the admitted record", into a
-// second ConfigMap it mounts as a directory in the agent pod and the
-// gateway pod. Both read the file where it is mounted, and the kubelet
+// record, each backend under its own keys. The operator reads the record,
+// admits it, and projects the home channels it stands behind, "the CR, else
+// the admitted record" per backend, into a second ConfigMap it mounts as a
+// directory in the agent pod and the gateway pod. Both read the file where it is mounted, and the kubelet
 // refreshes it in place, so a learned channel reaches them with no pod
 // replaced and no copy to drift: the agent, the HomeChannelUnset condition
 // and the gateway follow one read. The gateway writes the record's data keys
@@ -38,16 +38,22 @@ const (
 	// for audit; nothing here reads them.
 	homeChannelRecordSlackKey   = "slack"
 	homeChannelRecordRefusedKey = "slack.refused"
+	// Google Chat's pair in the same record: the space name and the refusal.
+	// The gateway also writes gchat.setBy and gchat.setAt.
+	homeChannelRecordGchatKey        = "gchat"
+	homeChannelRecordGchatRefusedKey = "gchat.refused"
 
-	// The projection: the home channel the operator admitted, in a ConfigMap
+	// The projection: the home channels the operator admitted, in a ConfigMap
 	// it owns and mounts as a directory in the agent pod and the gateway pod.
-	// One key, the Slack channel id or empty, always present, so a reader
-	// never sees two keys torn across a kubelet refresh and a pod with the
-	// mount always finds the file. Mounted without subPath, so the kubelet
+	// One key per backend, the Slack channel id and the Chat space name, each
+	// its backend's whole answer or empty and always present, so no reader
+	// joins two keys across a kubelet refresh and a pod with the mount always
+	// finds its file. Mounted without subPath, so the kubelet
 	// refreshes it in place, and kept out of every pod-template hash, so a
 	// learn rolls no pod.
 	a2aHomeChannelProjectionSuffix  = "-chat-home"
 	homeChannelProjectionKey        = "slack_home"
+	homeChannelProjectionGchatKey   = "gchat_home"
 	homeChannelProjectionVolumeName = "chat-home"
 	// World-readable: the agent container runs as its own user, not root.
 	homeChannelProjectionFileMode int32 = 0444
@@ -58,15 +64,21 @@ const (
 	// values of spec.integration.slack.homeChannelPolicy; absent reads as auto.
 	slackHomeChannelPolicyAuto   = "auto"
 	slackHomeChannelPolicyManual = "manual"
+	// spec.integration.googleChat.homeChannelPolicy takes the same two
+	// values, absent read as auto.
+	gchatHomeChannelPolicyAuto   = slackHomeChannelPolicyAuto
+	gchatHomeChannelPolicyManual = slackHomeChannelPolicyManual
 
 	// The gateway's view, rendered into its Deployment: whether it may learn,
 	// which ConfigMap it writes, its own image reference for the record's
 	// reader key (a container cannot read its own image from the environment
 	// otherwise), and the switch that arms the learn at all. The switch is
-	// true whenever Slack is on the gateway, which is also when this operator
-	// reads the record; the gateway still learns only with the CR home empty
-	// and the policy auto (Config.HomeLearnArmed).
+	// true whenever Slack or Chat is on the gateway, which is also when this
+	// operator reads the record; the gateway still learns a backend's home
+	// only with that backend's CR home empty and its policy auto
+	// (Config.HomeLearnArmed, Config.GchatHomeLearnArmed).
 	a2aSlackHomePolicyEnvVar    = "A2A_SLACK_HOME_POLICY"
+	a2aGchatHomePolicyEnvVar    = "A2A_GCHAT_HOME_POLICY"
 	a2aHomeChannelRecordEnvVar  = "A2A_HOME_CHANNEL_RECORD"
 	a2aGatewaySelfImageEnvVar   = "A2A_SELF_IMAGE"
 	a2aHomeChannelLearnEnvVar   = "A2A_HOME_CHANNEL_LEARN"
@@ -79,9 +91,13 @@ const (
 	// words below, mapped to a fixed sentence.
 	homeChannelRecordIDMax     = 32
 	homeChannelRecordMalformed = "<not a channel id>"
+	// gchatHomeChannelRecordIDMax bounds a recorded Chat space name the same
+	// way ("spaces/<id>" is about eighteen runes); the gateway's
+	// gchatHomeSpaceMax is the same number.
+	gchatHomeChannelRecordIDMax = 64
 
 	// The refusal vocabulary the gateway writes into slack.refused, its
-	// homeRefused* constants in a2a/gateway/slack_home_channel.go;
+	// homeRefused* constants in a2a/gateway/home_channel.go;
 	// TestHomeChannelRefusedReasonsMatchTheGatewaysVocabulary fails when this
 	// map and those words differ.
 	homeChannelRefusedShared        = "shared"
@@ -93,11 +109,15 @@ const (
 
 	// The HomeChannelUnset sentences that follow the base message
 	// (homeChannelUnsetMessageFormat) for Slack, at most one per message.
+	// Chat's sentence takes the manual and refused ones as they are and its
+	// own learn and malformed ones below.
 	homeChannelUnsetLearnSuffix            = " Or mention the agent in the channel you want: the gateway makes the channel of the first top-level mention after it started the home channel."
 	homeChannelUnsetManualSuffix           = " homeChannelPolicy is manual, so the gateway does not learn one from a mention."
 	homeChannelUnsetMalformedSuffix        = " The recorded channel is not a channel id (C... or G...), so it is not used."
 	homeChannelUnsetRefusedRecordedFormat  = " The recorded channel %s was refused: %s, so it is not used; the next admitted mention in a channel replaces it."
 	homeChannelUnsetRefusedCandidateFormat = " The last mention that could have set it was refused: %s."
+	gchatHomeChannelUnsetLearnSuffix       = " Or mention the agent in the space you want: the gateway makes the space of the first top-level mention after it started the home channel."
+	gchatHomeChannelUnsetMalformedSuffix   = " The recorded space is not a Chat space name (spaces/<id>), so it is not used."
 )
 
 // homeChannelRefusedReasons maps the gateway's refusal vocabulary to the
@@ -110,8 +130,28 @@ var homeChannelRefusedReasons = map[string]string{
 	homeChannelRefusedDirectMessage: "the channel is a direct or group direct message",
 }
 
-// homeChannelRecord is what the operator read from the record ConfigMap.
+// gchatHomeChannelRefusedReasons is the sentence a refusal word carries when
+// it was written for a Chat space; a word it lacks reads as an unknown reason.
+// The words are the gateway's one vocabulary (homeChannelRefusedReasons);
+// Chat writes no "archived".
+var gchatHomeChannelRefusedReasons = map[string]string{
+	homeChannelRefusedShared:        "the space admits people outside the organization",
+	homeChannelRefusedNotMember:     "the app is not a member of the space",
+	homeChannelRefusedMalformed:     "the recorded value is not a Chat space name",
+	homeChannelRefusedDirectMessage: "the space is a direct message or a group chat",
+}
+
+// gchatHomeRecord is the Google Chat half of the record, read as the Slack
+// half is: space is the admitted learned space name, recorded the raw one
+// (or homeChannelRecordMalformed), refused the condition's sentence.
+type gchatHomeRecord struct {
+	space, recorded, refused string
+}
+
+// homeChannelRecord is what the operator read from the record ConfigMap: the
+// Slack half in its own fields, the Google Chat half in gchat.
 type homeChannelRecord struct {
+	gchat gchatHomeRecord
 	// channel is the admitted learned channel id: "" when there is none, the
 	// id is malformed, the policy is manual, or the gateway refused it.
 	channel string
@@ -133,6 +173,18 @@ func slackHomeChannelPolicy(agent *agentv1alpha1.PlatformAgent) string {
 		return slackHomeChannelPolicyManual
 	}
 	return slackHomeChannelPolicyAuto
+}
+
+// gchatHomeChannelPolicy is spec.integration.googleChat.homeChannelPolicy
+// with absent read as auto.
+func gchatHomeChannelPolicy(agent *agentv1alpha1.PlatformAgent) string {
+	if !googleChatEnabled(agent) {
+		return gchatHomeChannelPolicyAuto
+	}
+	if strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannelPolicy) == gchatHomeChannelPolicyManual {
+		return gchatHomeChannelPolicyManual
+	}
+	return gchatHomeChannelPolicyAuto
 }
 
 // a2aHomeChannelRecordName is the record ConfigMap's name.
@@ -158,6 +210,7 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 	if cm == nil {
 		return rec
 	}
+	rec.gchat = readGchatHomeRecord(agent, cm)
 	raw := strings.TrimSpace(cm.Data[homeChannelRecordSlackKey])
 	if reason := strings.TrimSpace(cm.Data[homeChannelRecordRefusedKey]); reason != "" {
 		rec.refused = homeChannelRefusedReasons[reason]
@@ -182,20 +235,52 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 	return rec
 }
 
+// readGchatHomeRecord interprets the record's Google Chat keys, on the Slack
+// half's rules: a space is admitted only under policy auto, as a bare space
+// name within the bound, and with no refusal recorded beside it.
+func readGchatHomeRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.ConfigMap) gchatHomeRecord {
+	var rec gchatHomeRecord
+	raw := strings.TrimSpace(cm.Data[homeChannelRecordGchatKey])
+	if reason := strings.TrimSpace(cm.Data[homeChannelRecordGchatRefusedKey]); reason != "" {
+		rec.refused = gchatHomeChannelRefusedReasons[reason]
+		if rec.refused == "" {
+			rec.refused = homeChannelRefusedUnknown
+		}
+	}
+	if raw == "" {
+		return rec
+	}
+	if len([]rune(raw)) <= gchatHomeChannelRecordIDMax {
+		rec.recorded = gchatSpaceName(raw)
+	}
+	if rec.recorded == "" {
+		rec.recorded = homeChannelRecordMalformed
+		return rec
+	}
+	if gchatHomeChannelPolicy(agent) != gchatHomeChannelPolicyAuto || rec.refused != "" {
+		return rec
+	}
+	rec.space = rec.recorded
+	return rec
+}
+
 // a2aHomeChannelProjectionName is the projection ConfigMap's name.
 func a2aHomeChannelProjectionName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + a2aHomeChannelProjectionSuffix
 }
 
-// buildHomeChannelProjection is the projection for this pass: the one key,
-// the home channel the agent and the gateway are to use (a2aSlackHomeEffective)
-// or empty. The operator owns the data too, so a hand edit of this object
+// buildHomeChannelProjection is the projection for this pass: one key per
+// backend, the home channel the agent and the gateway are to use
+// (a2aSlackHomeEffective, a2aGchatHomeEffective) or empty. The operator owns the data too, so a hand edit of this object
 // is rewritten on the next pass; the record is where a hand edit belongs.
 func buildHomeChannelProjection(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
-		Data:       map[string]string{homeChannelProjectionKey: a2aSlackHomeEffective(agent, rec)},
+		Data: map[string]string{
+			homeChannelProjectionKey:      a2aSlackHomeEffective(agent, rec),
+			homeChannelProjectionGchatKey: a2aGchatHomeEffective(agent, rec),
+		},
 	}
 }
 
@@ -224,11 +309,11 @@ func homeChannelProjectionMount(dir string) corev1.VolumeMount {
 
 // homeChannelRecordFor reads the record from the cache, once per reconcile
 // (the caller carries it to the render and to both condition writers), or an
-// empty record where nothing reads it: a stack that is not rendered, or a
-// gateway that does not hold Slack. NotFound is an empty record: the pass
+// empty record where nothing reads it: a gateway that holds neither Slack nor
+// Google Chat. NotFound is an empty record: the pass
 // that creates the object has not run yet.
 func (r *PlatformAgentReconciler) homeChannelRecordFor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (homeChannelRecord, error) {
-	if !a2aStackRendering(agent) || !a2aSlackArmed(agent) {
+	if !a2aHomeChannelProjected(agent) {
 		return homeChannelRecord{}, nil
 	}
 	var cm corev1.ConfigMap
@@ -256,4 +341,25 @@ func a2aSlackHomeEffective(agent *agentv1alpha1.PlatformAgent, rec homeChannelRe
 		return a2aSlackHomeChannel(agent)
 	}
 	return rec.channel
+}
+
+// a2aGchatHomeEffective is a2aSlackHomeEffective for Google Chat: the CR's
+// space when it sets one, else the admitted record's. A CR value that is set
+// but is not a space name falls through to nothing, not to the record: the
+// gateway arms no chat.notify route on it (a2aGchatNotifyArmed).
+func a2aGchatHomeEffective(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
+	if !googleChatEnabled(agent) {
+		return ""
+	}
+	if strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) != "" {
+		return a2aGchatHomeSpace(agent)
+	}
+	return rec.gchat.space
+}
+
+// a2aHomeChannelProjected reports whether the gateway holds a backend that
+// reads the record and the projection: Slack or Google Chat. It decides the
+// record read, the learn env and the projection's mount in both pods.
+func a2aHomeChannelProjected(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aSlackArmed(agent) || a2aChatArmed(agent)
 }

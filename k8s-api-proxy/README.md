@@ -1,8 +1,8 @@
 # k8s-api-proxy
 
 The Kubernetes API proxy for the agent sandbox and A2A session pods (`<agent>-kube-proxy` deployment). Each caller's
-`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
-authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
+`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...` by default, without `--upstream-url`), and the proxy
+authenticates the caller (a `CallerAuthenticator`; the binary defaults to `pkg/tokenreview`), applies a per-request policy
 (`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
 caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), impersonation,
 `Audit-ID` and `Connection`-named headers (`pkg/k8sapiproxy/headers.go`), forwards the request to
@@ -11,13 +11,28 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
 `cmd/k8s-api-proxy` builds the production server binary.
 
-`NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
+`tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
 
-`pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
-`gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
+`jwtauth.NewAuthenticator` (`pkg/jwtauth`) is for an embedder whose platform mints a signed token
+per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer
+JWT that names its key (`kid`), verifies against the issuer's JSON Web Key Set fetched over HTTPS
+(RS\*, PS\* or ES\*; never a symmetric algorithm), and carries the configured issuer, one of the
+configured audiences, and an expiry it has not passed by more than a minute of clock skew. The
+username and groups come from configurable claims (`sub` by default). An optional `Allow` func
+can refuse a caller; without one, every token the issuer mints for that audience is admitted. The
+key set is cached for an hour and fetched again when a token names a key it lacks, at most every
+ten seconds whether or not the fetch succeeds, so a rotated key works without a restart. Keys the
+library cannot use (an unsupported type, an encryption key) are skipped. A key set that cannot be
+fetched is a 503, except that a key already cached keeps verifying for up to six hours past the
+set's expiry.
+`Config.CAFile` names a PEM bundle of the roots the key set's server is verified against
+instead of the system roots; it is re-read when it changes, like the server certificate below, and
+the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
+
+`upstream.Transport` (`upstream.New`, distinct from `upstream.StaticTransport` below) sends `in-cluster`, and the proxy's `--host-cluster-id` `gke_` cluster, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
 Application Default Credentials): it describes the cluster through the Container API and picks its
 endpoint by rules 1, 2 and 4 of
@@ -79,6 +94,53 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
+and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
+empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
+give its path to both flags. Files without a matching certificate and key stop the proxy at
+startup. The files are reloaded
+without a restart (`pkg/certreload`): at most once a second, a TLS handshake checks their size,
+modification time, device and inode (so a Secret or projected volume's `..data` symlink swap is
+seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
+not load, such as one read mid-rotation, is logged, counted in
+`kubeagents_kube_proxy_certificate_reload_failures_total`, and the last good certificate keeps
+being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
+`Transport` verifies each new connection against the current bundle, with hostname and IP SAN
+checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
+
+Cached responses and coalesced fetches are shared across callers, which is safe while the
+`UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
+transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
+authenticated caller is part of the cache and coalescing keys, so requests share a response or a
+fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
+the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
+partition needs the cache off (`Config.Cache` nil). A write evicts the resource's entries
+in every partition, since the data changed for every caller; a `401` or `403` evicts them in the
+caller's partition only, since only that credential's access changed.
+
+Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
+(`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
+archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
+archive was built for; the `kube-proxy` image prints the commit it was built from, and a local build
+prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
+it carry none.
+
+For standalone sidecar or loopback bridge deployments outside a host cluster, `cmd/k8s-api-proxy`
+provides three opt-in flags. `--auth-mode=none` (`KUBE_PROXY_AUTH_MODE`; default `token-review`)
+skips `TokenReview` setup, records `caller_username` as `unauthenticated`, logs a startup warning,
+and rejects `--allowed-callers`, `CREDENTIAL_PROXY_SESSION_AUDIENCE`, and
+`CREDENTIAL_PROXY_SESSION_CALLERS`. `--auth-mode=none` requires `--listen-addr`
+(`KUBE_PROXY_LISTEN_ADDR`) to be set explicitly, for example `127.0.0.1:8443` on a host loopback
+bridge. `--upstream-url=<url>` (`KUBE_PROXY_UPSTREAM_URL`) forwards
+`in-cluster` requests to one static `http://` or `https://` endpoint through `upstream.NewStatic`
+(`StaticConfig`, `StaticTransport`) without cloud credentials. It rejects `--host-cluster-id`,
+`--container-api-url`, `--scope-file`, `--hold-file`, `--exclude-host-cluster-id`, and
+`CREDENTIAL_PROXY_SCOPED_SA_POOL`, and sets `Config.DefaultClusterID` to `in-cluster` so bare
+`/api/...` and `/clusters/in-cluster/...` paths both work (`SplitClusterPathWithDefault`).
+`--deny-streaming` (`KUBE_PROXY_DENY_STREAMING`, `Policy.DenyStreaming`) refuses `watch` requests,
+`log` `follow` streams (`ReasonStreamingBlocked`), and protocol upgrades with `403 Forbidden`, and
+rejects `--allow-upgrade-subresources`.
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash
@@ -89,3 +151,15 @@ go test -race ./...
 
 `k8sapiproxy-test.yml` runs those and gosec, built from `k8s-operator/go.mod`'s pin (this module
 declares none); `make gosec` at the repository root runs the same scan over this module.
+
+Every kube-agents release `X.Y.Z` tags this module `k8s-api-proxy/vX.Y.Z` at the release commit,
+so a program can embed the handler with its own authenticator, upstream transport and audit sink:
+
+```bash
+go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
+```
+
+The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `UpstreamTransport`,
+`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The version moves with every
+kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
+module until the module's own versioning is decided.

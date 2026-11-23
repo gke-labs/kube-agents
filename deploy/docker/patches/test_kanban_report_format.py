@@ -249,7 +249,21 @@ class StanzaTest(unittest.TestCase):
         )
         self.assertNotIn("even when it ends", flat)
         # A root-cause card ending "Report the findings." keeps its sections.
-        self.assertIn("on a yes-or-no or status card, a closing request to report or summarize is not that ask.", flat)
+        self.assertIn("on a yes-or-no or status card, a closing request to report or summarize is not that ask", flat)
+
+    def test_a_propose_only_line_does_not_turn_a_question_into_a_report(self):
+        # The Platform ends every no-change card with this line; on a status card it drew a Sources list.
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn(
+            'Neither does a closing line that starts "Propose only", however it is worded: it '
+            "only rules out opening a pull request or making the change, and never turns a question into a "
+            "request for a fix, a report, "
+            "claims or a Sources list, so a yes-or-no or status card that carries it still gets the short answer.",
+            flat,
+        )
+        self.assertIn('summarize is not that ask, and neither is a line that starts "Propose only".', flat)
+        # The Platform rewords the line ("put the findings in the result"); quoting one wording would miss it.
+        self.assertNotIn("put the fix in result", flat)
 
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
@@ -275,6 +289,15 @@ class StanzaTest(unittest.TestCase):
             bullet,
         )
         self.assertIn("Keep a report under 2,000 characters where the findings allow", " ".join(REPORT_FORMAT_STANZA.split()))
+
+    def test_a_question_names_what_it_found_not_the_commands(self):
+        """#5200: the over-length answers spent their budget naming the commands, context and read time."""
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn("600 characters in all, aiming for under 400,", flat)
+        self.assertIn(
+            "Its evidence says what you found, not how: name no command, script, kube context or the time you ran them.",
+            flat,
+        )
 
     def test_the_stanza_itself_is_clean(self):
         """Self-consistency: the instructions must not violate their own rules."""

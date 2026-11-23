@@ -81,7 +81,7 @@ readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
 # Whether note_stale_network_policy_acceptance has spoken this run.
 NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
-# How check_flag_against_install_env compares a typed chat flag or --mode with the key
+# How check_flag_against_install_env compares a typed chat flag with the key
 # install.env records: a boolean read through is_truthy, a literal string, a
 # list read through hcl_csv_list (the form write_tfvars_from_state renders), or
 # a credential, whose value is never printed and whose home is the live Secret
@@ -96,8 +96,8 @@ readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
 # about, and not SLACK_ENABLED: the panel turns Slack on without asking for
 # the tokens, and its apply does not check for them.
 readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL"
-# The flags held to install.env that this run typed (the chat flags and
-# --mode), one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
+# The flags held to install.env that this run typed (the chat flags), one
+# KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
 # noted by parse_args; and the keys among them that install.env does not
 # assign, for record_flags_into_install_env to append once the run commits.
 INSTALL_ENV_FLAGS_TYPED=""
@@ -114,6 +114,15 @@ readonly GITLAB_TOKEN_SECRET_KEY="token"
 readonly GITLAB_READ_TOKEN_SECRET_KEY="read-token"
 readonly GITLAB_TOKEN_FIELD_MANAGER="kube-agents-installer"
 readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
+readonly STOCKOUT_INVESTIGATOR_PROMPT_DESC="GKE Stockout Investigator watches cluster-autoscaler noScaleUp Cloud Logging events for capacity or quota failures, diagnoses the root cause, and opens a GitOps remediation PR or posts diagnostics to your chat channel."
+readonly STOCKOUT_INVESTIGATOR_NO_HOME_CHANNEL_NOTE="No Google Chat or Slack home channel is configured yet, so proactive stockout alerts cannot be delivered immediately (they stay queued in HomeChannelUnset until a home channel is set); defaulting to No."
+readonly STOCKOUT_INVESTIGATOR_PROMPT_LABEL="Enable GKE Stockout Investigator for automated scale-up failure diagnostics?"
+readonly INSTALL_SIZING_PROFILE_DEFAULT="auto"
+readonly INSTALL_SIZING_PROFILE_VALUES="small medium fleet auto"
+readonly INSTALL_SIZING_PROFILE_CHOICES="small | medium | fleet | auto"
+readonly INSTALL_GKE_CLUSTER_MODE_STANDARD="standard"
+readonly INSTALL_GKE_SIZING_PROFILE_FLEET="fleet"
+readonly INSTALL_DEFAULT_SIZING_FLEET_CLUSTER_THRESHOLD=25
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -350,15 +359,13 @@ bootstrap_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
-  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
-  # switch the install's component stack for one run, and the next run from a
-  # clean shell would switch it back. --mode is refused for the same reason
-  # when it disagrees with this file (check_flags_against_install_env).
-  unset PLATFORM_AGENT_MODE
   # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
   # grow both data claims for one run, and the next run from a clean shell
   # would drop the field again, leaving claims larger than the CR says.
   unset PLATFORM_AGENT_STORAGE_SIZE
+  # The runtime sizing profile too: once install.env exists, only install.env
+  # (or --sizing-profile) sets it.
+  unset PLATFORM_AGENT_SIZING_PROFILE
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
@@ -401,6 +408,11 @@ bootstrap_install_env() {
   # shellcheck disable=SC1090
   . "$file"
   set +a
+  # PLATFORM_AGENT_MODE once chose the component stack; every install runs the
+  # A2A stack now, so the key is not read. Unset here, before anything runs
+  # from the environment; step 2 says so once the shared helpers are loaded
+  # (note_ignored_platform_agent_mode_key).
+  unset PLATFORM_AGENT_MODE
   # Whether the file records a GitHub App: the App belongs to the GitHub host
   # the file records, so validate_github_forge_flags refuses to carry it to
   # another host. Read from the file, not the variable, which the shell can
@@ -549,6 +561,12 @@ if [ -n "${GITHUB_MINTER_GSA_NAME:-}" ]; then
 else
   export GITHUB_MINTER_GSA_NAME_GIVEN="false"
 fi
+# And its KSA (#5282).
+if [ -n "${GITHUB_MINTER_KSA_NAME:-}" ]; then
+  export GITHUB_MINTER_KSA_NAME_GIVEN="true"
+else
+  export GITHUB_MINTER_KSA_NAME_GIVEN="false"
+fi
 # GitLab: the forge, a self-managed host, the Secret's name, and a FILE the
 # token is read from. There is deliberately no token-value input: a value in
 # argv or the environment is a value in `ps`, shell history and CI logs.
@@ -654,6 +672,14 @@ SCOPE_FLAG_PASSED="false"
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+SHELL_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED="false"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="false"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE="false"
+STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP="false"
+if [ -n "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR}" ]; then
+  PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="true"
+fi
 # Not filled by resolve_shared_defaults, and PARAM_ENABLE_GKE_BACKUP_PLAN below
 # is the pattern: warn_flag_beats_unrecorded_file_value reads an empty PARAM as
 # "nobody chose", and that is the only thing that keeps the destroyed-ingress
@@ -746,27 +772,8 @@ PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
-# Empty takes PLATFORM_AGENT_MODE_FALLBACK. Seeded from install.env, so a re-run
-# without --mode keeps the mode the file records.
-PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
-PARAM_PLATFORM_AGENT_MODE_PASSED="false"
-# What an empty mode resolves to. It starts as a first install's,
-# DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE, and adopt_live_platform_agent_mode
-# moves it to the live install's once the target cluster is known: whether this
-# is a first install is the cluster's to say, not install.env's. A target tree
-# from before that default has only DEFAULT_PLATFORM_AGENT_MODE, today there.
-# Run here and again by resolve_shared_defaults: under curl | bash the
-# defaults are only in scope after the workspace step sources them. The file's
-# presence is taken here, before a first install writes one.
-INSTALL_ENV_FOUND_AT_START="false"
-if [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
-  INSTALL_ENV_FOUND_AT_START="true"
-fi
-resolve_platform_agent_mode_fallback() {
-  PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"
-}
-resolve_platform_agent_mode_fallback
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
+PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY="${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Whether --model-default-name was typed: a switch to openai_compatible does not
 # carry over a model install.env pinned for another provider.
@@ -802,6 +809,8 @@ PARAM_SLACK_HOME_CHANNEL_POLICY="${SLACK_HOME_CHANNEL_POLICY:-}"
 # install.env, so this seeds from the file alone; --agent-namespace is the
 # other way in.
 PARAM_AGENT_NAMESPACE="${NAMESPACE:-}"
+PARAM_PLATFORM_AGENT_SIZING_PROFILE="${PLATFORM_AGENT_SIZING_PROFILE:-}"
+PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="false"
 
 show_help() {
   cat << EOF
@@ -828,23 +837,14 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --gcp-region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
-  --mode=MODE                   The PlatformAgent's spec.mode: next | today. next renders
-                                the NATS bus and the A2A gateway in front of the agent;
-                                today is the previous stack, kept as a rollback.
-                                Recorded in install.env as PLATFORM_AGENT_MODE when
-                                the file sets none; one that sets it differently refuses
-                                the flag, so change that key instead
-                                (a mode switch: the upgrade guide's
-                                "Switching spec.mode" section)
-                                (default when install.env sets none: on a cluster that
-                                already runs kube-agents, the mode it runs; on a first
-                                install, DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE,
-                                currently next, or today when it mirrors its third-party
-                                images with --third-party-registry-prefix)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
                                 namespace, so changing it is for CI and second installs
+  --sizing-profile=PROFILE      PlatformAgent spec.deployment.sizingProfile preset:
+                                auto | small | medium | fleet (default: auto, which
+                                promotes at 10 and 25 clusters when namespace quota
+                                allows)
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
                                 openai_compatible (a server speaking the OpenAI chat
                                 completions API: vLLM, TGI, an internal gateway) |
@@ -1039,7 +1039,8 @@ Flags for AI Agents & Automation:
                                 proxy)
   --third-party-registry-prefix=PATH
                                 Registry path holding the mirrored third-party images
-                                (LiteLLM, fluent-bit, the GitHub token minter, Hindsight).
+                                (LiteLLM, fluent-bit, the NATS bus, the GitHub token minter,
+                                Hindsight).
                                 Unset, they stay on their upstream registries --
                                 --registry-prefix deliberately does not cover them.
                                 See 'make mirror-images'
@@ -1052,14 +1053,17 @@ Flags for AI Agents & Automation:
                                 Against an existing install.env, --enable-slack,
                                 --enable-google-chat, --google-chat and the
                                 --slack-*, --google-chat-allowed-users,
-                                --google-chat-home-channel, --google-chat-mode and
+                                --google-chat-home-channel,
+                                --google-chat-home-channel-policy, --google-chat-mode and
                                 --chat-topic-name flags must agree with the key the file
                                 assigns (a disagreement is refused: edit the key); a key
                                 the file lacks is recorded there, tokens excepted
   --enable-pubsub-platform[=true|false]
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
-                                Enable GKE Stockout Investigator AgentPlugin (default: false)
+                                Enable GKE Stockout Investigator AgentPlugin (interactive installs
+                                ask, defaulting to yes when a chat home channel is configured;
+                                non-interactive default: false)
   --enable-drift-detector[=true|false]
                                 Report cluster changes made outside git. Exports this
                                 project's GKE audit log to Pub/Sub and starts the
@@ -1077,10 +1081,13 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
   --google-chat-home-channel=SPACE_ID
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
-  --slack-bot-token=TOKENS      Comma-separated Slack bot tokens (xoxb-...), one per
-                                workspace the agent serves. The relay keys each one by
-                                the team it authenticates as. Under --mode=next the
-                                A2A gateway serves one workspace: pass one token
+  --google-chat-home-channel-policy=POLICY
+                                auto (the default, also empty) or manual: sets
+                                spec.integration.googleChat.homeChannelPolicy on the
+                                PlatformAgent; the CRD reference describes the field
+  --slack-bot-token=TOKEN       One workspace's Slack bot token (xoxb-...). The A2A
+                                gateway serves one workspace, with or without Google
+                                Chat: a comma-separated list is refused
   --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
   --slack-allowed-users=USERS   Comma-separated Slack member IDs (e.g. U0123ABCD; not
                                 emails) allowed to talk to the agent. Empty allows
@@ -1117,8 +1124,8 @@ Configuration file:
   install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
   loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
   carries also beats an exported variable of the same name -- a flag is what
-  overrides a recorded value for one run, except the chat flags and --mode,
-  which must agree with it (see --enable-slack and --mode). Start from install.env.example.
+  overrides a recorded value for one run, except the chat flags, which must
+  agree with it (see --enable-slack). Start from install.env.example.
   Anything it sets is inherited by later runs, so a re-run that omits a flag
   keeps the value rather than reverting it to the default above.
 EOF
@@ -1185,7 +1192,7 @@ validate_bool_flag_value() {
 
 # The two chat flags with a default, given nothing. resolve_shared_defaults
 # turns an empty value into the default, so over an install.env recording
-# another topic or mode the refusal in check_flag_against_install_env would
+# another topic or Chat mode the refusal in check_flag_against_install_env would
 # name a value nobody typed and tell the operator to adopt it, and with no file
 # the run would apply the default where a wrapper meant to pass something.
 # Refused, like an empty toggle. A blank value (whitespace only) counts as
@@ -1230,18 +1237,6 @@ require_scope_flag_value() {
   exit 1
 }
 
-# --mode= given nothing is refused like an empty toggle: it cannot mean "keep
-# the recorded mode" (omitting the flag does that), and read as the default it
-# would switch a next install to today for this run. The value itself is
-# checked in main, against the CRD's enum and against install.env, once the
-# shared helpers are loaded.
-require_mode_flag_value() {
-  [ -n "${1:-}" ] && return 0
-  print_error "--mode= was given an empty value."
-  print_info "Pass --mode=today or --mode=next; to keep the mode install.env records, omit the flag."
-  exit 1
-}
-
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1253,14 +1248,12 @@ parse_args() {
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
       --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
-      --mode=*)
-        PARAM_PLATFORM_AGENT_MODE="${1#*=}"; PARAM_PLATFORM_AGENT_MODE_PASSED="true"
-        require_mode_flag_value "$PARAM_PLATFORM_AGENT_MODE"
-        # Held to install.env as the chat flags are: the run after a one-run
-        # switch, and every upgrade.sh, would read the file and switch back.
-        note_install_env_flag PLATFORM_AGENT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_PLATFORM_AGENT_MODE DEFAULT_PLATFORM_AGENT_MODE
-        shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
+      --sizing-profile=*)
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE="${1#*=}"
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_PLATFORM_AGENT_SIZING_PROFILE"
+        shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; PARAM_MODEL_DEFAULT_NAME_PASSED="true"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
@@ -1333,7 +1326,7 @@ parse_args() {
         SCOPE_FLAG_PASSED="true"
         PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${1#*=}"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"; shift ;;
-      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
+      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; PARAM_ENABLE_GVISOR_EXPLICIT="true"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
       # ${VAR:-...}, which reads an empty assignment as "unset" and hands back
@@ -1359,7 +1352,10 @@ parse_args() {
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
       --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED="true"
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET="true"
+        shift ;;
       --enable-drift-detector|--enable-drift|--enable-drift-detector=*|--enable-drift=*)
         PARAM_ENABLE_DRIFT_DETECTOR="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_DRIFT_DETECTOR"; shift ;;
@@ -1443,6 +1439,10 @@ parse_args() {
       --google-chat-home-channel=*)
         PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"
         note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL
+        shift ;;
+      --google-chat-home-channel-policy=*)
+        PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY="${1#*=}"
+        note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY
         shift ;;
       --migrate-node-pools=*)
         PARAM_MIGRATE_NODE_POOLS="${1#*=}"
@@ -2103,8 +2103,8 @@ install_env_records_key() {
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
 # needs the installer not to rewrite it. Naming the drift costs nothing
 # and leaves the decision where it belongs. The writes install.sh does make
-# are narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
-# appended from a chat flag or --mode, with the settings a chat toggle recorded
+# are narrower: a chat key the file does not assign,
+# appended from a chat flag, with the settings a chat toggle recorded
 # true brings (record_flags_into_install_env); and the GitOps keys
 # (record_gitops_forge_keys, record_github_gitops_keys). It changes no other key
 # the file sets.
@@ -2150,7 +2150,7 @@ warn_unrecorded_interview_answers() {
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
     LITELLM_ENV_SECRET_NAME PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+    USER_PROFILE_ENABLED ENABLE_STOCKOUT_INVESTIGATOR GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
     GITOPS_IDENTITY)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
@@ -2168,7 +2168,18 @@ warn_unrecorded_interview_answers() {
     if ! install_env_records_key "$file" "$key"; then
       if [ "$switched_to_openai_compatible" = "true" ] && [[ "$key" == OPENAI_COMPATIBLE_* ]]; then
         drifted="${drifted}${drifted:+ }${key}"
+      elif [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ] && [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" != "true" ] && [ "${STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP:-false}" != "true" ]; then
+        # An install.env written before this key existed resolves absent
+        # ENABLE_STOCKOUT_INVESTIGATOR as false in write_tfvars_from_state,
+        # unless the calling shell still exports ENABLE_STOCKOUT_INVESTIGATOR=true.
+        if is_truthy "${ENABLE_STOCKOUT_INVESTIGATOR:-false}" || { [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE:-false}" = "true" ] && is_truthy "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; }; then
+          drifted="${drifted}${drifted:+ }${key}"
+        fi
       fi
+      continue
+    fi
+    if [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ] && { [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" = "true" ] || [ "${STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP:-false}" = "true" ]; }; then
+      # CLI flag or shell-export disagreement is already reported by warn_flag_beats_unrecorded_file_value.
       continue
     fi
     recorded="$(recorded_install_env_value "$file" "$key")"
@@ -2176,7 +2187,17 @@ warn_unrecorded_interview_answers() {
       MEMORY) current="${PARAM_MEMORY:-}" ;;
       *) current="${!key:-}" ;;
     esac
-    [ "$recorded" != "$current" ] || continue
+    if [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ]; then
+      # An empty recorded line resolves to DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR (false),
+      # matching write_tfvars_from_state rather than diverging from interactive No.
+      [ -n "$recorded" ] || recorded="${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR:-false}"
+      local recorded_bool="false" current_bool="false"
+      is_truthy "$recorded" && recorded_bool="true"
+      is_truthy "$current" && current_bool="true"
+      [ "$recorded_bool" != "$current_bool" ] || continue
+    else
+      [ "$recorded" != "$current" ] || continue
+    fi
     # The GitHub GitOps keys follow the answer when the run commits
     # (record_github_gitops_keys), so they are not drift to report.
     case "$key" in
@@ -2377,7 +2398,7 @@ record_github_gitops_keys() {
   # cluster rather than defaulted, so a file that doesn't record them would
   # send the next upgrade.sh back to the project-wide names. And the key it
   # shares on purpose, when it does.
-  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME MINTER_SHARED_KEY; do
+  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME GITHUB_MINTER_KSA_NAME MINTER_SHARED_KEY; do
     [ -n "${!key:-}" ] && keys+=("$key")
   done
   for key in "${keys[@]}"; do
@@ -2515,9 +2536,7 @@ record_gitops_forge_keys() {
 # configures something upgrade.sh renders from the file alone, and upgrade.sh
 # takes none of them, so one that beat the file for a single run would be undone
 # by the next upgrade with no one told: a Slack relay switched off, a home
-# channel or an allowlist put back. --mode is held the same way, for the same
-# reason (validate_platform_agent_mode); it is not a chat key and brings no
-# companions. So against an existing install.env:
+# channel or an allowlist put back. So against an existing install.env:
 #
 #   - a flag that disagrees with the key the file assigns is refused before
 #     anything is applied, naming the file and the key;
@@ -2551,12 +2570,12 @@ record_gitops_forge_keys() {
 install_env_toggle_companions() {
   case "${1:-}" in
     SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME SLACK_HOME_CHANNEL_POLICY" ;;
-    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_HOME_CHANNEL_POLICY GOOGLE_CHAT_MODE" ;;
     *) ;;
   esac
 }
 
-# A chat flag or --mode this run typed, noted for check_flags_against_install_env. Its
+# A chat flag this run typed, noted for check_flags_against_install_env. Its
 # value is read from the PARAM_* at check time, so a flag given twice is checked
 # at the value that won.
 note_install_env_flag() {
@@ -2639,14 +2658,11 @@ check_flag_against_install_env() {
   if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
     remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
   fi
-  if [ "$key" = "PLATFORM_AGENT_MODE" ]; then
-    remedy="${remedy}. On a running install that is a mode switch: ${PLATFORM_AGENT_MODE_SWITCH_DOC}"
-  fi
   print_info "${remedy}."
   return 1
 }
 
-# Every chat flag and --mode this run typed, against an existing install.env. Each
+# Every chat flag this run typed, against an existing install.env. Each
 # disagreement is named before the run stops, so one run lists them all.
 check_flags_against_install_env() {
   local file="${INSTALL_ENV_FILE:-}" entry key flag kind param default_var default refused="false"
@@ -2779,6 +2795,52 @@ bootstrap_install_env_file() {
     if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
       print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
     fi
+    # Resolve stockout flag/shell-export drift before warn_unrecorded_interview_answers
+    # so STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP prevents duplicate warnings when both apply.
+    STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP="false"
+    local stockout_chosen="" stockout_recorded="" stockout_later="" stockout_restorer="" stockout_consequence="" stockout_source_label="--enable-stockout-investigator"
+    if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE:-false}" != "true" ]; then
+      stockout_chosen="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-}"
+    fi
+    if [ -n "$stockout_chosen" ]; then
+      read_recorded_install_env_values "$destination" ENABLE_STOCKOUT_INVESTIGATOR
+      stockout_recorded="$(recorded_install_env_value "$destination" ENABLE_STOCKOUT_INVESTIGATOR 2>/dev/null || true)"
+      if install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR; then
+        stockout_later="${stockout_recorded:-${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}}"
+        stockout_restorer="$destination"
+      elif [ -n "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-}" ] && { { is_truthy "$stockout_chosen" && ! is_truthy "$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"; } || { ! is_truthy "$stockout_chosen" && is_truthy "$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"; }; }; then
+        stockout_later="$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"
+        stockout_restorer="the ENABLE_STOCKOUT_INVESTIGATOR=${SHELL_ENABLE_STOCKOUT_INVESTIGATOR} this shell exports"
+      else
+        stockout_later="$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR"
+        stockout_restorer="the shipped ENABLE_STOCKOUT_INVESTIGATOR default (${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR})"
+      fi
+      if is_truthy "$stockout_chosen"; then
+        if is_truthy "$stockout_later"; then
+          stockout_chosen=""
+        elif ! install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR && is_truthy "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
+          if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" != "true" ]; then
+            stockout_source_label="ENABLE_STOCKOUT_INVESTIGATOR"
+          fi
+          stockout_consequence="A later upgrade.sh run or another shell without ENABLE_STOCKOUT_INVESTIGATOR exported renders the stockout investigator from ${stockout_restorer}, so it deletes the Log Router sink, Pub/Sub topic, subscription, and AgentPlugin this run enabled."
+        elif [ -n "${SHELL_ENABLE_STOCKOUT_INVESTIGATOR:-}" ] && ! install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR && ! is_truthy "$SHELL_ENABLE_STOCKOUT_INVESTIGATOR"; then
+          stockout_consequence="A later run without it renders the stockout investigator from ${stockout_restorer} (and in other shells from the shipped default (${DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR})), so the next upgrade.sh or --menu apply deletes the Log Router sink, Pub/Sub topic, subscription, and AgentPlugin this run enabled."
+        else
+          stockout_consequence="A later run without it renders the stockout investigator from ${stockout_restorer}, so the next upgrade.sh or --menu apply deletes the Log Router sink, Pub/Sub topic, subscription, and AgentPlugin this run enabled."
+        fi
+      elif is_truthy "$stockout_later"; then
+        if install_env_records_key "$destination" ENABLE_STOCKOUT_INVESTIGATOR; then
+          stockout_consequence="A later run without it renders the stockout investigator from ${stockout_restorer}, so the next upgrade.sh or --menu apply re-enables the stockout investigator this run turned off."
+        else
+          stockout_consequence="A later run without it re-reads ${stockout_restorer}, which re-enables the stockout investigator this run turned off."
+        fi
+      else
+        stockout_chosen=""
+      fi
+    fi
+    if [ -n "$stockout_chosen" ]; then
+      STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP="true"
+    fi
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
@@ -2806,6 +2868,11 @@ bootstrap_install_env_file() {
       "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
       true \
       "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" ENABLE_STOCKOUT_INVESTIGATOR "$stockout_source_label" \
+      "$stockout_chosen" \
+      "$stockout_consequence" \
+      true \
+      "every later install.sh run (upgrade.sh takes no such flag, or save the setting with './install.sh --menu')"
     # Five consequence strings, unlike every other call here, which take one.
     # This key is the only one whose consequence varies, and it varies on
     # three things at once.
@@ -3047,19 +3114,17 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CLUSTER_NAME "${CLUSTER_NAME:-}"
   write_env_var "$tmp" REGION "${REGION:-}"
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
-  # Recorded on every first install, the default included: the file is the one
-  # place a later run, and every upgrade.sh, reads the mode from, and a --mode
-  # that disagrees with it is refused (check_flags_against_install_env).
-  # Except a mode guessed because the cluster could not be read
-  # (adopt_live_platform_agent_mode): the next run that can read it settles it.
-  if [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" != "true" ] || [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ]; then
-    write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
-  fi
   # Only when set: a first install that inherits a size records it, because
   # every later run reads the file alone, and a size missing there would read
   # as the lower default. Unset, later runs follow the default.
   if [ -n "${PLATFORM_AGENT_STORAGE_SIZE:-}" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
+  fi
+  if [ -n "${PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_SIZING_PROFILE "$PLATFORM_AGENT_SIZING_PROFILE"
+  fi
+  if [ -n "${TF_VAR_sizing_profile:-}" ]; then
+    write_env_var "$tmp" TF_VAR_sizing_profile "$TF_VAR_sizing_profile"
   fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
@@ -3100,6 +3165,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
   write_env_var "$tmp" GOOGLE_CHAT_ENABLED "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   write_env_var "$tmp" GOOGLE_CHAT_HOME_CHANNEL "${GOOGLE_CHAT_HOME_CHANNEL:-}"
+  write_env_var "$tmp" GOOGLE_CHAT_HOME_CHANNEL_POLICY "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"
   write_env_var "$tmp" GOOGLE_CHAT_MODE "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
   write_env_var "$tmp" SLACK_ENABLED "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   write_secret_env_var "$tmp" SLACK_BOT_TOKEN "${SLACK_BOT_TOKEN:-}"
@@ -3186,7 +3252,7 @@ bootstrap_install_env_file() {
   # NAMESPACE is not in that list, and is handled separately below: the
   # ambient variable must not be frozen, but a flag must be.
   local identity_key
-  for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
+  for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME GITHUB_MINTER_KSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
     if [ -n "${!identity_key:-}" ]; then
       write_env_var "$tmp" "$identity_key" "${!identity_key}"
     fi
@@ -3495,21 +3561,25 @@ source_provisioning_helpers() {
 # living next to the code that reads it, and two copies drift. It also reads
 # as though the value might legitimately be unset at that point, which it
 # cannot be: this runs in step 2, before the interview.
-# Gives the token minter this install's own key ring, key and GSA names where
-# the operator named none (#3504): the names its state holds on an install
-# that already has a minter, else names derived from the cluster
+# Gives the token minter this install's own key ring, key, GSA and KSA names
+# where the operator named none (#3504, #5282): the names its state holds on an
+# install that already has a minter, else names derived from the cluster
 # (minter_derived_names). Called once project and cluster are settled and
 # before anything reads the names: the PEM decision, the interview's
-# defaults, and the KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME this run
-# records in install.env, which keep a new install's names on later runs.
+# defaults, and the KMS_KEYRING, KMS_KEY, GITHUB_MINTER_GSA_NAME and
+# GITHUB_MINTER_KSA_NAME this run records in install.env, which keep a new
+# install's names on later runs.
 apply_minter_name_defaults() {
-  local project=$1 cluster=$2 names ring key gsa
+  local project=$1 cluster=$2 names ring key gsa ksa
   names="$(minter_name_defaults "$project" "$cluster")"
-  IFS='|' read -r ring key gsa <<<"$names"
+  IFS='|' read -r ring key gsa ksa <<<"$names"
   [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] || PARAM_KMS_KEYRING="$ring"
   [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ] || PARAM_KMS_KEY="$key"
   if [ "${GITHUB_MINTER_GSA_NAME_GIVEN:-false}" != "true" ]; then
     export GITHUB_MINTER_GSA_NAME="$gsa"
+  fi
+  if [ "${GITHUB_MINTER_KSA_NAME_GIVEN:-false}" != "true" ]; then
+    export GITHUB_MINTER_KSA_NAME="$ksa"
   fi
 }
 
@@ -3569,7 +3639,6 @@ confirm_minter_key_owner() {
 
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
-  resolve_platform_agent_mode_fallback
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
   PARAM_PERMISSION_SET="${PARAM_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
@@ -3610,11 +3679,11 @@ resolve_shared_defaults() {
   PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
-  PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
-  # No PARAM_ENABLE_DRIFT_DETECTOR. Empty has to survive this function and
-  # reach bootstrap_install_env_file's guard as "nobody chose"; its two
-  # readers, write_env_var below and the generator, each apply
-  # DEFAULT_ENABLE_DRIFT_DETECTOR themselves.
+  # No PARAM_ENABLE_STOCKOUT_INVESTIGATOR or PARAM_ENABLE_DRIFT_DETECTOR. Empty
+  # has to survive this function and reach bootstrap_install_env_file's guard as
+  # "nobody chose"; their downstream readers apply
+  # DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR and DEFAULT_ENABLE_DRIFT_DETECTOR
+  # themselves.
 }
 
 # Run a command or function in the background, animating a spinner with elapsed
@@ -3764,8 +3833,10 @@ wait_for_rollout() {
   log_file="$(mktemp -t kube-agents-rollout.XXXXXX)"
 
   local rc=0
+  # ${ctx_flag[@]+...}: empty without a context, and macOS's bash 3.2 treats
+  # an empty array expansion as unbound under `set -u`.
   run_with_spinner "$deployment" "$log_file" \
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" ${ctx_flag[@]+"${ctx_flag[@]}"} --timeout="${timeout_secs}s" || rc=$?
 
   # Published for the caller's failure message. How long the wait actually ran is
   # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
@@ -3806,7 +3877,8 @@ wait_for_deployment_object() {
   fi
 
   local deadline=$((SECONDS + timeout_secs))
-  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
+  # ${ctx_flag[@]+...}: as in wait_for_rollout, for bash 3.2.
+  while ! kubectl get deployment "$deployment" -n "$namespace" ${ctx_flag[@]+"${ctx_flag[@]}"} >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       return 1
     fi
@@ -4103,7 +4175,8 @@ auto_install_tool() {
 # memory_mode -- rather than restating a default the run never applied.
 write_json_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-install-report.json"
+  # KUBE_AGENTS_INSTALL_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_INSTALL_REPORT_FILE:-/tmp/kube-agents-install-report.json}"
   local timestamp
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")
 
@@ -4242,7 +4315,11 @@ print_generate_only_handoff() {
     echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
   fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
-  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  local sizing_prefix=""
+  if [ -n "${TF_VAR_sizing_profile:-}" ]; then
+    sizing_prefix="TF_VAR_sizing_profile=$(printf '%q' "$TF_VAR_sizing_profile") "
+  fi
+  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ${sizing_prefix}./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
   echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
   echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions)"
@@ -4285,8 +4362,22 @@ run_lifecycle_apply() {
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
     export KUBE_AGENTS_STATE_PREFIX
     KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+    # An explicit --enable-gvisor=false, or "No" picked at the interview's
+    # gVisor prompt, is the confirmation lifecycle.sh's guard_gvisor_pool_teardown
+    # asks for before it destroys a live gVisor pool. A value that only came from
+    # install.env is not: that is the line a lost or wrong file gets wrong.
+    # ENABLE_GVISOR, not PARAM_ENABLE_GVISOR: the interview's answer reaches
+    # only the former (exported with the rest of the run's configuration).
+    if [ "${PARAM_ENABLE_GVISOR_EXPLICIT:-}" = "true" ] && [ "${ENABLE_GVISOR:-}" = "false" ]; then
+      export KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true
+    fi
     ./lifecycle.sh apply -auto-approve -input=false
-  ) 2>&1 | tee "$log_file" || ps=("${PIPESTATUS[@]}")
+  # tee ignores SIGINT (-i) for the reason lifecycle.sh's run_apply gives for
+  # its own: Ctrl-C reaches every process in the foreground group, and
+  # Terraform saves state and releases the lock only while it can still print.
+  # A tee that died of the signal would close the pipe under lifecycle.sh, and
+  # SIGPIPE would end the apply before that shutdown finished.
+  ) 2>&1 | tee -i "$log_file" || ps=("${PIPESTATUS[@]}")
 
   # ${ps[@]+"${ps[@]}"}: empty on a clean apply, and macOS's bash 3.2 treats an
   # empty array expansion as unbound under `set -u`.
@@ -4857,6 +4948,7 @@ settle_network_policy_acceptance() {
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
     export ACCEPT_NO_NETWORK_POLICY="true"
     KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+      KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
       write_tfvars_from_state "$tfvars_file" "$image_tag"
   fi
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
@@ -5008,185 +5100,6 @@ validate_litellm_redaction_ip_action() {
     print_error "--litellm-redaction-ip-action must be one of pseudonym, mask, off, got '${value}'."
     return 1
   fi
-}
-
-# --mode, or the PLATFORM_AGENT_MODE install.env records: one of the CRD's
-# spec.mode values, named by whichever carried it. Checked before
-# check_flags_against_install_env, so a misspelt --mode is refused as one
-# rather than as a disagreement with the file. Against an existing
-# install.env, --mode is then held to the file like the chat flags
-# (note_install_env_flag in parse_args): every other flag that overrides the
-# file applies for one run and is warned about
-# (warn_flag_beats_unrecorded_file_value); this one is refused, because the
-# run after it reads the file again and switches back, and upgrade.sh takes no
-# --mode to stop it: a next install would lose its A2A stack on the next
-# upgrade, a today install gain one for a single run. Switching is an edit to
-# the file, which every later run then keeps, and the apply that carries it
-# says so (announce_platform_agent_mode_switch). A file that assigns no
-# PLATFORM_AGENT_MODE has the --mode recorded into it when the run commits
-# (record_flags_into_install_env). Needs installer_common.sh sourced.
-validate_platform_agent_mode() {
-  local value="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
-  is_valid_platform_agent_mode "$value" && return 0
-  if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
-    print_error "--mode must be today or next, got '${value}'."
-  elif [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
-    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix it in ${INSTALL_ENV_FILE}."
-  else
-    # No file yet: a first install seeds the key from the environment.
-    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
-  fi
-  return 1
-}
-
-# Whether this run is a first install is the target cluster's to say, not
-# install.env's. A new checkout, another machine, or an install.env copied from
-# install.env.example has no mode recorded, and the first-install default
-# (DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE) would switch a live today install
-# to next, without a prompt under -y. So when
-# nothing chose a mode (no --mode, no exported PLATFORM_AGENT_MODE, no key in
-# install.env, all of which win) and the cluster exists, the cluster decides:
-# a PlatformAgent's spec.mode (absent is today), or, with the CR gone but the
-# kube-agents release still installed, the mode the release records (absent
-# is today), since the next apply recreates the CR from it. A cluster with
-# neither is a first install.
-#
-# The read uses a kubeconfig of its own, so the operator's kubeconfig and its
-# current context are left as they were: --dry-run and --generate-only stay
-# free of side effects. Only gcloud's NOT_FOUND is no cluster, as the tfvars
-# generator reads it (gke_describe_error_is_not_found). A cluster that cannot
-# be described or read is not guessed at as a first install, because a wrong
-# guess is a mode switch: an install.env that records no mode keeps today, as
-# it did before the cluster was asked; with no install.env, --dry-run and
-# --generate-only fall back to today with a warning, and an applying run is
-# refused. Returns 1 to refuse.
-# Needs installer_common.sh sourced and PROJECT_ID, REGION and CLUSTER_NAME
-# exported.
-adopt_live_platform_agent_mode() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live="" holder="" kubeconfig_dir
-  [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ] && return 0
-  # A key assigned empty is today to every front door (write_tfvars_from_state),
-  # and nothing can be recorded over it, so it is not the cluster's to decide.
-  if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
-    PLATFORM_AGENT_MODE_SETTLED="true"
-    PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
-    return 0
-  fi
-  local describe_err="" seen="exists" why="" remedy_next="pass --mode=next" remedy_switch="Pass --mode=${PLATFORM_AGENT_MODE_FALLBACK}" remedy_choose="Pass --mode=today or --mode=next"
-  # The menu takes no --mode: its remedy is the key it applies.
-  if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
-    remedy_next="set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
-    remedy_switch="Set PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} in ${INSTALL_ENV_FILE}"
-    remedy_choose="Set PLATFORM_AGENT_MODE=today or PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
-  fi
-  # Only a NOT_FOUND is no cluster, as the tfvars generator reads it; any
-  # other failure is a cluster that could not be read.
-  if describe_err="$(trap - ERR; gcloud container clusters describe "$CLUSTER_NAME" --location "$REGION" \
-    --project "$PROJECT_ID" --format="value(name)" 2>&1 >/dev/null)"; then
-    kubeconfig_dir="$(mktemp -d)"
-    local -x KUBECONFIG="${kubeconfig_dir}/kubeconfig"
-    GKE_DNS_ENDPOINT_FLAG=""
-    gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID" || true
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" \
-      --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
-    read_platform_agent_install_state "$namespace"
-    rm -rf "$kubeconfig_dir"
-    # Not held for the mode notice: it was read through this function's own
-    # kubeconfig. Read by take_platform_agent_install_state.
-    # shellcheck disable=SC2034
-    PLATFORM_AGENT_READS_HELD_FOR=""
-    case "$PLATFORM_AGENT_CR_READ" in
-      "$PLATFORM_AGENT_READ_OK")
-        live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
-        holder="its PlatformAgent"
-        if [ -z "$live" ]; then
-          case "$PLATFORM_AGENT_RECORD_READ" in
-            "$PLATFORM_AGENT_READ_NONE") return 0 ;;
-            "$PLATFORM_AGENT_READ_OK")
-              live="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
-              holder="its kube-agents release: the PlatformAgent is gone, and the next apply recreates it from the release"
-              ;;
-          esac
-        fi
-        ;;
-      "$PLATFORM_AGENT_READ_NONE") return 0 ;;
-    esac
-    why="the kubeconfig has no context '$(gke_context_name)'"
-    [ -n "${PLATFORM_AGENT_READ_ERROR:-}" ] && why="the read failed (${PLATFORM_AGENT_READ_ERROR})"
-  else
-    gke_describe_error_is_not_found "$describe_err" && return 0
-    seen="may exist"
-    why="gcloud could not describe it (${describe_err:-unknown gcloud failure})"
-  fi
-  if [ -z "$live" ]; then
-    PLATFORM_AGENT_MODE_SETTLED="true"
-    # Not recorded in install.env (queue_unrecorded_platform_agent_mode,
-    # bootstrap_install_env_file): the next run that can read the cluster
-    # settles it from there instead.
-    PLATFORM_AGENT_MODE_GUESSED="true"
-    if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ]; then
-      print_warning "Cluster '${CLUSTER_NAME}' ${seen}, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. ${INSTALL_ENV_FILE} records no PLATFORM_AGENT_MODE, so this run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE}, as upgrade.sh reads that file, and records nothing. If the install runs next, stop and ${remedy_next}."
-      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
-      return 0
-    fi
-    if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then
-      print_warning "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. This run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE} and records no mode in install.env; applying it would switch an install that runs next. ${remedy_choose} to say which mode this install runs. An applying run would be refused."
-      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
-      return 0
-    fi
-    print_error "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}."
-    print_info "${remedy_choose} to say which mode this install runs, or restore access to the cluster and run again. Guessing would switch a running install's mode."
-    return 1
-  fi
-  live="$(effective_platform_agent_mode "$live")"
-  PLATFORM_AGENT_MODE_SETTLED="true"
-  [ "$live" = "$PLATFORM_AGENT_MODE_FALLBACK" ] && return 0
-  print_info "Nothing chose a spec.mode for this run (no --mode, and install.env records none), and cluster '${CLUSTER_NAME}' already runs kube-agents on spec.mode ${live} (from ${holder}), so this run keeps ${live} rather than a first install's ${PLATFORM_AGENT_MODE_FALLBACK}. ${remedy_switch} to switch it (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
-  PLATFORM_AGENT_MODE_FALLBACK="$live"
-}
-
-# A first install that mirrors its third-party images ($1, the prefix)
-# defaults to today. next's NATS bus runs four images (nats, nats-box,
-# nats-server-config-reloader, prometheus-nats-exporter) that are the operator's compiled defaults, which neither this installer nor the
-# chart points at a mirror, so on a cluster that pulls only from the mirror
-# the bus would sit in ImagePullBackOff. Only the fallback moves: --mode, an
-# exported PLATFORM_AGENT_MODE, a recorded key and the cluster's live mode all win.
-mirrored_first_install_mode() {
-  [ -n "${1:-}" ] || return 0
-  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
-  [ "${PLATFORM_AGENT_MODE_SETTLED:-false}" = "true" ] && return 0
-  [ "$PLATFORM_AGENT_MODE_FALLBACK" = "next" ] || return 0
-  local remedy="Pass --mode=next"
-  [ "${PARAM_MENU_MODE:-false}" = "true" ] && remedy="Set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
-  print_info "This first install mirrors its third-party images (${1}), so it installs spec.mode today rather than next: next's NATS bus pulls nats, nats-box, nats-server-config-reloader and prometheus-nats-exporter from Docker Hub, and nothing in this install points them at the mirror. ${remedy} to install next anyway."
-  PLATFORM_AGENT_MODE_FALLBACK="today"
-}
-
-# An install.env that records no PLATFORM_AGENT_MODE gets the mode this run
-# settled on, queued for record_flags_into_install_env like a typed --mode:
-# upgrade.sh reads such a file as today, so a next install it does not record
-# would be switched back by the next upgrade. A file this run cannot write is
-# named instead. A mode guessed because the cluster could not be read is not
-# recorded.
-queue_unrecorded_platform_agent_mode() {
-  local file="${INSTALL_ENV_FILE:-}"
-  [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
-  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
-  [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] && return 0
-  install_env_records_key "$file" PLATFORM_AGENT_MODE && return 0
-  if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
-    print_info "${file} assigns no PLATFORM_AGENT_MODE; a run without --dry-run records the one it applies (${PLATFORM_AGENT_MODE_FALLBACK}) there."
-    return 0
-  fi
-  if [ ! -w "$file" ]; then
-    print_warning "${file} assigns no PLATFORM_AGENT_MODE and is not writable, so this run cannot record spec.mode ${PLATFORM_AGENT_MODE_FALLBACK} there; upgrade.sh reads a file with no key as ${DEFAULT_PLATFORM_AGENT_MODE}. Add PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} to it."
-    return 0
-  fi
-  case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
-    *" PLATFORM_AGENT_MODE "*) ;;
-    *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD}${INSTALL_ENV_KEYS_TO_RECORD:+ }PLATFORM_AGENT_MODE" ;;
-  esac
 }
 
 # The openai_compatible questions, shared by step 7 and the Day-2 menu: the
@@ -5399,7 +5312,9 @@ gitlab_repo_path() {
   local seg lower n=0 segs=()
   IFS=/ read -r -a segs <<<"$repo"
   [[ "$repo" == */ ]] && return 0
-  for seg in "${segs[@]}"; do
+  # ${segs[@]+...}: `/` and `.git` leave no segment, and bash 3.2 treats an
+  # empty array expansion as unbound under `set -u`.
+  for seg in ${segs[@]+"${segs[@]}"}; do
     # The reserved endings in any case, as the operator compares them.
     lower="$(printf '%s' "$seg" | tr '[:upper:]' '[:lower:]')"
     if ! [[ "$seg" =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?$ ]] || [[ "$lower" == *.git ]] || [[ "$lower" == *.atom ]]; then
@@ -6996,16 +6911,25 @@ run_menu_system() {
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
   # already exists and its Save & Apply re-applies what it displays, so an
-  # install.env with no ENABLE_GVISOR has to read as the standard runtime —
-  # that is what such a cluster is actually running. Defaulting on here would
-  # show "gVisor Sandbox" for an unsandboxed install and then provision a node
-  # pool nobody asked for on the next apply.
-  local enable_gvisor="${ENABLE_GVISOR:-false}"
+  # install.env with no ENABLE_GVISOR has to read as what the cluster runs:
+  # resolve_existing_install_gvisor asks it, the same reader the Terraform
+  # variables use, so the panel and the apply cannot disagree. A default of
+  # true would show "gVisor Sandbox" for an unsandboxed install and provision a
+  # pool nobody asked for; a default of false showed a Standard install's pool
+  # as off and destroyed it on the next apply.
+  local enable_gvisor
+  enable_gvisor="$(resolve_existing_install_gvisor "$project_id" "$cluster_name" "$region")"
   # DEFAULT_ENABLE_WEBUI is "false" and the paragraph above applies to it too:
   # the panel has to read as what an unconfigured install is running. Flipping
   # that default on would make this show a dashboard nobody deployed, so the
   # two have to be reconsidered together.
   local enable_webui="${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
+  local enable_stockout_investigator="${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  if is_truthy "$enable_stockout_investigator"; then
+    enable_stockout_investigator="true"
+  else
+    enable_stockout_investigator="false"
+  fi
   local github_org="${GITOPS_ORG:-${GITHUB_ORG:-}}"
   local github_repo="${GITOPS_REPO:-${GITHUB_REPO:-$DEFAULT_GITOPS_REPO}}"
   local github_app_id="${GITHUB_APP_ID:-}"
@@ -7027,13 +6951,14 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")$([ -n "$litellm_env_secret_name" ] && echo " (credentials Secret: ${litellm_env_secret_name})" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} $([ "$enable_stockout_investigator" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
 
     local menu_choice=""
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
       "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI / OpenAI-compatible)" \
-      "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
+      "🛡️ Modify Security, Permission Boundaries & Stockout Investigator (gVisor / IAM / Alerts)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
       "🚪 Exit Control Panel" \
@@ -7065,13 +6990,8 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
-            if [ "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" = "next" ]; then
-              prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
-                google_chat_home_channel "$google_chat_home_channel"
-            else
-              prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-                google_chat_home_channel "$google_chat_home_channel"
-            fi
+            prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+              google_chat_home_channel "$google_chat_home_channel"
             ;;
           2) slack_enabled="true" ;;
           3) google_chat_enabled="false"; slack_enabled="false" ;;
@@ -7133,9 +7053,10 @@ run_menu_system() {
         ;;
       4)
         local p_opt=""
-        prompt_menu "Select GCP IAM Permission Set:" \
+        prompt_menu "Select Security / Capability Option:" \
           "read-only — auditing and observability: read roles, no write to infrastructure (Default)" \
           "custom — exactly the roles you list, no built-in bundle" \
+          "Toggle GKE Stockout Investigator (currently $([ "$enable_stockout_investigator" = "true" ] && echo "ENABLED" || echo "DISABLED"))" \
           p_opt
         case "$p_opt" in
           1) permission_set="read-only" ;;
@@ -7147,6 +7068,15 @@ run_menu_system() {
               print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
             done
             warn_on_overreaching_custom_roles "$custom_roles"
+            ;;
+          3)
+            if [ "$enable_stockout_investigator" = "true" ]; then
+              enable_stockout_investigator="false"
+              print_success "GKE Stockout Investigator disabled."
+            else
+              enable_stockout_investigator="true"
+              print_success "GKE Stockout Investigator enabled!"
+            fi
             ;;
         esac
         ;;
@@ -7185,29 +7115,11 @@ run_menu_system() {
         # The chat screen's home channel, which the home-channel warning below
         # reads; save_env_var exports it again when it writes install.env.
         export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
-        # An install.env with no mode key (one copied from install.env.example
-        # onto a running install) would render today here, switching a next
-        # install back with nothing asked. The mode is settled from the
-        # cluster as main() does, and saved with the rest; a guess (a cluster
-        # that cannot be read) is rendered as today and not saved.
-        local menu_mode_to_save=""
-        if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
-          PARAM_PLATFORM_AGENT_MODE="" PLATFORM_AGENT_MODE_GUESSED="false" PLATFORM_AGENT_MODE_SETTLED="false"
-          resolve_platform_agent_mode_fallback
-          PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
-            adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || return 1
-          # The menu has no flag, so the recorded prefix is the mirror.
-          local menu_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
-          mirrored_first_install_mode "${menu_third_party_prefix%/}"
-          export PLATFORM_AGENT_MODE="$PLATFORM_AGENT_MODE_FALLBACK"
-          [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] || menu_mode_to_save="$PLATFORM_AGENT_MODE_FALLBACK"
-        fi
-        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
-        # from install.env, and if Slack moves to the A2A gateway under next,
-        # the settings it cannot use are refused (and again after the
-        # generator, for a bot token it recovers from the live Secret).
-        refuse_next_slack_gateway_settings_from_env || return 1
-        warn_next_home_channel_unset_from_env
+        # Before anything is saved: if Slack moves to the A2A gateway, the
+        # settings it cannot use are refused (and again after the generator,
+        # for a bot token it recovers from the live Secret).
+        refuse_slack_gateway_settings_from_env || return 1
+        warn_gateway_home_channel_unset_from_env
         # Kept until the check after the generator has passed, so that a
         # refusal there puts install.env back as it was.
         # The copy holds install.env's credentials, so it is 0600 under a
@@ -7266,14 +7178,12 @@ run_menu_system() {
         fi
         save_env_var ENABLE_GVISOR "$enable_gvisor"
         save_env_var HERMES_DASHBOARD_ENABLED "$enable_webui"
+        save_env_var ENABLE_STOCKOUT_INVESTIGATOR "${enable_stockout_investigator:-${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}}"
         save_env_var GITOPS_ORG "$github_org"
         save_env_var GITOPS_REPO "$github_repo"
         save_env_var GITHUB_APP_ID "$github_app_id"
         save_env_var KMS_KEYRING "$kms_keyring"
         save_env_var KMS_KEY "$kms_key"
-        if [ -n "$menu_mode_to_save" ]; then
-          save_env_var PLATFORM_AGENT_MODE "$menu_mode_to_save"
-        fi
         print_success "Updated configuration saved to: $INSTALL_ENV_FILE"
 
         # One engine for every kind of change: a full terraform apply
@@ -7292,11 +7202,12 @@ run_menu_system() {
         # usable -- and an operator reaches it to change a model provider, not to
         # decide the fate of a database.
         KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+          KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
           write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
         # Again for a bot token the generator recovered from the live Secret.
         # The keys are saved by now, so a refusal restores install.env and
         # removes the tfvars that render the refused settings.
-        if ! refuse_next_slack_gateway_settings_from_env; then
+        if ! refuse_slack_gateway_settings_from_env; then
           if [ -n "$install_env_before" ]; then
             # A 0600 replacement (the .tmp is written under umask 077),
             # moved into place complete, as save_env_var writes it (on_error
@@ -7331,10 +7242,6 @@ run_menu_system() {
         # A live GitHub minter this render would destroy (#3075), or a GitOps
         # repository it would drop beside a minter this install did not make.
         refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
-        # The menu edits no mode key, but an install.env edited by hand since
-        # the last apply reaches the cluster through this apply too, with no
-        # confirmation after the notice.
-        announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
         check_scope_container_access || exit 1
         check_scope_export_sink_access || exit 1
         enable_scope_selector_apis "$PROJECT_ID"
@@ -7347,19 +7254,18 @@ run_menu_system() {
         if is_truthy "$google_chat_enabled"; then
           project_number="$(gcloud projects describe "$project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"
         fi
-        local menu_mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
-        PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
+        PROJECT_NUMBER="$project_number" print_chat_setup_checklists
         if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
           # Unlike main(), this apply does not wait for a rollout, and the menu
-          # redrawn below would push the checklist off screen. Under next the
-          # A2A gateway answers the platform it holds; the agent, the rest.
+          # redrawn below would push the checklist off screen. The A2A gateway
+          # answers every enabled platform.
           local menu_listeners="" menu_deployment
-          if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
-            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
+          if google_chat_moves_to_a2a_gateway "$google_chat_enabled" ||
+            slack_moves_to_a2a_gateway "$slack_enabled"; then
             menu_listeners="$PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT"
           fi
-          if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled"; } ||
-            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; }; then
+          if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$google_chat_enabled"; } ||
+            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$slack_enabled"; }; then
             menu_listeners="${menu_listeners} ${PLATFORM_AGENT_DEPLOYMENT}"
           fi
           echo ""
@@ -7425,6 +7331,79 @@ apply_agent_namespace_override() {
   fi
 }
 
+# Prompt whether to enable the GKE Stockout Investigator AgentPlugin during
+# interactive installs. Skips under --non-interactive, without a controlling
+# TTY, or when --enable-stockout-investigator / --enable-stockout was already
+# passed on the CLI. Defaults to yes when an enabled Google Chat or Slack
+# home channel is configured (or follows the loaded install.env / environment
+# setting when already set), and no otherwise.
+prompt_stockout_investigator() {
+  local google_chat_on="${1:-false}"
+  local google_chat_home="${2:-}"
+  local slack_on="${3:-false}"
+  local slack_home="${4:-}"
+  local project_name="${5:-}"
+
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    return 0
+  fi
+  if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" = "true" ]; then
+    return 0
+  fi
+
+  local has_home_channel="false"
+  if { [ "$google_chat_on" = "true" ] && [ -n "$(trim_go_space "$google_chat_home")" ]; } ||
+    { [ "$slack_on" = "true" ] && [ -n "$(trim_go_space "$slack_home")" ]; }; then
+    has_home_channel="true"
+  fi
+
+  local default_yes="false"
+  if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" = "true" ]; then
+    if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
+      default_yes="true"
+    fi
+  elif [ "$has_home_channel" = "true" ]; then
+    default_yes="true"
+  fi
+
+  print_info "$STOCKOUT_INVESTIGATOR_PROMPT_DESC"
+  print_info "Provisioning enables the Pub/Sub platform adapter and creates a Cloud Logging sink, Pub/Sub topic, and pull subscription${project_name:+ in ${project_name}}."
+  if [ "$has_home_channel" != "true" ] && [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ]; then
+    print_info "$STOCKOUT_INVESTIGATOR_NO_HOME_CHANNEL_NOTE"
+  fi
+
+  local prompt_suffix="(y/N)" default_letter="n"
+  if [ "$default_yes" = "true" ]; then
+    prompt_suffix="(Y/n)"
+    default_letter="y"
+  fi
+
+  local stockout_choice="" normalized_choice=""
+  while true; do
+    prompt_read "${STOCKOUT_INVESTIGATOR_PROMPT_LABEL} ${prompt_suffix}" stockout_choice "$default_letter"
+    normalized_choice="$(printf '%s' "$stockout_choice" | tr '[:upper:]' '[:lower:]')"
+    case "$normalized_choice" in
+      y | yes)
+        if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ] || [ "$default_yes" != "true" ]; then
+          PARAM_ENABLE_STOCKOUT_INVESTIGATOR="true"
+        fi
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE="true"
+        break
+        ;;
+      n | no)
+        if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ] || [ "$default_yes" != "false" ]; then
+          PARAM_ENABLE_STOCKOUT_INVESTIGATOR="false"
+        fi
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE="true"
+        break
+        ;;
+      *)
+        print_error "Please enter y or n."
+        ;;
+    esac
+  done
+}
+
 main() {
   parse_args "$@"
   apply_agent_namespace_override
@@ -7438,13 +7417,6 @@ main() {
     # The menu reloads install.env and reads the scope keys, and the scoped
     # service account pool's switch and cap, from it alone; a flag here would
     # be validated and then dropped without a word.
-    # --mode likewise: the menu applies the mode install.env records, so a
-    # flag here would be dropped and the switch it asked for never announced.
-    if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
-      print_error "--menu takes no --mode: it applies the PLATFORM_AGENT_MODE install.env records."
-      print_info "Set PLATFORM_AGENT_MODE in install.env to switch the mode; the menu's apply says it is a mode switch before it applies it."
-      exit 1
-    fi
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
       print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
@@ -7453,12 +7425,20 @@ main() {
     # The chat flags likewise: the menu applies the keys install.env records
     # and edits them on its own screens, so a flag here would be dropped.
     if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
-      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
+      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-home-channel-policy, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
       print_info "The menu's chat screen turns Google Chat on or off and edits its allowlist and home channel; set the other keys in install.env (to turn Slack on, SLACK_ENABLED=true, with the tokens on a plain install.sh run), or pass the flags to a plain install.sh run."
       exit 1
     fi
+    if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}"; then
+      print_error "--menu takes no --enable-stockout-investigator: toggle GKE Stockout Investigator inside the menu (Option 4 -> Option 3), or pass the flag to a plain install.sh run."
+      exit 1
+    fi
+    if [ "${PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED:-false}" = "true" ]; then
+      print_error "--menu takes no --sizing-profile: edit PLATFORM_AGENT_SIZING_PROFILE in install.env or pass --sizing-profile to a plain install.sh or upgrade.sh run."
+      exit 1
+    fi
     run_menu_system
-    print_next_home_channel_unset_summary
+    print_gateway_home_channel_unset_summary
     exit 0
   fi
 
@@ -7548,9 +7528,9 @@ main() {
   acquire_source_repo repo_dir "$image_tag"
   source_provisioning_helpers "$repo_dir"
   resolve_shared_defaults
-  # The mode first: a value the CRD refuses is named as that, not as a
-  # disagreement with install.env.
-  validate_platform_agent_mode || exit 1
+  # An install.env that still assigns PLATFORM_AGENT_MODE is told once that
+  # the key is not read; bootstrap_install_env unset the value already.
+  note_ignored_platform_agent_mode_key "${INSTALL_ENV_FILE:-}"
   # A GitHub App ID that is a name rather than the App's number (#3076), from
   # the flag or install.env, before the interview and any --dry-run preview.
   validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
@@ -7564,7 +7544,42 @@ main() {
   # refuse the disagreement, so that value is sent back to the file.
   require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
     "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
-  # The chat flags and --mode against an existing install.env, as soon as
+  # GOOGLE_CHAT_HOME_CHANNEL_POLICY, on the same terms.
+  require_google_chat_home_channel_policy "${PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}" \
+    "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"GOOGLE_CHAT_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
+  _install_is_valid_sizing_profile() {
+    local val="${1:-}" item
+    if declare -F is_valid_platform_agent_sizing_profile >/dev/null; then
+      is_valid_platform_agent_sizing_profile "$val"
+      return $?
+    fi
+    for item in $INSTALL_SIZING_PROFILE_VALUES; do
+      [ "$val" = "$item" ] && return 0
+    done
+    return 1
+  }
+  local default_sizing_profile="${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$INSTALL_SIZING_PROFILE_DEFAULT}"
+  if [ -n "${PARAM_PLATFORM_AGENT_SIZING_PROFILE:-}" ] && ! _install_is_valid_sizing_profile "$PARAM_PLATFORM_AGENT_SIZING_PROFILE"; then
+    if [ "${PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED:-false}" = "true" ]; then
+      print_error "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' is not valid; use ${INSTALL_SIZING_PROFILE_CHOICES}."
+    else
+      print_error "PLATFORM_AGENT_SIZING_PROFILE='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' is not valid; use ${INSTALL_SIZING_PROFILE_CHOICES} (or empty for '${default_sizing_profile}')."
+    fi
+    exit 1
+  fi
+  if [ "${PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED:-false}" = "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+    local recorded_sizing_profile=""
+    if install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_SIZING_PROFILE; then
+      recorded_sizing_profile="$(recorded_install_env_value "$INSTALL_ENV_FILE" PLATFORM_AGENT_SIZING_PROFILE)"
+      if [ "${recorded_sizing_profile:-$default_sizing_profile}" != "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" ]; then
+        print_warning "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' overrides PLATFORM_AGENT_SIZING_PROFILE='${recorded_sizing_profile:-$default_sizing_profile}' in ${INSTALL_ENV_FILE} for this run only."
+        print_info "Update PLATFORM_AGENT_SIZING_PROFILE=${PARAM_PLATFORM_AGENT_SIZING_PROFILE} in ${INSTALL_ENV_FILE} so future upgrade.sh runs keep it."
+      fi
+    elif [ -n "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" ] && [ "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" != "$default_sizing_profile" ]; then
+      print_warning "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' applies for this run only (${INSTALL_ENV_FILE} has no PLATFORM_AGENT_SIZING_PROFILE, so future upgrades default to '${default_sizing_profile}')."
+    fi
+  fi
+  # The chat flags against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
   # applied.
@@ -7786,16 +7801,6 @@ main() {
   fi
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
-  # Settled before step 6, whose prompts and Slack refusals follow the mode:
-  # a run where nothing chose a mode, against a cluster that already runs
-  # kube-agents, keeps the mode it runs; a mirrored first install defaults to
-  # today; and an install.env with no mode key records the result. The target
-  # is known from here; the exports come later.
-  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
-    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
-  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"
-  queue_unrecorded_platform_agent_mode
-
   # 6. Chat & Messaging Platform Integration
   print_step "6. Chat & Messaging Integrations Setup"
   # The option the loaded configuration already corresponds to. It is a
@@ -7860,6 +7865,7 @@ main() {
     exit 1
   fi
   local google_chat_home_channel="${PARAM_GOOGLE_CHAT_HOME_CHANNEL:-}"
+  local google_chat_home_channel_policy="${PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"
   # Seeded from PARAM_SLACK_*, which carry both the --slack-* flags and the
   # loaded SLACK_* keys, so the non-interactive path can carry the Slack
   # settings: prompt_read keeps a non-empty current value there.
@@ -7908,13 +7914,13 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
-    # Under next with Chat off the A2A gateway takes Slack (the mode was
-    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
-    # it takes one bot token, member IDs and a channel id. Those prompts say
-    # so and ask again on an answer the gateway cannot use, rather than let
-    # the refusal after this step throw the interview away. A run with nobody
+    # The A2A gateway takes Slack, with Google Chat on or off, and it takes
+    # one bot token, member IDs and
+    # a channel id. Those prompts say so and ask again on an answer the
+    # gateway cannot use, rather than let the refusal after this step throw
+    # the interview away. A run with nobody
     # to ask keeps its values, and that refusal is its check.
-    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true "$google_chat_enabled"; then
+    if slack_moves_to_a2a_gateway true; then
       _prompt_slack_settings_for_gateway
       return 0
     fi
@@ -7937,15 +7943,15 @@ main() {
       can_ask=false
     fi
     while :; do
-      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)" \
         slack_bot_token "$slack_bot_token" true "$bot_hint"
       bad="$(slack_bot_token_list_count "$slack_bot_token")"
       if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
       { [ -n "$bad" ] && $can_ask; } || break
       if [ "$bad" = stray ]; then
-        print_error "SLACK_BOT_TOKEN holds a comma or space. Under spec.mode next the A2A gateway takes one bot token as it is; enter it without one."
+        print_error "SLACK_BOT_TOKEN holds a comma or space. The A2A gateway takes one bot token as it is; enter it without one."
       else
-        print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+        print_error "SLACK_BOT_TOKEN holds ${bad} tokens. The A2A gateway takes one workspace's bot token; enter one."
       fi
       # Not the re-ask's default: prompt_read prints a default it has no
       # label for, and this one is the list just typed under read -s.
@@ -7957,7 +7963,7 @@ main() {
         slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
       bad="$(slack_allowlist_emails "$slack_allowed_users")"
       { [ -n "$bad" ] && $can_ask; } || break
-      print_error "These look like emails: ${bad}. Under spec.mode next the allowlist matches Slack member IDs exactly. Find one in Slack: open the person's profile, choose ⋮ (More), then Copy member ID."
+      print_error "These look like emails: ${bad}. The A2A gateway matches the allowlist against Slack member IDs exactly. Find one in Slack: open the person's profile, choose ⋮ (More), then Copy member ID."
       # The refused list stays the default (an empty one would admit
       # everyone), so the hint shows it rather than a label for another.
       slack_allowed_hint=""
@@ -8002,11 +8008,6 @@ main() {
     fi
     chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
-    if [ "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" != "next" ]; then
-      prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-        google_chat_home_channel "$google_chat_home_channel"
-      return 0
-    fi
     local can_ask=true
     if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
       can_ask=false
@@ -8018,16 +8019,20 @@ main() {
     done
   }
 
-  # Under next the A2A gateway posts alerts and reports only to a home
-  # channel (#3320). An empty answer is allowed, after a warning and a yes:
+  # The A2A gateway posts alerts and reports only to a home channel (#3320).
+  # An empty answer is allowed, after a warning and a yes:
   # true to keep the answer, false to ask again. $1 the key, $2 the answer,
   # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
-  # the warning before the apply and the closing summary say it then.
+  # the warning before the apply and the closing summary say it then. The
+  # warning names the other platform's home channel when it holds a value
+  # already: an answer (Google Chat is asked first), a flag or install.env.
   _confirm_no_home_channel() {
-    local home keep=""
+    local home keep="" set_platform
     home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
-    print_warning "$(next_home_channel_unset_message "$1")"
+    set_platform="$(gateway_home_channel_set_platform \
+      "$slack_enabled" "$google_chat_enabled" "$slack_home_channel" "$google_chat_home_channel")"
+    print_warning "$(gateway_home_channel_unset_message "$1" "$set_platform")"
     prompt_read "Continue without a home channel for now? (y/N)" keep "n"
     case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
     return 1
@@ -8043,16 +8048,10 @@ main() {
     # after_summary is true for the repeat at the end of main(), where the
     # component summary has already printed the web console command.
     local after_summary="${1:-false}"
-    # The resolved PlatformAgent mode: after the apply as the closing summary
-    # reads it, and at the chat step (before main() has resolved its own
-    # copy) from the flag or the fallback the mode check settled. Under next
-    # the CR carries the NoChatPlatform condition, which says where the
-    # agent's findings go.
-    local mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${platform_agent_mode:-${PARAM_PLATFORM_AGENT_MODE:-${PLATFORM_AGENT_MODE_FALLBACK:-}}}}"
     print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
-    if [ "$mode" = "next" ]; then
-      print_info "The PlatformAgent carries the NoChatPlatform condition, which says where the agent's findings go instead of chat."
-    fi
+    # The CR carries the NoChatPlatform condition, which says where the
+    # agent's findings go.
+    print_info "The PlatformAgent carries the NoChatPlatform condition, which says where the agent's findings go instead of chat."
 
     # gcloud rejects --dns-endpoint on clusters without an external DNS
     # endpoint, so print the resolved flag rather than a literal one. Resolved
@@ -8125,7 +8124,6 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
-      print_info "Under spec.mode next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;
@@ -8134,14 +8132,14 @@ main() {
       ;;
   esac
   # The Slack settings are settled here, whether from a flag, install.env or
-  # an answer. If Slack moves to the A2A gateway under next, the settings it
+  # an answer. If Slack moves to the A2A gateway, the settings it
   # cannot use (an email in the allowlist, a home channel that is not a
   # channel id, a list of bot tokens) are refused now, before the generator,
   # install.env or any apply. A token the generator recovers from the live
   # Secret is checked after it. A --dry-run applies nothing, so it is warned
   # there instead, once, with the recovered token included.
   if [ "$PARAM_DRY_RUN" != "true" ]; then
-    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
+    refuse_slack_gateway_settings "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
   fi
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
@@ -8179,9 +8177,6 @@ main() {
   if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
     hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
   fi
-  # The mode was checked at step 2, before check_flags_against_install_env
-  # held --mode to install.env (validate_platform_agent_mode).
-  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   # The scoped service account pool, checked here for the same reason as the
   # toggle above: a misspelt switch is refused rather than read as off, and a
   # cap the module would refuse is named with its key before the interview.
@@ -8717,11 +8712,19 @@ main() {
       prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)" "$gvisor_no" gvisor_choice
       if [ "$gvisor_choice" = "2" ]; then
         enable_gvisor="false"
+        # The operator's own choice, as --enable-gvisor=false is: it confirms
+        # the destroy of a live gVisor pool (run_lifecycle_apply).
+        PARAM_ENABLE_GVISOR_EXPLICIT="true"
       fi
     else
       prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)" "$gvisor_yes" gvisor_choice
       if [ "$gvisor_choice" = "2" ]; then
         enable_gvisor="true"
+      else
+        # "No" kept, with install.env (or a flag) already saying false: the
+        # operator affirmed it at the prompt, which is the confirmation
+        # guard_gvisor_pool_teardown names for a live pool.
+        PARAM_ENABLE_GVISOR_EXPLICIT="true"
       fi
     fi
 
@@ -8817,6 +8820,7 @@ main() {
     if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || [ "$memory_choice" != "$memory_seed_choice" ]; then
       PARAM_MEMORY_EXPLICIT="true"
     fi
+    prompt_stockout_investigator "$google_chat_enabled" "$google_chat_home_channel" "$slack_enabled" "$slack_home_channel" "$project_id"
   fi
 
   # bootstrap_install_env_file records PARAM_MEMORY, not this local, so the
@@ -8926,17 +8930,6 @@ main() {
   export LITELLM_REDACTION_ENABLED="$redaction_enabled"
   export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
-  platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
-  export PLATFORM_AGENT_MODE="$platform_agent_mode"
-  # The bus's three third-party images are the operator's compiled defaults
-  # (A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE in
-  # images.json), which neither this installer nor the chart points at a
-  # mirror, so a next install that mirrors its third-party images still pulls
-  # those three from Docker Hub.
-  if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
-    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's four images (nats, nats-box, nats-server-config-reloader, prometheus-nats-exporter) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
-    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE name the mirrored copies (images.json lists all four)."
-  fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
@@ -8954,6 +8947,7 @@ main() {
   export CHAT_SUB_NAME="$chat_sub_name"
   export GOOGLE_CHAT_ENABLED="$google_chat_enabled"
   export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
+  export GOOGLE_CHAT_HOME_CHANNEL_POLICY="$google_chat_home_channel_policy"
   export GOOGLE_CHAT_MODE="$google_chat_mode"
   export SLACK_ENABLED="$slack_enabled"
   export SLACK_BOT_TOKEN="$slack_bot_token"
@@ -8999,9 +8993,16 @@ main() {
   if [ -n "${PARAM_ENABLE_WEB_CONSOLE:-}" ]; then
     export WEB_CONSOLE_ENABLED="$PARAM_ENABLE_WEB_CONSOLE"
   fi
+  if [ -n "${PARAM_PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+    export PLATFORM_AGENT_SIZING_PROFILE="$PARAM_PLATFORM_AGENT_SIZING_PROFILE"
+  fi
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
-  export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  # Conditional, like ENABLE_DRIFT_DETECTOR below: a run that did not say
+  # leaves the recorded value (or, with none, the default) to the generator.
+  if [ -n "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-}" ]; then
+    export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  fi
   # Conditional, like ENABLE_GKE_BACKUP_PLAN above and for the same reason:
   # resolve_shared_defaults leaves this PARAM empty when nothing chose, so an
   # unconditional export would write an empty value over whatever install.env
@@ -9042,6 +9043,7 @@ main() {
   # does not exist yet. uninstall.sh deliberately does not opt in.
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
     KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$image_tag"
   if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then
     memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"
@@ -9056,20 +9058,20 @@ main() {
   # CrashLoops.
   require_slack_tokens_after_recovery
   # Again on the exported keys, for a bot token the generator recovered from
-  # the live Secret (refuse_next_slack_gateway_settings). Still before
+  # the live Secret (refuse_slack_gateway_settings). Still before
   # install.env and the apply. The tfvars just written render the refused
   # settings, so a refusal removes them: --generate-only hands that file to
   # lifecycle.sh apply. A --dry-run warns instead.
   if [ "$PARAM_DRY_RUN" = "true" ]; then
-    refuse_next_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"
-  elif ! refuse_next_slack_gateway_settings_from_env flags; then
+    refuse_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"
+  elif ! refuse_slack_gateway_settings_from_env flags; then
     rm -f "$tfvars_file"
     print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
     exit 1
   fi
   # A chat backend the gateway holds with no home channel (#3320): a
   # warning, never a refusal, repeated at the end of the run.
-  warn_next_home_channel_unset_from_env flags
+  warn_gateway_home_channel_unset_from_env flags
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a
@@ -9113,33 +9115,6 @@ main() {
       refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"
     fi
   fi
-  # A PLATFORM_AGENT_MODE that moves the CR's spec.mode is a mode switch, and
-  # it is named before the operator confirms the apply. Outside the gate
-  # above, so --dry-run and --generate-only say it too; it takes the reads the
-  # scope check in the gate just made, and reads for itself when the gate did
-  # not run. The reads need this cluster's context, which the gate fetched for
-  # an applying run. A first install reads nothing (the generator found no
-  # cluster); on a cluster that exists, a missing context or a read that fails
-  # says the check did not run.
-  # -y applies without the step-11 prompt, so the notice is the ungated one.
-  local mode_notice_route=""
-  if [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ]; then
-    mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
-  fi
-  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"
-  # Under -y nothing stands between that notice and the apply, so a switch
-  # nobody chose is refused: one that comes from the fallback rather than
-  # from --mode, an exported PLATFORM_AGENT_MODE or the key install.env
-  # records (editing that key is the documented way to switch).
-  if [ "$mode_notice_route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ] \
-    && [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] \
-    && [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] \
-    && ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
-    rm -f "$tfvars_file"
-    print_error "Refusing to switch spec.mode under -y when nothing asked for it: no --mode, and install.env records no PLATFORM_AGENT_MODE."
-    print_info "Pass --mode=today or --mode=next to say which mode this install runs, or run without -y to confirm the switch at the prompt."
-    exit 1
-  fi
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
   # project; both are checked before anything is applied, first install
@@ -9171,6 +9146,64 @@ main() {
     settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"
   fi
 
+  # Scan visible clusters in scope to report runtime/host/storage sizing
+  # guidance and size new fleet Standard node pools before writing install.env.
+  local sizing_include_cr="false" sizing_is_create_cluster="true"
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
+    sizing_include_cr="true"
+    sizing_is_create_cluster="false"
+  fi
+  if declare -F scan_visible_clusters_in_scope >/dev/null; then
+    scan_visible_clusters_in_scope "$project_id" "$sizing_include_cr"
+  fi
+  local configured_runtime_profile="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$INSTALL_SIZING_PROFILE_DEFAULT}}"
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" != "true" ] && \
+     [ "${TFVARS_CREATE_CLUSTER:-true}" = "true" ] && \
+     [ "${TFVARS_CLUSTER_MODE:-$cluster_mode}" = "$INSTALL_GKE_CLUSTER_MODE_STANDARD" ] && \
+     { [ "$configured_runtime_profile" = "$INSTALL_SIZING_PROFILE_DEFAULT" ] || [ "$configured_runtime_profile" = "$INSTALL_GKE_SIZING_PROFILE_FLEET" ]; } && \
+     [ -n "${SIZING_SCAN_CLUSTER_COUNT:-}" ] && \
+     [ "${SIZING_SCAN_CLUSTER_COUNT}" -ge "${SIZING_FLEET_CLUSTER_THRESHOLD:-$INSTALL_DEFAULT_SIZING_FLEET_CLUSTER_THRESHOLD}" ] && \
+     [ -z "${TF_VAR_sizing_profile:-}" ] && \
+     ! install_env_records_key "${INSTALL_ENV_FILE:-}" TF_VAR_sizing_profile && \
+     [ -z "${TF_VAR_standard_machine_type:-}" ]; then
+    if [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ] && [ ! -w "$INSTALL_ENV_FILE" ]; then
+      if [ -n "${tfvars_file:-}" ]; then
+        rm -f "$tfvars_file"
+      fi
+      print_error "${INSTALL_ENV_FILE} assigns no TF_VAR_sizing_profile, which this run would record there, and it is not writable."
+      print_info "Make it writable, or add TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} to it yourself, and re-run."
+      exit 1
+    fi
+    local fleet_nodes_chosen="false"
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "$PARAM_DRY_RUN" = "true" ] || ! has_controlling_tty; then
+      fleet_nodes_chosen="true"
+      export TF_VAR_sizing_profile="$INSTALL_GKE_SIZING_PROFILE_FLEET"
+      print_info "Setting TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} for this new Standard cluster (${SIZING_SCAN_CLUSTER_COUNT} clusters in scope require >= 8 vCPU nodes for the fleet broker's 4 vCPU request)."
+    else
+      local sizing_prompt_ans=""
+      prompt_read "Set TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} for the new Standard node pools (${SIZING_SCAN_CLUSTER_COUNT} clusters detected; fits 4 vCPU fleet broker)? (Y/n)" sizing_prompt_ans "y"
+      case "$sizing_prompt_ans" in
+        [Yy]|[Yy][Ee][Ss])
+          fleet_nodes_chosen="true"
+          export TF_VAR_sizing_profile="$INSTALL_GKE_SIZING_PROFILE_FLEET"
+          print_success "Set TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} for the new Standard cluster."
+          ;;
+        *)
+          print_warning "Leaving Standard node pools at default machine types; set TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} before applying if needed."
+          ;;
+      esac
+    fi
+    if [ "$fleet_nodes_chosen" = "true" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+      case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+        *" TF_VAR_sizing_profile "*) ;;
+        *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD:+${INSTALL_ENV_KEYS_TO_RECORD} }TF_VAR_sizing_profile" ;;
+      esac
+    fi
+  fi
+  if declare -F report_cluster_sizing_guidance >/dev/null; then
+    report_cluster_sizing_guidance "$SIZING_SCAN_CONTEXT_INSTALL" "$project_id" "${TFVARS_CLUSTER_MODE:-$cluster_mode}" "$sizing_is_create_cluster" "$SIZING_SCAN_SKIP_FLAG"
+  fi
+
   # Written once, and only when there is nothing there. The probed cluster
   # shape is deliberately NOT recorded: a file that is read as configuration
   # and also written as findings has two answers for one question. The probe is
@@ -9193,14 +9226,6 @@ main() {
     summarize_existing_cluster_mutations "$project_id" "$cluster_name" "$region" "$enable_gvisor"
   fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
-  # Named on every run, a first install included, where no switch notice
-  # fires: a first install is next by default, and this is where it learns
-  # that and how to keep the previous stack instead.
-  if [ "$platform_agent_mode" = "next" ]; then
-    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway in front of the agent; --mode=today on a first install, or PLATFORM_AGENT_MODE=today in install.env, installs the previous stack)"
-  else
-    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}"
-  fi
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
@@ -9212,6 +9237,11 @@ main() {
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
+  if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"; then
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} Enabled (Pub/Sub adapter + noScaleUp sink)"
+  else
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} Disabled (enable later with --enable-stockout-investigator, ENABLE_STOCKOUT_INVESTIGATOR=true in install.env, or ./install.sh --menu)"
+  fi
   # Only shown for a mirrored install: on a default one both lines restate the
   # defaults. The second line is the one worth seeing before confirming, because
   # a mirror that covers only the first-party images fails at cert-manager, with
@@ -9237,6 +9267,12 @@ main() {
   # no notes, so this is where the front door prints them; `helm get notes`
   # does after the apply. On the dry run too: the number is the point of
   # previewing.
+  local summary_sizing_profile="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$INSTALL_SIZING_PROFILE_DEFAULT}}"
+  if [ -n "${SIZING_SCAN_CLUSTER_COUNT:-}" ]; then
+    echo -e "  • ${C_CYAN}Runtime Sizing Profile:${C_RESET} ${summary_sizing_profile} (${SIZING_SCAN_CLUSTER_COUNT} cluster(s) in scope -> recommended '${SIZING_SCAN_TIER}')"
+  else
+    echo -e "  • ${C_CYAN}Runtime Sizing Profile:${C_RESET} ${summary_sizing_profile}"
+  fi
   echo -e "  • ${C_CYAN}Cluster Footprint & Modeled Cost:${C_RESET}"
   print_footprint_summary "$repo_dir" "$tfvars_file"
   echo -e "${C_CYAN}${C_BOLD}"
@@ -9332,7 +9368,7 @@ main() {
     fi
     print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
     write_json_report "DRY_RUN_SUCCESS"
-    print_next_home_channel_unset_summary flags
+    print_gateway_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -9376,15 +9412,19 @@ main() {
         # needs in install.env.
         warn_install_env_keys_not_recorded
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
-        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
-        # After the lines above: the printers read the mode and the toggles
-        # from install.env, which this route leaves as it found it.
+        local paused_sizing_prefix=""
+        if [ -n "${TF_VAR_sizing_profile:-}" ]; then
+          paused_sizing_prefix="TF_VAR_sizing_profile=$(printf '%q' "$TF_VAR_sizing_profile") "
+        fi
+        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ${paused_sizing_prefix}./lifecycle.sh apply${C_RESET}"
+        # After the lines above: the printers read the chat toggles from
+        # install.env, which this route leaves as it found it.
         if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
           print_info "After the apply, set up the chat app with the checklist these print:"
           print_chat_checklist_commands
         fi
         write_json_report "PAUSED"
-        print_next_home_channel_unset_summary flags
+        print_gateway_home_channel_unset_summary flags
         exit 0
         ;;
     esac
@@ -9393,14 +9433,14 @@ main() {
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}" "${GITOPS_HOST:-}" "$(gitops_ca_file_for_check)"
-    # Past every gate that can stop this route: a chat flag or --mode whose
+    # Past every gate that can stop this route: a chat flag whose
     # key the install.env lacks is recorded for the handoff, and so are the
     # GitHub GitOps keys, which the handoff's lifecycle.sh apply renders.
     record_github_gitops_keys "$INSTALL_ENV_FILE"
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
-    print_next_home_channel_unset_summary flags
+    print_gateway_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -9474,8 +9514,8 @@ main() {
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
   # Past every gate that can stop this route (set -e makes each step above
-  # one): a chat flag or --mode whose key the install.env lacks is recorded
-  # for the apply.
+  # one): a chat flag whose key the install.env lacks is recorded for the
+  # apply.
   # The forge keys likewise, and only here: a forge switch the operator
   # previewed (--generate-only) or declined must leave install.env as it was,
   # or the next upgrade.sh would render the forge nobody applied.
@@ -9605,17 +9645,20 @@ main() {
   if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}}"; then
     print_web_console_access "$namespace"
   fi
+  if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"; then
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} ${C_GREEN}Enabled${C_RESET} (monitoring cluster-autoscaler noScaleUp events)"
+  else
+    echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} Disabled (enable with ${C_BOLD}--enable-stockout-investigator${C_RESET}, ENABLE_STOCKOUT_INVESTIGATOR=true in install.env, or ./install.sh --menu)"
+  fi
 
-  # The checklists and the closing summary follow the mode the CR is left
-  # on, which a mode set outside this installer can keep from the key.
-  print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
+  print_chat_setup_checklists
   # Repeated here, where the checklists above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().
   if [ "$chat_choice" = "4" ]; then
     echo ""
     _prompt_no_chat_enabled true
   fi
-  print_next_home_channel_unset_summary flags
+  print_gateway_home_channel_unset_summary flags
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

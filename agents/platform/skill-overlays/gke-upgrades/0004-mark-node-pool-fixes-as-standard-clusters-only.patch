@@ -2,7 +2,7 @@ Subject: Mark node pool fixes as Standard clusters only
 
 Why: node-pool fixes in the troubleshooting reference (surge, strategy, driver, resume, blue-green update) do not apply to Autopilot clusters; without the qualifier the fleet audit recommended them for Autopilot members.
 Local-Issue: #1018 (fixed in #1226)
-Upstream-Issue: none filed yet
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Retire-When: upstream marks these fixes as Standard only
 
 diff --git a/references/troubleshooting.md b/references/troubleshooting.md

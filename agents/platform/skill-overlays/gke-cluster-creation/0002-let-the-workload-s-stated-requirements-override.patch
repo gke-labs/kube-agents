@@ -2,7 +2,7 @@ Subject: Let the workload's stated requirements override the golden-path default
 
 Why: upstream defaults every new cluster to golden-path Autopilot and template values; asked for a cluster "with Agent Substrate installed", the worker built an Autopilot cluster in 2 of 3 #2935 e2e runs (2026-10-21) because nothing told it the workload's own requirements (Standard mode, beta APIs, a node label, a bucket, IAM) win over a template default.
 Local-Issue: #2935 (its done-when end-to-end runs, 2026-10-21)
-Upstream-Issue: none
+Eval-Case: substrate-cluster-gitops-pr
 Retire-When: upstream's mode selection reads the workload's requirements before applying a template default
 
 diff --git a/SKILL.md b/SKILL.md

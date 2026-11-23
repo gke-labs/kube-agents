@@ -28,15 +28,15 @@ import (
 // Role) and its own task records, which count chat turns, not the kanban
 // cards the script's tasks line counts; the line is labelled for that. No model is in the loop, and the block
 // names no cluster, project, namespace, task or person: the audit below
-// refuses a block that does, outside the model line and the proposals-by-origin
-// line, which are printed by design.
+// refuses a block that does, outside the model line, the reasoning effort line and
+// the proposals-by-origin line, which are printed by design.
 
 const (
 	usageSummaryTitle = "kube-agents usage & feedback summary"
 	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
 	//: matches its own block's shape (the script adds the live LiteLLM figures and
 	//: task rows this block does not carry); nothing holds the two in step, by design.
-	usageSummaryMaxLines = 56
+	usageSummaryMaxLines = 57
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
 	//: SessionTTL, past which idle records (and their tasks) are deleted.
@@ -84,13 +84,16 @@ const (
 	//: What the roll-up counts. The script's line with the same window counts
 	//: kanban cards; this one counts the gateway's task records, one per chat
 	//: turn, so the label says so and a reader of both pastes is not misled.
-	usageSummaryTurnsLabel     = "chat turns"
-	usageSummaryFence          = "```"
-	usageSummaryUnavailable    = "unavailable"
+	usageSummaryTurnsLabel  = "chat turns"
+	usageSummaryFence       = "```"
+	usageSummaryUnavailable = "unavailable"
+	//: The reasoning effort line's value when the model is known and the config
+	//: states no effort, so the model thinks at its own default.
+	usageSummaryUnset          = "unset"
 	usageSummaryUnknown        = "unknown"
 	usageSummaryNever          = "never"
 	usageSummaryNone           = "none"
-	usageSummaryDefaultMode    = "today"
+	usageSummaryDefaultMode    = "next"
 	usageSummaryReadyCondition = "Ready"
 	usageSummaryMinIdentifier  = 3
 	usageSummaryDateLayout     = "2006-01-02"
@@ -103,20 +106,26 @@ const (
 	platformAgentNameEnv = "PLATFORM_AGENT_NAME"
 	//: The model line's start: the audit runs over the block without this line.
 	usageSummaryModelLinePrefix = "  model: "
+	//: The reasoning effort line's start: a setting, not an identifier, printed by
+	//: design like the model line, so an install named after its effort word is not
+	//: refused for it.
+	usageSummaryReasoningEffortLinePrefix = "  reasoning effort: "
 	//: The origin line's start: the audit runs over the block without this
 	//: line, which carries only fixed words and digits.
 	usageSummaryOriginLinePrefix = "  proposals by origin: "
 	//: What precedes the origin's name in its field.
 	usageSummaryOriginFieldPrefix = "proposalsFrom"
-	//: status.inference, the operator's reading of the install's default model.
-	inferenceStatusKey        = "inference"
-	inferenceProviderField    = "provider"
-	inferenceModelField       = "model"
-	inferenceSeparator        = "/"
-	usageNoReading            = "no reading"
-	usageForgeReadingSuffix   = " (as the forge reports)"
-	usageGatewayReadingSuffix = " (as the gateway reports)"
-	usageAgentReadingSuffix   = " (as the agent reports)"
+	//: status.inference, the operator's reading of the install's default model and
+	//: of the reasoning effort configured on it.
+	inferenceStatusKey            = "inference"
+	inferenceProviderField        = "provider"
+	inferenceModelField           = "model"
+	inferenceReasoningEffortField = "reasoningEffort"
+	inferenceSeparator            = "/"
+	usageNoReading                = "no reading"
+	usageForgeReadingSuffix       = " (as the forge reports)"
+	usageGatewayReadingSuffix     = " (as the gateway reports)"
+	usageAgentReadingSuffix       = " (as the agent reports)"
 	//: status.usage.topTools: the operator's reading of the broker's five
 	//: most-invoked tool and subcommand pairs since the broker pod started,
 	//: and the row fields it carries. The script's TOP_TOOLS_* names.
@@ -161,11 +170,11 @@ var usageSummaryBrokerSubcommands = map[string][]string{
 	},
 	"git": {
 		"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-		"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
-		"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
-		"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
-		"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
-		"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
+		"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "diff-tree",
+		"fetch", "init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base",
+		"mv", "pull", "push", "rebase", "remote", "reset", "restore", "rev-list",
+		"rev-parse", "revert", "rm", "show", "sparse-checkout", "stash", "status",
+		"submodule", "switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
 	},
 	"gh": {
 		"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -224,11 +233,11 @@ var usageSummaryOriginFields = []string{
 }
 
 // : The lines printed by design, each removed (its first occurrence) before the audit.
-var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageSummaryOriginLinePrefix}
+var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageSummaryReasoningEffortLinePrefix, usageSummaryOriginLinePrefix}
 
 // : The environment lines, in the order the block prints them: the script's
 // : ENVIRONMENT_KEYS verbatim.
-var usageSummaryEnvironmentKeys = []string{"version", "mode", "model", "kubernetes", "installed", "interfaces"}
+var usageSummaryEnvironmentKeys = []string{"version", "mode", "model", "reasoning effort", "kubernetes", "installed", "interfaces"}
 
 // : Spec subtrees whose string leaves name the install and must not reach the
 // : block: the script's list verbatim, so the two audits read the same (chat
@@ -472,6 +481,20 @@ func inferenceModelLine(cr map[string]any) string {
 	return provider + inferenceSeparator + model
 }
 
+// inferenceReasoningEffortLine is status.inference.reasoningEffort under the model
+// line: unavailable whenever the model line is, unset when the pair is present
+// without an effort, the value as written otherwise.
+func inferenceReasoningEffortLine(cr map[string]any) string {
+	if inferenceModelLine(cr) == usageSummaryUnavailable {
+		return usageSummaryUnavailable
+	}
+	inference, _ := nested(cr, "status", inferenceStatusKey).(map[string]any)
+	if effort := asString(inference[inferenceReasoningEffortField]); effort != "" {
+		return effort
+	}
+	return usageSummaryUnset
+}
+
 // usageSummaryOriginLine lists the origins whose reading is above zero in the
 // table's order, "none" when every reading is zero, and "no reading" when the
 // readings are absent. The operator writes all nine or none; a status carrying only
@@ -527,12 +550,13 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		joined = usageSummaryNone
 	}
 	environment := map[string]string{
-		"version":    tag,
-		"mode":       mode,
-		"model":      inferenceModelLine(cr),
-		"kubernetes": serverVersion,
-		"installed":  fmt.Sprintf("%s; ready: %s", installAge(cr, now), readyState(cr)),
-		"interfaces": joined,
+		"version":          tag,
+		"mode":             mode,
+		"model":            inferenceModelLine(cr),
+		"reasoning effort": inferenceReasoningEffortLine(cr),
+		"kubernetes":       serverVersion,
+		"installed":        fmt.Sprintf("%s; ready: %s", installAge(cr, now), readyState(cr)),
+		"interfaces":       joined,
 	}
 	for _, key := range usageSummaryEnvironmentKeys {
 		lines = append(lines, "  "+key+": "+environment[key])
@@ -670,11 +694,12 @@ func usageIdentifiers(cr map[string]any) []string {
 	return ids
 }
 
-// usageSummaryWithoutFixedLines is the block less its first model line and its
-// first origin line, the lines printed by design: a deployment name can carry
-// a spec identifier as a segment, and the origin line prints origin words a
-// cluster may be named ("chat", "drift"). Neither line is the reason a block
-// is refused; every other line stays audited.
+// usageSummaryWithoutFixedLines is the block less its first model line, its first
+// reasoning effort line and its first origin line, the lines printed by design: a
+// deployment name can carry a spec identifier as a segment, an effort word is a
+// setting a cluster may be named after ("high"), and the origin line prints origin
+// words a cluster may be named ("chat", "drift"). None of the three is the reason a
+// block is refused; every other line stays audited.
 func usageSummaryWithoutFixedLines(text string) string {
 	lines := strings.Split(text, "\n")
 	for _, prefix := range usageSummaryFixedLinePrefixes {
@@ -689,7 +714,7 @@ func usageSummaryWithoutFixedLines(text string) string {
 }
 
 // auditUsageSummary returns the identifiers that appear in text as whole
-// tokens, skipping the template's own vocabulary (a cluster named "today" is
+// tokens, skipping the template's own vocabulary (a cluster named "next" is
 // not told apart from the mode line, and is not refused for it).
 func auditUsageSummary(text string, identifiers []string) []string {
 	var leaked []string

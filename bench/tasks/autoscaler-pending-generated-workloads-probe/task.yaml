@@ -1,0 +1,119 @@
+# Skill-guidance probe for gke-cluster-autoscaler: Pods stay Pending with an
+# empty NotTriggerScaleUp reason while the pool is below its maximum, and the
+# prompt does not say that the pool carries a compute-class label. The
+# autoscaler skill is where a pending-Pod question starts. Its checklist had no
+# item for a labelled pool and a Pod that names no class, so the read of an
+# empty reason ended at capacity. The overlay patch adds that item, and a
+# section for workloads whose names are generated (no manifest in Git), where
+# the class is named once on the namespace.
+#
+# The base for this case's red is main with the gke-compute-classes text for
+# the same behaviour (Symptom 13 of its debug reference) already in it: that
+# text gives the cause to an agent that opens it, and this case asks if the
+# autoscaler skill leads there.
+#
+# The prompt gives no list of answers to choose from, because a list that
+# holds the answer lets the case pass with no skill text. It does not name the
+# checklist, the namespace or a label. The objective reads one line that the
+# prompt asks for, "FIX-SETS:" and the exact thing that the durable fix sets,
+# and passes when that line holds the namespace default class label key
+# (cloud.google.com/default-compute-class, in either of its two forms). The
+# line binds the label to the fix: an answer that names the label only as a
+# thing to compare, or only for kube-system, does not pass on it. The key
+# must be whole (a longer made-up key does not count), and a fix line that
+# negates the label, hedges it with a question mark, or names another fix
+# beside it fails. For workloads that are not in Git, that label is the fix
+# that goes through Git.
+# Limits: an answer whose FIX-SETS line is the controller's pod template
+# (also a valid fix), a cluster default class, or a GKE upgrade fails. The
+# "NEXT-COMMAND" line is not graded by a deterministic check; the judge reads
+# it against expected_output, which names the side where the cause is (the
+# pool's class label, Pods with no constraint). The prompt's sentence about a
+# hand-off is for the Planning Agent, not for the skill.
+# bench/tests/test_autoscaler_pending_generated_workloads_verdict.py pins the
+# check both ways.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: autoscaler-pending-generated-workloads-probe
+name: Pending Pods with an empty NotTriggerScaleUp reason lead to the pool's compute-class label, and generated workloads get the class on the namespace
+
+owner: Fuxiao-Gao
+domain: capacity
+
+prompt: >-
+  Our Standard GKE cluster runs 1.35.8-gke.1796000 with one node pool, apps:
+  e2-standard-4, autoscaling 1 to 10, 3 nodes now. A controller creates
+  Deployments named render-<uuid> through the Kubernetes API; they are not in
+  our Git repository. Six of their pods, each requesting 500m CPU, have been
+  Pending for 20 minutes with "0/3 nodes are available: 3 Insufficient cpu".
+  Each has the cluster-autoscaler event NotTriggerScaleUp with the message
+  "Pod didn't trigger scale-up:" and nothing after the colon. In the
+  autoscaler visibility log the pods are under noScaleUp.unhandledPodGroups
+  with no rejectedMigs and no skippedMigs. There is no quota error and no
+  scale.up.error entry. The on-call engineer wants to open a capacity ticket
+  for a zonal stockout. Load the installed gke-cluster-autoscaler skill and
+  answer from it before searching documentation. Start your answer with
+  exactly one line, with nothing else on it: "NEXT-COMMAND: " and then the one
+  read-only command that you run next to find the cause. If you hand this
+  question to another agent, pass these instructions word for word, and keep
+  its lines in your reply. Then say what you expect the command to show. End
+  your answer with exactly one line, with nothing else on it: "FIX-SETS: " and
+  then the exact field, flag or label key that the durable fix sets. Do not
+  run the command and do not apply anything.
+expected_output: >-
+  NEXT-COMMAND: kubectl get nodes -L cloud.google.com/compute-class. The cause
+  is on the pool's side, not in the pod spec: the pods have no constraint that
+  the pool cannot meet; the pool carries a compute-class label and the pods
+  name no class. An empty NotTriggerScaleUp reason with no rejected or skipped
+  pool, on a pool below its maximum, means that no scale-up was tried, so it
+  is not a stockout and a capacity ticket does not help. Compare the pods' nodeSelector or required
+  nodeAffinity on cloud.google.com/compute-class, and the namespace's
+  default-compute-class label, against the node pool's compute-class label: on
+  1.35.8-gke.1796000 a labelled pool does not grow for a pod that names no
+  class. The Deployments have generated names and no manifest in Git, so the
+  class is named once with the label cloud.google.com/default-compute-class on
+  the Namespace manifest, by pull request; it applies to new pods, so the
+  pending pods need recreation. FIX-SETS:
+  cloud.google.com/default-compute-class.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-fix-names-the-namespace-default-class
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        - "(?m)^fix-sets: (?:[^\\n]*[\\s\"'\\[(])?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9-])"
+      forbidden_patterns:
+        - "(?m)^fix-sets:.*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|don't|\\binstead\\b|\\bupgrade\\b|nodeselector|;|\\bor\\b|\\?)"
+      fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

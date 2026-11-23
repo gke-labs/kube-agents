@@ -119,6 +119,15 @@
             }
           }
         },
+        "cardStop": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "slackTestUsers": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
@@ -192,6 +201,15 @@
         "envFromSecret": {
           "type": "string"
         },
+        "masterKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "generate": {
+              "type": "boolean"
+            }
+          }
+        },
         "maxTokens": {
           "type": "integer",
           "minimum": 0
@@ -250,7 +268,7 @@
               "type": "string"
             },
             "serviceAccountAnnotations": {
-              "type": "object"
+              "type": ["object", "null"]
             },
             "projectId": {
               "type": "string"
@@ -385,7 +403,7 @@
           "type": "boolean"
         },
         "podMonitoring": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "redaction": {
           "type": "object",
@@ -789,7 +807,7 @@
           "type": "boolean"
         },
         "podMonitoring": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "podDisruptionBudget": {
           "type": "object",
@@ -908,7 +926,103 @@
         }
       }
     },
+    "a2aBus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "images": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nats": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            },
+            "natsBox": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            },
+            "configReloader": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            },
+            "prometheusExporter": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "agentSandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
+    "credentialProxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
+    "hermesBridge": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -937,6 +1051,7 @@
           "type": "string"
         },
         "mode": {
+          "description": "Deprecated and ignored: every install runs the A2A stack, and the chart renders no spec.mode on the PlatformAgent. Accepted so a values file that still sets it renders.",
           "enum": [null, "", "today", "next"]
         },
         "telemetry": {
@@ -1105,6 +1220,14 @@
             },
             "projectId": {
               "type": "string"
+            },
+            "universeDomain": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)?$",
+              "not": {
+                "pattern": "\\.googleapis\\.com$"
+              }
             },
             "hermes": {
               "type": "object",
@@ -1313,9 +1436,47 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "sessionResources": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requests": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cpu": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        },
+                        "memory": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        }
+                      }
+                    },
+                    "limits": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cpu": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        },
+                        "memory": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        }
+                      }
+                    }
+                  }
+                },
                 "busReplicas": {
                   "type": "integer",
                   "enum": [1, 3]
+                },
+                "defaultRoute": {
+                  "type": "string",
+                  "enum": ["session", "platform"]
                 },
                 "admission": {
                   "type": "object",
@@ -1571,6 +1732,9 @@
               "minimum": 0,
               "maximum": 86400
             },
+            "evalRunTags": {
+              "type": "boolean"
+            },
             "credentialProxy": {
               "type": "object",
               "additionalProperties": false,
@@ -1645,7 +1809,7 @@
               "type": "string"
             },
             "serviceAccountAnnotations": {
-              "type": "object"
+              "type": ["object", "null"]
             },
             "scopedServiceAccountPool": {
               "type": "object",
@@ -1911,6 +2075,10 @@
                 },
                 "answerFeedback": {
                   "type": "boolean"
+                },
+                "homeChannelPolicy": {
+                  "type": "string",
+                  "enum": ["", "auto", "manual"]
                 }
               }
             },
@@ -2359,6 +2527,112 @@
           }
         },
         "cluster": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "persona": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                }
+              }
+            },
+            "harness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                },
+                "model": {
+                  "type": "string"
+                },
+                "maxTurns": {
+                  "type": "integer"
+                }
+              }
+            },
+            "allowedTiers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": { "type": "string", "enum": ["read", "unattended"] }
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "activeDeadlineSeconds": {
+                  "type": "integer"
+                },
+                "ttlSecondsAfterFinished": {
+                  "type": "integer"
+                }
+              }
+            },
+            "concurrency": {
+              "type": "integer"
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "fleetAudit": {
           "type": "object",
           "additionalProperties": false,
           "properties": {

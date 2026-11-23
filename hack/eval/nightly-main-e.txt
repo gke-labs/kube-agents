@@ -11,3 +11,9 @@ gitops-drift-backlog-digest
 gitops-drift-unmanaged-object-triage
 monitoring-alert-policy-read
 upgrades-retrospective-log-volume-gate
+# first-run-report-on-demand (#4056): one kubectl exec plant, 200s default, into
+# the shortest chain at the time.
+first-run-report-on-demand
+# Added when the case joined the nightly with the image-pull-failing check: the
+# shortest chain then.
+obtainability-image-pull-failing

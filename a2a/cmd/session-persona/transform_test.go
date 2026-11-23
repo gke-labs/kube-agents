@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	personafmt "github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // The real sources, relative to this package: the tests build the shipped
@@ -393,6 +395,7 @@ func TestWorkerImageShipsTheTreeWhereTheHarnessReadsIt(t *testing.T) {
 	for _, want := range []string{
 		"COPY --from=build " + run[1] + "/" + personaFile + " " + home[1] + "/" + personaFile,
 		"COPY --from=build " + run[1] + "/" + skillsDir + "/ " + home[1] + "/" + skillsDir + "/",
+		"COPY --from=build " + run[1] + "/" + personafmt.IntegrityManifestFile + " " + home[1] + "/" + personafmt.IntegrityManifestFile,
 	} {
 		if !strings.Contains(df, want) {
 			t.Errorf("Dockerfile lacks %q", want)
@@ -872,6 +875,19 @@ func TestShippedWorkloadSkillsCarrySessionReportNote(t *testing.T) {
 		rewritten := strings.Join(replaceFileReferences(replaceReportingSteps([]string{sample.in})), "\n")
 		if rewritten != sample.want {
 			t.Errorf("sample %q:\n got %q\nwant %q", sample.in, rewritten, sample.want)
+		}
+	}
+}
+
+// The propose-only note is where a session skill meets a step that changes
+// something. When the person wants it done, the note sends the whole ask to
+// platform in the turn it is asked, with its reads, not a later handoff of the
+// change alone: a session with the cluster view otherwise reads first and the
+// change never reaches platform (#6859).
+func TestTheProposeOnlyNoteHandsTheWholeAskToPlatform(t *testing.T) {
+	for _, want := range []string{"do not run it", "delegate the whole ask to `platform`", "when the delegate tool lists it", "in the turn it is asked", "with the reads it depends on"} {
+		if !strings.Contains(proposeOnlyNote, want) {
+			t.Errorf("proposeOnlyNote lacks %q: %q", want, proposeOnlyNote)
 		}
 	}
 }

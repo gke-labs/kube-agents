@@ -67,7 +67,8 @@ to it before the broker runs anything:
     ``--kubeconfig`` (each checked to name the target) are dropped from the
     argv; the one ``--context`` the broker runs is the injected one.
   * **No target** (no ``proxyToken``): local-only commands and nothing
-    else, run against no kubeconfig at all.
+    else, run against no kubeconfig at all. A report credential, which has
+    no target either, is refused before this module runs (#5619).
 
 This is a confinement layer over IAM, not a sandbox. What it cannot parse it
 lists as a known limit rather than pretending to cover:

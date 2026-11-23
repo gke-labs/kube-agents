@@ -991,6 +991,130 @@ which is the property this design exists to hold.
 Anything beyond this one token — a Role, a Secret, a second audience — is the boundary
 moving again, and should be argued for here the way this one is.
 
+#### A memory guard beside sshd
+
+A memory limit alone does not keep the container up: every session's commands share it, and one
+`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 14 GiB. That one read OOMKilled
+the shell, ended every session in it, and the agents sent it again after the restart. The entrypoint
+starts [`shell-memory-guard`](../../deploy/sandbox/shell-memory-guard.py) as root before `sshd`, in
+a loop that restarts it every 5 s if it exits. Every 100 ms the guard reads what the kernel cannot
+reclaim before an OOMKill: on cgroup v2, `memory.current` less the page cache (shared memory
+excepted) and the reclaimable slab; on cgroup v1, `memory.usage_in_bytes` less `total_cache` (shared
+memory excepted); nothing subtracted when `memory.stat` is absent. At the limit less the larger of
+256 MiB and an eighth of the limit, at most a quarter of it, the guard sends SIGKILL to processes of
+a non-root user that hold at least 64 MiB of the memory a kill frees (`RssAnon` plus `RssShmem`),
+largest first, in one batch large enough to bring usage 64 MiB under the watermark. Memory of a
+process it signalled in the last second counts as leaving, so one burst is not paid for twice.
+`sshd`, the entrypoint and the guard run as root, and a session's shell is far below the floor, so
+none of them is chosen. The commands fail as killed processes do, and the container and the other
+sessions stay up. Commands each under the floor are not stopped: the guard logs `no-candidate` once
+when small ones fill the container, and the kubectl admission's slots bound how many run at once. A
+process that does not exit after SIGKILL is not chosen again.
+
+Before each kill the guard checks that a kill can help. When the memory held outside processes
+(usage less the summed sizes of every process) is so large that stopping even a 64 MiB
+command would leave the container at its limit, that memory is in tmpfs or a mapping no kill frees.
+The guard then holds off rather than empty the container of sessions, and kills again as soon as a
+kill can keep the container under its limit, or once usage falls below the watermark. Sizes count copy-on-write and shared pages in every process that maps them, so the outside figure errs
+towards killing.
+
+It defends against the OOMKill at the limit, not against the kubelet's eviction of a pod above its
+request under node pressure. The limit comes from `SANDBOX_MEMORY_LIMIT_BYTES`, which the operator
+sets from the container's `limits.memory`, because under gVisor the cgroup v1 limit can be the
+sandbox's virtual memory (on the gateway pod it read 10.25 GiB). Without the variable the guard
+reads cgroup v2 `memory.max`, then cgroup v1's `memory.limit_in_bytes` when it is below the
+machine's `MemTotal` (on gVisor that file is the container's limit on the shell and the sandbox's
+whole memory elsewhere); with none, it stops nothing and logs that it is disabled. Under
+gVisor the shell has cgroup v1 with no `memory.stat`, so nothing is subtracted, and no `RssAnon`, so processes are sized by `VmRSS`; the guard stopped a process growing at 100 MiB/s at 1,834 MiB of a 2
+GiB limit, as on runc. Under gVisor the sentry also holds host memory per guest process that the
+guest's figures do not show: in a fan-out of about 180 processes the host OOM-killed the sentry while
+the guest read 1,795 MiB of 2 GiB, at least 1.4 MiB a process. The guard detects gVisor from the
+kernel release and lowers its watermark by 3 MiB, about twice that, per running process. Each kill, hold, release and `no-candidate` is a JSON line on the container's log. A kill names the command by its program and the plain words before its first flag. A flag and its value, a long word, and a word with a digit or punctuation end what is kept, so a token passed by flag, in a URL, or as a word holding a digit does not reach the log; a positional secret made only of letters could. The guard does not make an oversized read succeed: the read fails
+every time until it is narrowed.
+
+#### A cost check in front of kubectl
+
+The guard keeps the container up; it does not make an oversized read succeed, and it acts after the
+read has run for tens of seconds. The kubectl admission refuses such a read before it starts.
+`/usr/local/bin/kubectl` execs [`kubectl-admit`](../../deploy/sandbox/kubectl-admit.py), which
+charges a `get` across the cluster (`-A`, or a cluster-scoped kind) the peak memory that
+[`kubectl-costs.json`](../../deploy/sandbox/kubectl-costs.json) lists for it. The table's key is
+`get <kinds> cluster <json|table>`; every output that decodes full objects, `-o name` included, is
+`json`, and only the table the API server builds is `table`. A `--sort-by` read is `json` too: the
+Table request then carries every object. A `describe` across the cluster is charged as the `json`
+read of its kinds, because it reads the list as `get` does before it describes each object. A
+command whose key is not listed is charged the sum of its kinds' entries (`get all`, `get po,svc`,
+`deployments.apps`); a `table` read of a kind with no `table` entry is charged the kind's `json`
+entry, its upper bound; and the tier's `other` figure applies only when none of its kinds is listed.
+One namespace, named objects, other verbs, watches and `--raw` reads run unchanged: their cost does
+not grow with the fleet, and the guard bounds them. `top pods -A` is the exception: it holds one
+metrics object per Pod and is left to the guard, so a stopped one exits 137 with no `capacity:`
+reason.
+
+Nothing is estimated at run time. The table is measured ahead of time by
+[`scripts/dev/profile_kubectl_costs.py`](../../scripts/dev/profile_kubectl_costs.py), which runs
+each command alone, with the Linux `kubectl` the image pins, against a reference cluster and records
+its peak. One read costs very different amounts on different fleets: `get pods -A -o json` peaks at
+67 MiB on a cluster of about 80 Pods and at 14,307 MiB on one of 104,944. So the table has one
+column per sizing tier, and the install picks one with `KUBEAGENTS_KUBECTL_COST_TIER` in
+`spec.deployment.env` (`default` when unset). The charge comes from the tier, not from the cluster
+read: on the `fleet` tier a small cluster's `get pods -A` is charged the reference cluster's figure
+and refused. The operator passes the tier only as a lowercase word, and the entrypoint writes it to
+a root-owned file. A command charged `other` is recorded in the admission's event log, which is how
+the table learns new commands. The procedure is the
+[`update-kubectl-cost-table`](../../.agents/skills/update-kubectl-cost-table/SKILL.md) skill.
+
+The charge is booked as a reservation: a file named by the wrapper's pid, in a directory every
+session user shares, written atomically under an exclusive lock. Two large reads therefore cannot
+both see free memory and both start. The free budget is the guard's watermark, less the memory in
+use outside admitted reads, less every reservation at full size. A read that fits runs as a child
+under its reservation. One that does not fit now waits up to 30 s and then fails with exit 75. One
+larger than a single read may take (the watermark less 256 MiB) fails at once with exit 3. Both
+refusals print a `capacity:` reason with the alternatives: a count from one item (`kubectl get --raw
+'<collection>?limit=1'` and its `metadata.remainingItemCount`), one namespace at a time, a selector
+when it matches few objects, or a batch of at most 10 clusters. A read with a selector narrows by an
+amount no table knows, so it is never refused for its size; it books what is free, up to its charge,
+and waits, then fails with exit 75, only while nothing is free. A read the
+guard stops prints the same reason.
+
+Every kubectl command also takes a slot, a pid-named file beside the reservations, for as long as it
+runs: the charged reads, and the reads of one namespace or one object that pass through. A command
+that passes through keeps its pid across the exec, so its slot lasts exactly as long as kubectl.
+Only verbs that decode objects take one (`get`, `describe`, `events`, `top`, `logs`, `diff`,
+`apply`, `delete`, `api-resources`); a watch, `logs -f`, `exec`, `rollout status` or `wait` stays
+open as long as the session likes and takes none.
+
+The limits are hard and come from the container's size. Every waiting command is a process holding
+about 16 MiB that the guard never stops, so the queue is bounded as well as the running reads: one
+read's capacity (the watermark less 256 MiB) is divided into pairs of a 96 MiB slot and a 16 MiB
+place in the queue. At the default 2 GiB that is 13 running and 13 waiting; under gVisor the reserve
+lowers the watermark and the count. A command that finds the slots full waits in the queue up to
+30 s, then fails with exit 75 and a `capacity:` reason. A command that finds the queue full too, or
+cannot take the lock within 5 s, fails at once, before it takes the lock, with the same exit and
+reason. The slots answer the shape the guard cannot: 60 concurrent per-namespace reads, each under the 64 MiB floor,
+grew together by about 1 GiB in a second, faster than kills could follow.
+
+The admission is advisory. A session can run `/usr/local/libexec/kubectl` directly, and the shared
+directory is writable by every session user, so the guard is the boundary that holds either way. The
+admission reads the guard's memory figure and watermark from the guard's own module, so the two
+agree. When it cannot read them, or fails in any other way, it runs the command unchanged. A command
+that cannot take the lock waits for it in the kernel for up to 5 s, once, and is then refused: in a fan-out of 60 commands on two CPUs, the commands that ran unslotted after a lock
+timeout outgrew the shell.
+
+A2A session Pods under the cluster view run kubectl against the kube-proxy too, in a container
+limited to `A2A_SESSION_MEMORY_LIMIT` (2 GiB by default) with no guard running. The worker image's
+wrapper runs kubectl directly, with no admission, when the tier's largest read fits the Pod's memory
+limit (every default install), or for a command the admission never charges. Otherwise it execs
+the same admission, with three settings from its environment: its state in a directory the session
+user owns (`KUBECTL_ADMIT_RUN_DIR`), the guard loaded only as a library for its memory figure and
+watermark (`KUBECTL_ADMIT_GUARD_PATH`), and `KUBECTL_ADMIT_ON_BUSY=run`. With `run`, a command the
+Pod finds busy waits up to the admission's wait (`ADMIT_WAIT_SECONDS`), then runs anyway,
+unslotted, and the event log records it as `ran-busy`; it is never refused for being busy. Only a
+read larger than the Pod could ever hold is refused, with exit 3. The sandbox's wrapper unsets
+these three settings, so a sandbox session cannot use them. The tier comes from `KUBEAGENTS_KUBECTL_COST_TIER`,
+which the operator passes to the gateway and the gateway to each session Pod, both checking it is a
+plain lowercase word.
+
 ### Running the sandbox under gVisor
 
 `harness.experimental.shellSandbox.runtimeClassName` puts the sandbox pod on a sandboxed
@@ -1349,7 +1473,7 @@ the model can rename it aside and put its own in its place until the next start.
 `/opt/vcs/libexec/platform` is the second copy, root-owned and mode 0755, and it is the
 one a caller that logs in as `hermes` runs: the pull-request and issue crons forward a
 forge verb into this container rather than holding a forge CLI themselves, the Cluster
-Agent reconcile sends its GKE reads to `gke_cluster_reads.py` here, and running
+Agent reconcile and stall_watch send their GKE reads to `gke_cluster_reads.py` here, and running
 the data volume's copy over that session would hand the credential to whatever sits at
 that path. The read-only mount narrows that to the fallback, and the second copy stays
 as defence in depth. The whole import closure is staged, because `sys.path[0]` is the
@@ -2515,10 +2639,13 @@ are questions about this pod that a file in the other one cannot answer.
 
 Reading that as the general answer would be a mistake. It crosses what one
 notifier was already going to deliver, at one moment in a card's life, into a
-directory nothing else reads. The one other agent-side reader that crosses is
-`bootstrap_delivery.py`, which reads the file it posts, `INVENTORY.md`, and the three
+directory nothing else reads. Two other agent-side readers cross.
+`bootstrap_delivery.py` reads the file it posts, `INVENTORY.md`, and the three
 JSON files written beside it by name once its markers say a delivery is due, and lands
-nothing on disk. Every other
+nothing on disk. `get_first_run_report` in `platform_mcp_server.py` reads one of three
+fixed names (`INVENTORY.delivered.md`, `INVENTORY.md`, `INVENTORY.raw.md`) through
+`sandbox_exec.read_bytes` under a byte cap when a user asks what onboarding found, and
+lands nothing on disk either: the bytes go back as the tool's result. Every other
 agent-side reader still looks on the gateway's volume and still finds nothing, and
 generalising either — a tool the model can call to bring a file across on demand,
 with a landing directory that persists past a single delivery — is a decision about
@@ -2675,8 +2802,9 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, when the next stack takes Google Chat, the A2A gateway's, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
+the same listener, on every install the A2A gateway's, the A2A MCP server's own
+ServiceAccount unless `A2A_MCP_DOOR=false` (and while this `PlatformAgent` controls it), under
+the operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
@@ -2696,7 +2824,10 @@ had and nothing checked. The same table carries a third role, `a2a-chat`, for th
 gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
 role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
-apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+apart from the legacy chat one. It is bound to its caller as the session role is, below:
+`CREDENTIAL_PROXY_A2A_CHAT_CALLERS` names the A2A gateway's own ServiceAccount, which may present
+only the a2a-chat audience, or the a2a-reports audience when `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names it too, and no other caller may present that audience; with the list empty,
+as from an operator that doesn't render it, the audience alone decides. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
 (the `profile` and `scope` roles, below, reach it too), and
@@ -2709,17 +2840,47 @@ Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
 ([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). With the
-A2A MCP server on, a fifth, `mcp`, is the MCP pod's: its token is minted for
-`kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
+A2A MCP server on (the default unless `A2A_MCP_DOOR=false`), a fifth, `mcp`, is the MCP
+pod's: its token is minted for `kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
 admits `proposal-view` only, checked on the normalised verb before the body is read, with that
 verb's managed-repository check still applying. It is bound the same way:
 `CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
 the mcp audience, and no other caller may present it; with the list empty, nobody holds the
-role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. Under
-`mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
+role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. On
+every install, `a2a-reports` is the A2A gateway's audit-report reader: its token is minted for
+`kubeagents-credential-proxy-a2a-reports`, it reaches `/v1/audit-reports` alone, and there only
+`GET /v1/audit-reports/{audit_id}/publish/latest` and `GET .../publish/runs/{ts}` of any audit:
+it sends the reserved word `publish`, and the broker relays it as the install's publish key
+(`no_forge%2Flocal` when there is none). Any real key from it, listing, the run index, writes and
+deletes are refused, and no other role's `publish` is resolved. It
+is bound both ways: `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names the gateway's ServiceAccount, no
+other caller may present the audience, and that account may present only this audience or the
+`a2a-chat` one, whose token the same pod holds ([fleet-audit-report-store.md](fleet-audit-report-store.md)
+§3). With
+an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
-allowlist. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
+allowlist. `/v1/vcs/` admits it too, and every verb there needs a valid task credential:
+`ROLE_VCS_VERBS` gives it the reads (`clone`, `proposal-view`, `proposal-list`,
+`proposal-commits`, `branch-view`, `identity`, `issue-list`, `issue-view`) and three writes,
+`publish`, `proposal-create` and `proposal-update`. Those three also need the
+`vcs:proposal-create` permit in the credential, which the dispatcher mints only for a
+submission that asked for a change. Both checks run before the body is read, and the managed
+list still bounds which repository any verb reaches. Under the permit, `proposal-update`
+reaches only a proposal the install opened from its own `platform-agent/` branch in this
+repository, `publish` only a `platform-agent/` branch, and onto one carrying open proposals
+only when they are all the install's, and `proposal-create` only from the install's own
+`platform-agent/` branch of this repository, each named by its bare branch name (rule
+`caller.vcs-ownership`). Beyond the install's own, each write reaches only what the same task
+made: a branch it published while the name was free on the remote, and a proposal it opened
+(`PROPOSAL_NOT_THIS_TASKS`, same rule), from a record the one stateful broker pod keeps in
+memory and loses on a restart, which refuses rather than permits. A profile `proposal-update` changes only the title and body; a
+label edit is refused under `caller.vcs-labels`. A profile `issue-list` may not widen its
+search past the managed repository: a `query` that is not plain words (a `:`, quote,
+backslash or parenthesis, or `OR`, `AND` or `NOT` as a word), or a quote or backslash in a
+label name, is refused under `caller.vcs-query`. A profile `identity` with no repository answers the
+managed repositories' names, read-only, and nothing else. The shell is held to none of this. No
+other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in
 `X-Kube-Agents-Task-Credential`, bound to the caller's pod, and is confined to that
@@ -2729,7 +2890,7 @@ credential's cluster and project. Profile calls together hold at most
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
-The scope publisher Job under `mode: next` has a role of its own, `scope`:
+The scope publisher Job has a role of its own, `scope`:
 its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
 `CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
 `ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token

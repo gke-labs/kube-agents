@@ -3176,6 +3176,13 @@ def test_tool_called_still_reads_a_key_a_cut_name_cannot_complete():
     assert _verdicts() == ("pass", "fail")
 
 
+def test_tool_called_reads_a_clip_marker_inside_a_value_as_text():
+    # The command itself printed a clipped record; the pod's own marker ends the string.
+    head = '{"command": "echo ...[clipped 5 chars] done", "x": "' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("pass", "fail")
+
+
 def test_tool_called_leaves_a_scalar_json_refuses_unread():
     head = '{"timeout": 030, "command": "' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
@@ -4736,6 +4743,51 @@ def test_finding_objects_mirrors_the_renderers_reader():
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", excerpt=where)),
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{row}"), finding_ids=named),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n", finding_ids=named),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "no-memory-limit",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "default-sa-automount",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                        "remediation": {
+                            "note": (
+                                f"{renderer.SHARED_ACCOUNT_SHIELD_PREFIX}"
+                                " `Deployment/other` (org/repo:notes/sa.md) — "
+                                "kept `kind: manual` so the namespace-wide ServiceAccount patch is not proposed."
+                            )
+                        },
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"),
         _ledger_body(
             findings="#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
@@ -5498,6 +5550,51 @@ def test_a_rename_away_from_a_kept_path_is_a_change_to_it(token, github):
     assert _pr_check(unchanged_paths=_KEPT).verify(5.0).status == "fail"
 
 
+def test_files_read_under_a_rate_limit_name_the_limit_not_a_permission(token, github):
+    """#6105: a pull request's files answered with the installation's limit
+    used to read as "needs `pull_requests: read`"; the reason names the limit."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (
+        403, {"message": "API rate limit exceeded for installation ID 157029058."}
+    )
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_rate_limit_reason_reads_the_reads_headers(monkeypatch):
+    """A 403 whose body names no limit but whose headers do (no budget left)
+    is a limit; with neither, there is no limit reason."""
+    verifiers._last_forge_error_headers.set({"X-RateLimit-Remaining": "0"})
+    assert "rate-limited" in verifiers._rate_limit_reason(403, {"message": "Forbidden"}, "x")
+    verifiers._last_forge_error_headers.set(None)
+    assert verifiers._rate_limit_reason(403, {"message": "Resource not accessible by integration"}, "x") is None
+
+
+def test_a_nan_header_waits_as_if_absent(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100"}) == 101.0
+
+
+def test_a_429_on_the_commits_page_names_the_limit(token, github):
+    """A 429 that outlasts the wait on `_head_push`'s commits page used to
+    fall through to "unexpected GitHub response 429"; it names the limit,
+    as every other grading read does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (429, {"message": "Too many requests"})
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason, res.reason
+    assert "unexpected GitHub response" not in res.reason
+
+
 def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())
@@ -5506,6 +5603,44 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+# ---- body_contains: the description carries the evidence (#4966)
+
+_EVIDENCE_PHRASES = ["## Evidence", "**Verify after merge:**"]
+
+
+def test_a_pull_request_whose_description_lacks_the_evidence_is_a_fail(token, github):
+    """The one-line body of #4966 passes every other clause."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        {**_pr_payload(), "body": "Applies a PDB (minAvailable: 1) for the checkout deployment."},
+    )
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "fail"
+    assert "'## Evidence'" in res.reason and "body_contains" in res.reason
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_pull_request_with_no_description_is_a_fail_under_body_contains(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": None})
+    _pr_head_routes(github)
+    assert _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0).status == "fail"
+
+
+def test_a_pull_request_carrying_the_evidence_passes(token, github):
+    _stash_pr_report()
+    body = (
+        "Adds a PDB.\n\n## Evidence\n\n**Finding:** no PDB\n\n"
+        "**Verify after merge:**\n\n```bash\nkubectl get pdb -A\n```\n"
+    )
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": body})
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "pass", res.reason
 
 
 # ---- changed_paths_only: an allowlist gates every sibling manifest and IaC path
@@ -5942,7 +6077,7 @@ def test_a_field_path_is_checked_when_the_case_loads():
 
 
 def test_an_added_file_is_read_from_the_listing_alone(token, github):
-    """The grading credential has no `contents: read`; a file the pull request
+    """The check makes no `/contents` read; a file the pull request
     adds is whole in its patch, so nothing else is fetched."""
     _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
@@ -7100,6 +7235,156 @@ def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeyp
     finally:
         verifiers._forge_unavailable.reset(token)
     assert seen == [(noted, "answered 429")]
+
+
+def _ci_grading_token(monkeypatch, tmp_path) -> str:
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    (tmp_path / "t").write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
+    return forges.read_token(forges.forge_name())
+
+
+def _limited_then(answers):
+    """A fake _http_get_json that plays answers in order, each (status,
+    payload, headers), setting the headers as the real one does for an error."""
+    remaining = list(answers)
+
+    def get(url, tok, timeout):
+        status, payload, headers = remaining.pop(0)
+        if status // 100 != 2:
+            verifiers._last_forge_error_headers.set(headers)
+        return status, payload
+
+    return get
+
+
+_INSTALLATION_LIMIT = {"message": "API rate limit exceeded for installation ID 157029058."}
+
+
+def test_a_grading_read_waits_out_the_installation_limit_until_its_reset(monkeypatch, tmp_path):
+    """#6105: the shared installation's limit answers a 403 with no
+    Retry-After and an X-RateLimit-Reset minutes away; the read waits until
+    then and answers what the read after the reset says, noting nothing."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([
+        (403, _INSTALLATION_LIMIT, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}),
+        (200, [], None),
+    ]))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0) == (200, [])
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert slept == [121.0]
+    assert seen == []
+
+
+def test_a_limit_that_outlasts_the_budget_answers_as_transient(monkeypatch, tmp_path):
+    """The wait is bounded: past the budget the read answers the 403, noted
+    transient, so the check reads as the forge's weather, and the process
+    has waited exactly the budget."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "150")
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, _INSTALLATION_LIMIT, {"Retry-After": "60"})] * 10))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0)[0] == 403
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert slept == [60.0, 60.0, 30.0]
+    assert seen == [(True, "answered 403")]
+
+
+def test_a_local_token_and_a_permission_403_never_wait(monkeypatch, tmp_path):
+    """Only the CI grading token waits: a local token can be the agent's own.
+    And a 403 that names no limit is a permission, answered at once."""
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    monkeypatch.delenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, raising=False)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, _INSTALLATION_LIMIT, {"Retry-After": "60"})]))
+    assert verifiers._forge_get_json("https://api.github.com/x", "ghp_personal", 1.0)[0] == 403
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, {"message": "Resource not accessible by integration"}, {})]))
+    assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0)[0] == 403
+    assert slept == []
+
+
+def test_a_secondary_limit_with_budget_left_waits_the_default_not_the_reset(monkeypatch):
+    """#6177: X-RateLimit-Reset is when the hourly budget returns, so it is
+    the wait only when that budget is spent; a secondary limit with budget
+    left waits the default, not up to a slice."""
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "3000"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}) == 121.0
+
+
+def test_a_token_renewal_during_the_wait_does_not_stop_it(monkeypatch, tmp_path):
+    """#6177: the job renews the grading token file every 40 minutes. A
+    renewal while the read waits must not make the next pass read the sent
+    token as someone else's and stop waiting."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+
+    def renew_while_sleeping(_seconds):
+        (tmp_path / "t").write_text("ghs_renewed\n")
+
+    monkeypatch.setattr(verifiers.time, "sleep", renew_while_sleeping)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (200, [], None),
+    ]))
+    assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0) == (200, [])
+
+
+def test_a_gitlab_limit_is_named_as_gitlabs(monkeypatch):
+    """#6177: only GitHub's evals repositories share one installation, so a
+    GitLab 429 names GitLab and not the shared budget."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "gitlab")
+    verifiers._last_forge_error_headers.set(None)
+    reason = verifiers._rate_limit_reason(429, None, "the issue")
+    assert reason.startswith("GitLab rate-limited")
+    assert "installation" not in reason
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    assert "installation" in verifiers._rate_limit_reason(429, None, "the issue")
+
+
+def test_a_past_reset_waits_the_floor_and_an_infinite_budget_is_capped(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "inf")
+    assert verifiers._forge_rate_limit_budget() == verifiers._FORGE_RATE_LIMIT_BUDGET_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "0")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == 0
+
+
+@pytest.mark.parametrize(
+    "status, payload, headers, limited",
+    [
+        (429, None, None, True),
+        (403, _INSTALLATION_LIMIT, None, True),
+        (403, {"message": "You have exceeded a secondary rate limit."}, None, True),
+        (403, None, {"X-RateLimit-Remaining": "0"}, True),
+        (403, None, {"Retry-After": "5"}, True),
+        (403, {"message": "Resource not accessible by integration"}, {"X-RateLimit-Remaining": "4000"}, False),
+        (404, _INSTALLATION_LIMIT, None, False),
+    ],
+)
+def test_what_reads_as_a_rate_limit(status, payload, headers, limited):
+    assert verifiers.is_rate_limit_answer(status, payload, headers) is limited
 
 
 def test_a_handled_issues_404_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
@@ -8291,9 +8576,16 @@ def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, fa
 
 
 _WEBHOOK_RUN = "the-readiness-run-happened"
-# The route objective's whole check, the run it requires and the hand survey it forbids, so the
-# table below exercises both halves as the case runs them.
-_WEBHOOK_RUN_CHECK = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+# The route objective is two members under `all`. The first reads the card log's rows: the run it
+# requires and the hand survey it forbids, and the table below exercises both halves on rows. The
+# second reads the same forbidden survey on each worker call as typed; the tests further down grade
+# the two together, as the case runs them.
+_WEBHOOK_RUN_ENTRY = next(e for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+# Read by what each member holds, so that a changed case fails its pin test below and not the
+# import of this file.
+_WEBHOOK_RUN_MEMBERS = _WEBHOOK_RUN_ENTRY["check"].get("checks") or [_WEBHOOK_RUN_ENTRY["check"]]
+_WEBHOOK_RUN_CHECK = next(m for m in _WEBHOOK_RUN_MEMBERS if m.get("required_runs"))
+_WEBHOOK_TYPED_CHECK = next((m for m in _WEBHOOK_RUN_MEMBERS if m.get("after_result_pattern") is not None), {})
 _WEBHOOK_RUNS = _WEBHOOK_RUN_CHECK["required_runs"]
 _SCRIPT_PATH = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py"
 _SCRIPTS_DIR = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts"
@@ -8543,9 +8835,402 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
             WorkerRun(**bad)
 
 
+def test_shell_argvs_reads_a_substitution_mark_text_on_a_line_with_no_substitution():
+    """The reader marks a substitution inside the line with NUL, ``S``, an index, NUL. A line
+    that holds that text and no substitution raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00S0\x00") == [["echo", "\x00S0\x00"]]
+    # the same text in quotes, inside a word, behind an escape, and with an index that fits no list
+    assert _shell_argvs("echo '\x00S0\x00' \"\x00S1\x00\" a\x00S2\x00b") == [["echo", "\x00S0\x00", "\x00S1\x00", "a\x00S2\x00b"]]
+    assert _shell_argvs("echo \\\x00S0\x00") == [["echo", "\x00S0\x00"]]
+    assert _shell_argvs("echo \x00S9999999999999999999999\x00") == [["echo", "\x00S9999999999999999999999\x00"]]
+    # in a span that the line leaves open, and in the command line that a substitution or a shell runs
+    assert _shell_argvs("echo $(date \x00S0\x00") == [["echo", "$(date", "\x00S0\x00"]]
+    assert _shell_argvs("echo $(echo \x00S0\x00)") == [["echo", "$(echo \x00S0\x00)"], ["echo", "\x00S0\x00"]]
+    assert _shell_argvs("bash -c 'echo \x00S0\x00'")[-1] == ["echo", "\x00S0\x00"]
+
+
+def test_shell_argvs_reads_an_operator_mark_text_on_a_line_with_no_operator():
+    """The operator mark is NUL, ``O``, an index, NUL, as a word of its own. A line that holds
+    that word and no operator raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00O0\x00 x") == [["echo", "\x00O0\x00", "x"]]
+    assert _shell_argvs("eval echo \x00O0\x00 x")[-1] == ["echo", "\x00O0\x00", "x"]
+    # a NUL character alone, and the text of the reader's own literal mark, stay as they are
+    assert _shell_argvs("echo \x00 \x00N\x00") == [["echo", "\x00", "\x00N\x00"]]
+
+
+def test_shell_argvs_reads_a_mark_text_with_a_valid_index_as_text():
+    """With a substitution or an operator on the line, the same text has an index that exists.
+    It read as that substitution or that operator, so the words were not the words of the line."""
+    from kube_agents_bench.shell_words import _ShellOperator, _shell_argvs, _shell_words_and_spans
+
+    # was: the second `$(date)` in the place of the text
+    assert _shell_argvs("echo $(date) \x00S0\x00") == [["echo", "$(date)", "\x00S0\x00"], ["date"]]
+    # was: a `;` in the place of the text, so `echo` and `x` were two commands
+    assert _shell_argvs("echo a; echo \x00O0\x00 x") == [["echo", "a"], ["echo", "\x00O0\x00", "x"]]
+    # was: a second `>` with no target, which is a line that the reader refuses
+    words, _ = _shell_words_and_spans("ls > out \x00O0\x00")
+    assert words == ["ls", ">", "out", "\x00O0\x00"]
+    assert [isinstance(word, _ShellOperator) for word in words] == [False, True, False, False]
+
+
+def test_shell_argvs_refuses_command_lines_nested_past_the_limit():
+    """The reader calls itself for each command line inside a line (after an `eval`, behind a
+    shell's `-c` flag, in a substitution). About 1,000 levels raised RecursionError, and a
+    verifier that read such a line ended with a traceback. The reader now raises its own error
+    at a limit, after 17 reads at most: the 17th level, or the budget of a long line (#6552)."""
+    from kube_agents_bench.shell_words import _MAX_COMMAND_LINE_NESTING, ShellReadLimitError, _shell_argvs
+
+    assert _MAX_COMMAND_LINE_NESTING == 16
+    depth = sys.getrecursionlimit() + 200
+    for line in (
+        "eval " * depth + "python3 f.py --readiness",
+        "echo " + "$(echo " * depth + "$(python3 f.py --readiness)" + ")" * depth,
+        "cat " + "<(cat " * depth + "f" + ")" * depth,
+        "bash -c '" + "eval " * depth + "x'",
+    ):
+        with pytest.raises(ShellReadLimitError, match="more than 16 levels|more reading than"):
+            _shell_argvs(line)
+
+
+def test_shell_argvs_reads_sixteen_levels_and_refuses_the_next_one():
+    from kube_agents_bench.shell_words import ShellReadLimitError, _shell_argvs
+
+    argvs = _shell_argvs("eval " * 16 + "python3 f.py --readiness")
+    assert len(argvs) == 17 and argvs[-1] == ["python3", "f.py", "--readiness"]
+    argvs = _shell_argvs("echo " + "$(echo " * 15 + "$(python3 f.py --readiness)" + ")" * 15)
+    assert argvs[-1] == ["python3", "f.py", "--readiness"]
+    with pytest.raises(ShellReadLimitError, match="more than 16 levels"):
+        _shell_argvs("eval " * 17 + "python3 f.py --readiness")
+    with pytest.raises(ShellReadLimitError, match="more than 16 levels"):
+        _shell_argvs("echo " + "$(echo " * 16 + "$(python3 f.py --readiness)" + ")" * 16)
+
+
+def test_shell_argvs_refuses_a_short_line_whose_reading_doubles_at_each_level():
+    """A substitution inside an `eval` word is read two times: as a span of the line and again in
+    the line that `eval` runs. Twenty such levels are a line of 166 characters, and the reader
+    worked on it for about half a minute and gave four million argvs. It now stops at a limit."""
+    from kube_agents_bench.shell_words import ShellReadLimitError, _shell_argvs
+
+    line = "eval " + "$(eval " * 20 + "x" + ")" * 20
+    assert len(line) == 166
+    with pytest.raises(ShellReadLimitError):
+        _shell_argvs(line)
+
+
+def test_shell_argvs_refuses_a_line_that_needs_more_reading_than_its_budget():
+    """Inside 16 levels the same doubling still multiplies the reading. The reader has a budget
+    of characters for one typed line (6 times its length and 65,536 more); each command line
+    that it reads costs its length and 16 more."""
+    from kube_agents_bench.shell_words import ShellReadLimitError, _shell_argvs
+
+    payload = "python3 f.py --readiness " + "x" * 2000
+    line = "eval " + "$(eval " * 7 + payload + ")" * 7
+    with pytest.raises(ShellReadLimitError, match="more reading than"):
+        _shell_argvs(line)
+    # the same shape with a short payload stays inside the budget and is read
+    argvs = _shell_argvs("eval " + "$(eval " * 7 + "python3 f.py --readiness" + ")" * 7)
+    assert ["python3", "f.py", "--readiness"] in argvs
+
+
+def test_worker_commands_is_an_error_when_a_line_past_the_readers_limit_can_hold_the_run():
+    """A line past the shell reader's limit has no argvs. A required run that no readable line
+    made, or a forbidden run that no readable line made, can be on that line: not a pass and not
+    a fail. The rule is the one for a capture with gaps."""
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    for nested in ("eval " * (sys.getrecursionlimit() + 200) + "python3 f.py --readiness", "eval " * 17 + "python3 f.py --readiness"):
+        # the first line is the one that gave RecursionError and a traceback before
+        _stash_commands([nested, "cat README.md"])
+        for runs in ({"required_runs": [f_py]}, {"forbidden_runs": [f_py]}, {"required_runs": [{"script": "g.py"}], "forbidden_runs": [f_py]}):
+            res = WorkerCommandsVerifier(type="worker_commands", **runs).verify(5.0)
+            assert res.status == "error" and not res.success, res.reason
+            assert "past the shell reader's limit (more " in res.reason and "eval eval" in res.reason, res.reason
+            assert "could not be evaluated" in res.reason, res.reason
+        # a check with patterns only reads no argv, so it stays evaluable on the same line
+        res = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"cat README"], forbidden_patterns=[r"kubectl delete"]).verify(5.0)
+        assert res.status == "pass", res.reason
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"f\.py --readiness"]).verify(5.0)
+        assert res.status == "fail", res.reason
+    # the unread line alone: the required run was not read, so the check cannot pass
+    _stash_commands(["eval " * 17 + "python3 f.py --readiness"])
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0).status == "error"
+
+
+def test_worker_commands_keeps_a_conclusive_result_beside_a_line_past_the_readers_limit():
+    """What was read is conclusive, whatever a line past the limit holds."""
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    nested = "eval " * 17 + "echo x"
+    _stash_commands([nested, "kubectl delete pod x", "python3 f.py --readiness"])
+    # a forbidden pattern that a readable line matched: a fail, as before the limit
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], forbidden_patterns=[r"kubectl delete"]).verify(5.0)
+    assert res.status == "fail" and "forbidden pattern(s) matched" in res.reason, res.reason
+    # a required run that a readable line made: a pass
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+    assert res.status == "pass", res.reason
+    # a forbidden run that a readable line made: a fail
+    res = WorkerCommandsVerifier(type="worker_commands", forbidden_runs=[f_py]).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # a missing required pattern is read from the text, so it is a fail beside the unread line
+    res = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py clone"], required_runs=[{"script": "g.py"}]).verify(5.0)
+    assert res.status == "fail" and "required pattern(s)" in res.reason, res.reason
+    # a line that an exemption takes out of the required list is not read for the required runs
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], exempt_patterns=[r"eval eval"]).verify(5.0)
+    assert res.status == "fail" and "no worker command ran g.py" in res.reason, res.reason
+    # with each command of the required list read, the missing run is a fail whatever the typed
+    # line past the limit holds: a forbidden run there would be a fail too
+    _stash_commands([nested, "cat README.md"])
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], forbidden_runs=[f_py], exempt_patterns=[r"eval eval"]).verify(5.0)
+    assert res.status == "fail" and "no worker command ran g.py across 1 command(s)" in res.reason, res.reason
+    # beside a conclusive failure, the reason does not say for sure that the run was not made
+    _stash_commands(["eval " * 17 + "python3 g.py", "kubectl delete pod x"])
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], forbidden_patterns=[r"kubectl delete"]).verify(5.0)
+    assert res.status == "fail" and "forbidden pattern(s) matched" in res.reason, res.reason
+    assert "no worker command ran g.py across 2 command(s) (a command past the shell reader's limit was not read)" in res.reason, res.reason
+
+
+def test_worker_commands_a_capture_with_gaps_keeps_its_own_error_beside_a_line_past_the_limit():
+    """With `after_result_pattern` and a capture that recorded gaps, the check is an error for
+    the gaps whatever the line past the limit holds, and the reason names the gaps."""
+    entries = [_terminal("eval " * 17 + "echo x", at=1), _terminal("kubectl get deploy kube-dns", at=2)]
+    transcript.set("ok", _TRAJECTORY + entries, worker_capture_gaps=["card t_9: locked"])
+    check = WorkerCommandsVerifier(
+        type="worker_commands", after_result_pattern=r"kubernetes\.read-only", required_runs=[{"script": "g.py"}], forbidden_patterns=[r"kubectl delete"]
+    )
+    res = check.verify(5.0)
+    assert res.status == "error" and "card t_9: locked" in res.reason and "shell reader's limit" not in res.reason, res.reason
+    # the same capture with no gaps: the line past the limit is the reason
+    transcript.set("ok", _TRAJECTORY + entries)
+    res = check.verify(5.0)
+    assert res.status == "error" and "past the shell reader's limit" in res.reason, res.reason
+
+
+_DELETE = "gcloud compute firewall-rules delete allow-all --quiet"
+_NO_DELETE = {"forbidden_runs": [{"script": "gcloud", "word_patterns": ["^compute$", "^delete$"]}]}
+
+
+def _typed_calls(*commands, **stash):
+    """Worker calls of a card with no log row: the verifier reads them as typed."""
+    transcript.set("ok", _TRAJECTORY + [_terminal(command, at=index) for index, command in enumerate(commands, 1)], worker_commands=[], **stash)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        _DELETE + "\ncat <<EOF > notes.txt\nDon't forget the rule\nEOF",
+        _DELETE + "\ncat <<'EOF' > notes.txt\nsay \"hello\nEOF",
+        "echo $'it\\'s done'; " + _DELETE,
+        _DELETE + "\necho 'oops",
+        "cat <<EOF > a.txt\nDon't forget\nEOF\n" + _DELETE + "\ncat <<EOF > b.txt\nit can't wait\nEOF",
+    ],
+)
+def test_worker_commands_reads_a_forbidden_run_in_a_call_that_the_first_read_does_not_split(call):
+    """bash runs the write in each call. The reader's first read gave no words for the call
+    (or, in the last one, words without the write), and the forbidden run passed."""
+    _typed_calls(call)
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # the same check with a window that each call is in
+    res = WorkerCommandsVerifier(type="worker_commands", after_result_pattern="(?!)", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail", res.reason
+
+
+def test_worker_commands_is_an_error_when_a_part_that_the_reader_refuses_can_hold_the_run():
+    """An open quote on the line of the write: the reader gives no argv for that line, and it
+    cannot tell if bash refuses the line too. A forbidden run can be there: not a pass and not a
+    fail."""
+    refused = _DELETE + " && echo 'oops"
+    _typed_calls("ls", refused)
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert "the shell reader refuses a part of worker command" in res.reason and "a run of gcloud" in res.reason, res.reason
+    assert "could not be evaluated" in res.reason, res.reason
+    # a card log row joins the lines of a call, so a heredoc with an odd apostrophe is refused there
+    _stash_commands(["cat <<EOF > notes.txt Don't forget EOF " + _DELETE])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+    # a required run that no command made, with a refused part that has its words
+    _typed_calls("ls", "python3 f.py --readiness > 'out")
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+    assert res.status == "error" and "a run of f.py" in res.reason, res.reason
+    # a module run has the stem after `-m`
+    _typed_calls("python3 -m f --readiness > 'out")
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0).status == "error"
+    # a substitution that does not close for the reader, in a call with a heredoc inside it
+    _typed_calls("git commit -m \"$(cat <<'EOF'\nDon't break\nEOF\n)\"\n" + _DELETE)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+    # a check with patterns only reads no argv, so it stays evaluable
+    _typed_calls("ls", refused)
+    assert WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"kubectl delete"]).verify(5.0).status == "pass"
+    assert WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"firewall-rules\s+delete"]).verify(5.0).status == "fail"
+
+
+@pytest.mark.parametrize(
+    "refused",
+    [
+        "echo 'oops",
+        # the script's name inside a longer word, or as text with no run's words beside it
+        "tar czf out.tgz 'my-gcloud-notes",
+        "echo 'the image is old; compute the delete list",
+        "echo 'do not use gcloud here",
+        # a read of the same script: the part has no word for `^delete$`
+        "gcloud compute firewall-rules list --format='json",
+    ],
+)
+def test_worker_commands_reads_past_a_refused_part_that_cannot_hold_the_run(refused):
+    """A run is an argv with the script as a word and a word for each word pattern. A refused
+    part without those words cannot hold the run, so the check is evaluated on what was read."""
+    _typed_calls("ls", refused)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    # the same for a card log row with a heredoc that has an odd apostrophe
+    _stash_commands(["cat <<EOF > n.md It's fine EOF " + refused.replace("'", "")])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+
+
+def test_worker_commands_finds_the_words_of_a_run_in_a_refused_part():
+    # a required run: the script and each flag are words of the part
+    _typed_calls("ls", "echo 'oops")
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "f.py"}]).verify(5.0)
+    assert res.status == "fail" and "no worker command ran f.py" in res.reason, res.reason
+    _typed_calls("echo 'do not forget f.py")
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0).status == "fail"
+    # the words count with the quoting characters and the line continuations off
+    for spelled in ("g'c'loud compute firewall-rules delete x && echo 'oops", "gcl\\\noud compute firewall-rules delete x && echo 'oops", "/usr/bin/gcloud compute firewall-rules delete 'x"):
+        _typed_calls(spelled)
+        assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error", spelled
+    # the limit: a run that reaches the script through a variable is not found, as in a part
+    # that was read
+    _typed_calls("G=gcloud; $G compute firewall-rules delete 'x")
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+
+
+def test_worker_commands_keeps_a_conclusive_result_beside_a_refused_part():
+    """What was read is conclusive, whatever a refused part holds."""
+    refused = _DELETE + " && echo 'oops"
+    _typed_calls(refused, _DELETE)
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    _typed_calls("python3 f.py > 'out", "python3 f.py")
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "f.py"}]).verify(5.0).status == "pass"
+    # a missing required pattern is read from the text, so it is a fail beside the refused part
+    _typed_calls(refused)
+    res = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py clone"], **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "required pattern(s)" in res.reason, res.reason
+    # a capture with gaps keeps its own error
+    _typed_calls(refused, worker_capture_gaps=["card t_9: locked"])
+    res = WorkerCommandsVerifier(type="worker_commands", after_result_pattern="(?!)", **_NO_DELETE).verify(5.0)
+    assert res.status == "error" and "card t_9: locked" in res.reason and "shell reader refuses" not in res.reason, res.reason
+
+
+def _clipped(command):
+    """A worker call whose arguments the pod's clip cut, with the clip's mark at the end."""
+    raw = json.dumps({"command": command})
+    return _terminal(None, args={"raw": raw[:2000] + f" ...[clipped {len(raw) - 2000} chars]"})
+
+
+def test_worker_commands_reads_a_clipped_command_as_if_its_open_quote_closed_at_the_cut():
+    """The pod's clip cuts a long command, often inside a quoted value. The commands before the
+    cut are read, and the command at the cut is read as if the quote closed there. What the
+    clip removed is not reported: a forbidden run in the cut tail still passes."""
+    long_value = "x " * 1100
+    # the cut is inside the quoted value of a harmless command: nothing to report
+    transcript.set("ok", _TRAJECTORY + [_clipped("ls -l\necho '" + long_value + "'\n" + _DELETE)], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    # a forbidden run before the cut: the first read gave no words for the whole call
+    transcript.set("ok", _TRAJECTORY + [_clipped(_DELETE + "\necho '" + long_value + "'")], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # the forbidden run is the command at the cut, and the cut is inside its quoted value
+    transcript.set("ok", _TRAJECTORY + [_clipped(_DELETE + ' --description "' + long_value + '"')], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # a required run at the cut gets its credit
+    transcript.set("ok", _TRAJECTORY + [_clipped("python3 f.py --readiness --note '" + long_value + "'")], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "f.py", "flags": ["--readiness"]}]).verify(5.0).status == "pass"
+    # a part that the worker left open before the cut is the worker's own: the error rule holds
+    own = 'bash -c "' + _DELETE + " && echo 'oops\"\necho '" + long_value + "'"
+    transcript.set("ok", _TRAJECTORY + [_clipped(own)], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+
+
+def test_worker_commands_reports_a_clipped_command_that_a_closing_quote_does_not_make_whole():
+    """A cut inside a substitution, or inside two quotes, leaves a part that one closing quote
+    does not make whole. The part is text that the capture holds, so a forbidden run in it is
+    read or is an error; it does not pass."""
+    long_value = "x " * 1100
+    # the forbidden run is the command at the cut, and the cut is inside a heredoc in a substitution
+    in_substitution = _DELETE + " --description \"$(cat <<'EOF'\n" + long_value + "\nEOF\n)\""
+    transcript.set("ok", _TRAJECTORY + [_clipped(in_substitution)], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # the cut is inside two quotes: the closing quote gives the shell's argv, not the run
+    transcript.set("ok", _TRAJECTORY + [_clipped('bash -lc "' + _DELETE + " --description '" + long_value + "'\"")], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "error" and "shell reader refuses" in res.reason, res.reason
+    # the same cut with no word of the run in the text that is left: nothing to report
+    transcript.set("ok", _TRAJECTORY + [_clipped("git commit -m \"$(cat <<'EOF'\n" + long_value + "\nEOF\n)\"")], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+
+
+def test_worker_commands_reads_an_execute_code_program_with_the_first_read_alone():
+    """A program is not a shell call. The verifier reads its text as shell lines, as before the
+    second read: no command of it is read in turn, and a part that the reader refuses is not
+    reported."""
+    program = "q = '\\''\n" + _DELETE
+    code = {"name": "execute_code", "args": {"code": program}, "result": "ok", "status": "completed", "agent": "platform", "task": "t_1", "session": "s_1", "at": 1.0}
+    transcript.set("ok", _TRAJECTORY + [code], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    # the same text as a terminal call has a refused part with the run's words
+    _typed_calls(program)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+    # a heredoc operator in a program opens no second read
+    shifted = "x = 1 << EOF\nit's\nEOF\n" + _DELETE
+    transcript.set("ok", _TRAJECTORY + [dict(code, args={"code": shifted})], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    _typed_calls(shifted)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "fail"
+
+
+def test_shell_argvs_keeps_the_order_of_the_commands_inside_a_line():
+    """A pin of the order of the commands inside a line (after an `eval`, behind a shell's `-c`
+    flag, in a substitution): a line's own segments first, then the commands inside each inner
+    line in turn, each inner line to its end before the next one. A substitution inside an
+    `eval` word or a `-c` word is read two times, so its commands are in the list two times."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("a 1; eval \"b $(c 2)\" 'x; y'; bash -c 'd; eval e \"$(f)\"' $(g `h 3`) <(i | j)") == [
+        ["a", "1"], ["eval", "b $(c 2)", "x; y"], ["bash", "-c", 'd; eval e "$(f)"', "$(g `h 3`)", "<(i | j)"],
+        ["b", "$(c 2)", "x"], ["y"], ["c", "2"], ["d"], ["eval", "e", "$(f)"], ["e", "$(f)"], ["f"], ["f"],
+        ["c", "2"], ["g", "`h 3`"], ["h", "3"], ["i"], ["j"]]  # fmt: skip
+    assert _shell_argvs("eval eval 'k; bash -c \"l && m\"'; n $(o $(p; q) `r`)") == [
+        ["eval", "eval", 'k; bash -c "l && m"'], ["n", "$(o $(p; q) `r`)"], ["eval", "k"], ["bash", "-c", "l && m"],
+        ["k"], ["l"], ["m"], ["o", "$(p; q)", "`r`"], ["p"], ["q"], ["r"]]  # fmt: skip
+    assert _shell_argvs("timeout 5 bash -lc 'eval \"s $(t)\"; u' && v \"$(w; eval x $(y))\"") == [
+        ["timeout", "5", "bash", "-lc", 'eval "s $(t)"; u'], ["v", "$(w; eval x $(y))"], ["eval", "s $(t)"], ["u"],
+        ["s", "$(t)"], ["t"], ["t"], ["w"], ["eval", "x", "$(y)"], ["x", "$(y)"], ["y"], ["y"]]  # fmt: skip
+
+
+def test_shell_argvs_keeps_a_nul_character_in_its_word():
+    """A pin of the reader's rule, not of a shell's: the worker's terminal tool passes the line
+    inside one argument of a shell's `-c` flag, and an argument cannot hold a NUL character, so
+    no shell reads such a line. The reader keeps the character in its word (#6552)."""
+    from kube_agents_bench.verifiers import WorkerRun, _argv_runs, _shell_argvs
+
+    assert _shell_argvs("ec\x00ho hi") == [["ec\x00ho", "hi"]]
+    run = WorkerRun(script="f.py", flags=["--readiness"])
+    # the character in the script's name or in the flag: the word is another word, so no run
+    assert not any(_argv_runs(argv, run) for argv in _shell_argvs("python3 f\x00.py --readiness"))
+    assert not any(_argv_runs(argv, run) for argv in _shell_argvs("python3 f.py --readiness\x00"))
+    # the character in another word: the run is still read, toward a finding for a forbidden run
+    assert any(_argv_runs(argv, run) for argv in _shell_argvs('python3 f.py --readiness --note "a\x00b"'))
+
+
 def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
     # The forbid, not the run reader, is what refuses a survey that stands beside the dictated
-    # run: with the survey the objective fails and names the pattern; without it, it passes.
+    # run: with the survey the rows member fails and names the pattern; without it, it passes.
     _stash_commands([f"python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json", "kubectl --context gke_p_l_seeded-b get pdb -A -o json"])
     res = WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0)
     assert res.status == "fail" and "forbidden run" in res.reason and "kubectl ran as" in res.reason, res.reason
@@ -8558,11 +9243,255 @@ def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
         WorkerRun(script="kubectl", word_patterns=["("])
 
 
+_ROUTE_RUN = f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/r.json"
+# The survey as a worker types it over several kubeconfigs: one call, four lines.
+_SURVEY_LOOP = 'for f in /data/kubeconfig_*.yaml; do\n  echo "=== $f ==="\n  kubectl --kubeconfig="$f" get pdb -A\ndone'
+
+
+def _as_row(command: str) -> str:
+    """A call as the card log shows it: on one line."""
+    return " ".join(command.split())
+
+
+def _route_objective(entries, rows=None) -> str:
+    """The whole objective as the case runs it, on the calls as typed and on the card log's rows
+    (each call on one line, unless `rows` names them)."""
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries] if rows is None else rows)
+    return VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status
+
+
+def test_the_route_objective_has_the_same_forbidden_survey_in_both_members():
+    assert _WEBHOOK_RUN_ENTRY["check"]["type"] == "all" and len(_WEBHOOK_RUN_MEMBERS) == 2
+    assert _WEBHOOK_TYPED_CHECK["forbidden_runs"] == _WEBHOOK_RUN_CHECK["forbidden_runs"]
+    assert set(_WEBHOOK_TYPED_CHECK) == {"type", "after_result_pattern", "forbidden_runs"}
+
+
+def test_the_route_objective_sees_a_survey_on_a_later_line_of_a_call():
+    # On the row the loop is one line and `kubectl` reads as a word of the `echo`. The rows
+    # member also reads the logged card's call as typed (#6106), as the typed member does: each
+    # line is an argv of its own.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=2)]
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "fail"
+    typed = WorkerCommandsVerifier(**_WEBHOOK_TYPED_CHECK).verify(5.0)
+    assert typed.status == "fail" and "kubectl ran as" in typed.reason, typed.reason
+    assert _route_objective(entries) == "fail"
+
+
+@pytest.mark.parametrize(
+    "calls, on_rows, verdict",
+    [
+        # the dictated run alone, and beside a kubectl that is not the survey
+        ([_ROUTE_RUN], "pass", "pass"),
+        ([_ROUTE_RUN, "for c in a b; do\n  kubectl --context $c get nodes\ndone"], "pass", "pass"),
+        # the survey on a later line, which the row does not show and the rows member reads in
+        # the card's typed call (#6106): in a loop, after an `echo`, after a `cd`, and on a line
+        # that a backslash continues
+        ([_ROUTE_RUN, _SURVEY_LOOP], "fail", "fail"),
+        ([_ROUTE_RUN, 'echo "webhooks next"\nkubectl get validatingwebhookconfigurations -o json'], "fail", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c describe pdb pinned-batch-runner -n seeded-upgrade"], "fail", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c \\\n  get pdb -A"], "fail", "fail"),
+        # the survey with no run at all: the rows member already fails it, on the missing run
+        ([_SURVEY_LOOP], "fail", "fail"),
+        # a mention on a later line is one word and no command
+        ([_ROUTE_RUN, 'cd /opt/data/scratch\ngrep -n "kubectl get pdb -A" notes.md'], "pass", "pass"),
+        ([_ROUTE_RUN, 'echo "next step"\necho "not running kubectl get validatingwebhookconfigurations"'], "pass", "pass"),
+        # Known limit of the typed member: a heredoc body is read line by line, so a survey line
+        # fails in a script that never ran and in a notes file alike. The rows member leaves a
+        # call with a heredoc on its row.
+        ([_ROUTE_RUN, "cat > /tmp/later.sh <<'EOF'\nkubectl get pdb -A\nEOF"], "pass", "fail"),
+        ([_ROUTE_RUN, "cat > /opt/data/scratch/notes.md <<'EOF'\nTo check by hand:\nkubectl get pdb -A\nEOF"], "pass", "fail"),
+        # Known limit: neither member reads a survey whose resource comes from a variable.
+        ([_ROUTE_RUN, "for r in pdb validatingwebhookconfigurations; do\n  kubectl get $r -A\ndone"], "pass", "pass"),
+    ],
+)
+def test_the_route_objective_reads_each_typed_line_as_a_command(calls, on_rows, verdict):
+    entries = [_terminal(command, at=index) for index, command in enumerate(calls, 1)]
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == on_rows, calls
+    assert _route_objective(entries) == verdict, calls
+
+
+def test_the_route_objective_does_not_read_a_survey_that_a_program_runs():
+    # Known limit: the typed read splits shell text into argvs; it does not read what a program
+    # in `execute_code` starts.
+    program = {"code": 'import subprocess\nsubprocess.run(["kubectl", "get", "pdb", "-A"])'}
+    entries = [_terminal(_ROUTE_RUN, at=1), {**_terminal("", at=2, args=program), "name": "execute_code"}]
+    _stash_terminal(entries, commands=[_as_row(_ROUTE_RUN)])
+    assert VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status == "pass"
+
+
+def test_the_route_objective_is_an_error_when_a_typed_call_has_no_time():
+    # Known limit: an untimed call makes the typed member `error`.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal("kubectl get nodes", at=None)]
+    assert _route_objective(entries) == "error"
+    # The rows member orders nothing, so it reads the untimed survey and its fail wins.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=None)]
+    assert _route_objective(entries) == "fail"
+
+
+def test_the_route_objective_sees_a_survey_the_row_shows_as_a_count():
+    # The card log shows a chain as its first command and a count; the typed call keeps the chain.
+    entries = [_terminal(f"{_ROUTE_RUN} && kubectl --context c get pdb -A", at=1)]
+    assert _route_objective(entries, rows=[f"{_ROUTE_RUN} + 1 command"]) == "fail"
+
+
+def test_the_route_objective_fails_a_typed_survey_that_the_terminal_refused():
+    # The typed read does not know whether a call ran: an attempt at the survey fails too.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, _REFUSAL, at=2)]
+    assert entries[1]["status"] == "error"
+    assert _route_objective(entries) == "fail"
+
+
+def test_the_route_objective_still_reads_a_survey_that_only_the_card_log_has():
+    entries = [_terminal(_ROUTE_RUN, at=1)]
+    assert _route_objective(entries, rows=[_as_row(_ROUTE_RUN), "kubectl --context c get pdb -A"]) == "fail"
+
+
+def test_the_route_objective_is_an_error_without_a_readable_typed_call():
+    # Known limit: with no tagged worker call the typed member cannot say that no survey ran,
+    # so the objective is `error` and not a pass, although the rows member passes.
+    _stash_commands([_as_row(_ROUTE_RUN)])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
+    assert VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status == "error"
+
+
 def test_worker_commands_required_run_names_what_did_not_run():
     _stash_commands(["kubectl get pdb -A", 'grep -rn "fleet_upgrade_report.py --readiness" /opt'])
     v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
     res = v.verify(5.0)
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+
+
+# ------------------------------- the checked-webhooks case's lines and its route
+#
+# upgrades-readiness-checked-webhooks-named asks which fail-closed webhooks the readiness check
+# tested and whether each backend answered: one fixed-form line per webhook. The planted gate's
+# line must say its backend is missing; one webhook line must say `ready`, on a line that names no
+# planted dead gate; and the route check is the failclosed-webhook case's, held equal here so that
+# case's route tables stand for both.
+
+_CHECKED_CASE = TASKS / "upgrades-readiness-checked-webhooks-named" / "task.yaml"
+_CHECKED_SPEC = yaml.safe_load(_CHECKED_CASE.read_text(encoding="utf-8"))
+_CHECKED_GATE = "the-gate-line-says-its-backend-is-missing"
+_CHECKED_LIVE = "a-webhook-whose-backend-answered-is-named"
+_CHECKED_ROUTE = "the-names-come-from-the-readiness-run"
+
+
+def _checked_verdict(objective: str, text: str) -> str:
+    check = next(e["check"] for e in _CHECKED_SPEC["verification_spec"] if e["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="checked-webhooks-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_CHECKED_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status
+
+
+def _checked_line(obj: str, backend: str, cluster: str = "seeded-b", kind: str = "webhook") -> str:
+    return f"{cluster}/{obj}: kind {kind}; backend: {backend}"
+
+
+_CHECKED_GATE_LINE = _checked_line("seeded-fail-closed-gate", "missing")
+# A fail-closed webhook with a Service backend on a GKE cluster (Managed Prometheus's operator).
+_CHECKED_LIVE_LINE = _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com", "ready")
+
+
+def test_the_checked_webhooks_route_is_the_failclosed_case_route():
+    route = next(e for e in _CHECKED_SPEC["verification_spec"] if e["name"] == _CHECKED_ROUTE)
+    assert route["check"] == _WEBHOOK_RUN_ENTRY["check"]
+    assert (route["role"], route["mode"]) == (_WEBHOOK_RUN_ENTRY["role"], _WEBHOOK_RUN_ENTRY["mode"])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _CHECKED_GATE_LINE + "\n" + _CHECKED_LIVE_LINE,
+        # the gate by its webhook, a live webhook on another cluster by its configuration kind, a
+        # closing stop the fold drops, prose between the lines
+        _checked_line("gate.seeded.invalid", "missing") + "\n\nThe Service it calls does not exist.\n" + _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com", "ready", cluster="seeded-a", kind="validatingwebhookconfiguration") + ".",
+        # several live webhooks on several clusters, and one left out: the check names none of them
+        "\n".join([_CHECKED_LIVE_LINE, _CHECKED_GATE_LINE, _checked_line("sidecar-injector.example.com", "ready", kind="mutatingwebhookconfigurations"), _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com", "ready", cluster="seeded-c")]),
+        # the gate's line with a closing stop, and the only ready line by its mutating configuration
+        _CHECKED_GATE_LINE + ".\n" + _checked_line("sidecar-injector.example.com", "ready", kind="mutatingwebhookconfiguration"),
+        # the webhook's own name after the configuration's, and a project before the cluster
+        _CHECKED_GATE_LINE + "\n" + _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com/validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com", "ready", cluster="eval-project/seeded-a"),
+        # the kind field in other words: the check reads it for the word webhook, not for its form
+        _CHECKED_GATE_LINE + "\n" + "seeded-a/gmp-operator.gmp-system.monitoring.googleapis.com/validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com: validating webhook; backend: ready",
+        "seeded-b/seeded-fail-closed-gate/gate.seeded.invalid: ValidatingWebhookConfiguration webhook; backend: missing\nseeded-c/gmp-operator.gmp-system.monitoring.googleapis.com: MutatingWebhookConfiguration webhook; backend: ready",
+        _CHECKED_GATE_LINE + "\n" + "seeded-d/gmp-operator.gmp-system.monitoring.googleapis.com: kind: webhook; backend: ready",
+        # slot b's other planted dead gate, where the fleet has it, with its backend missing
+        "\n".join([_CHECKED_GATE_LINE, _checked_line("seeded-crd-gate", "missing"), _CHECKED_LIVE_LINE]),
+        # a planted dead gate by its Service name with its backend missing: the forbids are for
+        # another value only
+        "\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-admission-gate", "missing"), _checked_line("nonexistent-crd-gate", "missing"), _CHECKED_LIVE_LINE]),
+        # a real name that starts with a digit, or with a refused word and a dot: the refusal is
+        # for a segment that is a refused word or a number, alone or before a hyphen or a space,
+        # not for a start that goes on with a letter or a dot
+        _CHECKED_GATE_LINE + "\n" + _checked_line("1password.example.com", "ready"),
+        _CHECKED_GATE_LINE + "\n" + _checked_line("each.example.com", "ready"),
+    ],
+)
+def test_the_checked_webhooks_lines_accepted(text):
+    assert (_checked_verdict(_CHECKED_GATE, text), _checked_verdict(_CHECKED_LIVE, text)) == ("pass", "pass"), text
+
+
+@pytest.mark.parametrize(
+    ("text", "gate", "live"),
+    [
+        # the dead gate alone: the answer of a report that names no webhook whose backend answered
+        (_CHECKED_GATE_LINE + "\n5 more fail-closed webhooks have a backend that answered.", "pass", "fail"),
+        # no line at all
+        ("The readiness check tested 6 webhooks on seeded-b.", "fail", "fail"),
+        # the gate written as ready: wrong for the gate, and not the ready line the second asks for
+        (_checked_line("seeded-fail-closed-gate", "ready"), "fail", "fail"),
+        # the gate hedged
+        (_checked_line("seeded-fail-closed-gate", "missing, probably") + "\n" + _CHECKED_LIVE_LINE, "fail", "pass"),
+        # a second line about the gate that contradicts the first
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("seeded-fail-closed-gate", "ready") + "\n" + _CHECKED_LIVE_LINE, "fail", "pass"),
+        # slot b's other planted dead gate written as ready, by configuration, webhook or Service
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("seeded-crd-gate", "ready"), "fail", "fail"),
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("crd-gate.seeded.invalid", "ready"), "fail", "fail"),
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("nonexistent-crd-gate", "ready"), "fail", "fail"),
+        # a ready line of another kind, and a webhook whose backend is not ready
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("inference-server", "ready", kind="pdb"), "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("warden-validating", "missing"), "pass", "fail"),
+        # the gate by its webhook name written as ready
+        (_checked_line("gate.seeded.invalid", "ready") + "\n" + _CHECKED_LIVE_LINE, "fail", "pass"),
+        # the gate's Service written as a ready webhook: not the ready line, and no gate line
+        (_checked_line("nonexistent-admission-gate", "ready"), "fail", "fail"),
+        # slot b's other planted dead gate written as ready beside a true ready line: the gate
+        # objective's second forbid
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("seeded-crd-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("crd-gate.seeded.invalid", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        # either planted dead gate written as ready by its Service name beside a true ready line:
+        # the second objective passes on the true line, so the gate objective's forbids refuse it
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-crd-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-admission-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        # a count in the line form, the nearest thing an answer with no names can write: a word for
+        # the rest or a number in the place of the name, with or without the word webhooks
+        (_CHECKED_GATE_LINE + "\nseeded-a/others: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/other: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/rest: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/remaining: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/each: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/every: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/12: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-b/all-other-webhooks: validating webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/4 webhooks: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\n- 12 webhooks have a backend that answers (ready).", "pass", "fail"),
+        # more fields after ready, and a kind field that is not a webhook's
+        (_CHECKED_GATE_LINE + "\nseeded-a/gmp-operator.gmp-system.monitoring.googleapis.com: kind webhook; backend: ready; blocks the upgrade: no", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/webhook-budget: kind pdb; backend: ready", "pass", "fail"),
+        # a ready line that names no webhook: a summary, and a copy of the prompt's form
+        (_CHECKED_GATE_LINE + "\nall other webhooks: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\n<cluster>/<configuration name>: kind webhook; backend: ready", "pass", "fail"),
+        # a hedge on the ready field
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("warden-validating", "ready, as far as the Service shows"), "pass", "fail"),
+    ],
+)
+def test_the_checked_webhooks_lines_refused(text, gate, live):
+    assert (_checked_verdict(_CHECKED_GATE, text), _checked_verdict(_CHECKED_LIVE, text)) == (gate, live), text
 
 
 # ------------------------------- the retrospective's drained-budget case's line
@@ -10081,6 +11010,34 @@ def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
     clipped = out[:200] + " ...[clipped 3000 chars]"
     res = _grade_claims(_block("kubectl get nodes", "phase \u2026 node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
     assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_reads_the_head_up_to_the_pods_marker_not_a_printed_one():
+    # The worker's own output quotes a clipped record; the pod's marker opens the kept tail.
+    from kube_agents_bench import worker_trajectory
+
+    output = "earlier: a ...[clipped 12 chars] record\nnode-b NotReady " + "x" * 4000 + "\nverdict: done"
+    out = json.dumps({"output": output, "exit_code": 0})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    res = _grade_claims(_block("kubectl get nodes", "node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+    assert verifiers._clipped_result_marker(clipped).start() == limit
+
+
+def test_verified_claims_backed_a_kept_tail_does_not_make_a_clipped_result_whole():
+    # The tail closes the JSON string and object again, so a whole-object decode
+    # succeeds; an excerpt from the dropped middle is unchecked, not invented.
+    from kube_agents_bench import worker_trajectory
+
+    output = "head " + "x" * 2500 + " middle node-b NotReady " + "y" * 2500 + " tail"
+    out = json.dumps({"output": output, "exit_code": 0, "error": None})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    text, was_clipped = verifiers._terminal_output(clipped)
+    assert was_clipped and "[clipped" not in text and text.startswith("head ")
+    res = _grade_claims(_block("kubectl get nodes", "middle node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" in res.reason and "output clipped" in res.reason, res
 
 
 def test_verified_claims_backed_masks_addresses_as_the_pod_does():

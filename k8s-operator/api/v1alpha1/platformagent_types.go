@@ -22,6 +22,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// PlatformAgentModeNext is the one value spec.mode takes. The field is
+// deprecated: "today" named a stack no release renders any more, so the
+// admission webhook rewrites it, and an absent field, to this value, and the
+// operator patches a stored "today" to it. The CRD markers on Mode below
+// spell the same value by hand, since a marker cannot name a constant.
+const PlatformAgentModeNext = "next"
+
 // PlatformAgentSpec defines the desired state of PlatformAgent
 type PlatformAgentSpec struct {
 	AgentSpec `json:",inline"`
@@ -34,10 +41,14 @@ type PlatformAgentSpec struct {
 	// +optional
 	Integration *PlatformAgentIntegrationSpec `json:"integration,omitempty"`
 
-	// Mode selects which component stack the operator renders.  "today" is the
-	// current architecture.  "next" additionally renders the NATS and A2A
-	// gateway components, which are otherwise dark.  Absent means "today".
+	// Mode is deprecated and ignored: every install runs the A2A stack (the
+	// NATS bus and the A2A gateway), which "next" once selected.
+	// The field stays so a stored object that still carries "today" remains
+	// valid; the admission webhook rewrites "today" to "next", the schema
+	// defaults an absent field to "next", and the operator patches a stored
+	// "today" to "next" on its first pass. A later release removes the field.
 	// +kubebuilder:validation:Enum=today;next
+	// +kubebuilder:default=next
 	// +optional
 	Mode *string `json:"mode,omitempty"`
 
@@ -52,10 +63,106 @@ type PlatformAgentSpec struct {
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
 
+	// Hold pauses the agents' access to clusters' Kubernetes APIs without taking
+	// them out of scope: an operator's lever for an incident, set with kubectl
+	// patch and lifted by removing it. The credential broker and kube-proxy
+	// refuse a held cluster's API to every caller, on the routes
+	// spec.scope.exclude.clusters is refused on, and the refusal names the hold
+	// and its reason so the agent reports it and stops rather than working
+	// around it. A Cluster Agent task that targets a held cluster is refused for
+	// every command, metadata reads included; the Platform Agent's own reads of
+	// the GKE control plane for it (the project's cluster list, a describe) stay
+	// allowed. Unlike an exclusion, a held cluster keeps its Cluster Agent
+	// profile and its place in fleet answers and audits, and nothing restarts:
+	// the operator renders the hold into the <name>-hold ConfigMap, which no
+	// pod-template hash covers, the kubelet syncs the mounted file (usually
+	// within a minute or two), and both components re-read it on the next
+	// request. Like an exclusion it is checked when a request starts: a watch, a
+	// followed log, or an exec, attach, port-forward or proxy stream opened before the
+	// hold reached them keeps running until it ends. The installer does not
+	// carry it: an upgrade keeps the live value.
+	// +optional
+	Hold *HoldSpec `json:"hold,omitempty"`
+
 	// Storage sizes the agent's /opt/data volume and the shell sandbox's data
 	// volume.
 	// +optional
 	Storage *PlatformAgentStorageSpec `json:"storage,omitempty"`
+
+	// Tiers says which tier each person's profile tasks run at.
+	// +optional
+	Tiers *PlatformAgentTiersSpec `json:"tiers,omitempty"`
+}
+
+// PlatformAgentTiersSpec maps people to tiers (#3659).
+type PlatformAgentTiersSpec struct {
+	// Membership lists the people whose profile tasks run at a tier other
+	// than read. Anyone not listed runs at read, and the console runs at
+	// read whatever this says, since everyone on it shares one principal. A
+	// thread whose authors are at different tiers can't start a profile task,
+	// and a steer from an author at another tier than the running task's is
+	// refused. A member whose tier no Tier defines is refused profile tasks
+	// until one does; they don't fall back to read. The tier must be
+	// interactive: the admission webhook refuses an unattended-mode Tier.
+	// +listType=map
+	// +listMapKey=backend
+	// +listMapKey=user
+	// At most 200 entries, so the list fits the one environment variable the
+	// gateway reads it from (TestTheLargestMembershipFitsOneEnvString).
+	// +kubebuilder:validation:MaxItems=200
+	// +optional
+	Membership []TierMember `json:"membership,omitempty"`
+}
+
+// TierMember maps one person on one chat backend to a tier.
+type TierMember struct {
+	// Backend is the surface the person writes from: one whose requester is
+	// one verified person. The a2a door's eval class isn't one: its callers
+	// name themselves under a shared token; its Google and Entra sign-in
+	// classes are.
+	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a-google;a2a-entra
+	// +required
+	Backend string `json:"backend"`
+
+	// User is the person's id on that backend: their email on Google Chat
+	// (compared without case) and on a2a-google (as their Google token
+	// carries it), their Entra object id on a2a-entra (as their Entra token
+	// carries it), their user id on Slack or Discord.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[^,=\s]+$`
+	// +required
+	User string `json:"user"`
+
+	// Tier is the name of an interactive-mode Tier.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +required
+	Tier string `json:"tier"`
+}
+
+// HoldSpec names the clusters whose Kubernetes API the agents must not reach
+// until an operator lifts the hold.
+type HoldSpec struct {
+	// All holds every cluster, the one the harness runs in included.
+	// +optional
+	All bool `json:"all,omitempty"`
+
+	// Clusters holds single clusters by the full triple, matched as
+	// spec.scope.exclude.clusters entries are.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
+	// +optional
+	Clusters []ScopeClusterRef `json:"clusters,omitempty"`
+
+	// Reason is shown in every refusal, so the agent can tell its user why
+	// the cluster is paused (an incident link, a change window).
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // PlatformAgentStorageSpec sizes the agent's persistent data volumes.
@@ -308,6 +415,21 @@ type GoogleChatSpec struct {
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
 
+	// HomeChannelPolicy ("auto", also absent, or "manual") says whether the
+	// A2A gateway may learn the Google Chat home space when HomeChannel is
+	// empty. Under "auto" the space of the first top-level mention of the
+	// agent in a named space, never a direct message or a group chat, becomes
+	// the home channel: the gateway records it in the <agent>-home-channel
+	// ConfigMap, the operator projects it into the <agent>-chat-home
+	// ConfigMap it mounts as a directory in the agent pod and the gateway
+	// pod, both read the file within about a minute with no pod restarted,
+	// and HomeChannelUnset clears. Under "manual" HomeChannel alone decides.
+	// A set HomeChannel wins under either. No schema default, as on Slack:
+	// absent is read as "auto" by the operator.
+	// +kubebuilder:validation:Enum=auto;manual
+	// +optional
+	HomeChannelPolicy string `json:"homeChannelPolicy,omitempty"`
+
 	// Mode controls output verbosity in Google Chat ("default" or "debug").
 	// "default": Quiet mode (silences memory reviews, approval cards, and tool progress).
 	// "debug": Full verbosity (surfaces tool progress, memory reviews, interim messages, and approval cards).
@@ -317,7 +439,7 @@ type GoogleChatSpec struct {
 	Mode string `json:"mode,omitempty"`
 
 	// AnswerFeedback draws thumbs-up and thumbs-down buttons under each
-	// final answer on Google Chat under spec.mode next, and keeps each rating
+	// final answer on Google Chat, and keeps each rating
 	// with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
 	// False hides the buttons and keeps nothing.
 	// +kubebuilder:default=true
@@ -362,7 +484,7 @@ type SlackSpec struct {
 	HomeChannelName string `json:"homeChannelName,omitempty"`
 
 	// AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
-	// each final answer under spec.mode next, and keeps each rating with
+	// each final answer, and keeps each rating with
 	// its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
 	// False hides the buttons and keeps nothing.
 	// +kubebuilder:default=true
@@ -370,10 +492,9 @@ type SlackSpec struct {
 	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 
 	// HomeChannelPolicy ("auto", also absent, or "manual") says whether the
-	// A2A gateway may learn the Slack home channel under spec.mode next with
-	// Slack on the gateway (Google Chat not enabled) when HomeChannel is
-	// empty. Under "auto" the channel of the first top-level
-	// mention of the agent in a channel becomes the home channel: the gateway
+	// A2A gateway may learn the Slack home channel when HomeChannel is
+	// empty. Under "auto" the channel of the first top-level mention of the
+	// agent in a channel becomes the home channel: the gateway
 	// records it in the <agent>-home-channel ConfigMap, the operator projects
 	// it into the <agent>-chat-home ConfigMap it mounts as a directory in the
 	// agent pod and the gateway pod, both read the file within about a minute
@@ -422,7 +543,14 @@ type TeamsSpec struct {
 	// +optional
 	AllowAllUsers *bool `json:"allowAllUsers,omitempty"`
 
-	// HomeChannel is the default channel ID for scheduled messages.
+	// HomeChannel is the Teams conversation the agent's proactive posts go
+	// to: on the Hermes path the default conversation for scheduled
+	// messages; with the gateway's Teams backend armed (the operator's
+	// A2A_TEAMS_BACKEND switch), the home its chat.notify route posts alerts
+	// and reports into. A conversation id: "19:..." (a channel ends in
+	// @thread.tacv2, a group or meeting chat in @thread.v2) or "a:..." (a
+	// personal chat), never a thread (no ";messageid="); the gateway refuses
+	// any other shape, and only a channel home threads its posts.
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
 

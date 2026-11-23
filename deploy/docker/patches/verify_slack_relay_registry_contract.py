@@ -6,8 +6,10 @@ A failure here fails the image build.
 
 The unit suites in ``agents/platform/scripts/test_slack_relay_patch.py`` and
 ``test_google_chat_relay_patch.py`` cover the two ``register`` shims (Slack's,
-and Google Chat's for its standalone sender) against fakes, and fakes are
-written by the same hand as the shims.
+and Google Chat's for its standalone sender) against fakes, and
+``test_teams_relay_patch.py`` covers the Teams patch's ``create_adapter``
+replacement and its entry the same way; fakes are written by the same hand
+as the shims.
 That is not a hypothetical weakness. ``slack_relay_patch.install()`` replaces
 ``PlatformRegistry.register`` on the class, and until v2026.8.13 both the shim
 and both test fakes declared ``register(self, entry)``. The base-image bump in
@@ -151,7 +153,8 @@ UPSTREAM_SIGNATURES = {
     # google_chat_relay_patch's relay_standalone_send stands in for this one
     # and declares the same parameters: send_message_tool calls it with
     # upstream's keywords, so one it does not declare is a TypeError on every
-    # `hermes send` and every alert on a today-mode install.
+    # `hermes send` and every alert posted through Hermes's own Google Chat
+    # platform.
     "google_chat._standalone_send": (
         "pconfig, chat_id, message, *, thread_id=..., media_files=..., "
         "force_document=..."
@@ -171,6 +174,14 @@ UPSTREAM_SIGNATURES = {
     "BasePlatformAdapter.filter_local_delivery_paths": "file_paths, session_key=...",
     "media_policy.media_delivery_strict": "",
     "base._path_under_denied_prefix": "resolved",
+    # The Teams relay's standalone sender: the Slack sender's arguments plus
+    # the ``metadata`` the cron lane and the send tool pass for a thread key,
+    # and a catch-all for anything newer, so `hermes send -t teams:…` and a
+    # `deliver: teams` job never hit a TypeError on a keyword it lacks.
+    "teams._standalone_send": (
+        "pconfig, chat_id, message, *, thread_id=..., media_files=..., "
+        "force_document=..., caption=..., metadata=..., **_kwargs"
+    ),
 }
 
 # Default values the relay patches depend on. Keyed by (callable label, parameter name).
@@ -311,6 +322,76 @@ def relay_backed(entry) -> bool:
     )
 
 
+def accepts_every_parameter(label: str, override: object, base: object) -> None:
+    """An override takes every parameter its base method declares.
+
+    The Teams adapter is built on Hermes' ``BasePlatformAdapter`` and
+    overrides the methods the gateway calls; a parameter the base grows that
+    the override neither names nor catches with ``**kwargs`` is a TypeError
+    on the first call, in the pod, not here. Names are compared, not kinds
+    or defaults: the override may widen a signature, never narrow it.
+    """
+    base_params = inspect.signature(base).parameters
+    over = inspect.signature(override).parameters
+    catch_all = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in over.values())
+    missing = [name for name in base_params if name not in over and not catch_all]
+    check(f"{label} accepts every parameter the base declares", missing, [])
+
+
+def teams_checks(phase: str) -> None:
+    """What the Teams relay patch must have done, once installed.
+
+    Its grip differs from the two register() shims: ``install()`` replaces
+    ``PlatformRegistry.create_adapter`` for the ``teams`` name and registers
+    its own entry on the singleton, and the adapter class is built on the
+    image's real ``BasePlatformAdapter`` at install time, so an abstract
+    method the base gains, or a field ``PlatformEntry`` loses, shows up here
+    rather than as the first Teams message failing on a running install.
+    """
+    from gateway.platform_registry import PlatformRegistry, platform_registry
+    from gateway.platforms.base import BasePlatformAdapter
+
+    import teams_relay_patch
+
+    check(
+        f"[{phase}] install() replaced PlatformRegistry.create_adapter for teams",
+        getattr(PlatformRegistry, "_teams_relay_patched", False),
+        True,
+    )
+    entry = platform_registry.get("teams")
+    check(f"[{phase}] the Teams entry reached the registry", entry is not None, True)
+    if entry is None:
+        return
+    for field, expected in (
+        ("cron_deliver_env_var", "TEAMS_HOME_CHANNEL"),
+        ("allowed_users_env", "TEAMS_ALLOWED_USERS"),
+        ("allow_all_env", "TEAMS_ALLOW_ALL_USERS"),
+        ("max_message_length", teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH),
+    ):
+        check(f"[{phase}] the Teams entry's {field}", getattr(entry, field, None), expected)
+    check(
+        f"[{phase}] the Teams relay sender takes upstream's arguments",
+        shape(entry.standalone_sender_fn),
+        UPSTREAM_SIGNATURES["teams._standalone_send"],
+    )
+    try:
+        adapter = platform_registry.create_adapter("teams", None)
+    except Exception as exc:  # an abstract method the base gained, among others
+        fail(f"[{phase}] create_adapter builds the Teams adapter on the real base", repr(exc))
+        return
+    check(
+        f"[{phase}] create_adapter builds the Teams adapter on the real base",
+        isinstance(adapter, BasePlatformAdapter) and type(adapter).__name__ == "TeamsRelayAdapter",
+        True,
+    )
+    for name in ("connect", "disconnect", "send", "send_typing", "get_chat_info"):
+        base_method = getattr(BasePlatformAdapter, name, None)
+        if base_method is None:
+            fail(f"[{phase}] BasePlatformAdapter.{name}", "gone from the base; the Teams adapter overrides it")
+            continue
+        accepts_every_parameter(f"[{phase}] TeamsRelayAdapter.{name}", getattr(type(adapter), name), base_method)
+
+
 def registry_checks(scope: str, google_chat_relayed: bool) -> None:
     """The behaviour both the hand-installed and the wired process must show.
 
@@ -397,6 +478,7 @@ def unwired() -> int:
         "_slack_standalone_relay_patched",
         "_credential_proxy_relay_patched",
         "_google_chat_standalone_relay_patched",
+        "_teams_relay_patched",
     ):
         check(
             f"no relay patch installed before the pin is read ({sentinel})",
@@ -523,6 +605,16 @@ def unwired() -> int:
     )
     registry_checks(scope, google_chat_relayed=True)
 
+    # --- the Teams relay, its own grip -----------------------------------
+    # Not a register() wrapper: install() replaces create_adapter for the
+    # teams name and registers its entry itself. The pod installs it beside
+    # the other two whenever TEAMS_RELAY_URL is rendered.
+    os.environ["TEAMS_RELAY_URL"] = RELAY_URL
+    import teams_relay_patch
+
+    teams_relay_patch.install()
+    teams_checks("unwired")
+
     return report("unwired")
 
 
@@ -541,6 +633,7 @@ def wired() -> int:
     for platform, sentinel, variable in (
         ("Slack", "_slack_standalone_relay_patched", "SLACK_RELAY_URL"),
         ("Google Chat", "_google_chat_standalone_relay_patched", "GOOGLE_CHAT_RELAY_URL"),
+        ("Microsoft Teams", "_teams_relay_patched", "TEAMS_RELAY_URL"),
     ):
         label = f"importing the registry installed the {platform} relay patch"
         if getattr(PlatformRegistry, sentinel, False):
@@ -558,6 +651,7 @@ def wired() -> int:
         return report("wired")
 
     registry_checks(hermes_home_key(), google_chat_relayed=True)
+    teams_checks("wired")
     return report("wired")
 
 
@@ -575,11 +669,12 @@ def main() -> int:
     if os.environ.get(WIRED):
         return wired()
 
-    # Every variable ``sitecustomize`` arms a patch on, not just Slack's. The
-    # operator sets GOOGLE_CHAT_RELAY_URL on the agent container, and
-    # google_chat_relay_patch.install() replaces create_adapter too -- so
-    # running this inside a pod with only SLACK_RELAY_URL stripped reads the
-    # Google Chat shim and reports create_adapter as drifted when it has not.
+    # Every variable ``sitecustomize`` arms a patch on, not just Slack's. A
+    # container can have another relay variable set: the operator renders
+    # TEAMS_RELAY_URL with Teams on (and set GOOGLE_CHAT_RELAY_URL in the
+    # past), and each relay patch's install() replaces create_adapter too --
+    # so running this inside a pod with only SLACK_RELAY_URL stripped reads
+    # another relay's shim and reports create_adapter as drifted when it has not.
     # That misfire is worse than a missed check: the docstring above tells the
     # reader to update the pin deliberately, and doing so here would pin the
     # shim against itself and delete the only guard on that method.
@@ -597,7 +692,12 @@ def main() -> int:
     print("\n-- again, wired the way the pod wires it --")
     child_env = dict(
         os.environ,
-        **{WIRED: "1", "SLACK_RELAY_URL": RELAY_URL, "GOOGLE_CHAT_RELAY_URL": RELAY_URL},
+        **{
+            WIRED: "1",
+            "SLACK_RELAY_URL": RELAY_URL,
+            "GOOGLE_CHAT_RELAY_URL": RELAY_URL,
+            "TEAMS_RELAY_URL": RELAY_URL,
+        },
     )
     child_env.pop("SLACK_BOT_TOKEN", None)
     child = subprocess.run(

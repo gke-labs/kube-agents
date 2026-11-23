@@ -131,8 +131,13 @@ class _StubKubectl:
         plugin_releases="",
         declared_sidecars="",
         sidecar_owner="platform-agent",
+        operator_env=None,
     ):
         """Run the script against one or more stubbed reads of the template.
+
+        `operator_env` is the controller manager's env as `NAME=value` lines,
+        which answers the script's read of the operator Deployment; None reads
+        as no operator Deployment under the label.
 
         Each `name=image` listing answers one `kubectl get deployment` call, the
         last repeating once they run out, so a sequence exercises the poll. The
@@ -152,6 +157,8 @@ class _StubKubectl:
 
         for index, template in enumerate(templates):
             (stub_dir / f"read-{index}").write_text(textwrap.dedent(template).strip() + "\n")
+        if operator_env is not None:
+            (stub_dir / "operator-env").write_text(textwrap.dedent(operator_env).strip() + "\n")
 
         if deployment_missing:
             template_branch = textwrap.dedent(
@@ -184,6 +191,14 @@ class _StubKubectl:
             textwrap.dedent(
                 f"""\
                 #!/usr/bin/env bash
+                if [[ "$*" == *kube-agents-operator* ]]; then
+                  if [[ "$*" != *'containers[?(@.name=="manager")]'* ]]; then
+                    echo 'stub kubectl: the operator read does not name the manager container' >&2
+                    exit 1
+                  fi
+                  cat "{stub_dir}/operator-env" 2>/dev/null
+                  exit 0
+                fi
                 if [[ "$*" == *release-name* && "$*" == *platformagent* ]]; then
                   printf '%s\\n' '{agent_release}'
                   exit 0
@@ -244,7 +259,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             sandbox-credential-cleanup={_GHCR}/platform-agent:{_TAG}
             envoy-credential-proxy={_GHCR}/credential-proxy:{_TAG}
             platform-agent={_GHCR}/platform-agent:{_TAG}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.5
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -254,7 +269,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         result = self._run(
             f"""
             platform-agent={_GHCR}/platform-agent:{_TAG}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.5
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -268,7 +283,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             sandbox-credential-cleanup={_MIRROR}/platform-agent:{_TAG}
             envoy-credential-proxy={_MIRROR}/credential-proxy:{_TAG}
             platform-agent={_MIRROR}/platform-agent:{_TAG}
-            fluent-bit={_MIRROR}/fluent-bit:5.1.2
+            fluent-bit={_MIRROR}/fluent-bit:5.1.5
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -285,7 +300,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             f"""
             sandbox-credential-cleanup={_GHCR}/platform-agent:{_TAG}
             platform-agent={_GHCR}/platform-agent:{_TAG}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.5
             platform-agent-data-vol=
             plugin-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
             """,
@@ -347,6 +362,96 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         )
         self.assertEqual(mirrored.returncode, 0, mirrored.stdout + mirrored.stderr)
         self.assertIn("all 2 release image(s)", mirrored.stdout)
+
+    def test_a_companion_the_operator_pins_is_not_judged(self):
+        """CREDENTIAL_PROXY_IMAGE and A2A_BRIDGE_IMAGE on the operator (the
+        chart's credentialProxy.image and hermesBridge.image) name the
+        agent-api-auth and hermes-bridge images outright, at a tag no re-tag of
+        the agent moves. A container on the pin is reported and left out of the
+        verdict; the same containers with no pin behind them are judged.
+        """
+        listing = f"""
+            agent-api-auth={_GHCR}/credential-proxy:{_OLD}
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            hermes-bridge={_GHCR}/hermes-bridge:{_OLD}
+            """
+        pins = f"""
+            ENABLE_WEBHOOKS=false
+            POD_NAMESPACE=
+            CREDENTIAL_PROXY_IMAGE={_GHCR}/credential-proxy:{_OLD}
+            A2A_BRIDGE_IMAGE={_GHCR}/hermes-bridge:{_OLD}
+            """
+        result = self._run(listing, operator_env=pins)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 release image(s)", result.stdout)
+        self.assertIn(
+            f"agent-api-auth: {_GHCR}/credential-proxy:{_OLD} (pinned by CREDENTIAL_PROXY_IMAGE",
+            result.stdout,
+        )
+        self.assertIn(
+            f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD} (pinned by A2A_BRIDGE_IMAGE",
+            result.stdout,
+        )
+
+        unpinned = self._run(listing)
+        self.assertEqual(unpinned.returncode, 1, unpinned.stdout + unpinned.stderr)
+        self.assertIn(f"agent-api-auth: {_GHCR}/credential-proxy:{_OLD}", unpinned.stdout)
+        self.assertIn(f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD}", unpinned.stdout)
+        self.assertNotIn("pinned by", unpinned.stdout)
+
+        # An operator Deployment that carries neither variable pins nothing.
+        bare = self._run(listing, operator_env="ENABLE_WEBHOOKS=false")
+        self.assertEqual(bare.returncode, 1, bare.stdout + bare.stderr)
+        self.assertNotIn("pinned by", bare.stdout)
+
+    def test_a_pin_the_container_is_not_on_does_not_excuse_it(self):
+        """A pin set after the operator last rendered, or one it never read,
+        leaves the container where it was: off the pin and off the deploy's
+        tag, which is the skew the read-back exists to name.
+        """
+        stale = "0" * 40
+        result = self._run(
+            f"""
+            agent-api-auth={_GHCR}/credential-proxy:{_OLD}
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            hermes-bridge={_GHCR}/hermes-bridge:{_OLD}
+            """,
+            operator_env=f"""
+            CREDENTIAL_PROXY_IMAGE={_GHCR}/credential-proxy:{stale}
+            A2A_BRIDGE_IMAGE={_GHCR}/hermes-bridge:{stale}
+            """,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"agent-api-auth: {_GHCR}/credential-proxy:{_OLD}", result.stdout)
+        self.assertIn(f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD}", result.stdout)
+        self.assertNotIn("pinned by", result.stdout)
+
+    def test_the_last_entry_of_a_repeated_pin_is_the_one_that_counts(self):
+        """The chart appends operator.extraEnv after its own entry so that it
+        wins in the container; the read-back takes the same entry.
+        """
+        winner = "1" * 40
+        listing = f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            hermes-bridge={_GHCR}/hermes-bridge:{winner}
+            """
+        pins = f"""
+            A2A_BRIDGE_IMAGE={_GHCR}/hermes-bridge:{_OLD}
+            A2A_BRIDGE_IMAGE={_GHCR}/hermes-bridge:{winner}
+            """
+        result = self._run(listing, operator_env=pins)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("pinned by A2A_BRIDGE_IMAGE", result.stdout)
+
+        overridden = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            hermes-bridge={_GHCR}/hermes-bridge:{_OLD}
+            """,
+            operator_env=pins,
+        )
+        self.assertEqual(overridden.returncode, 1, overridden.stdout + overridden.stderr)
+        self.assertNotIn("pinned by", overridden.stdout)
 
     def test_a_plugin_installed_outside_the_release_is_not_judged(self):
         """agentplugins/*/install.sh releases a plugin on its own, at its own tag.
@@ -453,7 +558,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             sandbox-credential-cleanup={_GHCR}/platform-agent:{_OLD}
             envoy-credential-proxy={_GHCR}/credential-proxy:{_OLD}
             platform-agent={_GHCR}/platform-agent:{_OLD}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.5
             """,
             cr_image=f"{_GHCR}/platform-agent:{_OLD}",
         )
@@ -533,7 +638,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             f"""
             platform-agent={_GHCR}/platform-agent:{_TAG}
             envoy-credential-proxy={_GHCR}/credential-proxy:{_OLD}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.5
             """
         )
         self.assertEqual(result.returncode, 1)
@@ -547,7 +652,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
 
     def test_it_fails_when_no_release_image_is_present(self):
         # An unrecognisable read-back is not a pass.
-        result = self._run("fluent-bit=docker.io/fluent/fluent-bit:5.1.2")
+        result = self._run("fluent-bit=docker.io/fluent/fluent-bit:5.1.5")
         self.assertEqual(result.returncode, 1)
         self.assertIn("Found no first-party release image", result.stdout)
 

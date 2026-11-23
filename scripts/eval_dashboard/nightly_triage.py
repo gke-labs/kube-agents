@@ -28,8 +28,11 @@ classification, a suspected pull request, an open or merged fix, a priority
 and a confidence (VERDICT_SCHEMA), checks its answer against the evidence,
 and routes (``route``):
 
-    a suspected pull request from the window, confidence not low, class
+    a suspected pull request from the window that merged between the
+    last green and the first red night, confidence not low, class
     product bug or grader/harness   -> that pull request's author
+    such a pull request that merged
+    outside those nights            -> the filer's rule
     grader/harness, no such PR      -> ``infra_owner`` in domains.yaml
     infra                           -> ``infra_owner``
     a case problem, low confidence,
@@ -50,13 +53,14 @@ the rule without a model call. At most MAX_ISSUES_PER_RUN issues are triaged
 per run and each prompt is capped at MAX_INPUT_TOKENS (transcripts are cut
 first, then the oldest commits, then grading lines).
 
-**Dry run is the default.** Unarmed, the workflow runs both phases on the
-issues the filer filed that tick (``--issue``), calls the model, and prints
-one line per issue -- the classification, the pull request numbers, the
-priority, the confidence and who it would assign -- with no case name and no
-grading text: the job log is public. ``--no-model`` routes every pending
-issue by the rule without calling the model; the workflow uses it, live,
-to drain issues left pending after triage is switched off.
+**Dry run is the default.** Unarmed, with a model named in
+NIGHTLY_TRIAGE_MODEL, the workflow runs both phases on the issues the filer
+filed that tick (``--issue``), calls the model, and prints one line per issue -- the
+classification, the pull request numbers, the priority, the confidence and
+who it would assign -- with no case name and no grading text: the job log is
+public. With no model named, or with ``--no-model``, every issue goes by the
+rule without a model call; the workflow uses ``--no-model``, live, to drain
+issues left pending while triage is switched off or has no model named.
 """
 
 from __future__ import annotations
@@ -80,11 +84,20 @@ except ImportError:  # run as a script: scripts/eval_dashboard/nightly_triage.py
 
 REPO_ROOT = nightly_bugs.REPO_ROOT
 
-# --- The model. Triage handles a few issues a day, so the strongest model
-# the pool runs, not the cheapest; NIGHTLY_TRIAGE_MODEL (a repository
-# variable the workflow passes through) overrides it.
-DEFAULT_MODEL = "gemini-4-argon"
+# --- The model: NIGHTLY_TRIAGE_MODEL, a repository secret the workflow
+# passes through (a secret, so the public job log masks it). The file carries no default: it is public, and names no
+# model. With no name the route falls back
+# to the filer's rule, the way every other model failure does, and says so.
 MODEL_ENV = "NIGHTLY_TRIAGE_MODEL"
+MODEL_MISSING = f"nightly triage: no model; set {MODEL_ENV} (a repository secret; docs/ci-health.md, \"Nightly triage\") or pass --model; routing by the filer's rule"
+# Why an issue went by the rule with no model call: switched off, or armed
+# (NIGHTLY_TRIAGE_LIVE, the workflow's switch, passed through the same way)
+# with no model named. The posted comment tells the two apart, so the fix it
+# points at is the right one.
+LIVE_ENV = "NIGHTLY_TRIAGE_LIVE"
+LIVE_ON = "true"
+OFF_REASON = f"triage is switched off ({LIVE_ENV} is not {LIVE_ON})"
+NO_MODEL_NAME_REASON = f"no model is named ({MODEL_ENV} is not set)"
 # The project the call is billed to, which must grant the publisher
 # roles/aiplatform.user (docs/ci-health.md, "Nightly triage").
 DEFAULT_PROJECT = "kube-agents-prow"
@@ -189,7 +202,7 @@ class ModelError(RuntimeError):
 
 
 class VertexModel:
-    """Gemini on Vertex AI, with the job's own credential (the publisher's
+    """The model on Vertex AI, with the job's own credential (the publisher's
     Workload Identity, through ``gcloud auth print-access-token``): no key."""
 
     def __init__(self, project: str, model: str, runner=subprocess.run, opener=urllib.request.urlopen):
@@ -572,7 +585,30 @@ RULE_WHY = {
     "no_pr": "triage named no pull request from the commit window",
     "author_bot": "the suspected pull request's author is a bot",
     "no_author": "the suspected pull request's author could not be read",
+    "outside_nights": "the suspected pull request did not merge between the last green and the first red night",
 }
+
+
+def merged_between_nights(bundle: dict | None, number: int) -> bool:
+    """Whether pull request ``number`` merged between the issue's last green
+    night and its first red one (``window``). The commit window is not
+    enough on its own: with no green night on record it is the MAX_COMMITS
+    commits up to the first red one, which reach back weeks (2026-11-16: a
+    pull request merged 12 days before its case went red was named). No
+    green night, or no merge date, is False. By UTC date, the green bound a
+    day early: a night is dated by its start plus NIGHT_START_GRACE, so a
+    green build that started late the day before carries the next day's
+    date, and a merge just after it would otherwise be lost."""
+    bundle = bundle or {}
+    green, red = bundle.get("green") or {}, bundle.get("red") or {}
+    merged = ((bundle.get("prs") or {}).get(str(number)) or {}).get("merged_at")
+    if not (isinstance(merged, str) and isinstance(green.get("date"), str) and isinstance(red.get("date"), str)):
+        return False
+    try:
+        floor = (datetime.date.fromisoformat(green["date"][:10]) - datetime.timedelta(days=1)).isoformat()
+    except ValueError:
+        return False
+    return floor <= merged[:10] <= red["date"][:10]
 
 
 def route(verdict: dict | None, failure: str | None, bundle: dict | None, chain: list[str], infra_owner: str | None) -> list[tuple[str, str]]:
@@ -585,6 +621,11 @@ def route(verdict: dict | None, failure: str | None, bundle: dict | None, chain:
         reason = RULE_WHY["low"]
     elif verdict["classification"] == "case_rework":
         reason = RULE_WHY["case_rework"]
+    elif verdict["classification"] in ("product", "grader_or_harness") and str(verdict["suspected_pr"]) in ((bundle or {}).get("prs") or {}) \
+            and not merged_between_nights(bundle, verdict["suspected_pr"]):
+        # A record that could not be read at all keeps its old routing
+        # (RULE_WHY["no_author"], or the infra owner for a grader fault).
+        reason = RULE_WHY["outside_nights"]
     elif verdict["classification"] in ("product", "grader_or_harness") and verdict["suspected_pr"] and nightly_bugs.case_owner.is_person_login(
             ((bundle or {}).get("prs") or {}).get(str(verdict["suspected_pr"]), {}).get("author")):
         author = bundle["prs"][str(verdict["suspected_pr"])]["author"]
@@ -686,8 +727,10 @@ def label_names(issue: dict) -> list[str]:
 class Router:
     """The route phase for one run (module docstring)."""
 
-    def __init__(self, gh: ghcli.Gh, model, model_name: str, repo_root: pathlib.Path = REPO_ROOT, live: bool = False, now=None, stale_only: bool = False):
+    def __init__(self, gh: ghcli.Gh, model, model_name: str, repo_root: pathlib.Path = REPO_ROOT, live: bool = False, now=None, stale_only: bool = False,
+                 off_reason: str = OFF_REASON):
         self.gh, self.model, self.model_name, self.live = gh, model, model_name, live
+        self.off_reason = off_reason
         # The tick's backstop (--stale-only): triage is on, and did not route
         # these issues in time.
         self.stale_only = stale_only
@@ -721,7 +764,7 @@ class Router:
             failure = "already assigned"
         elif self.model is None:
             failure = (f"the triage job did not route this issue in the {int(PENDING_MAX_AGE.total_seconds() // 3600)} hours since filing" if self.stale_only
-                       else "triage is switched off (NIGHTLY_TRIAGE_LIVE is not true)")
+                       else self.off_reason)
         elif bundle is None and opened and self.now - opened > PENDING_MAX_AGE:
             failure = f"no evidence was gathered in the {int(PENDING_MAX_AGE.total_seconds() // 3600)} hours since filing"
         elif bundle is None:
@@ -854,7 +897,7 @@ def parse_args(argv=None):
     prep.add_argument("--out", required=True, type=pathlib.Path)
     rt = sub.add_parser("route", help="ask the model, then assign, comment and mark done")
     rt.add_argument("--bundles", type=pathlib.Path, help="prepare's output; an issue missing from it waits for the next tick")
-    rt.add_argument("--model", default=os.environ.get(MODEL_ENV) or DEFAULT_MODEL)
+    rt.add_argument("--model", default=os.environ.get(MODEL_ENV) or None, help=f"the Vertex AI model id; {MODEL_ENV} otherwise")
     rt.add_argument("--project", default=os.environ.get(PROJECT_ENV) or DEFAULT_PROJECT)
     rt.add_argument("--no-model", action="store_true", help="route by the filing rule without a model call")
     rt.add_argument("--stale-only", action="store_true",
@@ -871,6 +914,15 @@ def parse_args(argv=None):
 
 def main(argv=None, gh_runner=None, source_runner=None, model=None, git=None, gcs=None, now=None) -> int:
     args = parse_args(argv)
+    # No name and no injected model: the rule routes, and the comment says
+    # the name is missing when that is the one thing missing, whether
+    # --no-model was passed or implied.
+    named = model is not None or bool(getattr(args, "model", None))
+    armed = os.environ.get(LIVE_ENV) == LIVE_ON
+    off_reason = NO_MODEL_NAME_REASON if armed and not named else OFF_REASON
+    if args.phase == "route" and not args.no_model and not named:
+        log(MODEL_MISSING)
+        args.no_model = True
     gh = ghcli.Gh(args.repo, gh_runner) if gh_runner else ghcli.Gh(args.repo)
     # The comment quotes grading lines and transcripts: it goes to a private
     # issues repository or nowhere.
@@ -906,8 +958,8 @@ def main(argv=None, gh_runner=None, source_runner=None, model=None, git=None, gc
         client = None
     else:
         client = model or VertexModel(args.project, args.model)
-    router = Router(gh, client, args.model, args.repo_root, live=not args.dry_run, now=now, stale_only=args.stale_only)
-    print(f"nightly triage ({'live' if not args.dry_run else 'dry run'}, {'no model' if client is None else args.model}): {len(issues)} issues", flush=True)
+    router = Router(gh, client, args.model, args.repo_root, live=not args.dry_run, now=now, stale_only=args.stale_only, off_reason=off_reason)
+    print(f"nightly triage ({'live' if not args.dry_run else 'dry run'}, {'no model' if client is None else 'with the model'}): {len(issues)} issues", flush=True)
     # One line as each issue finishes, so a step killed at its timeout still
     # says what it routed.
     for issue in issues:

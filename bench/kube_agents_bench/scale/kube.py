@@ -41,6 +41,8 @@ RETRY_MAX_DELAY_SECONDS = 300
 # Failures that pass on their own: credentials, network, an API server that is briefly away.
 TRANSIENT_RE = re.compile(
     r"failed to retrieve access token|Unable to connect to the server|i/o timeout|connection refused"
+    # kubectl's own wording when the control plane is away: "The connection to the server <ip> was refused".
+    r"|The connection to the server \S+ was refused"
     r"|connection reset|TLS handshake timeout|ServiceUnavailable|server is currently unable|getaddrinfo"
     r"|no such host|unexpected EOF|Internal error occurred|etcdserver|context deadline exceeded"
     r"|There was a problem refreshing your current auth tokens|Temporary failure in name resolution",

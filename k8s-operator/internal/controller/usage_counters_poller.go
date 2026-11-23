@@ -143,8 +143,9 @@ const (
 // eventsIngestedTotal, remediationsProposedTotal, chatMessagesInboundTotal,
 // sessionsTotal, chatSessionsTotal, toolExecutionsBlockedTotal,
 // brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
-// negativeFeedbackTotal, positiveFeedbackTotal, inputTokensTotal,
-// outputTokensTotal, spendMicrosUSDTotal, lastActiveTime and
+// negativeFeedbackTotal, positiveFeedbackTotal,
+// autonomousNegativeFeedbackTotal, autonomousPositiveFeedbackTotal,
+// inputTokensTotal, outputTokensTotal, spendMicrosUSDTotal, lastActiveTime and
 // lastHumanActiveTime on every PlatformAgent, the two cluster gauges, the six
 // proposal readings, the two people readings (peopleSeen7d, peopleSeen30d),
 // the broker's top tools (topTools) and the nine origin readings
@@ -181,11 +182,12 @@ type UsageCounterPoller struct {
 	// The per-field pruning records are the reconciler's (prunedNewerFields
 	// there): the poller writes and reads them, and the usage gauges' publish
 	// reads them on every reconcile.
-	// gatewayMisses counts, per CR, the consecutive polls in which no gateway
-	// replica's body was read while the watcher is on: listeners failing, pods
-	// Pending or without an IP, or none running. At usageScrapeFailureEventStreak
-	// the poll clears the gauges to absent, the no current reading it is,
-	// rather than holding one that reads as current. In
+	// gatewayMisses counts, per CR, the consecutive polls with no fleet
+	// reading while the watcher is on: listeners failing, pods Pending or
+	// without an IP, none running, or every answering replica still building its
+	// initial watch set (k8s_event_watcher_watch_set_ready below 1). At
+	// usageScrapeFailureEventStreak the poll clears the gauges to absent, the no
+	// current reading it is, rather than holding one that reads as current. In
 	// memory, like streaks: a leader change delays the clear by one streak and
 	// never advances it.
 	gatewayMisses map[string]int
@@ -349,8 +351,7 @@ func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAge
 // noteReadings records, per reading, whether this poll's bodies carried it for
 // the CR, and returns each reading's run of misses: a reading read ends its
 // run. The people reading is not counted, and any run it had is dropped,
-// while peopleReadingEnabled is false (no A2A stack, or a chat platform on
-// Hermes): its kind is then absent from the map returned, and
+// while peopleReadingEnabled is false (a chat platform on Hermes): its kind is then absent from the map returned, and
 // usageReadingsForPoll clears its fields without a miss. With the gate open,
 // a poll that reads no A2A gateway body, its pod missing or unreadable, is a
 // miss like any other.
@@ -586,8 +587,12 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			})
 		}
 	}
-	// Whether any gateway replica's body was read this poll: a watcher body
-	// always carries a cluster reading, zero or not, and no other body does.
+	// Whether any gateway replica's body carried a fleet reading this poll: a
+	// watcher body carries a cluster reading once its watch set is built (zero
+	// or not), and no other body does. A watcher scraped while still building
+	// its watch set leaves Clusters nil, so it counts as a missed poll and
+	// holds prior readings until buildWatchSet finishes or the miss streak
+	// clears them.
 	gatewayRead := !eventWatcherEnabled(cached)
 	for _, s := range scraped {
 		if s.Clusters != nil {
@@ -967,8 +972,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		// The chat listener also serves the origins reading, from the proposals
 		// ledger, on the same gate as its counters.
 		{gatewayPodSelector(agent), usageChatCounters, []usageReadingKind{usageReadingOrigins}, platformAgentContainerName, chatMetricsPortName, true, runsGateway, 0, usageMetricsPath},
-		// The A2A gateway, a pod a next-mode install runs and a today install
-		// does not: the chat counter again, from the gateway that owns Chat
+		// The A2A gateway: the chat counter again, from the gateway that owns Chat
 		// ingress there, and the people reading. The selector matches no pod
 		// elsewhere.
 		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod, 0, usageMetricsPath},
@@ -1287,6 +1291,9 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterInputTokens:           usageStatusFloor(agent.Status.Usage.InputTokensTotal),
 		usageCounterOutputTokens:          usageStatusFloor(agent.Status.Usage.OutputTokensTotal),
 		usageCounterSpendMicros:           usageStatusFloor(agent.Status.Usage.SpendMicrosUSDTotal),
+		// The ratings of the posts the agent made on its own.
+		usageCounterAutonomousNegativeFeedback: usageStatusFloor(agent.Status.Usage.AutonomousNegativeFeedbackTotal),
+		usageCounterAutonomousPositiveFeedback: usageStatusFloor(agent.Status.Usage.AutonomousPositiveFeedbackTotal),
 		// sessionsTotal split between the halves (usageStatusSessionsSeed);
 		// the read-back bound holds the pair's sum to it (usageDocumentInvalid).
 		usageCounterSessionsTriage:        triageSessions,
@@ -1469,6 +1476,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	background := doc.Totals[usageCounterBackgroundTasksGaveUp]
 	negative := doc.Totals[usageCounterNegativeFeedback]
 	positive := doc.Totals[usageCounterPositiveFeedback]
+	postNegative := doc.Totals[usageCounterAutonomousNegativeFeedback]
+	postPositive := doc.Totals[usageCounterAutonomousPositiveFeedback]
 	tokensIn := doc.Totals[usageCounterInputTokens]
 	tokensOut := doc.Totals[usageCounterOutputTokens]
 	spend := doc.Totals[usageCounterSpendMicros]
@@ -1479,7 +1488,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the chat counter, the blocked counter, the failures
-	// counter, the errored counter, the background-tasks counter, the two
+	// counter, the errored counter, the background-tasks counter, the four
 	// feedback counters, the chat sessions, the proposal readings, the people
 	// readings and the origin readings arrived later, each at its own
 	// release, and a CRD at a previous schema prunes some or all of them, so
@@ -1498,6 +1507,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	backgroundPruned := p.newerFieldPruned(agent, usageCounterBackgroundTasksGaveUp)
 	feedbackPruned := p.newerFieldPruned(agent, usageCounterNegativeFeedback)
 	positivePruned := p.newerFieldPruned(agent, usageCounterPositiveFeedback)
+	postNegativePruned := p.newerFieldPruned(agent, usageCounterAutonomousNegativeFeedback)
+	postPositivePruned := p.newerFieldPruned(agent, usageCounterAutonomousPositiveFeedback)
 	chatSessionsPruned := p.newerFieldPruned(agent, usageStatusFieldChatSessions)
 	inferencePruned := p.newerFieldPruned(agent, usageNewerFieldInference)
 	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
@@ -1516,6 +1527,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
 		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!backgroundPruned && usage.BackgroundTasksGaveUpTotal < background) ||
 		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) || (!positivePruned && usage.PositiveFeedbackTotal < positive) ||
+		(!postNegativePruned && usage.AutonomousNegativeFeedbackTotal < postNegative) || (!postPositivePruned && usage.AutonomousPositiveFeedbackTotal < postPositive) ||
 		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) ||
 		(!inferencePruned && (usage.InputTokensTotal < tokensIn || usage.OutputTokensTotal < tokensOut || usage.SpendMicrosUSDTotal < spend)) || readingsMoved || topToolsMoved
 	// sessionsTotal is in the first schema beside the first three counters
@@ -1536,6 +1548,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.BackgroundTasksGaveUpTotal = background
 	usage.NegativeFeedbackTotal = negative
 	usage.PositiveFeedbackTotal = positive
+	usage.AutonomousNegativeFeedbackTotal = postNegative
+	usage.AutonomousPositiveFeedbackTotal = postPositive
 	usage.SessionsTotal = sessions
 	// Written only while unpruned, so a patch for another counter does not
 	// carry it and refresh a fresh pruning record.
@@ -1634,6 +1648,12 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if positive > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterPositiveFeedback, agent.Status.Usage.PositiveFeedbackTotal == positive)
+	}
+	if postNegative > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterAutonomousNegativeFeedback, agent.Status.Usage.AutonomousNegativeFeedbackTotal == postNegative)
+	}
+	if postPositive > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterAutonomousPositiveFeedback, agent.Status.Usage.AutonomousPositiveFeedbackTotal == postPositive)
 	}
 	// Gated on !chatSessionsPruned as well, unlike the counters above, so a
 	// fresh pruning record is not refreshed by a patch for another field.

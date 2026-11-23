@@ -1,5 +1,5 @@
-// The a2a chatops gateway: chat in (Google Chat, Slack or Discord, one
-// backend per process), tasks on the bus out.
+// The a2a chatops gateway: chat in (every armed backend of Google Chat, Slack, Teams
+// and Discord, behind one mux beside the console), tasks on the bus out.
 //
 // PLAYGROUND POSTURE: bot token as a plain Secret, no exporter, no breaker,
 // gateway sweep as the only janitor. Each has a decided design in
@@ -7,15 +7,15 @@
 //
 // The auth callout is no longer on that list - it is armed, and the sessions
 // this gateway spawns authenticate through it with per-pod grants. The gateway
-// itself is still a static NATS user, and that is sequencing rather than
-// posture: it has a ServiceAccount and a map entry could be rendered for it
-// tomorrow, but this program dials with NATS_USER/NATS_PASSWORD and moving the
-// identity before the program would refuse the gateway at connect on every
-// install.
+// itself dials as the static NATS user (NATS_USER/NATS_PASSWORD) by default,
+// or, at A2A_GATEWAY_BUS_AUTH=token, with its projected ServiceAccount token,
+// which the callout mints from the gateway's own map entry (#5301). Both are
+// rendered until the static user is retired a release after the flip.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,6 +24,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/gateway"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"k8s.io/client-go/kubernetes"
@@ -40,6 +41,21 @@ const (
 	// not start leaves, whichever step refused it.
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics and no /readyz until it restarts, so the pod never reads Ready and the PlatformAgent stays Provisioning; conversations are unaffected"
 )
+
+// terminationLogPath is the kubelet's default terminationMessagePath.
+var terminationLogPath = "/dev/termination-log"
+
+// homeLearnBackends maps a chat.notify route's platform to the gateway
+// backend that can learn that platform's home channel (armHomeLearn).
+var homeLearnBackends = map[string]string{
+	lib.NotifyPlatformSlack: gateway.BackendSlack,
+	lib.NotifyPlatformGchat: gateway.BackendGchat,
+}
+
+// terminationLogMode is the termination message's file mode: owner-only,
+// as gosec's G306 asks. The kubelet reads the file through its host-side
+// mount, not as the container's user, so it still reads it.
+const terminationLogMode = 0o600
 
 func main() {
 	os.Exit(run())
@@ -67,31 +83,104 @@ func run() int {
 	return 0
 }
 
-// buildAdapters puts the configured chat backend and the console adapter
-// behind one mux. The console runs whenever the gateway runs: its identity
-// renders under mode next like the rest of the bus, and a render that
-// predates it surfaces as a logged refusal on the console subscription, not a
-// boot failure (spec-chatops-gateway.md, "The console adapter"). With no real
-// backend (an inject-only eval install) the console is the only chat backend
-// and is returned alone, since a mux of one would need a key for nothing.
-func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
+// buildAdapters puts every configured chat backend (backends, keyed by
+// backend name) and the console adapter behind one mux. The console runs
+// whenever the gateway runs: its identity renders under mode next like the
+// rest of the bus, and a render that predates it surfaces as a logged
+// refusal on the console subscription, not a boot failure
+// (spec-chatops-gateway.md, "The console adapter"). With no real backend (an
+// inject-only eval install) the console is the only chat backend and is
+// returned alone, since a mux of one would need a key for nothing.
+func buildAdapters(cfg *gateway.Config, backends map[string]gateway.Adapter, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
 	console, err := gateway.NewConsoleAdapter(cfg.NATSURL, natsOpts, log)
 	if err != nil {
 		return nil, err
 	}
-	return buildAdaptersWith(cfg, primary, console, log)
+	return buildAdaptersWith(backends, console, log)
+}
+
+// a2aDoorOptions carries the A2A door's configuration from the environment
+// to the door: the card's public URL and addressee, the task deadline, and
+// each sign-in class's arming and allowlist. One function, so a class the
+// config reads cannot be left out of the door that would check it.
+func a2aDoorOptions(cfg *gateway.Config, log *slog.Logger) gateway.A2ADoorOptions {
+	return gateway.A2ADoorOptions{
+		PublicURL:          cfg.A2ADoorPublicURL,
+		DefaultAddressee:   cfg.DefaultAddressee,
+		TaskDeadline:       cfg.TaskDeadline,
+		GoogleClientID:     cfg.A2ADoorGoogleClientID,
+		GoogleAllowedUsers: cfg.A2ADoorAllowedUsers,
+		EntraTenantID:      cfg.A2ADoorEntraTenantID,
+		EntraClientID:      cfg.A2ADoorEntraClientID,
+		EntraAllowedUsers:  cfg.A2ADoorEntraAllowedUsers,
+		Logger:             log,
+	}
 }
 
 // buildAdaptersWith is buildAdapters around a console adapter already
-// dialed, which realMain keeps for the console's chat.notify route.
-func buildAdaptersWith(cfg *gateway.Config, primary gateway.Adapter, console *gateway.ConsoleAdapter, log *slog.Logger) (gateway.Adapter, error) {
-	if primary == nil {
+// dialed, which realMain keeps for the console's chat.notify route. A lone
+// real backend is the mux's primary; with two or more no one backend is.
+func buildAdaptersWith(backends map[string]gateway.Adapter, console *gateway.ConsoleAdapter, log *slog.Logger) (gateway.Adapter, error) {
+	if len(backends) == 0 {
 		return console, nil
 	}
-	return gateway.NewMultiAdapter(cfg.Backend(), "console", map[string]gateway.Adapter{
-		cfg.Backend(): primary,
-		"console":     console,
-	}, log)
+	all := map[string]gateway.Adapter{gateway.BackendConsole: console}
+	primary := ""
+	for name, a := range backends {
+		all[name] = a
+		if len(backends) == 1 {
+			primary = name
+		}
+	}
+	return gateway.NewMultiAdapter(primary, gateway.BackendConsole, all, log)
+}
+
+// buildBackendAdapters builds one adapter per backend in cfg.Backends(),
+// keyed by backend name. One set of metrics serves them all.
+func buildBackendAdapters(cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger) (map[string]gateway.Adapter, error) {
+	adapters := map[string]gateway.Adapter{}
+	for _, backend := range cfg.Backends() {
+		switch backend {
+		case gateway.BackendGchat:
+			chat, err := gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", backend, err)
+			}
+			chat.SetMetrics(metrics)
+			adapters[backend] = chat
+		case gateway.BackendSlack:
+			sl, err := gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", backend, err)
+			}
+			// The allowlist's T…:U… entries: other workspaces' members it serves.
+			sl.SetAllowedGuests(cfg.SlackAllowedUsers)
+			sl.SetMetrics(metrics)
+			// End-to-end test users, meant for CI and eval installs; the
+			// allowlist still decides who is served.
+			sl.SetTestUsers(cfg.SlackTestUsers)
+			adapters[backend] = sl
+		case gateway.BackendTeams:
+			tm, err := gateway.NewTeamsAdapter(cfg.TeamsRelayURL, cfg.TeamsTokenPath, cfg.TeamsTenantID, cfg.TeamsAdaptiveCards, log)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", backend, err)
+			}
+			// The allowlist, so a sender listed by either of their ids is
+			// handed over under the listed one; the gateway still decides.
+			tm.SetAllowedUsers(cfg.TeamsAllowedUsers, cfg.TeamsAllowAllUsers)
+			tm.SetMetrics(metrics)
+			adapters[backend] = tm
+		case gateway.BackendDiscord:
+			dc, err := gateway.NewDiscordAdapter(cfg.DiscordToken, log)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", backend, err)
+			}
+			adapters[backend] = dc
+		default:
+			return nil, fmt.Errorf("unknown chat backend %q", backend)
+		}
+	}
+	return adapters, nil
 }
 
 // composeAdapters is the whole stack the gateway drives: the chat backends
@@ -103,18 +192,18 @@ func buildAdaptersWith(cfg *gateway.Config, primary gateway.Adapter, console *ga
 // prefix dispatch has no key for an inject: or a2a: conversation. It does pass
 // TaskObserver and SessionLookupSink on to the chat backend, which is how
 // the Slack adapter below it learns its session threads.
-func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, doors []gateway.DoorSpec, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
+func composeAdapters(cfg *gateway.Config, backends map[string]gateway.Adapter, doors []gateway.DoorSpec, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
 	console, err := gateway.NewConsoleAdapter(cfg.NATSURL, natsOpts, log)
 	if err != nil {
 		return nil, err
 	}
-	return composeAdaptersWith(cfg, primary, console, doors, log)
+	return composeAdaptersWith(backends, console, doors, log)
 }
 
 // composeAdaptersWith is composeAdapters around a console adapter already
 // dialed.
-func composeAdaptersWith(cfg *gateway.Config, primary gateway.Adapter, console *gateway.ConsoleAdapter, doors []gateway.DoorSpec, log *slog.Logger) (gateway.Adapter, error) {
-	chat, err := buildAdaptersWith(cfg, primary, console, log)
+func composeAdaptersWith(backends map[string]gateway.Adapter, console *gateway.ConsoleAdapter, doors []gateway.DoorSpec, log *slog.Logger) (gateway.Adapter, error) {
+	chat, err := buildAdaptersWith(backends, console, log)
 	if err != nil {
 		return nil, err
 	}
@@ -135,13 +224,23 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("config", "err", err)
 		return err
 	}
+	// The install's Tier resources, rendered by the operator (#3659): the
+	// mint validates every grant against the tier table.
+	capability.StartTierFile(ctx, os.Getenv, log)
 
-	natsOpts := gatewayNATSOptions(cfg)
+	natsOpts, err := gatewayNATSOptions(cfg)
+	if err != nil {
+		log.Error("nats auth", "err", err)
+		return err
+	}
 	client, err := lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
 		lib.WithAgreementPolicy(gateway.SupervisorAgreement(cfg)),
 		lib.WithNATSOptions(natsOpts...),
+		// Unset until the operator renders it from the latched profile
+		// supervisor form (#5301); a malformed value reads as unset.
+		lib.WithProfileSupervisorCutoff(lib.ProfileSupervisorCutoffFromEnv(os.Getenv, log)),
 	)
 	if err != nil {
 		log.Error("nats connect", "err", err)
@@ -149,58 +248,33 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	defer client.Close()
 
-	// FromEnv already enforced at most one real backend, and that the door
-	// carries a token if it is armed at all.
+	// FromEnv already enforced that the door carries a token if it is armed
+	// at all. Every armed real backend runs; cfg.Backend() is the first of
+	// them, or "" when only a door is armed (gateway.New then picks the door
+	// default), and stays the gateway's authority default.
 	backend := cfg.Backend()
 	// One set of counters for the whole process: the gateway counts what it
 	// relays, the Chat adapter counts its pulls, the Slack adapter reports its
 	// connection, and the metrics listener serves them all (gateway/metrics.go).
 	metrics := gateway.NewMetrics()
-	var adapter gateway.Adapter
-	switch backend {
-	case "gchat":
-		var chat *gateway.GoogleChatAdapter
-		chat, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
-		if err == nil {
-			chat.SetMetrics(metrics)
-			adapter = chat
-		}
-	case "slack":
-		var sl *gateway.SlackAdapter
-		sl, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
-		if err == nil {
-			// The allowlist's T…:U… entries: other workspaces' members it serves.
-			sl.SetAllowedGuests(cfg.SlackAllowedUsers)
-			sl.SetMetrics(metrics)
-			// End-to-end test users, meant for CI and eval installs; the
-			// allowlist still decides who is served.
-			sl.SetTestUsers(cfg.SlackTestUsers)
-			adapter = sl
-		}
-	case "":
+	backendAdapters, err := buildBackendAdapters(cfg, metrics, log)
+	if err != nil {
+		log.Error("adapter", "backends", cfg.Backends(), "err", err)
+		return err
+	}
+	if len(backendAdapters) == 0 && !cfg.InjectArmed() && !cfg.A2ADoorArmed() {
 		// No real backend: the doors (inject, A2A) and the console are the
 		// only ingresses, which is what lets an eval install's gateway start
 		// at all (#1660).
-		if !cfg.InjectArmed() && !cfg.A2ADoorArmed() {
-			log.Info("console-only: no chat backend, serving the console door")
-		}
-	default:
-		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
+		log.Info("console-only: no chat backend, serving the console door")
 	}
-	if err != nil {
-		log.Error("adapter", "backend", backend, "err", err)
-		return err
-	}
-	// The chat.notify route needs the backend adapter itself, not the
-	// composite the doors and console wrap it in below.
-	backendAdapter := adapter
-	// The door is a side door, not a backend: it can be armed beside either
+	// The door is a side door, not a backend: it can be armed beside any
 	// of the above, and the composite routes by conversation key. Dev and
 	// eval installs only; the operator renders A2A_INJECT_LISTEN and the
 	// token only under its eval flag. See a2a/gateway/inject.go.
 	var doors []gateway.DoorSpec
 	if cfg.InjectArmed() {
-		door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+		door, err := newInjectDoor(cfg, log)
 		if err != nil {
 			log.Error("inject door", "err", err)
 			return err
@@ -208,17 +282,10 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		doors = append(doors, gateway.InjectDoorSpec(door))
 	}
 	// The A2A door is the same kind of thing for an agent caller: armed
-	// beside either backend or alone, routed by its own key prefix, its
+	// beside any backend or alone, routed by its own key prefix, its
 	// callers resolved through its own map. See a2a/gateway/a2adoor.go.
 	if cfg.A2ADoorArmed() {
-		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
-			PublicURL:          cfg.A2ADoorPublicURL,
-			DefaultAddressee:   cfg.DefaultAddressee,
-			TaskDeadline:       cfg.TaskDeadline,
-			GoogleClientID:     cfg.A2ADoorGoogleClientID,
-			GoogleAllowedUsers: cfg.A2ADoorAllowedUsers,
-			Logger:             log,
-		})
+		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, a2aDoorOptions(cfg, log))
 		if err != nil {
 			log.Error("A2A door", "err", err)
 			return err
@@ -231,7 +298,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("console adapter", "err", err)
 		return err
 	}
-	adapter, err = composeAdaptersWith(cfg, adapter, console, doors, log)
+	adapter, err := composeAdaptersWith(backendAdapters, console, doors, log)
 	if err != nil {
 		log.Error("console adapter", "err", err)
 		return err
@@ -253,14 +320,18 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// lead is all of the gateway's work: the chat.notify routes and Run.
 	// Under the election it runs only while this replica holds the lease.
 	lead := func(ctx context.Context, opts gateway.RunOptions) error {
-		if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
+		for _, notifier := range chatNotifiers(cfg, backendAdapters, gw.Conversations, log) {
 			// Home posts refused for want of a home channel are kept in the
 			// session-state bucket and digested when a channel arrives
-			// (gateway/notify_refused.go), whatever the backend.
+			// (gateway/notify_refused.go), each backend in its own store.
 			notifier.SetKept(gateway.NewRefusedStore(client, notifier.Backend()))
 			// The home source is wired before the route starts: Start's boot
-			// line reads it, and nothing writes it after.
-			armHomeLearn(cfg, backendAdapter, notifier, log)
+			// line reads it, and nothing writes it after. The Slack and Chat
+			// routes learn their homes; armHomeLearn returns early for the
+			// rest, and for a backend the operator did not arm.
+			if backend, ok := homeLearnBackends[notifier.Backend()]; ok {
+				armHomeLearn(cfg, backend, backendAdapters[backend], notifier, log)
+			}
 			defer runNotifier(ctx, notifier, client)()
 		}
 		// The console's route runs whenever the console does: a card filed
@@ -274,7 +345,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 
 	log.Info("a2a gateway starting",
 		"nats", cfg.NATSURL,
-		"backend", backend,
+		"backends", cfg.Backends(),
 		"injectDoor", cfg.InjectArmed(),
 		"a2aDoor", cfg.A2ADoorArmed(),
 		"defaultAddressee", cfg.DefaultAddressee,
@@ -347,19 +418,45 @@ func gatewayElection(cfg *gateway.Config, log *slog.Logger) (gateway.Election, e
 	}, nil
 }
 
+// gatewayInboxOwner is the gateway user's inbox owner, _INBOX.gateway: the
+// static user's name and the callout map entry's user alike.
+const gatewayInboxOwner = "gateway"
+
 // gatewayNATSOptions is how the gateway's user dials, the gateway's own
-// connection and the feedback export's alike.
-func gatewayNATSOptions(cfg *gateway.Config) []nats.Option {
+// connection and the feedback export's alike: as the static user, or on
+// A2A_GATEWAY_BUS_AUTH=token with its ServiceAccount token, which the
+// callout mints as the same user with the same inbox (#5301).
+func gatewayNATSOptions(cfg *gateway.Config) ([]nats.Option, error) {
+	if cfg.BusAuth == gateway.BusAuthToken {
+		return lib.KSATokenNATSOptions(cfg.BusTokenFile, gatewayInboxOwner)
+	}
 	natsOpts := []nats.Option{
 		// The gateway user may only subscribe under its own inbox prefix
 		// (per-user _INBOX prefixes, deployment spec); the JS API replies
 		// every publish and consume depends on land there.
-		nats.CustomInboxPrefix("_INBOX.gateway"),
+		nats.CustomInboxPrefix("_INBOX." + gatewayInboxOwner),
 	}
 	if cfg.NATSUser != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPassword))
 	}
-	return natsOpts
+	return natsOpts, nil
+}
+
+// chatNotifiers builds one chat.notify route per real backend adapter, in
+// cfg.Backends() order; a backend whose route does not arm is left out.
+func chatNotifiers(cfg *gateway.Config, backends map[string]gateway.Adapter, conversations func(gateway.Adapter) gateway.NotifyConversations,
+	log *slog.Logger) []*gateway.Notifier {
+	var notifiers []*gateway.Notifier
+	for _, name := range cfg.Backends() {
+		a, ok := backends[name]
+		if !ok {
+			continue
+		}
+		if n := chatNotifier(cfg, a, conversations, log); n != nil {
+			notifiers = append(notifiers, n)
+		}
+	}
+	return notifiers
 }
 
 // chatNotifier builds the chat.notify route for the backend adapter, or nil
@@ -373,7 +470,11 @@ func gatewayNATSOptions(cfg *gateway.Config) []nats.Option {
 func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations func(gateway.Adapter) gateway.NotifyConversations,
 	log *slog.Logger) *gateway.Notifier {
 	if slack, ok := backend.(*gateway.SlackAdapter); ok {
-		if cfg.SlackHomeChannel == "" {
+		switch {
+		case cfg.SlackHomeChannel != "":
+		case cfg.HomeLearnArmed():
+			log.Info("chat.notify home posts use a learned home channel: none is configured, so they go to the channel the gateway learned, or wait for the first mention in a channel to set one; conversation posts are armed")
+		default:
 			log.Warn("chat.notify home posts not armed: no Slack home channel configured; conversation posts are")
 		}
 		n, err := gateway.NewSlackNotifier(slack, cfg.SlackHomeChannel, log)
@@ -384,11 +485,27 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 		n.SetConversations(conversations(slack))
 		return n
 	}
+	if teams, ok := backend.(*gateway.TeamsAdapter); ok {
+		if cfg.TeamsHomeChannel == "" {
+			log.Warn("chat.notify home posts not armed: no Teams home channel configured; conversation posts are")
+		}
+		n, err := gateway.NewTeamsNotifier(teams, cfg.TeamsHomeChannel, log)
+		if err != nil {
+			log.Error("chat.notify route not armed", "err", err)
+			return nil
+		}
+		n.SetConversations(conversations(teams))
+		return n
+	}
 	gchat, ok := backend.(*gateway.GoogleChatAdapter)
 	if !ok {
 		return nil
 	}
-	if cfg.GchatHomeChannel == "" {
+	switch {
+	case cfg.GchatHomeChannel != "":
+	case cfg.GchatHomeLearnArmed():
+		log.Info("chat.notify home posts use a learned home channel: none is configured, so they go to the space the gateway learned, or wait for the first mention in a space to set one; conversation posts are armed")
+	default:
 		log.Warn("chat.notify home posts not armed: no home channel configured; conversation posts are")
 	}
 	n, err := gateway.NewGchatNotifier(gchat, cfg.GchatHomeChannel, log)
@@ -423,34 +540,34 @@ func armResolvedScope(cfg *gateway.Config, gw *gateway.Gateway, log *slog.Logger
 	log.Info("resolved scope armed", "configmap", cfg.ResolvedScopeConfigMap)
 }
 
-// armHomeLearn lets a Slack gateway learn its home channel from the first
-// admitted channel mention and record it (gateway/slack_home_channel.go), when
-// the operator armed it (Config.HomeLearnArmed), and points the notify route
-// at the home channel the operator projects into this pod as a file. The
-// record client is the pod's own ServiceAccount, whose Role reaches that one
-// ConfigMap; one that cannot be built leaves the learn off and chat ingress
-// untouched.
-func armHomeLearn(cfg *gateway.Config, backend gateway.Adapter, notifier *gateway.Notifier, log *slog.Logger) {
-	slack, ok := backend.(*gateway.SlackAdapter)
-	if !ok || !cfg.HomeLearnArmed() {
+// armHomeLearn lets a Slack or Google Chat backend learn its home channel
+// from the first admitted mention outside a direct message and record it
+// (gateway/home_channel.go), when the operator armed it for that backend
+// (Config.HomeLearnArmedFor), and points the notify route at the home channel
+// the operator projects into this pod as a file. The record client is the
+// pod's own ServiceAccount, whose Role reaches that one ConfigMap; one that
+// cannot be built leaves the learn off and chat ingress untouched.
+func armHomeLearn(cfg *gateway.Config, name string, backend gateway.Adapter, notifier *gateway.Notifier, log *slog.Logger) {
+	learner, ok := backend.(gateway.HomeLearner)
+	if !ok || !cfg.HomeLearnArmedFor(name) {
 		return
 	}
 	rc, err := rest.InClusterConfig()
 	if err != nil {
-		log.Error("home channel learn not armed: no in-cluster config", "err", err)
+		log.Error("home channel learn not armed: no in-cluster config", "backend", name, "err", err)
 		return
 	}
 	cs, err := kubernetes.NewForConfig(rc)
 	if err != nil {
-		log.Error("home channel learn not armed: no Kubernetes client", "err", err)
+		log.Error("home channel learn not armed: no Kubernetes client", "backend", name, "err", err)
 		return
 	}
-	slack.SetHomeLearner(cs, cfg.Namespace, cfg.HomeChannelRecord, cfg.SelfImage, gateway.HomeFileDir)
+	learner.SetHomeLearner(cs, cfg.Namespace, cfg.HomeChannelRecord, cfg.SelfImage, gateway.HomeFileDir)
 	if notifier != nil {
-		notifier.SetHomeSource(slack.LearnedHome)
-		notifier.SetHomeVerifier(slack.VerifyHomeForPost)
+		notifier.SetHomeSource(learner.LearnedHome)
+		notifier.SetHomeVerifier(learner.VerifyHomeForPost)
 	}
-	log.Info("home channel learn armed", "record", cfg.HomeChannelRecord, "file", gateway.HomeFileDir)
+	log.Info("home channel learn armed", "backend", name, "record", cfg.HomeChannelRecord, "file", gateway.HomeFileDir)
 }
 
 // runNotifier runs a chat.notify route until ctx ends, and returns the stop
@@ -479,6 +596,14 @@ func runNotifier(ctx context.Context, n *gateway.Notifier, client *lib.Client) f
 func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, readiness func() (bool, string), log *slog.Logger, run func(context.Context) error) error {
 	startMetricsListener(ctx, cfg, metrics, readiness, log)
 	if err := run(ctx); err != nil && ctx.Err() == nil {
+		if errors.Is(err, gateway.ErrTermBusLost) {
+			// A restart that kubectl describe can explain: the kubelet shows
+			// the termination message as the last state's message.
+			msg := "ErrTermBusLost: " + err.Error() + "; the lease is released and the restarted container stands by"
+			log.Error("gateway exited: the bus was down mid-term (ErrTermBusLost)", "err", err)
+			_ = os.WriteFile(terminationLogPath, []byte(msg), terminationLogMode)
+			return err
+		}
 		log.Error("gateway exited", "err", err)
 		return err
 	}
@@ -506,4 +631,18 @@ func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gat
 			log.Error(metricsUnavailableAlert, "err", err)
 		}
 	}()
+}
+
+// newInjectDoor builds the inject door from the config, armed for intent
+// "confirm" only when A2A_INJECT_CONFIRM is set (Config.InjectConfirm). It is
+// realMain's one route to the door, split out so the wiring is testable.
+func newInjectDoor(cfg *gateway.Config, log *slog.Logger) (*gateway.InjectAdapter, error) {
+	door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.InjectConfirm {
+		door.AllowConfirm()
+	}
+	return door, nil
 }

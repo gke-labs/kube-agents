@@ -1,7 +1,7 @@
 // The a2a MCP server: a Model Context Protocol endpoint for one `next`
 // install, as a console client of its bus. The operator renders it in its own
-// Deployment only when the install opts in, behind a ClusterIP Service, and a
-// person reaches it with kubectl port-forward. See package mcp.
+// Deployment unless the install switches it off, behind a ClusterIP Service,
+// and a person reaches it with kubectl port-forward. See package mcp.
 package main
 
 import (
@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/mcp"
 )
 
@@ -179,6 +180,9 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	s.bus.Logger = log
+	// Unset until the operator renders it from the latched profile
+	// supervisor form (#5301); a malformed value reads as unset.
+	s.bus.ProfileSupervisorCutoff = lib.ProfileSupervisorCutoffFromEnv(getenv, log)
 	bus, err := dialWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*mcp.NATSBus, error) {
 		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 		defer cancel()

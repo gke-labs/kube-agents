@@ -64,6 +64,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -204,12 +205,12 @@ const (
 	ActivityStatusError       = "error"
 	ActivityStatusInterrupted = "interrupted"
 
-	redactedValue = "[redacted]"
+	redactedValue = answerscrub.Redacted
 )
 
 // What of an input reaches the bus does not depend on the executor mode,
 // because this stream is retained for days and copied into eval records.
-// First, redactedKeyPattern and its siblings name input keys whose values
+// First, answerscrub.SecretLookingKey names input keys whose values
 // never go on the bus, so the trace still says a secret-looking key was
 // there. Then every remaining string value becomes its shape (shapeValue):
 // the graders on the inject lane read tool names (an entry's tool, a
@@ -222,7 +223,7 @@ const (
 // for, and, on a kanban_create that made a card, the card's id. A title is
 // the one place a value taken from the arguments is published, and it is a
 // short identifier the renderer needs (a cluster, a file's tail, a search
-// query, a card's title), passed through scrubInlineSecrets as a net. The
+// query, a card's title), passed through answerscrub.ScrubInline as a net. The
 // model's reasoning is read for the step boundary it marks and is not
 // published: a model that has read a secret may restate it, and a scrubber
 // is not a contract.
@@ -259,33 +260,6 @@ var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // writeScopeFile writes one file of a child scope; a variable only so a
 // test can observe the order the two files are written in.
 var writeScopeFile = os.WriteFile
-
-var (
-	// A key is secret-looking when one of the words is a whole component of
-	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key, private_key, and in camelCase
-	// accessToken, clientSecret, dbPassword), not a substring (tokenizer,
-	// secretName): the latter are names, and blanking them would put
-	// "[redacted]" where the worker adapter's trace carries the value.
-	// A count or a path that ends in the word (max_tokens, credentials_file,
-	// accessTokenExpiry) is blanked too; that is the accepted price of
-	// catching SECRET_KEY. The camelCase form is case-sensitive: the word
-	// starts a component when any letter or digit precedes its capital (so
-	// an acronym prefix counts: AWSSecretAccessKey, DBPassword, IDToken), and
-	// ends one at the end, a separator or the next capital. A key that opens
-	// with the word is handled apart (redactedCamelHeadPattern below).
-	redactedKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|cookie|set-cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:$|[_.-])`)
-	// An all-caps key with the word as an unseparated suffix (PGPASSWORD,
-	// DBPASSWORD, MYSQLPASSWORD): the libpq spelling, not an exotic one.
-	redactedUpperSuffixPattern = regexp.MustCompile(`[A-Z0-9](?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|COOKIE|CREDENTIAL)S?$`)
-	redactedCamelKeyPattern    = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Cookie|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Credential)s?(?:$|[_.-]|[A-Z])`)
-	// A camelCase key that opens with the word and goes on in another
-	// component (secretAccessKey, SecretKey, tokenValue, passwordHash) is a
-	// credential unless the next component says it is a name, a reference
-	// or a location of one: secretName, SecretRef, tokenPath, credentialsFile,
-	// passwordId stay.
-	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?[A-Z]`)
-	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
-)
 
 // schemaKeyPattern is what an object key must look like to be published
 // under shape mode: a tool schema's key, letters, digits, underscore or dash,
@@ -544,6 +518,11 @@ type activityState struct {
 	// stepRefused says a step record was refused at encoding and the log
 	// has said so; one line per task (publishSteps).
 	stepRefused atomic.Bool
+
+	// secrets is the secret values this task's tool results carried
+	// (answerscrub.Seen), redacted out of its answer and cleared when it
+	// finalizes.
+	secrets answerscrub.Seen
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -843,7 +822,7 @@ const debugErrorTextCap = 320
 // debugErrorText is a failed call's error text for its activity entry: ""
 // unless BRIDGE_DEBUG_ERROR_TEXT is true, else the first line of hermes's
 // error_message (or of the result, when hermes gave none), run through
-// scrubInlineSecrets and capped.
+// answerscrub.ScrubInline and capped.
 func debugErrorText(d hookDelivery) string {
 	if !debugErrorTextOn() {
 		return ""
@@ -857,7 +836,7 @@ func debugErrorText(d hookDelivery) string {
 			text = string(d.Extra.Result)
 		}
 	}
-	return oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap)
+	return oneLinePreview(answerscrub.ScrubInline(text), debugErrorTextCap)
 }
 
 // debugErrorTextOn reports whether the BRIDGE_DEBUG_ERROR_TEXT switch is on.
@@ -898,16 +877,6 @@ func durationMillis(n json.Number) int64 {
 		return int64(f)
 	}
 	return 0
-}
-
-// secretLookingKey says whether a value under this key never goes on the
-// bus: a secret word as a whole component in any spelling, or a camelCase
-// key that opens with the word and goes on in something other than a name.
-func secretLookingKey(k string) bool {
-	if redactedKeyPattern.MatchString(k) || redactedCamelKeyPattern.MatchString(k) || redactedUpperSuffixPattern.MatchString(k) {
-		return true
-	}
-	return redactedCamelHeadPattern.MatchString(k) && !camelHeadNamePattern.MatchString(k)
 }
 
 // redactInput returns the tool input fit for the bus: the structure with
@@ -1066,7 +1035,7 @@ func redactKeys(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			if secretLookingKey(k) {
+			if answerscrub.SecretLookingKey(k) {
 				t[k] = redactedValue
 			} else {
 				t[k] = redactKeys(val)
@@ -1359,13 +1328,19 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	run := b.runForSignature(r.Header.Get(hookSignatureHeader), body)
+	sig := r.Header.Get(hookSignatureHeader)
+	run, decoded, runs := b.routeDelivery(sig, body)
 	if run == nil {
+		if decoded != nil {
+			b.collectCardWorkerSecrets(runs, decoded)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil {
+	if decoded != nil {
+		d = *decoded
+	} else if err := json.Unmarshal(body, &d); err != nil {
 		// Signed for this task and unreadable, and which event it was
 		// cannot be known: an unreadable pre costs the trace nothing (the
 		// post carries the record whole), an unreadable post leaves its
@@ -1381,6 +1356,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// and the entry would then be dropped as post-terminal - present in the
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
+	// The result's secret values, for the answer's scrub, read before
+	// run.mu: the read is CPU only and bounded, and holding run.mu over it
+	// would hold the heartbeat and a finalize behind it. A value that lands
+	// after the answer was published scrubs nothing; the answer is out.
+	if d.Event == hookPostToolCall {
+		act.secrets.CollectToolResult(d.Extra.Result)
+	}
 	run.mu.Lock()
 	entry, ok, steps := act.observe(d)
 	b.publishSteps(run, act, steps)
@@ -1405,8 +1387,17 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 // session id is read only after the signature verifies, so an unsigned body
 // cannot pick a task.
 func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
+	run, _, _ := b.routeDelivery(sig, body)
+	return run
+}
+
+// routeDelivery is runForSignature, also handing back what it read on the
+// way, so the door neither verifies nor decodes a body twice: the delivery,
+// when the pod's shared secret signed it and it decoded (nil otherwise),
+// and the snapshot of tasks it matched against.
+func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery, []*taskRun) {
 	if sig == "" {
-		return nil
+		return nil, nil, nil
 	}
 	b.mu.Lock()
 	runs := make([]*taskRun, 0, len(b.tasks))
@@ -1416,22 +1407,42 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	b.mu.Unlock()
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.signed(sig, body) {
-			return r
+			return r, nil, runs
 		}
 	}
 	if !hookSigned(b.cfg.ActivitySecret, sig, body) {
-		return nil
+		return nil, nil, runs
 	}
-	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil || d.SessionID == "" {
-		return nil
+	d := new(hookDelivery)
+	if err := json.Unmarshal(body, d); err != nil {
+		return nil, nil, runs
+	}
+	if d.SessionID == "" {
+		return nil, d, runs
 	}
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
-			return r
+			return r, d, runs
 		}
 	}
-	return matchWorkerDeliveryRun(runs, d)
+	return matchWorkerDeliveryRun(runs, *d), d, runs
+}
+
+// collectCardWorkerSecrets reads the Secret values of a post_tool_call
+// that matched no task's trace because its card's worker ran before the
+// task started waiting on its cards (a card runs as soon as it is filed,
+// while the coordinator's turn goes on), into the set of the task that
+// filed or tracks the card (cardWorkerRun), whose answer folds the card's
+// report in. Nothing else of the delivery is used: it stays out of the
+// trace, as before. d is the delivery routeDelivery verified and decoded,
+// and runs the tasks it matched against.
+func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
+	if d.Event != hookPostToolCall || d.SessionID == "" {
+		return
+	}
+	if run := cardWorkerRun(runs, *d); run != nil {
+		run.act.Load().secrets.CollectToolResult(d.Extra.Result)
+	}
 }
 
 // --- the heartbeat ---

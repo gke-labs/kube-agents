@@ -19,6 +19,10 @@ endpoint and ``inject`` enters the A2A gateway through its side door. This one
 goes the way a person does. A test user mentions the install's bot in a CI
 channel with ``chat.postMessage`` and a user token, Slack delivers it over
 Socket Mode, and the transport reads the thread back until the turn settles.
+A prompt opening with ``[bench:reply-under-home-post: <marker>]`` (HOME_POST_DIRECTIVE)
+starts no thread: it waits for the bot's newest top-level post holding the
+marker in the channel, a post the case's setup had the agent make on its own
+(a scheduled report, an alert), and replies under it as the test user.
 What it grades is the report the thread delivered (split_thread; the harness folds it), and it times each Slack leg:
 post to the bot's first reaction, to its first reply (the ack), and to the
 answer.
@@ -77,11 +81,42 @@ USER_TOKEN_PREFIXES = ("xoxp-", "xoxe.xoxp-")
 # script sets it beside the run's KUBE_AGENTS_TIMING_FILE, which carries only
 # the post-to-answer leg the scorer reads.
 TIMING_FILE_ENV = "BENCH_SLACK_TIMING_FILE"
+# A second turn the lane sends once the first settles, replying in its thread:
+# a follow-up, or a typed choice for a question's buttons. Recorded beside the
+# first turn's timing under slack_then_*; the case grades the first turn.
+THEN_ENV = "BENCH_SLACK_THEN"
+# A prompt whose first line is "[bench:reply-under-home-post: <marker>]" replies in
+# the thread of a post the agent made on its own in the channel (the home
+# channel, on the lane), not in a thread a mention opens: the case's setup has
+# the agent post (a scheduled report, an alert), and the rest of the prompt is
+# the reply. The post is the newest top-level bot post holding <marker> since
+# the case started (CASE_START_ENV, epoch seconds, which the lane's runner sets
+# before each case), or, run by hand without it, since HOME_POST_LOOKBACK_ENV
+# seconds before the turn (default HOME_POST_LOOKBACK_SECONDS). So an earlier
+# run's post with the same marker is never this run's. It is watched for up to
+# HOME_POST_WAIT_ENV seconds (default HOME_POST_WAIT_SECONDS), since it may
+# land after the setup returns, read every HOME_POST_POLL_SECONDS.
+HOME_POST_DIRECTIVE = "[bench:reply-under-home-post:"
+CASE_START_ENV = "BENCH_SLACK_CASE_START"
+# Taken off the case's start before it bounds the search: the runner's clock
+# and Slack's timestamps differ, and a post a few seconds after the start must
+# not read as before it. An earlier run's post comes before its own setup, far
+# outside it.
+CASE_START_MARGIN_SECONDS = 60.0
+HOME_POST_LOOKBACK_ENV = "BENCH_SLACK_HOME_POST_LOOKBACK"
+HOME_POST_LOOKBACK_SECONDS = 3600.0
+HOME_POST_WAIT_ENV = "BENCH_SLACK_HOME_POST_WAIT"
+HOME_POST_WAIT_SECONDS = 600.0
+HOME_POST_POLL_SECONDS = 10.0
+HISTORY_PAGE_LIMIT = 200
 
 POLL_SECONDS = 2.0
 # The bot's reactions that end a turn rather than mark it in flight: blocked and
 # failed (slackMarkEmoji in a2a/gateway/slack_reactions.go).
 SETTLE_REACTIONS = frozenset({"double_vertical_bar", "x"})
+# The blocked mark alone: a typed answer continues a paused ask, which keeps ⏸️
+# until the continuing task draws its first mark. A failed ask's ❌ never lifts.
+BLOCKED_REACTION = "double_vertical_bar"
 # How long the thread must stay unchanged, after the reaction is gone, for the
 # turn to count as settled: long enough to cover the gap between a status line's
 # last edit and the answer's post.
@@ -200,6 +235,37 @@ def split_thread(posts: list[dict]) -> tuple[dict | None, list[dict]]:
     return (content[0], content[1:]) if content else (None, [])
 
 
+def parse_home_post(prompt: str) -> tuple[str, str] | None:
+    """The (marker, reply) of a reply-under-home-post prompt, or None for any other prompt.
+
+    Raises ValueError for the directive with no marker or no reply: a case
+    written wrong, never a turn to post.
+    """
+    first, _, rest = prompt.lstrip().partition("\n")
+    first = first.strip()
+    if not first.startswith(HOME_POST_DIRECTIVE):
+        return None
+    inner = first[len(HOME_POST_DIRECTIVE):]
+    close = inner.find("]")
+    if close < 0:
+        raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] is not closed: {first!r}")
+    if inner[close + 1:].strip():
+        # The marker ends at the directive's own "]"; anything after it on the
+        # line is a case written wrong, never more marker.
+        raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] has text after it on its line: {first!r}")
+    marker = inner[:close].strip()
+    reply = rest.strip()
+    if not marker or not reply:
+        raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] needs a marker and a reply after it")
+    return marker, reply
+
+
+def is_top_level(msg: dict) -> bool:
+    """Whether msg opens its own thread or none, rather than replying in one."""
+    thread = msg.get("thread_ts")
+    return not thread or thread == msg.get("ts")
+
+
 @dataclass
 class SlackExchange:
     """One turn as the thread showed it.
@@ -261,6 +327,89 @@ class SlackTurn:
     def run(self, prompt: str, deadline_seconds: float) -> SlackExchange:
         sent = self.client.call("chat.postMessage", channel=self.channel, text=f"<@{self.bot_user}> {prompt}")
         ex = SlackExchange(ask_ts=str(sent["ts"]))
+        return self._await(ex, ex.ask_ts, deadline_seconds)
+
+    def follow_up(self, first: SlackExchange, text: str, deadline_seconds: float) -> SlackExchange:
+        """Reply in the first ask's thread as the test user and read that turn until it settles.
+
+        The exchange's ask is the reply, and its posts are the bot's replies
+        after it. A typed answer to a question goes this way, since Slack's
+        Web API cannot press a button; the gateway reads it as continuing the
+        first ask and marks that ask, not the reply, while the work runs, so
+        the first ask's reactions are read as well.
+        """
+        sent = self.client.call("chat.postMessage", channel=self.channel, thread_ts=first.ask_ts,
+                                text=f"<@{self.bot_user}> {text}")
+        ex = SlackExchange(ask_ts=str(sent["ts"]))
+        return self._await(ex, first.ask_ts, deadline_seconds, also_marked=first.ask_ts)
+
+    def find_home_post(self, marker: str, since: float, wait_seconds: float,
+                       errors: list[str] | None = None) -> dict | None:
+        """The newest top-level post of the bot's holding marker, posted after since
+        (epoch seconds), watched for until wait_seconds pass; None if none came.
+
+        A thread reply never counts (a post the agent made on its own opens its
+        thread), and neither does another app's post or a test user's. A
+        transient read error is polled through and appended to errors.
+        """
+        oldest = f"{since:.6f}"
+        deadline = self._clock() + wait_seconds
+        while True:
+            try:
+                found = [m for m in self._history(oldest)
+                         if is_bot_message(m, self.bot_user) and is_top_level(m) and marker in str(m.get("text") or "")]
+            except SlackAPIError as err:
+                if not err.transient:
+                    raise
+                if errors is not None:
+                    errors.append(str(err))
+                found = []
+            if found:
+                return max(found, key=lambda m: ts_value(m.get("ts")) or Decimal(0))
+            if self._clock() >= deadline:
+                return None
+            self._sleep(max(self._poll, HOME_POST_POLL_SECONDS))
+
+    def wall(self) -> float:
+        """The wall clock the turn reads, epoch seconds."""
+        return self._wall()
+
+    def reply_under(self, post_ts: str, text: str, deadline_seconds: float) -> SlackExchange:
+        """Reply in post_ts's thread as the test user, mentioning the bot, and read that
+        turn until it settles. The exchange's posts are the bot's replies after the reply,
+        so the post itself and anything before the reply in its thread are not the turn's."""
+        sent = self.client.call("chat.postMessage", channel=self.channel, thread_ts=post_ts,
+                                text=f"<@{self.bot_user}> {text}")
+        ex = SlackExchange(ask_ts=str(sent["ts"]))
+        return self._await(ex, post_ts, deadline_seconds)
+
+    def _history(self, oldest: str) -> list[dict]:
+        messages: list[dict] = []
+        cursor = ""
+        while True:
+            params = {"channel": self.channel, "oldest": oldest, "limit": str(HISTORY_PAGE_LIMIT)}
+            if cursor:
+                params["cursor"] = cursor
+            page = self.client.call("conversations.history", **params)
+            messages.extend(page.get("messages") or [])
+            cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                return messages
+
+    def _await(self, ex: SlackExchange, root_ts: str, deadline_seconds: float,
+               also_marked: str = "") -> SlackExchange:
+        """Poll ex's reaction and the bot's posts after ex's ask in root_ts's thread until the
+        turn settles.
+
+        also_marked is a continued ask's message (a typed answer's first ask). Its
+        reactions never count as ex's own; they hold the turn open while it is in
+        flight, and while it still carries the ⏸️ Turn 1 left on it (the gateway
+        keeps it until the continuing task draws its first mark), since until
+        then the answer has not visibly taken. A ❌ Turn 1 left never lifts, so
+        it holds nothing.
+        """
+        after = ts_value(ex.ask_ts)
+        left_by_first = set(self._bot_reactions(also_marked)) if also_marked else set()
         deadline = self._clock() + deadline_seconds
         last_shape: tuple = ()
         quiet_since: float | None = None
@@ -269,7 +418,9 @@ class SlackTurn:
             self._sleep(self._poll)
             try:
                 names = self._bot_reactions(ex.ask_ts)
-                ex.posts = self._bot_replies(ex.ask_ts)
+                continued = set(self._bot_reactions(also_marked)) if also_marked else set()
+                ex.posts = [p for p in self._bot_replies(root_ts)
+                            if after is None or (ts_value(p.get("ts")) or after) > after]
             except SlackAPIError as err:
                 if err.transient:
                     ex.errors.append(str(err))
@@ -280,6 +431,9 @@ class SlackTurn:
             # The ask's own mark stays on beside a blocked mark (the gateway adds
             # it after the ask's), so any settle mark ends the turn.
             reacting = bool(names) and not SETTLE_REACTIONS.intersection(names)
+            if also_marked and ((continued and not SETTLE_REACTIONS & continued)
+                                or (BLOCKED_REACTION in left_by_first and continued == left_by_first)):
+                reacting = True
             shape = tuple((p.get("ts"), (p.get("edited") or {}).get("ts"), p.get("text")) for p in ex.posts)
             if shape != last_shape:
                 last_shape, quiet_since = shape, self._clock()

@@ -515,6 +515,9 @@ func buttonParameters(b gchatButton) map[string]string {
 // open. The relay call runs off the
 // inbox worker, so a slow relay does not hold the clicked turn.
 func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, verified bool) {
+	// A verified ask typed at the top of a space: the one turn that can set
+	// the home space (gchat_home_channel.go).
+	a.homeVerified(conversation, messageID, verified)
 	a.mu.Lock()
 	ux := a.uxLocked()
 	p, ok := ux.pending[messageID]

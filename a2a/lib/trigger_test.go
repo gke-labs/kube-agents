@@ -1,6 +1,8 @@
 package lib
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -11,7 +13,7 @@ func TestValidateTriggerAcceptsTheShapesAGrantBinds(t *testing.T) {
 		{"schedule/compliance-audit", TriggerOriginBuiltin, ""},
 		{"stall-watch", TriggerOriginBuiltin, ""},
 	} {
-		if err := ValidateTrigger(c[0], c[1], c[2]); err != nil {
+		if err := ValidateTrigger(c[0], c[1], c[2], ""); err != nil {
 			t.Errorf("%q: %v", c, err)
 		}
 	}
@@ -37,8 +39,68 @@ func TestValidateTriggerRefusesMalformedShapes(t *testing.T) {
 		"another schedule's stream": {"schedule/compliance-audit", TriggerOriginBuiltin, "ai-security-audit"},
 		"a stream on a bare source": {"stall-watch", TriggerOriginBuiltin, "stall-watch"},
 	} {
-		if err := ValidateTrigger(c[0], c[1], c[2]); err == nil {
+		if err := ValidateTrigger(c[0], c[1], c[2], ""); err == nil {
 			t.Errorf("%s: accepted %q", name, c)
+		}
+	}
+}
+
+// A built-in schedule's run may name a profile script (#5622): a DNS-1123
+// label, looked up in the profile's allowlist and never read as a path.
+func TestValidateTriggerHoldsAScriptToALabel(t *testing.T) {
+	if err := ValidateTrigger("schedule/compliance-audit", TriggerOriginBuiltin, "", "compliance-audit"); err != nil {
+		t.Errorf("a label script: %v", err)
+	}
+	for name, script := range map[string]string{
+		"a path":             "/opt/scripts/run.sh",
+		"a relative path":    "../run",
+		"a dotted name":      "run.sh",
+		"an upper-case name": "Run",
+		"a space":            "run it",
+		"a wildcard":         ">",
+		"an over-long name":  strings.Repeat("a", 64),
+	} {
+		if err := ValidateTrigger("schedule/a", TriggerOriginBuiltin, "", script); err == nil {
+			t.Errorf("%s: accepted script %q", name, script)
+		}
+	}
+	// Only a schedule's trigger names a script, as only it binds a stream.
+	if err := ValidateTrigger("stall-watch", TriggerOriginBuiltin, "", "stall-watch"); err == nil {
+		t.Error("accepted a script on a collector trigger")
+	}
+	if err := ValidateTrigger("schedule", TriggerOriginBuiltin, "", "compliance-audit"); err == nil {
+		t.Error("accepted a script on a bare schedule trigger, which names no schedule")
+	}
+}
+
+// triggerScriptNames is the case list AgentSchedule.spec.script's CRD test
+// reads too (k8s-operator TestAgentScheduleScriptNamesEnvtest), so the CRD's
+// rule and this one hold the same names.
+type triggerScriptNames struct {
+	Accepted []string `json:"accepted"`
+	Refused  []string `json:"refused"`
+}
+
+func TestValidateTriggerScriptNamesMatchTheCRD(t *testing.T) {
+	raw, err := os.ReadFile("testdata/trigger-script-names.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names triggerScriptNames
+	if err := json.Unmarshal(raw, &names); err != nil {
+		t.Fatal(err)
+	}
+	if len(names.Accepted) == 0 || len(names.Refused) == 0 {
+		t.Fatalf("the case list is empty: %+v", names)
+	}
+	for _, name := range names.Accepted {
+		if err := ValidateTrigger("schedule/a", TriggerOriginBuiltin, "a", name); err != nil {
+			t.Errorf("script %q refused: %v", name, err)
+		}
+	}
+	for _, name := range names.Refused {
+		if err := ValidateTrigger("schedule/a", TriggerOriginBuiltin, "a", name); err == nil {
+			t.Errorf("script %q accepted", name)
 		}
 	}
 }

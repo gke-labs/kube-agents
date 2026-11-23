@@ -22,10 +22,17 @@ type Trigger struct {
 	Name   string `json:"name"`
 	Origin string `json:"origin"`
 	Stream string `json:"stream,omitempty"`
+	// Script, on a built-in schedule's run, names the profile script the run
+	// executes (#5622): a label, never a path, and only on a schedule's
+	// trigger. The gateway writes it from the submission's trigger.script;
+	// the dispatcher's profile allowlist (#5953) resolves it to a path
+	// against the profile's spec.scripts. Bound in the grant, so the whole-trigger equality the
+	// verifier requires covers it. Empty on every other trigger.
+	Script string `json:"script,omitempty"`
 }
 
 func (t *Trigger) validate() error {
-	return lib.ValidateTrigger(t.Name, t.Origin, t.Stream)
+	return lib.ValidateTrigger(t.Name, t.Origin, t.Stream, t.Script)
 }
 
 // equal reports whether t and o name the same trigger, nil equal only to nil.
@@ -39,11 +46,11 @@ func (t *Trigger) equal(o *Trigger) bool {
 // The authority block's key for the claimed trigger, and the trigger's own keys.
 const authorityTriggerKey = "trigger"
 
-var triggerKeys = []string{"name", "origin", "stream"}
+var triggerKeys = []string{"name", "origin", "stream", "script"}
 
 // TriggerFromAuthority pulls the trigger a submission claims out of an
 // envelope's authority block. The gateway writes it there on a trigger's
-// submission and nowhere else (that half is Track 2 of #4685, not yet built);
+// submission and nowhere else (a2a/gateway/trigger_ingress.go, Track 2 of #4685);
 // it is a claim, not authority, until the verifier finds it equal to the
 // grant's (profile.run). nil when the block names none: the block absent or
 // null, or its trigger absent or null.
@@ -156,7 +163,7 @@ func readTrigger(dec *json.Decoder) (*Trigger, error) {
 	if _, err := dec.Token(); err != nil {
 		return nil, err
 	}
-	t := &Trigger{Name: values["name"], Origin: values["origin"], Stream: values["stream"]}
+	t := &Trigger{Name: values["name"], Origin: values["origin"], Stream: values["stream"], Script: values["script"]}
 	if err := t.validate(); err != nil {
 		return nil, err
 	}

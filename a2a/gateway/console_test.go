@@ -40,7 +40,7 @@ func startConsoleRig(t *testing.T) *consoleRig {
 		t.Fatalf("NewConsoleAdapter: %v", err)
 	}
 	t.Cleanup(a.Close)
-	browser, err := nats.Connect(s.ClientURL())
+	browser, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatalf("browser connect: %v", err)
 	}
@@ -69,8 +69,19 @@ func (r *consoleRig) inbound() []InboundMessage {
 
 func (r *consoleRig) send(t *testing.T, token string, frame ConsoleInFrame) {
 	t.Helper()
+	r.sendOn(t, "chat.console."+token+".in", frame)
+}
+
+// sendConfirm publishes a frame on the confirm door, chat.console.<token>.confirm.
+func (r *consoleRig) sendConfirm(t *testing.T, token string, frame ConsoleInFrame) {
+	t.Helper()
+	r.sendOn(t, "chat.console."+token+".confirm", frame)
+}
+
+func (r *consoleRig) sendOn(t *testing.T, subject string, frame ConsoleInFrame) {
+	t.Helper()
 	data, _ := json.Marshal(frame)
-	if err := r.browser.Publish("chat.console."+token+".in", data); err != nil {
+	if err := r.browser.Publish(subject, data); err != nil {
 		t.Fatal(err)
 	}
 	_ = r.browser.Flush()
@@ -82,6 +93,20 @@ func TestConsoleFrameBecomesAnInboundMessage(t *testing.T) {
 	waitFor(t, "inbound", func() bool { return len(r.inbound()) == 1 })
 	got := r.inbound()[0]
 	want := InboundMessage{Conversation: "console:tab-1", Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m1", Text: "hello there"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("inbound = %+v, want %+v", got, want)
+	}
+}
+
+// A frame's replyTo rides the inbound message as typed; the gateway checks
+// its shape where it writes the part (startTaskWith).
+func TestConsoleFrameReplyToReachesTheInboundMessage(t *testing.T) {
+	r := startConsoleRig(t)
+	r.send(t, "tab-2", ConsoleInFrame{MessageID: "m1", Text: "and the other pool?", ReplyTo: "task-7"})
+	waitFor(t, "inbound", func() bool { return len(r.inbound()) == 1 })
+	got := r.inbound()[0]
+	want := InboundMessage{Conversation: "console:tab-2", Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor,
+		MessageID: "m1", Text: "and the other pool?", ReplyTo: "task-7"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("inbound = %+v, want %+v", got, want)
 	}
@@ -367,14 +392,14 @@ func TestConsoleNotifyArrivesAsANotifyFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = r.browser.Flush()
-	id, err := r.adapter.PostNotifyFrame("console:tab-8", "", "the report", "task-7", false)
+	id, err := r.adapter.PostNotifyFrame("console:tab-8", "", "the report", "task-7", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(id, consoleNotifyIDPrefix) {
 		t.Errorf("minted id %q lacks the %q prefix", id, consoleNotifyIDPrefix)
 	}
-	if _, err := r.adapter.PostNotifyFrame("console:tab-8", id, "the report, updated", "task-7", true); err != nil {
+	if _, err := r.adapter.PostNotifyFrame("console:tab-8", id, "the report, updated", "task-7", true, true); err != nil {
 		t.Fatal(err)
 	}
 	var raw []string
@@ -385,10 +410,10 @@ func TestConsoleNotifyArrivesAsANotifyFrame(t *testing.T) {
 		}
 		raw = append(raw, string(msg.Data))
 	}
-	if want := `{"messageId":"` + id + `","text":"the report","kind":"notify","replyTo":"task-7"}`; raw[0] != want {
+	if want := `{"messageId":"` + id + `","text":"the report","kind":"notify","replyTo":"task-7","report":true}`; raw[0] != want {
 		t.Errorf("notify frame = %s, want %s", raw[0], want)
 	}
-	if want := `{"messageId":"` + id + `","text":"the report, updated","edit":true,"kind":"notify","replyTo":"task-7"}`; raw[1] != want {
+	if want := `{"messageId":"` + id + `","text":"the report, updated","edit":true,"kind":"notify","replyTo":"task-7","report":true}`; raw[1] != want {
 		t.Errorf("edit frame = %s, want %s", raw[1], want)
 	}
 }
@@ -542,6 +567,71 @@ func TestConsoleLogsARefusedSubscriptionWithTheRemedy(t *testing.T) {
 	}
 }
 
+// inbound reads the door (in or confirm) only off a chat.console.<token>.*
+// subject. A four-token subject that ends in confirm but is not a console
+// door is dropped like any unknown subject and yields no message.
+func TestConsoleDropsAConfirmShapedSubjectOutsideTheConsoleFamily(t *testing.T) {
+	logs := &bytes.Buffer{}
+	a := &ConsoleAdapter{log: slog.New(slog.NewTextHandler(logs, nil))}
+	data, _ := json.Marshal(ConsoleInFrame{MessageID: "m1", Text: "yes, go ahead"})
+	for _, subject := range []string{"a2a.topics.shared.confirm", "x.console.tok.confirm", "chat.x.tok.confirm"} {
+		logs.Reset()
+		msg, notice, ok := a.inbound(&nats.Msg{Subject: subject, Data: data})
+		if ok || notice != "" || !reflect.DeepEqual(msg, InboundMessage{}) {
+			t.Errorf("%s: inbound = (%+v, %q, %v), want a drop", subject, msg, notice, ok)
+		}
+		if !strings.Contains(logs.String(), "console frame dropped") || !strings.Contains(logs.String(), "reason=\"subject shape\"") {
+			t.Errorf("%s: drop not logged as a subject-shape drop:\n%s", subject, logs.String())
+		}
+	}
+	// The same frame on the real confirm door is a confirm, so the drops
+	// above are the prefix check and not a frame the adapter refuses anyway.
+	msg, _, ok := a.inbound(&nats.Msg{Subject: "chat.console.tok.confirm", Data: data})
+	if !ok || msg.Intent != IntentConfirm {
+		t.Errorf("console confirm door: inbound = (%+v, %v), want a confirm", msg, ok)
+	}
+}
+
+// The confirm door is a second subscription: a render that grants the
+// gateway chat.console.*.in but not chat.console.*.confirm has its confirm
+// subscribe refused, and the log names the confirm subject, not .in.
+func TestConsoleLogsARefusedConfirmSubscriptionByItsSubject(t *testing.T) {
+	opts := &natsserver.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*natsserver.User{{
+			Username: "gateway", Password: "pw",
+			Permissions: &natsserver.Permissions{
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.in"}},
+				Publish:   &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.out"}},
+			},
+		}},
+	}
+	s, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("server")
+	}
+	t.Cleanup(s.Shutdown)
+	logs := &lockedBuffer{}
+	a, err := NewConsoleAdapter(s.ClientURL(), []nats.Option{nats.UserInfo("gateway", "pw")}, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = a.Run(ctx, func(InboundMessage) {}) }()
+	waitFor(t, "the confirm refusal in the log", func() bool {
+		return strings.Contains(logs.String(), `subject=chat.console.*.confirm`)
+	})
+	if strings.Contains(logs.String(), `subject=chat.console.*.in`) {
+		t.Errorf("the granted .in subscription was logged as refused:\n%s", logs.String())
+	}
+}
+
 // A refused notice publish (the gateway grant lacks chat.console.*.out) is
 // logged as a publish refusal naming the subject, not as a subscription one.
 func TestConsoleLogsARefusedPublishAsAPublish(t *testing.T) {
@@ -623,7 +713,7 @@ func TestConsoleRecoversARefusedSubscriptionOnReconnect(t *testing.T) {
 		Host: "127.0.0.1", Port: port, NoLog: true, NoSigs: true,
 		Users: []*natsserver.User{
 			{Username: "gateway", Password: "pw", Permissions: &natsserver.Permissions{
-				Subscribe: &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.in"}},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.in", "chat.console.*.confirm"}},
 				Publish:   &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.out"}},
 			}},
 			{Username: "browser", Password: "pw"},
@@ -642,7 +732,7 @@ func TestConsoleRecoversARefusedSubscriptionOnReconnect(t *testing.T) {
 		return strings.Contains(logs.String(), "console connection restored")
 	})
 
-	browser, err := nats.Connect(s2.ClientURL(), nats.UserInfo("browser", "pw"))
+	browser, err := connectTest(s2.ClientURL(), nats.UserInfo("browser", "pw"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -791,7 +881,7 @@ func TestAConsoleNotifyFrameCutSaysTheReportWasCut(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = r.browser.Flush()
-	if _, err := r.adapter.PostNotifyFrame("console:tab-11", "", strings.Repeat("<", consoleResultTextCap), "task-1", false); err != nil {
+	if _, err := r.adapter.PostNotifyFrame("console:tab-11", "", strings.Repeat("<", consoleResultTextCap), "task-1", true, false); err != nil {
 		t.Fatal(err)
 	}
 	msg, err := sub.NextMsg(5 * time.Second)
@@ -804,5 +894,41 @@ func TestAConsoleNotifyFrameCutSaysTheReportWasCut(t *testing.T) {
 	}
 	if !strings.HasSuffix(f.Text, consoleNotifyCutNote) || strings.HasSuffix(f.Text, consoleResultCutNote) {
 		t.Errorf("cut notify text ends %q, want the notify note", f.Text[len(f.Text)-80:])
+	}
+}
+
+// A task's status line names its task and profile on the wire when the
+// gateway gives a profile (a profile turn), and the inbound frame it answers,
+// so a console client that can't see the profile's submission can follow the
+// task its own turn started. A plain status line, with
+// Stop alone, is the bytes a notice always was.
+func TestConsoleStatusLineNamesAProfileTask(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-6.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	if _, err := r.adapter.PostMessage("console:tab-6", OutMessage{Text: "⏳ submitted…", Stop: "task-plain"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.adapter.PostMessage("console:tab-6", OutMessage{Text: "⏳ submitted…", Stop: "task-7", Profile: "cluster", InReplyTo: "mcp-0123abcd"}); err != nil {
+		t.Fatal(err)
+	}
+	var raw []string
+	for len(raw) < 2 {
+		msg, err := sub.NextMsg(5 * time.Second)
+		if err != nil {
+			t.Fatalf("after %d frames: %v", len(raw), err)
+		}
+		raw = append(raw, string(msg.Data))
+	}
+	id := regexp.MustCompile(`"messageId":"c-[^"]+"`)
+	norm := func(s string) string { return id.ReplaceAllString(s, `"messageId":"ID"`) }
+	if got, want := norm(raw[0]), `{"messageId":"ID","text":"⏳ submitted…"}`; got != want {
+		t.Errorf("plain status line = %s, want %s", raw[0], want)
+	}
+	if got, want := norm(raw[1]), `{"messageId":"ID","text":"⏳ submitted…","addressee":"cluster","taskId":"task-7","inReplyTo":"mcp-0123abcd"}`; got != want {
+		t.Errorf("profile status line = %s, want %s", raw[1], want)
 	}
 }

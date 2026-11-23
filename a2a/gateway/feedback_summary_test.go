@@ -272,7 +272,7 @@ func TestUsageSummaryOriginFieldsAreTheNineStatusFieldsInTheTableOrder(t *testin
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "performance:\n  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n", "chat turns (7 days): unavailable"} {
+	for _, want := range []string{"  version: unknown", "  mode: next", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "performance:\n  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n", "chat turns (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -309,6 +309,37 @@ func TestRenderUsageSummaryModelLineReadsStatusInference(t *testing.T) {
 	}
 }
 
+// TestRenderUsageSummaryReasoningEffortLineFollowsTheModelLine: the effort line
+// prints the status value under the model line, unset when a known model has none,
+// and unavailable whenever the model line is.
+func TestRenderUsageSummaryReasoningEffortLineFollowsTheModelLine(t *testing.T) {
+	cr := summaryCR()
+	status := cr["status"].(map[string]any)
+	inference := status["inference"].(map[string]any)
+	inference["reasoningEffort"] = "high"
+	if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  model: vertex_ai/claude-opus-5\n  reasoning effort: high\n") {
+		t.Errorf("block lacks the effort line under the model line:\n%s", text)
+	}
+	delete(inference, "reasoningEffort")
+	if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  reasoning effort: unset\n") {
+		t.Errorf("a known model with no effort must print unset:\n%s", text)
+	}
+	for name, value := range map[string]any{
+		"empty":         map[string]any{},
+		"provider only": map[string]any{"provider": "vertex_ai", "reasoningEffort": "high"},
+		"absent":        nil,
+	} {
+		if value == nil {
+			delete(status, "inference")
+		} else {
+			status["inference"] = value
+		}
+		if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  model: unavailable\n  reasoning effort: unavailable\n") {
+			t.Errorf("%s: the effort must be unavailable with the model:\n%s", name, text)
+		}
+	}
+}
+
 // TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys: the environment
 // block prints usageSummaryEnvironmentKeys in order, one line each, and the
 // whole block stays under the cap with the model line in it.
@@ -330,7 +361,7 @@ func TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys(t *testing.T) {
 // TestUsageSummaryWithoutFixedLinesDropsTheModelLine: the audit's input is
 // the block less the model line; every other line stays audited.
 func TestUsageSummaryWithoutFixedLinesDropsTheModelLine(t *testing.T) {
-	text := "```\n  mode: today\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
+	text := "```\n  mode: next\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
 	got := usageSummaryWithoutFixedLines(text)
 	if strings.Contains(got, "model:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
 		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
@@ -402,7 +433,7 @@ func TestUsageIdentifiersAreTheNamingSubtreesStringsButNotSettings(t *testing.T)
 }
 
 func TestAuditUsageSummaryMatchesWholeTokensAndSkipsTheTemplate(t *testing.T) {
-	if got := auditUsageSummary("on prod-eu-1 today", []string{"prod-eu-1", "today", "kube-agents"}); len(got) != 1 || got[0] != "prod-eu-1" {
+	if got := auditUsageSummary("on prod-eu-1 next", []string{"prod-eu-1", "next", "kube-agents"}); len(got) != 1 || got[0] != "prod-eu-1" {
 		t.Fatalf("audit = %v, want [prod-eu-1]", got)
 	}
 	if got := auditUsageSummary("version: 0.14.0-rc", []string{"0.14.0"}); len(got) != 0 {
@@ -420,7 +451,7 @@ func TestAuditSkipsTheBlocksOwnVocabulary(t *testing.T) {
 			t.Fatalf("fixture: %q is not in the block", word)
 		}
 	}
-	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "today", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
+	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "next", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
 	if leaked := auditUsageSummary(text, vocabulary); len(leaked) != 0 {
 		t.Fatalf("the audit refused the block's own words: %v", leaked)
 	}
@@ -505,6 +536,7 @@ func (f fakeUsageSource) ServerVersion(context.Context) (string, error) { return
 // gateway's own answer, like the bare form: one fenced block, no task, no
 // change to the conversation's state.
 func TestFeedbackSummaryPostsTheBlockAndStartsNoTask(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.usage = fakeUsageSource{cr: summaryCR(), version: "v1.33.4-gke.1234000"}
 	conv := "discord:g1/thread-fbs1"
@@ -572,6 +604,7 @@ func TestFeedbackSummaryDoesNotRefuseAModelSegmentEqualToTheClusterName(t *testi
 }
 
 func TestFeedbackSummaryUnavailableWhenTheResourceCannotBeRead(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.usage = fakeUsageSource{err: errors.New("platformagents.kubeagents.x-k8s.io is forbidden")}
 	conv := "discord:g1/thread-fbs3"
@@ -673,5 +706,22 @@ func TestAuditSkipsTheBrokersVocabulary(t *testing.T) {
 		if _, ok := usageSummaryBrokerSubcommands[tool]; !ok {
 			t.Errorf("the gateway's vocabulary lacks %s", tool)
 		}
+	}
+}
+
+// TestUsageSummaryWithoutFixedLinesDropsTheReasoningEffortLine: the effort line
+// is a setting printed by design, like the model line, so an install whose name
+// equals its effort word is not refused for it; every other line stays audited.
+func TestUsageSummaryWithoutFixedLinesDropsTheReasoningEffortLine(t *testing.T) {
+	text := "```\n  model: x/y\n  reasoning effort: prod-eu-1\n  kubernetes: prod-eu-1\n```"
+	got := usageSummaryWithoutFixedLines(text)
+	if strings.Contains(got, "reasoning effort:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
+		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
+	}
+	if want := len(strings.Split(text, "\n")) - 2; len(strings.Split(got, "\n")) != want {
+		t.Fatalf("dropped other than the model and effort lines: %q", got)
+	}
+	if leaked := auditUsageSummary(got, []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("the rest of the block must stay audited, got %v", leaked)
 	}
 }

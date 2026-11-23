@@ -54,14 +54,15 @@ the entry records:
 chat relay partial: the report did not reach slack. Delivered — do not re-run to resend.
 ```
 
-The home channel is set either by the
-CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
-`spec.mode: next` `/sethome` does not reach the gateway, so for the platform the gateway holds the CR
-field is the only way. The operator renders the Google Chat field into the gateway as
+The home channel is the CR field (`spec.integration.googleChat.homeChannel` or
+`spec.integration.slack.homeChannel`) or a channel or space the gateway learned from a mention.
+`/sethome` does not reach the gateway. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
-`spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
-only chat platform is the gateway's and has no home channel sends anyway: the gateway refuses the
+`spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. The operator names every armed platform in
+`A2A_NOTIFY_CONVERSATIONS` and every armed platform with a home channel set on the CR in
+`A2A_NOTIFY_PLATFORM`; the agent adds a platform whose home the gateway learned, and with no
+home anywhere, every armed platform keeps the posts for its digest. So an
+install whose gateway holds no platform with a home channel sends anyway: the gateway refuses the
 recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error
 is the relay's `composed but not delivered to <platform>`, as above. Alerts on such an install are
 sent too, refused and kept, and the recap lists each as not delivered with the keep as the reason
@@ -103,6 +104,14 @@ without a session; they are counted on a line of their own and in no other numbe
 load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
 drift record is not an event the watcher forwarded. [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
+
+The same rows answer a question on demand. The Platform Agent's `get_alert_history` tool
+([`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py)) reads one page
+of `GET /v1/intercepted-events` over a window (its `since`), and the
+[`alert-history`](../../agents/platform/skills/alert-history/SKILL.md) skill is how "what alerts
+fired overnight?" reaches it from any door. The tool is the worker's only route: the sandbox shell
+reaches neither the loopback port nor the file. It excludes nothing, so unlike the recap it also
+returns the drift and stall rows.
 
 Three things are deliberately not sources. The `incidents` table alongside it holds the triage
 report each alerted incident produced, and the recap does not read it: nothing it lists was alerted,
@@ -267,7 +276,7 @@ informational churn. Each is **counted**, on its own line above the body:
   metric that does not exist.
 
 A third class exists on a headless install (`platforms.google_chat.enabled: false` and
-`platforms.slack.enabled: false` with no `A2A_NOTIFY_PLATFORM` route): **alerts dispatched without
+`platforms.slack.enabled: false` with no armed route at all (`A2A_NOTIFY_CONVERSATIONS` empty, so `routed_platforms()` is empty; a single-platform install with no home channel is routed through the fallback and sends)): **alerts dispatched without
 a chat platform** (`notified = 2`, `NOTIFIED_HEADLESS`). `trigger_agent_troubleshooter` stamps `2`
 via `mark_delivery_headless` and queues the triage start without attempting a chat post, and
 `filter_and_aggregate_events` tallies those rows in `dispatched_headless` rather than

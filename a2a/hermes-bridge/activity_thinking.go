@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -19,41 +20,6 @@ var (
 	cmdClusterFlagRe     = regexp.MustCompile(`(?:--cluster|--context)[=\s]+['"]?([A-Za-z0-9_.:-]+)['"]?`)
 	kanbanCardIDPattern  = regexp.MustCompile(`\b(t_[A-Za-z0-9_-]{2,32})\b`)
 	kanbanCardIDExact    = regexp.MustCompile(`^t_[A-Za-z0-9_-]{2,32}$`)
-
-	inlineTokenValuePattern = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|1//[0-9A-Za-z_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|r8_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
-	// A private-key armour header ends in "PRIVATE KEY-----" (PEM, OpenSSH,
-	// PKCS#8, EC, RSA, DSA) or "PRIVATE KEY BLOCK-----" (PGP).
-	pemPrivateKeyBlockPattern     = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----.*?-----END [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----`)
-	pemPrivateKeyOpenPattern      = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----.*`)
-	inlineAuthHeaderPattern       = regexp.MustCompile(`(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
-	inlineAuthSchemePrefixPattern = regexp.MustCompile(`(?i)^(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|AWS4-HMAC-SHA256|Mutual|OAuth)([ \t]+)`)
-	// The password runs to the userinfo's closing @ and may hold a path
-	// character, as base64-style passwords do; a URL with an @ in its path
-	// after a port is over-redacted, the safe side.
-	inlineURLCredPattern     = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s'"]+(@)`)
-	cliUserPassPattern       = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+))(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
-	cliAttachedPassPattern   = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)([^\s"';|&]+)`)
-	cliSpacedPassPattern     = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	cliLongSecretFlagPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	// Prose that states a secret: "the password is hunter2", "password for
-	// admin is hunter2", "the token was abc", "the password is now hunter2",
-	// "the secret is set to abc". The verb may be followed by a qualifier
-	// (now, currently, still, just, simply, set to, equal to) or a colon,
-	// none of which is the value.
-	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:for\s+[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
-	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
-	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
-	// An all-caps env-style key whose last component says it holds a key,
-	// credentials, a DSN or private material (ENCRYPTION_KEY, STRIPE_KEY,
-	// AWS_CREDS, DB_DSN, RSA_PRIVATE): the spelling is the credential's,
-	// whatever the first component names. Case-sensitive on purpose, so a
-	// prose "primary key" or a JSON "sort_key" is not blanked.
-	allCapsSecretSuffixKeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*_(?:KEY|KEYS|CREDS|DSN|PRIVATE)$`)
-	leadingEqAssignmentPattern    = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_.-]*)=[^\s=]`)
-	allCapsEnvKeyPattern          = regexp.MustCompile(`^[A-Z_][A-Z0-9_]+$`)
-	base64PaddingTokenPattern     = regexp.MustCompile(`^[A-Za-z0-9+/_-]+={1,2}(?:[\s,;)\]}>]|\\?["'](?:\s|$)|$)`)
-	yamlSecretBlockHeaderPattern  = regexp.MustCompile(`^([ \t]*)(?:data|stringData)[ \t]*:[ \t]*(?:#.*)?$`)
-	yamlBlockEntryPattern         = regexp.MustCompile(`^([ \t]+[-A-Za-z0-9_./]+[ \t]*:[ \t]*)([^\r\n#]+?)([ \t]*(?:#.*)?)$`)
 
 	// envFlagsWithValue are flags to `env` that consume the following
 	// argument before the command name.
@@ -123,6 +89,7 @@ type sessionTrace struct {
 	plannedTitles        map[string]string // tool call id -> the step title it was planned under
 	sessionCards         map[string]string // worker sessionID -> cardID
 	cardTitles           map[string]string // cardID -> short cluster/card title
+	filedCards           map[string]bool   // cardID -> made by this task's kanban_create, title or not
 	claimedSessions      map[string]bool   // worker sessionID claimed by this task
 	reportedSettledCards map[string]bool   // cardID -> KindSubtask step already emitted for this task
 }
@@ -158,6 +125,7 @@ func (a *activityState) initSessionTraceLocked() {
 	if a.trace.sessionCards == nil {
 		a.trace.sessionCards = make(map[string]string)
 		a.trace.cardTitles = make(map[string]string)
+		a.trace.filedCards = make(map[string]bool)
 		a.trace.claimedSessions = make(map[string]bool)
 		a.trace.plannedTitles = make(map[string]string)
 		a.trace.reportedSettledCards = make(map[string]bool)
@@ -196,7 +164,7 @@ func (a *activityState) SyncKanbanCard(cardID, title, workerSessionID string) {
 	workerSessionID = strings.TrimSpace(workerSessionID)
 	if cardID != "" && title != "" {
 		// kanban.db's title is model-written: scrubbed, as at kanban_create.
-		a.trace.cardTitles[cardID] = shortCardClusterOrTitle(scrubInlineSecrets(title))
+		a.trace.cardTitles[cardID] = shortCardClusterOrTitle(answerscrub.ScrubInline(title))
 	}
 	if workerSessionID != "" && cardID != "" {
 		a.trace.sessionCards[workerSessionID] = cardID
@@ -250,8 +218,15 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	}
 	effectiveTool, parsed := unwrapHermesToolCall(d.ToolName, rawInput)
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
-		if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
-			a.trace.cardTitles[createdCardID] = short
+		// A card is recorded only from an id the create's result reports in a
+		// JSON field without error: free text or error text may name another
+		// task's card (#6430). A filed card claims its workers' deliveries even
+		// with no title.
+		if kanbanCardIDFromJSON(d.Extra.Result) == createdCardID {
+			a.trace.filedCards[createdCardID] = true
+			if short := shortCardClusterOrTitle(answerscrub.ScrubInline(extractArgStr(parsed, "title"))); short != "" {
+				a.trace.cardTitles[createdCardID] = short
+			}
 		}
 	}
 	if strings.HasPrefix(effectiveTool, "kanban_") && sessID != "" && sessID != a.sessionID {
@@ -460,7 +435,7 @@ func (a *activityState) hasCardID(cardID string) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.trace.cardTitles[cardID] != ""
+	return a.trace.filedCards[cardID] || a.trace.cardTitles[cardID] != ""
 }
 
 // buildAPIRequestSteps reads one post_api_request delivery into the step
@@ -718,7 +693,7 @@ func extractArgStr(m map[string]any, keys ...string) string {
 		if v, ok := m[k].(string); ok {
 			v = strings.TrimSpace(v)
 			if v != "" && v != redactedValue && !strings.HasPrefix(v, "<string,") {
-				return scrubInlineSecrets(v)
+				return answerscrub.ScrubInline(v)
 			}
 		}
 	}
@@ -935,296 +910,29 @@ func extractLeadingCommand(cmd string) (bin, sub string) {
 	return "", ""
 }
 
-// inlineSecretKey says whether a key seen inside text (a key=value pair, a
-// --flag, a YAML entry) names a credential: the bus-wide secretLookingKey
-// rule, the extra spellings text uses (pass, pwd, auth, a key file's
-// extension), and the all-caps env-style suffixes.
-func inlineSecretKey(k string) bool {
-	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
-}
-
-// scrubInlineSecrets is the defence in depth on the little text the api
-// executor does publish: the identifier a step title names (a cluster, a
-// file's tail, a search query, a card's title) and a settled card's report.
-// Tool arguments, results, error messages and model reasoning never reach
-// it, because they are not published at all (the executor note in
-// activity.go); a scrubber is a net, not a contract.
-func scrubInlineSecrets(s string) string {
-	if s == "" || s == redactedValue {
-		return s
-	}
-	s = pemPrivateKeyBlockPattern.ReplaceAllString(s, redactedValue)
-	s = pemPrivateKeyOpenPattern.ReplaceAllString(s, redactedValue)
-	s = scrubYAMLSecretBlocks(s)
-	s = inlineTokenValuePattern.ReplaceAllString(s, redactedValue)
-	s = inlineAuthHeaderPattern.ReplaceAllString(s, "$1 "+redactedValue)
-	s = inlineURLCredPattern.ReplaceAllString(s, "${1}"+redactedValue+"${2}")
-	s = scrubCLISecretFlags(s)
-	s = proseSecretPattern.ReplaceAllString(s, "${1}"+redactedValue)
-	return scrubInlineKVSecrets(s)
-}
-
-func scrubCLISecretFlags(s string) string {
-	s = cliUserPassPattern.ReplaceAllString(s, "${1}${2}${3}:"+redactedValue+"${5}")
-	s = cliSpacedPassPattern.ReplaceAllStringFunc(s, func(m string) string {
-		sub := cliSpacedPassPattern.FindStringSubmatch(m)
-		if len(sub) < 3 || strings.HasPrefix(sub[2], "-") {
-			return m
-		}
-		return sub[1] + redactedValue
-	})
-	s = cliAttachedPassPattern.ReplaceAllString(s, "${1}"+redactedValue)
-	s = cliLongSecretFlagPattern.ReplaceAllStringFunc(s, func(m string) string {
-		sub := cliLongSecretFlagPattern.FindStringSubmatch(m)
-		if len(sub) < 5 || !inlineSecretKey(sub[2]) {
-			return m
-		}
-		if sub[3] != "=" && strings.HasPrefix(sub[4], "-") {
-			return m
-		}
-		return sub[1] + redactedValue
-	})
-	return s
-}
-
-func scrubYAMLSecretBlocks(s string) string {
-	if !strings.Contains(s, "data:") && !strings.Contains(s, "stringData:") {
-		return s
-	}
-	lines := strings.Split(s, "\n")
-	inSecretBlock := false
-	blockIndent := 0
-	for i, line := range lines {
-		trimmedLine := strings.TrimRight(line, "\r")
-		if m := yamlSecretBlockHeaderPattern.FindStringSubmatch(trimmedLine); m != nil {
-			inSecretBlock = true
-			blockIndent = len(m[1])
-			continue
-		}
-		if !inSecretBlock {
-			continue
-		}
-		if strings.TrimSpace(trimmedLine) == "" || strings.HasPrefix(strings.TrimSpace(trimmedLine), "#") {
-			continue
-		}
-		indent := len(trimmedLine) - len(strings.TrimLeft(trimmedLine, " \t"))
-		if indent <= blockIndent {
-			inSecretBlock = false
-			if m := yamlSecretBlockHeaderPattern.FindStringSubmatch(trimmedLine); m != nil {
-				inSecretBlock = true
-				blockIndent = len(m[1])
-			}
-			continue
-		}
-		if em := yamlBlockEntryPattern.FindStringSubmatch(trimmedLine); em != nil {
-			val := strings.TrimSpace(em[2])
-			if val != "" && val != "{}" && val != "[]" && val != "|" && val != ">" && val != "|-" && val != ">-" {
-				cr := ""
-				if strings.HasSuffix(line, "\r") {
-					cr = "\r"
-				}
-				lines[i] = em[1] + redactedValue + em[3] + cr
-			}
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-func scrubInlineKVSecrets(s string) string {
-	var sb strings.Builder
-	pos := 0
-	for pos < len(s) {
-		loc := inlineKVSecretPattern.FindStringSubmatchIndex(s[pos:])
-		if loc == nil {
-			sb.WriteString(s[pos:])
-			break
-		}
-		matchStart := pos + loc[0]
-		matchEnd := pos + loc[1]
-		openQuote := s[pos+loc[2] : pos+loc[3]]
-		key := s[pos+loc[4] : pos+loc[5]]
-		closeQuote := s[pos+loc[6] : pos+loc[7]]
-		sep := s[pos+loc[10]]
-		hadPreSepSpace := loc[10] > loc[8]
-		hadPostSepSpace := loc[9] > loc[11]
-		if !inlineSecretKey(key) {
-			sb.WriteString(s[pos:matchEnd])
-			pos = matchEnd
-			continue
-		}
-		sb.WriteString(s[pos:matchEnd])
-		rest := s[matchEnd:]
-		if rest == "" || rest[0] == '\r' || rest[0] == '\n' {
-			pos = matchEnd
-			continue
-		}
-		if sep == '=' && !hadPreSepSpace && hadPostSepSpace && isFollowingKVAssignment(rest) {
-			pos = matchEnd
-			continue
-		}
-		if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(rest); sloc != nil {
-			sb.WriteString(rest[:sloc[1]])
-			matchEnd += sloc[1]
-			rest = rest[sloc[1]:]
-		}
-		if openQuote != "" && closeQuote == "" && sep == ':' && !strings.HasPrefix(rest, `"`) && !strings.HasPrefix(rest, `'`) && !strings.HasPrefix(rest, `\"`) && !strings.HasPrefix(rest, `\'`) {
-			var closeIdx int
-			if len(openQuote) == 2 {
-				closeIdx = findUnescapedEscapedQuote(rest, openQuote[1])
-			} else {
-				closeIdx = findUnescapedQuote(rest, openQuote[0])
-			}
-			if closeIdx >= 0 {
-				sb.WriteString(redactedValue)
-				pos = matchEnd + closeIdx
-				continue
-			}
-		}
-		switch {
-		case strings.HasPrefix(rest, `\"`), strings.HasPrefix(rest, `\'`):
-			q := rest[:2]
-			afterOpen := rest[2:]
-			if closeIdx := findUnescapedEscapedQuote(afterOpen, q[1]); closeIdx >= 0 {
-				sb.WriteString(q + redactedValue + q)
-				pos = matchEnd + 2 + closeIdx + 2
-			} else {
-				lineEnd := len(afterOpen)
-				if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
-					lineEnd = nl
-				}
-				sb.WriteString(q + redactedValue)
-				pos = matchEnd + 2 + lineEnd
-			}
-		case strings.HasPrefix(rest, `"`), strings.HasPrefix(rest, `'`):
-			q := rest[0]
-			afterOpen := rest[1:]
-			if closeIdx := findUnescapedQuote(afterOpen, q); closeIdx >= 0 {
-				inner := afterOpen[:closeIdx]
-				sb.WriteByte(q)
-				if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(inner); sloc != nil {
-					sb.WriteString(inner[:sloc[1]])
-				}
-				sb.WriteString(redactedValue)
-				sb.WriteByte(q)
-				pos = matchEnd + 1 + closeIdx + 1
-			} else {
-				lineEnd := len(afterOpen)
-				if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
-					lineEnd = nl
-				}
-				sb.WriteByte(q)
-				sb.WriteString(redactedValue)
-				pos = matchEnd + 1 + lineEnd
-			}
-		case strings.HasPrefix(rest, redactedValue):
-			sb.WriteString(redactedValue)
-			pos = matchEnd + len(redactedValue)
-		default:
-			if sep == ':' && openQuote == "" && closeQuote == "" && isLineLeadingKVKey(s, matchStart) {
-				lineEnd := len(rest)
-				if nl := strings.IndexAny(rest, "\r\n"); nl >= 0 {
-					lineEnd = nl
-				}
-				lineRest := strings.TrimRight(rest[:lineEnd], " \t")
-				if lineRest != "" && !strings.ContainsAny(lineRest, "{};") && !hasLaterInlineKVAssignment(lineRest) {
-					sb.WriteString(redactedValue)
-					pos = matchEnd + len(lineRest)
-					continue
-				}
-			}
-			valLen := 0
-			for valLen < len(rest) {
-				if strings.HasPrefix(rest[valLen:], `\"`) || strings.HasPrefix(rest[valLen:], `\'`) {
-					break
-				}
-				c := rest[valLen]
-				if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}' || c == ']' || c == '>' {
-					break
-				}
-				if c == ';' && (sep == '=' || valLen+1 >= len(rest) || rest[valLen+1] == ' ' || rest[valLen+1] == '\t') {
-					break
-				}
-				valLen++
-			}
-			if valLen == 0 {
-				pos = matchEnd
-				continue
-			}
-			sb.WriteString(redactedValue)
-			pos = matchEnd + valLen
-		}
-	}
-	return sb.String()
-}
-
-func isLineLeadingKVKey(s string, matchStart int) bool {
-	lineStart := 0
-	if nl := strings.LastIndexByte(s[:matchStart], '\n'); nl >= 0 {
-		lineStart = nl + 1
-	}
-	prefix := strings.TrimLeft(s[lineStart:matchStart], " \t")
-	return prefix == "" || prefix == "-"
-}
-
-func hasLaterInlineKVAssignment(lineRest string) bool {
-	ws := strings.IndexAny(lineRest, " \t")
-	if ws < 0 {
-		return false
-	}
-	afterFirstToken := strings.TrimLeft(lineRest[ws:], " \t")
-	if loc := inlineKVSecretPattern.FindStringSubmatchIndex(afterFirstToken); loc != nil {
-		return inlineSecretKey(afterFirstToken[loc[4]:loc[5]])
-	}
-	return false
-}
-
-func isFollowingKVAssignment(rest string) bool {
-	if base64PaddingTokenPattern.MatchString(rest) {
-		return false
-	}
-	m := leadingEqAssignmentPattern.FindStringSubmatch(rest)
-	if len(m) < 2 {
-		return false
-	}
-	candKey := m[1]
-	return inlineSecretKey(candKey) || allCapsEnvKeyPattern.MatchString(candKey)
-}
-
-func findUnescapedQuote(s string, q byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' {
-			i++
-			continue
-		}
-		if s[i] == q {
-			return i
-		}
-	}
-	return -1
-}
-
-func findUnescapedEscapedQuote(s string, q byte) int {
-	for i := 1; i < len(s); i++ {
-		if s[i] != q || s[i-1] != '\\' {
-			continue
-		}
-		bs := 0
-		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
-			bs++
-		}
-		if bs%4 == 1 {
-			return i - 1
-		}
-	}
-	return -1
-}
-
 // createdKanbanCardID is the id of the card a kanban_create's result names
 // (its id, card_id or task_id field, else the first card token in the raw
 // result), or "" when the call made no card or was not a kanban_create. It
 // is the one thing read out of a tool result: an identifier with the card
 // token's shape, which the task's own subtask steps name again.
 func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
+	if id := kanbanCardIDFromJSON(rawResult); id != "" {
+		return id
+	}
+	if toolName == kanbanCreateTool {
+		if m := kanbanCardIDPattern.FindStringSubmatch(strings.TrimSpace(string(rawResult))); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// kanbanCardIDFromJSON is the card id a result names in a JSON field (id,
+// card_id or task_id, at the top level or in a JSON string holding an
+// object), or "" when the call named none or carried an error. Unlike
+// createdKanbanCardID it never reads an id out of free text, which can be an
+// error message naming some other card (#6430).
+func kanbanCardIDFromJSON(rawResult json.RawMessage) string {
 	trimmed := strings.TrimSpace(string(rawResult))
 	if trimmed == "" || trimmed == "null" {
 		return ""
@@ -1247,15 +955,18 @@ func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
 		}
 	}
 	if m, ok := decoded.(map[string]any); ok {
+		if errVal, hasErr := m["error"]; hasErr && errVal != nil && errVal != false && errVal != "" {
+			return ""
+		}
+		if okVal, hasOk := m["ok"]; hasOk {
+			if b, isBool := okVal.(bool); isBool && !b {
+				return ""
+			}
+		}
 		for _, k := range []string{"id", "card_id", "task_id"} {
 			if v, ok := m[k].(string); ok && isCardID(v) {
 				return strings.TrimSpace(v)
 			}
-		}
-	}
-	if toolName == kanbanCreateTool {
-		if m := kanbanCardIDPattern.FindStringSubmatch(trimmed); len(m) > 1 {
-			return m[1]
 		}
 	}
 	return ""
@@ -1318,6 +1029,37 @@ func matchWorkerDeliveryRun(runs []*taskRun, d hookDelivery) *taskRun {
 				a.SyncKanbanCard(cid, "", d.SessionID)
 				return r
 			}
+		}
+	}
+	return nil
+}
+
+// cardWorkerRun is the API task whose card a worker session's delivery
+// belongs to, waiting on its cards or not: the session the task already
+// mapped to a card, else the card the delivery's workspace or kanban
+// arguments name, when the task filed or tracks it. A coordinator session
+// (a2a-*) is never a worker. It changes no task's card map.
+func cardWorkerRun(runs []*taskRun, d hookDelivery) *taskRun {
+	if strings.HasPrefix(d.SessionID, apiSessionIDPrefix) {
+		return nil
+	}
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.sessionID != "" && a.hasWorkerSession(d.SessionID) {
+			return r
+		}
+	}
+	cid := extractKanbanCardIDFromCwd(d.Cwd)
+	if cid == "" {
+		if tool, parsed := unwrapHermesToolCall(d.ToolName, d.ToolInput); strings.HasPrefix(tool, "kanban_") {
+			cid = extractArgStr(parsed, "card_id", "task_id", "id")
+		}
+	}
+	if cid == "" {
+		return nil
+	}
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.sessionID != "" && a.hasCardID(cid) {
+			return r
 		}
 	}
 	return nil

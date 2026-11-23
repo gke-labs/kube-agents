@@ -15,6 +15,7 @@ gitops-repo/
 ├── knowledge/                     # OKF base (§5) — never applied to a cluster
 ├── policy/                        # admission policies (ValidatingAdmissionPolicy; Gatekeeper/Kyverno)
 ├── .kube-agents/intent.yaml       # where the declaring audits look for declared-intent notes
+├── .kube-agents/automation.yaml   # which fixes may merge without a human (reference/automation-rules)
 └── .github/workflows/             # the actuation pipeline config (customer's CI/CD)
 ```
 
@@ -55,12 +56,17 @@ gitops-repo/
   and a node pool kept in one zone on purpose (`stockout_prevention_sop.md` §4a, object
   `NodePool/<pool>` with `namespace: ""`, a namespace written on the item read as empty; the
   declaration covers the zone-locked arm of 3.9 alone, and a pool at its autoscaling ceiling stays a
-  finding).
+  finding), and a snapshot kept after its source disk is gone (`gce_compute_fleet_sop.md` §2a,
+  object `Snapshot/<name>` with `namespace: ""`, and `cluster` the finding's `project/<id>` when the
+  choice is one project's), and two peered networks kept at different MTUs on purpose
+  (`gcp_networking_fabric_sop.md` §2a, object `NetworkPeering/<a>--<b>` as the finding spells it,
+  `namespace: ""`, and `cluster` the finding's `project/<id>` when the choice is one project's).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and
-  `cluster` when the choice is one cluster's rather than fleet-wide, spelled as the qualified
-  `<project>/<location>/<name>` every stream's findings carry, never the bare name, and `expires`
+  `cluster` when the choice is one cluster's or one project's rather than fleet-wide, spelled as the
+  finding's own target: the qualified `<project>/<location>/<name>` a cluster stream's findings carry,
+  never the bare name, or `project/<id>` for the GCE compute audit, and `expires`
   (`YYYY-MM-DD`, UTC) when the choice is to be renewed rather than kept until withdrawn: the last day
   the item stands, after which the posture returns as a finding with a _Declared intent expired_
   line naming the note and the date; the audit reads the

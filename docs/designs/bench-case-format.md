@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -42,9 +42,10 @@ rejects `task_id:` in a case here.
 
 The value must equal the directory name. The directory name is what
 `hack/ci-eval-pr.sh` derives `TASK_NAME` from, what the results file is copied to, and
-what every lint and every table in `bench/tasks/DRAFTS.md` keys on. An id that disagrees
-with its directory means two names for one case and a search that finds half the
-references.
+what every lint and every table in `bench/tasks/DRAFTS.md` keys on. The `Eval-Case:` line
+of an overlay patch names it too, and `make skills-check` fails a line that names no
+directory here. An id that disagrees with its directory means two names for one case and a
+search that finds half the references.
 
 ## The fields, and what each one is for
 
@@ -54,15 +55,15 @@ references.
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
 than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner, and the
-harness fills in the cluster placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
-`{{FLEET_CLUSTER_*:<role>}}`).
+harness fills in the placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
+`{{FLEET_CLUSTER_*:<role>}}`, `{{BENCH_GITOPS_REPO}}`).
 A first line of `[bench:slack-question-wake]` makes the run a replay of the wake a card blocked
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 sends its turns to the agent's API server under either `AGENT_TRANSPORT`, as a card's wake reaches
-the front door there under `spec.mode: next` too. A `session: fresh` answer carries today's Slack
-thread context, which next's door does not send, so a case with one stays in
-`hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
+the front door there too. A `session: fresh` answer carries the Slack thread context the
+api transport sends and the inject door does not, so a case with one stays in
+`hack/eval/inject-lane-exclusions.txt`, which no CI lane runs. The reply to a wake is posted nowhere, but the
 same front door writes it, so a case that grades that reply still runs on the inject lane. A
 first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability`,
 `dependency` or `capacity`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
@@ -71,20 +72,68 @@ first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
 ([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
-only over the inject transport, so the case needs an entry in
-`hack/eval/api-lane-exclusions.txt`. `[bench:stop-mid-turn]`, optionally with `after=<seconds>` and
+only over the inject transport, which every CI lane uses. `[bench:stop-mid-turn]`, optionally with `after=<seconds>` and
 `observe=<seconds>`, is the same stop sent while the opening turn still runs, `after` seconds after
-the harness first sees it working; a run whose stopped turn filed no card passes. The harness
-writes two entries for either case, `harness_stop_sent` and `harness_cards_stopped`, and the case's
-`tool_called` objectives name them.
+the harness first sees it working; a run whose stopped turn filed no card passes.
+`[bench:stop-in-card-wait]`, optionally with `deadline=<seconds>` and `observe=<seconds>`, sends the
+ask through the gateway's A2A door, whose turns hold for their cards, whatever the lane's transport.
+It cancels the door task (`tasks/cancel`) once a card filed since the send is on the board while the
+task still works. No card within `deadline`, or a task that ends before any card, is
+infrastructure, not a pass. The next lane turns the door on for it, so an eval install runs with a
+door a default install doesn't have. The harness writes two entries for any of these cases, `harness_stop_sent` and `harness_cards_stopped`, and the case's
+`tool_called` objectives name them. When the door accepted the cancel and the task ended canceled,
+it writes a third, `harness_cancel_reported`: completed only when the canceled task carries a
+`cardStop` result whose stopped cards are exactly the cards the board shows archived (less any the
+result calls settled) and whose text opens `canceled; ` (#5528).
+
+A prompt that starts with `[bench:profile name=<profile> <key>=<value> ...]` sends its ask to that
+AgentProfile as a new top task, with the other fields as the task's parameters, rather than to the
+platform agent ([`bench/kube_agents_bench/profile_hook.py`](../../bench/kube_agents_bench/profile_hook.py),
+#5945). The directive ends at its first `]`, so the ask may follow on the same line, and its values
+take the `{{AGENT_CLUSTER_*}}` and `{{FLEET_CLUSTER_*}}` placeholders. It must open the prompt, and the
+lint refuses one that doesn't. No other `[bench:...]` directive may follow it, because the readers that
+schedule a stopped ask or a replay read only a prompt's first line, so a combined case would run in
+the wrong phase; combining one is a later change.
+It runs only over the inject transport (the door's `profile` and `parameters`), which every CI
+lane uses; the api transport errors on it.
+One field is not a parameter: `intent=confirm` submits the ask as a structured confirm, the door's
+`"intent":"confirm"`, so the gateway sets the task's `changeRequested`, which a profile's write path
+(the `cluster` persona's version-control skill) needs. `confirm` is its only value, and the lint
+refuses any other; a directive without it sends a typed message. The door takes the confirm only
+where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
+which is infrastructure, since the agent never saw the ask.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
 into a Slack or Google Chat gateway conversation, then sends the reply as a second message on the same conversation
 ([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
 the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
-for the plant. Inject transport only, so the case is listed in `hack/eval/api-lane-exclusions.txt`
-as well.
+for the plant. Inject transport only, as the stop directives are.
+A first line of `[bench:reply-under-home-post: <marker>]`, with the reply on the lines under it,
+grades a reply to a post the agent made on its own (its setup has the agent post a scheduled report
+or an alert into the home channel): the transport waits for the bot's newest top-level post holding
+`<marker>` since the case started, replies under it with the reply, and grades that turn
+([`bench/kube_agents_bench/slack_transport.py`](../../bench/kube_agents_bench/slack_transport.py)).
+The marker ends at the directive's own `]`, and nothing else may follow on that line. Give each such
+case a marker no other case's post holds. Only top-level posts are searched, and a scheduled job's
+later reports on a UTC day reply inside its first report's thread (one thread per job per day), so
+mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
+own. Slack transport only: the other transports refuse it, so
+such a case runs on the Slack lane alone and keeps no inject record.
+A first line of `[bench:session-cap-queue]`, optionally with `max-cap=<n>` (default 2) and
+`hold=<seconds>`, with a `/session` ask under it, grades the gateway's session-cap line (#6882):
+the harness reads the install's session cap off the gateway Deployment, fills it with busy
+`/session` conversations through the inject door, sends the ask on one more, and writes
+`harness_session_cap_queued`, completed when the conversation shows the queued notice, then the
+task, then its answer
+([`bench/kube_agents_bench/session_cap.py`](../../bench/kube_agents_bench/session_cap.py)). A cap
+above `max-cap`, or one the fillers did not hold, is infrastructure; the ask's POST refused with the
+cap's own text is the graded red. Inject transport only.
+
+A first line that opens with `[bench:` and names none of these directives is infrastructure: the
+harness does not send a directive it does not know to the agent as text. A pull request is graded
+with its base commit's `bench/` (`hack/ci-eval-pr.sh`, `pin_grader`), so a case that uses a new
+directive lands after the harness change that reads it.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
 carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which
@@ -126,7 +175,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `gateway_plugins_as_shipped`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -150,8 +199,10 @@ boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `writes_alone` is for a case that requests no pull request but whose wrong answer may open one
 the reply never names: the lane runs it alone in its second phase and marks the write
 safeguard's window exclusive, so any write in the window is charged to it
-(`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
-ignores the key.
+(`bench/kube_agents_bench/lane.py`). A case whose stack writes a file to the default branch of
+the GitOps repository uses it too, so that no other unit sees the file and the repository reset
+runs before each of its units. A bare YAML boolean, `false` by default; devops-bench ignores
+the key.
 
 `requested_pull_requests` is for a case that opens more pull requests by design than its checks
 grade: the case's total, a bare decimal integer above the count of its `pull_request_opened` and
@@ -179,8 +230,7 @@ lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
-starts. devops-bench ignores the key.
+run beside the case's runs and grade their ledger. devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
 clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never
@@ -201,12 +251,37 @@ project and location, so a case can exclude as many clusters as the install mana
 reconcile prunes nothing for them. The validator refuses a slot the catalogue does not declare and a list that
 excludes every slot. devops-bench ignores the key.
 
+`scope_hold` is for a case whose precondition is an install that holds a cluster
+(`spec.hold`): `scope_hold: {agent_cluster: true, reason: <text>}` holds the install's own
+host cluster, read from `AGENT_CLUSTER_CONTEXT`, so the case needs no seeded fleet, and
+`all: true` holds every cluster; at least one of the two is a bare `true`, and the reason is one
+line of at most `MAX_REASON_CHARS` (`bench/kube_agents_bench/scope_hold.py`). The runner
+(`hack/ci-eval-pr.sh`, `scope_hold_apply`) runs the case's repetitions alone, after every other
+unit and after the `scope_exclude` cases, because a hold refuses every Kubernetes API request to
+the held cluster. A hold restarts nothing, so there is no reconcile to wait for: the helper patches
+the CR, waits until the operator's `<agent>-hold` ConfigMap carries the hold, then waits
+`PROPAGATION_SECONDS` for the kubelet to refresh the copy the proxy and broker read. The hold it
+replaced is saved on the CR, so the EXIT trap and the next lease restore it after a run that died
+first. A hold that does not take effect is recorded as infrastructure. On an install whose
+PlatformAgent CRD has no `spec.hold` the helper patches nothing and the case runs on the
+install as it is, graded: the behaviour is missing, which is the case's red, not an
+infrastructure failure. For a local run, `python -m kube_agents_bench.scope_hold apply --task
+tasks/<id>/task.yaml --context <ctx> --namespace <ns> --name <cr>` before devops-bench and
+`python -m kube_agents_bench.scope_hold restore --context <ctx> --namespace <ns> --name <cr> [--wait]`
+after (restore takes no `--task`; `--wait` also waits `PROPAGATION_SECONDS` for the lift to reach
+the pods). The validator refuses a malformed value and a case that
+declares both `scope_hold` and `scope_exclude`. devops-bench ignores the key.
+
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
-four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
-`no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a
-write from one of them mid-eval is still possible. An audit case starts its own run from its
+`no_agent` jobs and any job the image doesn't ship. The five audits the `oobe` stage starts on a
+fresh install are paused once the stage is done, or before that once it has fired or adopted the
+audit, and no run of it is due or under way, since the stage holds a paused audit rather than
+starting it; every pause pass applies
+that, and a watch through the fan-out repeats it every few minutes, except while the
+`oobe-first-run-audits` stack has the stage armed. Until then a write from one of them mid-eval
+is still possible. `hack/ci_pause_scheduled_audits.py`'s header has the rule in full. An audit case starts its own run from its
 prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
 stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
 charged to the cases.
@@ -338,22 +413,24 @@ calls include one that may hold more than one line, which the row joins with a s
 with a clipped code-tool call, and a card whose calls did not reach the trajectory is read from its
 rows alone); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
-it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
+it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make (a logged row joins the lines of one call with a space, so a word of a later line counts for the command of the first), such as a `kubectl get` of the objects a script grades, read on each card log row and in a logged card's `terminal` calls as typed, so a run behind a chain or on a later line of a call is read, except in a call whose text holds `<<` (a heredoc), which stays on its row; `refused_result_pattern`, set with `forbidden_runs`, is a regular expression for the result of a refused call, and the forbidden runs do not read a typed call of one command whose result matches it, nor one row equal to it; a call is read a command at a time, and a quote in a heredoc body opens nothing (a body line that reads as a command is still a run), so the commands before one that the bench's shell reader refuses (quotes that do not balance, a redirect with no target, a substitution that does not close) are read, and when the refused part has the words of a required run that is still missing, or of a forbidden run on a clean read (the script as a word, each flag, and a word for each word pattern), the check is `status: "error"`; a command that the pod clipped is read as if its open quote closed at the cut, and a run in the tail that the clip removed is not read and not reported; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden patterns apply only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out, while the forbidden runs read every typed call; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
 inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
-error on the api transport, so a case using it is listed in `hack/eval/api-lane-exclusions.txt`),
+error on the api transport, so a case using it runs over the inject transport alone),
 `worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
 the cap closes with `Iteration budget exhausted (N/M)`; `budget` is the `M` every such record must
 name; a worker that finishes inside 90% of its cap records neither, so the check is for a card
-written to outrun the cap; a run whose cards have no run rows, in which no attempt
-ran out and none completed either (the harness archives a card still running at its delegation
-ceiling, which closes the attempt `reclaimed`), or whose capture recorded gaps and no attempt ran
-out, is `status: "error"`),
+written to outrun the cap; a run with no worker capture to read, a run in which no record names a
+cap and no attempt has the outcome `completed` (no run rows, or the harness archives a card still
+running at its delegation ceiling, which closes the attempt `reclaimed`), or a run in which no
+record names a cap and either the capture recorded gaps or the workers' captured results, one or
+more, are all withheld or absent, is `status: "error"`; any other run in which no record names a
+cap is a fail),
 `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question
@@ -384,7 +461,7 @@ line on a row scanned in full, so an audit relayed empty does not pass).
 completed cluster cards has a block line) or `ranking_card_filed` (the newest unarchived card keyed
 `bootstrap-inventory-prioritize` filed at or after the sweep carries the hand-off's own body and is
 not `blocked`, `triage`, `failed` or `cancelled`) or `raw_report_no_first_run_audit_checks` (the
-same parse, and no block line carries a check from the roster of one of the four audits the `oobe`
+same parse, and no block line carries a check from the roster of one of the five audits the `oobe`
 stage runs after the scan).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:
@@ -409,7 +486,13 @@ holds a name for) against the gateway's platform profile copy, the one `skill_ma
 authored under a new name) are reported, not failed, and no lane sets either target aside. A stack that runs Python in the sandbox does it as
 root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
 no `__pycache__` in the reference tree for this check to read as an edit. The check
-still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
+still flags a cache file that appears anyway, since a `.pyc` is code. `gateway_plugins_as_shipped` execs into the
+same agent container and requires each plugin directory the image ships under `/opt/defaults/plugins` to be on the
+agent's data volume at `/opt/data/plugins`, a real directory owned by the agent's user and (outside the pinned
+`hermes_otel`, whose directory carries its own state) matching the image; a missing, symlinked, differing or
+foreign-owned plugin fails (an entry beside the image's that the image does not ship is reported, not failed: the
+entrypoint copies without pruning, so an image change leaves one on an older volume), and the script's own count of
+the image's plugin directories must match the units it read. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
@@ -418,7 +501,7 @@ the run started (or, with `since_state_file`, since the `fired_at` a case's stac
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
 value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
-`required_finding_phrases` entry, a finding in its `document` whose id contains it. `report_store_reply`, in its own module
+`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
@@ -426,9 +509,10 @@ newest, per repository store) or during it. An audit whose stores need no URL (a
 open ledger, or no record before the turn) passes on the mention alone; which audit a URL is given
 to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
-`cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
-of the four first-run audits as marked due and each has a run claimed since the stage marked it
-that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
+`cron/executions.db` in the agent pod (with no state file, the install's own first run when the stack
+chose it, which it records in `.bench-oobe-own.json`; with neither, an error), and passes when the stage's `.oobe_audits_fired` lists each
+of the five first-run audits as marked due and each has a run claimed since the stage marked it
+that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended. `oobe_audits_ended`, beside it, reads the same records and fails when a run the stage marked due ended in a state other than completed.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
 workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least
 `min_folded` of them were folded into its newest admitted incident, which must be newer than the
@@ -444,7 +528,10 @@ job's threads since the fire, and the chat report the run's `finish` left on the
 passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
 whose record predates the fire, or that did not finish every repository it started fails, and a
 silent run or one that never ended is an error. `triage_starts`, in its own module
-(`bench/kube_agents_bench/triage_starts.py`), lists the pods in its `namespace` on the agent's cluster,
+(`bench/kube_agents_bench/triage_starts.py`), reads the planted pods from the ConfigMap the stack
+records them in (`planted_record`, optional; without it, or when the namespace holds no such ConfigMap,
+the pods in its `namespace` on the agent's cluster), so a pod deleted mid-run is still graded and is
+named in the reason; a live pod the record leaves out is an error. It
 joins the Session KV server's admitted `intercepted_events` rows for them (by pod UID) to the default
 profile's Hermes `state.db`, and passes when at least `min_alerts` pods have an admitted alert and every
 one of those alerts has a session with a message, a started triage turn; a session with no message is a
@@ -472,9 +559,9 @@ filed is read from the trajectory, as far as the capture reached it) — a route
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
 pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
 log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
-arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a forbidden pattern or
-run never sees a command chained behind another (a required pattern or run also reads that
-card's tagged calls as typed, so it does), and the quotes stay, so a listed word the command
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a forbidden pattern
+never sees a command chained behind another (a required pattern or run also reads that
+card's tagged calls as typed, and a forbidden run its `terminal` calls that hold no heredoc, so they do), and the quotes stay, so a listed word the command
 splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
@@ -579,8 +666,8 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
 job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
-`EVAL_TIER=certification`, the cases in `hack/eval/certification-cases.txt` alone. A case
-runs because one of those files names it; cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+`EVAL_TIER=validated-capabilities`, every case whose task file carries the bare line `suite: validated-capabilities`. A case
+runs because a file names it or its task file carries that line; other cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
@@ -591,9 +678,7 @@ test checks both, so two case pull requests don't edit the same lines). It lands
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
-the night it merges, its record accrues in the evidence store (for a case in
-`hack/eval/api-lane-exclusions.txt`, which runs only over the inject transport, under the
-version key's `next` mode), and a presubmit seat is a
+the night it merges, its record accrues in the evidence store, and a presubmit seat is a
 later pull request that moves its line to the presubmit file, adds its name to
 `hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
 blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as
@@ -606,10 +691,10 @@ for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
-The one exception is a case with `suite: certification` in its task file: it registers in
-`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
+The one exception is a case with the bare line `suite: validated-capabilities` in its task file: that
+line is its registration (with `suite_part: N` for a section other than 1), it runs only under `EVAL_TIER=validated-capabilities`, and never
 in the presubmit or nightly files
-([`bench/README.md`](../../bench/README.md#certification-suite)).
+([`bench/README.md`](../../bench/README.md#validated-capabilities-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was
@@ -644,7 +729,7 @@ compares a known boolean field such as `spec.suspend` to the string `"true"` or 
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
 descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters and an optional `absent` from 1 to `MAX_ABSENT`, names a slot
-`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
+`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a `scope_hold:` that is not `{agent_cluster: true, all: true, reason: ...}` with at least one flag a bare true and a one-line reason, or sits beside a `scope_exclude:`, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
 refuses (a key that overrides one merged in with `<<:` is not a repeat). It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
@@ -664,6 +749,8 @@ or on the dev install, and the case cites the run by its directory name or build
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.
+One rule is outside that: the parser rule ("What it does not catch", below) runs only where
+the bench package is installed, which the lint's job does not do, so a bench test gates it.
 That whole-set assertion is the load-bearing half, not the shared module. The lint spent
 one commit asserting only on a hand-listed set of substrings, and every rule whose
 wording was not on the list — a missing `id:`, a duplicate verification entry name, an
@@ -677,7 +764,9 @@ The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` in the `Ma
 `.github/workflows/python-tests.yml`, so a separate job running the target would re-derive
 findings CI already has, on a second checkout, for nothing. The target is the pre-push
 copy of the gate rather than the gate; a rule that has to be enforced goes in the
-validator, where both reach it. Nothing should be added to the target alone.
+validator, where both reach it. Nothing should be added to the target alone. The parser
+rule is in the validator too, and `bench/tests/test_case_entries_load.py` calls the same
+`validate_all()` for it in the job that has the parser.
 
 "Carries no assertion" is stricter than "the field is present". `required_phrases: [""]`
 is a populated list, and the empty string is in every text there has ever been, so the
@@ -691,17 +780,45 @@ no longer exists fails the lint.
 ### What it does not catch
 
 A green `make bench-case-check` is not a promise that devops-bench will load the case. The
-validator checks the rules above; it does not reimplement the harness's schema, and three
-classes of mistake get through it and fail at spec-load, after a cluster lease is spent:
+validator checks the rules above; it does not reimplement the harness's schema. Two classes
+of mistake are caught only where the bench package is installed (`make test-bench-deps`),
+because the rule that catches them reads each entry with the harness's own YAML reader and
+loads it with the harness's own parser (`parse_entries`, with this repository's check types
+registered). It runs last, and only on a case that no other rule faults, so one defect is one
+finding; a field defect of a case with another finding shows after that finding is corrected:
 
 - **An extra or misspelled key on a verification entry or a check node.** The compound
   nodes in `devops_bench/verification/spec.py` are `ConfigDict(extra="forbid")`, so
-  `requried_phrases:` is a hard rejection there and merely an unrecognised key here.
+  `requried_phrases:` is a hard rejection there. The harness does not stop on it: it drops
+  the entry and runs the case without that check. The gate turns a repetition with such a
+  parse error red, but only after a cluster lease is spent.
 - **A missing required field on a check.** That surfaces as pydantic's `Field required`
-  against the verifier's own model, which this validator does not have.
+  against the verifier's own model.
+
+The rule reads with the harness's reader because of the YAML split described below: PyYAML
+would hand the parser `required_phrases: [no]` as a boolean, and the rule would then refuse
+an entry that a run loads. The rule reads an entry as the file has it; the harness
+substitutes its placeholders first, so a field whose whole value is a placeholder can be
+refused here and load in a run. No case in the tree has one.
+
+Without the package the rule does not run, and the target's last line, on stderr, says so.
+The same holds when the installed package is another checkout's, or a copy that an install
+made: the line then says that the package is installed, but behind the tree. Only an editable
+install of this checkout counts. The rule knows the check types and the fields of the
+installed package and of the installed devops-bench, so after a pull that changes
+`bench/pyproject.toml`, install again: `make test-bench-deps` brings the package's entry
+points up to date; for a new devops-bench pin use `uv sync` in `bench/` or a new environment,
+because pip can keep the old commit when the version did not change.
+The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
+the rule in the job that does, over every case in the tree.
+
+A third class gets through in both places and fails at spec-load, after a cluster lease is
+spent:
+
 - **`critical: yes`.** This one the validator structurally cannot catch, and the reason is
-  worth knowing. It reads cases with PyYAML, which is YAML 1.1 and parses the bare `yes`
-  into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
+  worth knowing. The parser rule above reads `verification_spec` with the harness's reader
+  and nothing else of the case; every other rule reads the case with PyYAML, which is YAML
+  1.1 and parses the bare `yes` into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
   the validator sees the field, the trap has already been parsed away. The same split hides
@@ -712,11 +829,11 @@ A fourth divergence is caught: PyYAML's `safe_load` keeps the last of two equal 
 silently, where `YAML(typ="safe")` raises `DuplicateKeyError`, so the validator loads with
 a `SafeLoader` subclass that refuses a key written twice in one mapping.
 
-The gap is deliberate rather than pending. `make bench-case-check` depends on PyYAML alone,
-so it runs in a checkout with no `bench/` virtualenv and no harness install, which is what
-makes it cheap enough to run on every edit. Importing devops-bench to close these three
-would trade that for a second copy of a schema that already exists. Note the divergence
-when writing a case; do not add the dependency.
+`make bench-case-check` needs PyYAML alone, so it runs in a checkout with no `bench/`
+virtualenv and no harness install, which is what makes it cheap enough to run on every
+edit. The parser rule keeps that: it uses the harness when the harness is there and is
+skipped when it is not, so it adds no second copy of the schema and no required
+dependency. Do not make the dependency required.
 
 ## Changing the format
 

@@ -9,7 +9,10 @@
 # with no link to the report; the bridge reads the stored row before the turn
 # and attaches the report ahead of the user's words
 # (a2a/hermes-bridge/incident.go), as the Hermes gateway's incident_context
-# hook does under today. gke-labs/kube-agents#4059.
+# hook does under today. On a live install the gateway relays a card's
+# report it posted into the thread ahead of that row (a2a/docs/hermes-bridge.md);
+# the row is the fallback, and the one this case exercises, since nothing
+# posts into an inject conversation. gke-labs/kube-agents#4059.
 #
 # HOW IT REACHES THE PATH WITHOUT A CHAT PLATFORM. The prompt is a directive
 # (kube_agents_bench/pushed_report.py): the opening ask runs as turn one
@@ -31,8 +34,8 @@
 # guesses from the fleet, or says it has no such report: the objective fails.
 #
 # `fixtures: []`: the case stores and reads its own row and reads no cluster.
-# Inject lane only (hack/eval/api-lane-exclusions.txt): the API server has
-# no conversation the bridge keys the row to.
+# Needs the inject door, which every CI lane grades through: the API server
+# has no conversation the bridge keys the row to.
 id: chat-reply-under-pushed-report
 name: A reply under a pushed report is answered with the report
 prompt: |-

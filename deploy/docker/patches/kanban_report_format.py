@@ -145,12 +145,18 @@ written), and splits anything past 4000 characters across messages:
   The step is for the requester to send: never act on it yourself, before
   or after kanban_complete.
 - A question gets that paragraph and nothing more: at most four sentences and
-  600 characters in all, as short as the answer allows, with no table, no
-  section and no list of the commands you ran. Decide by what the card asks:
+  600 characters in all, aiming for under 400, with no table, no section and
+  no list of the commands you ran. Its evidence says what you found, not
+  how: name no command, script, kube context or the time you ran them.
+  Decide by what the card asks:
   whether something is true (a yes-or-no or status question) gets the
   answer, with no claims, sections or Sources list unless the card asks for
   them; why something broke gets the report. A closing request to report or summarize never turns a
-  question into a report. This rule outranks the link,
+  question into a report. Neither does a closing line that starts
+  "Propose only", however it is worded: it only rules out opening a
+  pull request or making the change, and never turns a question into a
+  request for a fix, a report, claims or a Sources list, so a yes-or-no or
+  status card that carries it still gets the short answer. This rule outranks the link,
   backtick and table rules below: name the cluster once, name only the pod or
   node that is not healthy, and count the rest. On a yes-or-no question or a
   status check, leave `verified_claims` empty and call nothing verified, unless
@@ -161,7 +167,7 @@ written), and splits anything past 4000 characters across messages:
   each one rests on, with the sentences above it still inside the ceilings.
   Use `##` for sections only when the card asks for a list or a report's
   sections; on a yes-or-no or status card, a closing request to report or
-  summarize is not that ask.
+  summarize is not that ask, and neither is a line that starts "Propose only".
   Never `#` — the chat message already shows the card title, so an H1 renders
   as a second, duplicate banner — and no `###`: Google Chat flattens every
   level to bold, so a sub-level is invisible there. If you are triaging an

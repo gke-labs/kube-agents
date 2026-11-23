@@ -558,7 +558,7 @@ class SubnetCapacityTest(unittest.TestCase):
         self.assertEqual(
             finding["evidence"]["command"],
             "gcloud container clusters list --project=p1 "
-            "'--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)'",
+            "'--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'",
         )
         # 1 - 0.9 is 0.0999... in floating point; it reads as the 10% the excerpt implies.
         self.assertEqual(finding["title"], "Pod range pods-a of subnet gke in us-central1 has 10% available")
@@ -1637,6 +1637,7 @@ PROJECT_SLUGS = [
     "mtu-packet-fragmentation",
     "cloud-armor-false-positive",
     "firewall-world-open-ingress",
+    "missing-nodelocal-dnscache",
 ]
 
 
@@ -2122,7 +2123,7 @@ class ProjectTargetTest(unittest.TestCase):
                 patch("sys.stderr", new_callable=io.StringIO):
             return networking_audit.collect_project_target("p1")
 
-    def test_a_quiet_project_records_all_five_checks_as_run(self):
+    def test_a_quiet_project_records_all_six_checks_as_run(self):
         entry = self.collect()
         self.assertEqual(entry["name"], "project/p1")
         self.assertEqual(entry["outcome"], "collected")
@@ -2186,7 +2187,7 @@ class ProjectTargetTest(unittest.TestCase):
         self.assertEqual(
             [c["check"] for c in entry["commands"]],
             ["psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
-             "firewall-world-open-ingress"],
+             "firewall-world-open-ingress", "missing-nodelocal-dnscache"],
         )
         self.assertEqual(
             sorted(c["check"] for c in entry["candidates"]),
@@ -2196,7 +2197,7 @@ class ProjectTargetTest(unittest.TestCase):
     def test_a_firewall_read_failure_lists_only_the_firewall_check(self):
         entry = self.collect(**{"firewall-rules list": (1, "PERMISSION_DENIED compute.firewalls.list")})
         self.assertEqual(unevaluated_slugs(entry), ["firewall-world-open-ingress"])
-        self.assertEqual(len(entry["commands"]), 4)
+        self.assertEqual(len(entry["commands"]), 5)
 
     def test_a_get_status_that_is_not_an_object_costs_the_nat_check(self):
         entry = self.collect(**{"routers list": [dynamic_router()], "get-status": []})
@@ -2212,7 +2213,7 @@ class ProjectTargetTest(unittest.TestCase):
     def test_every_read_failing_gates_the_target(self):
         entry = self.collect(**{phrase: (1, "PERMISSION_DENIED") for phrase in (
             "routers list", "forwarding-rules list", "networks list", "security-policies list",
-            "firewall-rules list")})
+            "firewall-rules list", "clusters list")})
         self.assertEqual(entry["outcome"], "gate-failed")
         self.assertIn("cloud-nat-exhaustion", entry["error"])
         self.assertNotIn("commands", entry)
@@ -2237,6 +2238,110 @@ class ProjectTargetTest(unittest.TestCase):
             "'--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)'",
         )
         self.assertEqual(by_check["firewall-world-open-ingress"]["severity"], "critical")
+
+
+class NodeLocalDnsCacheTest(unittest.TestCase):
+    """SOP 2.7: a Standard cluster without the NodeLocal DNSCache add-on."""
+
+    GKE_API_OFF = (
+        "ERROR: (gcloud.container.clusters.list) SERVICE_DISABLED: Kubernetes Engine API has not been "
+        "used in project p1 before or it is disabled."
+    )
+
+    def setUp(self):
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+
+    @staticmethod
+    def cluster(name, addons=None, autopilot=False):
+        cluster = {"name": name, "location": "us-central1-a", "autopilot": {"enabled": autopilot}}
+        if addons is not None:
+            cluster["addonsConfig"] = addons
+        return cluster
+
+    def collect(self, calls=None, **answers):
+        with patch.object(networking_audit, "run_cmd",
+                          side_effect=fake_run_cmd({"p1": project_answers(**answers)}, calls)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            return networking_audit.collect_project_target("p1")
+
+    def test_only_a_standard_cluster_without_the_add_on_is_a_hit(self):
+        hits, undecided = networking_audit.check_nodelocal_dnscache([
+            self.cluster("key-absent", {"networkPolicyConfig": {"disabled": True}}),
+            self.cluster("turned-off", {"dnsCacheConfig": {"enabled": False}}),
+            self.cluster("empty-block", {"dnsCacheConfig": {}}),
+            self.cluster("turned-on", {"dnsCacheConfig": {"enabled": True}}),
+            self.cluster("autopilot", {}, autopilot=True),
+            self.cluster("no-add-ons-listed"),
+            {**self.cluster("cloud-dns", {}), "networkConfig": {"dnsConfig": {"clusterDns": "CLOUD_DNS"}}},
+            {**self.cluster("kube-dns", {}), "networkConfig": {"dnsConfig": {"clusterDns": "KUBE_DNS"}}},
+        ])
+        self.assertEqual(
+            [hit["object"] for hit in hits],
+            ["Cluster/us-central1-a/key-absent", "Cluster/us-central1-a/turned-off", "Cluster/us-central1-a/empty-block",
+             "Cluster/us-central1-a/kube-dns"],
+        )
+        self.assertEqual(undecided, ["us-central1-a/no-add-ons-listed"])
+
+    def test_the_project_target_files_the_cluster_and_the_read_that_shows_it(self):
+        entry = self.collect(**{"clusters list": [
+            self.cluster("seeded-c", {"dnsCacheConfig": {"enabled": False}}),
+            self.cluster("seeded-a", {"dnsCacheConfig": {"enabled": True}}),
+        ]})
+        (candidate,) = entry["candidates"]
+        self.assertEqual(candidate["check"], "missing-nodelocal-dnscache")
+        self.assertEqual(candidate["object"], "Cluster/us-central1-a/seeded-c")
+        self.assertEqual(candidate["severity"], "minor")
+        self.assertIn("clusters list --project=p1", candidate["command"])
+        self.assertIn("addonsConfig", candidate["command"])
+        self.assertNotIn("limitations", entry)
+
+    def test_a_project_with_the_kubernetes_engine_api_off_owes_no_add_on_check(self):
+        entry = self.collect(**{"clusters list": (1, self.GKE_API_OFF)})
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual([d["check"] for d in entry["checks_not_applicable"]], ["missing-nodelocal-dnscache"])
+        self.assertEqual([c["check"] for c in entry["commands"]], PROJECT_SLUGS[:-1])
+        self.assertEqual(unevaluated_slugs(entry), [])
+
+    def test_a_failed_clusters_read_costs_the_add_on_check_alone(self):
+        entry = self.collect(**{"clusters list": (1, "PERMISSION_DENIED container.clusters.list")})
+        self.assertEqual(unevaluated_slugs(entry), ["missing-nodelocal-dnscache"])
+        self.assertEqual([c["check"] for c in entry["commands"]], PROJECT_SLUGS[:-1])
+        self.assertIn("missing-nodelocal-dnscache could not be evaluated", entry["limitations"])
+
+    def test_a_partial_listing_and_a_cluster_with_no_add_ons_are_limitations(self):
+        warning = "WARNING: The following zones did not respond: us-east1-b. List results may be incomplete."
+        entry = self.collect(**{"clusters list": Warned([self.cluster("bare"), self.cluster("other")], warning)})
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("Cluster add-ons partially read", entry["limitations"])
+        self.assertIn(
+            "missing-nodelocal-dnscache was not decided for us-central1-a/bare, us-central1-a/other:",
+            entry["limitations"],
+        )
+
+    def test_a_cluster_the_declared_scope_excludes_is_not_judged(self):
+        scope = networking_audit.declared_scope
+        excluded = {("p1", "us-central1-a", "left-out"), ("p1", "us-central1-a", "left-out-bare")}
+        with patch.object(scope, "excluded_clusters", excluded), patch.object(scope, "dropped", {}):
+            entry = self.collect(**{"clusters list": [
+                self.cluster("left-out", {}), self.cluster("left-out-bare"),
+                self.cluster("kept", {}), self.cluster("kept-bare"),
+            ]})
+        # An excluded cluster is neither a finding nor an undecided name.
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["Cluster/us-central1-a/kept"])
+        self.assertIn("us-central1-a/kept-bare", entry["limitations"])
+        self.assertNotIn("left-out", entry["limitations"])
+
+    def test_the_fleet_run_lists_each_projects_clusters_once(self):
+        calls = []
+        answers = project_answers(**{"clusters list": [self.cluster("seeded-c", {})]})
+        with patch.object(networking_audit, "get_target_projects", return_value=["p1"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd({"p1": answers}, calls)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        self.assertEqual(len([cmd for cmd in calls if cmd[1:4] == ["container", "clusters", "list"]]), 1)
+        target = {e["name"]: e for e in manifest["clusters"]}["project/p1"]
+        self.assertEqual([c["object"] for c in target["candidates"]], ["Cluster/us-central1-a/seeded-c"])
 
 
 def unevaluated_slugs(entry):
@@ -2413,6 +2518,27 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         audit_report.validate_findings(doc, "gcp-networking-fabric-audit")
         audit_report.cross_check_manifest(doc, manifest)
         self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+    def test_the_add_on_check_validates_as_a_finding_and_as_not_applicable(self):
+        import audit_report
+
+        off = [{"name": "seeded-c", "location": "us-central1-a", "addonsConfig": {}}]
+        for answer, objects, not_applicable in (
+            (off, ["Cluster/us-central1-a/seeded-c"], []),
+            ((1, NodeLocalDnsCacheTest.GKE_API_OFF), [], ["missing-nodelocal-dnscache"]),
+        ):
+            with self.subTest(not_applicable=not_applicable):
+                answers = project_answers(**{"clusters list": answer})
+                with patch.object(networking_audit, "get_target_projects", return_value=["p1"]), \
+                        patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd({"p1": answers})), \
+                        patch("sys.stderr", new_callable=io.StringIO):
+                    manifest = networking_audit.collect_fleet(check=networking_audit.PROJECT_CHECKS_CHOICE)
+                doc = json.loads(json.dumps(self.document(manifest)))
+                self.assertEqual([f["object"] for f in doc["findings"]], objects)
+                (target,) = doc["scope"]["clusters"]
+                self.assertEqual([d["check"] for d in target["checks_not_applicable"]], not_applicable)
+                audit_report.validate_findings(doc, "gcp-networking-fabric-audit")
+                audit_report.cross_check_manifest(doc, manifest)
 
     def test_the_roster_is_partitioned_by_target_kind(self):
         import audit_report

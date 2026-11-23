@@ -2,7 +2,7 @@ Subject: Restore the asset name the balanced zonal bullet lost
 
 Why: Upstream's balanced reserved zonal bullet ends on "Asset:" with the asset name deleted; this restores the name the previous upstream version carried, so the agent can find the file.
 Local-Issue: #2692
-Upstream-Issue: none filed yet
+Eval-Case: compute-class-canary-active-migration-pdb-probe
 Retire-When: upstream names the asset after "Asset:" again
 
 diff --git a/SKILL.md b/SKILL.md

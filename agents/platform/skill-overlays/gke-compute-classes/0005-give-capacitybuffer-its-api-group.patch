@@ -2,8 +2,8 @@ Subject: Give `CapacityBuffer` its API group
 
 Why: SKILL.md put `buffer.x-k8s.io`, the provisioning-strategy prefix, where the API group goes; the CRD is `autoscaling.x-k8s.io` (the provisioning-methods reference, the gke-cluster-autoscaler asset, and the CRD on a 1.35 cluster all say so), and an agent copying the bullet into `apiVersion:` writes a manifest the API server rejects.
 Local-Issue: #2692
-Upstream-Issue: none filed yet
-Retire-When: when upstream SKILL.md names `autoscaling.x-k8s.io` for `CapacityBuffer`
+Eval-Case: compute-class-canary-active-migration-pdb-probe
+Retire-When: upstream SKILL.md names `autoscaling.x-k8s.io` for `CapacityBuffer`
 
 diff --git a/SKILL.md b/SKILL.md
 --- a/SKILL.md

@@ -1,9 +1,10 @@
 # The a2a console image: the console page (a2a/web) built to static files,
 # and the Go server that serves them, hands the page its bus credential and
 # proxies its websocket to the bus. It also carries the MCP server
-# (a2a/cmd/mcp), the other console client, which the operator runs from this
-# image with /mcp as its command when an install opts in, so it ships without
-# an image of its own.
+# (a2a/cmd/mcp, run by default unless switched off) and the OKF memory curator
+# (a2a/cmd/curator, run when an install opts in), which the operator runs from
+# this image with /mcp or /curator as its command so each ships without an
+# image of its own.
 #
 # Build from the a2a/ module root:
 #   docker build --platform linux/amd64 -f Dockerfile.console -t <registry>/a2a-console:<tag> .
@@ -12,7 +13,7 @@
 # Dockerfile.worker spell them, so `make mirror-images` and
 # hack/check-image-inventory.sh cover this build too.
 ARG NODE_IMAGE=node
-ARG NODE_VERSION=22-slim
+ARG NODE_VERSION=24-slim
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
 ARG DISTROLESS_IMAGE=gcr.io/distroless/static
@@ -36,7 +37,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/console ./cmd/console \
- && CGO_ENABLED=0 go build -trimpath -o /out/mcp ./cmd/mcp
+ && CGO_ENABLED=0 go build -trimpath -o /out/mcp ./cmd/mcp \
+ && CGO_ENABLED=0 go build -trimpath -o /out/curator ./cmd/curator
 
 # Distroless nonroot is USER 65532 and the Deployment imposes 1000, so the
 # Deployment sets WorkingDir explicitly -- WORKDIR /home/nonroot is 0700
@@ -44,6 +46,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/console ./cmd/console \
 FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
 COPY --from=build /out/console /console
 COPY --from=build /out/mcp /mcp
+COPY --from=build /out/curator /curator
 COPY --from=page /web/dist /srv/console
 USER nonroot
 ENTRYPOINT ["/console"]

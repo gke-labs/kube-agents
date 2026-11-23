@@ -115,6 +115,13 @@ const (
 	a2aRatingLabel          = "rating"
 	a2aRatingUp             = "up"
 	a2aRatingDown           = "down"
+	// a2aPostFeedbackSeries is the A2A gateway's count of the ratings
+	// verified senders gave the posts it made on its own (alerts and
+	// scheduled or audit reports), by platform, rating and kind: under
+	// a2aRatingUp autonomousPositiveFeedbackTotal, under a2aRatingDown
+	// autonomousNegativeFeedbackTotal, each summed over the family's other
+	// labels and never into the answer counters (a2a/gateway/metrics.go).
+	a2aPostFeedbackSeries = "kubeagents_a2a_gateway_post_feedback_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -204,6 +211,14 @@ const (
 	// at clusterUpMonitored the clusters monitored.
 	clusterUpSeries    = "k8s_event_watcher_cluster_up"
 	clusterUpMonitored = 1
+	// watchSetReadySeries is 0 while buildWatchSet is assembling the initial
+	// watch set and watchSetReadyDone once every initial cluster's cluster_up
+	// series is published. A value below watchSetReadyDone suppresses
+	// Clusters and DataVolume so an early scrape reads as no reading rather
+	// than an empty fleet; an older watcher without the series keeps its
+	// previous behaviour.
+	watchSetReadySeries = "k8s_event_watcher_watch_set_ready"
+	watchSetReadyDone   = 1
 	// The series' three labels, the cluster's triple as the watcher's profile
 	// names it, read into usageClusterGauges.Refs for the ScopeUndeclared
 	// condition (usage_scope.go). Label values are the peer's text and are
@@ -238,8 +253,13 @@ const (
 	// board's streak, in seconds, beside the ticks; matched to them by board.
 	// A plugin from before it serves only the ticks.
 	kanbanDispatcherFailingSecondsSeries = "kubeagents_kanban_dispatcher_failing_seconds"
-	kanbanDispatcherBoardLabel           = "board"
-	kanbanDispatcherErrorLabel           = "error"
+	// kanbanDispatcherStuckSecondsSeries is the plugin's gauge of a board whose
+	// tick ran past its limit or failed on a database lock after a busy timeout
+	// (a locked board), in seconds since that tick began; a board can be stuck
+	// before a streak rule holds. A plugin from before it serves none.
+	kanbanDispatcherStuckSecondsSeries = "kubeagents_kanban_dispatcher_stuck_seconds"
+	kanbanDispatcherBoardLabel         = "board"
+	kanbanDispatcherErrorLabel         = "error"
 	// usageDispatcherBoardCeiling bounds the failing boards one body may list,
 	// refused rather than clamped as usageClusterGaugeCeiling is. Hermes keeps
 	// a handful of boards; a body past this is a broken one.
@@ -312,6 +332,15 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
+
+	// usageClosedIdleErrorText is the text of net/http's unexported
+	// errServerClosedIdle: the transport's read loop starts as soon as the
+	// connection is dialled, and when the peer's close reaches it before the
+	// request is registered there, that plain sentinel -- neither a
+	// net.OpError nor io.EOF, and wrapping neither -- is what client.Do
+	// returns. usageConnectKind compares the innermost cause against it by
+	// equality, so no byte a peer sent can steer the match.
+	usageClosedIdleErrorText = "http: server closed idle connection"
 )
 
 var (
@@ -349,11 +378,12 @@ var (
 		},
 		"git": {
 			"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
-			"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
-			"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
-			"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
-			"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
+			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "diff-tree",
+			"fetch", "init", "log", "ls-files", "ls-remote", "ls-tree", "merge",
+			"merge-base", "mv", "pull", "push", "rebase", "remote", "reset", "restore",
+			"rev-list", "rev-parse", "revert", "rm", "show", "sparse-checkout", "stash",
+			"status", "submodule", "switch", "symbolic-ref", "tag", "update-ref",
+			"version", "worktree",
 		},
 		"gh": {
 			"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -419,6 +449,10 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return chatFeedbackNegativeSeries, nil
 	case usageCounterPositiveFeedback:
 		return a2aAnswerFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
+	case usageCounterAutonomousNegativeFeedback:
+		return a2aPostFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingDown: true}}
+	case usageCounterAutonomousPositiveFeedback:
+		return a2aPostFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
 	case usageCounterInputTokens:
 		return litellmInputSeries, nil
 	case usageCounterOutputTokens:
@@ -609,8 +643,10 @@ func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool 
 
 // usageReading is what one scrape yields: each wanted counter summed over its
 // label sets, the start time the body carried, nil when it carried none, and,
-// for the watcher's body alone, its cluster gauges; nil for any other body, so
-// that a poll can tell a watcher reporting no clusters from no watcher read.
+// for a ready watcher's body alone, its cluster gauges; nil for any other
+// body or a watcher still building its initial watch set
+// (watchSetReadySeries < watchSetReadyDone), so that a poll can distinguish a
+// ready watcher reporting no clusters from no fleet reading.
 // For a target that serves readings, Readings holds the reading fields of
 // every requested reading present in its body, by status field, and
 // ReadingsPresent says, for each requested reading, whether it was; both nil
@@ -623,8 +659,9 @@ type usageReading struct {
 	Readings        map[string]int64
 	ReadingsPresent map[usageReadingKind]bool
 	// DataVolume is the watcher's data volume reading, nil when the body
-	// carried no complete one: not the watcher's, or a watcher whose statfs
-	// failed, or one built before it exported the series.
+	// carried no complete one: not the watcher's, a watcher still building its
+	// initial watch set (watchSetReadySeries < watchSetReadyDone), a watcher
+	// whose statfs failed, or one built before it exported the series.
 	DataVolume *usageDataVolume
 	// Dispatcher is the chat plugin's kanban dispatcher reading, nil for any
 	// body but the chat_metrics listener's; an empty one when no board is
@@ -642,6 +679,15 @@ type usageReading struct {
 // failure.
 type usageDispatcherReading struct {
 	Failing []usageDispatcherFailure
+	// Stuck is the boards whose tick ran past the plugin's limit or failed on a
+	// lock after a busy timeout, with the seconds since that tick began.
+	Stuck []usageDispatcherStuck
+}
+
+// usageDispatcherStuck is one board the plugin reports stuck.
+type usageDispatcherStuck struct {
+	Board   string
+	Seconds int64
 }
 
 // usageDispatcherFailure is one board's failed-tick streak, and its age when
@@ -701,10 +747,11 @@ func (e *usageScrapeError) Error() string {
 
 // usageConnectKind classifies a client.Do error by what happened rather than
 // where it surfaced: a timeout, a dial that was refused, unreachable, a
-// connection the peer accepted but never answered on, or -- only when the peer
-// did send a status line the client could not parse -- a malformed response, so
-// the event points the reader at the layer that failed rather than at a policy.
-// Never the text net/http builds from the bytes it read.
+// connection the peer accepted but never answered on (however the transport
+// reports the close), or -- only when the peer did send a status line the
+// client could not parse -- a malformed response, so the event points the
+// reader at the layer that failed rather than at a policy. Never the text
+// net/http builds from the bytes it read.
 func usageConnectKind(err error) string {
 	if usageTimedOut(err) {
 		return usageScrapeKindTimeout
@@ -728,7 +775,26 @@ func usageConnectKind(err error) string {
 		errors.Is(err, io.EOF) {
 		return usageScrapeKindConnect
 	}
+	// The same close, seen by the transport's read loop before the request
+	// was registered with it, surfaces as the closed-idle sentinel instead of
+	// the EOF underneath: still nothing answered, still connect.
+	if usageRootCause(err).Error() == usageClosedIdleErrorText {
+		return usageScrapeKindConnect
+	}
 	return usageScrapeKindMalformed
+}
+
+// usageRootCause is the innermost error of err's Unwrap chain, the one whose
+// text is its own rather than a wrapper's, so a wrapper that quotes the peer's
+// bytes around a cause is never what a sentinel is compared against.
+func usageRootCause(err error) error {
+	for {
+		inner := errors.Unwrap(err)
+		if inner == nil {
+			return err
+		}
+		err = inner
+	}
 }
 
 // usageTimedOut reports whether err is a deadline or a network timeout, which
@@ -838,6 +904,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			wanted = append(wanted, family)
 		}
 	}
+	watchSetStarting := false
 	for _, counter := range counters {
 		family, filter := usageSeriesFor(counter)
 		sums[counter] = 0
@@ -848,12 +915,12 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
 			volume = map[string]float64{}
-			wanted = append(wanted, clusterUpSeries, dataVolumeSeries)
+			wanted = append(wanted, clusterUpSeries, watchSetReadySeries, dataVolumeSeries)
 		}
 		if family == kanbanGaveUpSeries {
 			dispatcher = &usageDispatcherReading{}
 			dispatcherAges = map[string]int64{}
-			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries)
+			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries, kanbanDispatcherStuckSecondsSeries)
 		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
@@ -959,6 +1026,24 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						dispatcherAges[usageLabelValue(metric, kanbanDispatcherBoardLabel)] = int64(value)
 						continue
 					}
+					if name == kanbanDispatcherStuckSecondsSeries {
+						// Bounded as the age is. The condition uses the value only to
+						// pick the board that it names.
+						if len(dispatcher.Stuck) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						dispatcher.Stuck = append(dispatcher.Stuck, usageDispatcherStuck{
+							Board:   usageLabelValue(metric, kanbanDispatcherBoardLabel),
+							Seconds: int64(value),
+						})
+						continue
+					}
+					if name == watchSetReadySeries {
+						if value < watchSetReadyDone {
+							watchSetStarting = true
+						}
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -1012,6 +1097,10 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				dispatcher.Failing[i].Seconds, dispatcher.Failing[i].HasAge = age, true
 			}
 		}
+	}
+	if watchSetStarting {
+		clusters = nil
+		volume = nil
 	}
 	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
 	if readings != nil {

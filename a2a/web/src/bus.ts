@@ -98,6 +98,12 @@ export interface Durable {
 }
 
 /**
+ * The agent types a session worker publishes under: the harness it runs
+ * (the worker adapter's Driver.Harness). Each keeps a per-task durable.
+ */
+export const WORKER_HARNESSES: ReadonlySet<string> = new Set(["claude-code", "antigravity"]);
+
+/**
  * The durables the page can find a session by. Nothing publishes heartbeats,
  * so a consumer with a pull outstanding is the only liveness signal on the
  * bus. The names come from the executors themselves: the gateway's relay,
@@ -112,7 +118,7 @@ export function durablesFor(agents: Iterable<AgentView>): Durable[] {
       d = { session: a.session, name: GATEWAY_RELAY, stream: "TASKS", perTask: false };
     } else if (a.agentType === "hermes-bridge" && a.profile) {
       d = { session: a.session, name: `bridge-${a.profile}`, stream: "TASKS", perTask: false };
-    } else if (a.agentType === "claude-code" && a.status !== "done" && a.status !== "closed") {
+    } else if (WORKER_HARNESSES.has(a.agentType) && a.status !== "done" && a.status !== "closed") {
       d = { session: a.session, name: `${a.session}-in`, stream: "TASKS", perTask: true };
     }
     if (d !== null && CONSUMER_NAME_RE.test(d.name)) out.push(d);
@@ -193,9 +199,10 @@ export interface BusHandle {
    * Publishes one console turn. Dispatches `consoleSent` first, so the
    * transcript shows it at once, then `sendFailed` if the publish throws or
    * the server refuses it. The caller has already trimmed and size-checked
-   * the text (commands.ts).
+   * the text (commands.ts). `replyTo` names the root task of a card's report
+   * the turn answers, from that report's notify frame.
    */
-  send(text: string): void;
+  send(text: string, replyTo?: string): void;
   /** Switches the `.out` subscription to another conversation (/new). */
   setConversation(conversation: string): void;
   close(): Promise<void>;
@@ -511,13 +518,17 @@ export async function startBus(
         });
       return probeInFlight;
     },
-    send(text: string): void {
+    // `replyTo` is the root task of a card's report the turn answers, sent as
+    // the frame's `replyTo` (console.ts says what the gateway makes of it).
+    // The transcript's own line does not carry it: the human's message reads
+    // the same either way.
+    send(text: string, replyTo?: string): void {
       if (conversation === undefined) throw new Error("send needs a conversation; this is the read-only view");
       const messageId = mintMessageId();
       dispatch({ type: "consoleSent", messageId, text, conversation, at: Date.now() });
       lastSent = messageId;
       try {
-        nc.publish(inSubject(conversation), encodeInFrame({ messageId, text }));
+        nc.publish(inSubject(conversation), encodeInFrame({ messageId, text, replyTo }));
       } catch (error) {
         lastSent = null;
         dispatch({ type: "sendFailed", messageId, error: String(error) });

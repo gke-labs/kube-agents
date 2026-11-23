@@ -101,10 +101,17 @@ ROLE_NOT_CHECKED = "not_checked"
 # finishes, told apart from a read that failed, which says nothing about the
 # fixture.
 ROLE_ABSENT = "absent"
-ROLE_STATES = (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_ABSENT, ROLE_NOT_CHECKED)
+# The fixture is planted and in shape, and its audit's age gate has not
+# passed (the orphaned-snapshot roles, which the GCE compute audit ignores
+# for 91 days): the state script's `not_ready` verdict, whose detail line
+# names the time the clock passes. Read, not drifted, and no re-apply moves
+# it, so neither the drift condition nor the reconcile's --drifted reads it.
+ROLE_NOT_READY = "not_ready"
+ROLE_STATES = (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_ABSENT, ROLE_NOT_READY, ROLE_NOT_CHECKED)
 REPORT_VERDICT_TO_STATE = {
     "converged": ROLE_HEALTHY,
     "drifted": ROLE_DRIFTED,
+    "not_ready": ROLE_NOT_READY,
     "unchecked": ROLE_NOT_CHECKED,
     "unpublished": ROLE_NOT_CHECKED,
     "no_state": ROLE_NOT_CHECKED,
@@ -144,6 +151,11 @@ SCOPE_SELECTED = "selected"
 # hack/fleet_reconcile.py --drifted read these.
 OP_AGE_GATE = "age_hours_ge"
 OP_AHEAD_OF_CHANNEL = "not_ahead_of_channel"
+# A seeded file in the pool's GitOps repository (the scan's `repository/<path>`
+# subject) is out of shape until an operator replaces it; the fleet stack
+# never writes that repository. The hourly scan holds no credential to read
+# it, so such a line reaches a published document only from a hand run.
+OP_AS_SEEDED = "as_seeded"
 # An age-gate line that read one timestamp; the age is negative when the
 # scanning host's clock lags the cluster's createTime. An unparseable one ends
 # "not one RFC 3339 timestamp" instead, and no clock clears that.
@@ -151,6 +163,9 @@ AGE_GATE_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AGE_GATE} (?P<hours>\d+(?:\.\d+)?)
 # A master-ahead line, the one shape of that op meaning the channel offers
 # nothing as new; an unset channel or an unreadable version is other drift.
 AHEAD_OF_CHANNEL_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AHEAD_OF_CHANNEL}: observed "[^"]+", newer than every ')
+# A seeded-file line: `repository/<path> as_seeded: observed blob <sha>, seeded
+# blob <sha>; <repair>` or `...: observed nothing; <repair>`.
+AS_SEEDED_LINE_RE = re.compile(rf"^\S+ {OP_AS_SEEDED}: observed ")
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"
@@ -168,6 +183,10 @@ NO_OUTPUT = "no output"
 # reason fits on one line of a Chat message or an issue.
 ERROR_LINE_PREFIX = "ERROR"
 REASON_MAX_CHARS = 300
+# The status of a tool that is there and cannot be started (not executable, the
+# wrong binary format, a spawn that fails), as a shell has it. The text beside
+# it is the error with its class.
+STATUS_CANNOT_EXECUTE = 126
 
 # The runner's warnings that explain an unpublished role, most specific
 # first: a role named, its slot named, then the project-wide ones.
@@ -266,11 +285,14 @@ def _error_summary(text: str) -> str:
 
 
 def _run(cmd: list[str], env: dict, timeout: float, runner=subprocess.run) -> tuple[int, str, str]:
-    """(rc, stdout, stderr); rc 124 on a timeout, 127 when the binary is missing."""
+    """(rc, stdout, stderr); rc 124 on a timeout, 127 when the binary is missing,
+    126 when it is there and cannot be started."""
     try:
         proc = runner(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        return STATUS_CANNOT_EXECUTE, "", f"{type(exc).__name__}: {exc}"
     except subprocess.TimeoutExpired as exc:
         err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         return 124, "", err
@@ -434,12 +456,14 @@ def drift_map(document: dict | None) -> dict[str, list[str]]:
 
 
 def no_reapply_op(line: str) -> str | None:
-    """OP_AGE_GATE or OP_AHEAD_OF_CHANNEL for a drift line no re-apply
-    clears; None for every other line."""
+    """OP_AGE_GATE, OP_AHEAD_OF_CHANNEL or OP_AS_SEEDED for a drift line no
+    re-apply clears; None for every other line."""
     if AGE_GATE_LINE_RE.match(line):
         return OP_AGE_GATE
     if AHEAD_OF_CHANNEL_LINE_RE.match(line):
         return OP_AHEAD_OF_CHANNEL
+    if AS_SEEDED_LINE_RE.match(line):
+        return OP_AS_SEEDED
     return None
 
 
@@ -475,7 +499,7 @@ def unread_units(document: dict | None) -> int:
         states = [v.get(KEY_STATE) for v in roles.values() if isinstance(v, dict)]
         # The same "reached" test as checked_projects: a project seen only
         # through absent roles still reports the reads that failed there.
-        if any(s in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_ABSENT) for s in states):
+        if any(s in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_NOT_READY, ROLE_ABSENT) for s in states):
             count += sum(1 for s in states if s == ROLE_NOT_CHECKED)
     return count
 
@@ -503,12 +527,12 @@ def absent_map(document: dict | None) -> dict[str, list[str]]:
 
 
 def read_map(document: dict | None) -> dict[str, list[str]]:
-    """{project: [roles the scan read there, healthy or drifted]}, sorted."""
+    """{project: [roles the scan read there, healthy, drifted or not yet ready]}, sorted."""
     out: dict[str, list[str]] = {}
     projects = (document or {}).get(KEY_PROJECTS) if isinstance(document, dict) else None
     for project, entry in sorted((projects or {}).items()) if isinstance(projects, dict) else []:
         roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
-        read = sorted(role for role, verdict in (roles or {}).items() if isinstance(verdict, dict) and verdict.get(KEY_STATE) in (ROLE_HEALTHY, ROLE_DRIFTED))
+        read = sorted(role for role, verdict in (roles or {}).items() if isinstance(verdict, dict) and verdict.get(KEY_STATE) in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_NOT_READY))
         if read:
             out[project] = read
     return out
@@ -536,7 +560,7 @@ def checked_projects(document: dict | None) -> int:
     count = 0
     for entry in (projects or {}).values() if isinstance(projects, dict) else []:
         roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
-        if any(isinstance(v, dict) and v.get(KEY_STATE) in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_ABSENT) for v in (roles or {}).values()):
+        if any(isinstance(v, dict) and v.get(KEY_STATE) in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_NOT_READY, ROLE_ABSENT) for v in (roles or {}).values()):
             count += 1
     return count
 
@@ -569,6 +593,7 @@ def summarize(projects: dict[str, dict]) -> dict:
         ROLE_HEALTHY: counts.get(ROLE_HEALTHY, 0),
         ROLE_DRIFTED: counts.get(ROLE_DRIFTED, 0),
         ROLE_ABSENT: counts.get(ROLE_ABSENT, 0),
+        ROLE_NOT_READY: counts.get(ROLE_NOT_READY, 0),
         ROLE_NOT_CHECKED: counts.get(ROLE_NOT_CHECKED, 0),
     }
 
@@ -603,10 +628,13 @@ def scan(
             entries = {project: future.result() for project, future in futures.items()}
     for project, entry in entries.items():
         drifted = [role for role, verdict in entry[KEY_ROLES].items() if verdict[KEY_STATE] == ROLE_DRIFTED]
+        not_ready = [role for role, verdict in entry[KEY_ROLES].items() if verdict[KEY_STATE] == ROLE_NOT_READY]
         if entry.get(KEY_ERROR):
             log(f"{project}: not checked: {entry[KEY_ERROR]}")
         elif drifted:
             log(f"{project}: drifted: {', '.join(drifted)}")
+        if not_ready:
+            log(f"{project}: not yet ready: {', '.join(not_ready)}")
     document = {
         "schema_version": SCHEMA_VERSION,
         KEY_SCANNED_AT: iso(now),
@@ -687,7 +715,7 @@ def main(argv=None) -> int:
     log(
         f"fixture-state: {summary['checked']} of {summary[KEY_PROJECTS]} pool projects checked, "
         f"{summary['drifted_projects']} with drift ({summary[ROLE_HEALTHY]} roles healthy, "
-        f"{summary[ROLE_DRIFTED]} drifted, {summary[ROLE_ABSENT]} absent, {summary[ROLE_NOT_CHECKED]} not checked) in {document[KEY_DURATION]}s; wrote {args.out}"
+        f"{summary[ROLE_DRIFTED]} drifted, {summary[ROLE_ABSENT]} absent, {summary[ROLE_NOT_READY]} not yet ready, {summary[ROLE_NOT_CHECKED]} not checked) in {document[KEY_DURATION]}s; wrote {args.out}"
     )
     return EXIT_OK
 

@@ -94,6 +94,7 @@ func TestNotifyRefusedLayoutKeepsTheRatingOnText(t *testing.T) {
 // The target is the root of the ask the plan key is bound to, none for a key
 // no ask holds, and none while feedback is off.
 func TestAnswerFeedbackTargetIsTheAskItsPlanNames(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	origin := completeTurn(t, r, "discord:g1/fb12", "d-1", "the fleet is fine")
@@ -158,6 +159,7 @@ func TestClaimCardAnswerOncePerAskWithinItsCap(t *testing.T) {
 // A turn that leaves cards running is not the answer: its result goes out
 // unmarked, and the card's report is marked instead.
 func TestATurnThatLeavesCardsRunningIsNotMarked(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/fb13", Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "why?"}

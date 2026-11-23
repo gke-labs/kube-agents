@@ -6,15 +6,16 @@ This guide covers configuring the **Microsoft Teams Bot Framework relay** (`spec
 
 ## Overview & Current Scope
 
-The Microsoft Teams integration connects the gateway (`agents/platform/scripts/teams_relay_patch.py` and `agents/chat/plugins/platforms/teams/`) to the credential broker (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`).
+The Microsoft Teams integration connects a consumer to the credential broker's Teams relay (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`): the Planning Agent's adapter (`agents/platform/scripts/teams_relay_patch.py` and `agents/chat/plugins/platforms/teams/`) by default, or the A2A chat gateway's `teams` backend when the operator arms it (the bullet below).
 
 ### What Ships Today vs. Current Limitations
 
 - **Outbound Bot Framework Relay (Shipped)**: The `credential-proxy` sidecar holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, exchanges them for Microsoft Entra OAuth 2.0 `client_credentials` tokens (`https://api.botframework.com/.default`), caches the token in memory, and forwards outbound activity posts through `POST /v1/chat/teams/api`.
-- **Outbound Egress & Method Guards (Shipped)**: `/v1/chat/teams/api` permits only `POST v3/conversations/<id>/activities` (and activity reply subpaths, excluding `/activities/history`) to official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`). Service URLs containing query strings (`?`) or fragments (`#`) are rejected, and HTTP `3xx` redirects are refused so the bot's Bearer token is never forwarded off-host.
-- **Microsoft Adaptive Cards v1.5 (Shipped)**: Outbound messages convert Markdown headings, bullet lists, and fenced code blocks into Adaptive Card v1.5 attachments when `adaptiveCards: true` (default), or send plain text when `adaptiveCards: false`.
-- **In-Pod Event Queue & Authorization Scaffolding (Shipped)**: The credential broker exposes `/v1/chat/teams/events`, `/v1/chat/teams/events/ack`, and `/v1/chat/teams/events/nack`, both the broker and `TeamsRelayAdapter` enforce single-tenant isolation (`TEAMS_TENANT_ID` against `channelData.tenant.id` or `conversation.tenantId`), and only `TeamsRelayAdapter` in the gateway enforces the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`), so the broker queues an activity from any sender in the tenant. List users by Entra ID Object ID (`from.aadObjectId`) or Bot Framework user ID (`from.id`), the identifiers an inbound Teams activity carries. The adapter also compares `from.userPrincipalName` / `from.email`, but a Bot Framework activity does not carry those fields and nothing in the harness adds them, so a UPN or email entry matches no one. Display names are never matched.
-- **External Inbound Webhook Ingress (Not Yet Shipped)**: The operator does not yet deploy an in-cluster Bot Framework JWT-verifying webhook receiver, and the credential broker's `CREDENTIAL_PROXY_ALLOWED_CALLERS` allowlist and `NetworkPolicy` (`reconcileCredentialProxyNetworkPolicy`) admit `TCP/8765` connections only from the gateway pod (`CALLER_ROLE_CHAT`) and shell-sandbox pod (`CALLER_ROLE_SANDBOX`). Because no external forwarder ServiceAccount or NetworkPolicy ingress rule is provisioned yet, `/v1/chat/teams/events` is currently reachable only from inside the gateway pod. In addition, proactive alerts and scheduled cron reports are delivered only to Google Chat and Slack.
+- **Outbound Egress & Method Guards (Shipped)**: `/v1/chat/teams/api` permits only `POST v3/conversations/<id>/activities` (and activity reply subpaths, excluding `/activities/history`), plus `PUT` on one activity's own path for the gateway's status-line edits, to official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`). Service URLs containing query strings (`?`) or fragments (`#`) are rejected, and HTTP `3xx` redirects are refused so the bot's Bearer token is never forwarded off-host.
+- **Microsoft Adaptive Cards v1.5 (Shipped)**: On the Planning Agent path, outbound messages convert Markdown headings, bullet lists, fenced code blocks, and a pipe table (a header row followed by a delimiter row) into Adaptive Card v1.5 attachments when `adaptiveCards: true` (default), or send plain text when `adaptiveCards: false`; the gateway backend renders the same set at full pane width. A long reply is split into several messages; a message whose card would exceed the gateway adapter's activity size cap is sent as plain text instead, and text that still does not fit is cut with a marker saying so.
+- **In-Pod Event Queue & Authorization Scaffolding (Shipped)**: The credential broker exposes `/v1/chat/teams/events`, `/v1/chat/teams/events/ack`, and `/v1/chat/teams/events/nack`, both the broker and `TeamsRelayAdapter` enforce single-tenant isolation (`TEAMS_TENANT_ID` against `channelData.tenant.id` or `conversation.tenantId`), and only the consumer enforces the user allowlist (`TeamsRelayAdapter` in the gateway through `TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`, or the A2A gateway's `teams` backend through `A2A_TEAMS_ALLOWED_USERS` / `A2A_TEAMS_ALLOW_ALL_USERS` when the operator arms it), so the broker queues an activity from any sender in the tenant. The queue holds `TEAMS_EVENT_QUEUE_MAXSIZE` activities (500). An activity the gateway hands back (`/nack`) while the queue is full is dropped with a warning in the broker log, not held: the gateway nacks once and never retries, so a held activity would never be delivered. List users by Entra ID Object ID (`from.aadObjectId`) or Bot Framework user ID (`from.id`), the identifiers an inbound Teams activity carries. The adapter also compares `from.userPrincipalName` / `from.email`, but a Bot Framework activity does not carry those fields and nothing in the harness adds them, so a UPN or email entry matches no one. Display names are never matched.
+- **A2A gateway backend (Shipped, behind an operator switch)**: with `A2A_TEAMS_BACKEND=true` on the operator's Deployment (the chart's `operator.extraEnv`), the A2A chat gateway's `teams` backend consumes the broker's Teams queue instead of the Hermes gateway: the operator renders `A2A_TEAMS_RELAY_URL`, the allowlist and `allowAllUsers` as the CRD defines them, the tenant and the home channel on the gateway (`a2aTeamsArmed`), admits the gateway as a broker caller, and leaves the Hermes `TEAMS_*` platform env out, so one consumer pulls the queue. Replies are Adaptive Cards unless `adaptiveCards` is false or a card would exceed the activity budget, a channel reply keys its session on the thread's conversation id, a kanban card's report comes back through the gateway's `chat.notify` route, and the sender is the Entra object id (or the Bot Framework id when that is what the list names). The operator also tells the broker (`CREDENTIAL_PROXY_TEAMS_A2A_CALLER`) that the gateway is the queue's consumer; without that word the broker's Teams routes admit the Planning Agent's role alone. The roster's scheduled reports reach the Teams home through the agent's delivery resolver, beside the other platforms. A Hermes cron job created by hand (`hermes cron create --deliver teams` or `--deliver chat`) does not: the Hermes scheduler delivers only through its own platforms, and on an armed install Teams is not one of them; post through `a2a notify --platform teams` instead. Without the switch the Hermes path stays. The design is in `docs/designs/spec-chatops-gateway.md`, "The Teams adapter".
+- **External Inbound Webhook Ingress (Not Yet Shipped)**: The operator does not yet deploy an in-cluster Bot Framework JWT-verifying webhook receiver, and the credential broker's `CREDENTIAL_PROXY_ALLOWED_CALLERS` allowlist and `NetworkPolicy` (`reconcileCredentialProxyNetworkPolicy`) admit `TCP/8765` connections only from the gateway pod (`CALLER_ROLE_CHAT`), the shell-sandbox pod (`CALLER_ROLE_SANDBOX`) and, when a relay-backed backend is armed on it, the A2A gateway pod (`CALLER_ROLE_A2A_CHAT`). Because no external forwarder ServiceAccount or NetworkPolicy ingress rule is provisioned yet, `/v1/chat/teams/events` is currently reachable only from the Hermes gateway pod, and from the A2A gateway pod when a relay backend is armed on it. A cron job whose `deliver` names `teams` posts its report to `homeChannel` (the operator renders it as `TEAMS_HOME_CHANNEL`), so proactive reports can target Teams; the default jobs' `deliver: chat` relays to Google Chat and Slack, and the bot must be installed in the home channel's team or chat for the post to land. With the gateway backend armed and `homeChannel` set, the gateway's `chat.notify` route posts proactive alerts and cron reports into that Teams conversation (the agent's delivery resolver names Teams only on this path).
 
 ---
 
@@ -42,7 +43,7 @@ Store the bot credentials in the PlatformAgent credentials secret:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: platform-agent-credentials
+  name: platform-agent-secrets
   namespace: kubeagents-system
 type: Opaque
 stringData:
@@ -61,7 +62,7 @@ The tenant lock-down is not read from this Secret. Set it with `tenantId` in Ste
 ```yaml
 platformAgent:
   credentials:
-    secretName: platform-agent-credentials
+    secretName: platform-agent-secrets
   integration:
     teams:
       enabled: true
@@ -69,7 +70,7 @@ platformAgent:
       allowedUsers:
         - "22222222-2222-2222-2222-222222222222" # Entra ID Object ID (from.aadObjectId)
       allowAllUsers: false
-      homeChannel: "19:abc123conversationid@thread.v2"
+      homeChannel: "19:abc123conversationid@thread.tacv2" # a channel; a group chat ends in @thread.v2, a personal chat starts with a:
       adaptiveCards: true
 ```
 
@@ -83,21 +84,21 @@ metadata:
   namespace: kubeagents-system
 spec:
   credentialsSecretRef:
-    name: platform-agent-credentials
+    name: platform-agent-secrets
   integration:
     teams:
       enabled: true
       appIdSecretRef:
-        name: platform-agent-credentials
+        name: platform-agent-secrets
         key: TEAMS_APP_ID
       appPasswordSecretRef:
-        name: platform-agent-credentials
+        name: platform-agent-secrets
         key: TEAMS_APP_PASSWORD
       tenantId: "11111111-1111-1111-1111-111111111111"
       allowedUsers:
         - "22222222-2222-2222-2222-222222222222"
       allowAllUsers: false
-      homeChannel: "19:teamchannelid@thread.v2"
+      homeChannel: "19:teamchannelid@thread.tacv2"
       adaptiveCards: true
 ```
 
@@ -110,3 +111,10 @@ A reference Microsoft Teams app manifest template is included at [`docs/samples/
 1. Replace `${TEAMS_APP_ID}` with your Microsoft Application (Client) ID.
 2. Package `manifest.json` together with your `color.png` (192x192) and `outline.png` (32x32) icons into a ZIP archive.
 3. In Microsoft Teams, navigate to **Apps** -> **Manage your apps** -> **Upload an app** to install the bot into the target team or conversation so the bot is authorized to post outbound activities to that `conversation.id`.
+
+---
+
+## Step 5: Talk to the Bot
+
+- **Personal chat**: every message you send to the bot reaches it; no mention is needed.
+- **Channels and group chats**: Teams delivers to a bot only the messages that mention it. Type `@` and pick the bot from the suggestion list so the name becomes a mention chip; plain text that merely reads `@Kage` is not a mention, and a reply inside a thread needs its own mention too. A message without one is never sent to the bot, so nothing in the gateway or broker logs will show it. The adapter strips the bot's own mention before the agent reads the text, and a thread reply reaches the same conversation session as the post that started it.

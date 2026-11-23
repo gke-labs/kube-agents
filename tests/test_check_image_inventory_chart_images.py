@@ -47,12 +47,21 @@ _CHECK_THREE_FUNCTIONS = (
     "check_mirror_names",
     "check_toggle",
 )
-_CHECK_THREE_CONSTANTS = (*_LIFTED_CONSTANTS, "LABEL_DEFAULT", "LABEL_MIRRORED")
+_CHECK_THREE_CONSTANTS = (*_LIFTED_CONSTANTS, "LABEL_DEFAULT", "LABEL_MIRRORED", "MIRRORED_VALUES")
 
 # The env vars the chart renders an image into. The pattern has to match every
 # one of them: a name it misses is an image the operator stamps onto agent pods
 # that no check sees.
-_IMAGE_ENV_NAMES = ("OPERATOR_IMAGE", "PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMAGE", "FLUENT_BIT_IMAGE")
+_IMAGE_ENV_NAMES = (
+    "OPERATOR_IMAGE",
+    "PLATFORM_AGENT_IMAGE",
+    "AGENT_SANDBOX_IMAGE",
+    "FLUENT_BIT_IMAGE",
+    "A2A_NATS_IMAGE",
+    "A2A_PROVISION_IMAGE",
+    "A2A_NATS_RELOADER_IMAGE",
+    "A2A_NATS_EXPORTER_IMAGE",
+)
 
 # What the behavioural tests below cannot reach, because it is top-level script
 # rather than a function: the call that puts the minter through check_toggle,
@@ -64,7 +73,21 @@ _IMAGE_ENV_NAMES = ("OPERATOR_IMAGE", "PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMA
 # the test.
 _CALL_SITES = (
     'check_toggle githubMinter "${MINTER_VALUES[@]}"',
+    "\ncheck_toggle webConsole --set webConsole.enabled=true\n",
+    "\ncheck_toggle profiles.cluster --set profiles.cluster.enabled=true\n",
+    "\ncheck_toggle hindsight --set hindsight.enabled=true\n",
     "--set githubMinter.enabled=true",
+    'check_chart_image_env_rendered "$LABEL_DEFAULT" "$default_render"',
+    # The reused-values render (no a2aBus key) goes through the same four
+    # checks, over the bus's four env vars alone: the template's own copy of
+    # the bus pins is read by nothing else, and the rest of that render is the
+    # default render's.
+    "readonly REUSED_VALUES=(--set a2aBus=null)",
+    'check_chart_image_env_rendered "$LABEL_REUSED" "$reused_render"',
+    'reused_bus_images="$(bus_image_env_refs <<<"$reused_render")"',
+    'check_inventory_pins "$LABEL_REUSED" "$reused_bus_images"',
+    'check_mirror_prefix "$LABEL_REUSED_MIRRORED" "$(bus_image_env_refs <<<"$mirrored_reused_render")"',
+    'check_mirror_names "$LABEL_REUSED_MIRRORED" "$(bus_image_env_refs <<<"$mirrored_reused_render")"',
 )
 _GUARDS = (
     '[ -n "$(image_field_refs <<<"$default_render")" ] || {',
@@ -101,7 +124,7 @@ spec:
             - name: AGENT_SANDBOX_IMAGE
               value: "ghcr.io/gke-labs/kube-agents/agent-sandbox:v0.1.0"
             - name: FLUENT_BIT_IMAGE
-              value: "docker.io/fluent/fluent-bit:5.1.2"
+              value: "docker.io/fluent/fluent-bit:5.1.5"
             - name: GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:
@@ -110,7 +133,7 @@ spec:
 """
 
 _EXPECTED = [
-    "docker.io/fluent/fluent-bit:5.1.2",
+    "docker.io/fluent/fluent-bit:5.1.5",
     "ghcr.io/gke-labs/kube-agents/agent-sandbox:v0.1.0",
     "ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0",
     "ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0",
@@ -376,10 +399,21 @@ class CheckToggleTest(unittest.TestCase):
 
 
 class CheckThreeWiringTest(unittest.TestCase):
-    def test_script_puts_the_minter_through_check_toggle(self):
+    def test_script_puts_every_toggle_through_check_toggle(self):
         text = _SCRIPT.read_text()
         for call in _CALL_SITES:
             self.assertIn(call, text)
+
+    def test_every_image_env_var_is_required_of_the_default_render(self):
+        """CHART_IMAGE_ENV_NAMES is the list check_chart_image_env_rendered
+        holds the render to; an env var missing from it can drop out of the
+        chart with every check green."""
+        text = _SCRIPT.read_text()
+        start = text.index("readonly CHART_IMAGE_ENV_NAMES=(")
+        block = text[start : text.index(")", start)]
+        for name in _IMAGE_ENV_NAMES:
+            with self.subTest(name=name):
+                self.assertIn(f"\n  {name}\n", block)
 
     def test_script_guards_against_an_extraction_that_matches_nothing(self):
         text = _SCRIPT.read_text()

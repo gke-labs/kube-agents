@@ -3,18 +3,18 @@
 The gateway pod, where the k8s-event-watcher serves its metrics on the
 agent-api-auth sidecar; the credential-proxy pod, where the broker serves its
 own on a metrics-only listener; the kube-proxy pod, where k8s-api-proxy serves its
-own on a metrics-only listener; the A2A gateway pod a `spec.mode: next`
-install runs, which serves its own on a metrics-only listener too; and the
-same install's NATS pods, where an exporter sidecar serves the bus's JetStream
-figures. The NATS row is held to the next-mode golden, which renders the
-bus, and has a PodMonitoring alone (no ServiceMonitor or VMPodScrape). For each,
+own on a metrics-only listener; the A2A gateway pod, which serves its own on
+a metrics-only listener too; and the NATS pods, where an exporter sidecar
+serves the bus's JetStream figures. The NATS row is held to the operator's
+golden, which renders the bus, and has a PodMonitoring alone (no ServiceMonitor
+or VMPodScrape). For each,
 three things have to agree for the scrape to work: the port the operator
 declares on the container, the number in the PodMonitoring, and the labels the
 operator puts on the pod. The chart cannot read the operator, so the structural
 tests hold the template to the operator's golden manifest instead. No golden
-renders mode next with both doors armed (the next-mode golden is the example
-CR, which arms neither), so the A2A gateway's row is held to the rendered A2A
-ingress fixture (k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml).
+renders both doors armed (the golden is the example CR, which arms neither),
+so the A2A gateway's row is held to the rendered A2A ingress fixture
+(k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml).
 Whether they render at all follows the cluster by
 default: helm template has no cluster, so the render tests hand it the
 PodMonitoring API with --api-versions where they mean a cluster that serves it.
@@ -39,9 +39,11 @@ _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _GOLDEN = (
     _REPO_ROOT / "k8s-operator" / "internal" / "testing" / "testdata" / "platform" / "expected" / "platformagent.yaml"
 )
-_NEXT_GOLDEN = _GOLDEN.with_name("platformagent-next.yaml")
 _OPERATOR_A2A_SOURCE = (
     _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
+)
+_OPERATOR_CURATOR_SOURCE = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_curator.go"
 )
 _KIND_UP = _REPO_ROOT / "hack" / "kind-up.sh"
 _A2A_FIXTURE = (
@@ -125,12 +127,20 @@ _SCRAPES = (
 )
 
 
-# The NATS exporter's row: a StatefulSet in the next-mode golden, scraped by a
+# The OKF memory curator's row: rendered behind A2A_CURATOR, so no golden
+# carries the Deployment; its port and pod labels come from the operator's
+# curator builder constants directly.
+_CURATOR_SCRAPE = {
+    "suffix": "-curator-monitoring",
+    "operator_source": _OPERATOR_CURATOR_SOURCE,
+    "selector_keys": ("app", "kubeagents.x-k8s.io/component"),
+}
+# The NATS exporter's row: a StatefulSet in the golden, scraped by a
 # PodMonitoring with no ServiceMonitor or VMPodScrape beside it, so it sits
 # outside _SCRAPES (whose rows all carry both).
 _NATS_SCRAPE = {
     "suffix": "-a2a-nats-monitoring",
-    "fixture": _NEXT_GOLDEN,
+    "fixture": _GOLDEN,
     "deployment": "platformagent-a2a-nats",
     "container": "nats-exporter",
     "port_name": "nats-metrics",
@@ -140,13 +150,17 @@ _NATS_SCRAPE = {
     "metric_relabeling": [{"sourceLabels": ["__name__"], "regex": "jetstream_consumer_.*", "action": "drop"}],
 }
 # Every row with a PodMonitoring, in template order.
-_POD_MONITORING_SCRAPES = _SCRAPES + (_NATS_SCRAPE,)
+_POD_MONITORING_SCRAPES = _SCRAPES + (_CURATOR_SCRAPE, _NATS_SCRAPE)
 # The workload kinds a row's pod template can come from.
 _WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 
 
 def _scrape_port(scrape):
-    """The port a row's PodMonitoring has to scrape, from the golden or the A2A fixture."""
+    """The port a row's PodMonitoring has to scrape, from the golden, fixture, or operator source."""
+    if "operator_source" in scrape:
+        match = re.search(r"^\s*a2aCuratorStatusPort\s*=\s*(\d+)\s*$", scrape["operator_source"].read_text(), re.MULTILINE)
+        assert match, f"a2aCuratorStatusPort not found in {scrape['operator_source']}"
+        return int(match.group(1))
     fixture = scrape.get("fixture", _GOLDEN)
     return _manifest_port(fixture, scrape["deployment"], scrape["container"], scrape["port_name"])
 
@@ -179,6 +193,16 @@ def _manifest_pod_labels(fixture, deployment):
 def _selector(scrape, name):
     """The selector the PodMonitoring has to carry for agent `name`: the manifest's
     values for the keys the row names, with the manifest's agent name replaced."""
+    if "operator_source" in scrape:
+        src = scrape["operator_source"].read_text()
+        suffix = re.search(r'^\s*a2aCuratorNameSuffix\s*=\s*"([^"]+)"', src, re.MULTILINE)
+        component = re.search(r'^\s*a2aCuratorComponent\s*=\s*"([^"]+)"', src, re.MULTILINE)
+        assert suffix and component, f"curator selector constants missing in {scrape['operator_source']}"
+        raw = {
+            "app": name + suffix.group(1),
+            "kubeagents.x-k8s.io/component": component.group(1),
+        }
+        return {key: raw[key] for key in scrape["selector_keys"]}
     fixture = scrape.get("fixture", _GOLDEN)
     agent_name = scrape.get("agent_name", _GOLDEN_AGENT)
     labels = _manifest_pod_labels(fixture, scrape["deployment"])
@@ -226,7 +250,8 @@ class MonitoringShapeTest(unittest.TestCase):
             if scrape["suffix"] == "-credential-proxy-monitoring":
                 want.append(str(_manifest_port(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier",
                                                "envoy-credential-proxy", "cred-metrics")))
-        # The NATS exporter's PodMonitoring is the template's last.
+        # The curator's and NATS exporter's PodMonitorings follow _SCRAPES.
+        want.append(str(_scrape_port(_CURATOR_SCRAPE)))
         want.append(str(_scrape_port(_NATS_SCRAPE)))
         self.assertEqual(ports, want)
 
@@ -264,7 +289,7 @@ class MonitoringShapeTest(unittest.TestCase):
     def test_kind_up_leaves_the_default_to_the_cluster(self):
         # kind serves no PodMonitoring API, so the null default renders nothing
         # there; pinning it false would hide a detection regression from the
-        # kind job. The LiteLLM switch is a plain boolean and stays pinned.
+        # kind job.
         self.assertNotIn("platformAgent.podMonitoring", _KIND_UP.read_text())
 
 

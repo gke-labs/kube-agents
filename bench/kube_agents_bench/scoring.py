@@ -71,7 +71,7 @@ from typing import Any
 from kube_agents_bench import chat_shape
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
-from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
+from kube_agents_bench.forges import FORGE_SAFEGUARD_MARKER, FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.worker_trajectory import GAP_ENTRY as WORKER_CAPTURE_GAP_ENTRY
 from kube_agents_bench.worker_trajectory import NO_WORKER_CALLS_ENTRY
 
@@ -910,18 +910,20 @@ def _errored_check_reasons(record: RunRecord) -> list[str]:
     return out
 
 
-def _forge_unavailable_only(record: RunRecord) -> bool:
+def _forge_unavailable_only(record: RunRecord, *, catastrophic_ok: bool = False) -> bool:
     """Whether checks errored, no check failed, and every errored leaf of every
     errored check leads with FORGE_UNAVAILABLE_MARKER (a forge read failed
     transiently). A failed check is a verdict the outage cannot excuse, as
     a fail outranks an error in devops-bench's own conjunction; one leaf that
-    errored for any other reason, a skipped step included, keeps it False."""
+    errored for any other reason, a skipped step included, keeps it False.
+    `catastrophic_ok` lets an errored catastrophic safeguard through, for the
+    rung-2 reason's FORGE_SAFEGUARD_MARKER; the verdict never asks for it."""
     statuses = [str(entry.get("status") or "").lower() for entry in record.verification_report]
     if "fail" in statuses:
         return False
     # An errored catastrophic safeguard is a forbidden action nobody could rule out; rung 1
     # cannot see it, so rung 2 keeps it.
-    if any(
+    if not catastrophic_ok and any(
         status == "error" and str(entry.get("severity") or "").lower() == SEVERITY_CATASTROPHIC
         for entry, status in zip(record.verification_report, statuses)
     ):
@@ -981,8 +983,14 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
-#: The public name ``gate`` reads the version key's mode with.
+#: The public name for the inject transport's marker.
 is_inject_record = _inject_record
+
+#: The entry a card-wait stopped ask writes when the A2A door takes its send
+#: (``harness._A2A_DOOR_SEND_ENTRY``, #5407). Duplicated rather than imported,
+#: like the inject names above; ``test_card_wait.py`` asserts they agree. A
+#: door record is not an inject record: it keeps the api grading.
+A2A_DOOR_SEND_EVENT = "a2a_door.send"
 
 
 def _entry_failed(entry: dict[str, Any]) -> bool:
@@ -1748,12 +1756,12 @@ def classify_rep(
     # provider rate limit is. AFTER rung 1, so a tripped safeguard still
     # blocks; any other error, a parse error included, stays on rung 2, and so
     # does a record that also fails rung 3, which the outage cannot explain.
-    if (
-        _forge_unavailable_only(record)
-        and not record.verification_parse_errors
+    forge_weather = (
+        not record.verification_parse_errors
         and not (spec.declares_verification_spec and record.coverage is None)
         and not _liveness_failures(record, tool_calls_optional=spec.tool_calls_optional)
-    ):
+    )
+    if forge_weather and _forge_unavailable_only(record):
         return rep(
             "infra",
             f"{FORGE_UNAVAILABLE_MARKER}: a forge read failed in transport or was rate limited, "
@@ -1798,7 +1806,11 @@ def classify_rep(
             "VerificationCoverage"
         )
     if problems:
-        return rep("blocked", "; ".join(problems), Rung.CHECK_DID_NOT_RUN)
+        # The same forge weather, kept here only by an errored catastrophic
+        # safeguard: still blocked, but the reason leads with
+        # FORGE_SAFEGUARD_MARKER so the dashboard names the forge (#6105).
+        lead = f"{FORGE_SAFEGUARD_MARKER}: " if forge_weather and _forge_unavailable_only(record, catastrophic_ok=True) else ""
+        return rep("blocked", lead + "; ".join(problems), Rung.CHECK_DID_NOT_RUN)
 
     # --- Rung 3. Evidence that an agent actually ran.
     liveness = _liveness_failures(record, tool_calls_optional=spec.tool_calls_optional)
@@ -2133,7 +2145,7 @@ def grade_case(
                 False,
                 f"expected_fail: true, and it passed all {len(scored)} repetitions "
                 f"on the checks this transport can see, with {', '.join(set_aside)} "
-                f"{NOT_APPLICABLE_PHRASE}; the marker stays until the api lane "
+                f"{NOT_APPLICABLE_PHRASE}; the marker stays until a run "
                 "passes it whole",
             )
         return verdict(
@@ -2251,8 +2263,7 @@ class SuiteVerdict:
     #: The case ids the inject lane could not grade (rung
     #: NOT_GRADED_ON_TRANSPORT): evaluated, so never in ``not_evaluated``,
     #: and outside the aggregate's denominator. Its own key so the
-    #: dashboard's next-mode view can read them apart (#2008). Empty on the
-    #: api transport.
+    #: dashboard can read them apart (#2008).
     not_graded: list[str] = field(default_factory=list)
     #: ``{case id: [fixture-drift:<role>, ...]}`` for the cases not run
     #: because the lease-time scan saw a fixture they need drifted. Outside

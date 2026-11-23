@@ -25,10 +25,15 @@ func TestReasonInPlainWords(t *testing.T) {
 			reasonSentences["hermes-unstructured-reasoning"], true},
 		{"known token with an operator's detail reads as its sentence", "reason: hermes-api-failed - HTTP 500; session: s-1; error: upstream - timed out",
 			reasonSentences["hermes-api-failed"], true},
+		{"a draining tier's refusal reads as its sentence, not the profile-naming detail", "reason: tier-withdrawn - profile tse no longer runs tier oncall; it is draining, so tasks already running at it finish and nothing new starts",
+			reasonSentences["tier-withdrawn"], true},
 		{"detail-shown token reads as its detail", "reason: verifier-refused - the verifier does not allow this agent to run on prod-east",
 			"the verifier does not allow this agent to run on prod-east", true},
 		{"detail-shown token's detail keeps its own dashes and stops before a session id", "reason: capability-refused - the chain does not terminate at a root - the gateway minted none; session: s-1; turn 2",
 			"the chain does not terminate at a root - the gateway minted none", true},
+		{"an agy denied turn reads as its sentence, not the action list", "reason: permission-denied - skipped for want of approval: command (Bash)",
+			reasonSentences["permission-denied"], true},
+		{"an agy print timeout reads as its sentence", "reason: print-timeout", reasonSentences["print-timeout"], true},
 		{"unknown token with detail reads as nothing", "reason: something-new - exec: /usr/bin/x: no such file", "", true},
 		{"known token without detail", "reason: hermes-unstructured-reasoning",
 			reasonSentences["hermes-unstructured-reasoning"], true},
@@ -78,6 +83,9 @@ func TestTerminalNoticeCarriesNoToken(t *testing.T) {
 		{"rejected with plain text", lib.StateRejected, "no capability", "🚫 the executor rejected the task: no capability"},
 		{"rejected with nothing", lib.StateRejected, "", "🚫 the executor rejected the task"},
 		{"canceled ignores the reason", lib.StateCanceled, "reason: canceled-by-request", "🛑 canceled"},
+		{"canceled ignores a sentence outside canceledReasonShown", lib.StateCanceled, "reason: tier-withdrawn", "🛑 canceled"},
+		{"canceled by an ended tier says so (#5850)", lib.StateCanceled, "reason: tier-ended - an administrator ended tier oncall's drain on profile tse",
+			"🛑 canceled — " + reasonSentences["tier-ended"]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := terminalNotice(tc.state, tc.reason)

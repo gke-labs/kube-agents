@@ -2,7 +2,7 @@ Subject: Check Terraform syntax with tofu fmt, not terraform init and validate
 
 Why: the sandbox carries OpenTofu for `tofu fmt` only, and no `terraform` binary; `init` and `validate` need a provider registry and a cloud identity the sandbox does not have, and the all-skills guard in test_command_policy.py allows no Terraform command but `tofu fmt`.
 Local-Issue: #2936 (gcp-terraform, #2999)
-Upstream-Issue: none
+Eval-Case: terraform-spot-replacement-pr
 Retire-When: never; the sandbox's Terraform tooling is this repository's
 
 diff --git a/references/gke_configuration_prerequisites.md b/references/gke_configuration_prerequisites.md

@@ -1,9 +1,9 @@
 # CI-only build of the four core first-party images (platform-agent,
 # credential-proxy, agent-sandbox, k8s-operator) in a single Cloud Build, plus
 # the web console the deploy installs on every lane (the `web-console` step),
-# when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, the four A2A images of
-# the next stack and the Hermes bridge sidecar (the `a2a` and `a2a-bridge`
-# steps at the end, no-ops otherwise), and under EVAL_REPLAY_SHADOW=true the
+# and, when hack/ci-deploy.sh passes their URIs, the A2A stack's images and the
+# Hermes bridge sidecar (the `a2a` and `a2a-bridge` steps at the end, no-ops
+# otherwise), and under EVAL_REPLAY_SHADOW=true the
 # shadow-mode replay proxy (the `replay-shadow-proxy` step, a no-op otherwise).
 #
 # Why this exists next to cloudbuild.yaml rather than replacing it: that config
@@ -183,6 +183,8 @@ steps:
       - "$_KUBE_PROXY_URI"
       - "-f"
       - "deploy/kube-proxy/Dockerfile"
+      - "--build-arg"
+      - "KUBE_AGENTS_VERSION=$_KUBE_AGENTS_VERSION"
       - "."
 
   # The two AgentPlugin images the presubmit deploys so the Pub/Sub platform
@@ -212,9 +214,9 @@ steps:
           docker push "$$uri"
         done
 
-  # The next stack's six first-party images (a2a/Dockerfile.gateway,
+  # The A2A stack's six first-party images (a2a/Dockerfile.gateway,
   # .authcallout, .worker, .verifier, .console, .dispatcher), built only when hack/ci-deploy.sh
-  # runs under EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
+  # passes their URIs. With the substitutions at their
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
   # entry fails the build, which is why this step pushes from inside itself.
@@ -226,9 +228,10 @@ steps:
   # which copies the credential broker's shim client from agents/platform/scripts - each
   # Dockerfile's header says which. One step rather than six: they share the Go
   # module download layer, which the daemon serves to the ones after the first.
-  # The cluster AgentProfile's persona (a2a/Dockerfile.persona-cluster, context
-  # agents/cluster/persona, as docker-publish-ghcr.yml builds it) rides along:
-  # a busybox image with one COPY, so it adds seconds, not minutes.
+  # The cluster, tse and fleet-audit AgentProfiles' personas
+  # (a2a/Dockerfile.persona-cluster, -tse and -fleet-audit, contexts
+  # agents/<name>/persona, as docker-publish-ghcr.yml builds them) ride along:
+  # busybox images with one COPY each, so they add seconds, not minutes.
   # Nothing here depends on the platform image, so the step starts at once,
   # like sandbox and operator; the bridge, which does, is the step after.
   #
@@ -247,7 +250,7 @@ steps:
       - "-c"
       - |
         if [ -z "$_A2A_GATEWAY_URI" ]; then
-          echo "A2A images not requested (EVAL_MODE_NEXT unset); skipping"
+          echo "A2A images not requested (no _A2A_*_URI substitutions); skipping"
           exit 0
         fi
         set -e
@@ -263,6 +266,10 @@ steps:
         build_and_push dispatcher "$_A2A_DISPATCHER_URI" a2a
         # The cluster profile's persona: busybox and the persona directory.
         build_and_push persona-cluster "$_PERSONA_CLUSTER_URI" agents/cluster/persona
+        # The tse profile's persona, the same shape (#3842).
+        build_and_push persona-tse "$_PERSONA_TSE_URI" agents/tse/persona
+        # The fleet-audit profile's persona, the same shape (#5623).
+        build_and_push persona-fleet-audit "$_PERSONA_FLEET_AUDIT_URI" agents/fleet-audit/persona
 
   # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
   # flag and the same no-op rule. It is FROM the platform-agent image of THIS
@@ -287,7 +294,7 @@ steps:
       - "-c"
       - |
         if [ -z "$_A2A_BRIDGE_URI" ]; then
-          echo "bridge image not requested (EVAL_MODE_NEXT unset); skipping"
+          echo "bridge image not requested (no _A2A_BRIDGE_URI substitution); skipping"
           exit 0
         fi
         set -e
@@ -302,14 +309,13 @@ steps:
 
   # The web console (a2a/Dockerfile.web-console), on every pull-request path:
   # hack/ci-deploy.sh installs the chart with webConsole.enabled=true on every
-  # lane and gates the console's routes and a chat turn through it under today
-  # and under next (its gate_web_console), so a console that breaks on either
-  # mode reds the lane rather than waiting for someone to port-forward to it
+  # lane and gates the console's routes and a chat turn through it (its
+  # gate_web_console), so a console that breaks reds the lane rather than
+  # waiting for someone to port-forward to it
   # (#2462). Empty URI, no-op, and it pushes from inside itself, as the a2a
-  # step does. It waits for the a2a step so that under EVAL_MODE_NEXT=1 its
+  # step does. It waits for the a2a step so that its
   # builder stage finds the Go module download layer the six images above
-  # left in the daemon; on a today lane that step exits at once and this one
-  # starts beside sandbox and operator. The release-candidate path builds
+  # left in the daemon. The release-candidate path builds
   # nothing and installs the candidate's published web-console image
   # (REQUIRED_RELEASE_IMAGES in scripts/release/common.sh).
   - id: web-console
@@ -335,7 +341,7 @@ steps:
   # empty default the step prints one line and exits, and it pushes from
   # inside itself for the reason the a2a step gives. Stdlib Python on a slim
   # base, from the repository root because it carries the install's scrubbers
-  # from agents/; nothing here waits for it.
+  # from agents/ and their shell reader from bench/; nothing here waits for it.
   - id: replay-shadow-proxy
     name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
@@ -387,7 +393,7 @@ substitutions:
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
   # Empty means the a2a and a2a-bridge steps are no-ops; hack/ci-deploy.sh
-  # sets all seven together under EVAL_MODE_NEXT=1. The a2a step gates on
+  # sets all seven together. The a2a step gates on
   # _A2A_GATEWAY_URI alone, so they are set as a set or not at all.
   _A2A_GATEWAY_URI: ""
   _A2A_CALLOUT_URI: ""
@@ -404,6 +410,8 @@ substitutions:
   _A2A_BRIDGE_URI: ""
   _A2A_DISPATCHER_URI: ""
   _PERSONA_CLUSTER_URI: ""
+  _PERSONA_TSE_URI: ""
+  _PERSONA_FLEET_AUDIT_URI: ""
   # Empty means the replay-shadow-proxy step is a no-op; hack/ci-deploy.sh sets
   # it under EVAL_REPLAY_SHADOW=true.
   _REPLAY_SHADOW_PROXY_URI: ""

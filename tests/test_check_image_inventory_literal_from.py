@@ -41,6 +41,8 @@ _CALL_SITES = (
     "check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile files/",
     # A persona image: the persona directory is the context, the payload /files/.
     "check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/",
+    "check_literal_from busybox a2a/Dockerfile.persona-tse . /files/",
+    "check_literal_from busybox a2a/Dockerfile.persona-fleet-audit . /files/",
 )
 
 # The sweep after the call sites: a plugin Dockerfile the fence never saw is
@@ -217,7 +219,7 @@ class CheckLiteralFromTest(unittest.TestCase):
             (f"#\rsyntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#^Msyntax=docker/dockerfile:1"),
             (f"#!/usr/bin/env -S docker build -f\n# syntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# syntax=docker/dockerfile:1"),
             (f"# a note first\n#escape=`\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#escape=`"),
-            (f"# digest=ea2b9914 is what the tag resolved to\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# digest=ea2b9914 is what the tag resolved to"),
+            (f"# digest=0123abcd is what the tag resolved to\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# digest=0123abcd is what the tag resolved to"),
         ):
             with self.subTest(text=text):
                 result = _run_check(text)

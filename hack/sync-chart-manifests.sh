@@ -6,6 +6,9 @@
 #     config/rbac/role.yaml: the ClusterRole document between the GENERATED RULES
 #     markers, the namespaced Role document between the GENERATED NAMESPACED RULES
 #     markers.
+#   - k8s-operator/config/profiles/role.yaml is the Role document of config/rbac/role.yaml,
+#     copied whole for the profile namespace's kustomization (kustomize refuses a resource
+#     above its own directory). The one destination under k8s-operator/config/.
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The chart is the only thing that installs those
 #     policies, so a drifted copy is a backstop nobody applies.
@@ -14,6 +17,9 @@
 #     A2A_GATEWAY_POD_POLICY env is set from too.
 #   - templates/web-console-cr-admission-policy.yaml is config/admission/web-console-cr-policy.yaml,
 #     verbatim, wrapped in the kube-agents.webConsoleCRPolicyEnabled helper.
+#   - templates/agentschedule-builtin-admission-policy.yaml is config/admission/agentschedule-builtin-policy.yaml
+#     under the admission values gate, with the chart's operator identity substituted for the
+#     second of its operator usernames, as for the agent RBAC policy.
 #   - templates/a2a-dispatcher-job-admission-policy.yaml is config/admission/a2a-dispatcher-job-policy.yaml,
 #     likewise, under kube-agents.a2aDispatcherJobPolicyEnabled and A2A_DISPATCHER_JOB_POLICY.
 #   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
@@ -23,8 +29,9 @@
 # And one derived file whose source is NOT under config/:
 #   - charts/kube-agents/files/footprint.yaml holds the resource totals of the pods the operator
 #     renders, which the chart's quota preflight cannot compute for itself. It is summed
-#     from the operator's golden manifests for the default example CR (platformagent.yaml,
-#     and platformagent-next.yaml for what spec.mode: next adds), not from config/ and
+#     from the operator's settled golden manifest for the default example CR
+#     (platformagent-settled.yaml, the render once the bus is provisioned, which carries the
+#     hermes-bridge container, the provisioning Job and the A2A gateway), not from config/ and
 #     not from a live render, so the goldens are what you edit: change the operator, re-bless
 #     the goldens, then sync. Syncing before re-blessing regenerates the old numbers.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
@@ -35,6 +42,7 @@ CRD_SRC=k8s-operator/config/crd/bases
 CRD_DST=charts/kube-agents/crds
 ROLE_SRC=k8s-operator/config/rbac/role.yaml
 RBAC_TPL=charts/kube-agents/templates/operator-rbac.yaml
+readonly PROFILE_ROLE_DST=k8s-operator/config/profiles/role.yaml
 VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
 VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
 readonly GATEWAY_POD_VAP_SRC=k8s-operator/config/admission/a2a-gateway-pod-policy.yaml
@@ -43,11 +51,13 @@ readonly WEB_CONSOLE_CR_VAP_SRC=k8s-operator/config/admission/web-console-cr-pol
 readonly WEB_CONSOLE_CR_VAP_TPL=charts/kube-agents/templates/web-console-cr-admission-policy.yaml
 readonly DISPATCHER_JOB_VAP_SRC=k8s-operator/config/admission/a2a-dispatcher-job-policy.yaml
 readonly DISPATCHER_JOB_VAP_TPL=charts/kube-agents/templates/a2a-dispatcher-job-admission-policy.yaml
+readonly SCHEDULE_BUILTIN_VAP_SRC=k8s-operator/config/admission/agentschedule-builtin-policy.yaml
+readonly SCHEDULE_BUILTIN_VAP_TPL=charts/kube-agents/templates/agentschedule-builtin-admission-policy.yaml
 readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
 readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
 readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
 readonly FOOTPRINT_GEN=scripts/generate_chart_footprint.py
-readonly FOOTPRINT_SRC=k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml
+readonly FOOTPRINT_SRC=k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml
 readonly FOOTPRINT_DST=charts/kube-agents/files/footprint.yaml
 
 check=false
@@ -81,8 +91,9 @@ for dst in "$CRD_DST"/*.yaml; do
 done
 
 # RBAC rules: role.yaml carries two documents, the ClusterRole from the
-# markers without `namespace=` and the Role from the one with it (the Secret
-# write verbs, in the install namespace). Each document's rules block is spliced
+# markers without `namespace=` and the Role from the ones with it (the write
+# verbs on every kind the operator renders, bound in the install namespace and
+# the profile namespace). Each document's rules block is spliced
 # between its own pair of markers: GENERATED RULES for the ClusterRole,
 # GENERATED NAMESPACED RULES for the Role. Without the BEGIN markers the awk
 # pass would copy the template unchanged and both modes would silently pass
@@ -130,6 +141,30 @@ else
   mv "$tmp" "$RBAC_TPL"
 fi
 
+# The profile namespace's copy of the Role document, for the kustomize path.
+# config/profiles is its own kustomization (config/default's `namespace:`
+# would rewrite the Role into the install namespace), and kustomize refuses a
+# resource above its own directory, so the Role document is copied there
+# whole, under a header, and held to role.yaml here the way the chart's
+# spliced block is. The kustomization's namespace and prefix do the rest.
+tmp=$(mktemp)
+{
+  echo "# GENERATED from $ROLE_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo "# The Role document of that file (the +kubebuilder:rbac markers with"
+  echo "# \`namespace=\`), rendered into the profile namespace by this kustomization."
+  # Records are the `---`-separated documents; the one whose kind line reads
+  # `kind: Role` (and not `kind: ClusterRole`) is the namespaced document.
+  awk 'BEGIN { RS = "---\n"; ORS = "" } /\nkind: Role\n/ { print "---\n" $0 }' "$ROLE_SRC"
+} >"$tmp"
+grep -q '^kind: Role$' "$tmp" || { rm -f "$tmp"; fail "no Role document found in $ROLE_SRC for $PROFILE_ROLE_DST"; }
+if $check; then
+  [[ -f "$PROFILE_ROLE_DST" ]] || { rm -f "$tmp"; fail "profile Role copy missing: $PROFILE_ROLE_DST"; }
+  diff -u "$PROFILE_ROLE_DST" "$tmp" >&2 || { rm -f "$tmp"; fail "profile Role copy out of date vs $ROLE_SRC: $PROFILE_ROLE_DST"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$PROFILE_ROLE_DST"
+fi
+
 # Admission policies: the whole template is generated, so there is nothing in it
 # to hand-edit and nothing to splice around — the chart adds only the values gate.
 # Everything else, including the honesty header about what the policies do not
@@ -163,6 +198,26 @@ if $check; then
   rm -f "$tmp"
 else
   mv "$tmp" "$VAP_TPL"
+fi
+
+# The AgentSchedule builtin policy: the agent RBAC policy's gate, and its one
+# substitution, since it exempts the operator by name.
+[[ -f "$SCHEDULE_BUILTIN_VAP_SRC" ]] || fail "admission policy source missing: $SCHEDULE_BUILTIN_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}'
+  echo "# GENERATED from $SCHEDULE_BUILTIN_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# See values.yaml (admissionPolicy) for the gate. The semverCompare half keeps a 1.29 cluster,'
+  echo '# where ValidatingAdmissionPolicy is not v1 yet, installable.'
+  sed "s|'system:serviceaccount:kubeagents-system:kube-agents-operator-sa'|'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'|" "$SCHEDULE_BUILTIN_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$SCHEDULE_BUILTIN_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $SCHEDULE_BUILTIN_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$SCHEDULE_BUILTIN_VAP_TPL"
 fi
 
 # The gateway's pod policy: the same shape, under the helper rather than an inline gate,
@@ -254,7 +309,7 @@ if $check; then
   footprint_rc=0
   python3 "$FOOTPRINT_GEN" --check || footprint_rc=$?
   if [[ $footprint_rc -eq 1 ]]; then
-    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC or its next-mode sibling (see the diff above)." >&2
+    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC (see the diff above)." >&2
     echo "       Both are goldens, so re-bless them before syncing:" >&2
     echo "       (cd k8s-operator && go test ./internal/testing/... -update), then 'make chart-sync'." >&2
     echo "       That package, not ./internal/controller/..., writes this golden; the latter has an" >&2
@@ -263,7 +318,7 @@ if $check; then
   elif [[ $footprint_rc -ne 0 ]]; then
     exit "$footprint_rc"
   fi
-  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC and its next-mode sibling."
+  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC."
 else
   echo "Chart CRD, RBAC and admission-policy copies synced from k8s-operator/config."
   echo "Note: $WEBHOOK_TPL is hand-maintained and was not rewritten; 'make chart-check' compares it with $WEBHOOK_SRC_DIR."

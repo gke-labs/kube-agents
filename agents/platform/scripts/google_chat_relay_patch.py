@@ -20,6 +20,10 @@ from slack_relay_patch import is_silent_text
 
 
 LOGGER = logging.getLogger("google-chat-relay-patch")
+# The relay is the credential broker, an in-cluster Service: a proxy from the
+# environment must not get this request and its bearer token, and urllib does
+# not leave out a cluster host by itself.
+_RELAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Below: what ``hermes send`` needs to reach Chat from a process with no
 # credential of its own.
@@ -30,7 +34,8 @@ LOGGER = logging.getLogger("google-chat-relay-patch")
 # with no service-account JSON it falls back to Application Default
 # Credentials, the metadata server is unreachable from the agent container by
 # design, and every send ends at "token refresh timed out" after ten seconds.
-# On ``spec.mode: today`` that is every incident alert session_kv_server posts.
+# Where Hermes's own Google Chat platform is the consumer, that is every
+# incident alert session_kv_server posts.
 
 #: The registry name the plugin registers the platform under.
 PLATFORM_NAME = "google_chat"
@@ -302,7 +307,7 @@ def install() -> None:
             headers=headers,
             method="GET" if body is None else "POST",
         )
-        with urllib.request.urlopen(req, timeout=35) as response:
+        with _RELAY_OPENER.open(req, timeout=35) as response:
             return json.load(response)
 
     class RelayMessage:

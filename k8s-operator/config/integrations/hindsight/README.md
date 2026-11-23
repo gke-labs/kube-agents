@@ -39,7 +39,7 @@ kustomize alone leaves them unsubstituted for the API server to reject. The
 target resolves them from `images.json` and runs `envsubst` first.
 
 There is nothing else to configure and no prerequisite Secret. Both images are
-pinned by digest; `pgvector/pgvector` rebuilds a version tag like `0.8.6-pg15` in
+pinned by digest; `pgvector/pgvector` rebuilds a version tag like `0.8.7-pg15` in
 place when the Postgres base image is patched, so the digest is what stands between
 a pod reschedule and a Postgres minor nobody chose. Both pins live in [`images.json`](../../../../images.json) at
 the repository root, not here — that is what lets `make mirror-images` copy them
@@ -54,8 +54,10 @@ Neither workload reads a Secret, and that is a decision rather than an oversight
 no password in it. What keeps the database private is a ClusterIP service with no
 route in from outside the cluster, and — on clusters that enforce it —
 [`networkpolicy.yaml`](networkpolicy.yaml), which lets only the Hindsight API pod
-reach port 5432 and confines `hindsight-api` itself to same-namespace and Managed
-Prometheus ingress on port 8888 and egress to cluster DNS, `hindsight-postgresql`,
+reach port 5432 and confines `hindsight-api` itself on port 8888 to trusted
+gateway and curator pods in the same namespace (excluding shell-sandbox,
+`credential-proxy`, `credential-proxy-exec-tier`, `kube-proxy`, and session/worker
+pods) plus Managed Prometheus, and egress to cluster DNS, `hindsight-postgresql`,
 and the inference gateway. A password would add an install step (generate it, keep
 two keys in agreement, rotate it) to protect an in-cluster database from pods that
 are already trusted with the memories it holds.
@@ -75,11 +77,12 @@ method it was initialised with, and the passwordless DSN will be rejected. Movin
 an existing install onto this manifest means deleting
 `data-hindsight-postgresql-0`, which discards every stored memory.
 
-**LiteLLM takes no key either.** The gateway runs without a master key — the
-agents authenticate to it with the literal string `none`
+**Hindsight sends LiteLLM a placeholder, not a key.** The agents send the literal
+string `none`
 ([`deploy/shared/defaults/config.yaml`](../../../../deploy/shared/defaults/config.yaml)) and
 Hindsight does the same. The value is a placeholder the OpenAI-compatible client
-insists on, not a credential. The real provider keys (Gemini, Anthropic, OpenAI)
+insists on, not a credential; the gateway's caller-auth hook admits it as the
+`keyless` class ([`litellm_caller_auth.py`](../litellm/base/litellm_caller_auth.py)). The real provider keys (Gemini, Anthropic, OpenAI)
 live in LiteLLM's own secret and never reach this pod.
 
 ## What the agent connects to
@@ -90,8 +93,8 @@ http://hindsight-api.kubeagents-system.svc.cluster.local:8888
 
 Nothing bakes that URL in. The operator derives it from the agent's namespace and
 passes it as `HINDSIGHT_API_URL`; `agents/chat/defaults/hindsight/config.json`
-carries `mode`, `memory_mode` and `recall_budget` and deliberately **no**
-`api_url` key, because the plugin prefers the file over the environment and a
+carries `mode`, `memory_mode`, `recall_budget`, and `recall_types` and deliberately
+**no** `api_url` key, because the plugin prefers the file over the environment and a
 value left there would outrank the operator's silently. Installing into a
 different namespace therefore needs no edit and no image rebuild. The manifests
 are namespace-agnostic for the same reason — every in-cluster address in them is

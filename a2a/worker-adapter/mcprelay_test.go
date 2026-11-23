@@ -3,6 +3,7 @@ package workeradapter
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -171,6 +172,57 @@ func TestTheTaskCredentialIsReadPerRequest(t *testing.T) {
 	assertRelayError(t, out, 7, "task credential")
 }
 
+// jwtShaped is an unsigned header.payload.sig string with these nats claims:
+// the relay reads claims, never verifies.
+func jwtShaped(t *testing.T, nats map[string]any) string {
+	t.Helper()
+	seg := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	return seg(map[string]string{"typ": "JWT"}) + "." + seg(map[string]any{"jti": "J", "nats": nats}) + ".c2ln"
+}
+
+// A report credential names no target, and the broker refuses it on the MCP
+// relay, so the relay never sends one; a targeted credential, and one whose
+// claims can't be read, are sent as before.
+func TestTheRelaySendsNoReportCredential(t *testing.T) {
+	report := jwtShaped(t, map[string]any{"type": "task", "tier": "report", "trigger": map[string]string{"name": "t"}})
+	targeted := jwtShaped(t, map[string]any{"type": "task", "target": map[string]string{"cluster": "c"}})
+	for _, tc := range []struct {
+		name, token, want string
+	}{
+		{"report", report, ""},
+		{"targeted", targeted, targeted},
+		{"unreadable claims", "a.b.c", "a.b.c"},
+		{"no nats claim", "eyJ0eXAiOiJKV1QifQ.eyJqdGkiOiJKIn0.c2ln", "eyJ0eXAiOiJKV1QifQ.eyJqdGkiOiJKIn0.c2ln"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newRelayBroker(t)
+			b.reply = func(w http.ResponseWriter, _ []byte) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+			}
+			relayEnv(t, b.URL, tc.token)
+			if _, err := runRelay(t, b.URL+"/v1/mcp/developer_knowledge", `{"jsonrpc":"2.0","id":1,"method":"ping"}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			if len(b.headers) != 1 {
+				t.Fatalf("%d requests reached the broker, want 1", len(b.headers))
+			}
+			if got := b.headers[0].Get(taskCredentialHeader); got != tc.want {
+				t.Errorf("task credential header = %q, want %q", got, tc.want)
+			}
+			if got := b.headers[0].Get("Authorization"); got != "Bearer sa-token" {
+				t.Errorf("Authorization = %q", got)
+			}
+		})
+	}
+}
+
 // A redirect from the broker is never followed, so the credentials never
 // reach the address it names; the request is answered with an error.
 func TestTheRelayFollowsNoRedirect(t *testing.T) {
@@ -288,7 +340,7 @@ func TestTheClusterPersonaRendersItsServerThroughTheBridge(t *testing.T) {
 		Harness:    persona.ClaudeCode,
 		Relay:      ProfileRelay("/usr/local/bin/worker-adapter", func(k string) string { return env[k] }),
 	}
-	out, err := renderPersona(pw)
+	out, err := renderPersona(pw, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +379,7 @@ func TestTheClusterPersonaRendersItsServerThroughTheBridge(t *testing.T) {
 	}
 
 	pw.Relay = persona.Relay{}
-	bare, err := renderPersona(pw)
+	bare, err := renderPersona(pw, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

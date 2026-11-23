@@ -2,7 +2,7 @@ Subject: Mark node pool commands as Standard clusters only
 
 Why: node pool commands do not apply to Autopilot clusters; without the qualifier the fleet audit SOP recommended them for Autopilot members.
 Local-Issue: #1018 (fixed in #1226)
-Upstream-Issue: none filed yet
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Retire-When: upstream marks node pool commands as Standard only
 
 diff --git a/SKILL.md b/SKILL.md

@@ -584,6 +584,10 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 			Annotations: map[string]string{credentialProxyClusterTypeAnnotation: clusterType},
 		},
 		Spec: appsv1.DeploymentSpec{
+			// One pod, rolled with Recreate: the broker keeps a process-local record
+			// of which profile task made which branch and proposal (#6400), which is
+			// only right while one process serves /v1/vcs/. Scaling this out moves
+			// that record to shared state first (TestTheStatefulBrokerIsOnePod...).
 			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
@@ -595,9 +599,9 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           saName,
 					AutomountServiceAccountToken: ptr.To(false),
-					// ndots:3, see brokerCallerPodDNSConfig. The exec tier
+					// ndots:2, see publicAPICallerPodNdots. The exec tier
 					// copies this pod spec.
-					DNSConfig: brokerCallerPodDNSConfig(),
+					DNSConfig: publicAPICallerPodDNSConfig(),
 					// See credentialProxyTerminationGraceSeconds: covers the
 					// broker's drain on SIGTERM.
 					TerminationGracePeriodSeconds: ptr.To(credentialProxyTerminationGraceSeconds),
@@ -677,6 +681,10 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 	// Service — the sandbox's wrapped CLIs and the gateway's chat relays, which
 	// are hosted in this same process, and one listener serves both.
 	envVars := buildCredentialProxyEnvForPlugins(agent, agentPlugins, owned, profiles)
+	// Where the audit-report store listens and the token for it. Appended
+	// after the merge with spec.deployment.env, which reserves both names, as
+	// the federation pair below is.
+	envVars = append(envVars, auditReportStoreBrokerEnv(agent)...)
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -792,6 +800,14 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The scope declaration in every mode: spec.scope.exclude.clusters is
 	// refused at the broker for every caller (scope_exclude.py).
 	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
+	// spec.hold, refused the same way from its own ConfigMap
+	// (buildHoldConfigMap), which a hold edit changes without a roll.
+	mounts = append(mounts, holdMount())
+	// The token for the audit-report store and nothing else
+	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
+	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
+	_, tiersMount, _ := a2aTiersVolumeAndMount(agent)
+	mounts = append(mounts, tiersMount)
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
@@ -891,14 +907,12 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
 		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
 	}
-	// The A2A gateway pod, while its Google Chat adapter pulls the relay
-	// hosted here. The same condition as allowedBrokerCallers: a peer that
-	// is not a caller is a rule with nobody behind it.
-	if a2aChatArmed(agent) {
-		callers = append(callers, networkingv1.NetworkPolicyPeer{
-			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
-		})
-	}
+	// The A2A gateway pod, on every install: its report reader calls the
+	// store routes, and its Google Chat adapter, when armed, the relay. The
+	// same condition as allowedBrokerCallers.
+	callers = append(callers, networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
+	})
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods, under the cluster-view flag: the same selector
 		// the session fence and the bus fence name, on the credentialed port
@@ -907,12 +921,13 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		// that lets it connect.
 		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
 	}
-	// The MCP server's pod, under its flag, on the same condition as its
-	// place on allowedBrokerCallers (a2aMCPBrokerPeers).
+	// The MCP server's pod, by default unless switched off, on the same
+	// condition as its place on allowedBrokerCallers (a2aMCPBrokerPeers).
 	callers = append(callers, a2aMCPBrokerPeers(agent)...)
 	// The scope publisher's pods, while the broker confers the scope role,
 	// beside their place on allowedBrokerCallers (scopeBrokerPeers).
 	callers = append(callers, scopeBrokerPeers(agent)...)
+	callers = append(callers, a2aCuratorBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -968,11 +983,6 @@ var (
 		"credential-proxy-policy":    true,
 		"credential-proxy-runtime":   true,
 		"credential-proxy-ksa-token": true,
-		// The watcher-audience token confers the broker's `watcher` role: every
-		// fleet cluster's events and named objects, and the drift subscription.
-		// It is projected into agent-api-auth alone, and that geometry is the
-		// whole of what keeps it from the model's container.
-		watcherTokenVolume: true,
 	}
 	credentialProxyRuntimeVolumeNames = map[string]bool{
 		"credential-proxy-policy":    true,
@@ -1011,8 +1021,14 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	// The scope declaration, in every mode (CREDENTIAL_PROXY_SCOPE_FILE): the
 	// broker refuses an excluded cluster for every caller from it, and under
 	// mode next the scope role reads it to bound its arguments.
-	volumes = append(volumes, scopeConfigVolume(agent))
+	volumes = append(volumes, scopeConfigVolume(agent), holdVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
+	// The token the broker presents to the audit-report store.
+	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)
+	// The install's tier table (#6091): the operator's rendered, non-secret
+	// tiers ConfigMap, mounted read-only.
+	tiersVolume, _, _ := a2aTiersVolumeAndMount(agent)
+	volumes = append(volumes, tiersVolume)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 

@@ -274,6 +274,12 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # as the task is active -- what the real gateway answers for a task an
     # executor took. "" is a stream with no event.
     executor_states: list[str]
+    # Entries the stub appends at the start of the first probed read after
+    # finish_after_active_reads reads of the active task, so a test can
+    # finish the task after the harness has seen given states, whatever the
+    # runner's speed. 0 leaves the entries alone.
+    on_finish: list[dict[str, Any]]
+    finish_after_active_reads: int = 0
     probed_reads: int = 0
     active_reads: int = 0
     # Overrides on the probe. probe_active None derives it: active until the
@@ -364,6 +370,13 @@ class _StubGatewayServer(ThreadingHTTPServer):
 
     def probe_report(self, task: str = "", chain: bool = False) -> dict[str, Any]:
         self.probed_reads += 1
+        if (
+            self.finish_after_active_reads
+            and self.active_reads >= self.finish_after_active_reads
+            and self.on_finish
+        ):
+            self.entries = self.entries + self.on_finish
+            self.on_finish = []
         finished = any(
             e["kind"] == inject.ENTRY_TERMINAL and e.get("taskId") == self.task_id
             for e in self.entries
@@ -445,6 +458,7 @@ def stub_gateway(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubGatewayServe
     server.calls = []
     server.on_cancel = []
     server.executor_states = []
+    server.on_finish = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_TRANSPORT", "inject")
@@ -717,18 +731,15 @@ def test_the_record_carries_the_lifecycle_as_status_events(
     transport uses, and the final one is what rung 3 accepts in place of a
     token count. Tokens stay null (the stub reports no usage); latency is the harness's."""
     stub_gateway.executor_states = ["submitted", "working"]
-    # Let two reads see the task running before the terminal appears.
     stub_gateway.entries = running_transcript(stub_gateway.task_id)
-
-    def finish() -> None:
-        time.sleep(0.3)
-        stub_gateway.entries = stub_gateway.entries + [
-            entry(4, inject.ENTRY_POST, text="all quiet", messageId=RESULT_ID),
-            entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="completed",
-                  source=inject.TERMINAL_SOURCE_EXECUTOR),
-        ]
-
-    threading.Thread(target=finish, daemon=True).start()
+    # Two reads see the task running before the terminal appears. Counted in
+    # reads, not seconds: a timer lost the race on a slow runner (#6212).
+    stub_gateway.finish_after_active_reads = len(stub_gateway.executor_states)
+    stub_gateway.on_finish = [
+        entry(4, inject.ENTRY_POST, text="all quiet", messageId=RESULT_ID),
+        entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="completed",
+              source=inject.TERMINAL_SOURCE_EXECUTOR),
+    ]
     result = KubeAgentsHarness().run("watch it")
 
     assert result.output == "all quiet"
@@ -1002,12 +1013,10 @@ def test_a_task_inside_the_grace_is_still_waited_for(stub_gateway: _StubGatewayS
     stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
     stub_gateway.executor_states = ["", "", "working"]
     stub_gateway.probe_age_seconds = 0
-
-    def finish() -> None:
-        time.sleep(0.4)
-        stub_gateway.entries = completed_transcript(stub_gateway.task_id, "late but fine")
-
-    threading.Thread(target=finish, daemon=True).start()
+    # Finish only after every scripted state was read, so the run reaches the
+    # in-grace reads however slow the runner is.
+    stub_gateway.finish_after_active_reads = len(stub_gateway.executor_states)
+    stub_gateway.on_finish = completed_transcript(stub_gateway.task_id, "late but fine")[2:]
     result = KubeAgentsHarness().run("patience")
 
     assert result.output == "late but fine"
@@ -4574,3 +4583,172 @@ def test_a_cancel_settle_adopted_off_the_stream_still_carries_the_usage(
 
     assert any("did not reach a terminal state" in e for e in result.errors)
     assert (result.tokens["input"], result.tokens["output"], result.tokens["total"]) == (1500, 200, 1700)
+
+
+def test_a_profile_directive_addresses_the_opening_turn_to_that_profile(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """[bench:profile ...] sends the opening turn to the named profile with its
+    parameters (#5945), and the directive itself never reaches the agent."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run(
+        "[bench:profile name=cluster project=p1 location=us-east1 cluster=prod] what's failing in kube-system"
+    )
+
+    opening = stub_gateway.submissions[0]
+    assert opening["profile"] == "cluster"
+    assert opening["parameters"] == {"project": "p1", "location": "us-east1", "cluster": "prod"}
+    assert opening["text"] == "what's failing in kube-system"
+
+
+def test_a_profile_directive_with_intent_confirm_submits_a_structured_confirm(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """intent=confirm goes on the opening submit as the door's intent, and is
+    neither a parameter nor text the agent reads."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run("[bench:profile name=cluster intent=confirm project=p1] open the pull request")
+
+    opening = stub_gateway.submissions[0]
+    assert opening["intent"] == inject.INTENT_CONFIRM
+    assert opening["parameters"] == {"project": "p1"}
+    assert opening["text"] == "open the pull request"
+
+
+def test_a_profile_directive_without_intent_sends_no_intent(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run("[bench:profile name=cluster project=p1] look at it")
+
+    assert "intent" not in stub_gateway.submissions[0]
+
+
+def test_a_prompt_without_the_directive_sends_no_profile(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run("what's failing in kube-system")
+
+    assert "profile" not in stub_gateway.submissions[0]
+    assert "parameters" not in stub_gateway.submissions[0]
+    assert "intent" not in stub_gateway.submissions[0]
+
+
+def test_a_malformed_profile_directive_errors_and_sends_nothing(stub_gateway: _StubGatewayServer) -> None:
+    result = KubeAgentsHarness().run("[bench:profile project=p1] no name given")
+
+    assert result.errors and "name= is required" in result.errors[0]
+    assert stub_gateway.submissions == []
+
+
+def test_the_api_transport_refuses_a_profile_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the inject door can address a profile; over api the directive would
+    reach the agent as text and be graded, so the run errors instead."""
+    monkeypatch.setenv("AGENT_TRANSPORT", harness.TRANSPORT_API)
+    result = KubeAgentsHarness().run("[bench:profile name=cluster project=p1 location=l cluster=c] ask")
+    assert result.errors and "needs AGENT_TRANSPORT=inject" in result.errors[0]
+
+
+# ------------------------------------------------ the submit's intent
+
+
+def _captured_payloads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any] | None]]:
+    sent: list[tuple[str, dict[str, Any] | None]] = []
+
+    def request(url: str, timeout: float, token: str, payload: dict[str, Any] | None = None, *a: Any, **k: Any) -> Any:
+        sent.append((url, payload))
+        return {"taskId": "t-1", "conversation": "inject:c"}
+
+    monkeypatch.setattr(inject, "_request", request)
+    return sent
+
+
+def test_the_submit_carries_no_intent_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _captured_payloads(monkeypatch)
+    inject.InjectTask(base_url="http://door", conversation="c", prompt="hi", token="tok").submit()
+    (url, payload), = sent
+    assert url.endswith(inject.INJECT_PATH)
+    assert payload is not None and "intent" not in payload
+
+
+def test_the_submit_carries_the_confirm_intent_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _captured_payloads(monkeypatch)
+    task = inject.InjectTask(
+        base_url="http://door", conversation="c", prompt="open the PR", token="tok",
+        profile="cluster", parameters={"project": "p1"}, intent=inject.INTENT_CONFIRM,
+    )
+    task.submit()
+    (_, payload), = sent
+    assert payload == {
+        "conversation": "c", "author": inject.DEFAULT_AUTHOR, "text": "open the PR",
+        "profile": "cluster", "parameters": {"project": "p1"}, "intent": "confirm",
+    }
+
+
+@pytest.mark.parametrize("intent", ["cancel", "Confirm", "confirm ", "yes"])
+def test_an_intent_the_door_does_not_take_is_refused_before_anything_is_sent(
+    monkeypatch: pytest.MonkeyPatch, intent: str
+) -> None:
+    sent = _captured_payloads(monkeypatch)
+    with pytest.raises(ValueError, match="inject intent"):
+        inject.InjectTask(base_url="http://door", conversation="c", prompt="hi", token="tok", intent=intent)
+    assert sent == []
+
+
+def test_a_confirmed_tasks_cancel_carries_no_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The intent is the opening submit's alone: the cancel a stray run gets is
+    not a confirm."""
+    sent = _captured_payloads(monkeypatch)
+    task = inject.InjectTask(
+        base_url="http://door", conversation="c", prompt="open the PR", token="tok", intent=inject.INTENT_CONFIRM
+    )
+    task.submit()
+    task.cancel(settle=0)
+    cancels = [p for url, p in sent if url.endswith(inject.CANCEL_SUFFIX)]
+    assert cancels and all(p is not None and "intent" not in p for p in cancels)
+
+
+def test_a_turn_queued_at_the_session_cap_is_followed_to_its_answer(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """At the session cap the gateway queues the turn (#6882): the POST is
+    answered with the queued refusal, and the task the turn starts once a
+    worker frees lands on the same conversation, after the queued notice. The
+    harness follows it there and grades its answer, as a chat user reads it in
+    the thread, rather than calling a queued turn one that started nothing."""
+    stub_gateway.accept_submissions = False
+    stub_gateway.refusal_code = inject.REFUSAL_QUEUED
+    stub_gateway.entries = [
+        entry(1, inject.ENTRY_POST, text="⏳ **queued** — every session worker is busy", messageId="inj-q"),
+        *[{**e, "seq": e["seq"] + 1} for e in completed_transcript(stub_gateway.task_id, "PINEAPPLE")],
+    ]
+
+    result = KubeAgentsHarness().run("/session reply with PINEAPPLE")
+
+    assert not infra(result), result.errors
+    assert result.output == "PINEAPPLE"
+    assert result.metadata["task_id"] == stub_gateway.task_id
+    assert len(stub_gateway.submissions) == 1
+
+
+def test_a_queued_turn_given_up_on_is_taken_out_of_the_line(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A queued turn whose task never appears inside the harness's backstop
+    is infrastructure, and the harness takes it out of the gateway's line
+    (a cancel naming no task), or the gateway would start it later with
+    nobody watching."""
+    monkeypatch.setattr(inject, "QUEUED_START_WAIT_SECONDS", 0.5)
+    stub_gateway.accept_submissions = False
+    stub_gateway.refusal_code = inject.REFUSAL_QUEUED
+    stub_gateway.entries = [entry(1, inject.ENTRY_POST, text="⏳ **queued** — every session worker is busy", messageId="inj-q")]
+
+    result = KubeAgentsHarness().run("/session reply with PINEAPPLE")
+
+    assert infra(result)
+    assert "did not start inside the line's bound" in result.errors[0]
+    assert "took it out of the line" in result.errors[0]
+    assert len(stub_gateway.cancels) == 1
+    assert "taskId" not in stub_gateway.cancels[0]
+    assert stub_gateway.cancels[0]["messageId"].endswith(inject.LEAVE_LINE_MESSAGE_ID_SUFFIX)

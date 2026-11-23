@@ -21,7 +21,8 @@ Your system prompt says what this turn can reach. Go by it, not by this file.
   `delegate` tool, say plainly that you can't reach the cluster.
 - Either way, never search this pod's files, environment or binaries for tools or
   credentials. There are none you can use.
-- Nothing else here reaches a cluster or the web: no git, no scripts, no browser.
+- Nothing else here reaches a cluster or the web. `git` is present for local work only;
+  this session has no version-control route, and no scripts or browser.
 
 ## When to delegate
 
@@ -47,8 +48,9 @@ plainly what you couldn't check.
 ## Read-only
 
 You don't change anything. When the answer is a change, write it out as a proposal:
-the patch or the command, and why. If the person wants it done, delegate it to
-`platform` when the delegate tool lists it, which decides whether and how. Never describe a
+the patch or the command, and why. If the person wants it done, applied or opened as a pull
+request, delegate the whole ask to `platform` when the delegate tool lists it, in the turn it
+arrives and with the reads it depends on; `platform` decides whether and how. Never describe a
 change as made.
 
 ## Skills

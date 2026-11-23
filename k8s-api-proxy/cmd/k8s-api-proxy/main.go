@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -15,9 +16,12 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/client-go/rest"
 
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/certreload"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/tokenreview"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/upstream"
 )
 
@@ -25,11 +29,56 @@ const (
 	decimalBase             = 10
 	int64Bits               = 64
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
+	listenAddrEnv           = "KUBE_PROXY_LISTEN_ADDR"
+	listenAddrFlag          = "listen-addr"
+	defaultListenAddr       = ":8443"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
+	tlsCertFileEnv          = "KUBE_PROXY_TLS_CERT_FILE"
+	tlsCertFileFlag         = "tls-cert-file"
+	defaultTLSCertFile      = "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"
+	// #nosec G101 -- environment variable and mounted file path names, not credentials.
+	tlsKeyFileEnv     = "KUBE_PROXY_TLS_KEY_FILE"
+	tlsKeyFileFlag    = "tls-key-file"
+	defaultTLSKeyFile = "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"
+	modeEnv           = "KUBE_PROXY_MODE"
+	hostClusterIDEnv  = "KUBE_PROXY_HOST_CLUSTER_ID"
+	// #nosec G101 -- environment variable name, not a credential.
+	redactSecretsEnv  = "KUBE_PROXY_REDACT_SECRETS"
+	allowUpgradesEnv  = "KUBE_PROXY_ALLOW_UPGRADE_SUBRESOURCES"
+	kubeAPIServerEnv  = "CREDENTIAL_PROXY_KUBE_API_SERVER"
+	defaultKubeAPISrv = "https://kubernetes.default.svc"
+	kubeCAFileEnv     = "CREDENTIAL_PROXY_KUBE_CA_FILE"
+	defaultKubeCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	// #nosec G101 -- environment variable and mounted ServiceAccount file path names, not credentials.
+	kubeTokenFileEnv = "CREDENTIAL_PROXY_KUBE_TOKEN_FILE"
+	// #nosec G101 -- standard Kubernetes ServiceAccount mount path, not a credential.
+	defaultKubeTokenFile  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	audienceEnv           = "CREDENTIAL_PROXY_AUDIENCE"
+	defaultAudience       = "kubeagents-credential-proxy"
+	allowedCallersEnv     = "CREDENTIAL_PROXY_ALLOWED_CALLERS"
+	cacheMaxBytesEnv      = "KUBE_PROXY_CACHE_MAX_BYTES"
+	cacheMaxEntryBytesEnv = "KUBE_PROXY_CACHE_MAX_ENTRY_BYTES"
+	cacheResourceTTLEnv   = "KUBE_PROXY_CACHE_RESOURCE_TTL"
+	cacheDiscoveryTTLEnv  = "KUBE_PROXY_CACHE_DISCOVERY_TTL"
+	scopeFileEnv          = "KUBE_PROXY_SCOPE_FILE"
+	holdFileEnv           = "KUBE_PROXY_HOLD_FILE"
+	excludeHostClusterEnv = "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID"
+	wifServiceAccountEnv  = "CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT"
+	// #nosec G101 -- environment variable name, not a credential.
+	wifTokenFileEnv         = "CREDENTIAL_PROXY_WIF_TOKEN_FILE"
 	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
 	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
 	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
+	authModeEnv             = "KUBE_PROXY_AUTH_MODE"
+	authModeTokenReview     = "token-review"
+	authModeNone            = "none"
+	upstreamURLEnv          = "KUBE_PROXY_UPSTREAM_URL"
+	denyStreamingEnv        = "KUBE_PROXY_DENY_STREAMING"
+	unauthenticatedUsername = "unauthenticated"
+	binaryName              = "k8s-api-proxy"
+	// devVersion is what a build without the release's -ldflags reports.
+	devVersion = "dev"
 
 	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
 	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
@@ -48,6 +97,104 @@ const (
 	// its client reconnects to another replica.
 	serverShutdownTimeout = 10 * time.Second
 )
+
+type unauthenticatedAuthenticator struct{}
+
+func (unauthenticatedAuthenticator) AuthenticateRequest(*http.Request) (*k8sapiproxy.CallerIdentity, error) {
+	return &k8sapiproxy.CallerIdentity{Username: unauthenticatedUsername}, nil
+}
+
+type proxyConfig struct {
+	showVersion              bool
+	listenAddr               string
+	listenAddrSet            bool
+	metricsPort              int
+	tlsCertFile              string
+	tlsKeyFile               string
+	modeRaw                  string
+	authMode                 string
+	upstreamURL              string
+	denyStreaming            bool
+	hostClusterID            string
+	redactSecrets            bool
+	allowUpgradeSubresources bool
+	kubeAPIServer            string
+	kubeCAFile               string
+	kubeTokenFile            string
+	audience                 string
+	allowedCallers           string
+	sessionAudience          string
+	sessionCallers           string
+	cacheMaxBytes            int64
+	cacheMaxEntryBytes       int64
+	cacheResourceTTL         time.Duration
+	cacheDiscoveryTTL        time.Duration
+	scopeFile                string
+	holdFile                 string
+	excludeHostCluster       string
+	universeDomainRaw        string
+	containerAPIURLOverride  string
+	wifAudience              string
+	wifServiceAccount        string
+	wifTokenFile             string
+	scopedSAPool             string
+	scopedSAPoolFile         string
+	maxInFlight              int
+}
+
+func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
+	cfg.listenAddrSet = strings.TrimSpace(os.Getenv(listenAddrEnv)) != ""
+	fs.BoolVar(&cfg.showVersion, "version", false, "Print the release or commit this binary was built for and exit")
+	fs.StringVar(&cfg.listenAddr, listenAddrFlag, envOrDefault(listenAddrEnv, defaultListenAddr), "TCP address to listen on")
+	fs.IntVar(&cfg.metricsPort, metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
+	fs.StringVar(&cfg.tlsCertFile, tlsCertFileFlag, envOrDefault(tlsCertFileEnv, defaultTLSCertFile), "TLS server certificate chain PEM file, re-read when it changes; give the same path as --"+tlsKeyFileFlag+" for one PEM file holding the chain and its private key (empty for plain HTTP)")
+	fs.StringVar(&cfg.tlsKeyFile, tlsKeyFileFlag, envOrDefault(tlsKeyFileEnv, defaultTLSKeyFile), "TLS server private key PEM file, re-read when it changes; the --"+tlsCertFileFlag+" path when that file holds the key (empty for plain HTTP)")
+	fs.StringVar(&cfg.modeRaw, "mode", envOrDefault(modeEnv, string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
+	fs.StringVar(&cfg.authMode, "auth-mode", envOrDefault(authModeEnv, authModeTokenReview), "Caller authentication mode: token-review or none")
+	fs.StringVar(&cfg.upstreamURL, "upstream-url", envOrDefault(upstreamURLEnv, ""), "Static http:// or https:// upstream URL (skips cloud discovery and defaults bare paths to in-cluster)")
+	fs.BoolVar(&cfg.denyStreaming, "deny-streaming", envBoolOrDefault(denyStreamingEnv, false), "Refuse watch requests, pod log follow streams, and protocol upgrades")
+	fs.StringVar(&cfg.hostClusterID, "host-cluster-id", envOrDefault(hostClusterIDEnv, ""), "Optional gke_ cluster ID to route through the in-cluster ServiceAccount instead of Google credentials")
+	fs.BoolVar(&cfg.redactSecrets, "redact-secrets", envBoolOrDefault(redactSecretsEnv, true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
+	fs.BoolVar(&cfg.allowUpgradeSubresources, "allow-upgrade-subresources", envBoolOrDefault(allowUpgradesEnv, false), "Allow exec, attach, portforward, and proxy subresources when mode is read-write")
+	fs.StringVar(&cfg.kubeAPIServer, "kube-api-server", envOrDefault(kubeAPIServerEnv, defaultKubeAPISrv), "Host cluster Kubernetes API server URL")
+	fs.StringVar(&cfg.kubeCAFile, "kube-ca-file", envOrDefault(kubeCAFileEnv, defaultKubeCAFile), "Host cluster CA bundle PEM file")
+	fs.StringVar(&cfg.kubeTokenFile, "kube-token-file", envOrDefault(kubeTokenFileEnv, defaultKubeTokenFile), "Host cluster ServiceAccount token file")
+	fs.StringVar(&cfg.audience, "audience", envOrDefault(audienceEnv, defaultAudience), "Required TokenReview JWT audience")
+	fs.StringVar(&cfg.allowedCallers, "allowed-callers", envOrDefault(allowedCallersEnv, ""), "Comma-separated allowlist of caller ServiceAccount usernames")
+	fs.Int64Var(&cfg.cacheMaxBytes, "cache-max-bytes", envInt64OrDefault(cacheMaxBytesEnv, k8sapiproxy.DefaultCacheMaxBytes), "Maximum bytes for the in-memory response cache (0 disables caching)")
+	fs.Int64Var(&cfg.cacheMaxEntryBytes, "cache-max-entry-bytes", envInt64OrDefault(cacheMaxEntryBytesEnv, k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
+	fs.DurationVar(&cfg.cacheResourceTTL, "cache-resource-ttl", envDurationOrDefault(cacheResourceTTLEnv, k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
+	fs.StringVar(&cfg.scopeFile, "scope-file", envOrDefault(scopeFileEnv, ""), "The install's scope.json; every request to a cluster its exclude.clusters names is refused (empty excludes nothing)")
+	fs.StringVar(&cfg.holdFile, "hold-file", envOrDefault(holdFileEnv, ""), "The install's hold.json (spec.hold); every request to a cluster it holds is refused, re-read on change (empty holds nothing)")
+	fs.StringVar(&cfg.excludeHostCluster, "exclude-host-cluster-id", envOrDefault(excludeHostClusterEnv, ""), "gke_ ID of the cluster the proxy runs in, which in-cluster is checked against the exclusions as; routing is unaffected")
+	fs.StringVar(&cfg.universeDomainRaw, "universe-domain", envOrDefault(universeDomainEnv, envOrDefault(googleCloudUniverseEnv, "")), "Google Cloud API universe domain (auto-detected from GKE metadata when unset on GKE, defaulting to googleapis.com)")
+	fs.StringVar(&cfg.containerAPIURLOverride, "container-api-url", envOrDefault(containerAPIURLEnv, ""), "Optional override for the GKE Container API base URL (derived from --universe-domain when empty)")
+	fs.DurationVar(&cfg.cacheDiscoveryTTL, "cache-discovery-ttl", envDurationOrDefault(cacheDiscoveryTTLEnv, k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
+	fs.IntVar(&cfg.maxInFlight, "max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
+}
+
+func parseFlags(fs *flag.FlagSet, args []string, cfg *proxyConfig) error {
+	registerFlags(fs, cfg)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == listenAddrFlag {
+			cfg.listenAddrSet = true
+		}
+	})
+	return nil
+}
+
+func loadEnvOnlyConfig(cfg *proxyConfig) {
+	cfg.sessionAudience = os.Getenv(sessionAudienceEnv)
+	cfg.sessionCallers = os.Getenv(sessionCallersEnv)
+	cfg.wifAudience = os.Getenv(wifAudienceEnv)
+	cfg.wifServiceAccount = os.Getenv(wifServiceAccountEnv)
+	cfg.wifTokenFile = os.Getenv(wifTokenFileEnv)
+	cfg.scopedSAPool = os.Getenv(scopedPoolFlagEnv)
+	cfg.scopedSAPoolFile = envOrDefault(scopedPoolFileEnv, defaultScopedPoolFile)
+}
 
 func envOrDefault(key, fallback string) string {
 	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
@@ -157,32 +304,195 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 	return map[string][]string{aud: callers}, nil
 }
 
-func main() {
-	var (
-		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
-		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
-		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
-		tlsKeyFile               = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
-		modeRaw                  = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
-		hostClusterIDF           = flag.String("host-cluster-id", envOrDefault("KUBE_PROXY_HOST_CLUSTER_ID", ""), "Optional gke_ cluster ID to route through the in-cluster ServiceAccount instead of Google credentials")
-		redactSecrets            = flag.Bool("redact-secrets", envBoolOrDefault("KUBE_PROXY_REDACT_SECRETS", true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
-		allowUpgradeSubresources = flag.Bool("allow-upgrade-subresources", envBoolOrDefault("KUBE_PROXY_ALLOW_UPGRADE_SUBRESOURCES", false), "Allow exec, attach, portforward, and proxy subresources when mode is read-write")
-		kubeAPIServer            = flag.String("kube-api-server", envOrDefault("CREDENTIAL_PROXY_KUBE_API_SERVER", "https://kubernetes.default.svc"), "Host cluster Kubernetes API server URL")
-		kubeCAFile               = flag.String("kube-ca-file", envOrDefault("CREDENTIAL_PROXY_KUBE_CA_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"), "Host cluster CA bundle PEM file")
-		kubeTokenFile            = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
-		audience                 = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
-		allowedCallers           = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
-		cacheMaxBytes            = flag.Int64("cache-max-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", k8sapiproxy.DefaultCacheMaxBytes), "Maximum bytes for the in-memory response cache (0 disables caching)")
-		cacheMaxEntryBytes       = flag.Int64("cache-max-entry-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_ENTRY_BYTES", k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
-		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
-		scopeFile                = flag.String("scope-file", envOrDefault("KUBE_PROXY_SCOPE_FILE", ""), "The install's scope.json; every request to a cluster its exclude.clusters names is refused (empty excludes nothing)")
-		excludeHostCluster       = flag.String("exclude-host-cluster-id", envOrDefault("KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", ""), "gke_ ID of the cluster the proxy runs in, which in-cluster is checked against the exclusions as; routing is unaffected")
-		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
-		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
-	)
-	flag.Parse()
+func buildHandler(
+	ctx context.Context,
+	cfg proxyConfig,
+	mode k8sapiproxy.Mode,
+	logger *slog.Logger,
+	metrics *k8sapiproxy.Metrics,
+	tp trace.TracerProvider,
+) (http.Handler, error) {
+	if cfg.denyStreaming && cfg.allowUpgradeSubresources {
+		return nil, errors.New("--deny-streaming cannot be combined with --allow-upgrade-subresources")
+	}
 
-	mode, err := k8sapiproxy.ParseMode(*modeRaw)
+	var authn k8sapiproxy.CallerAuthenticator
+	var inCluster *rest.Config
+	switch cfg.authMode {
+	case authModeTokenReview:
+		callers, err := parseAllowedCallers(cfg.allowedCallers)
+		if err != nil {
+			return nil, err
+		}
+		inCluster = inClusterConfig(cfg.kubeAPIServer, cfg.kubeCAFile, cfg.kubeTokenFile)
+		audienceCallers, err := parseSessionAudienceCallers(cfg.sessionAudience, cfg.sessionCallers)
+		if err != nil {
+			return nil, err
+		}
+		authn, err = tokenreview.NewAuthenticator(tokenreview.Config{
+			Kubernetes:      inCluster,
+			Audience:        cfg.audience,
+			AllowedCallers:  callers,
+			AudienceCallers: audienceCallers,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize TokenReview authenticator: %w", err)
+		}
+	case authModeNone:
+		if !cfg.listenAddrSet || strings.TrimSpace(cfg.listenAddr) == "" {
+			return nil, errors.New("--" + listenAddrFlag + " (or " + listenAddrEnv + ") must be set explicitly when --auth-mode=none")
+		}
+		if strings.TrimSpace(cfg.allowedCallers) != "" {
+			return nil, errors.New("--auth-mode=none cannot be combined with --allowed-callers (or CREDENTIAL_PROXY_ALLOWED_CALLERS)")
+		}
+		if strings.TrimSpace(cfg.sessionAudience) != "" || strings.TrimSpace(cfg.sessionCallers) != "" {
+			return nil, errors.New("--auth-mode=none cannot be combined with " + sessionAudienceEnv + " or " + sessionCallersEnv)
+		}
+		logger.Warn(
+			"caller authentication is disabled; isolate the listener at the network boundary",
+			"auth_mode", authModeNone,
+			"listen_addr", cfg.listenAddr,
+			"tls_enabled", cfg.tlsCertFile != "" && cfg.tlsKeyFile != "",
+		)
+		authn = unauthenticatedAuthenticator{}
+	default:
+		return nil, fmt.Errorf("invalid --auth-mode %q: expected %q or %q", cfg.authMode, authModeTokenReview, authModeNone)
+	}
+
+	var upstreamTransport k8sapiproxy.UpstreamTransport
+	// The scoped pool does not route the host's gke_ ID in-cluster, so only the default
+	// transport makes it an alias the cache folds into in-cluster.
+	var inClusterAlias string
+	var defaultClusterID string
+	staticURL := strings.TrimSpace(cfg.upstreamURL)
+	if staticURL != "" {
+		if strings.TrimSpace(cfg.hostClusterID) != "" {
+			return nil, errors.New("--upstream-url cannot be combined with --host-cluster-id")
+		}
+		if scopedPoolEnabled(cfg.scopedSAPool) {
+			return nil, errors.New("--upstream-url cannot be combined with " + scopedPoolFlagEnv)
+		}
+		if strings.TrimSpace(cfg.containerAPIURLOverride) != "" {
+			return nil, errors.New("--upstream-url cannot be combined with --container-api-url")
+		}
+		if strings.TrimSpace(cfg.scopeFile) != "" || strings.TrimSpace(cfg.holdFile) != "" || strings.TrimSpace(cfg.excludeHostCluster) != "" {
+			return nil, errors.New("--upstream-url cannot be combined with --scope-file, --hold-file or --exclude-host-cluster-id")
+		}
+		st, err := upstream.NewStatic(upstream.StaticConfig{URL: staticURL})
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize static upstream transport: %w", err)
+		}
+		upstreamTransport = st
+		defaultClusterID = k8sapiproxy.InClusterID
+	} else {
+		if inCluster == nil {
+			inCluster = inClusterConfig(cfg.kubeAPIServer, cfg.kubeCAFile, cfg.kubeTokenFile)
+		}
+		probeMetadata := strings.HasPrefix(cfg.hostClusterID, gkeClusterIDPrefix) ||
+			strings.HasPrefix(cfg.excludeHostCluster, gkeClusterIDPrefix) ||
+			cfg.wifAudience != "" ||
+			scopedPoolEnabled(cfg.scopedSAPool)
+		resolvedUniverse, err := resolveKubeProxyUniverseDomain(ctx, cfg.universeDomainRaw, probeMetadata, "", nil)
+		if err != nil {
+			return nil, err
+		}
+		iamCredentialsURL := iamCredentialsURLForUniverse(resolvedUniverse)
+		containerAPIURL := containerAPIURLForUniverse(resolvedUniverse, cfg.containerAPIURLOverride)
+
+		gcpTokens := newGCPTokenSource(gcpTokenConfig{
+			WIFAudience:       cfg.wifAudience,
+			WIFServiceAccount: cfg.wifServiceAccount,
+			WIFTokenFile:      cfg.wifTokenFile,
+			STSURL:            stsURLForUniverse(resolvedUniverse),
+			IAMCredentialsURL: iamCredentialsURL,
+		})
+
+		if scopedPoolEnabled(cfg.scopedSAPool) {
+			members, err := loadScopedSAPool(cfg.scopedSAPoolFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load scoped service account pool: %w", err)
+			}
+			upstreamTransport, err = newScopedPoolTransport(ctx, members, gcpTokens, iamCredentialsURL, nil, inCluster, containerAPIURL)
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize scoped upstream transport: %w", err)
+			}
+		} else {
+			upstreamTransport, err = upstream.New(ctx, upstream.Config{
+				InCluster:       inCluster,
+				HostClusterID:   cfg.hostClusterID,
+				TokenSource:     gcpTokens,
+				ContainerAPIURL: containerAPIURL,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize upstream transport: %w", err)
+			}
+			inClusterAlias = cfg.hostClusterID
+		}
+	}
+
+	var cacheCfg *k8sapiproxy.CacheConfig
+	if cfg.cacheMaxBytes > 0 {
+		cacheCfg = &k8sapiproxy.CacheConfig{
+			MaxBytes:            cfg.cacheMaxBytes,
+			MaxEntryBytes:       cfg.cacheMaxEntryBytes,
+			DefaultResourceTTL:  cfg.cacheResourceTTL,
+			DefaultDiscoveryTTL: cfg.cacheDiscoveryTTL,
+			HostClusterID:       inClusterAlias,
+		}
+	}
+
+	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
+		Authenticator: authn,
+		Upstream:      upstreamTransport,
+		Policy: k8sapiproxy.Policy{
+			Mode:                     mode,
+			RedactSecrets:            cfg.redactSecrets,
+			AllowUpgradeSubresources: cfg.allowUpgradeSubresources,
+			DenyStreaming:            cfg.denyStreaming,
+		},
+		DefaultClusterID: defaultClusterID,
+		Cache:            cacheCfg,
+		Exclusions:       k8sapiproxy.NewExclusions(cfg.scopeFile, cfg.excludeHostCluster),
+		Holds:            k8sapiproxy.NewHolds(cfg.holdFile, cfg.excludeHostCluster),
+		Logger:           logger,
+		Metrics:          metrics,
+		TracerProvider:   tp,
+		MaxInFlight:      cfg.maxInFlight,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize k8s-api-proxy handler: %w", err)
+	}
+	return handler, nil
+}
+
+// version is what the binary was built for: the release (X.Y.Z) for a release archive,
+// stamped by scripts/release/build_release_binaries.sh, or the commit SHA for the
+// kube-proxy image, stamped by deploy/kube-proxy/Dockerfile from KUBE_AGENTS_VERSION, which
+// every image build passes as it does for the platform-agent image. Both use -ldflags "-X main.version=...".
+var version = devVersion
+
+// versionString is what --version prints and the startup log names.
+func versionString() string {
+	return binaryName + " " + version
+}
+
+func main() {
+	var cfg proxyConfig
+	_ = parseFlags(flag.CommandLine, os.Args[1:], &cfg)
+	if cfg.showVersion {
+		fmt.Println(versionString())
+		return
+	}
+	loadEnvOnlyConfig(&cfg)
+
+	// TLS needs both paths; either one empty serves plain HTTP. The same path for both
+	// means one PEM file holds the certificate chain and its private key.
+	certFile, keyFile := cfg.tlsCertFile, cfg.tlsKeyFile
+	if certFile == "" || keyFile == "" {
+		certFile, keyFile = "", ""
+	}
+
+	mode, err := k8sapiproxy.ParseMode(cfg.modeRaw)
 	if err != nil {
 		log.Fatalf("invalid mode: %v", err)
 	}
@@ -201,96 +511,16 @@ func main() {
 		}()
 	}
 
-	callers, err := parseAllowedCallers(*allowedCallers)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
-
-	audienceCallers, err := parseSessionAudienceCallers(os.Getenv(sessionAudienceEnv), os.Getenv(sessionCallersEnv))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
-		Kubernetes:      inCluster,
-		Audience:        *audience,
-		AllowedCallers:  callers,
-		AudienceCallers: audienceCallers,
-	})
-	if err != nil {
-		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
-	}
-
-	gcpTokens := newGCPTokenSource(gcpTokenConfig{
-		WIFAudience:       os.Getenv("CREDENTIAL_PROXY_WIF_AUDIENCE"),
-		WIFServiceAccount: os.Getenv("CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT"),
-		WIFTokenFile:      os.Getenv("CREDENTIAL_PROXY_WIF_TOKEN_FILE"),
-	})
-
-	var upstreamTransport k8sapiproxy.UpstreamTransport
-	// The scoped pool does not route the host's gke_ ID in-cluster, so only the default
-	// transport makes it an alias the cache folds into in-cluster.
-	var inClusterAlias string
-	if scopedPoolEnabled(os.Getenv(scopedPoolFlagEnv)) {
-		poolPath := envOrDefault(scopedPoolFileEnv, defaultScopedPoolFile)
-		members, err := loadScopedSAPool(poolPath)
-		if err != nil {
-			log.Fatalf("failed to load scoped service account pool: %v", err)
-		}
-		upstreamTransport, err = newScopedPoolTransport(ctx, members, gcpTokens, "", nil, inCluster, "")
-		if err != nil {
-			log.Fatalf("failed to initialize scoped upstream transport: %v", err)
-		}
-	} else {
-		upstreamTransport, err = upstream.New(ctx, upstream.Config{
-			InCluster:     inCluster,
-			HostClusterID: *hostClusterIDF,
-			TokenSource:   gcpTokens,
-		})
-		if err != nil {
-			log.Fatalf("failed to initialize upstream transport: %v", err)
-		}
-		inClusterAlias = *hostClusterIDF
-	}
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	metrics := k8sapiproxy.NewMetrics()
-	startMetricsListener(ctx, *metricsPort, metrics, logger)
-
-	var cacheCfg *k8sapiproxy.CacheConfig
-	if *cacheMaxBytes > 0 {
-		cacheCfg = &k8sapiproxy.CacheConfig{
-			MaxBytes:            *cacheMaxBytes,
-			MaxEntryBytes:       *cacheMaxEntryBytes,
-			DefaultResourceTTL:  *cacheResourceTTL,
-			DefaultDiscoveryTTL: *cacheDiscoveryTTL,
-			HostClusterID:       inClusterAlias,
-		}
-	}
-
-	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
-		Authenticator: authn,
-		Upstream:      upstreamTransport,
-		Policy: k8sapiproxy.Policy{
-			Mode:                     mode,
-			RedactSecrets:            *redactSecrets,
-			AllowUpgradeSubresources: *allowUpgradeSubresources,
-		},
-		Cache:          cacheCfg,
-		Exclusions:     k8sapiproxy.NewExclusions(*scopeFile, *excludeHostCluster),
-		Logger:         logger,
-		Metrics:        metrics,
-		TracerProvider: tp,
-		MaxInFlight:    *maxInFlight,
-	})
+	handler, err := buildHandler(ctx, cfg, mode, logger, metrics, tp)
 	if err != nil {
-		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)
+		log.Fatal(err)
 	}
+	startMetricsListener(ctx, cfg.metricsPort, metrics, logger)
 
 	srv := &http.Server{
-		Addr:              *listenAddr,
+		Addr:              cfg.listenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		TLSConfig: &tls.Config{
@@ -299,11 +529,22 @@ func main() {
 	}
 
 	listen := srv.ListenAndServe
-	if *tlsCertFile != "" && *tlsKeyFile != "" {
-		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
-		listen = func() error { return srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile) }
+	if certFile != "" {
+		serverCert, err := certreload.NewServerCertificate(certFile, keyFile, certreload.Options{
+			OnReloadError: func(err error) {
+				logger.Warn("serving the previous TLS certificate: the changed certificate or key could not be loaded", "err", err)
+				metrics.RecordCertificateReloadFailure()
+			},
+		})
+		if err != nil {
+			log.Fatalf("failed to load the TLS server certificate: %v", err)
+		}
+		srv.TLSConfig.GetCertificate = serverCert.GetCertificate
+		log.Printf("starting %s (TLS) on %s (mode=%s, authMode=%s, redactSecrets=%v, denyStreaming=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), cfg.listenAddr, mode, cfg.authMode, cfg.redactSecrets, cfg.denyStreaming, cfg.metricsPort, cfg.cacheMaxBytes)
+		// Empty file names make the server take certificates from TLSConfig.GetCertificate.
+		listen = func() error { return srv.ListenAndServeTLS("", "") }
 	} else {
-		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
+		log.Printf("starting %s (plain HTTP) on %s (mode=%s, authMode=%s, redactSecrets=%v, denyStreaming=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), cfg.listenAddr, mode, cfg.authMode, cfg.redactSecrets, cfg.denyStreaming, cfg.metricsPort, cfg.cacheMaxBytes)
 	}
 	drainErr, err := serveUntilDrained(ctx, srv, listen, serverShutdownTimeout)
 	if err != nil {
