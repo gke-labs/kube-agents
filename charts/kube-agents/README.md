@@ -1725,7 +1725,7 @@ inventory. It takes no target: it reads no cluster itself, and each cluster's
 checks run as a delegated `cluster` task. Its one parameter, `dry_run`, marks a
 shadow run. Its persona is the `persona-fleet-audit`
 image, built from `agents/fleet-audit/persona`, and its report scripts are in the
-`a2a-worker` image under `/opt/fleet-audit/scripts`. `profiles.fleetAudit.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
+`a2a-worker` image under `/opt/kube-agents/scripts/fleet-audit`. `profiles.fleetAudit.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. Its tiers are `read` and `unattended`, since a scheduled audit
 runs at `unattended`. No schedule runs on it yet.
 

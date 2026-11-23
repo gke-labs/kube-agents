@@ -1,7 +1,7 @@
 """The fleet-audit report scripts in the worker image (#5623).
 
 a2a/Dockerfile.worker copies the fleet-audit AgentProfile's report scripts into
-/opt/fleet-audit/scripts from their sources at build time, flat, so a script's
+/opt/kube-agents/scripts/fleet-audit from their sources at build time, flat, so a script's
 own directory is where Python finds the modules it imports. This holds the COPY
 to exactly that set of sources, and checks the set imports from one directory
 alone, as the image's build-time check does, without building the image.
@@ -19,7 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER_DOCKERFILE = REPO_ROOT / "a2a" / "Dockerfile.worker"
-DEST = "/opt/fleet-audit/scripts/"
+DEST = "/opt/kube-agents/scripts/fleet-audit/"
 
 # audit_report.py and the modules its finish paths import: the closure a
 # profile worker needs, and no more.
@@ -36,10 +36,10 @@ SOURCES = (
 
 
 def scripts_dir(tmp: str) -> Path:
-    """The image's own layout under tmp, <tmp>/opt/fleet-audit/scripts:
+    """The image's own layout under tmp, <tmp>/opt/kube-agents/scripts/fleet-audit:
     audit_report.py reads Path(__file__).parents[3] at import, which a
     shallow directory doesn't have."""
-    d = Path(tmp) / "opt" / "fleet-audit" / "scripts"
+    d = Path(tmp) / DEST.strip("/")
     d.mkdir(parents=True)
     return d
 
@@ -54,7 +54,28 @@ def copy_sources(dockerfile: str) -> list[str]:
     return []
 
 
+DISPATCH_GO = REPO_ROOT / "a2a" / "lib" / "dispatch.go"
+AGENTPROFILE_TYPES_GO = REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "agentprofile_types.go"
+
+
+def go_string_const(path: Path, name: str) -> str:
+    m = re.search(r"^const " + re.escape(name) + r'\s*=\s*"([^"]+)"', path.read_text(), re.M)
+    if not m:
+        raise AssertionError(f"no const {name} in {path}")
+    return m.group(1)
+
+
 class WorkerFleetAuditScriptsTest(unittest.TestCase):
+    def test_the_scripts_are_under_the_helper_script_root(self):
+        """A script row (spec.scripts[].path) may name only a path under the one
+        helper script root: lib.ScriptRoot for the dispatcher and the worker, and
+        AgentProfileScriptRoot for the CRD's validation. The scripts' directory
+        stays under both, so the two can't drift apart."""
+        for path, name in ((DISPATCH_GO, "ScriptRoot"), (AGENTPROFILE_TYPES_GO, "AgentProfileScriptRoot")):
+            root = go_string_const(path, name)
+            self.assertTrue(root.endswith("/"), f"{name} = {root!r}")
+            self.assertTrue(DEST.startswith(root), f"{DEST} is not under {name} = {root!r}")
+
     def test_the_copy_names_exactly_the_closure(self):
         self.assertEqual(sorted(copy_sources(WORKER_DOCKERFILE.read_text())), sorted(SOURCES))
 

@@ -13,10 +13,10 @@ Write `findings.json` exactly as [`references/findings-document.md`](references/
 
 ## Finishing
 
-The scripts are in the worker image, under `/opt/fleet-audit/scripts`:
+The scripts are in the worker image, under `/opt/kube-agents/scripts/fleet-audit`:
 
 ```
-python3 /opt/fleet-audit/scripts/audit_report.py finish --audit <audit id> --findings-file findings.json --dry-run
+python3 /opt/kube-agents/scripts/fleet-audit/audit_report.py finish --audit <audit id> --findings-file findings.json --dry-run
 ```
 
 - `--audit` is the stream the task's request names.

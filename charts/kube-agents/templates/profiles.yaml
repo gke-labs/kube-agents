@@ -113,7 +113,7 @@ spec:
 The fleet-audit profile (#5623, #5620): the parent of the install's fleet-wide
 scheduled audits and of onboarding's first inventory. Its persona is
 agents/fleet-audit/persona, published as the persona-fleet-audit image; its
-report scripts are in the worker image (/opt/fleet-audit/scripts). It takes no
+report scripts are in the worker image (/opt/kube-agents/scripts/fleet-audit). It takes no
 target: it runs fleet-wide, and each cluster's checks run as a delegated
 cluster task. Its one parameter, dry_run, marks a shadow run. Off by default: no schedule runs on it until the
 onboarding PR renders one. Delegation from a profile task will need the

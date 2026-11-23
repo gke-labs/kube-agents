@@ -1,7 +1,7 @@
 # persona-fleet-audit: the fleet-audit AgentProfile's persona
 # (agents/fleet-audit/persona, #5623) as a persona image, for the parent of the
 # install's fleet-wide audits. Text only: its report scripts are in the worker
-# image (/opt/fleet-audit/scripts, a2a/Dockerfile.worker).
+# image (/opt/kube-agents/scripts/fleet-audit, a2a/Dockerfile.worker).
 #
 # The operator mounts an image's /files at /persona in the profile's worker
 # pod (k8s-operator/internal/profilepod). Where the cluster can't mount image

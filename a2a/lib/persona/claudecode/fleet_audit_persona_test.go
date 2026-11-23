@@ -15,7 +15,7 @@ import (
 )
 
 // The fleet-audit persona (#5623): the parent of the install's fleet-wide
-// audits. Its report scripts are in the worker image (/opt/fleet-audit/scripts,
+// audits. Its report scripts are in the worker image (/opt/kube-agents/scripts/fleet-audit,
 // a2a/Dockerfile.worker), copied from their sources at build time, so the
 // persona carries only text.
 const fleetAuditPersonaDir = "../../../../agents/fleet-audit/persona"
