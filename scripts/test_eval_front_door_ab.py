@@ -154,6 +154,37 @@ class CompareTest(unittest.TestCase):
                 self.assertEqual(ab.main([str(a), str(b)]), 2)
             self.assertIn("run A deployed session and run B platform", err.getvalue())
 
+    def test_the_front_door_is_the_route_the_install_resolved(self) -> None:
+        """Since #6942 a deploy records the requested and the resolved route,
+        and the resolved one is what the run graded. A record from before it
+        holds the requested route alone, and no record means platform."""
+        cases = {
+            "session\n": "session",
+            "requested=session\nresolved=session\n": "session",
+            "requested=platform\nresolved=platform\n": "platform",
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, ab.FRONT_DOOR_FILE).write_text(text, encoding="utf-8")
+                self.assertEqual(ab.front_door(Path(tmp)), want)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(ab.front_door(Path(tmp)), "platform")
+
+    def test_a_run_that_resolved_another_route_is_refused(self) -> None:
+        """A session run whose install resolved platform graded platform: the
+        compare refuses it rather than read it as the session run, and one
+        whose resolved route is unknown can't say what it graded."""
+        for text, says in (
+            ("requested=session\nresolved=platform\n", "requested session but the install resolved platform"),
+            ("requested=session\nresolved=unknown\n", "was not recorded"),
+            ("requested=session\n", "was not recorded"),
+        ):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, ab.FRONT_DOOR_FILE).write_text(text, encoding="utf-8")
+                with self.assertRaises(ab.UnreadableRun) as raised:
+                    ab.front_door(Path(tmp))
+                self.assertIn(says, str(raised.exception))
+
     def test_booleans_are_not_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "case-x.json").write_text(

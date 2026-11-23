@@ -225,6 +225,15 @@ func run() int {
 		return 0
 	}
 
+	// The session's shipped persona and skills, checked against their
+	// build-time manifest before the harness first runs.
+	if dir := harnessConfigDir(); dir != "" {
+		if err := workeradapter.CheckSessionHome(dir, log); err != nil {
+			log.Error("session worker failed", "err", err)
+			return 1
+		}
+	}
+
 	res, err := workeradapter.Run(ctx, cfg)
 	if err != nil {
 		log.Error("adapter run failed", "task", cfg.TaskID, "state", string(res.State), "err", err)
@@ -541,6 +550,12 @@ func harnessCommandWithoutDelegate() []string {
 // to find.
 func harnessUserSettings() string {
 	return activeHarness.userSettings(os.Getenv)
+}
+
+// harnessConfigDir is the harness's config directory: $CLAUDE_CONFIG_DIR,
+// else ~/.claude. "" when neither is known.
+func harnessConfigDir() string {
+	return claudeConfigDir(os.Getenv)
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare

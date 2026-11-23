@@ -402,6 +402,9 @@ REQUIRED_APIS = {
     # project's RolloutSequences through the GKE Hub API; the composition
     # enables it for the same reason.
     "gkehub.googleapis.com",
+    # The seeded fleet's Config Sync on seeded-a (bench/tf/fleet/config-sync.tf),
+    # a fleet feature that needs the Config Management API.
+    "anthosconfigmanagement.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
     # The eval nightlies' Gemini Developer API key (check_gemini_api_key): the
@@ -526,6 +529,14 @@ FORGE_FINDINGS = frozenset(
 # position as the pieces: nothing on the public lanes resolves eval.internal.
 FINDING_DNS_API = "apis/dns.googleapis.com"
 LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | FORGE_FINDINGS | {FINDING_DNS_API}
+# The seeded fleet's Config Sync (bench/tf/fleet/config-sync.tf) needs these on
+# a project listed in post_merge_sync_projects, and only the reconcile reads
+# them: a leased run uses neither the Config Management API nor the
+# reconciler's gkehub grant, so a project missing them is not the pool's
+# reason for a red, and the health bot's pool-drift advice must not say it is.
+FINDING_CONFIG_MANAGEMENT_API = "apis/anthosconfigmanagement.googleapis.com"
+FINDING_FLEET_RECONCILER_GKEHUB = "iam/fleet-reconciler/missing/roles/gkehub.editor"
+LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | {FINDING_CONFIG_MANAGEMENT_API, FINDING_FLEET_RECONCILER_GKEHUB}
 
 # ─── The eval nightlies' Gemini Developer API key ────────────────────────────
 # scripts/provision_ci_pool_gemini_key.sh mints the key and keeps its string as
@@ -1104,6 +1115,9 @@ FLEET_RECONCILER_ROLES = {
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
+    # gkehub.editor: the stack registers seeded-a to the fleet and turns on Config
+    # Sync for it (config-sync.tf): gkehub.memberships.* and gkehub.features.*.
+    "roles/gkehub.editor",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/resourcemanager.projectIamAdmin",

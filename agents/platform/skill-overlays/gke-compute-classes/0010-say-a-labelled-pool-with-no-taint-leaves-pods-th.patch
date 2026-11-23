@@ -3,8 +3,7 @@ Subject: Say a labelled pool with no taint leaves Pods that name no class `Pendi
 Why: The skill said only that a manual pool needs the compute-class label and taint. It did not say what happens with the label and no taint: Pods that name no class run on the pool until its nodes fill, then stay Pending while the autoscaler does not grow the pool, with an empty `NotTriggerScaleUp` message that reads like a capacity problem. The agent needs the sign (four conditions together), the version scope as observed (seen on 1.35.8-gke.1796000, not on 1.36.4-gke.2377000, other versions not tested), and the repair (name the class by `nodeSelector` or required `nodeAffinity`, or set a default class), so that it does not report a stockout.
 Local-Issue: #2528
 Eval-Case: compute-class-untargeted-pending-probe, autoscaler-pending-generated-workloads-probe
-Upstream-Issue: none filed yet
-Retire-When: when upstream's debug reference describes this case with its version scope
+Retire-When: upstream's debug reference describes this case with its version scope
 
 diff --git a/SKILL.md b/SKILL.md
 --- a/SKILL.md
