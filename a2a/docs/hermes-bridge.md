@@ -452,7 +452,8 @@ turn) or one thread the reply carries the newest. This is how a card filed in a 
 child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
 reply never reads, and the relay carries the report across. The relay rides a human turn on every
 route; this executor frames it on the platform route (the install's default), and a conversation
-on its own session pod (the a2a-worker) does not read it yet. Then, with no relayed part (the gateway restarted
+on its own session pod (the a2a-worker) frames it the same way (`lib.FrameReport`, the frame below),
+with no lookup behind it. Then, with no relayed part (the gateway restarted
 since the post, or the post was one it does not keep), the bridge asks session-kv for the row the poster stored
 (`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's recent-reports
 index or its Google Chat first-reply recovery): first, when the submission carries a `replyTo`

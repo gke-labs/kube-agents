@@ -3440,11 +3440,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	// A human turn under a report the notify route posted carries that
 	// report, on every route (pushedReports); the replyTo part above stays
-	// its fallback. Every executor a human turn reaches reads text parts
-	// only and ignores a data part it does not know: the hermes-bridge
-	// (promptFromMessage) frames this one; the a2a-worker (textFromParts),
-	// which runs session pods and profile tasks, does not read it yet; the
-	// dispatcher reads taskParameters alone (dispatch/admission.go).
+	// its fallback. Every executor a human turn reaches ignores a data part
+	// it does not know: the hermes-bridge (attachPushedReport) and the
+	// a2a-worker (withPushedReport) frame this one ahead of the turn's text
+	// (lib.FrameReport); the dispatcher reads taskParameters alone
+	// (dispatch/admission.go).
 	// A chat thread's kept reports are forgotten once this turn is on the
 	// bus (below), not here: a publish that fails leaves them for the retry.
 	var threadReportRead uint64

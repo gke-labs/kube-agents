@@ -2141,8 +2141,8 @@ session keeps what that turn was shown, and the next turn is as likely to be abo
 or the alert the thread hangs under, as about this one; the bridge's own lookup serves it, as it did
 before); a turn naming none anywhere else carries nothing. The turn's submission gets it as a
 `pushedReport` part (`spec-a2a-payloads.md`), which the hermes-bridge frames ahead of the words on
-the platform route, the install's default; the a2a-worker, which runs session pods and profile
-tasks, reads text parts only and does not frame it yet. Process memory: a restart forgets every report, and a reply then falls back to the
+the platform route, the install's default, and the a2a-worker frames the same way on the session
+route (`lib.FrameReport`). Process memory: a restart forgets every report, and a reply then falls back to the
 executor's own lookup (`a2a/docs/hermes-bridge.md`).
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and

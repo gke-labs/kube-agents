@@ -780,8 +780,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return done(Result{State: state}, err)
 	}
 	// The kind is the ask's words, as the bridge reads them: the message's
-	// own text, before any primer.
+	// own text, before any report or primer.
 	a.askKind = askkind.Kind(prompt)
+	prompt = a.withPushedReport(origin, prompt)
 	prompt = withPrimer(plan.primer, prompt)
 
 	// The live in-subject consumer opens positioned just after the
@@ -2034,6 +2035,41 @@ func promptFromOrigin(origin *lib.Envelope) string {
 		return ""
 	}
 	return textFromParts(m.Parts)
+}
+
+// withPushedReport puts the report a reply is under ahead of the reply,
+// framed as untrusted data (lib.FrameReport), when the submission carries
+// one: the gateway attaches a pushedReport part to a human turn under a
+// report its notify route posted into the conversation, on every route.
+// The hermes-bridge frames the same part the same way (attachPushedReport);
+// this executor has no session-kv lookup to fall back on, so a turn without
+// the part, or with one the gateway would not have written
+// (lib.PushedReportOf: no text, text past lib.PushedReportTextCap, a bad
+// task id, or a second part), runs on the person's words alone, and the
+// malformed part is logged. The cap is the part's own: a longer report
+// never reaches the model, since PushedReportOf refuses it.
+//
+// The opening prompt only, as on the bridge: a steer is a correction to a
+// turn that already has the report. Not limited to session pods: the gateway
+// writes the part on human turns alone, so a profile task does not carry
+// one, and a part that did reach one would be framed as untrusted all the
+// same.
+func (a *adapter) withPushedReport(origin *lib.Envelope, prompt string) string {
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		return prompt
+	}
+	report, found, err := lib.PushedReportOf(m.Parts)
+	if err != nil {
+		a.log.Warn("pushedReport part ignored; the turn runs without the report it answers", "task", a.taskID, "err", err)
+		return prompt
+	}
+	if !found {
+		return prompt
+	}
+	a.log.Info("pushed report attached from the gateway's relay",
+		"task", a.taskID, "reportTask", report.TaskID, "bytes", len(report.Text))
+	return lib.FrameReport(report.Text, prompt)
 }
 
 func textFromParts(parts []lib.Part) string {

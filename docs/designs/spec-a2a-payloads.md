@@ -861,10 +861,12 @@ Google Chat thread key, `lib.ThreadKeyedConversation`), which names no task and 
 report kept for the thread's key, after which the gateway forgets the reports that turn read
 (`taskId` absent; `spec-chatops-gateway.md`, "Proactive posts"). The hermes-bridge (the platform route, the install's default) frames
 the text as it frames a report it looked up, untrusted and ahead of the words, and skips the lookup
-(`a2a/docs/hermes-bridge.md`). `text` is at most 64 KiB (`lib.PushedReportTextCap`), cut by the
-gateway with a note; a part with no text, text past the cap, a task id that is not a subject
-token, or a second part is ignored (`lib.PushedReportOf`) and the executor looks the report up
-instead. Only the gateway writes it; it is the gateway's own relay, not the sender's text.
+(`a2a/docs/hermes-bridge.md`); the a2a-worker (the session route) frames it the same way
+(`lib.FrameReport`) on the task's opening prompt. `text` is at most 64 KiB
+(`lib.PushedReportTextCap`), cut by the gateway with a note; a part with no text, text past the cap,
+a task id that is not a subject token, or a second part is ignored (`lib.PushedReportOf`) and the
+bridge looks the report up instead, while the worker, which has no lookup, runs the turn on the
+words alone. Only the gateway writes it; it is the gateway's own relay, not the sender's text.
 
 ### Card work after the task ends
 
