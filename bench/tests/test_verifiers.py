@@ -10246,6 +10246,20 @@ def test_worker_commands_required_run_succeeded_flag():
     assert "no worker command ran other_missing.py across 2 command(s)" in res_gap_uncredited_unrun_fail.reason
     assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_uncredited_unrun_fail.reason
 
+    # An unread card command past the shell reader's limit beside an uncredited succeeded: true run and capture gaps
+    # is inconclusive for succeeded: false runs, yielding status="error" instead of a conclusive "fail".
+    nested = "eval " * 17 + "echo x"
+    transcript.set(
+        "ok",
+        traj_other,
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}, {"task": "t_1", "command": nested}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_unread_run = v_with_unrun_fail.verify(5.0)
+    assert res_gap_unread_run.status == "error"
+    assert "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_unread_run.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_unread_run.reason
+
     # Conclusive pattern miss beside an unrun_failed succeeded: true run and capture gaps yields conclusive failure (status="fail")
     # and qualifies the failed run rather than dropping it silently.
     transcript.set(

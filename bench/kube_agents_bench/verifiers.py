@@ -3742,7 +3742,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             failed = conclusive or bool((missing or unrun_missing or unrun_failed or unrun_masked) and not partial)
         else:
             partial = bool(gaps) and bool(uncredited_succeeded)
-            conclusive = bool(hits or ran or missing or any(not r.succeeded for r in unrun_missing))
+            conclusive = bool(hits or ran or missing or (unread is None and any(not r.succeeded for r in unrun_missing)))
             failed = conclusive or bool((unrun_missing or unrun_failed or unrun_masked) and not partial)
 
         # A line past the reader's limit is a gap of the same kind for the runs, with one
