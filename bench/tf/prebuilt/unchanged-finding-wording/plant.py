@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Plant and remove the previous run of bench/tasks/fleet-audit-unchanged-finding-keeps-wording
-and of bench/tasks/fleet-audit-remediation-right-and-not-stale.
+"""Plant and remove the previous run of bench/tasks/fleet-audit-unchanged-finding-keeps-wording,
+of bench/tasks/fleet-audit-remediation-right-and-not-stale and of
+bench/tasks/fleet-audit-wrong-kept-remediation-gives-way.
 
 main.tf runs this in the container that runs `audit_report.py finish`, as
 `python3 - <mode> <scripts dir> <mark> [<remediation>]`. That container holds
@@ -33,8 +34,11 @@ go green or red for the reason it tests.
 `manual` (the default) is the marked note above. `gcloud-stale` is a marked
 `gcloud` command with a literal range, on evidence that differs from this
 run's: `finish` must not carry it, and each run of the case is then measured
-on its own words. `gcloud-same` is the same command on equal evidence, which
-`finish` carries: the negative control, run by hand.
+on its own words. `gcloud-same` is the same command on equal evidence: the
+plant of fleet-audit-wrong-kept-remediation-gives-way. `finish`
+keeps the planted title and impact, and judges the planted command by its
+content rules: a literal range where the procedure leaves the value to the
+owner gives way to this run's own remediation.
 
 teardown: removes each stored envelope of the stream, `latest.json` and the
 ring entries, that holds <mark>. A kept wording then does not stay in the
@@ -81,6 +85,12 @@ STALE_EVIDENCE_LINE = "\nprevious run: {mark}"
 # Stamp the planted envelope one week in the past so that a reader of the store
 # sees a previous weekly run, not a run that finished seconds ago.
 PLANTED_RUN_AGE = timedelta(days=7)
+# The ring keeps only the newest envelopes, by the stamp in each file's name.
+# A ring entry named for a week ago is the first one a prune drops on a store
+# that already holds that many newer runs, and a case that reads the plant
+# after the run would then find it gone. The entry is named for a minute ago:
+# newer than every earlier run, older than the run under test.
+PLANTED_RING_AGE = timedelta(minutes=1)
 STDERR_TAIL_CHARS = 500
 
 
@@ -159,12 +169,12 @@ def plant(audit_report, mark: str, scripts: str, remediation: str = MANUAL_KIND)
         print(f"{COLLECTOR} gave no candidate; nothing to plant.", file=sys.stderr)
         return 1
     repo = audit_report.resolve_repo_or_no_forge(AUDIT)
-    now = datetime.now(timezone.utc) - PLANTED_RUN_AGE
+    now = datetime.now(timezone.utc)
     envelope = audit_report.report_envelope(
         AUDIT,
         {"status": "UPDATED"},
         {"findings": findings},
-        now,
+        now - PLANTED_RUN_AGE,
         repo=repo,
         issue_number=None,
         ledger_body="",
@@ -172,7 +182,7 @@ def plant(audit_report, mark: str, scripts: str, remediation: str = MANUAL_KIND)
         resolved_ids=[],
         rendered_ids=[f["id"] for f in findings],
     )
-    audit_report.write_report(AUDIT, envelope, now)
+    audit_report.write_report(AUDIT, envelope, now - PLANTED_RING_AGE)
     stored = audit_report.reports_dir_for(AUDIT, repo) / audit_report.REPORT_LATEST_NAME
     try:
         text = stored.read_text(encoding="utf-8")

@@ -4914,6 +4914,9 @@ unit_cost_hint() {
     # Tofu too: a plant of a few kubectl execs and one drift collector run,
     # then the same full drift audit as consistency-drift-outlier. Unmeasured.
     fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
+    # The same stack and the same full drift audit, with another plant state.
+    # Unmeasured on the lane.
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 900 ;;
     # The sibling's plant plus a real scheduled drift run the stack fires and
     # waits out: a full audit on an image without the gate, a collector and a
     # precheck with it. Unmeasured; priced at the band plus the plant.
@@ -5179,6 +5182,7 @@ unit_delegation_timeout() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
@@ -5339,7 +5343,9 @@ fi
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
 #                 consistency-no-environment-label,
-#                 fleet-audit-unchanged-finding-keeps-wording, and
+#                 fleet-audit-unchanged-finding-keeps-wording,
+#                 fleet-audit-remediation-right-and-not-stale,
+#                 fleet-audit-wrong-kept-remediation-gives-way, and
 #                 fleet-audit-unread-target-keeps-finding write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,

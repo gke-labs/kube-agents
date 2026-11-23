@@ -219,11 +219,16 @@ _ENVELOPE_STARTED_KEY = "started_at"
 _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 # The store's ring of earlier envelopes, beside `latest.json`
 # (audit_report.REPORT_RUNS_DIR); a planted previous run stays there after the
-# run under test has written its own `latest.json`.
+# run under test has written its own `latest.json`, for as long as the ring,
+# which keeps the newest envelopes only, still holds it.
 _REPORT_RUNS_DIR = "runs"
+# Keys of the listing `report_store_command` prints for a `finding` block: the
+# selected findings, and how many envelopes hold the planted mark.
+_LISTED_FINDINGS_KEY = "findings"
+_LISTED_MARK_ENVELOPES_KEY = "mark_envelopes"
 # A literal IPv4 range, the thing a remediation command must not carry where
 # the SOP says the value is the owner's to give.
-_CIDR_LITERAL_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}(?!\d)")
+_CIDR_LITERAL_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?(?![\d.])")
 _SHELL_COMMENT_PREFIX = "#"
 _SHELL_TRAILING_COMMENT = " #"
 _SHELL_LINE_CONTINUATION = "\\\n"
@@ -9770,8 +9775,8 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
                 for f in findings if isinstance(f, dict)
             }}
         if {fragments!r}:
-            entry["findings"] = [
-                {{"id": str(f.get("id", "")), "recommendation": f.get("recommendation"), "remediation": f.get("remediation")}}
+            entry[{_LISTED_FINDINGS_KEY!r}] = [
+                {{"id": str(f.get("id", "")), "title": str(f.get("title", "")), "recommendation": f.get("recommendation"), "remediation": f.get("remediation")}}
                 for f in findings
                 if isinstance(f, dict) and all(part in str(f.get("id", "")) for part in {fragments!r})
             ]
@@ -9781,7 +9786,7 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
             for stored in [path, *ring]:
                 with open(stored, encoding="utf-8") as handle:
                     held += {mark!r} in handle.read()
-            entry["mark_envelopes"] = held
+            entry[{_LISTED_MARK_ENVELOPES_KEY!r}] = held
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
@@ -9878,8 +9883,10 @@ class StoredFindingCheck(BaseModel):
     opening with ``command_prefix`` must carry ``command_argument`` as a whole
     word and every flag of ``command_flags``; no command line of the note,
     whatever it opens with, may give a flag of ``no_cidr_value`` a literal
-    IPv4 range. ``forbidden_text`` must not occur
-    in the finding's ``recommendation`` or ``remediation``. ``planted_mark`` is
+    IPv4 address or range. ``forbidden_text`` must not occur
+    in the finding's ``recommendation`` or ``remediation``. ``title_contains``
+    must each occur in its ``title``: the witness that ``finish`` kept a
+    planted run's wording for this finding. ``planted_mark`` is
     the mark of a previous run the case's stack planted: when no envelope of
     the store holds it, the plant is gone and the check is an error, not a pass.
     """
@@ -9893,12 +9900,16 @@ class StoredFindingCheck(BaseModel):
     command_flags: list[str] = Field(default_factory=list)
     no_cidr_value: list[str] = Field(default_factory=list)
     forbidden_text: list[str] = Field(default_factory=list)
+    title_contains: list[str] = Field(default_factory=list)
     planted_mark: str | None = None
 
     @model_validator(mode="after")
     def _command_fields_need_a_prefix(self) -> "StoredFindingCheck":
-        if (self.command_argument or self.command_flags or self.no_cidr_value) and not self.command_prefix:
+        reads_commands = bool(self.command_argument or self.command_flags or self.no_cidr_value)
+        if reads_commands and not self.command_prefix:
             raise ValueError("command_argument, command_flags and no_cidr_value read the lines command_prefix names")
+        if self.command_prefix and not reads_commands:
+            raise ValueError("command_prefix alone asserts nothing: give command_argument, command_flags or no_cidr_value")
         return self
 
     def problems(self, finding: dict[str, Any]) -> list[str]:
@@ -9933,11 +9944,14 @@ class StoredFindingCheck(BaseModel):
                     value for argv in every_line for value in flag_values(argv, flag) or [] if _CIDR_LITERAL_RE.search(value)
                 ]
                 if literal:
-                    found.append(f"{flag} is given a literal range: {literal}")
+                    found.append(f"{flag} is given a literal address or range: {literal}")
         text = json.dumps([finding.get("recommendation"), finding.get("remediation")])
         held = [word for word in self.forbidden_text if word in text]
         if held:
             found.append(f"its recommendation or remediation holds {held}")
+        missing = [word for word in self.title_contains if word not in str(finding.get("title") or "")]
+        if missing:
+            found.append(f"its title does not hold {missing}")
         return found
 
 
@@ -10032,7 +10046,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 envelopes.extend(listing)
         if not read_any:
             return "error", "neither the sandbox nor the agent container could be read", None
-        if self.finding and self.finding.planted_mark and not any(e.get("mark_envelopes") for e in envelopes):
+        if self.finding and self.finding.planted_mark and not any(e.get(_LISTED_MARK_ENVELOPES_KEY) for e in envelopes):
             return (
                 "error",
                 f"no stored {self.audit} envelope holds {self.finding.planted_mark!r}: the previous run the "
@@ -10106,7 +10120,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
             elif unevidenced:
                 failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
-            elif self.finding and not envelope.get("findings"):
+            elif self.finding and not envelope.get(_LISTED_FINDINGS_KEY):
                 failures.append(
                     f"{envelope.get('repo')}: no finding in its document has an id containing every one of "
                     f"{self.finding.id_contains}"
@@ -10114,7 +10128,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             elif self.finding and (
                 wrong_findings := [
                     f"{finding.get('id')}: {'; '.join(problems)}"
-                    for finding in envelope["findings"]
+                    for finding in envelope[_LISTED_FINDINGS_KEY]
                     if (problems := self.finding.problems(finding))
                 ]
             ):

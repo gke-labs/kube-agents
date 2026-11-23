@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/fleet-audit-unchanged-finding-keeps-wording:
+# The scenario driver for bench/tasks/fleet-audit-unchanged-finding-keeps-wording,
+# bench/tasks/fleet-audit-remediation-right-and-not-stale and
+# bench/tasks/fleet-audit-wrong-kept-remediation-gives-way:
 # plant a previous run of the fleet-consistency-drift stream in the report store
 # of the install under test, and remove it again on destroy.
 #
@@ -23,8 +25,10 @@
 #
 # The planted run has the evidence and severity that `finish` gives each drift
 # candidate on the unchanged seeded fleet, and wording that starts with
-# var.mark. The planted envelope names no issue, so it does not change the delta
-# of the next run.
+# var.mark. var.planted_remediation chooses what the planted authorized-networks
+# finding proposes, and whether its evidence equals this run's (plant.py says
+# which state each case uses). The planted envelope names no issue, so it does
+# not change the delta of the next run.
 
 terraform {
   required_version = ">= 1.5.0"

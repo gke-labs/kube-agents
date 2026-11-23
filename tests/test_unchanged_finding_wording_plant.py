@@ -28,6 +28,7 @@ import pathlib
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -147,6 +148,48 @@ class PlantTest(unittest.TestCase):
             self.assertEqual(published, own)
             self.assertNotIn("203.0.113.0/24", published)
             self.assertNotIn(_MARK, published)
+            # The witness the case reads: the planted title is kept, so the
+            # plant matched this run's finding and the rules were asked.
+            self.assertEqual(finding["title"], f"{_MARK} authorized-networks Cluster/seeded-c")
+
+    def test_the_carry_asks_the_two_content_rules_the_cases_name(self):
+        """The cases' headers say two rules. A third rule changes what the
+        control's plant can show, and its header with it."""
+        names = [name for name, _rule in self.audit_report.CARRY_RULES]
+        self.assertEqual(names, [self.audit_report.CARRY_RULE_OTHER_CLUSTER, self.audit_report.CARRY_RULE_OWNER_VALUE])
+
+    def fill_the_ring_with_this_weeks_runs(self):
+        runs = self.store() / "runs"
+        runs.mkdir(parents=True)
+        now = datetime.now(timezone.utc)
+        for hours in range(1, self.audit_report.REPORT_HISTORY + 1):
+            stamp = (now - timedelta(hours=hours)).strftime(self.audit_report.REPORT_STAMP_FORMAT)
+            (runs / f"{stamp}.json").write_text(json.dumps({"repo": _REPO, "document": {"findings": []}}), encoding="utf-8")
+        return runs
+
+    def marked_ring_entries_after_the_run_under_test(self, runs):
+        self.assertEqual(self.run_plant(_MANIFEST, self.plant.REMEDIATION_STALE), 0)
+        # The run under test keeps nothing in this state: its envelope holds no mark.
+        own = {"repo": _REPO, "document": {"findings": []}}
+        self.assertTrue(self.audit_report.write_report(self.plant.AUDIT, own, datetime.now(timezone.utc)))
+        self.assertEqual(len(list(runs.glob("*.json"))), self.audit_report.REPORT_HISTORY)
+        return [path for path in runs.glob("*.json") if _MARK in path.read_text(encoding="utf-8")]
+
+    def test_the_plant_outlives_the_run_on_a_ring_full_of_this_weeks_runs(self):
+        """The stale case reads the plant after the run, and by then the ring
+        entry is its only copy. The ring keeps its newest entries by name."""
+        (planted,) = self.marked_ring_entries_after_the_run_under_test(self.fill_the_ring_with_this_weeks_runs())
+        # The envelope still reads as a run of a week ago.
+        finished = datetime.fromisoformat(json.loads(planted.read_text(encoding="utf-8"))["finished_at"])
+        self.assertLess(finished, datetime.now(timezone.utc) - self.plant.PLANTED_RUN_AGE + timedelta(minutes=1))
+
+    def test_a_ring_entry_named_for_a_week_ago_is_pruned_on_that_ring(self):
+        """Why the entry's name is not the envelope's time: named a week old,
+        the plant is the first entry a prune drops, and the case's check on the
+        planted mark then errors on a run that was right."""
+        runs = self.fill_the_ring_with_this_weeks_runs()
+        with mock.patch.object(self.plant, "PLANTED_RING_AGE", self.plant.PLANTED_RUN_AGE):
+            self.assertEqual(self.marked_ring_entries_after_the_run_under_test(runs), [])
 
     def test_without_the_carry_rules_the_same_evidence_plant_is_kept(self):
         """What the control case reads on a build without the rules: the
@@ -208,9 +251,12 @@ class PlantTest(unittest.TestCase):
 
 class RemediationCasesTest(unittest.TestCase):
     """The two cases that read the drift outlier's remediation in the stored
-    report: one plant state each, the same four checks, each case's own mark."""
+    report: one plant state each, the same four checks, each case's own mark,
+    and in the control the witness that its plant matched."""
 
     _TASKS = _REPO_ROOT / "bench" / "tasks"
+    _WITNESS = "the-kept-title-shows-that-the-plant-matched"
+    _STREAM = "fleet-consistency-drift"
     _CASES = {
         "fleet-audit-remediation-right-and-not-stale": "gcloud-stale",
         "fleet-audit-wrong-kept-remediation-gives-way": "gcloud-same",
@@ -252,8 +298,27 @@ class RemediationCasesTest(unittest.TestCase):
             return out
 
         stale, control = (checks(case) for case in self._CASES)
-        self.assertEqual(stale, control)
+        self.assertEqual(stale, [entry for entry in control if entry[0] != self._WITNESS])
         self.assertEqual([role for _name, role, _type, _finding in stale].count("objective"), 4)
+
+    def test_the_control_alone_has_the_witness_and_it_reads_the_same_finding(self):
+        """A plant that does not match keeps nothing, and the four checks then
+        pass with no rule asked. The kept title is what tells the two apart.
+        The stale case has no witness: its plant must not match."""
+        stale, control = (self._load(case) for case in self._CASES)
+        self.assertNotIn(self._WITNESS, [entry["name"] for entry in stale["verification_spec"]])
+        (witness,) = [entry for entry in control["verification_spec"] if entry["name"] == self._WITNESS]
+        self.assertEqual((witness["role"], witness["check"]["audit"]), ("objective", self._STREAM))
+        self.assertEqual(witness["check"]["finding"]["title_contains"], [control["infrastructure"]["variables"]["mark"]])
+        read = {tuple(entry["check"]["finding"]["id_contains"]) for entry in control["verification_spec"] if "finding" in entry["check"]}
+        self.assertEqual(len(read), 1, "the witness and the four checks read one finding")
+
+    def test_both_cases_name_the_stream_their_run_writes(self):
+        """Neither case has a ledger check, so this line is where the runner
+        learns which stream's lock, in-flight note and ledger the unit owns."""
+        for case in self._CASES:
+            with self.subTest(case=case):
+                self.assertEqual(self._load(case)["audit_streams"], [self._STREAM])
 
     def test_the_states_the_cases_ask_for_are_states_the_plant_knows(self):
         spec = importlib.util.spec_from_file_location("unchanged_finding_wording_plant_states", _PLANT)
