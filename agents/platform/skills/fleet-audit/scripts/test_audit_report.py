@@ -3784,7 +3784,7 @@ class TestAuditCatalogue(unittest.TestCase):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("eleven §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("twelve §4 facets marked _Standard cohorts only_", text)
         self.assertIn("reads as complete at eight of eight", text)
         self.assertIn("logging-components", text)
         self.assertIn("monitoring-components", text)
@@ -3826,6 +3826,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "managed-prometheus",
                 "logging-components",
                 "monitoring-components",
+                "boot-disk",
             ],
         }
         for audit_id, checks in expected_na_checks.items():

@@ -70,7 +70,7 @@ def cluster(name, project="acme", location="us-central1", autopilot=False, statu
         "nodePools": [
             {
                 "name": "default-pool",
-                "config": {"shieldedInstanceConfig": {"enableSecureBoot": True, "enableIntegrityMonitoring": True}, "imageType": "COS_CONTAINERD"},
+                "config": {"shieldedInstanceConfig": {"enableSecureBoot": True, "enableIntegrityMonitoring": True}, "imageType": "COS_CONTAINERD", "diskType": "pd-balanced", "diskSizeGb": 100},
                 "autoscaling": {"enabled": True},
             }
         ],
@@ -93,10 +93,14 @@ def cluster(name, project="acme", location="us-central1", autopilot=False, statu
     return doc
 
 
-def pool(name, *, secure_boot=True, integrity=True, autoscaling=True, image="COS_CONTAINERD", taints=None):
+def pool(name, *, secure_boot=True, integrity=True, autoscaling=True, image="COS_CONTAINERD", taints=None, disk_type="pd-balanced", disk_gb=100):
     """A node pool for the cohorts below, varying one `_pool_fraction` input
     at a time so a fleet differs on exactly the facet a test is about."""
     config = {"shieldedInstanceConfig": {"enableSecureBoot": secure_boot, "enableIntegrityMonitoring": integrity}, "imageType": image}
+    if disk_type:
+        config["diskType"] = disk_type
+    if disk_gb:
+        config["diskSizeGb"] = disk_gb
     if taints:
         config["taints"] = taints
     return {"name": name, "config": config, "autoscaling": {"enabled": autoscaling}}
@@ -621,7 +625,7 @@ class FacetNormalizeTest(unittest.TestCase):
         # a difference rather than a loss, so _flag_ne is right for them and
         # wrong everywhere else. Pin the membership so a new facet has to choose.
         bidirectional = {f.slug for f in fd.FACETS if f.should_flag is fd._flag_ne}
-        self.assertEqual(bidirectional, {"release-channel", "intra-node-visibility", "datapath-provider"})
+        self.assertEqual(bidirectional, {"release-channel", "intra-node-visibility", "datapath-provider", "boot-disk"})
 
     def test_network_policy_reads_both_engines_as_one_token(self):
         # Two tokens, not three. A Calico cluster and a Dataplane V2 cluster
@@ -1751,6 +1755,7 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         "secure-boot", "integrity-monitoring", "node-autoprovisioning", "pool-autoscaling",
         "image-type", "shielded-nodes", "datapath-provider", "intra-node-visibility",
         "managed-prometheus", "logging-components", "monitoring-components",
+        "boot-disk",
     )
 
     def manifest(self, clusters):
@@ -1862,7 +1867,7 @@ class UnvotedFacetsTest(unittest.TestCase):
     out of nineteen fell between the two.
     """
 
-    POOL_FACETS = ["image-type", "integrity-monitoring", "pool-autoscaling", "secure-boot"]
+    POOL_FACETS = ["boot-disk", "image-type", "integrity-monitoring", "pool-autoscaling", "secure-boot"]
 
     def manifest(self, clusters):
         clusters_json = json.dumps(clusters)
@@ -1991,7 +1996,7 @@ class CohortLimitationsTest(unittest.TestCase):
         lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
         text = lim[K("std-a")]
         self.assertIn("cohort standard/prod has only 1 comparable cluster", text)
-        self.assertIn("11 node-level facets uncompared", text)
+        self.assertIn("12 node-level facets uncompared", text)
         self.assertNotIn("no facet compared", text)
 
     def test_an_autopilot_cluster_short_of_node_level_peers_has_nothing_to_report(self):
@@ -2386,9 +2391,9 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         wrong about -- and an operator who checks finds the finding contradicted
         by the same ledger's coverage column."""
         excerpt = self.check(self._straddling_shape())[1][K("std-0")][0]["excerpt"]
-        self.assertIn("11 facets keyed `(mode, environment)` compare nothing", excerpt)
+        self.assertIn("12 facets keyed `(mode, environment)` compare nothing", excerpt)
         self.assertIn("the other 8 reach a baseline", excerpt)
-        self.assertNotIn("all 19 comparative checks", excerpt)
+        self.assertNotIn("all 20 comparative checks", excerpt)
 
     def test_the_peers_named_are_the_ones_at_this_clusters_mode(self):
         """Where the gap is node-level, the floor being described is the
@@ -2502,6 +2507,144 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         spec = audit_report.AUDITS["fleet-consistency-drift"]
         self.assertIn(fd.UNLABELLED_SLUG, spec.checks)
         self.assertEqual(len(spec.checks), len(fd.FACETS) + 1)
+
+
+class BootDiskPoolVoteTest(unittest.TestCase):
+    """§4.15: node pools vote on boot-disk type and size, inside the cluster
+    cohort, and the outlier is filed on the pool."""
+
+    @staticmethod
+    def seeded_fleet():
+        """The eval fleet's shape: four Standard clusters, ten pools, nine on
+        20 GB and one cluster's only pool on 50 GB."""
+        def pools(*names, gb=20):
+            return [pool(name, disk_gb=gb) for name in names]
+
+        return [
+            cluster("a", nodePools=pools("default-pool", "idle-batch-pool", "pinned-inference-pool", "declared-zonal-pool", "missing-reservation-pool")),
+            cluster("b", nodePools=pools("default-pool", "no-surge-pool")),
+            cluster("c", nodePools=pools("default-pool", gb=50)),
+            cluster("d", nodePools=pools("default-pool", "second-zone-pool")),
+        ]
+
+    @staticmethod
+    def boot_disk(candidates, name):
+        return [f for f in candidates[K(name)] if f["check"] == "boot-disk"]
+
+    def test_the_token_is_type_and_size(self):
+        self.assertEqual(fd.pool_boot_disk(pool("p", disk_type="pd-standard", disk_gb=100)), "pd-standard/100")
+
+    def test_a_pool_missing_either_half_holds_no_token(self):
+        self.assertIsNone(fd.pool_boot_disk(pool("p", disk_type=None)))
+        self.assertIsNone(fd.pool_boot_disk(pool("p", disk_gb=None)))
+        self.assertIsNone(fd.pool_boot_disk({"name": "p"}))
+
+    def test_the_odd_pool_is_filed_on_the_pool_at_base_severity(self):
+        # Nine of ten pools agree: r = 0.90, k = 1, no rung of the ladder.
+        _, candidates = fd.compute_drift(self.seeded_fleet(), now=NOW)
+        (finding,) = self.boot_disk(candidates, "c")
+        self.assertEqual(finding["object"], "NodePool/default-pool")
+        self.assertEqual(finding["namespace"], "")
+        self.assertEqual(finding["severity"], "major")
+        self.assertIn("=pd-balanced/20 in 9/10 node pools of cohort standard/prod", finding["excerpt"])
+        self.assertIn("observed: pd-balanced/50", finding["excerpt"])
+        self.assertIn("(base major, none)", finding["excerpt"])
+        for name in "abd":
+            self.assertEqual(self.boot_disk(candidates, name), [])
+
+    def test_a_cluster_vote_would_have_dropped_the_same_fleet(self):
+        """Why pools vote. The four clusters split three to one, r = 0.75, two
+        rungs down from `major`, so no cluster-level facet below `critical`
+        files anything on this fleet."""
+        self.assertEqual(fd.apply_severity_ladder("major", 3 / 4, 1, False)[0], None)
+
+    def test_the_peers_line_names_pools_that_hold_the_baseline(self):
+        _, candidates = fd.compute_drift(self.seeded_fleet(), now=NOW)
+        peers = next(line for line in self.boot_disk(candidates, "c")[0]["excerpt"].splitlines() if line.startswith("peers: "))
+        # Bare names here: `collect_fleet` qualifies them before the vote.
+        self.assertIn("a/default-pool", peers)
+        self.assertNotIn("c/default-pool", peers)
+        self.assertIn("+3 more", peers)
+
+    def test_every_cluster_with_a_voting_pool_ran_the_check(self):
+        checks_run, _ = fd.compute_drift(self.seeded_fleet(), now=NOW)
+        for name in "abcd":
+            self.assertEqual(checks_run[K(name)].count("boot-disk"), 1)
+
+    def test_one_odd_pool_among_a_clusters_pools_is_the_only_one_filed(self):
+        fleet = self.seeded_fleet()
+        fleet[2]["nodePools"] = [pool("default-pool", disk_gb=20)]
+        fleet[0]["nodePools"][3] = pool("declared-zonal-pool", disk_type="pd-ssd", disk_gb=20)
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual([f["object"] for f in self.boot_disk(candidates, "a")], ["NodePool/declared-zonal-pool"])
+        self.assertIn("observed: pd-ssd/20", self.boot_disk(candidates, "a")[0]["excerpt"])
+
+    def test_a_shape_three_pools_share_is_a_pool_role_and_not_drift(self):
+        """Three data pools on a larger disk, one per cluster, among nine
+        pools: r = 0.67 and k = 3, three rungs, so the ladder drops them. A
+        role that recurs is §3.5's undeclared cohort, not an outlier."""
+        fleet = [cluster(f"c{i}", nodePools=[pool("system"), pool("app"), pool("data", disk_gb=500)]) for i in range(3)]
+        checks_run, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertIn("boot-disk", checks_run[K("c0")])
+        for i in range(3):
+            self.assertEqual(self.boot_disk(candidates, f"c{i}"), [])
+
+    def test_a_windows_pool_does_not_vote(self):
+        fleet = self.seeded_fleet()
+        fleet[2]["nodePools"] = [pool("default-pool", disk_gb=20), pool("win", image="WINDOWS_LTSC_CONTAINERD", disk_gb=200)]
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual(self.boot_disk(candidates, "c"), [])
+        self.assertEqual(len(fd.facet_tokens(fd.FACETS_BY_SLUG["boot-disk"], fleet)), 10)
+
+    def test_a_pool_with_no_readable_disk_does_not_vote_and_is_not_an_outlier(self):
+        fleet = self.seeded_fleet()
+        fleet[1]["nodePools"].append(pool("unread", disk_gb=None))
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual(self.boot_disk(candidates, "b"), [])
+        self.assertIn("in 9/10 node pools", self.boot_disk(candidates, "c")[0]["excerpt"])
+
+    def test_many_odd_pools_on_one_cluster_count_as_one_facet_for_the_split_guard(self):
+        """§3.6 counts facets, not findings: six odd pools are one facet."""
+        fleet = [cluster(f"c{i}", nodePools=[pool(f"p{j}") for j in range(3)]) for i in range(18)]
+        fleet.append(cluster("odd", nodePools=[pool(f"p{j}", disk_gb=50) for j in range(fd.SPLIT_CLUSTER_FACETS)]))
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual([f["check"] for f in candidates[K("odd")]], ["boot-disk"] * fd.SPLIT_CLUSTER_FACETS)
+
+    def manifest(self, clusters):
+        clusters_json = json.dumps(clusters)
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        return {c["name"]: c for c in collected(run, now=NOW)["clusters"]}
+
+    def test_a_cluster_whose_pools_are_all_unreadable_says_so_in_limitations(self):
+        fleet = self.seeded_fleet()
+        fleet[1]["nodePools"] = [pool("default-pool", disk_gb=None)]
+        entry = self.manifest(fleet)[T("b")]
+        self.assertNotIn("boot-disk", {c["check"] for c in entry["commands"]})
+        self.assertIn("held no readable value", entry["limitations"])
+        self.assertIn("`boot-disk`", entry["limitations"])
+
+    def test_pools_with_no_majority_shape_reach_no_baseline_and_say_so(self):
+        fleet = [cluster(f"c{i}", nodePools=[pool("p", disk_gb=gb)]) for i, gb in enumerate((20, 50, 100, 200))]
+        entries = self.manifest(fleet)
+        entry = entries[T("c0")]
+        self.assertEqual([f for f in entry["candidates"] if f["check"] == "boot-disk"], [])
+        self.assertIn("reached no baseline", entry["limitations"])
+        self.assertIn("`boot-disk` (4 readable value(s), commonest on 1)", entry["limitations"])
+
+    def test_the_finding_id_names_the_cluster_and_the_pool(self):
+        import audit_report
+
+        entry = self.manifest(self.seeded_fleet())[T("c")]
+        (finding,) = [f for f in entry["candidates"] if f["check"] == "boot-disk"]
+        fid = audit_report.derive_finding_id({**finding, "cluster": entry["name"]})
+        self.assertTrue(fid.startswith("boot-disk."), fid)
+        self.assertIn("nodepool-default-pool", fid)
+        self.assertIn("acme-us-central1-c", fid)
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):

@@ -9,7 +9,7 @@
 # nineteen checks are majority votes, so a cluster with too few peers is
 # compared on nothing -- and an unlabelled cluster has no peers by
 # construction, because §2.3 keys the eight configurable facets on
-# (environment) and the eleven node-level ones on (mode, environment) and
+# (environment) and the twelve node-level ones on (mode, environment) and
 # merges `unknown` into no named cohort under either. The collector
 # (skills/fleet-audit/scripts/fleet_drift.py) turns that permanent coverage
 # gap into a finding naming the label to set.
