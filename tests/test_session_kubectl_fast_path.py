@@ -228,7 +228,8 @@ class FastPathParityTest(unittest.TestCase):
         # Each case arm of plain flags, a bracket of short flags (-[olnLcsv]) included, with its body
         # up to `;;`. An arm whose body sets skip=1 takes a value, whatever else it sets; an empty
         # body is a switch. Arms with a glob (--*=*, -f?*) match no flag here.
-        arms = re.findall(r"((?:-[-\w\[\]]+(?:\s*\|\s*\\?\s*)?)+)\)((?:(?!;;).)*);;", body, re.S)
+        # One character class, no nested repetition (linear time): the arm's pattern list, then its body.
+        arms = re.findall(r"(-[-\w\[\]|\\\s]*)\)([^;]*(?:;(?!;)[^;]*)*);;", body)
 
         def flags(names: str) -> set[str]:
             found = set()
