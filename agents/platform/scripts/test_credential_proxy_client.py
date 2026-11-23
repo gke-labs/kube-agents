@@ -4922,17 +4922,11 @@ class WriteRefusalRecordTest(unittest.TestCase):
         self.assertEqual([], self.records())
         self.assertNotIn("not recorded", stderr.getvalue())
 
-    def test_a_version_control_write_refusal_appends_a_record(self):
-        refusal = {"status": "blocked", "error": "no permit", "code": "CALLER_PERMIT_REQUIRED",
-                   "rule": "caller.vcs-permit", "write_refusal": True}
-        with self.environ(), self._answer(403, refusal):
-            with self.assertRaises(credential_proxy_client.WorkspaceRequestError):
-                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
-        record = self.records()[0]
-        self.assertEqual(("caller.vcs-permit", "publish", "/v1/vcs/publish"), (record["rule"], record["verb"], record["route"]))
-
-    def test_no_record_for_another_version_control_refusal(self):
+    def test_a_version_control_refusal_is_never_recorded(self):
+        # Even one carrying the mark: the permit refusal's answer is the patch
+        # the version-control skill gives, so it must not stop the task.
         cases = (
+            (403, {"error": "no permit", "code": "CALLER_PERMIT_REQUIRED", "rule": "caller.vcs-permit", "write_refusal": True}),
             (403, {"error": "no credential", "code": "CALLER_PERMIT_REQUIRED", "rule": "caller.vcs-permit", "write_refusal": False}),
             (403, {"error": "explain-only", "code": "WRITE_MODE_NONE", "rule": "vcs.write-mode"}),
             (409, {"error": "the base branch moved", "code": "BASE_MOVED", "write_refusal": True}),
