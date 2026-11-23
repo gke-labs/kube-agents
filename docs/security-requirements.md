@@ -95,7 +95,7 @@ The broker authenticates every caller. A caller presents an audience-bound proje
 token (one hour; the audience is per pod: `kubeagents-credential-proxy` for the sandbox,
 `kubeagents-credential-proxy-chat` for the gateway, `kubeagents-credential-proxy-watcher` for the
 watchers in the gateway Pod's `agent-api-auth` container, `kubeagents-credential-proxy-a2a-chat` for
-the A2A gateway when it consumes Google Chat, `kubeagents-credential-proxy-a2a-reports` for the A2A gateway on every install, and, under the operator's
+the A2A gateway when it consumes Google Chat, `kubeagents-credential-proxy-a2a-reports` for the A2A gateway on every install, `kubeagents-credential-proxy-mcp` for the A2A MCP server's pod unless `A2A_MCP_DOOR=false` (while the `PlatformAgent` controls its ServiceAccount), and, under the operator's
 `A2A_SESSION_CLUSTER_VIEW` flag, `kubeagents-credential-proxy-session` for the session pods,
 bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next) describes,
 and, with an `AgentProfile` bound, `kubeagents-credential-proxy-profile`
@@ -118,8 +118,9 @@ NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometh
 collector runs, and to the operator's own pods, selected by namespace and pod label, which
 read the counters into the `PlatformAgent`'s `status.usage`; both are readers of counters, and
 no other peer reaches it by selector; the site's security reference states the one residual above one replica, a shape the operator does not render today ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
-allowlist names the gateway's ServiceAccount and the sandbox's (and, under that flag, the
-session pods') and does not vary on which one
+allowlist names the gateway's ServiceAccount, the sandbox's, the A2A gateway's, and (unless
+`A2A_MCP_DOOR=false` or unowned) the MCP server's (plus, under their conditions, the session
+pods', profile tiers', and scope publisher's) and does not vary on which one
 presented the token (the audience and the route table it feeds do), so the allowlist is a
 multi-tenancy control rather than an agent-containment one.
 The token crosses the cluster network in cleartext. And the sandbox holds that token, so it holds a

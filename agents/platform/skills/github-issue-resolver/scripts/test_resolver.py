@@ -935,6 +935,17 @@ class UntrackedRepositoryTest(ResolverTest):
         self.assertEqual(payload["untracked_repos"], ["ws/infra"])
         self.assertIn("with an issue tracker", payload["error"])
 
+    def test_a_refusal_code_that_is_not_a_text_reads_as_no_code_and_ends_in_no_traceback(self):
+        """The sweep and the poll look the refusal's code up in a set, and a list cannot enter
+        one: the lookup raised TypeError. `vcs_client.VcsError` keeps a code only when it is a
+        text, so the refusal reads as one with no code, which is this side's BROKER_UNREACHABLE."""
+        for code in (["FORGE_UNSUPPORTED"], {"name": "LABELS_UNSUPPORTED"}):
+            with self.subTest(code=code):
+                payload, exit_code = self.poll(forge=FakeForge(refuse={"a/one": code}), repos=("a/one",))
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(payload["unreachable_repos"], ["a/one"])
+                self.assertIn(f"resolver: a/one: {resolver.BROKER_UNREACHABLE}:", self.stderr)
+
     def test_a_repository_with_no_tracker_is_named_and_not_refused(self):
         forge = NoIssueTrackerForge(
             {"ws/infra"}, issues={"acme/toolkit": [issue(12, title="work", body="d")]}

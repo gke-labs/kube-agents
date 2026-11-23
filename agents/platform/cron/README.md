@@ -469,7 +469,12 @@ the clusters after that point wait for a later run. A call that fails costs
 only its own clusters. Every cluster in a call is stamped in the ledger
 (`cluster_runs`) however the call ended; the least recently stamped go first,
 and clusters stamped together are shuffled by the run's date so batch
-membership changes from run to run. Projects go least recently swept first
+membership changes from run to run. On a tick that swept at least one target,
+`cluster_runs` entries for clusters outside the current sweep's targets
+(`LEEWAY_WATCH_CLUSTERS` or the target projects) whose timestamp is unparseable
+or older than twice the refresh window (`2 * LEEWAY_WATCH_REFRESH_DAYS`) are
+dropped so clusters removed from `LEEWAY_WATCH_CLUSTERS` or from projects that
+leave the scope do not accumulate. Projects go least recently swept first
 (`project_runs`): a project whose turn starts with a full 15 minutes is
 stamped then and rotates behind the others, so a project too big for one tick
 is covered over the next ticks without starving the rest. A project's turn
@@ -512,30 +517,42 @@ retires once that list was read.
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
 findings bypass the drift floor so single-zone node-pool confinement still
-alerts once per refresh window; `LEEWAY_WATCH_MIN_SEVERITY`,
+alerts once per refresh window. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
-`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
-runs started by hand in the pod with `--dry-run` (the operator's
-`spec.deployment.env` allowlist does not carry them). The report's
+`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` set the
+scheduled sweep's alert thresholds and re-post interval from the `PlatformAgent` CR's
+`spec.deployment.env` (the operator's allowlist carries them), and also work
+on runs started by hand in the pod with `--dry-run`. `LEEWAY_WATCH_CLUSTERS`,
+`LEEWAY_WATCH_PROJECTS` and `LEEWAY_WATCH_HOME` are not carried, so they apply
+only to runs started by hand. The report's
 topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
 `leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
 key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
 `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
 by cluster, class, judging rule and kind. A finding earns a report under
 `<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
-`latest.md` and `latest.json` symlinks) and a chat summary line naming up to
-six due subjects with their cause and share when it first appears, when its
-`suspectedCause` (a rank finding's `rule`) changes or its `severity` escalates,
-or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
-of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
-clusters are retired with a single resolution line, while clusters whose scan
-failed or that were not reached retain their ledger entries so transient
-errors do not erase state and re-page tomorrow. A run with a finding due
-writes and publishes its own report, partial or not. The JSON report carries
-a `coverage` block: `clusters_swept`, `clusters_read`, and the projects
-`not_reached` or with `scan_errors` this run (each with its summary), since
-`summary` counts only the clusters read; a cluster missing from a partial
-report is unread, not clean. Every other rewrite of
+`latest.md` and `latest.json` symlinks) and a place in one chat message when
+it first appears, when its `suspectedCause` (a rank finding's `rule`) changes
+or its `severity` escalates, or when its 7-day refresh window
+(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. The
+message opens with a bold headline ("**2 pod placement problems on 2 clusters
+(1 new, 1 still open)**"), names up to three of them, most severe first, by
+workload, zone, compute class or node pool (named as one) and cluster, with
+leeway's cause in plain words (`CAUSE_PHRASES` in the script) and a share
+where there is one (a workload's pods or a node pool's nodes in one zone, a
+compute class's time on its last machine choice), adds "and N more" past that, and ends by pointing at the agent for
+fixes and with the date its findings are next posted if still open.
+The report's path on the pod is left out, since a chat reader cannot open it.
+Resolved findings on cleanly scanned (`status: "ok"`) clusters are retired
+under their own headline in the same post ("**1 pod placement problem has
+cleared**", then up to three names), while clusters whose scan failed or that
+were not reached retain their ledger entries so transient errors do not erase
+state and re-page tomorrow. Lines about the scan itself follow the headlines. A run
+with a finding due writes and publishes its own report, partial or not. The
+JSON report carries a `coverage` block: `clusters_swept`, `clusters_read`, and
+the projects `not_reached` or with `scan_errors` this run (each with its
+summary), since `summary` counts only the clusters read; a cluster missing
+from a partial report is unread, not clean. Every other rewrite of
 `latest.*` waits for a run that reads every project in full without a
 failure: the refresh after findings retire, a refresh deferred from an
 earlier run, and the one after a threshold override changes. A failed project
@@ -1215,7 +1232,7 @@ tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_ga
 
 - `"low"`: Read-only governance watchdogs, audits, and internal scheduler plumbing. Runs under
   the configured `cron_mode` (typically `approve`), protected by the denylist floor (hardline +
-  `approvals.deny` + Tirith POSIX shell content scan), terminal escape rejection, lookalike TLD
+  `approvals.deny`), terminal escape rejection, lookalike TLD
   blocks, and `execute_code` blocks.
 - `"high"`: Workloads with broad operational authority or untrusted input sources (such as
   `github-repo-watcher`), as well as unannotated dispatches. For agentic (prompt-driven) jobs,

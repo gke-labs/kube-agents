@@ -39,6 +39,9 @@ func TestStartMetrics_ServesTheRegistryAndHealthz(t *testing.T) {
 	if !strings.Contains(body, want) {
 		t.Errorf("/metrics does not carry %q:\n%s", want, body)
 	}
+	if !strings.Contains(body, watchSetReadyMetric+" 0") {
+		t.Errorf("/metrics does not start %s at 0:\n%s", watchSetReadyMetric, body)
+	}
 	if got := httpGet(t, base+"/healthz"); got != "ok\n" {
 		t.Errorf("/healthz = %q, want ok", got)
 	}
@@ -225,5 +228,60 @@ func TestRealMain_LogsTheMetricsAddressItOpened(t *testing.T) {
 	}
 	if got := logs.String(); !strings.Contains(got, "/metrics listening on 127.0.0.1:") {
 		t.Errorf("log does not name the address the listener opened:\n%s", got)
+	}
+}
+
+// publishWatchSet holds watchSetMu so no concurrent Gather observes
+// watch_set_ready=1 while initial cluster_up series are missing or partial.
+func TestPublishWatchSet_AtomicWithConcurrentGather(t *testing.T) {
+	const clusterCount = 16
+	clusters := make([]targetCluster, 0, clusterCount)
+	for i := range clusterCount {
+		clusters = append(clusters, targetCluster{
+			Name:      "c" + strconv.Itoa(i),
+			ProjectID: "p",
+			Location:  "us-central1",
+		})
+	}
+
+	for range 32 {
+		m := newMetrics()
+		start := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			<-start
+			m.publishWatchSet(clusters)
+		}()
+		close(start)
+
+		for {
+			families, err := m.registry.Gather()
+			if err != nil {
+				t.Fatalf("Gather: %v", err)
+			}
+			var readyVal float64
+			var clusterUpCount int
+			for _, fam := range families {
+				switch fam.GetName() {
+				case watchSetReadyMetric:
+					if len(fam.GetMetric()) > 0 {
+						readyVal = fam.GetMetric()[0].GetGauge().GetValue()
+					}
+				case "k8s_event_watcher_cluster_up":
+					clusterUpCount = len(fam.GetMetric())
+				}
+			}
+			if readyVal == 0 && clusterUpCount != 0 {
+				t.Fatalf("observed cluster_up count=%d while watch_set_ready=0", clusterUpCount)
+			}
+			if readyVal == 1 {
+				if clusterUpCount != clusterCount {
+					t.Fatalf("observed watch_set_ready=1 with %d cluster_up series, want %d", clusterUpCount, clusterCount)
+				}
+				break
+			}
+		}
+		<-done
 	}
 }

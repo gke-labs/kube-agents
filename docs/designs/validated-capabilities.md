@@ -29,7 +29,7 @@ commits no customer installs. This document separates the two.
   that cannot survive maintenance"). Rows are typed by hand; everything else is computed.
 - **Scenario.** One bench case under `bench/tasks/<id>/` with `suite: validated-capabilities` in its
   `task.yaml`, graded by deterministic checks on the product's own artifacts (the audit ledger,
-  the pull request, the chat answer). A row has one or more scenarios as its tests.
+  the pull request, the chat answer, the incident ledger). A row has one or more scenarios as its tests.
 - **Roster.** The task files: a scenario is on the lane when its task file carries the bare line
   `suite: validated-capabilities`, in the section its `suite_part: N` line names (none is part 1),
   with the row it grades in the task file's header comment.

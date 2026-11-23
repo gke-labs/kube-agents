@@ -67,6 +67,14 @@ GCHAT_HOME_FILE_KEY = "gchat_home"
 HOME_FILE_KEYS = (HOME_FILE_KEY, GCHAT_HOME_FILE_KEY)
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
+#: The Teams platform name. A Teams conversation id is "<kind>:<body>"
+#: ("19:…" for a channel, group or meeting chat, "a:…" for a personal chat),
+#: so it carries the one ":" the <platform>:<chat>:<thread> target splits on,
+#: and a Teams thread is the last TEAMS_ID_SEGMENTS segments of a target,
+#: whatever a builder put before them (the chat id, which for Teams is the
+#: thread's own conversation, or nothing).
+TEAMS_PLATFORM = "teams"
+TEAMS_ID_SEGMENTS = 2
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
 # bus URL and an identity, A2A_BUS_USER or the older NATS_USER.
 BUS_URL_ENV = "NATS_URL"
@@ -326,7 +334,13 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
         if json_output:
             argv.append("--json")
         return argv + ["--to", target, message]
-    chat, _, thread = rest.partition(":")
+    if platform == TEAMS_PLATFORM:
+        # "teams:<conversation>:<conversation;messageid=…>" or "teams:<conversation>":
+        # the thread is the trailing id; a bare conversation is a home post.
+        segments = rest.split(":") if rest else []
+        chat, thread = "", (":".join(segments[-TEAMS_ID_SEGMENTS:]) if len(segments) > TEAMS_ID_SEGMENTS else "")
+    else:
+        chat, _, thread = rest.partition(":")
     argv = [A2A_CLI, "notify", "--platform", platform]
     if wait_seconds is not None:
         argv += ["--timeout", f"{max(1, int(wait_seconds))}s"]

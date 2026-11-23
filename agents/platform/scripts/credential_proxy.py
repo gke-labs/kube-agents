@@ -680,6 +680,19 @@ GCE_METADATA_FLAVOR_HEADER = "Metadata-Flavor"
 GCE_METADATA_FLAVOR_VALUE = "Google"
 GCE_METADATA_TIMEOUT_SECONDS = 0.5
 GCE_METADATA_MAX_BYTES = 512
+# The start check of a universe domain that the environment names, against the
+# metadata server's answer. No answer (a timeout, a connection error, a status
+# other than 200 and 404) is tried up to this many times in total, with this
+# pause between tries: at most about 15 seconds, which is longer than a
+# metadata server takes to answer a pod that has just started.
+UNIVERSE_CHECK_ATTEMPTS = 10
+UNIVERSE_CHECK_PAUSE_SECONDS = 1.0
+# What the broker does when the metadata server gives no answer in every try:
+# True starts with the value unchecked and says so in one WARNING record, False
+# does not start. A host with no metadata server, such as a harness on kind,
+# never gets an answer, so False stops it. The decision is here and nowhere
+# else.
+UNIVERSE_CHECK_UNANSWERED_STARTS = True
 _METADATA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _CACHED_METADATA_UNIVERSE_DOMAIN: str | None = None
 _METADATA_UNIVERSE_LOCK = threading.Lock()
@@ -836,6 +849,10 @@ WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
 # rather than relayed in part.
 WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
+WATCHER_K8S_TIMEOUT_CODE = "UPSTREAM_TIMEOUT"
+WATCHER_K8S_TIMEOUT_ERROR = "the API server did not answer within the relay deadline"
+WATCHER_K8S_UNRELAYABLE_CODE = "UPSTREAM_UNRELAYABLE"
+WATCHER_K8S_UNRELAYABLE_ERROR = "the upstream answer could not be relayed"
 # The header the shim's get-credentials check sends on its one relay read
 # (credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, held equal by a test).
 # It only narrows: with it, a clusters-get for a cluster that
@@ -1261,6 +1278,18 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 VCS_PROVIDER_LABEL = "provider"
 VCS_PROVIDER_NONE = "none"
+DECISION_MEMORY_CHECKS_METRIC = "kubeagents_credential_proxy_decision_memory_checks_total"
+DECISION_MEMORY_VERDICT_LABEL = "verdict"
+DECISION_MEMORY_VERDICT_ALLOW = "allow"
+DECISION_MEMORY_VERDICT_WARN = "warn"
+DECISION_MEMORY_VERDICT_BLOCK = "block"
+DECISION_MEMORY_VERDICT_ERROR = "error"
+DECISION_MEMORY_VERDICTS = frozenset({
+    DECISION_MEMORY_VERDICT_ALLOW,
+    DECISION_MEMORY_VERDICT_WARN,
+    DECISION_MEMORY_VERDICT_BLOCK,
+    DECISION_MEMORY_VERDICT_ERROR,
+})
 # The one-time claim token minted with each `proposal-create` answer, under
 # CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
 # (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
@@ -1540,6 +1569,41 @@ LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 LOG_MSEC_FORMAT = "%s.%03dZ"
 
 
+def probe_gce_universe_domain_answer(
+    metadata_url: str = GCE_UNIVERSE_METADATA_URL,
+    timeout: float = GCE_METADATA_TIMEOUT_SECONDS,
+    opener: Any = None,
+) -> tuple[str | None, bool]:
+    """Ask the GCE/GKE metadata server for the universe domain: `(domain, answered)`.
+
+    `(domain, True)` for an HTTP 200 with a valid universe domain. `(None, True)`
+    for an HTTP 404: the host has no universe route (not GCE, or an older
+    emulator), which is an answer with nothing in it. `(None, False)` for no
+    answer: a timeout, a connection error, any other status, or a body that
+    is not a valid universe domain.
+    """
+    request = urllib.request.Request(
+        metadata_url,
+        headers={GCE_METADATA_FLAVOR_HEADER: GCE_METADATA_FLAVOR_VALUE},
+        method="GET",
+    )
+    active_opener = _METADATA_OPENER if opener is None else opener
+    try:
+        with active_opener.open(request, timeout=timeout) as response:
+            if response.status == HTTPStatus.NOT_FOUND:
+                return None, True
+            if response.status != HTTPStatus.OK:
+                return None, False
+            raw = response.read(GCE_METADATA_MAX_BYTES).decode("utf-8", "replace").strip()
+            if not raw:
+                return None, False
+            return credential_proxy_client.normalize_universe_domain(raw), True
+    except urllib.error.HTTPError as exc:
+        return None, exc.code == HTTPStatus.NOT_FOUND
+    except (OSError, ValueError, http.client.HTTPException):
+        return None, False
+
+
 def probe_gce_universe_domain_status(
     metadata_url: str = GCE_UNIVERSE_METADATA_URL,
     timeout: float = GCE_METADATA_TIMEOUT_SECONDS,
@@ -1552,28 +1616,57 @@ def probe_gce_universe_domain_status(
     and 5xx responses return `(googleapis.com, False)` so callers never cache a
     transient metadata blip as commercial Google Cloud.
     """
-    request = urllib.request.Request(
-        metadata_url,
-        headers={GCE_METADATA_FLAVOR_HEADER: GCE_METADATA_FLAVOR_VALUE},
-        method="GET",
+    domain, answered = probe_gce_universe_domain_answer(metadata_url, timeout, opener)
+    return domain or credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, answered
+
+
+def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time.sleep) -> None:
+    """Refuse a universe domain from the environment that the metadata server contradicts.
+
+    The environment's value otherwise goes unchecked: a value that names hosts
+    of another universe, or of the commercial one under other names, would send
+    this host's credential there. The metadata server says which universe the
+    host is in, so an answer that differs raises and the broker does not start.
+    An answer that agrees passes. A host with no universe route has nothing to
+    contradict the value: it passes, with a WARNING record that the value was
+    not checked. No answer in UNIVERSE_CHECK_ATTEMPTS tries is
+    UNIVERSE_CHECK_UNANSWERED_STARTS's case, with the same record.
+    """
+    reported, answered = None, False
+    for attempt in range(UNIVERSE_CHECK_ATTEMPTS):
+        if attempt:
+            sleep(UNIVERSE_CHECK_PAUSE_SECONDS)
+        reported, answered = probe_gce_universe_domain_answer()
+        if answered:
+            break
+    variables = (
+        f"{credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV} or "
+        f"{credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV}"
     )
-    active_opener = _METADATA_OPENER if opener is None else opener
-    try:
-        with active_opener.open(request, timeout=timeout) as response:
-            if response.status == HTTPStatus.NOT_FOUND:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
-            if response.status != HTTPStatus.OK:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-            raw = response.read(GCE_METADATA_MAX_BYTES).decode("utf-8", "replace").strip()
-            if not raw:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-            return credential_proxy_client.normalize_universe_domain(raw), True
-    except urllib.error.HTTPError as exc:
-        if exc.code == HTTPStatus.NOT_FOUND:
-            return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
-        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-    except (OSError, ValueError, http.client.HTTPException):
-        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
+    if not answered:
+        if not UNIVERSE_CHECK_UNANSWERED_STARTS:
+            raise RuntimeError(
+                f"the environment ({variables}) names universe domain {configured!r}, and the "
+                f"metadata server gave no answer in {UNIVERSE_CHECK_ATTEMPTS} tries to check it against"
+            )
+        LOGGER.warning(
+            "universe domain %s from the environment was not checked: the metadata server gave no answer in %d tries",
+            configured,
+            UNIVERSE_CHECK_ATTEMPTS,
+        )
+        return
+    if reported is None:
+        LOGGER.warning(
+            "universe domain %s from the environment was not checked: the metadata server has no universe route",
+            configured,
+        )
+        return
+    if reported != configured:
+        raise RuntimeError(
+            f"the environment ({variables}) names universe domain {configured!r}, and the metadata "
+            f"server reports {reported!r}. One credential proxy serves one universe domain and sends "
+            f"no credential to another. Set the variable to {reported!r} or remove it."
+        )
 
 
 def _cached_metadata_universe_domain() -> tuple[str, bool]:
@@ -1591,12 +1684,8 @@ def _cached_metadata_universe_domain() -> tuple[str, bool]:
         return domain, determined
 
 
-def resolve_universe_domain(
-    *,
-    environ: Any = os.environ,
-    probe_metadata: bool = False,
-) -> str:
-    """Resolve the active Google Cloud universe domain (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` -> `CLOUDSDK_CORE_UNIVERSE_DOMAIN` -> optional GCE metadata -> `googleapis.com`)."""
+def configured_universe_domain(environ: Any = os.environ) -> str | None:
+    """The universe domain the environment names, normalised, or None when it names none."""
     for name in (
         credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV,
         credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV,
@@ -1604,6 +1693,18 @@ def resolve_universe_domain(
         raw = environ.get(name, "").strip()
         if raw:
             return credential_proxy_client.normalize_universe_domain(raw)
+    return None
+
+
+def resolve_universe_domain(
+    *,
+    environ: Any = os.environ,
+    probe_metadata: bool = False,
+) -> str:
+    """Resolve the active Google Cloud universe domain (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` -> `CLOUDSDK_CORE_UNIVERSE_DOMAIN` -> optional GCE metadata -> `googleapis.com`)."""
+    configured = configured_universe_domain(environ)
+    if configured is not None:
+        return configured
     if probe_metadata:
         domain, _ = _cached_metadata_universe_domain()
         return domain
@@ -2291,7 +2392,8 @@ DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 #
 # The split is real rather than notional because the two callers already need
 # disjoint routes and the operator already gives each only what its side needs:
-# the gateway has GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL and an empty
+# the gateway has a relay URL (TEAMS_RELAY_URL with Teams on; the operator no
+# longer renders GOOGLE_CHAT_RELAY_URL or SLACK_RELAY_URL) and an empty
 # CREDENTIAL_PROXY_URL, and the sandbox has the reverse. What was missing was
 # anything on this side that refused when a caller reached across.
 #
@@ -2361,6 +2463,10 @@ DEFAULT_CREDENTIAL_PROXY_PROFILE_AUDIENCE = "kubeagents-credential-proxy-profile
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
+# The operator sets this to "true" on the broker when the A2A gateway's teams
+# backend is the Teams queue's consumer (A2A_TEAMS_BACKEND); only then does the
+# a2a-chat role reach the Teams routes (see _teams_route_roles).
+TEAMS_A2A_CALLER_ENV = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
 # The session pod the A2A gateway spawns, under the operator's
 # A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
 # (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
@@ -2908,6 +3014,21 @@ AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
 # 404 to the caller that may legitimately be probing for it —
 # `vcs_client` reads a codeless 404 as an older broker, and a 403 there would
 # read as "not permitted" rather than "not supported".
+def _teams_route_roles(a2a_caller: bool) -> tuple[str, ...]:
+    """The roles the Teams relay routes admit.
+
+    The Hermes consumer's chat role always; the A2A gateway's a2a-chat role
+    only when the operator renders ``TEAMS_A2A_CALLER_ENV`` beside the switch
+    that makes the gateway the consumer. The broker has no other view of that
+    switch, and without the gate a Chat-armed gateway's token could drain or
+    feed the Hermes consumer's queue and post as the Teams bot on an install
+    whose Teams stays on Hermes.
+    """
+    return (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT) if a2a_caller else (CALLER_ROLE_CHAT,)
+
+
+TEAMS_ROUTE_ROLES = _teams_route_roles(os.environ.get(TEAMS_A2A_CALLER_ENV, "").strip() == "true")
+
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
@@ -2918,6 +3039,13 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # No trailing slash: the passthrough is one exact path, and the handler
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
+    # The Teams relay serves whichever gateway the install arms on it: the
+    # Hermes consumer (chat role), or the A2A gateway's teams backend
+    # (a2a-chat role) when the operator runs with A2A_TEAMS_BACKEND=true and
+    # says so to the broker (TEAMS_A2A_CALLER_ENV, _teams_route_roles). One
+    # queue, one consumer per install; the prefix sits before the bare chat
+    # prefix so it is reachable.
+    ("/v1/chat/teams/", TEAMS_ROUTE_ROLES),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     # The admission report sits under /v1/exec and must be matched first: the
     # shell's fleet sweeps size their pools by it, so it is the shell's alone
@@ -5828,9 +5956,11 @@ class ServiceAccountAuthenticator:
                 request, timeout=self.timeout_seconds, context=context
             ) as response:
                 review = json.load(response)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             # A TokenReview that cannot be completed is a rejection, not an
             # allow. An API server outage must not turn into an open broker.
+            # HTTPException: an answer that is not HTTP, or a body that ends
+            # early, is not an OSError.
             raise AuthenticationError(
                 f"TokenReview could not be completed: {type(exc).__name__}"
             ) from exc
@@ -7577,6 +7707,19 @@ class SlackRelay:
         return {"receipt": receipt, **event}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled event: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the event too, and spends the
+        receipt. Nothing retries a failed nack: the gateway nacks once and
+        moves on, and ``pull`` hands out queue entries only, so an event held
+        back here would sit in the receipt table until the pod restarts,
+        never delivered, and the table would grow by one each time. Dropping
+        it loses the same message and leaves nothing behind. The case needs
+        the slot the pull freed to be refilled before the nack: one arrival
+        if the queue was already full, SLACK_EVENT_QUEUE_MAXSIZE if it was
+        empty. A gateway that keeps pulling makes either rare; the warning
+        is the record when it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7585,8 +7728,9 @@ class SlackRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Slack event queue is full; cannot requeue event")
-                    return False
+                    LOGGER.warning(
+                        "Slack event queue is full; the nacked event is dropped, not requeued"
+                    )
             del self._receipts[receipt]
             return True
 
@@ -7723,6 +7867,14 @@ TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
     r"^v3/conversations/[^/?#%\\]+/activities(?:/(?!history$)[^/?#%\\]+)?$",
     re.IGNORECASE,
 )
+# The one path a PUT may take: an update of one activity the bot posted
+# (Bot Framework's updateActivity), never the activities collection. The
+# gateway's rolling status line edits its own message through it.
+TEAMS_UPDATE_ACTIVITY_PATH_RE = re.compile(
+    r"^v3/conversations/[^/?#%\\]+/activities/(?!history$)[^/?#%\\]+$",
+    re.IGNORECASE,
+)
+TEAMS_RELAY_METHODS = frozenset({"POST", "PUT"})
 
 
 def is_trusted_teams_service_url(service_url: str) -> bool:
@@ -7954,6 +8106,21 @@ class TeamsRelay:
         return {"event": event, "receipt": receipt}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled activity: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the activity and its attempt
+        count, and spends the receipt, as a nack past
+        TEAMS_MAX_DELIVERY_ATTEMPTS does. Nothing retries a failed nack: the
+        gateway nacks once and moves on, and ``pull`` hands out queue entries
+        only, so an activity held back here would sit in the receipt table
+        until the pod restarts, never delivered, and the table and the
+        attempt map would grow by one each time. Dropping it loses the same
+        message and leaves nothing behind. The case needs the slot the pull
+        freed to be refilled before the nack: one arrival if the queue was
+        already full, TEAMS_EVENT_QUEUE_MAXSIZE if it was empty. A gateway
+        that keeps pulling makes either rare; the warning is the record when
+        it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7972,9 +8139,12 @@ class TeamsRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Teams event queue is full; cannot requeue activity")
-                    return False
-                self._attempts[event_key] = attempts + 1
+                    self._attempts.pop(event_key, None)
+                    LOGGER.warning(
+                        "Teams event queue is full; the nacked activity is dropped, not requeued"
+                    )
+                else:
+                    self._attempts[event_key] = attempts + 1
             else:
                 self._attempts.pop(event_key, None)
             del self._receipts[receipt]
@@ -7992,11 +8162,13 @@ class TeamsRelay:
         if not is_trusted_teams_service_url(service_url):
             raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
         upper_method = (method or "").strip().upper()
-        if upper_method != "POST":
+        if upper_method not in TEAMS_RELAY_METHODS:
             raise ValueError(f"Teams relay refuses HTTP method: {method}")
         clean_path = path.lstrip("/")
         if ".." in clean_path.split("/") or not TEAMS_ALLOWED_ACTIVITY_PATH_RE.match(clean_path):
             raise ValueError(f"Teams relay refuses endpoint: {path}")
+        if upper_method == "PUT" and not TEAMS_UPDATE_ACTIVITY_PATH_RE.match(clean_path):
+            raise ValueError(f"Teams relay refuses PUT on: {path}")
 
         token = self._get_access_token()
         url = f"{service_url.rstrip('/')}/{clean_path}"
@@ -8016,7 +8188,7 @@ class TeamsRelay:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
             },
-            method="POST",
+            method=upper_method,
         )
         with self._open_url(req, timeout=30) as resp:
             content = resp.read()
@@ -8671,7 +8843,8 @@ VCS_SCRATCH_DIR = "vcs"
 # its scratch directory (`--output`), from a bare clone.
 #
 # `diff-tree` is on it for one caller: `publish` diffs the incoming tip's tree
-# against the policy base's merge-base before pushing.
+# against the policy base's merge-base before pushing. `log` is on it so `publish`
+# inspects incoming commit author and committer addresses before pushing.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "archive",
@@ -8681,6 +8854,7 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "diff-tree",
         "fetch",
         "init",
+        "log",
         "ls-remote",
         "ls-tree",
         "merge-base",
@@ -13317,6 +13491,7 @@ def build_vcs_broker(
     executor: CommandExecutor,
     base_branch: str = "",
     pinned_bases: Mapping[tuple[str, str], str] | None = None,
+    metrics: ProxyMetrics | None = None,
 ):
     """The version-control broker. Always built; there is no switch.
 
@@ -13353,6 +13528,14 @@ def build_vcs_broker(
         # describe and a namespaced kubectl get, through the same executor,
         # kubeconfig selection and output cap as a caller's.
         cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
+        on_decision_memory_check=(
+            metrics.record_decision_memory_check if metrics is not None else None
+        ),
+        allowed_commit_emails=lambda host, viewer_login: vcs_readings.install_commit_emails(
+            host,
+            viewer_login,
+            os.environ.get(vcs_readings.GITHUB_APP_ID_ENV, "").strip() or None,
+        ),
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -14068,6 +14251,7 @@ class ProxyMetrics:
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str, str], int] = {}
+        self._decision_memory_checks: dict[str, int] = {}
         # The sweep's last reading of each kind, None until the first; a
         # withheld reading leaves the previous one here.
         self._outcomes: vcs_readings.OutcomesReading | None = None
@@ -14186,6 +14370,12 @@ class ProxyMetrics:
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
+    def record_decision_memory_check(self, verdict: str) -> None:
+        if verdict not in DECISION_MEMORY_VERDICTS:
+            verdict = DECISION_MEMORY_VERDICT_ERROR
+        with self._lock:
+            self._decision_memory_checks[verdict] = self._decision_memory_checks.get(verdict, 0) + 1
+
     def set_readings(
         self,
         outcomes: vcs_readings.OutcomesReading | None,
@@ -14303,6 +14493,7 @@ class ProxyMetrics:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
+            decision_memory_checks = sorted(self._decision_memory_checks.items())
             outcomes = self._outcomes
             details = self._details
             reading_failures = sorted(self._reading_failures.items())
@@ -14425,6 +14616,14 @@ class ProxyMetrics:
                 f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
                 f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
                 f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
+            )
+        lines += [
+            f"# HELP {DECISION_MEMORY_CHECKS_METRIC} Stage B OKF decision-memory guard checks evaluated on /v1/vcs/publish, by verdict (allow, warn, block, error).",
+            f"# TYPE {DECISION_MEMORY_CHECKS_METRIC} counter",
+        ]
+        for verdict, count in decision_memory_checks:
+            lines.append(
+                f'{DECISION_MEMORY_CHECKS_METRIC}{{{DECISION_MEMORY_VERDICT_LABEL}="{_escape_label_value(verdict)}"}} {count}'
             )
         # Wall clock, as the readings' `taken_at` is.
         self._render_readings(lines, outcomes, details, reading_failures, time.time())
@@ -16958,8 +17157,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         credential. `watcher_policy.evaluate_k8s` is the table. A watch is
         streamed through as the API server sends it. A Pod's metadata is read
         whole and relayed as its projection (`project_pod_metadata`).
-        Everything else is streamed too, with the Cloud API relay's deadline
-        on each read.
+        Everything else is read whole under the Cloud API relay's total
+        deadline and response cap before headers are sent.
         """
         request_id = str(uuid.uuid4())
         if self.command != watcher_policy.METHOD_GET:
@@ -17047,25 +17246,36 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         authorization = self._relay_authorization("watcher k8s", request_id)
         if authorization is None:
             return
-        read_timeout = WATCHER_WATCH_READ_TIMEOUT_S if watching else API_RELAY_DEADLINE_S
         # Built inside the try: a cached CA that will not load is a TLS failure
         # like any other, answered 502 and forgotten, not an unanswered request.
         connection: http.client.HTTPConnection | None = None
         started = time.monotonic()
+        deadline = started + API_RELAY_DEADLINE_S
         answered = False
         # The API server's status line arrived: the cached host and CA reached
         # it, so a failure after this point is not theirs to be forgotten for.
         upstream_answered = False
         try:
             connection = self._watcher_k8s_connection(host, ca_pem)
-            connection.connect()
-            connection.sock.settimeout(read_timeout)
+            try:
+                connection.connect()
+            except TimeoutError as exc:
+                raise ApiRelayConnectTimeout(
+                    f"connect to {host} did not complete in {API_RELAY_CONNECT_TIMEOUT_S}s"
+                ) from exc
+            sock = connection.sock
+            sock.settimeout(
+                WATCHER_WATCH_READ_TIMEOUT_S if watching else GoogleApiRelay._remaining(deadline)
+            )
             target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
             connection.putrequest(watcher_policy.METHOD_GET, target_path, skip_accept_encoding=True)
             connection.putheader("Authorization", authorization)
             if accept:
                 connection.putheader("Accept", accept)
             connection.endheaders()
+            sock.settimeout(
+                WATCHER_WATCH_READ_TIMEOUT_S if watching else GoogleApiRelay._remaining(deadline)
+            )
             response = connection.getresponse()
             upstream_answered = True
             if HTTPStatus.MULTIPLE_CHOICES <= response.status < HTTPStatus.BAD_REQUEST:
@@ -17075,29 +17285,57 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
                 )
                 return
-            if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
-                # Read whole and projected: the Pod's ObjectMeta carries every
-                # annotation and managedFields, and only the owner lookup's
-                # fields leave the broker. A non-200 answer is the API server's
-                # Status, which carries no Pod data, and is relayed as it is.
-                body = response.read(WATCHER_POD_METADATA_MAX_BYTES + 1)
-                if len(body) > WATCHER_POD_METADATA_MAX_BYTES:
-                    LOGGER.warning("watcher k8s pod metadata too large request_id=%s", request_id)
-                    self._json(
-                        HTTPStatus.BAD_GATEWAY,
-                        {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
-                    )
-                    return
-                if response.status == HTTPStatus.OK:
-                    projected = watcher_policy.project_pod_metadata(body)
-                    if projected is None:
-                        LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+            if not watching:
+                # Non-watch reads are bounded like GoogleApiRelay.fetch: re-arm
+                # the total deadline before each read1 chunk, cap Pod metadata
+                # at WATCHER_POD_METADATA_MAX_BYTES and other non-watch reads
+                # at API_RELAY_MAX_RESPONSE_BYTES, and fail on a Content-Length
+                # body cut short before sending status headers downstream.
+                max_bytes = (
+                    WATCHER_POD_METADATA_MAX_BYTES
+                    if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA
+                    else API_RELAY_MAX_RESPONSE_BYTES
+                )
+                chunks: list[bytes] = []
+                received = 0
+                while True:
+                    if response.isclosed():
+                        break
+                    sock.settimeout(GoogleApiRelay._remaining(deadline))
+                    chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > max_bytes:
+                        LOGGER.warning(
+                            "watcher k8s response too large request_id=%s rule=%s status=%d cap_bytes=%d",
+                            request_id,
+                            decision.rule_id,
+                            response.status,
+                            max_bytes,
+                        )
                         self._json(
                             HTTPStatus.BAD_GATEWAY,
-                            {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                            {"error": WATCHER_K8S_UNRELAYABLE_ERROR, "code": WATCHER_K8S_UNRELAYABLE_CODE},
                         )
                         return
-                    body = projected
+                    chunks.append(chunk)
+                if response.length:
+                    raise http.client.IncompleteRead(b"".join(chunks), response.length)
+                body = b"".join(chunks)
+                content_type = response.getheader("Content-Type", "")
+                if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
+                    if response.status == HTTPStatus.OK:
+                        projected = watcher_policy.project_pod_metadata(body)
+                        if projected is None:
+                            LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+                            self._json(
+                                HTTPStatus.BAD_GATEWAY,
+                                {"error": WATCHER_K8S_UNRELAYABLE_ERROR, "code": WATCHER_K8S_UNRELAYABLE_CODE},
+                            )
+                            return
+                        body = projected
+                    content_type = watcher_policy.POD_METADATA_MEDIA_TYPE
                 LOGGER.info(
                     "watcher k8s forwarded request_id=%s rule=%s status=%d bytes=%d",
                     request_id,
@@ -17107,7 +17345,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 self.send_response(response.status)
                 answered = True
-                self.send_header("Content-Type", watcher_policy.POD_METADATA_MEDIA_TYPE)
+                if content_type:
+                    self.send_header("Content-Type", sanitize_header(content_type))
                 # Framed by its length, so the connection stays reusable, and
                 # closed with the answer when the request's body went unread.
                 self.send_header("Content-Length", str(len(body)))
@@ -17133,8 +17372,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             sent = 0
+            cut_by_limit = False
             while True:
                 if watching and time.monotonic() - started > WATCHER_WATCH_MAX_S:
+                    cut_by_limit = True
                     break
                 chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
                 if not chunk:
@@ -17156,9 +17397,31 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         sent,
                     )
                     self.close_connection = True
+                    cut_by_limit = True
                     break
                 sent += len(chunk)
+            if not cut_by_limit and response.length:
+                raise http.client.IncompleteRead(b"", response.length)
             LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
+        except TimeoutError:
+            LOGGER.warning(
+                "watcher k8s upstream timeout request_id=%s host=%s deadline_s=%d",
+                request_id,
+                host,
+                API_RELAY_DEADLINE_S,
+            )
+            if answered:
+                self.close_connection = True
+            else:
+                if not upstream_answered:
+                    key = (target["project"], target["location"], target["cluster"])
+                    with self.watcher_endpoints_lock:
+                        self.watcher_endpoints.pop(key, None)
+                with contextlib.suppress(OSError):
+                    self._json(
+                        HTTPStatus.GATEWAY_TIMEOUT,
+                        {"error": WATCHER_K8S_TIMEOUT_ERROR, "code": WATCHER_K8S_TIMEOUT_CODE},
+                    )
         except (OSError, http.client.HTTPException) as exc:
             # Before our status line, an answer, and the cached address is
             # forgotten in case it is what failed: only when the API server's
@@ -18891,6 +19154,11 @@ def serve(args: argparse.Namespace) -> None:
 
     CredentialProxyHandler.policy = Policy.load(args.policy)
     CredentialProxyHandler.probe_metadata_universe = True
+    # Read before the resolve below, which can put a metadata answer into the
+    # environment: only a value the environment came with is checked.
+    configured_universe = configured_universe_domain()
+    if configured_universe is not None:
+        check_universe_domain_against_metadata(configured_universe)
     universe_domain = resolve_universe_domain(probe_metadata=True)
     if universe_domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
         os.environ.setdefault(
@@ -18970,6 +19238,7 @@ def serve(args: argparse.Namespace) -> None:
             executor,
             base_branch=CredentialProxyHandler.base_branch,
             pinned_bases=CredentialProxyHandler.pinned_bases,
+            metrics=CredentialProxyHandler.metrics,
         )
     # What the gate's soft watermark reclaims: vcs scratch no request of this
     # process holds (the vcs broker swept a dead process's at start), and on
@@ -19364,7 +19633,8 @@ def main(stream: TextIO = sys.stdout) -> int:
 
     Every refusal `serve` makes before it opens a listener -- an unsupported
     role or authentication mode, a listener reachable off the Pod with no
-    authenticator, a failed bootstrap command -- would otherwise leave the
+    authenticator, a failed bootstrap command, a universe domain the metadata
+    server contradicts -- would otherwise leave the
     process through the interpreter's default hook as a plain-text traceback
     on the same container log the JSON records go to, on every restart of a
     crash-looping broker. Caught here, it is one ERROR record with the

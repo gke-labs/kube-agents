@@ -1407,10 +1407,13 @@ class ReplayTest(ProxyTestCase):
         _, port, out = self.replay()
         calls = len(FakeLiteLLM.calls)
         tags = [f"night-{i}/case-a/1" for i in range(8)]
-        for run in tags:
+        for count, run in enumerate(tags, 1):
             status, headers, _ = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port,
                                               headers={"X-Kube-Agents-Eval-Run": run})
             self.assertEqual((status, headers["x-replay-served"]), (200, "true"))
+            # Each request queues its line after its response, so wait for it before the next request
+            # or two lines can be written in either order.
+            self.lines(count, out)
         self.assertEqual(len(FakeLiteLLM.calls), calls, "every rep is served")
         lines = self.lines(len(tags), out)
         served = {line["eval_run"]: line["served_alternate"] for line in lines}

@@ -513,9 +513,8 @@ subject falls outside the caller's own reply namespace, since the reply-to is ca
 check also gets a fresh reply subject and carries a fresh random `requestId`, which the verifier
 echoes on every verdict, and the client acts only on a reply that echoes its own id. That's defence
 in depth for the dispatcher's admission, which mints a task's credentials on the answer: a reply
-carrying another id is dropped, and a check with no answer of its own fails closed at its timeout,
-as does one whose reply doesn't parse. A reply with no id, from a verifier older than the echo, is
-still acted on while a release without the echo is inside the rollback window.
+carrying another id, or none, is dropped, and a check with no answer of its own fails closed at its
+timeout. A reply that doesn't parse is refused at once.
 
 **Where the weaker guarantee still applies.** With a shared agent identity the bound would be the
 widest capability concurrently delegated to that agent rather than the authority of the human whose

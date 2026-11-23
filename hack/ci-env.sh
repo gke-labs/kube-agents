@@ -845,8 +845,16 @@ resolve_replay_shadow() {
   fi
   local mode="${REPLAY_MODE_SHADOW}" cache_bucket=""
   # Record only on a trusted nightly: the account check above has already filed
-  # anything else as nightly-untrusted.
-  if [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
+  # anything else as nightly-untrusted. A run through the default session
+  # (EVAL_FRONT_DOOR=session, #6539) never records: the replay lanes replay the
+  # platform front door's recordings, and a session run's would mix into them.
+  if [ "${EVAL_FRONT_DOOR:-platform}" = "session" ]; then
+    if [ "${EVAL_REPLAY_RECORD:-}" = "true" ]; then
+      echo "ERROR: EVAL_REPLAY_RECORD=true with EVAL_FRONT_DOOR=session: a front-door A/B run never records into the shared replay cache." >&2
+      return 1
+    fi
+    echo "Replay proxy: shadow mode, not record: EVAL_FRONT_DOOR=session runs never record into the shared replay cache." >&2
+  elif [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
     if [ "${JOB_TYPE:-}" != "${REPLAY_RECORD_JOB_TYPE}" ]; then
       if [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
         echo "ERROR: EVAL_REPLAY_RECORD=true on JOB_TYPE='${JOB_TYPE:-}': only a ${REPLAY_RECORD_JOB_TYPE} records into the shared replay cache." >&2

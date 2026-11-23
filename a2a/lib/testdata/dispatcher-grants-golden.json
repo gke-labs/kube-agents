@@ -38,10 +38,13 @@
     "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-beta-read-child",
     "$JS.ACK.PROFILE_SUBMITS.profile-beta-read-child.>",
     "a2a.tasks.alpha.*.supervisor",
+    "a2a.tasks.p.alpha.*.supervisor",
     "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.alpha.*",
     "a2a.tasks.beta.*.supervisor",
+    "a2a.tasks.p.beta.*.supervisor",
     "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.beta.*",
     "a2a.tasks.gone.*.supervisor",
+    "a2a.tasks.p.gone.*.supervisor",
     "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.gone.*"
   ],
   "subscribe": [

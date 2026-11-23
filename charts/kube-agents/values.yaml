@@ -25,6 +25,10 @@
 # change only its own annotations and spec.integration.forges, repositories and
 # github on the PlatformAgent.
 #
+# And templates/agentschedule-builtin-admission-policy.yaml: only the operator may
+# make or unmake a built-in AgentSchedule (its origin: builtin label and controller
+# reference) or change a built-in's spec (spec.suspend excepted).
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
@@ -162,15 +166,15 @@ operator:
     enabled: true
   # The MCP server (<agent>-a2a-mcp), a Model Context Protocol endpoint that lets
   # an external coding agent or IDE talk to the install over its message bus.
-  # true sets A2A_MCP_DOOR=true on the controller manager, which then renders
-  # the server's Deployment, Service, deny-all ingress NetworkPolicy and
-  # bearer-token Secret beside every PlatformAgent it manages; the quota
-  # preflight counts its pod. Setting this back to false removes all of it, the
-  # token included. An A2A_MCP_DOOR entry in extraEnv wins: the chart then
-  # renders only that entry. What it renders and how to connect: the site's
-  # "MCP server" reference page.
+  # Rendered beside every PlatformAgent the operator manages: Deployment,
+  # Service, ServiceAccount, deny-all ingress NetworkPolicy and bearer-token
+  # Secret. false sets A2A_MCP_DOOR=false on the controller manager, which
+  # removes all of it, the token included; the quota preflight still counts its
+  # one pod from footprint.yaml (an over-count in the safe direction). An
+  # A2A_MCP_DOOR entry in extraEnv wins: the chart then renders only that entry.
+  # What it renders and how to connect: the site's "MCP server" reference page.
   mcpServer:
-    enabled: false
+    enabled: true
   # The AgentProfile dispatcher (<agent>-a2a-dispatcher), which offers each
   # profile task to a worker in the profile's warm pool, or runs an unattended
   # one as a Job. Rendered beside every PlatformAgent the operator manages.
@@ -201,6 +205,12 @@ operator:
   # Rendered as the operator's A2A_SLACK_TEST_USERS, which it hands the
   # gateway; an A2A_SLACK_TEST_USERS entry in extraEnv wins.
   slackTestUsers: []
+  # The A2A gateway's Microsoft Teams backend is off until the operator runs
+  # with A2A_TEAMS_BACKEND=true (an extraEnv entry; no value key yet): with it,
+  # a PlatformAgent whose integration.teams is enabled has the gateway, not the
+  # Planning Agent's adapter, consume the broker's Teams queue. Without it the
+  # Planning Agent path stays, which is what an upgrade must not move on its
+  # own. docs/chatops/microsoft-teams.md has the details.
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -2284,12 +2294,13 @@ profiles:
   cluster:
     enabled: false
     description: >-
-      Read-only SRE for one GKE cluster, named per task: live runtime state and
-      workload debugging (crash loops, OOMKills, pending pods, image-pull and
-      mount errors, connectivity and DNS timeouts, autoscaling, storage binding,
-      silent reconciliation stalls, observability gaps). Returns a grounded root
-      cause analysis and a proposed manifest patch; never mutates cluster state
-      and never opens pull requests.
+      SRE for one GKE cluster, named per task, read-only on that cluster: live
+      runtime state and workload debugging (crash loops, OOMKills, pending pods,
+      image-pull and mount errors, connectivity and DNS timeouts, autoscaling,
+      storage binding, silent reconciliation stalls, observability gaps).
+      Returns a grounded root cause analysis and a proposed manifest patch;
+      never mutates cluster state. Opens a pull request on the install's managed
+      repository only when the task asks for that change.
     persona:
       image:
         repository: ghcr.io/gke-labs/kube-agents/persona-cluster
@@ -2301,7 +2312,9 @@ profiles:
       model: model-default
       maxTurns: 90
     # Tier is authority, so it lives here and never in the persona. The cluster
-    # agent is read-only; unattended runs it as a Job per task.
+    # agent is read-only on its cluster; unattended runs it as a Job per task,
+    # and so does a task that asks for a change, whose pull request the broker
+    # admits only under that task's permit.
     allowedTiers:
       - read
     lifecycle:
