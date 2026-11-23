@@ -245,6 +245,8 @@ FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS hermes-upstream
 
 The agent images do not build on that image's layers. The build copies its files into an empty stage and leaves out GSAP (`/opt/hermes/node_modules/gsap`), an animation library that Hermes' dashboard workspace installs under a licence that is not an open-source one. Hermes' built dashboard does not contain it, and no layer of `platform-agent` or `credential-proxy` holds it. The Hermes image itself still does, so a mirror of it carries the package.
 
+The copy also leaves out python-telegram-bot, the LGPL-licensed library behind Hermes' Telegram adapter, from the Python environment and from the package cache beside it. The build removes the library from the list of packages Hermes installs on demand, so configuring Telegram on these images does not fetch it: the Telegram platform reports a missing dependency and stays off. A mirror of the Hermes image carries this package too.
+
 The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-agents` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
