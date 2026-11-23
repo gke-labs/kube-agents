@@ -535,13 +535,13 @@ func TestATaskPastItsEventCapIsTooLargeToRead(t *testing.T) {
 	}
 }
 
-// A wait checks for the task's end when a status-update arrives, not after
-// an artifact: an artifact cannot end a task, and a fold parses every payload
-// read so far.
+// A wait checks for the task's end when a final status-update arrives, not
+// after an artifact or a progress status: neither can end a task, and a fold
+// parses every payload read so far.
 // Folding after each artifact of a task near readMaxBytes took the gap
 // between pulls past taskConsumerIdle on a loaded runner, and the server
 // reaped the consumer under the read.
-func TestATaskWaitFoldsOnlyAfterAStatusUpdate(t *testing.T) {
+func TestATaskWaitFoldsOnlyAfterAFinalStatus(t *testing.T) {
 	url, js := testBus(t)
 	b := dial(t, url)
 	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-fold1"}
@@ -562,22 +562,25 @@ func TestATaskWaitFoldsOnlyAfterAStatusUpdate(t *testing.T) {
 		}
 	}
 	readTo(2)
-	if !w.statusUnfolded {
-		t.Fatal("submitted and working were read and no fold is owed")
+	if w.finalUnfolded {
+		t.Error("submitted and working marked the task for a fold; neither is final")
 	}
 	if task, final := w.ended(); final {
 		t.Fatalf("a working task read as ended: %+v", task)
 	}
 	publishResult(t, js, ref.Addressee, ref.TaskID, answerText)
 	readTo(3)
-	if w.statusUnfolded {
-		t.Error("an artifact marked the task for a fold; only a status-update can end it")
+	if w.finalUnfolded {
+		t.Error("an artifact marked the task for a fold; only a final status-update can end it")
 	}
 	if task, final := w.ended(); final {
 		t.Fatalf("an artifact ended the task: %+v", task)
 	}
 	publishStatus(t, js, ref.Addressee, ref.TaskID, lib.StateCompleted, true)
 	readTo(4)
+	if !w.finalUnfolded {
+		t.Fatal("the completed status was read and no fold is owed")
+	}
 	task, final := w.ended()
 	if !final {
 		t.Fatal("the completed status did not end the task")

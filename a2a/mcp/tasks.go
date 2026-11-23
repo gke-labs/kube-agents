@@ -264,8 +264,8 @@ type taskWatch struct {
 	seen    int
 	pending uint64
 	release func(created bool)
-	// statusUnfolded is a status-update taken since ended last folded.
-	statusUnfolded bool
+	// finalUnfolded is a final status-update taken since ended last folded.
+	finalUnfolded bool
 	// screen is the cutoff screen, nil on an unlatched install; dropped
 	// counts what it refused, and doubted holds what it could not decide yet.
 	screen  *cutoffScreen
@@ -442,11 +442,11 @@ func (w *taskWatch) admit(ctx context.Context, subject string, storedAt time.Tim
 	}
 }
 
-// noteTaken records, for ended, that an event the watch took is a
+// noteTaken records, for ended, that an event the watch took is a final
 // status-update. A held event is noted when resolveDoubts takes it, not when
 // it is read: until then it is not among the events a fold sees.
 func (w *taskWatch) noteTaken(env *lib.Envelope) {
-	w.statusUnfolded = w.statusUnfolded || env.Kind == lib.KindStatusUpdate
+	w.finalUnfolded = w.finalUnfolded || lib.IsFinalStatus(env)
 }
 
 // resolveDoubts settles the task's kind if events are held for it, and puts
@@ -548,19 +548,19 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 
 func (w *taskWatch) fold() (*lib.Task, error) { return lib.FoldTask(w.ref.TaskID, w.events) }
 
-// ended reports a final task, one time for each status-update read: it folds
-// only when a status-update has been read since the last fold, because
-// nothing else ends a task (FoldTask sets Final from a status-update alone).
-// A fold parses every payload read so far, so folding after each artifact of
-// a task near readMaxBytes costs the whole task again between one pull and
-// the next. On a loaded test runner that took the gap between pulls past
-// taskConsumerIdle, the server reaped the consumer under the read, and the
-// next pull failed with "no responders".
+// ended reports a final task, one time for each final status-update taken: it
+// folds only when one has been taken since the last fold, because nothing
+// else ends a task (FoldTask sets Final from a status-update's final field
+// alone). A fold parses every payload read so far, so folding after each
+// artifact or progress status of a task near readMaxBytes costs the whole
+// task again between one pull and the next. On a loaded test runner that took
+// the gap between pulls past taskConsumerIdle, the server reaped the consumer
+// under the read, and the next pull failed with "no responders".
 func (w *taskWatch) ended() (*lib.Task, bool) {
-	if !w.statusUnfolded {
+	if !w.finalUnfolded {
 		return nil, false
 	}
-	w.statusUnfolded = false
+	w.finalUnfolded = false
 	t, err := w.fold()
 	if err != nil || !t.Final {
 		return nil, false
