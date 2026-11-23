@@ -25,6 +25,9 @@ persona and the `a2a-topics` skill) is a different thing and lives in
 its tools (`gke.get_cluster`). `parameters` are values each task supplies,
 such as the target cluster: the dispatcher states them in the task, and the
 profile worker also exports each as `PROFILE_TASK_<NAME>` in the environment.
+A task a schedule's trigger started also gets the trigger's stream and origin
+as `PROFILE_TRIGGER_STREAM` and `PROFILE_TRIGGER_ORIGIN`, from the
+submission's authority block, never from a parameter.
 Nothing cluster-specific is stamped into the image.
 
 A persona holds no image references, no credentials and no secrets. Every

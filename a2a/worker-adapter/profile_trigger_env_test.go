@@ -127,3 +127,12 @@ printf '{"type":"result","subtype":"success","result":"stream=%s origin=%s"}\n' 
 		t.Errorf("result %q (state %s), want %q", artifactText(got, lib.ArtifactResult), got.State, want)
 	}
 }
+
+// The pod's own environment can't hand an untriggered task a trigger.
+func TestThePodsEnvCantHandATaskATrigger(t *testing.T) {
+	base := []string{"PATH=/bin", profileTriggerStreamEnv + "=compliance-audit", profileTriggerOriginEnv + "=builtin"}
+	got := withoutTriggerEnv(base)
+	if !slices.Equal(got, []string{"PATH=/bin"}) {
+		t.Errorf("withoutTriggerEnv(%v) = %v, want PATH alone", base, got)
+	}
+}

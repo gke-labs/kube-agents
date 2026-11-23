@@ -649,7 +649,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 	cfg.HarnessEnv = append(cfg.HarnessEnv, taskParameterEnv(h.origin, cfg.Logger)...)
 	// After the parameters, so that even a name they could spell can't stand
 	// in for the trigger's (they can't: their prefix is PROFILE_TASK_).
-	cfg.HarnessEnv = append(cfg.HarnessEnv, taskTriggerEnv(h.origin, cfg.Logger)...)
+	cfg.HarnessEnv = append(withoutTriggerEnv(cfg.HarnessEnv), taskTriggerEnv(h.origin, cfg.Logger)...)
 	a := newTaskAdapter(cfg, bus)
 	a.dispatched = true
 	a.abandon = h.abandon
@@ -780,9 +780,10 @@ func (w *profileWorker) finish(h *held, out turnOutcome) {
 // The trigger a dispatched task came from (#4685, #5623), as the harness
 // reads it. Runtime-owned: they come from the submission's authority block,
 // never from a task parameter, whose names all take the PROFILE_TASK_ prefix
-// (taskParameterEnv), so no parameter can set or override them. The fleet
-// audit's shadow run names its report stream after the schedule
-// (audit_report.py's SHADOW_TRIGGER_STREAM_ENV).
+// (taskParameterEnv), so no parameter can set or override them, and the
+// pod's own environment is stripped of them first (withoutTriggerEnv), so an
+// untriggered task never inherits one. The fleet audit's shadow run names
+// its report stream after the schedule (audit_report.py, #6956).
 const (
 	profileTriggerStreamEnv = "PROFILE_TRIGGER_STREAM"
 	profileTriggerOriginEnv = "PROFILE_TRIGGER_ORIGIN"
@@ -812,6 +813,20 @@ func taskTriggerEnv(origin *lib.Envelope, log interface{ Warn(string, ...any) })
 		env = append(env, profileTriggerOriginEnv+"="+trigger.Origin)
 	}
 	return env
+}
+
+// withoutTriggerEnv is env with any PROFILE_TRIGGER_STREAM or
+// PROFILE_TRIGGER_ORIGIN entry removed: only the task's own trigger sets them.
+func withoutTriggerEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == profileTriggerStreamEnv || name == profileTriggerOriginEnv {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // taskParameterEnv is the submission's declared parameters as the harness
