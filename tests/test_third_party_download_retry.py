@@ -28,8 +28,7 @@ The Dockerfile and shell guard is a pure function over text with its own
 fixtures (`DownloadCheckerTest`), for the same reason: a walk that silently
 matches nothing passes just as well as one that finds everything. A GitHub
 release download in an image build must also keep retrying for minutes, not
-seconds (`GITHUB_RELEASE_RETRY_FLOOR_SECONDS`); `TirithDownloadRetryTest` runs
-the one such download that is a wget loop rather than a curl line.
+seconds (`GITHUB_RELEASE_RETRY_FLOOR_SECONDS`).
 """
 
 import functools
@@ -180,32 +179,6 @@ GITHUB_RELEASE_RETRY_FLOOR_SECONDS = 240
 RETRY_COUNT_VALUE = re.compile(r"--retry[ =]([0-9]+)(?![0-9])")
 RETRY_DELAY_VALUE = re.compile(r"--retry-delay[ =]([0-9]+)(?![0-9])")
 RETRY_MAX_TIME_VALUE = re.compile(r"--retry-max-time[ =]([0-9]+)(?![0-9])")
-
-#: The tirith download in AGENT_DOCKERFILE, found by its target file. It is a
-#: wget loop rather than a curl line, because the a2a-tools stage builds on the
-#: Go Alpine image, which has busybox wget and no curl.
-TIRITH_DOWNLOAD = "/tmp/tirith.tar.gz"
-DOCKERFILE_RUN = "RUN "
-
-#: Where the tirith RUN stops fetching and starts checking what it fetched. The
-#: test runs only the part before it, so nothing it runs touches the host's /tmp.
-TIRITH_CHECK_STEP = 'echo "${sum}  '
-
-#: The build arguments the tirith RUN reads under `set -u`. Placeholders: the
-#: stub wget fails before anything is checked against them.
-TIRITH_BUILD_ARGS = {
-    "TARGETARCH": "amd64",
-    "TIRITH_VERSION": "v0.0.0",
-    "TIRITH_SHA256_AMD64": "0" * 64,
-    "TIRITH_SHA256_ARM64": "0" * 64,
-}
-
-#: Stands in for wget under the tirith RUN: records each call and fails, as
-#: every attempt did on a runner the CDN was failing.
-FAILING_FETCH_STUB = """#!/bin/sh
-echo call >> "%s"
-exit 1
-"""
 
 MAKE_TIMEOUT_SECONDS = 60
 
@@ -1259,7 +1232,7 @@ class ShippedGitHubReleaseRetryTest(unittest.TestCase):
                 )
 
     def test_the_floor_reads_every_github_release_download(self):
-        """Every release URL is on a curl line the walk reads or in the tirith RUN.
+        """Every release URL is on a curl line the walk reads.
 
         A wget loop, an ADD or a piped curl anywhere else would pass both checks
         unseen.
@@ -1268,17 +1241,15 @@ class ShippedGitHubReleaseRetryTest(unittest.TestCase):
             with self.subTest(source=source.name):
                 unread = []
                 for command, marks in _joined_commands(source.read_text()):
-                    tirith = command.startswith(DOCKERFILE_RUN) and TIRITH_DOWNLOAD in command
                     curl = [own_text for _, own_text, piped in network_fetches(command) if not piped]
-                    read = int(tirith) + sum(len(GITHUB_RELEASE_DOWNLOAD.findall(own_text)) for own_text in curl)
+                    read = sum(len(GITHUB_RELEASE_DOWNLOAD.findall(own_text)) for own_text in curl)
                     if len(GITHUB_RELEASE_DOWNLOAD.findall(command)) > read:
                         unread.append(marks[0][1])
                 self.assertEqual(
                     unread,
                     [],
                     "%s fetches a GitHub release asset in the instruction at line(s) %s in a way the "
-                    "floor cannot read, such as wget, ADD or a piped curl: fetch it to a file with curl, "
-                    "or run it against stubs as TirithDownloadRetryTest runs tirith" % (source, unread),
+                    "floor cannot read, such as wget, ADD or a piped curl: fetch it to a file with curl" % (source, unread),
                 )
 
     def test_the_walk_actually_reaches_the_github_release_downloads(self):
@@ -1294,54 +1265,6 @@ class ShippedGitHubReleaseRetryTest(unittest.TestCase):
             4,
             "expected at least the gh, yq, leeway and OpenTofu downloads; a walk "
             "finding fewer is matching the wrong shape",
-        )
-
-
-class TirithDownloadRetryTest(unittest.TestCase):
-    """The tirith download, a wget loop the curl walk cannot read, waits as long.
-
-    The RUN's fetch is lifted out of AGENT_DOCKERFILE and run under sh with a
-    stub wget that fails every attempt and a stub sleep that records its delay
-    instead of waiting, the way NatsCliInstallRetryTest runs the nats CLI step.
-    A loop that fell through after its last attempt would exit 0 here.
-    """
-
-    def setUp(self):
-        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="tirith-retry-")).resolve()
-        self.calls = self.tmp / "calls"
-        self.calls.write_text("")
-        self.sleeps = self.tmp / "sleeps"
-        self.sleeps.write_text("")
-        self.toolchain = self.tmp / "toolchain"
-        self.toolchain.mkdir()
-        _executable(self.toolchain / "wget", FAILING_FETCH_STUB % self.calls)
-        _executable(self.toolchain / "sleep", SLEEP_STUB % self.sleeps)
-        runs = [
-            command
-            for command, _ in _joined_commands(AGENT_DOCKERFILE.read_text())
-            if command.startswith(DOCKERFILE_RUN) and TIRITH_DOWNLOAD in command
-        ]
-        self.assertEqual(len(runs), 1, "expected exactly one RUN that downloads %s" % TIRITH_DOWNLOAD)
-        self.assertIn(TIRITH_CHECK_STEP, runs[0], "the tirith RUN no longer checks its download where this test cuts it")
-        self.script = runs[0][len(DOCKERFILE_RUN) : runs[0].index(TIRITH_CHECK_STEP)]
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_a_failing_download_waits_out_the_floor_before_it_fails(self):
-        env = dict(os.environ, PATH="%s%s%s" % (self.toolchain, os.pathsep, os.environ["PATH"]), **TIRITH_BUILD_ARGS)
-        result = subprocess.run(["sh", "-c", self.script], capture_output=True, text=True, env=env, timeout=MAKE_TIMEOUT_SECONDS)
-        delays = [int(line) for line in self.sleeps.read_text().split()]
-        self.assertNotEqual(result.returncode, 0, "a download that never succeeds must fail the RUN")
-        self.assertEqual(
-            len(self.calls.read_text().splitlines()),
-            len(delays) + 1,
-            "each wait should be followed by another attempt; stderr was:\n%s" % result.stderr,
-        )
-        self.assertGreaterEqual(
-            sum(delays),
-            GITHUB_RELEASE_RETRY_FLOOR_SECONDS,
-            "the tirith loop waits %ss in all (%s) before it gives up" % (sum(delays), delays),
         )
 
 

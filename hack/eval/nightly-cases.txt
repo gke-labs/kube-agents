@@ -954,6 +954,14 @@
 # the onboarding lock, like bootstrap-inventory-ranking-delivery.
 ./tasks/bootstrap-inventory-posture-scope/task.yaml
 
+# chat-answer-writes-a-table: a direct answer asked for as a table is a
+# markdown pipe table, not "Label: value | Label: value" lines. Red on the
+# api_server prompt hint that told the model to assume plain text (the Teams
+# live test of #6086, 2026-11-17); green with
+# deploy/docker/patches/apply_api_platform_hint.py. Needs only the agent's
+# own cluster.
+./tasks/chat-answer-writes-a-table/task.yaml
+
 # "/feedback <text>" is written up and shown for a yes before anything is
 # filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
 # carries the composed submission, the public-issue warning and a question,
@@ -972,6 +980,13 @@
 # deployer: noop, no fixtures. Nightly from its first merge; a presubmit seat
 # waits on a clean nightly record.
 ./tasks/chat-feedback-offers-usage-summary/task.yaml
+
+# An operator whose install has no home channel asks why the thread gets
+# replies but no alerts, and how to set one: the answer explains the two
+# routes and names a way to set the home channel, offers no pull request or
+# overlay of its own, and posts no test notification (#3112).
+# `validated: false` until its first observed nightly runs.
+./tasks/chat-home-channel-answer-names-the-setting/task.yaml
 
 # An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
 # the Chat sibling of the Slack shortcut) is investigated without a clarifying
@@ -1129,6 +1144,15 @@
 # cluster. deployer: noop. Red until #4457 (the structured confirm) and #6168
 # (the persona's version-control skill) land; its record shows when they do.
 ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
+
+# A cluster profile task that names no repository finds the one it may use
+# (#6389): the same confirmed PodDisruptionBudget pull request as the case
+# above with the repository left unnamed, so the persona asks `identity` with
+# no repository and uses the install's one managed repository. Graded the
+# same way. Regression coverage: it passed on main's persona too (the
+# behaviour shipped with #6411). Pool installs manage exactly one repository (hack/ci-deploy.sh:
+# one forge and one GitOps repository per leased project).
+./tasks/cluster-profile-finds-the-managed-repository/task.yaml
 
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
@@ -1374,6 +1398,15 @@
 # projects. Nightly from the merge that removes its FIXTURE_NOT_READY entry.
 ./tasks/networking-world-open-ingress/task.yaml
 
+# The obtainability stream's `image-pull-failing` check (3.28), nightly from
+# the start: a per-run plant (`prebuilt/image-pull-failing`) of two Deployments
+# whose image pull the registry refuses, one through the node identity and one
+# through a named pull secret, graded on one finding of the check on each
+# reaching the ledger. The stack waits eleven minutes after the plant, since
+# the check names a pull only once it has failed for ten; priced at the 900s
+# audit band plus that wait. Not on the scored suite for the same wait.
+./tasks/obtainability-image-pull-failing/task.yaml
+
 # The obtainability audit's sweep opens a pull request for a major finding
 # with a declared workload: checkout-gateway's no-pdb fix, beside the
 # clusters/seeded-a/seeded-reliability/checkout-gateway.yaml declaration
@@ -1419,13 +1452,6 @@
 # carry on their roster entries (#1947). deployer: noop, no fixture; the run
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
-
-# post-merge-verified-fixed: the post-merge check's verify-after-merge loop
-# (#6343 case 1), the eval record for #6311. A writer: the check merges the
-# agent's no-pdb fix, applies it and drives the cron's ticks (post_merge.py).
-# Cost: each repetition holds a serial writers slot for the agent's turn plus
-# up to 15 minutes of ticks, about 45 minutes a night across three.
-./tasks/post-merge-verified-fixed/task.yaml
 
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease

@@ -27,7 +27,7 @@ import threading
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from providers import ForgeUnsupported, IdentityUnknown, MAX_PAGE_SIZE, WorkspaceError
 from providers.validate import MAX_CONVERSATION_SIZE
@@ -215,6 +215,27 @@ def install_commit_emails(host: str, app_login: str, app_id: str | None) -> froz
     if app_id and slug:
         emails.add(APP_NOREPLY_EMAIL.format(app_id=app_id, slug=slug))
     return frozenset(email.casefold() for email in emails)
+
+
+def commit_is_ours(
+    commit: Mapping[str, Any],
+    install_login: str = "",
+    install_emails: frozenset[str] | None = None,
+    *,
+    host: str = "",
+) -> bool:
+    """True when ``commit`` carries the install's login or one of its git author emails."""
+    author = str(commit.get("author") or "").strip()
+    install = _login_key(install_login)
+    if author and install and _login_key(author) == install:
+        return True
+    email = str(commit.get("email") or "").strip().casefold()
+    if not email:
+        return False
+    if install_emails is None:
+        app_id = os.environ.get(GITHUB_APP_ID_ENV, "").strip() or None
+        install_emails = install_commit_emails(host, install_login, app_id)
+    return email in install_emails
 
 
 def classify_touch(event: dict, install_login: str, install_emails: frozenset[str]) -> Touch | None:

@@ -40,6 +40,7 @@
       "runtimeClassName": ""
     "image":
       "tag": "latest"
+    "sizingProfile": "auto"
   "harness":
     "clusterName": "c"
     "hermes":

@@ -218,6 +218,24 @@ class ManagedScopeTest(unittest.TestCase):
              _env(**{chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack"}):
             self.assertEqual(cp.enabled_chat_platforms(), ["google_chat", "slack"])
 
+    def test_teams_counts_only_as_a_routed_platform(self):
+        # The gateway's Teams backend is a destination through its chat.notify
+        # route; the Hermes teams platform, which the managed scope may enable,
+        # is not one of this resolver's (its cron delivery is `deliver: teams`),
+        # so an install that stays on Hermes sees no change.
+        with _managed("platforms:\n  google_chat:\n    enabled: true\n"
+                      "  teams:\n    enabled: true\n"), _env():
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat"])
+        with _managed("platforms:\n  teams:\n    enabled: false\n"), \
+             _env(**{chat_notify.NOTIFY_PLATFORM_ENV: "teams"}):
+            self.assertEqual(cp.enabled_chat_platforms(), ["teams"])
+        with _managed("platforms:\n  google_chat:\n    enabled: false\n"), \
+             _env(**{chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,teams"}):
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat", "teams"])
+        with _managed("platforms:\n  teams:\n    enabled: true\n"), \
+             _env(TEAMS_HOME_CHANNEL="19:abc@thread.tacv2"):
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat"])
+
 
 class ConfigPathContractTest(unittest.TestCase):
     """Both path constants are copied rather than imported; neither may drift."""

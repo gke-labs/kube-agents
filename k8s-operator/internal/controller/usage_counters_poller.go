@@ -182,11 +182,12 @@ type UsageCounterPoller struct {
 	// The per-field pruning records are the reconciler's (prunedNewerFields
 	// there): the poller writes and reads them, and the usage gauges' publish
 	// reads them on every reconcile.
-	// gatewayMisses counts, per CR, the consecutive polls in which no gateway
-	// replica's body was read while the watcher is on: listeners failing, pods
-	// Pending or without an IP, or none running. At usageScrapeFailureEventStreak
-	// the poll clears the gauges to absent, the no current reading it is,
-	// rather than holding one that reads as current. In
+	// gatewayMisses counts, per CR, the consecutive polls with no fleet
+	// reading while the watcher is on: listeners failing, pods Pending or
+	// without an IP, none running, or every answering replica still building its
+	// initial watch set (k8s_event_watcher_watch_set_ready below 1). At
+	// usageScrapeFailureEventStreak the poll clears the gauges to absent, the no
+	// current reading it is, rather than holding one that reads as current. In
 	// memory, like streaks: a leader change delays the clear by one streak and
 	// never advances it.
 	gatewayMisses map[string]int
@@ -586,8 +587,12 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			})
 		}
 	}
-	// Whether any gateway replica's body was read this poll: a watcher body
-	// always carries a cluster reading, zero or not, and no other body does.
+	// Whether any gateway replica's body carried a fleet reading this poll: a
+	// watcher body carries a cluster reading once its watch set is built (zero
+	// or not), and no other body does. A watcher scraped while still building
+	// its watch set leaves Clusters nil, so it counts as a missed poll and
+	// holds prior readings until buildWatchSet finishes or the miss streak
+	// clears them.
 	gatewayRead := !eventWatcherEnabled(cached)
 	for _, s := range scraped {
 		if s.Clusters != nil {
