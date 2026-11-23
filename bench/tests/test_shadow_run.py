@@ -55,6 +55,7 @@ from kube_agents_bench.verifiers import AuditReportStoredVerifier
 REPO = Path(__file__).resolve().parents[2]
 AUDIT_REPORT = REPO / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
 REPORT_QUERY = REPO / "agents" / "platform" / "skills" / "fleet-audit-reports" / "scripts" / "report_query.py"
+INSTALL_SCRIPTS = REPO / "agents" / "platform" / "scripts"
 SCHEDULE_TYPES = REPO / "k8s-operator" / "api" / "v1alpha1" / "agentschedule_types.go"
 FINDINGS_ROWS = REPO / "bench" / "tf" / "prebuilt" / "findings-item" / "findings.json"
 AUDIT = "compliance-audit"
@@ -76,8 +77,8 @@ _spec.loader.exec_module(fq)
 
 # report_query.py's command line and answers, over one stream's tree: `show`
 # (the envelope without its document), `findings` (ids) and `finding` (one
-# whole). A shadow envelope is refused without --include-shadow, as readers do
-# once dev-5's reader change lands; a stream under several keys is refused.
+# whole), under the key --repo names. A shadow envelope is refused without
+# --include-shadow, as readers do once dev-5's reader change lands.
 FAKE_READER = r"""
 import glob, json, os, sys
 args = sys.argv[1:]
@@ -88,10 +89,16 @@ paths = sorted(glob.glob(os.path.join(root, stream, "*", "*", "latest.json")))
 def answer(payload):
     print(json.dumps(payload))
     sys.exit(2 if payload.get("error") else 0)
+if "--repo" in args:
+    named = args[args.index("--repo") + 1].lower()
+    path = os.path.join(root, stream, *named.split("/"), "latest.json")
+    if paths and path not in paths:
+        answer({"error": "no reports for %s in %s" % (stream, named), "repos": ["/".join(p.split(os.sep)[-3:-1]) for p in paths]})
+    paths = [path] if path in paths else []
 if not paths:
     answer({"error": "%s has no run stored" % stream})
 if len(paths) > 1:
-    answer({"error": "%s is stored for several repositories; pass --repo" % stream})
+    answer({"error": "%s publishes to several repositories; name one with --repo" % stream})
 repo = "/".join(paths[0].split(os.sep)[-3:-1])
 envelope = json.load(open(paths[0]))
 if envelope.get("shadow") is True and not include:
@@ -137,6 +144,20 @@ def _gateway(state: dict[str, Any] | None, queue: list[dict[str, Any]] | None = 
     return shell
 
 
+def _register(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repos: list[tuple[str, str]], gitops: tuple[str, str] | None = None) -> None:
+    """The gitops-state ConfigMap's managed_repos (and gitops_repo) as files, where gitops_workspace reads them off-pod."""
+    state = tmp_path / "gitops"
+    state.mkdir(exist_ok=True)
+    entries = [{"type": "github", "url": f"https://github.com/{owner}/{name}"} for owner, name in repos]
+    (state / "managed_repos").write_text(json.dumps(entries), encoding="utf-8")
+    key = state / "gitops_repo"
+    if gitops is not None:
+        key.write_text(json.dumps({"type": "github", "url": f"https://github.com/{gitops[0]}/{gitops[1]}"}), encoding="utf-8")
+    elif key.exists():
+        key.unlink()
+    monkeypatch.setenv("GITOPS_STATE_PATH", str(state / "managed_repos"))
+
+
 @pytest.fixture
 def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     store = tmp_path / "reports"
@@ -145,6 +166,9 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     reader.write_text(FAKE_READER, encoding="utf-8")
     monkeypatch.setattr(verifiers, "REPORT_STORE_ROOT", str(store))
     monkeypatch.setattr(shadow_run, "READER_PATH", str(reader))
+    # The install's managed repositories, read by the image's own gitops_workspace.
+    monkeypatch.setattr(shadow_run, "INSTALL_SCRIPTS_DIR", str(INSTALL_SCRIPTS))
+    _register(tmp_path, monkeypatch, [INSTALL_KEY])
     monkeypatch.setattr(oobe, "agent_shell", _gateway(_fired_state()))
     # The roster check's pods hold nothing here: the shadow read is the gateway's alone.
     monkeypatch.setattr(onboarding, "sandbox_shell", _silent_shell)
@@ -267,13 +291,83 @@ def test_a_reader_that_refuses_its_arguments_is_an_error_naming_it(root, tmp_pat
     assert "unrecognized arguments: --include-shadow" in result.reason
 
 
-def test_a_stream_under_two_keys_is_refused_by_the_reader(root):
-    """A profile writes under the install's key alone; a second key is not read past."""
-    _store(root, CANARY, _shadow_envelope(CANARY))
-    _store(root, CANARY, _shadow_envelope(CANARY), key=("no_forge", "local"))
+def test_a_document_under_another_key_fails(root):
+    """The broker lets a profile write under the install's key alone: a document under any other is not this run's."""
+    _store(root, CANARY, _shadow_envelope(CANARY), key=("other-org", "other-repo"))
     result = _shadow()
     assert result.status == "fail"
-    assert "several repositories" in result.reason
+    assert "no reports for compliance-audit-canary in acme/fleet-gitops" in result.reason
+
+
+def test_the_install_keys_document_is_read_beside_another_keys(root):
+    _store(root, CANARY, _shadow_envelope(CANARY, document={"findings": [{"id": "elsewhere"}]}), key=("other-org", "other-repo"))
+    _store(root, CANARY, _shadow_envelope(CANARY))
+    result = _shadow()
+    assert result.status == "pass", result.reason
+    assert [entry["repo"] for entry in result.raw["stored"]] == ["acme/fleet-gitops"]
+
+
+def test_the_read_names_the_install_key_with_repo(root, monkeypatch):
+    seen: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if script.startswith("cat "):
+            return json.dumps(_fired_state())
+        seen.append(script)
+        return _local_shell(script, timeout)
+
+    monkeypatch.setattr(oobe, "agent_shell", shell)
+    _store(root, CANARY, _shadow_envelope(CANARY))
+    assert _shadow().status == "pass"
+    assert shadow_run.INSTALL_SCRIPTS_DIR in seen[0]
+
+
+def test_an_install_with_no_repository_reads_the_no_forge_key(root, tmp_path, monkeypatch):
+    _register(tmp_path, monkeypatch, [])
+    _store(root, CANARY, _shadow_envelope(CANARY), key=tuple(shadow_run.NO_FORGE_REPO.split("/")))
+    assert _shadow().status == "pass"
+    # And a document under a repository's key is not it.
+    _register(tmp_path, monkeypatch, [])
+    (root / CANARY / "no_forge").rename(root / "elsewhere")
+    _store(root, CANARY, _shadow_envelope(CANARY))
+    assert _shadow().status == "fail"
+
+
+def test_with_several_repositories_the_gitops_one_is_the_key(root, tmp_path, monkeypatch):
+    second = ("acme", "apps")
+    _register(tmp_path, monkeypatch, [INSTALL_KEY, second], gitops=second)
+    _store(root, CANARY, _shadow_envelope(CANARY))
+    assert _shadow().status == "fail"
+    _store(root, CANARY, _shadow_envelope(CANARY), key=second)
+    assert _shadow().status == "pass"
+
+
+def test_with_several_repositories_and_no_gitops_one_the_key_is_no_forge(root, tmp_path, monkeypatch):
+    _register(tmp_path, monkeypatch, [INSTALL_KEY, ("acme", "apps")])
+    _store(root, CANARY, _shadow_envelope(CANARY))
+    assert _shadow().status == "fail"
+    _store(root, CANARY, _shadow_envelope(CANARY), key=tuple(shadow_run.NO_FORGE_REPO.split("/")))
+    assert _shadow().status == "pass"
+
+
+def test_an_install_key_that_cannot_be_read_is_an_error(root, tmp_path, monkeypatch):
+    empty = tmp_path / "no-scripts"
+    empty.mkdir()
+    monkeypatch.setattr(shadow_run, "INSTALL_SCRIPTS_DIR", str(empty))
+    _store(root, CANARY, _shadow_envelope(CANARY))
+    result = _shadow()
+    assert result.status == "error"
+    assert "the install's store key could not be read" in result.reason
+
+
+def test_the_install_scripts_dir_holds_gitops_workspace_in_the_image():
+    dockerfile = (REPO / "deploy" / "docker" / "Dockerfile").read_text()
+    assert re.search(r"^COPY .*agents/platform/scripts/ .*" + re.escape(shadow_run.INSTALL_SCRIPTS_DIR) + "/", dockerfile, re.M)
+    assert (INSTALL_SCRIPTS / "gitops_workspace.py").exists()
+
+
+def test_the_no_forge_key_is_audit_reports():
+    assert re.search(r'^NO_FORGE_REPO = "([^"]+)"', AUDIT_REPORT.read_text(), re.M).group(1) == shadow_run.NO_FORGE_REPO
 
 
 def test_a_live_envelope_on_the_stream_fails_on_shadow(root):

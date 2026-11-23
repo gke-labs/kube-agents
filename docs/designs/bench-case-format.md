@@ -485,7 +485,8 @@ value given (`required_envelope: {precheck: unchanged}` reads the envelope's own
 stream (`stream`, required: the AgentSchedule's name for a scheduled canary, or `<audit>-shadow` for a run
 started by hand; never a live audit's stream), read on the gateway pod, where the broker's report-store
 listener writes, with the install's own `report_query.py --include-shadow` (readers refuse a shadow
-envelope without it), and holds the envelope to `shadow: true`, `shadow_stream` naming the stream and
+envelope without it) and `--repo` naming the install's own store key, the one key the broker lets a
+profile write under, and holds the envelope to `shadow: true`, `shadow_stream` naming the stream and
 `audit_id` naming `audit`; `required_finding_phrases` is required. Beside it, `findings_queue_untouched` fails on any
 findings-queue row registered, registered again or verified since the bound, and
 `schedule_report_not_posted` reads an AgentSchedule's `status.recentRuns` and fails when the fired run's

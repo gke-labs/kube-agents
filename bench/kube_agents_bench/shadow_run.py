@@ -37,8 +37,10 @@ run's start:
     sends it, onto the agent PVC under ``/opt/data/fleet-audit/reports``, which
     the gateway's agent container mounts too. The read is a ``kubectl exec``
     there running the install's own reader, ``report_query.py`` from the
-    root-owned image copy, with ``--root`` on that tree and
-    ``--include-shadow``: readers refuse a shadow run's envelope without it.
+    root-owned image copy, with ``--root`` on that tree, ``--repo`` naming the
+    install's own store key (decided as the broker decides it, from the
+    gitops-state ConfigMap), and ``--include-shadow``: readers refuse a shadow
+    run's envelope without it.
     The listener's HTTP routes take only the broker's audience-bound token,
     which the harness does not hold and does not need.
 ``findings_queue_untouched``
@@ -91,6 +93,13 @@ READER_PATH = "/opt/platform-template/skills/fleet-audit-reports/scripts/report_
 # report_query.py: INCLUDE_SHADOW_FLAG. Readers refuse a shadow run's envelope
 # without it; the canary's comparison and its eval pass it.
 INCLUDE_SHADOW_FLAG = "--include-shadow"
+# Where the agent image keeps gitops_workspace.py (deploy/docker/Dockerfile copies
+# agents/platform/scripts to /opt/defaults/scripts), the reader of the
+# gitops-state ConfigMap mounted at /etc/gitops in the gateway's agent container.
+INSTALL_SCRIPTS_DIR = "/opt/defaults/scripts"
+# audit_report.py: NO_FORGE_REPO, the store key an install with no publish
+# repository writes under (credential_proxy.REPORT_NO_FORGE_STORE_KEY decoded).
+NO_FORGE_REPO = "no_forge/local"
 # Far above any document's finding count; report_query's `findings` caps here.
 READER_FINDINGS_LIMIT = 10000
 SHADOW_READ = "__SHADOW_REPORT_READ__"
@@ -103,14 +112,41 @@ SHADOW_READ = "__SHADOW_REPORT_READ__"
 # answering at all (not JSON: a reader that refused its arguments). A reader
 # answer that is an error (no run stored, a shadow envelope refused) is an
 # entry with `error`, which grades as unread.
-# argv: reader, root, stream, flag, limit, keys (JSON), excerpt phrases (JSON or ""), sentinel.
+#
+# Every question names the install's own store key with --repo, decided as the
+# broker decides the one key a profile may write under
+# (credential_proxy.report_publish_store_key_for, over
+# gitops_workspace.get_managed_repos and get_gitops_repo): no managed
+# repository is no_forge; exactly one is that one; several is the gitops_repo
+# one when the key names a registered repository, else no_forge. A list that
+# cannot be read is an error, as the broker refuses the write then.
+# argv: reader, root, stream, flag, limit, keys (JSON), excerpt phrases (JSON or ""),
+# scripts dir, no-forge repo, sentinel.
 _SHADOW_DRIVER = r"""
 import json, subprocess, sys
-reader, root, stream, flag, limit, keys, phrases, sentinel = sys.argv[1:9]
+reader, root, stream, flag, limit, keys, phrases, scripts, no_forge, sentinel = sys.argv[1:11]
 keys = json.loads(keys)
 phrases = json.loads(phrases) if phrases else None
+out = {"envelopes": [], "error": None, "install_repo": None}
+try:
+    sys.path.insert(0, scripts)
+    import gitops_workspace
+    managed = list(gitops_workspace.get_managed_repos())
+    if not managed:
+        install = no_forge
+    elif len(managed) == 1:
+        install = managed[0]
+    else:
+        chosen = gitops_workspace.get_gitops_repo(managed) if gitops_workspace.gitops_repo_key_text() else None
+        install = chosen or no_forge
+except Exception as exc:
+    print(sentinel + json.dumps(dict(out, error="the install's store key could not be read: %s: %s" % (type(exc).__name__, exc))))
+    sys.exit(0)
+out["install_repo"] = install
 def ask(*args):
-    done = subprocess.run([sys.executable, reader, *args, "--root", root, flag], capture_output=True, text=True)
+    done = subprocess.run(
+        [sys.executable, reader, *args, "--root", root, "--repo", install, flag], capture_output=True, text=True
+    )
     try:
         payload = json.loads(done.stdout.strip().splitlines()[-1])
     except (IndexError, ValueError):
@@ -119,7 +155,6 @@ def ask(*args):
     if not isinstance(payload, dict):
         return None, "report_query.py %s printed no JSON object" % args[0]
     return payload, payload.get("error")
-out = {"envelopes": [], "error": None}
 show, err = ask("show", stream)
 if show is None:
     out["error"] = err
@@ -219,6 +254,8 @@ def shadow_read_command(stream: str, keys: tuple[str, ...], phrases: list[str] |
         str(READER_FINDINGS_LIMIT),
         json.dumps(list(keys)),
         json.dumps(phrases) if phrases is not None else "",
+        INSTALL_SCRIPTS_DIR,
+        NO_FORGE_REPO,
         SHADOW_READ,
     ]
     return (
@@ -257,20 +294,27 @@ class ShadowReportStoredVerifier(_StoredReportVerifier):
     canary, or ``<audit>-shadow`` for a run started by hand. It must be a store
     stream name and not a live audit's stream, as ``audit_report.shadow_stream``
     refuses one; ``audit`` keeps the roster rule. Reads the stream's newest
-    envelope in the gateway pod's report store with the install's
-    ``report_query.py --include-shadow`` (the stream's one repository
-    directory, the install's own store key for a profile's write; a stream
-    under several is refused by the reader), and grades it as
+    envelope under the install's own store key in the gateway pod's report
+    store, with the install's ``report_query.py --include-shadow --repo
+    <key>``. The key is decided as the broker decides the only key a profile
+    may write under, from the gitops-state ConfigMap the gateway mounts, so a
+    document under any other key is not this run's and is not read. It grades
+    the envelope as
     ``audit_report_stored`` does (the window, the start bound, ``status``,
     ``required_envelope``, the finding and evidence phrases), holding it to
     ``shadow: true``, ``shadow_stream: <stream>`` and ``audit_id: <audit>`` as
     well. A named finding is required: a shadow report with no finding the
     case planted says nothing about the audit.
 
+    Scope: a scheduled canary, whose profile worker writes through the broker
+    onto the gateway pod's store. A hand run's ``<audit>-shadow`` stream
+    written by a shell on the sandbox pod's own store is not read.
+
     No envelope from this run, or a reader that answered the stream holds
-    none, is a fail. A pod that cannot be read, a reader that refuses its
-    arguments (one without ``--include-shadow``), an unreadable state file or
-    a run with no start time is ``status="error"``.
+    none under the install's key, is a fail. A pod that cannot be read, an
+    install key that cannot be read, a reader that refuses its arguments (one
+    without ``--include-shadow``), an unreadable state file or a run with no
+    start time is ``status="error"``.
     """
 
     type: Literal["shadow_report_stored"]
