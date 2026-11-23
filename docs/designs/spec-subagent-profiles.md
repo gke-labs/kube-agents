@@ -613,9 +613,11 @@ change that mode refuses: a mutating verb, as the command policy resolves it, th
 a local render or, under `read-only-dry-run`, a server-side dry run. It reads the argv and
 the exit code, never kubectl's output. The adapter makes each turn's record file empty
 under the pod's scratch directory before the turn's harness starts, so one turn's record
-never stops the next. The wrapper can't tell which side refused, so the reason says a
-change was attempted and not made because writes are refused here, not that a server
-refused it. A writable kube-proxy mode, or none, records nothing.
+never stops the next. The wrapper can't tell which side refused, or whether kubectl
+reached the proxy at all, so the reason says a change was attempted and not made, and that
+writes are refused here, not that a server refused it. On a session pod the adapter counts
+only the wrapper's own rule, with a verb of one or two lowercase words, since the reason's
+verb is shown in chat and the record file is the harness's to write. A writable kube-proxy mode, or none, records nothing.
 
 **Evicted.** Node drains, spot preemptions, and GKE upgrades deliver `SIGTERM` with a
 grace period, and the adapter MUST trap it: flush the pending output buffer, publish

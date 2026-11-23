@@ -449,7 +449,9 @@ leave open:
   each tool-result line the worker reads the file. At the first record it stops the harness
   (closed stdin, SIGTERM to its process group, SIGKILL after the kill grace) and ends the task
   `rejected` with `reason: write-refused`, whose detail names the record's rule and verb and
-  carries no other output. A `gcp.read-only` refusal, a refused read spelling, a local render, an
+  carries no other output. The gateway shows that detail in chat after "🚫 the executor rejected
+  the task". A session pod's turn stops the same way at its first kubectl write attempt
+  ([the subagent spec](spec-subagent-profiles.md), "Stopped at a write refusal"). A `gcp.read-only` refusal, a refused read spelling, a local render, an
   MCP relay refusal and an API 403 don't stop the task. The broker refuses the write whether or
   not the task stops, so a lost record only lets the task run on. Every route a definitive write
   refusal can take to the model runs through the client: `kubectl` and `gcloud` on a profile
