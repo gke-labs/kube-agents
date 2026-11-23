@@ -520,8 +520,9 @@ leave open:
   so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
-  the dispatch config's `profileSupervisorForm` is `profile`; readers read both; contract
-  addendum 6, #5301), never its `.events`, which stays
+  the dispatch config's `profileSupervisorForm` is `profile`; readers read both, until a reader
+  given `A2A_PROFILE_SUPERVISOR_CUTOFF` stops taking the five-token form as a profile task's
+  terminal when the server stored it after that time; contract addendum 6, #5301), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,

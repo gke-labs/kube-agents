@@ -469,7 +469,12 @@ the clusters after that point wait for a later run. A call that fails costs
 only its own clusters. Every cluster in a call is stamped in the ledger
 (`cluster_runs`) however the call ended; the least recently stamped go first,
 and clusters stamped together are shuffled by the run's date so batch
-membership changes from run to run. Projects go least recently swept first
+membership changes from run to run. On a tick that swept at least one target,
+`cluster_runs` entries for clusters outside the current sweep's targets
+(`LEEWAY_WATCH_CLUSTERS` or the target projects) whose timestamp is unparseable
+or older than twice the refresh window (`2 * LEEWAY_WATCH_REFRESH_DAYS`) are
+dropped so clusters removed from `LEEWAY_WATCH_CLUSTERS` or from projects that
+leave the scope do not accumulate. Projects go least recently swept first
 (`project_runs`): a project whose turn starts with a full 15 minutes is
 stamped then and rotates behind the others, so a project too big for one tick
 is covered over the next ticks without starving the rest. A project's turn

@@ -868,7 +868,12 @@ commented on, labelled or closed in the window is not a write: an `updated_at` m
 push is read against the head commit and noted, not counted. And the branch listing wants
 `contents: read`, which the grading mint carries since #5519; a listing GitHub refuses is a note
 in the reason, not an error, and the check grades on pull requests alone. An unreadable pull-request listing — a 401, a denial, a repository the
-credential cannot see, an API it could not reach — is `status: "error"`, never a pass. Every call
+credential cannot see, an API it could not reach — is `status: "error"`, never a pass. So is a
+repetition with a command past the shell reader's limit (command lines nested deeper than the
+reader reads, or more reading than the line's budget), when a write that must be attributed by
+name is named by nothing that was read and no charged write decides the result: the calls that
+create a branch or a pull request are read from the argvs of each command, and such a command
+has none. Every call
 goes through one client with an injectable transport (`bench/kube_agents_bench/github_writes.py`),
 and the same module lists a run's leftovers for the job log after the fan-out; it closes nothing:
 the job's repository reset does, before each unit that may write

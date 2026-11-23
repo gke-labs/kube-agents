@@ -586,7 +586,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 			// setting sources) after the base argv, which carries none.
 			cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
 			cfg.HarnessCommandNoDelegate = nil
-			cfg.HarnessEnv = append(cfg.HarnessEnv, "CLAUDE_CONFIG_DIR="+dir)
+			cfg.HarnessEnv = append(cfg.HarnessEnv, cfg.driver().ConfigDirEnv(dir))
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)

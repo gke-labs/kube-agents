@@ -26,11 +26,13 @@ from tests.test_install_script import (
     _INSTALL_SH,
     _INSTALLER_COMMON,
     _REPO_ROOT,
+    _HOST_TOOL_MARKER,
+    _HOST_TOOL_PROBE,
     _run_installer_bash,
 )
 # The module, not the class: a TestCase imported by name is collected here too.
 from tests import test_installer_common as _installer_common
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _SENTINEL = "glpat-SENTINEL-7d1f0c9e4b2a"
 _READ_SENTINEL = "glpat-READONLY-3a9e5b1c7f20"
@@ -1021,12 +1023,20 @@ class GitLabThroughMainTest(unittest.TestCase):
 
     def _main(self, *args):
         body = (
+            f"{_HOST_TOOL_PROBE}"
             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
             f"main {' '.join(shlex.quote(a) for a in args)} && rc=0 || rc=$?\n"
             'echo "rc=$rc"\n'
         )
-        env = get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._install_env)})
-        return _run_installer_bash(body, env)
+        # main runs with no dry run. If the forge check did not stop it, step
+        # one would start the host's git, gcloud and terraform, and a package
+        # manager for a tool that is missing. The PATH has none of them.
+        env = get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(self._install_env),
+            "PATH": str(create_minimal_tools_bin(self._tmp, exclude=("git",)))})
+        proc = _run_installer_bash(body, env)
+        self.assertNotIn(_HOST_TOOL_MARKER, proc.stdout)
+        return proc
 
     def test_a_github_app_with_gitlab_is_refused_before_step_one(self):
         proc = self._main(

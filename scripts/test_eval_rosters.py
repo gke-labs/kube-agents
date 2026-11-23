@@ -895,6 +895,10 @@ INJECT_LANE_REQUESTING = [
     # cluster profile for the no-pdb pull request; its objective's
     # pull_request_opened leaf allows one.
     "cluster-profile-confirmed-pdb-pull-request",
+    # cluster-profile-finds-the-managed-repository: the same ask with the
+    # repository unnamed (#6389); its objective's pull_request_opened leaf
+    # allows one.
+    "cluster-profile-finds-the-managed-repository",
     # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
     # may propose the change as a pull request; its objective's
     # pull_request_opened leaf allows one.
