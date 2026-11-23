@@ -958,7 +958,7 @@ func TestKillSessionSparesTheWorkerListedInTheSession(t *testing.T) {
 	cmd.Env = append(os.Environ(), killSessionSelfEnv+"="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("the sweep over a session listing the worker ended it: %v\n%s", err, out)
+		t.Fatalf("the child failed (signal: killed means the sweep killed the worker): %v\n%s", err, out)
 	}
 	if !strings.Contains(string(out), killSessionSweptMarker) {
 		t.Fatalf("the child never swept the session:\n%s", out)
