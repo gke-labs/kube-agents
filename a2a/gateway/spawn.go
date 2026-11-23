@@ -913,7 +913,9 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 		limit++
 		replaces = rec.PodName
 	}
-	if live < limit && !behind {
+	// A turn replacing its own pod frees one as it takes one, so it need
+	// not wait behind the line.
+	if live < limit && (!behind || replacing) {
 		g.holdCapSlot(rec.Key, replaces)
 		if own != nil {
 			after = append(after, g.capAdmit(own))

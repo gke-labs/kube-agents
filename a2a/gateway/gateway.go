@@ -328,8 +328,11 @@ type Gateway struct {
 	// by its try's id until that turn ends and replays them (capRetryDone).
 	// capWaitOverride and capPollOverride, when positive, stand in for
 	// sessionCapWaitMax and sessionCapQueuePoll (tests only).
-	capQueue        []*capWaiter
-	capTicket       uint64
+	capQueue  []*capWaiter
+	capTicket uint64
+	// capStopped, guarded by capMu, is set once the stop has refused the
+	// line (refuseParkedAtStop); no turn parks after it.
+	capStopped      bool
 	capAdmitted     map[uint64][]InboundMessage
 	capKick         chan struct{}
 	capWaitOverride atomic.Int64
@@ -1481,7 +1484,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// (probeConversation) reports the same facts and heals nothing: the
 	// heal writes the record under this conversation's lock, and a read
 	// that also wrote would be a second writer racing the next turn.
-	g.healActiveTask(ctx, rec)
+	// A wake the heal starts checks the cap for itself, never parking this
+	// turn: the turn meets the cap on its own route below.
+	g.healActiveTask(withoutParking(ctx), rec)
 	// A card-stop control past its bound whose timer this process never
 	// held (it started before a restart) is given up here, before the stop
 	// switch reads it as in flight.

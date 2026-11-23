@@ -806,6 +806,89 @@ func TestAHeadPastTheBoundWithAPodListErrorIsAnsweredOnce(t *testing.T) {
 	}
 }
 
+// A turn whose heal wakes the session at the cap is not parked by the
+// wake's cap check: the wake is refused on its own, and the turn parks once,
+// on its own route, with nothing queued behind it.
+func TestAHealsWakeAtTheCapDoesNotParkTheTurn(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-heal-wake-cap"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+	r2, spawn2 := restartRig(t, r, func() {
+		completeTask(t, cexec, "fleet is green")
+		drainRelayDurable(t, r.url)
+		r.g.cfg.MaxSessions = 1
+		r.g.cfg.DefaultAddressee = RouteSession
+	})
+	spawn2.mu.Lock()
+	spawn2.liveSpawns = true
+	spawn2.live = 2
+	spawn2.mu.Unlock()
+
+	sessionRigTurn(r2, conv, "h-heal", "check the nodes")
+	waitFor(t, "the heal's status card", postedContaining(r2, "🔎 task `"+child.TaskID+"` is **completed**"))
+	waitFor(t, "the turn in line", func() bool { return r2.g.parkedAtCap(conv) })
+	time.Sleep(200 * time.Millisecond)
+	if n := followUpsOf(r2, conv); n != 0 {
+		t.Fatalf("%d follow-ups behind the parked turn; the turn was parked by the wake and queued behind itself", n)
+	}
+	r2.adapter.mu.Lock()
+	notices := 0
+	for _, p := range r2.adapter.posts {
+		if p.Conversation == conv && strings.HasPrefix(p.Text, "⏳ **queued**") {
+			notices++
+		}
+	}
+	r2.adapter.mu.Unlock()
+	if notices != 1 {
+		t.Fatalf("%d queued notices, want 1", notices)
+	}
+}
+
+// A turn replacing its own pod frees a slot as it takes one, so it starts
+// with a line waiting, as it did before the line existed.
+func TestAReplacingTurnNeedNotWaitBehindTheLine(t *testing.T) {
+	t.Parallel()
+	r, spawn, _ := queueRig(t, 1)
+	waiting := "discord:g1/t-replace-waiting"
+	say(r, waiting, "m1", "check the fleet")
+	waitFor(t, "the waiter's notice", noticeReads(r, waiting, sessionQueuedNext))
+
+	conv := "discord:g1/t-replace-own"
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-replace", Kind: "group",
+		Addressee: "chat-otter-bbbb", BusSession: "chat-otter-bbbb",
+		PodName: "chat-otter-bbbb",
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m2", Text: "Delegate: try again"}
+	waitFor(t, "the replacement spawn", func() bool { return len(spawn.calls()) == 1 })
+	if queuedNoticeOf(r, conv) != "" {
+		t.Fatal("the replacing turn was queued")
+	}
+	if !r.g.parkedAtCap(waiting) {
+		t.Fatal("the waiter left the line")
+	}
+}
+
+// After the stop has refused the line, a turn reaching the cap check is
+// refused rather than parked where nothing would answer it.
+func TestNoTurnParksAfterTheStopRefusedTheLine(t *testing.T) {
+	t.Parallel()
+	r, _, _ := queueRig(t, 1)
+	r.g.refuseParkedAtStop()
+	conv := "discord:g1/t-after-stop"
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the cap refusal", postedContaining(r, "🚦 not started: 1 session worker is already running (cap 1)"))
+	if r.g.parkedAtCap(conv) || queuedNoticeOf(r, conv) != "" {
+		t.Fatal("a turn parked after the stop")
+	}
+}
+
 // capLineLen is how many turns are in the session-cap line.
 func capLineLen(r *rig) int {
 	r.g.capMu.Lock()

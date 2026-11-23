@@ -145,6 +145,13 @@ func withParkableTurn(ctx context.Context, msg InboundMessage) context.Context {
 	return context.WithValue(ctx, capParkKey{}, msg)
 }
 
+// withoutParking is ctx with no turn to park, for a cap check made on the
+// turn's way but not for it (the heal's wake): parking the turn there would
+// leave it in line and also queued behind itself as its own follow-up.
+func withoutParking(ctx context.Context) context.Context {
+	return context.WithValue(ctx, capParkKey{}, nil)
+}
+
 func parkableTurn(ctx context.Context) (InboundMessage, bool) {
 	msg, ok := ctx.Value(capParkKey{}).(InboundMessage)
 	return msg, ok
@@ -275,7 +282,9 @@ func (g *Gateway) dequeueLocked(w *capWaiter) {
 // parkLocked puts msg at the back of the line as a new waiter, or reports
 // nil with the line full. The caller holds capMu.
 func (g *Gateway) parkLocked(key string, msg InboundMessage) *capWaiter {
-	if len(g.capQueue) >= sessionCapQueueMax {
+	// After the stop has refused the line, nothing joins it: a turn parked
+	// then would never be told it was not started.
+	if g.capStopped || len(g.capQueue) >= sessionCapQueueMax {
 		return nil
 	}
 	msg.capRetry, msg.capReplay = 0, false
@@ -337,7 +346,7 @@ func (g *Gateway) capKeepOrGiveUp(w *capWaiter, after *[]func()) bool {
 }
 
 // capPark parks msg for key at the back of the line, or reports false with
-// the line full. Its notice goes out after the check.
+// the line full or the gateway stopping. Its notice goes out after the check.
 func (g *Gateway) capPark(key string, msg InboundMessage, after *[]func()) bool {
 	g.capMu.Lock()
 	w := g.parkLocked(key, msg)
@@ -628,6 +637,7 @@ func (g *Gateway) capQueueLoop(ctx context.Context) {
 // not posted by then is lost the way a turn in flight would be.
 func (g *Gateway) refuseParkedAtStop() {
 	g.capMu.Lock()
+	g.capStopped = true
 	line := g.capQueue
 	g.capQueue = nil
 	for _, w := range line {
