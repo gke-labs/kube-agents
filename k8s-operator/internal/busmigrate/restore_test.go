@@ -233,8 +233,9 @@ func TestARestoredStreamOutsideItsPolicyIsDeleted(t *testing.T) {
 	// the account's then empty streams directory in a goroutine it does not
 	// wait for, and an add that lands in that removal fails with "error
 	// creating store for stream". The test adds TASKS again straight after
-	// its delete, which the restore itself never does without retrying
-	// (cli.go's restoreAllDirected).
+	// its delete. The restore adds nothing after this delete, and after its
+	// one other delete it adds again only inside its retry loop (cli.go's
+	// restoreAllDirected).
 	if _, err := js.AddStream(&nats.StreamConfig{Name: "KEPT", Subjects: []string{"kept.>"}}); err != nil {
 		t.Fatal(err)
 	}
