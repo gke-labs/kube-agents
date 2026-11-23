@@ -282,7 +282,11 @@ def _replay() -> pushed_report.Replay:
 
 
 def _context_the_nudge_stores(tmp_path: Path) -> str:
-    """What the nudge stores for its thread when it names the stack's rows: its text, then the ids."""
+    """What the nudge stores for its thread when it names the five rows of findings.json: its text, then the ids.
+
+    The queue here holds those five rows only. The reply case's twin stands for a finding that
+    entered the queue after the message was posted, so the message's context does not hold it.
+    """
     from datetime import datetime, timezone
 
     served = _Queue(tmp_path / "nudge.db")
@@ -294,7 +298,7 @@ def _context_the_nudge_stores(tmp_path: Path) -> str:
     return _nudge().build_nudge(plan, open_items, False, rows=rows).card["thread_context"]
 
 
-def test_the_replys_stored_context_is_what_the_nudge_writes_for_the_planted_rows(tmp_path: Path) -> None:
+def test_the_replys_stored_context_is_what_the_nudge_writes_for_the_rows_the_message_named(tmp_path: Path) -> None:
     assert _replay().report == _context_the_nudge_stores(tmp_path)
 
 

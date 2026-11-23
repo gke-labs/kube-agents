@@ -22,10 +22,10 @@
 # In findings.json, three rows share check, project and cluster, so they are one
 # gathered line of the nudge's message; findings-decision-covers-item's prompt names
 # the id of only one of them, and findings-decision-reply-names-no-id's names none.
-# findings-twin.json is those five rows and one more: the gathered line's first row
-# again under another project, which no message of the case names.
 # The other two share the project and differ in cluster or in check, so they are
 # lines of their own, and a decision on the first line must leave them alone.
+# findings-twin.json is those five rows and one more: the gathered line's first row
+# again under another project, which no message of the case names.
 # findings-unnamed.json has the same shape under its own project, with a fourth
 # row on the first line left `queued`.
 #
@@ -36,15 +36,16 @@
 # `first_shown_at`: the item-wide decision does not read it, and marking rows as
 # the paced publisher would spend a day's addition budget on the install.
 #
-# The project and clusters are invented names only these cases use. Nothing in
-# the fleet carries them, and the teardown resolves every open row under that
-# project. A plant that fails part-way runs the same teardown before it exits,
+# The projects and clusters are invented names only these cases use. Nothing in
+# the fleet carries them, and the teardown resolves every open row under the
+# rows' projects. A plant that fails part-way runs the same teardown before it exits,
 # because Terraform skips the destroy of a resource whose create failed.
 #
 # While the rows are planted, the install's nudge may name them in its next
 # message, like any other open finding. They are planted at a non-critical
-# severity on three lines, so one nudge run may add all three, up to the day's
-# non-critical limit. The run's decision or the teardown closes them.
+# severity on three lines (four with findings-twin.json), so one nudge run may
+# add them up to the day's non-critical limit. The run's decision or the
+# teardown closes them.
 
 terraform {
   required_version = ">= 1.5.0"

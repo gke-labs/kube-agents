@@ -1207,10 +1207,12 @@
 # card keeps the ids out of its text and in the context stored for its thread,
 # so the reply reaches a finding through a model's read of that context. A
 # replay stores the context the nudge writes for prebuilt/findings-item's rows
-# and sends "dismiss the readiness probe one on bench-shop-east"; the named
-# line has to end up dismissed and the same check on bench-shop-west has to
-# stay open. Inject door only, as every pushed-report replay; no fixture; the
-# host install.
+# and sends "dismiss the readiness probe one on bench-shop-east". The plant
+# (findings-twin.json) also holds a twin of the named line under another
+# project, which the context does not name. The named line has to end up
+# dismissed; the twin and the same check on bench-shop-west have to stay open.
+# Inject door only, as every pushed-report replay; no fixture; the host
+# install.
 ./tasks/findings-decision-reply-names-no-id/task.yaml
 
 # The first-install hello when the report was filed as a ledger issue before
