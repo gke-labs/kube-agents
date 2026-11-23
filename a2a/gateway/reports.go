@@ -70,6 +70,20 @@ const (
 // once more.
 const pushedReportsConsumedMax = 4 * pushedReportsConversationsMax
 
+const (
+	// reportMissTTL is how long a bucket read that found no row at an
+	// address stands before the address is read again, so a thread that
+	// never had a report doesn't pay a bucket read on every turn. On the
+	// session route only the active gateway writes report rows today, and
+	// put drops the cached miss for every address it writes, so a miss can
+	// go stale only through another writer; the TTL bounds how long such a
+	// writer's row (a scheduled-report source, say) goes unread.
+	reportMissTTL = 10 * time.Minute
+	// reportMissesMax bounds the cached misses, the oldest dropped first
+	// (notifyUpdates' conversation bound).
+	reportMissesMax = pushedReportsConversationsMax
+)
+
 // pushedReports is the cache: per conversation, its last reports in order,
 // each with the root of the task it reported on.
 type pushedReports struct {
@@ -89,6 +103,11 @@ type pushedReports struct {
 	// so a report the bounds forgot is still read from the bucket.
 	consumed      map[string]time.Time
 	consumedOrder []string
+	// misses is, per row key a bucket read found empty, when the miss was
+	// seen: the key is not read again until reportMissTTL has passed or
+	// put writes there. missOrder bounds it (reportMissesMax).
+	misses    map[string]time.Time
+	missOrder []string
 
 	// durable is the bucket side (gatewayReports); nil keeps reports in
 	// memory alone. log logs its failures; nil is slog.Default.
@@ -164,6 +183,9 @@ func (p *pushedReports) put(conversation, root, text string) {
 	if !ok {
 		return
 	}
+	p.mu.Lock()
+	p.dropMissLocked(addr.Key())
+	p.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), reportStoreTimeout)
 	defer cancel()
 	err := p.durable.PutReport(ctx, &lib.ReportRecord{
@@ -261,18 +283,72 @@ func (p *pushedReports) stored(conversation, root string, want func(*lib.ReportR
 	ctx, cancel := context.WithTimeout(context.Background(), reportStoreTimeout)
 	defer cancel()
 	for _, addr := range addrs {
+		key := addr.Key()
+		if p.missCached(key) {
+			continue
+		}
 		rec, err := p.durable.GetReport(ctx, addr)
 		if err != nil {
 			p.logger().Warn("stored pushed report not read; the turn runs on what memory holds",
-				"conversation", conversation, "root", root, "key", addr.Key(), "err", err)
+				"conversation", conversation, "root", root, "key", key, "err", err)
 			return nil, false
 		}
-		if rec == nil || !want(rec) || (consumed && !rec.PostedAt.After(through)) {
+		if rec == nil {
+			p.noteMiss(key)
+			continue
+		}
+		if !want(rec) || (consumed && !rec.PostedAt.After(through)) {
 			continue
 		}
 		return rec, true
 	}
 	return nil, false
+}
+
+// missCached reports whether a read of key found no row within the last
+// reportMissTTL, dropping a miss that has expired.
+func (p *pushedReports) missCached(key string) bool {
+	now := p.clock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen, ok := p.misses[key]
+	if !ok {
+		return false
+	}
+	if now.Sub(seen) < reportMissTTL {
+		return true
+	}
+	p.dropMissLocked(key)
+	return false
+}
+
+// noteMiss caches a read of key that found no row.
+func (p *pushedReports) noteMiss(key string) {
+	now := p.clock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.misses == nil {
+		p.misses = map[string]time.Time{}
+	}
+	if _, known := p.misses[key]; known {
+		p.missOrder = moveToEnd(p.missOrder, key)
+	} else {
+		p.missOrder = append(p.missOrder, key)
+	}
+	p.misses[key] = now
+	for len(p.missOrder) > reportMissesMax {
+		delete(p.misses, p.missOrder[0])
+		p.missOrder = p.missOrder[1:]
+	}
+}
+
+// dropMissLocked forgets a cached miss for key. Under p.mu.
+func (p *pushedReports) dropMissLocked(key string) {
+	if _, ok := p.misses[key]; !ok {
+		return
+	}
+	delete(p.misses, key)
+	p.missOrder = slices.DeleteFunc(p.missOrder, func(k string) bool { return k == key })
 }
 
 // noteConsumedLocked notes that this process forgot conversation's reports

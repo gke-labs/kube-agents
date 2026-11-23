@@ -516,3 +516,69 @@ func TestPruneReportsByRows(t *testing.T) {
 		}
 	}
 }
+
+// A bucket read that finds no row is not repeated for reportMissTTL: a
+// second turn in a thread with no report reads nothing; a report this
+// process writes there drops the miss; past the TTL the address is read
+// again; and the cache stays within its bound.
+func TestABucketMissIsCachedUntilAWriteOrTheTTL(t *testing.T) {
+	store := &fakeReports{}
+	clock := time.Date(2026, 11, 23, 9, 0, 0, 0, time.UTC)
+	p := &pushedReports{durable: store, now: func() time.Time { return clock }}
+	const thread = "slack:C7/7.7"
+	if _, _, ok := p.latestOrStored(thread); ok {
+		t.Fatal("an empty bucket found a report")
+	}
+	if n := store.reads.Load(); n != 1 {
+		t.Fatalf("first turn read the bucket %d times, want 1", n)
+	}
+	clock = clock.Add(reportMissTTL - time.Second)
+	p.latestOrStored(thread)
+	if n := store.reads.Load(); n != 1 {
+		t.Fatalf("a second turn within the TTL read the bucket (%d reads)", n)
+	}
+	clock = clock.Add(2 * time.Second)
+	p.latestOrStored(thread)
+	if n := store.reads.Load(); n != 2 {
+		t.Fatalf("past the TTL: %d reads, want 2", n)
+	}
+
+	// A write drops the miss: a new process would read the row, and so
+	// does this one once memory no longer holds the report.
+	p.latestOrStored(thread)
+	if n := store.reads.Load(); n != 2 {
+		t.Fatalf("the renewed miss was not cached (%d reads)", n)
+	}
+	p.put(thread, "", "a report")
+	p.mu.Lock()
+	p.forgetLocked(thread) // as the bounds evict it
+	p.mu.Unlock()
+	if text, _, ok := p.latestOrStored(thread); !ok || text != "a report" {
+		t.Fatalf("after a write: %q %v, want the stored report", text, ok)
+	}
+	if n := store.reads.Load(); n != 3 {
+		t.Fatalf("after a write: %d reads, want 3", n)
+	}
+
+	// A console reply caches its miss per address too, and the cache is
+	// bounded.
+	for i := 0; i < reportMissesMax+10; i++ {
+		p.byRootOrStored("console:tab-m", fmt.Sprintf("task-%d", i))
+	}
+	p.mu.Lock()
+	size, order := len(p.misses), len(p.missOrder)
+	p.mu.Unlock()
+	if size != reportMissesMax || order != reportMissesMax {
+		t.Fatalf("misses cached: %d (order %d), want %d", size, order, reportMissesMax)
+	}
+	before := store.reads.Load()
+	p.byRootOrStored("console:tab-m", "task-0")
+	if store.reads.Load() != before+1 {
+		t.Fatal("the evicted oldest miss was not read again")
+	}
+	before = store.reads.Load()
+	p.byRootOrStored("console:tab-m", fmt.Sprintf("task-%d", reportMissesMax+9))
+	if store.reads.Load() != before {
+		t.Fatal("a recent miss was read again")
+	}
+}

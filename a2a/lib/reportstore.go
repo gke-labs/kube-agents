@@ -11,7 +11,10 @@ import (
 // session-state bucket, under ReportKeyPrefix, so a reply under the report
 // still finds it after the process that posted it is gone. The gateway is
 // the only reader and writer of these rows, as of every value in that
-// bucket. Gateways older than the rows read only "sessions.>" and exact
+// bucket. An executor (the session worker, and the hermes-bridge once its
+// session-kv lookup retires) gets a report only as the pushedReport part
+// the gateway attaches to a turn (PushedReportPart), never by reading the
+// bucket, so no executor needs a grant on KV_session-state. Gateways older than the rows read only "sessions.>" and exact
 // keys there, so they never see one.
 //
 // The address mirrors the hermes-bridge's session-kv incident row
