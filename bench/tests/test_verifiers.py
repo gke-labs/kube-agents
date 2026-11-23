@@ -9654,6 +9654,76 @@ def test_worker_commands_a_capture_with_gaps_keeps_its_own_error_beside_a_line_p
     assert res.status == "error" and "past the shell reader's limit" in res.reason, res.reason
 
 
+def test_shell_argvs_with_exit_propagation_refuses_a_line_nested_past_16_levels():
+    from kube_agents_bench.shell_words import ShellReadLimitError
+    from kube_agents_bench.verifiers import _shell_argvs_with_exit_propagation
+
+    with pytest.raises(ShellReadLimitError, match="more than 16 levels"):
+        _shell_argvs_with_exit_propagation("eval " * 17 + "echo x")
+
+    line = "eval " + "$(eval " * 20 + "x" + ")" * 20
+    assert len(line) == 166
+    with pytest.raises(ShellReadLimitError):
+        _shell_argvs_with_exit_propagation(line)
+
+    nested = "eval " * (sys.getrecursionlimit() + 200) + "python3 f.py --readiness"
+    with pytest.raises(ShellReadLimitError):
+        _shell_argvs_with_exit_propagation(nested)
+
+
+def test_shell_argvs_with_exit_propagation_refuses_a_line_that_needs_more_reading_than_its_budget():
+    """Inside 16 levels the same doubling still multiplies the reading. The reader has a budget
+    of characters for one typed line (6 times its length and 65,536 more); each command line
+    that it reads costs its length and 16 more."""
+    from kube_agents_bench.shell_words import ShellReadLimitError
+    from kube_agents_bench.verifiers import _shell_argvs_with_exit_propagation
+
+    payload = "python3 f.py --readiness " + "x" * 2000
+    line = "eval " + "$(eval " * 7 + payload + ")" * 7
+    with pytest.raises(ShellReadLimitError, match="more reading than"):
+        _shell_argvs_with_exit_propagation(line)
+    # the same shape with a short payload stays inside the budget and is read
+    entries = _shell_argvs_with_exit_propagation("eval " + "$(eval " * 7 + "python3 f.py --readiness" + ")" * 7)
+    assert any(argv == ["python3", "f.py", "--readiness"] for argv, _ in entries)
+
+
+def test_worker_commands_trajectory_call_past_the_readers_limit():
+    """A worker terminal call in trajectory past the shell reader's limit has no argvs.
+    Under succeeded: true or standard required runs, an uncredited run beside an unread
+    trajectory call is an error rather than crash or hang."""
+    f_py = {"script": "f.py", "flags": ["--readiness"], "succeeded": True}
+    for nested in (
+        "eval " * (sys.getrecursionlimit() + 200) + "python3 f.py --readiness",
+        "eval " + "$(eval " * 20 + "x" + ")" * 20,
+    ):
+        entries = [_terminal(nested, at=1.0), _terminal("cat README.md", at=2.0)]
+        transcript.set("ok", _TRAJECTORY + entries, worker_commands=[])
+        res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+        assert res.status == "error" and not res.success, res.reason
+        assert "past the shell reader's limit" in res.reason, res.reason
+        assert "could not be evaluated" in res.reason, res.reason
+
+        # Patterns only check stays evaluable and passes
+        res = WorkerCommandsVerifier(
+            type="worker_commands",
+            required_patterns=[r"cat README"],
+            forbidden_patterns=[r"kubectl delete"],
+        ).verify(5.0)
+        assert res.status == "pass", res.reason
+
+        # A satisfied succeeded: true run beside the unread trajectory call passes
+        entries_with_run = entries + [_terminal("python3 f.py --readiness", at=3.0)]
+        transcript.set("ok", _TRAJECTORY + entries_with_run, worker_commands=[])
+        res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+        assert res.status == "pass", res.reason
+
+        # Beside capture gaps, gap reporting takes precedence
+        transcript.set("ok", _TRAJECTORY + entries, worker_commands=[], worker_capture_gaps=["card t_9: locked"])
+        res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+        assert res.status == "error" and "card t_9: locked" in res.reason, res.reason
+        assert "shell reader's limit" not in res.reason, res.reason
+
+
 def test_shell_argvs_keeps_the_order_of_the_commands_inside_a_line():
     """A pin of the order of the commands inside a line (after an `eval`, behind a shell's `-c`
     flag, in a substitution): a line's own segments first, then the commands inside each inner

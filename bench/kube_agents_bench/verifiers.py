@@ -105,6 +105,12 @@ from kube_agents_bench import (
 from kube_agents_bench.parsing import DELEGATION_TOOL
 from kube_agents_bench.shell_words import (
     _INTERPRETER_RE,
+    _MAX_COMMAND_LINE_NESTING,
+    _MAX_READ_CHARS_FACTOR,
+    _MAX_READ_CHARS_FLOOR,
+    _NESTING_LIMIT_TEXT,
+    _READ_COST_CHARS,
+    _READ_LIMIT_TEXT,
     _SHELL_ARITHMETIC_OPENER,
     _SHELL_ASSIGNMENT_RE,
     _SHELL_EVAL,
@@ -2833,14 +2839,26 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
 
 
 def _shell_argvs_with_exit_propagation(
-    command: str, outer_spans: tuple[str, ...] | list[str] = ()
+    command: str,
+    outer_spans: tuple[str, ...] | list[str] = (),
+    _nesting: int = 0,
+    _budget: list[int] | None = None,
 ) -> list[tuple[list[str], bool]]:
     """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
     shell line's final exit code faithfully reflects this segment's success or failure.
     See :class:`WorkerRun` (``succeeded``) for the exit propagation and operator rules.
     Redirects (``>``, ``2>&1``), environment assignments (``NAME=val``), non-detaching wrappers,
     transparent subshell parens ``(cmd)``, and lone command substitutions ``VAR=$(cmd)`` where the
-    inner command runs alone propagate exit status."""
+    inner command runs alone propagate exit status. A line whose command lines nest deeper than
+    ``_MAX_COMMAND_LINE_NESTING`` levels, or need more reading than the line's budget, raises
+    :class:`ShellReadLimitError`; ``_nesting`` and ``_budget`` are the reader's own."""
+    if _budget is None:
+        _budget = [_MAX_READ_CHARS_FACTOR * len(command) + _MAX_READ_CHARS_FLOOR]
+    if _nesting > _MAX_COMMAND_LINE_NESTING:
+        raise ShellReadLimitError(_NESTING_LIMIT_TEXT)
+    _budget[0] -= len(command) + _READ_COST_CHARS
+    if _budget[0] < 0:
+        raise ShellReadLimitError(_READ_LIMIT_TEXT)
     words, spans = _shell_words_and_spans(command)
     segments: list[list[str]] = []
     leading_ops: list[str] = []
@@ -2910,7 +2928,7 @@ def _shell_argvs_with_exit_propagation(
                 handled_spans.append(val)
                 is_outer = val in outer_spans
                 for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
-                    inner, outer_spans=outer_spans
+                    inner, outer_spans=outer_spans, _nesting=_nesting + 1, _budget=_budget
                 ):
                     results.append(
                         (inner_argv, False if is_outer else (carries_exit and inner_carries))
@@ -2919,7 +2937,7 @@ def _shell_argvs_with_exit_propagation(
         index = _command_word_index(seg)
         if index is not None and seg[index] == _SHELL_EVAL:
             for inner_argv, _ in _shell_argvs_with_exit_propagation(
-                " ".join(seg[index + 1:]), outer_spans=outer_spans
+                " ".join(seg[index + 1:]), outer_spans=outer_spans, _nesting=_nesting + 1, _budget=_budget
             ):
                 results.append((inner_argv, False))
             continue
@@ -2928,7 +2946,7 @@ def _shell_argvs_with_exit_propagation(
             if cmd_string is not None:
                 shell_carries = carries_exit and not has_noexec and not has_help_or_version
                 for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
-                    cmd_string, outer_spans=(*outer_spans, *spans)
+                    cmd_string, outer_spans=(*outer_spans, *spans), _nesting=_nesting + 1, _budget=_budget
                 ):
                     results.append((inner_argv, shell_carries and inner_carries))
 
@@ -2940,7 +2958,7 @@ def _shell_argvs_with_exit_propagation(
         inner = _substitution_commands(span)
         if inner is not None:
             for inner_argv, _ in _shell_argvs_with_exit_propagation(
-                inner, outer_spans=outer_spans
+                inner, outer_spans=outer_spans, _nesting=_nesting + 1, _budget=_budget
             ):
                 results.append((inner_argv, False))
 
@@ -3622,11 +3640,14 @@ class WorkerCommandsVerifier(BaseVerifier):
         typed_argvs, typed_unread = _argvs_and_first_unread(typed if self.forbidden_runs else [])
 
         traj_eligible = [(cmd, succ, is_clipped) for _, _, cmd, _, succ, is_clipped in traj_calls if cmd is not None and self._without_exempt_text(cmd) == cmd]
-        traj_argv_entries = [
-            (argv, call_succeeded, carries_exit, is_clipped)
-            for cmd_text, call_succeeded, is_clipped in traj_eligible
-            for argv, carries_exit in _shell_argvs_with_exit_propagation(cmd_text)
-        ]
+        traj_argv_entries: list[tuple[list[str], bool, bool, bool]] = []
+        traj_unread: tuple[str, ShellReadLimitError] | None = None
+        for cmd_text, call_succeeded, is_clipped in traj_eligible:
+            try:
+                for argv, carries_exit in _shell_argvs_with_exit_propagation(cmd_text):
+                    traj_argv_entries.append((argv, call_succeeded, carries_exit, is_clipped))
+            except ShellReadLimitError as limit:
+                traj_unread = traj_unread or (cmd_text, limit)
 
         unrun_missing: list[WorkerRun] = []
         unrun_failed: list[WorkerRun] = []
@@ -3700,7 +3721,11 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if cmd is None:
                     clipped_gap = True
                     break
-                argv_entries = _shell_argvs_with_exit_propagation(cmd)
+                try:
+                    argv_entries = _shell_argvs_with_exit_propagation(cmd)
+                except ShellReadLimitError as limit:
+                    traj_unread = traj_unread or (cmd, limit)
+                    argv_entries = []
                 if any(
                     not any(_argv_runs(argv, run) for argv, _ in argv_entries)
                     for run in uncredited_succeeded
@@ -3726,7 +3751,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         # was not read; with each of them read it is a fail whatever a typed line holds. A clean
         # read of the forbidden runs is not when a typed line was not read. Not a pass and not a
         # fail; a capture with gaps keeps its own error, below.
-        past_limit = None if hits or ran or missing else (unread if (unrun_missing or unrun_failed or unrun_masked) else typed_unread)
+        effective_unread = unread or traj_unread
+        past_limit = None if hits or ran or missing else (effective_unread if (unrun_missing or unrun_failed or unrun_masked) else typed_unread)
         if past_limit is not None and not partial:
             return VerificationResult(
                 success=False,
@@ -3748,7 +3774,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
                     parts.append(
                         f"no worker command ran {named} across {len(commands)} command(s){sources}"
-                        + (_UNREAD_COMMAND_NOTE if unread is not None else "")
+                        + (_UNREAD_COMMAND_NOTE if effective_unread is not None else "")
                     )
                 if unrun_failed:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
@@ -3778,7 +3804,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
                     parts.append(
                         f"no worker command ran {named} across {len(commands)} command(s){sources}"
-                        + (_UNREAD_COMMAND_NOTE if unread is not None else "")
+                        + (_UNREAD_COMMAND_NOTE if effective_unread is not None else "")
                     )
                 if unrun_failed_reported:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
