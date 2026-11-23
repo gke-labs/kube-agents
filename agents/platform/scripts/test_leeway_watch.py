@@ -2324,49 +2324,75 @@ class BatchTests(unittest.TestCase):
         )
 
     def test_cluster_stamps_for_out_of_scope_projects_and_removed_explicit_clusters_expire_by_age(self) -> None:
-        self.roster = {"p1": triples("p1", 1)}
+        self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1)}
         at_cutoff = watch.iso(T0 - timedelta(days=watch.CLUSTER_RUNS_RETENTION_MULTIPLIER * watch.REFRESH_DAYS_DEFAULT))
         past_cutoff = watch.iso(
             T0 - timedelta(days=watch.CLUSTER_RUNS_RETENTION_MULTIPLIER * watch.REFRESH_DAYS_DEFAULT, seconds=1)
         )
+        # p1 and p2 are in-scope projects; p9 left the scope. When p1 runs and
+        # spends the tick budget before p2 is reached, p2's active in-scope
+        # cluster stamp is preserved even though it is older than the cutoff,
+        # while out-of-scope p9's expired and corrupt stamps are pruned.
         self.write_ledger(
             **{
                 watch.CLUSTER_RUNS_KEY: {
+                    "p2/l/c00": past_cutoff,
                     "p9/l/at-cutoff": at_cutoff,
                     "p9/l/expired": past_cutoff,
                     "p9/l/corrupt": "not-an-iso-timestamp",
                 }
             }
         )
-        self.tick(0)
+        spend_tick = watch.TICK_BUDGET_SECONDS - watch.MIN_PROJECT_RUN_SECONDS + 1.0
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.tick(0, seconds=spend_tick)
         self.assertEqual(
             watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
-            {"p1/l/c00": watch.iso(T0), "p9/l/at-cutoff": at_cutoff},
+            {"p1/l/c00": watch.iso(T0), "p2/l/c00": past_cutoff, "p9/l/at-cutoff": at_cutoff},
         )
 
         # In LEEWAY_WATCH_CLUSTERS mode, a removed explicit cluster stays within
-        # the retention window and is pruned once older than 2 * LEEWAY_WATCH_REFRESH_DAYS.
+        # the retention window and is pruned once older than 2 * LEEWAY_WATCH_REFRESH_DAYS,
+        # while an unreached active explicit cluster keeps its older stamp so
+        # least-recently-stamped ordering survives multi-tick rotations.
+        explicit = triples("p1", watch.CLUSTERS_PER_BATCH + 1)
         with mock.patch.dict(
             os.environ,
-            {watch.CLUSTERS_ENV: "p1/l/c00", watch.PROJECTS_ENV: "", watch.REFRESH_DAYS_ENV: "3"},
+            {watch.CLUSTERS_ENV: ",".join(explicit), watch.PROJECTS_ENV: "", watch.REFRESH_DAYS_ENV: "3"},
         ):
             within_six_days = watch.iso(T0 - timedelta(days=6))
             older_than_six_days = watch.iso(T0 - timedelta(days=6, seconds=1))
+            unreached_active = explicit[-1]
             self.write_ledger(
                 **{
                     watch.CLUSTER_RUNS_KEY: {
+                        **dict.fromkeys(explicit[:-1], older_than_six_days),
+                        unreached_active: within_six_days,
                         "p2/l/kept": within_six_days,
                         "p2/l/dropped": older_than_six_days,
                     }
                 }
             )
-            self.tick(0)
-            self.assertEqual(
-                watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
-                {"p1/l/c00": watch.iso(T0), "p2/l/kept": within_six_days},
+            # First batch (12 clusters, stamped older_than_six_days) runs and spends
+            # the tick; unreached_active is not called on this tick, and even if an
+            # unreached active cluster had an expired stamp it stays in cluster_runs.
+            self.write_ledger(
+                **{
+                    watch.CLUSTER_RUNS_KEY: {
+                        unreached_active: older_than_six_days,
+                        "p2/l/kept": within_six_days,
+                        "p2/l/dropped": older_than_six_days,
+                    }
+                }
             )
+            self.tick(0, seconds=spend_tick)
+            saved_runs = watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY]
+            self.assertIn(unreached_active, saved_runs)
+            self.assertEqual(saved_runs["p2/l/kept"], within_six_days)
+            self.assertNotIn("p2/l/dropped", saved_runs)
 
         # A failed tick saves updated sweep-order stamps via save_stamps without pruning old entries.
+        self.roster = {"p1": triples("p1", 1)}
         self.write_ledger(**{watch.CLUSTER_RUNS_KEY: {"p9/l/expired": past_cutoff}})
         self.tick(0, hangs(*self.roster["p1"]))
         self.assertEqual(
@@ -2374,11 +2400,18 @@ class BatchTests(unittest.TestCase):
             {"p1/l/c00": watch.iso(T0), "p9/l/expired": past_cutoff},
         )
 
-        # An empty scope (no project scanned) does not prune existing cluster_runs entries.
+        # A tick where listing spent the budget before any call could start
+        # (target_reads empty) does not prune existing cluster_runs entries.
+        self.roster = {}
+
+        def slow_listing(argv, **kw):
+            self.clock += spend_tick
+            return subprocess.CompletedProcess(argv, 0, "c00\tl\n", "")
+
         self.write_ledger(**{watch.CLUSTER_RUNS_KEY: {"p9/l/expired": past_cutoff}})
-        empty = mock.Mock(projects=(), excluded_clusters=())
-        with mock.patch.object(watch, "declared_scope", return_value=empty):
-            self.tick(0)
+        self.clock = 0.0
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=slow_listing), redirect_stdout(io.StringIO()):
+            watch.tick(now=T0)
         self.assertEqual(
             watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
             {"p9/l/expired": past_cutoff},
