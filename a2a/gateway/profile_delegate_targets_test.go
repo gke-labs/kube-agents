@@ -246,11 +246,11 @@ func TestAProfileSubmissionWithoutAListIsAsBefore(t *testing.T) {
 }
 
 // TestAScheduledRunListsWhatItsDelegationAccepts is the one source of truth
-// for a scheduled run (#6744, #6789): the list a parent below a schedule is
-// offered and the delegation it makes run the same check
-// (delegateEntryCheck), so the list holds exactly the profiles that run at
-// read and list unattended, each of them is accepted, and each profile left
-// off is refused.
+// for a scheduled run (#6744, #6789): a run of a delegating profile carries a
+// delegateTargets part, and the list it carries and the delegation it makes
+// run the same check (delegateEntryCheck), so the list holds exactly the
+// profiles that run at read and list unattended, each of them is accepted,
+// and each profile left off is refused.
 func TestAScheduledRunListsWhatItsDelegationAccepts(t *testing.T) {
 	t.Parallel()
 	type entry struct {
@@ -271,9 +271,10 @@ func TestAScheduledRunListsWhatItsDelegationAccepts(t *testing.T) {
 	}
 	unlisted := []entry{{"legacy", nil}, {"readonly", nil}, {"writer", nil}, {targetPlatform, nil}}
 	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	const scheduledWidth = 4
 	start := func(t *testing.T) (*triggerRig, lib.Envelope, *lib.TaskExecution) {
 		t.Helper()
-		tr := startTriggerRig(t, nil)
+		tr := startTriggerRig(t, func(c *Config) { c.DelegationWidthMax = scheduledWidth })
 		for _, c := range cards {
 			tr.g.profiles.put(c.Name, c)
 		}
@@ -284,6 +285,20 @@ func TestAScheduledRunListsWhatItsDelegationAccepts(t *testing.T) {
 	t.Run("list", func(t *testing.T) {
 		t.Parallel()
 		tr, origin, _ := start(t)
+		var want []string
+		for _, e := range listed {
+			want = append(want, e.name)
+		}
+		// The list rides the run's own submission (publishTriggerRun), with
+		// the width the delegation refuses a wider batch under.
+		got := targetsOn(t, &origin)
+		if names := targetNames(got); !slices.Equal(names, want) {
+			t.Fatalf("the scheduled run's submitted targets = %v, want %v", names, want)
+		}
+		if got.WidthMax != scheduledWidth || got.WidthMax != tr.g.advertisedWidth() || got.Truncated {
+			t.Fatalf("the scheduled run's width = %d (truncated %v), want %d", got.WidthMax, got.Truncated, scheduledWidth)
+		}
+		// And it is the list the run's recorded entry is offered.
 		rec, err := tr.g.reg.Get(context.Background(), key)
 		if err != nil || rec == nil {
 			t.Fatalf("the run's record: %v", err)
@@ -292,12 +307,8 @@ func TestAScheduledRunListsWhatItsDelegationAccepts(t *testing.T) {
 		if !ok || !parent.belowSchedule() {
 			t.Fatalf("the run's entry = %+v, want one below a schedule", parent)
 		}
-		var want []string
-		for _, e := range listed {
-			want = append(want, e.name)
-		}
-		if got := targetNames(tr.g.profileDelegateTargets(rec, parent)); !slices.Equal(got, want) {
-			t.Fatalf("the scheduled run's targets = %v, want %v", got, want)
+		if names := targetNames(tr.g.profileDelegateTargets(rec, parent)); !slices.Equal(names, want) {
+			t.Fatalf("the scheduled run's entry is offered %v, want %v", names, want)
 		}
 	})
 	for _, tc := range []struct {
@@ -328,5 +339,41 @@ func TestAScheduledRunListsWhatItsDelegationAccepts(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestAScheduledRunOfANonDelegatingProfileIsAsBefore: a run of a profile
+// whose card doesn't delegate carries no delegateTargets part, and its
+// submission is byte for byte what publishTriggerRun built before the list
+// (#6789).
+func TestAScheduledRunOfANonDelegatingProfileIsAsBefore(t *testing.T) {
+	t.Parallel()
+	tr := startTriggerRig(t, func(c *Config) { c.DelegationWidthMax = 4 })
+	tr.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}})
+	origin, _ := startScheduledParent(t, tr)
+	parts := messageParts(t, &origin)
+	if _, ok, _ := lib.DelegateTargetsOf(parts); ok {
+		t.Fatal("a non-delegating profile's scheduled run carries a delegateTargets part")
+	}
+	s := goodScheduleSubmit()
+	route, err := tr.g.profileRouteFor(s.Profile, s.Parameters, capability.TierUnattended, lib.SubmitKindTop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := submissionPayload(triggerTaskText(s), origin.TaskID, origin.ContextID, route, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The one field minted afresh per build is the message id.
+	var gotMsg, wantMsg lib.Message
+	if err := json.Unmarshal(origin.Payload, &gotMsg); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(want, &wantMsg); err != nil {
+		t.Fatal(err)
+	}
+	want = bytes.Replace(want, []byte(`"messageId":"`+wantMsg.MessageID+`"`), []byte(`"messageId":"`+gotMsg.MessageID+`"`), 1)
+	if !bytes.Equal(origin.Payload, want) {
+		t.Fatalf("the run's payload =\n%s\nwant\n%s", origin.Payload, want)
 	}
 }

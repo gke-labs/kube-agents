@@ -232,6 +232,26 @@ func (g *Gateway) profileDelegateTargets(rec *SessionRecord, parent TaskRef) lib
 	return out
 }
 
+// profileTargetsParts is the delegateTargets part a profile task submitted
+// on its own carries (#6789), parent being the entry its submitter records
+// for it: one part when parent's profile's card says it delegates
+// (profileDelegates), none otherwise, so a non-delegating profile's
+// submission is unchanged. A part that can't be built is left off and
+// logged; the worker's delegate tool then falls back to platform. Both a
+// task started from a turn (startTaskWith) and a scheduled run
+// (publishTriggerRun) read it, so they carry the same list.
+func (g *Gateway) profileTargetsParts(rec *SessionRecord, parent TaskRef, taskID string) []lib.Part {
+	if !g.profileDelegates(parent.Addressee) {
+		return nil
+	}
+	part, err := lib.DelegateTargetsPart(g.profileDelegateTargets(rec, parent))
+	if err != nil {
+		g.log.Warn("delegate targets not attached to a profile task; its delegate tool falls back to platform", "taskId", taskID, "err", err)
+		return nil
+	}
+	return []lib.Part{part}
+}
+
 // fits reports whether t with next added is still a valid part: inside the
 // byte bound, and with next's parameters well formed (a card the operator
 // wrote is held to the part's rules rather than trusted).

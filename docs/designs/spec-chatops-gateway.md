@@ -875,8 +875,8 @@ it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refus
 runs the delegation's own checks on each profile, so it never offers one the delegation refuses:
 not `platform`, not a profile outside a cluster-scoped parent's cluster, only profiles that run at
 `read` and list `unattended` for a parent below a scheduled run, and nobody for a parent refused
-outright, such as one at the depth cap. A scheduled run's own submission, which the trigger ingress
-builds, carries no list yet. Any other profile submission is unchanged. The
+outright, such as one at the depth cap. A scheduled run of a delegating profile carries the list too, built
+the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
