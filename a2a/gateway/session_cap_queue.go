@@ -110,12 +110,11 @@ func sessionQueuedNotice(ahead int) string {
 	return fmt.Sprintf(sessionQueuedMany, ahead)
 }
 
-// capWaiter is one parked turn. ticket, key and parkedAt never change;
+// capWaiter is one parked turn. key and parkedAt never change;
 // msg, followUps and retry are guarded by Gateway.capMu; noticeID and
 // shownAhead by editMu, which also orders every edit of the notice, so a
 // position edit can never land after the edit that closed it.
 type capWaiter struct {
-	ticket   uint64
 	key      string
 	parkedAt time.Time
 	// msg is the parked turn as handleInbound received it, and followUps
@@ -279,9 +278,8 @@ func (g *Gateway) parkLocked(key string, msg InboundMessage) *capWaiter {
 	if len(g.capQueue) >= sessionCapQueueMax {
 		return nil
 	}
-	g.capTicket++
 	msg.capRetry, msg.capReplay = 0, false
-	w := &capWaiter{ticket: g.capTicket, key: key, parkedAt: time.Now(), msg: msg, shownAhead: -1}
+	w := &capWaiter{key: key, parkedAt: time.Now(), msg: msg, shownAhead: -1}
 	g.capQueue = append(g.capQueue, w)
 	return w
 }

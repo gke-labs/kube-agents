@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -171,9 +172,9 @@ func TestALaterMessageWaitsBehindTheParkedTurnAndSteersIt(t *testing.T) {
 	}
 }
 
-// Past the wait bound the turn gets the cap's refusal, today's text, and its
-// notice is closed; it is never started.
-func TestAWaitPastTheBoundGetsTheCapRefusal(t *testing.T) {
+// Past the wait bound the turn gets the line's give-up, telling the person
+// to send it again, and its notice is closed; it is never started.
+func TestAWaitPastTheBoundGetsTheGiveUp(t *testing.T) {
 	t.Parallel()
 	r, spawn, _ := queueRig(t, 1)
 	r.g.capWaitOverride.Store(int64(300 * time.Millisecond))
@@ -221,9 +222,8 @@ func TestAWaiterBehindTheHeadIsRefusedPastTheBound(t *testing.T) {
 		if i < 3 {
 			at = long
 		}
-		r.g.capTicket++
 		w := &capWaiter{
-			ticket: r.g.capTicket, key: conv, parkedAt: at, shownAhead: -1,
+			key: conv, parkedAt: at, shownAhead: -1,
 			msg: InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("m%d", i), Text: "check the fleet"},
 		}
 		line = append(line, w)
@@ -781,6 +781,28 @@ func TestAKeptTryEndingAfterTheNextIsQueuedLeavesTheWaiterInLine(t *testing.T) {
 	r.g.capRetryDone(InboundMessage{Conversation: conv, capRetry: first})
 	if !r.g.parkedAtCap(conv) {
 		t.Fatal("the waiter left the line as the kept try ended, with its next try in flight")
+	}
+}
+
+// A head that has waited out the bound and whose try then can't list the
+// session pods is answered once, with the give-up, not also with the
+// can't-count refusal.
+func TestAHeadPastTheBoundWithAPodListErrorIsAnsweredOnce(t *testing.T) {
+	t.Parallel()
+	r, spawn, _ := queueRig(t, 1)
+	conv := "discord:g1/t-waited-listerr"
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
+	spawn.setLiveErr(errors.New("api down"))
+	r.g.capWaitOverride.Store(1)
+	r.g.kickCapQueue()
+	waitFor(t, "the give-up", postedContaining(r, sessionQueueGaveUpNotice))
+	waitFor(t, "the notice closed", noticeReads(r, conv, sessionQueuedGaveUp))
+	time.Sleep(200 * time.Millisecond)
+	for _, p := range r.adapter.postTextsFor(conv) {
+		if strings.HasPrefix(p, "⚠️ not started") {
+			t.Fatalf("a second not-started notice: %q", p)
+		}
 	}
 }
 

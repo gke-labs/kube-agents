@@ -322,7 +322,7 @@ type Gateway struct {
 	capMu    sync.Mutex
 	capHolds map[string]capHold
 	// capQueue, guarded by capMu, is the line of turns waiting at the cap
-	// (session_cap_queue.go), oldest first; capTicket numbers its waiters.
+	// (session_cap_queue.go), oldest first; capTicket numbers the head's tries.
 	// capKick nudges the line's loop when a slot may have freed.
 	// capAdmitted, guarded by capMu, holds an admitted waiter's follow-ups
 	// by its try's id until that turn ends and replays them (capRetryDone).

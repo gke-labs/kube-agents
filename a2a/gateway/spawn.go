@@ -876,7 +876,10 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	}()
 	parked, parkable := parkableTurn(ctx)
 	if !g.acquireCapCheck(ctx) {
-		if own, _ := g.capDecision(rec.Key, false); own != nil && g.capKeepOrGiveUp(own, &after) {
+		// A waiter is answered by capKeepOrGiveUp either way: kept, or
+		// out of the line with its own give-up post.
+		if own, _ := g.capDecision(rec.Key, false); own != nil {
+			g.capKeepOrGiveUp(own, &after)
 			return true
 		}
 		notices = append(notices, capNotice{rec.Key, "⚠️ not started: other conversations were starting session workers and this one waited too long — try again in a moment"})
@@ -896,7 +899,8 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 		// Proceeding blind would make the cap advisory exactly when the API
 		// is misbehaving; say so instead of dropping the turn silently.
 		g.log.Error("session cap: live count failed", "conversation", rec.Key, "err", err)
-		if own != nil && g.capKeepOrGiveUp(own, &after) {
+		if own != nil {
+			g.capKeepOrGiveUp(own, &after)
 			return true
 		}
 		notices = append(notices, capNotice{rec.Key, "⚠️ not started: can't count the running session workers right now — try again in a moment"})
