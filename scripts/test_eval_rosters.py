@@ -742,11 +742,16 @@ def positive_check_types(node, negations: int = 0) -> set:
     return set()
 
 
+# The check types that grade the forge, for the GitLab lane and for the GHES
+# lane, which runs under the GitLab lane's rules: one set, so the two cannot drift.
+LANE_FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains", "forge_issue_state"}
+
+
 class GHESLaneTest(unittest.TestCase):
     """hack/eval/ghes-cases.txt: what the GHES lane runs (kube-agents#3684),
     under the GitLab lane's rules: registered cases that grade the forge."""
 
-    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains", "forge_issue_state"}
+    FORGE_CHECKS = LANE_FORGE_CHECKS
     PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
 
     def test_the_file_is_the_pinned_set(self):
@@ -762,9 +767,9 @@ class GHESLaneTest(unittest.TestCase):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge")
 
-    def test_the_lane_counts_the_forge_checks_the_gitlab_lane_counts(self):
-        # "Under the GitLab lane's rules": one definition of a forge check, not two that drift.
-        self.assertEqual(self.FORGE_CHECKS, GitLabLaneTest.FORGE_CHECKS)
+    def test_an_issue_state_check_alone_grades_the_forge(self):
+        only = {"verification_spec": [{"type": "forge_issue_state", "state": "closed"}]}
+        self.assertTrue(positive_check_types(only) & self.FORGE_CHECKS)
 
     def test_no_commented_out_case_path(self):
         self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GHES_CASES_FILE.read_text(encoding="utf-8")), [])
@@ -775,7 +780,7 @@ class GitLabLaneTest(unittest.TestCase):
     runs (kube-agents#2394). Registered cases only, every entry a case that
     grades the forge."""
 
-    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains", "forge_issue_state"}
+    FORGE_CHECKS = LANE_FORGE_CHECKS
     PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
 
     def test_the_file_is_the_pinned_set(self):
