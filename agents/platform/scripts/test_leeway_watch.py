@@ -3994,7 +3994,7 @@ class PlainStatusAndDryRunTests(unittest.TestCase):
             return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="permission denied")
 
         buf = io.StringIO()
-        with mock.patch.object(
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False), mock.patch.object(
             watch,
             "roster_clusters_by_project",
             return_value={"p1": ["p1/us-central1/seeded-d"], "p2": ["p2/us-central1/broken"]},

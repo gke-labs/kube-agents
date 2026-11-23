@@ -1986,7 +1986,7 @@ def failure_reason(exc: Exception, previous: str = "") -> str:
         return FAILED_REASON_WRITE
     if isinstance(exc, fleet_scope_targets.ScopeRenderUnreadable):
         return FAILED_REASON_SCOPE_UNREADABLE
-    if isinstance(exc, NoProject) or str(exc) == NO_PROJECT_DETAIL:
+    if isinstance(exc, NoProject):
         return FAILED_REASON_NO_PROJECT
     if isinstance(exc, LedgerUnusable):
         return FAILED_REASON_LEDGER
