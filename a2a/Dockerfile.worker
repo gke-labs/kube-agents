@@ -76,8 +76,19 @@ ARG KUBECTL_VERSION=1.35.10
 ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
 COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
+COPY deploy/sandbox/kubectl_session_fastpath.py /tmp/kubectl_session_fastpath.py
 # The wrapper below asks this first, and starts Python only when the context is not registered yet.
 COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexec/kubectl-context-registered
+# The sandbox shell's kubectl admission, at the sandbox's paths, so a cluster-wide read that
+# cannot fit in the pod's memory limit is refused with the alternatives rather than OOM-killing
+# the session pod. The wrapper's KUBE_PROXY_URL branch below runs it with three settings of
+# deploy/sandbox/kubectl-admit.py: its state in a directory the node user owns, the guard as a
+# library (nothing starts it as a daemon here; the worker adapter is PID 1), and a command that
+# finds the pod busy run as before, never refused, so its only refusal is a read larger than
+# the pod can ever hold. No limit file is written, so the limit is the cgroup's memory.max.
+COPY --chmod=0644 deploy/sandbox/kubectl-admit.py /usr/local/libexec/kubectl-admit
+COPY --chmod=0644 deploy/sandbox/shell-memory-guard.py /usr/local/libexec/shell-memory-guard
+COPY --chmod=0644 deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/kubectl-costs.json
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml jq git \
     && rm -rf /var/lib/apt/lists/* \
@@ -94,28 +105,19 @@ RUN apt-get update \
     && echo "${KUBECTL_SHA256}  /usr/local/libexec/kubectl" | sha256sum -c - \
     && chmod 0755 /usr/local/libexec/kubectl \
     && python3 -I /tmp/check_kubectl_base_path.py /usr/local/libexec/kubectl \
-    && rm /tmp/check_kubectl_base_path.py \
-    && printf '%s\n' \
-         '#!/bin/sh' \
-         'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
-         '  case " $* " in' \
-         '  *" --context"*)' \
-         '    /usr/local/libexec/kubectl-context-registered "$@" 2>/dev/null || PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
-         '    ;;' \
-         '  *)' \
-         '    if [ ! -f "${HOME}/.kube/config" ]; then' \
-         '      PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
-         '    fi' \
-         '    ;;' \
-         '  esac' \
-         '  exec /usr/local/libexec/kubectl "$@"' \
-         'fi' \
-         'if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then' \
-         '  exec /opt/credential-proxy/libexec/credential-proxy-exec kubectl "$@"' \
-         'fi' \
-         'exec /usr/local/libexec/kubectl "$@"' \
-         >/usr/local/bin/kubectl \
-    && chmod 0755 /usr/local/bin/kubectl
+    && rm /tmp/check_kubectl_base_path.py
+# Per cost tier, the smallest memory limit at which the admission above can refuse nothing
+# (deploy/sandbox/kubectl_session_fastpath.py); the wrapper runs kubectl directly for every
+# command on a pod at or above its tier's figure.
+RUN python3 -I -B /tmp/kubectl_session_fastpath.py /usr/local/libexec/kubectl-admit \
+      /usr/local/libexec/shell-memory-guard /usr/local/share/kube-agents/kubectl-costs.json \
+      >/usr/local/share/kube-agents/kubectl-session-fastpath \
+    && chmod 0644 /usr/local/share/kube-agents/kubectl-session-fastpath \
+    && test -s /usr/local/share/kube-agents/kubectl-session-fastpath \
+    && rm /tmp/kubectl_session_fastpath.py
+# The kubectl wrapper: deploy/sandbox/session-kubectl.sh says what it does on
+# each kind of pod.
+COPY --chmod=0755 deploy/sandbox/session-kubectl.sh /usr/local/bin/kubectl
 # credential-proxy-exec is a launcher that imports the client as a module, so
 # Python loads the client from bytecode compiled here and does not compile its
 # source at every brokered call (deploy/sandbox/Dockerfile says more).
@@ -134,6 +136,32 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/repo_ref.py \
      /opt/credential-proxy/libexec/
+# The fleet-audit report scripts, for the fleet-audit AgentProfile's persona
+# (agents/fleet-audit/persona, #5623): copied from their sources at build time,
+# flat in one directory, since a script's own directory is where Python finds
+# the others when the persona's skill runs `python3 /opt/kube-agents/scripts/fleet-audit/
+# audit_report.py`. They're the closure audit_report.py imports on its
+# `finish --dry-run` path (a live finish needs more, which the PR that runs one
+# adds); the RUN below fails the build if one no longer imports from here alone,
+# and tests/test_worker_fleet_audit_scripts.py runs that finish on a document.
+# Every worker carries them; they act only with the task's own confined
+# credential, so a cluster or tse worker gains nothing it couldn't already do.
+# They're under lib.ScriptRoot (/opt/kube-agents/scripts/), the one root a
+# script row may name, root-owned and not worker-writable as script mode
+# requires. tests/test_worker_fleet_audit_scripts.py holds this list to its
+# sources, and the directory to that root.
+COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
+     agents/platform/skills/fleet-audit/scripts/report_status.py \
+     agents/platform/skills/fleet-audit/scripts/manifest_delta.py \
+     agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/repo_ref.py \
+     agents/platform/scripts/gitops_preflight.py \
+     agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/vcs_client.py \
+     /opt/kube-agents/scripts/fleet-audit/
+RUN cd /opt/kube-agents/scripts/fleet-audit \
+    && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report" \
+    && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run
 # git for that skill's local half: the working copy `clone` unpacks from a
 # bundle, and `commit` and `publish` on it. It holds no credential; the profile
 # namespace's NetworkPolicy bounds the pod's egress. deploy/shared/worker-gitconfig,

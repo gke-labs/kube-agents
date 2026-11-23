@@ -18,7 +18,7 @@ Reported:
   verdict of the build that first wrote its first served answer's object
   (which may not be the night that produced it);
 - answers per key: of the served requests, how many came from a key with
-  several saved answers (the proxy hands those out in turn), and of those
+  several saved answers (the proxy draws among those by weight), and of those
   keys, how many had more than one of their answers served;
 - lost requests: replay lines whose analysis was dropped or failed, so they
   carry no hashes and join no conversation. They are counted, served or not;

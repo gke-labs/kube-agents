@@ -814,7 +814,7 @@ leaves the record as it was:
    console is `read`, and a requester with no identity is refused. The one path that mints
    `unattended` is the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which
    ships dark until the callout grants a trigger source its submit subject. A delegated profile child runs at its
-   parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
+   parent's tier when the parent is a profile task (`read` when the parent is `unattended`), and at its requester's otherwise. A profile
    task can't delegate to `platform`, whose child would be minted at the install's tier and
    scope.
 4. **Submit.** The submission goes on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the `PROFILE_SUBMITS` stream, `top`
@@ -840,8 +840,12 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent runs at `unattended`
-(`delegation.unattended-parent`), whose trigger binding a child's grant doesn't carry yet. A child's
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
+(a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
+parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
+trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
+(`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
+child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
@@ -969,7 +973,8 @@ released from the serialization at the conversation's next turn once it is older
 first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
 conversation saying so. Both subjects, not just `…events`: the fold reads them together,
 and assertion 9 exists because a task whose only event is its supervisor's terminal is not
-empty. That release publishes no terminal: age alone is not
+empty, unless that terminal is a five-token one on a profile task stored after the
+install's `A2A_PROFILE_SUPERVISOR_CUTOFF`, which is not folded, so the task is empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
@@ -3481,7 +3486,11 @@ which reads the gateway's inbound-message counter. Each armed door renders a cop
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every install now so that it is not (decided
-10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+10/6 on #2473). It is Ingress-only. The gateway's own dials are governed by a second policy,
+`<name>-a2a-gateway-egress` (#6553), which renders and goes with the fence: cluster DNS, the
+bus's client port, the broker's port, the Kubernetes API server, and TCP 443 except to private,
+link-local and shared addresses, for Slack, Discord and the A2A door's token check. Google Chat
+reaches Google through the broker's relay.
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
 once the gateway has bound its event relay and 503 until then, with the reason as the body

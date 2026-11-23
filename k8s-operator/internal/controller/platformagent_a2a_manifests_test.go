@@ -1391,6 +1391,49 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 }
 
+// TestGatewayGetsTheKubectlCostTierNormalised: the session pods' kubectl
+// admission charges the same tier as the shell sandbox's, so the gateway
+// gets spec.deployment.env's tier normalised as the sandbox does, and only
+// under the cluster view, the only pods that run the admission.
+func TestGatewayGetsTheKubectlCostTierNormalised(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aKubectlCostTierEnv {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	withTier := func(env ...corev1.EnvVar) *agentv1alpha1.PlatformAgent {
+		agent := a2aTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: env}
+		return agent
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	if _, ok := read(a2aTestAgent()); ok {
+		t.Errorf("%s rendered with no spec.deployment.env entry; unset means the default tier", a2aKubectlCostTierEnv)
+	}
+	for value, want := range map[string]string{"fleet": "fleet", " Fleet ": "fleet", "large-2": "large-2"} {
+		if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: value})); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", a2aKubectlCostTierEnv, got, ok, value, want)
+		}
+	}
+	for _, value := range []string{"", "../etc", "fleet tier", "\"fleet\"", "9fleet"} {
+		if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: value})); ok {
+			t.Errorf("%s = %q reached the gateway for the CR value %q; only a plain tier name may", a2aKubectlCostTierEnv, got, value)
+		}
+	}
+	fromSecret := withTier(corev1.EnvVar{Name: envKubectlCostTier,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}})
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the gateway: only a literal value may", envKubectlCostTier)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: "fleet"})); ok {
+		t.Errorf("%s = %q rendered with the cluster view off", a2aKubectlCostTierEnv, got)
+	}
+}
+
 func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
 	np := buildA2ASessionNetworkPolicy(a2aTestAgent(), []string{"10.96.0.10"})
 

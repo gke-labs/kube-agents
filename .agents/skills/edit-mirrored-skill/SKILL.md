@@ -68,8 +68,7 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
    `NNNN-<slug>.patch`.
 4. If refresh warns that the edit changes lines an earlier patch introduced, delete the new patch
    and go to step 2 with that patch's number.
-5. Fill in the new patch's header; refresh writes `TODO` in each line except `Upstream-Issue:`,
-   which gets `none`:
+5. Fill in the new patch's header; refresh writes `TODO` in each line:
    - `Why:`: why this repository needs the change. Whoever resolves a future conflict reads only
      this line, so state the intent, not the edit. Name a related earlier patch if there is one.
    - `Local-Issue:`: the issue that asked for it, not the pull request.
@@ -80,9 +79,14 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
      the patch, and of a later one that changed what it does (a fold, step 2). It does not say the
      case tested this patch alone. `make skills-check` fails while the line is missing, empty or
      starts with `TODO`, and when an id names no folder in `bench/tasks/`.
-   - `Retire-When:`: the upstream change that makes the patch unnecessary, or `never; <reason>`.
-   - `Upstream-Issue:`: the `google/skills` issue filed for a general fix, `none filed yet` if the
-     fix is general but not reported yet, or `none (specific to this repository)`.
+   - `Retire-When:`: what retires the patch, on one line. The line occurs one time, and
+     `make skills-check` fails a value that has none of the three forms. The header has no
+     `Upstream-Issue:` line; the check fails a patch that has one. The first word says if
+     `google/skills` must carry the fix, and only `upstream` says yes:
+     - `never; <reason>`: the patch is specific to this repository and stays.
+     - `local <change>`: the patch is specific to this repository, and a change here retires it.
+     - `upstream <change>` (or `upstream's <change>`): the fix is general, and that upstream
+       change retires the patch.
 
 ## Add or edit the appended section
 
@@ -120,7 +124,7 @@ a skill otherwise, patch it at its current pin ("Make a change").
 5. Run `make shellcheck`; clear a new finding in an upstream script as the scripts rule above says.
 6. Copy the sync's final report into the pull request: retired patches with their `Why:`, dropped
    patches and the reason, any `append.md` note, and the patch count, share of lines changed and
-   conflicts resolved. Question a retired patch whose `Retire-When:` says never.
+   conflicts resolved. Question a retired patch whose `Retire-When:` does not start with `upstream`.
 7. To abandon a sync, delete `.skill-sync/<skill>/`. Nothing outside it has changed.
 
 ## Start mirroring
@@ -141,12 +145,14 @@ a skill otherwise, patch it at its current pin ("Make a change").
 
 ## Fix a failing check
 
-| `make skills-check` reports                     | Cause                                                                       | Fix                                                                                       |
-| ----------------------------------------------- | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| the committed skill differs from copy + overlay | the skill was edited and no patch records it                                | `make skills-refresh SKILL=<skill>`                                                       |
-| the committed skill differs from copy + overlay | a patch or `append.md` was edited                                           | `make skills-generate SKILL=<skill>`                                                      |
-| a skill document is over 40,000 characters      | the generated skill grew past the size limit                                | move detail to `references/` in the overlay; `scripts/check_skill_size.py` names the file |
-| the copy does not match its lock                | the upstream copy was edited by hand                                        | revert the copy; change it only through a sync                                            |
-| a patch no longer applies                       | a patch it builds on was deleted or edited                                  | "Remove a change", step 3                                                                 |
-| fill in the `Eval-Case:` header of a patch      | the line is missing, empty or `TODO`                                        | "Make a change", step 5                                                                   |
-| the `Eval-Case:` header names no case folder    | an id is mistyped, its case was renamed or removed, or `none` has no reason | name the case's folder in `bench/tasks/`, or `none (<reason>)`                            |
+| `make skills-check` reports                           | Cause                                                                                                | Fix                                                                                       |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| the committed skill differs from copy + overlay       | the skill was edited and no patch records it                                                         | `make skills-refresh SKILL=<skill>`                                                       |
+| the committed skill differs from copy + overlay       | a patch or `append.md` was edited                                                                    | `make skills-generate SKILL=<skill>`                                                      |
+| a skill document is over 40,000 characters            | the generated skill grew past the size limit                                                         | move detail to `references/` in the overlay; `scripts/check_skill_size.py` names the file |
+| the copy does not match its lock                      | the upstream copy was edited by hand                                                                 | revert the copy; change it only through a sync                                            |
+| a patch no longer applies                             | a patch it builds on was deleted or edited                                                           | "Remove a change", step 3                                                                 |
+| fill in the `Eval-Case:` header of a patch            | the line is missing, empty or `TODO`                                                                 | "Make a change", step 5                                                                   |
+| the `Eval-Case:` header names no case folder          | an id is mistyped, its case was renamed or removed, or `none` has no reason                          | name the case's folder in `bench/tasks/`, or `none (<reason>)`                            |
+| the `Retire-When:` header has none of its three forms | no line, two lines, an empty line or `TODO`, a different first word, or no text after the first word | "Make a change", step 5; the report names the cause for each patch                        |
+| delete the `Upstream-Issue:` line of a patch          | the header has the line that `Retire-When:` replaced                                                 | delete the line; the first word of `Retire-When:` says the same                           |

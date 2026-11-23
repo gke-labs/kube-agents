@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2783,13 +2783,19 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
 
 def _terminal_call_texts(trajectory: list[Any]) -> list[tuple[str, str]]:
     """``(card, command)`` per tagged ``terminal`` call, as :func:`_worker_terminal_calls` reads it."""
-    texts: list[tuple[str, str]] = []
+    return [(card, command) for card, command, _ in _terminal_calls_with_results(trajectory)]
+
+
+def _terminal_calls_with_results(trajectory: list[Any]) -> list[tuple[str, str, str]]:
+    """``(card, command, result)`` per tagged ``terminal`` call; a result that is not text reads as empty."""
+    calls: list[tuple[str, str, str]] = []
     for entry in trajectory:
         if isinstance(entry, dict) and entry.get("agent") and entry.get("name") == _TERMINAL_TOOL:
             command = _code_call_text(entry)
             if command is not None:
-                texts.append((str(entry.get("task") or entry.get("session") or ""), command))
-    return texts
+                result = entry.get("result")
+                calls.append((str(entry.get("task") or entry.get("session") or ""), command, result if isinstance(result, str) else ""))
+    return calls
 
 
 def _clipped_cards(trajectory: list[Any]) -> set[str]:
@@ -2853,7 +2859,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
     a log line is graded on its log lines, whether or not its calls reached
     the trajectory, and any other card on its calls; the required patterns
-    and runs also read a logged card's calls. This verifier matches
+    and runs also read a logged card's calls, and the forbidden runs its
+    ``terminal`` calls that hold no heredoc. This verifier matches
     Python regular expressions against the union, ``re.search`` on each
     command verbatim, and an exemption reads a tagged call as it reads a log
     line. The two halves are not spelled alike. A log line is hermes's
@@ -2862,12 +2869,18 @@ class WorkerCommandsVerifier(BaseVerifier):
     chain joined by ``;``, ``&&`` or ``||`` arrives as its first command (a
     leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
     skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe, a
-    substitution and a backtick stay. A forbidden pattern or run reads the
+    substitution and a backtick stay. A forbidden pattern reads the
     rendering there, so a command chained behind another on a log line is not
     on any line it sees; a required pattern or run also reads the card's
     tagged calls as typed, so a run behind ``printenv X;`` is credited
     (#4620), and so is a run written into a heredoc that was never executed
-    (the admitting side, as under ``after_result_pattern``). A
+    (the admitting side, as under ``after_result_pattern``). A forbidden run
+    also reads the card's tagged ``terminal`` calls as typed, so a run behind
+    a chain or on a later line of a call is read (#6106); a call whose text
+    holds ``<<`` (a heredoc; a quoted ``<<`` or a shift counts too) is the
+    exception and stays on its row, because a heredoc body
+    splits into one argv for each line and a line written into a file is not a
+    run, so a forbidden run on a later line of such a call is not read. A
     tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
     reads each worker session's tool calls after the log scrape; ``tool_called``
     grades them), so a pattern, forbidden or exempt, reads a worker-filed
@@ -2947,6 +2960,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
     A command an exemption touched is out of the required runs as it is out
     of the required patterns; the forbidden runs read every command as typed.
+    ``refused_result_pattern`` (with ``forbidden_runs``) names the result of a
+    call that was refused, by the policy's refusal words: the forbidden runs
+    do not read a typed call of one command whose result matches, on any card
+    and under ``after_result_pattern`` too, nor, for each such call, one card
+    log row equal to its text. A call has one result, so a call of several
+    commands is read whatever its result holds; a row has no result, so the
+    row of such a call is read, and so is each row of a capture whose rows
+    name no card. A result that only quotes the refusal words matches too.
 
     ``after_result_pattern`` makes the forbidden set order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
@@ -3012,8 +3033,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     line, so a run written into the file is credited whether or not the file
     ran. A required pattern or run reads typed calls (a logged card's always,
     every card's under ``after_result_pattern``), so it credits that line; a
-    forbidden run reads a logged card's row, where the heredoc is one line
-    behind ``cat``, and does not. A card with no log line is read from its
+    forbidden run reads a logged card's row for a call that holds a heredoc
+    (without ``after_result_pattern``), where the heredoc is one line behind
+    ``cat``, and does not. The typed read does not know which commands ran: a
+    command behind ``&&`` or ``||``, in a branch that was not taken or in a
+    function that was never called reads as a run. A card with no log line is read from its
     typed calls by both. Under
     ``after_result_pattern``: a refused command whose output the call discarded
     prints nothing into its result; a result is clipped in the pod at
@@ -3049,6 +3073,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
     after_result_pattern: str | None = None
+    refused_result_pattern: str | None = None
 
     @field_validator("required_patterns", "forbidden_patterns", "exempt_patterns", "forbidden_result_patterns")
     @classmethod
@@ -3069,6 +3094,65 @@ class WorkerCommandsVerifier(BaseVerifier):
         if self.forbidden_result_patterns and self.after_result_pattern is None:
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
+
+    @field_validator("refused_result_pattern")
+    @classmethod
+    def _refused_pattern_compiles(cls, pattern: str | None) -> str | None:
+        if pattern is not None:
+            if not pattern:
+                raise ValueError("refused_result_pattern is empty, which matches each result; name the refusal's words")
+            re.compile(pattern)
+        return pattern
+
+    @model_validator(mode="after")
+    def _refused_pattern_needs_forbidden_runs(self) -> WorkerCommandsVerifier:
+        if self.refused_result_pattern is not None and not self.forbidden_runs:
+            raise ValueError("refused_result_pattern names the calls the forbidden runs skip; set forbidden_runs with it")
+        return self
+
+    def _refused(self, command: str, result: str) -> bool:
+        """Whether the forbidden runs skip a typed call: the option is set, the call is one
+        command, and its result matches. A call has one result, so a refusal in it says
+        nothing about the other commands of a longer call; such a call is read."""
+        if self.refused_result_pattern is None or not re.search(self.refused_result_pattern, result):
+            return False
+        try:
+            return len(_shell_argvs(command)) == 1
+        except ShellReadLimitError:
+            # A line past the reader's limit is not known to be one command, so it is read.
+            return False
+
+    def _forbidden_run_commands(self, snap: Any, calls: list[tuple[str, float | None, str, str, bool]], logged: set[str]) -> list[str]:
+        """The commands the forbidden runs read when no window orders the calls: each card
+        log row, the tagged calls of a card with no row, and a logged card's ``terminal``
+        calls as typed, so a run on a later line of a call or behind a chain is read
+        (#6106). A typed call that holds a heredoc is left on its row: its body splits into
+        one argv for each line, and a line written into a file is not a run. A refused call
+        (:meth:`_refused`) is not read, and for each one neither is one row equal to its
+        text. Rows that name no card cannot be joined to a call, so none of them is skipped.
+        The reader's limit holds for a typed call as for a row: a call past it gives no argvs,
+        and the check is an error unless a forbidden run was read."""
+        rows = [(str(row.get("task") or ""), str(row.get("command", ""))) for row in snap.worker_commands]
+        unjoined = "" in logged
+        children = [command for card, _, command, result, _ in calls if (unjoined or card not in logged) and not self._refused(command, result)]
+        if unjoined:
+            return [command for _, command in rows] + children
+        refused: dict[tuple[str, str], int] = {}
+        not_refused: set[tuple[str, str]] = set()
+        for card, command, result in _terminal_calls_with_results(snap.trajectory):
+            if self._refused(command, result):
+                refused[(card, command)] = refused.get((card, command), 0) + 1
+            else:
+                not_refused.add((card, command))
+        read_rows: list[str] = []
+        for card, command in rows:
+            if refused.get((card, command)):
+                refused[(card, command)] -= 1
+                continue
+            read_rows.append(command)
+        seen = set(rows)
+        beside = [command for card, command in sorted(not_refused) if card in logged and (card, command) not in seen and not _holds_heredoc(command)]
+        return read_rows + children + beside
 
     def _without_exempt_text(self, command: str, joined: bool = False) -> str:
         # ``joined``: the row's card typed a call the row may have joined lines of
@@ -3101,6 +3185,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         # The log rows of a card that typed a call the row may have joined lines of.
         joined_rows: set[str] = set()
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
+        # What the forbidden runs read; ``None`` is the typed set.
+        run_commands: list[str] | None = None
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3121,10 +3207,12 @@ class WorkerCommandsVerifier(BaseVerifier):
             # in the log and no tagged terminal call), so every log line is kept whatever
             # the trajectory holds, and the trajectory's calls join the
             # graded set by card, not by string: a card with a log line contributes its
-            # log lines and none of its calls to the forbidden set (the required
-            # checks also take its calls, below), so a command a filed card typed is counted
+            # log lines and none of its calls to the forbidden patterns (the required
+            # checks also take its calls, and the forbidden runs its terminal calls that
+            # hold no heredoc, below), so a command a filed card typed is counted
             # once (its log line and its call need not be spelled alike) and a command
-            # typed twice is counted twice. A card with no log line -- a worker filed it,
+            # typed twice is counted twice; a forbidden run can be named two times, on
+            # its row and in its typed call, when the two are not spelled alike. A card with no log line -- a worker filed it,
             # or its log showed no shell command -- contributes its tagged calls, which
             # for a filed card can only add ``execute_code`` text the log never shows (a
             # behaviour change for a filed card that ran only code: its program text is
@@ -3147,10 +3235,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # A log row shows a chain as its first command only (``printenv X + 1
                 # command``), so a run chained behind it is on no row (#4620). The
                 # required patterns and runs also read the logged cards' calls as
-                # typed, a call that repeats a row verbatim excepted. The forbidden set
-                # keeps the rows: a typed heredoc splits into one argv per line, so a
-                # command written into a file and never run would read as a forbidden
-                # run, and an exemption is written against the rendering. An exemption
+                # typed, a call that repeats a row verbatim excepted. The forbidden
+                # patterns keep the rows: an exemption is written against the rendering.
+                # The forbidden runs also read the logged cards' terminal calls
+                # (``_forbidden_run_commands``), a call with a heredoc excepted: a typed
+                # heredoc splits into one argv per line, so a command written into a
+                # file and never run would read as a forbidden run. An exemption
                 # still takes an exempt call out of the required read, as it does a row.
                 if self.required_patterns or self.required_runs:
                     rows = set(logged_commands)
@@ -3160,7 +3250,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined.append(f"{len(children)} from the tagged calls of cards with no log line")
                 if beside_rows:
                     count = len(beside_rows)
-                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
+                    readers = "the required checks and the forbidden runs" if self.forbidden_runs else "the required checks only"
+                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by {readers}")
                 if joined:
                     sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
             if self.exempt_grep_patterns:
@@ -3178,6 +3269,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined_rows = {str(row.get("command", "")) for row in snap.worker_commands if str(row.get("task") or "") in joined}
             typed = logged_commands + children
             windowed = typed
+            if self.forbidden_runs:
+                run_commands = self._forbidden_run_commands(snap, calls, logged)
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -3194,6 +3287,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            if self.refused_result_pattern is not None:
+                run_commands = [command for _, _, command, result, _ in calls if not self._refused(command, result)]
             # The ordered check reads the calls alone: a log row has no time.
             # A check with no forbidden set keeps the card log as a source for
             # its required checks: the trajectory can be the narrower read (two
@@ -3259,7 +3354,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         # for the forbidden runs. A check with patterns alone reads none. Each line is read by
         # itself; a line past the reader's limit has no argvs.
         argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
-        typed_argvs, typed_unread = _argvs_and_first_unread(typed if self.forbidden_runs else [])
+        typed_argvs, typed_unread = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [])
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
@@ -8676,7 +8771,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
-        "ingress-gateway-healthcheck-mismatch",
+        "ingress-gateway-healthcheck-mismatch", "image-pull-failing",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",

@@ -14,9 +14,22 @@
 
 # The scenario driver for bench/tasks/gitops-configsync-rootsync-stalled.
 #
-# It plants one Config Sync RootSync, `root-sync` in var.namespace, whose
-# status reports Stalled, for one run. Compliance check 2.17
-# (`configsync-reconciler-stalled`) reads that condition.
+# It plants one Config Sync RootSync, `root-sync` in var.namespace, for one
+# run, in one of the two states compliance check 2.17
+# (`configsync-reconciler-stalled`) reads (var.reconciler_state):
+#
+#  - `stalled`, the default and the stack's first case: the sync object's
+#    status reports Stalled.
+#  - `out-of-memory`, for bench/tasks/gitops-configsync-rootsync-oomkilled:
+#    the sync object reads healthy, and beside it a stand-in reconciler pod is
+#    killed for memory at every start. That is a live reconciler loop at a
+#    moment between two kills: each restart makes the Deployment available,
+#    the object's Reconciling condition goes False, and only the pod says what
+#    is wrong. The pod carries the labels Config Sync puts on a reconciler
+#    pod, with the sync object it serves; its image is not Config Sync's.
+#
+# One stack for both, so that either case's plant clears the other's
+# leftover: they share the namespace, the CRD and the label that owns them.
 #
 # No pool cluster runs Config Sync, so the stack installs the RootSync kind
 # itself (rootsync_crd.sh beside this file): a minimal CRD in
@@ -126,6 +139,76 @@ locals {
           lastUpdateTime: "${local.stalled_at}"
           lastTransitionTime: "${local.stalled_at}"
   MANIFEST
+
+  # The out-of-memory state. The sync object carries the one condition a live
+  # object held between two kills of its reconciler: nothing in it says the
+  # reconciler is down. Beside it, the stand-in reconciler: the labels of a
+  # real reconciler pod, and a container of the reconciler's name that
+  # allocates past its limit at every start. Its requests and limits are the
+  # ones an Autopilot host wrote for it (read back from a live plant on GKE
+  # 1.35), so the object is the same on either host type.
+  out_of_memory          = var.reconciler_state == "out-of-memory"
+  between_kills_at       = "2026-11-20T23:50:41Z"
+  manifest_out_of_memory = <<-MANIFEST
+    apiVersion: ${local.api_version}
+    kind: RootSync
+    metadata:
+      name: "${var.target_resource_name}"
+      labels:
+        managed-by: kube-agents-bench
+        created-by-stack: ${local.stack}
+    spec:
+      sourceFormat: unstructured
+      sourceType: git
+      git:
+        repo: https://config-sync-fixture.invalid/fleet-config.git
+        branch: main
+        dir: fixture-no-such-directory
+        auth: none
+    status:
+      observedGeneration: 1
+      conditions:
+        - type: Reconciling
+          status: "False"
+          lastUpdateTime: "${local.between_kills_at}"
+          lastTransitionTime: "${local.between_kills_at}"
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: ${local.reconciler}
+      labels:
+        managed-by: kube-agents-bench
+        created-by-stack: ${local.stack}
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          configsync.gke.io/deployment-name: ${local.reconciler}
+      template:
+        metadata:
+          labels:
+            app: reconciler
+            managed-by: kube-agents-bench
+            configsync.gke.io/deployment-name: ${local.reconciler}
+            configsync.gke.io/sync-kind: RootSync
+            configsync.gke.io/sync-name: "${var.target_resource_name}"
+            configsync.gke.io/sync-namespace: ${var.namespace}
+        spec:
+          automountServiceAccountToken: false
+          containers:
+            - name: reconciler
+              image: busybox:1.36
+              command: ["sh", "-c", "dd if=/dev/zero of=/dev/null bs=${var.allocate_mib}M count=1 && sleep 3600"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: ${var.memory_limit_mib}Mi
+                  ephemeral-storage: 1Gi
+                limits:
+                  memory: ${var.memory_limit_mib}Mi
+                  ephemeral-storage: 1Gi
+  MANIFEST
 }
 
 resource "null_resource" "crd" {
@@ -175,7 +258,7 @@ module "plant" {
   namespace             = var.namespace
   stack                 = local.stack
   labels                = local.ci_labels
-  manifest              = local.manifest
+  manifest              = local.out_of_memory ? local.manifest_out_of_memory : local.manifest
 
   depends_on = [null_resource.crd]
 }
