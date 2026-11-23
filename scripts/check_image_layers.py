@@ -3,8 +3,9 @@
 
 Docker's overlay2 storage driver refuses to mount a stack deeper than 128
 layers and reports ``max depth exceeded``. The deepest chain that
-``deploy/docker/Dockerfile`` ships -- ``agent-base`` -> ``platform`` -- runs
-close to that ceiling, and nothing in an ordinary build tells you how close.
+``deploy/docker/Dockerfile`` ships -- ``agent-base`` -> ``platform`` -- has run
+within a layer of this gate's budget, and nothing in an ordinary build tells
+you how close it is.
 
 This module owns the question of which image the gate points at, and the
 Dockerfile's layer-budget note defers to it. That chain used to end at
@@ -30,10 +31,10 @@ how build f9f1747c broke on 2026-08-07 before them (#658).
 
 The budget is checked against a real image rather than by counting ``RUN`` and
 ``COPY`` lines, because the two disagree: BuildKit elides instructions that
-produce no filesystem diff, and the base image contributes layers this file
-cannot see (38 of them, as of ``nousresearch/hermes-agent:v2026.9.14``). The
-count that matters is the one the daemon will have to stack, which is the one
-recorded in the image.
+produce no filesystem diff. The Hermes base no longer adds layers of its own:
+``agent-base`` copies its files into an empty stage, so they arrive as one
+layer however many the published image has. The count that matters is the one
+the daemon will have to stack, which is the one recorded in the image.
 
 The default ceiling is deliberately below 128. A build that has reached 128 is
 already broken; the point of a gate is to fail while there is still room to

@@ -70,9 +70,11 @@ type TokenValidator struct {
 	audience string
 
 	// now is injectable for tests. cacheTTL is reviewCacheTTL, or zero in
-	// a test that has to see every review.
-	now      func() time.Time
-	cacheTTL time.Duration
+	// a test that has to see every review. reviewBudget is
+	// authDecisionBudget, or the suite's connect budget in its harness.
+	now          func() time.Time
+	cacheTTL     time.Duration
+	reviewBudget time.Duration
 
 	// afterMiss, when set, runs after the first check of the memory has
 	// missed and before the shared call is joined. It is nil outside tests;
@@ -132,6 +134,7 @@ func NewTokenValidator(client kubernetes.Interface, audience string) (*TokenVali
 		audience:         audience,
 		now:              time.Now,
 		cacheTTL:         reviewCacheTTL,
+		reviewBudget:     authDecisionBudget,
 		cacheKeyMaterial: keyMaterial,
 		cache:            map[[sha256.Size]byte]cachedReview{},
 	}, nil
@@ -203,7 +206,7 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 		if att, ok := v.remembered(key); ok {
 			return reviewed{att: att, source: reviewCached}, nil
 		}
-		reviewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authDecisionBudget)
+		reviewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v.reviewBudget)
 		defer cancel()
 		att, err := v.review(reviewCtx, token)
 		if err != nil {

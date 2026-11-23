@@ -878,3 +878,16 @@ func TestShippedWorkloadSkillsCarrySessionReportNote(t *testing.T) {
 		}
 	}
 }
+
+// The propose-only note is where a session skill meets a step that changes
+// something. When the person wants it done, the note sends the whole ask to
+// platform in the turn it is asked, with its reads, not a later handoff of the
+// change alone: a session with the cluster view otherwise reads first and the
+// change never reaches platform (#6859).
+func TestTheProposeOnlyNoteHandsTheWholeAskToPlatform(t *testing.T) {
+	for _, want := range []string{"do not run it", "delegate the whole ask to `platform`", "when the delegate tool lists it", "in the turn it is asked", "with the reads it depends on"} {
+		if !strings.Contains(proposeOnlyNote, want) {
+			t.Errorf("proposeOnlyNote lacks %q: %q", want, proposeOnlyNote)
+		}
+	}
+}
