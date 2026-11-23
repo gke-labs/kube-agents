@@ -1724,7 +1724,8 @@ fi
 # its turns; shipped leaves the cap at the install default, what a customer
 # install gets, and an eviction, a wait or a refusal there is a finding about
 # that default.
-EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
+# DO NOT MERGE: a session-route twin for #6987.
+EVAL_FRONT_DOOR="session"
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
 platform | session) ;;
@@ -3396,6 +3397,9 @@ if ! verify_front_door; then
   report_cr_status "front-door-mismatch"
   exit 1
 fi
+# DO NOT MERGE (#6987 twin): what the operator rendered for the session pods'
+# cluster view, for the evidence.
+echo "cluster view: gateway A2A_SESSION_CLUSTER_VIEW=$(kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" -n "${NAMESPACE}" -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_SESSION_CLUSTER_VIEW")]}{.value}{end}{end}' 2>/dev/null || true)"
 
 # What the run has to show for itself, for the artifact log: the CR status,
 # the A2A stack, the ungated gateway, and the entrypoint's
