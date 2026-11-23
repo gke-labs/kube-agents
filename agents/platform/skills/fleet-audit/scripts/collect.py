@@ -710,6 +710,8 @@ SERVICEENTRY_COLLISION_MINIMUM = 2
 # script ships and runs standalone (see the module docstring), and a
 # constant four SOPs already agree on is safer copied once than imported
 # across a module boundary that changes what "the collector" depends on.
+# Config Sync's resource-group-system is the one entry the SOPs do not list
+# yet: a cluster running Config Sync gets it beside config-management-system.
 SYSTEM_NAMESPACES = frozenset(
     {
         "kube-system",
@@ -726,6 +728,9 @@ SYSTEM_NAMESPACES = frozenset(
         "anthos-identity-service",
         "gatekeeper-system",
         "composer-system",
+        # Config Sync's ResourceGroup controller, installed beside
+        # config-management-system (which the prefix below covers).
+        "resource-group-system",
     }
 )
 

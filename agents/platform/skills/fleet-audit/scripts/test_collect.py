@@ -15129,5 +15129,21 @@ class TestWebhookCaBundleExpired(unittest.TestCase):
         self.assertEqual(collect._COMPLIANCE_CHECK_SOURCES["webhook-ca-bundle-expired"], ("webhooks",))
 
 
+class ConfigSyncSystemNamespacesTest(unittest.TestCase):
+    """Config Sync's own namespaces are S1: its controllers are GKE-managed
+    infrastructure, and a cluster running it would otherwise file findings on
+    pods its owner cannot edit (resource-group-controller in
+    resource-group-system, the reconcilers and their monitoring under
+    config-management-*)."""
+
+    def test_config_syncs_namespaces_are_system_namespaces(self):
+        for ns in ("resource-group-system", "config-management-system", "config-management-monitoring"):
+            self.assertTrue(collect._is_system_namespace(ns), ns)
+
+    def test_a_workload_namespace_is_not(self):
+        for ns in ("resource-group", "resource-group-system-x", "seeded-post-merge"):
+            self.assertFalse(collect._is_system_namespace(ns), ns)
+
+
 if __name__ == "__main__":
     unittest.main()

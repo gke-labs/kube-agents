@@ -9061,5 +9061,15 @@ class PrepareKubeconfigTest(unittest.TestCase):
                 path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
             self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
+
+class ConfigSyncSystemNamespacesTest(unittest.TestCase):
+    """The waste audit's S1 set matches the collector's for Config Sync."""
+
+    def test_config_syncs_namespaces_are_system_namespaces(self):
+        for ns in ("resource-group-system", "config-management-system", "config-management-monitoring"):
+            self.assertTrue(fw._is_system_namespace(ns), ns)
+        self.assertFalse(fw._is_system_namespace("resource-group"))
+
+
 if __name__ == "__main__":
     unittest.main()
