@@ -1655,16 +1655,15 @@ KUBECTL_MUTATING_SUBVERBS: dict[str, frozenset[str]] = {
 }
 
 
-# A short-flag cluster (`-hv=9`): its letters, then `=` or the end. One
-# unambiguous character class, so the match is linear on any input; the help
-# letter is looked for in the letters afterwards (_short_help_cluster).
-_SHORT_FLAG_CLUSTER_RE = re.compile(r"\A-([A-Za-z]+)(?:=|\Z)")
-
-
 def _short_help_cluster(token: str) -> bool:
-    """Whether ``token`` is a short-flag cluster carrying the help letter."""
-    m = _SHORT_FLAG_CLUSTER_RE.match(token)
-    return m is not None and "h" in m.group(1)
+    """Whether ``token`` is a short-flag cluster carrying the help letter (`-hv=9`).
+
+    Plain string parsing: one dash, then ASCII letters up to an optional `=`.
+    """
+    if not token.startswith("-") or token.startswith("--"):
+        return False
+    letters = token[1:].split("=", 1)[0]
+    return letters.isascii() and letters.isalpha() and "h" in letters
 
 
 def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
