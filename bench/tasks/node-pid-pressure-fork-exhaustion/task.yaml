@@ -29,21 +29,21 @@
 # multi-process workload on a pool with no pod PID limit, and a node that
 # reports PIDPressure. The first half flips this case; the second reads
 # nothing here. The tests above contradict the first half as the fault, and
-# that contradiction is a question for #2581's owners, with a pointer on #5410
-# (eval-fix-loop, "The premise"); at this commit the question is not posted.
+# that contradiction is a question for #2581's owners (eval-fix-loop, "The
+# premise"), posted there with the test results:
+# https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7112363582.
 # Fixture rule 9 has no state for a case that waits on such a question: by its
 # words a setting at the platform's default is not a fixture. The case keeps
-# its lane lines, as before this change, because a build of the check is in
-# flight under #2581. If its owners drop the first half, no fixture on the
-# fleet makes the other half fire, and the case parks; if that half lands, the
-# case passes on the shape that `expected_output` names and on no more. The
-# readiness rule group-oom-kill and the case
-# upgrades-fleet-readiness-multi-process-container assert it is the fleet's
-# only forking container, so no second forking plant may land. Domain
-# `fleet-audits` as the other GCE compute cases.
+# its lane lines, as before this change, until the owners answer. If they drop
+# the first half, no fixture on the fleet makes the other half fire, and the
+# case parks; if that half lands, the case passes on the shape that
+# `expected_output` names and on no more. The readiness rule group-oom-kill
+# and the case upgrades-fleet-readiness-multi-process-container assert it is
+# the fleet's only forking container, so no second forking plant may land.
+# Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
-name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit, the platform's default; a question for the check's owners follows this change)"
+name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit, the platform's default; a question to the check's owners is open)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2
