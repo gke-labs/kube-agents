@@ -661,31 +661,52 @@ func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
 // tail before each match, not from the line's start (#5311 review). Read
 // from the line's start, 256 KiB took about two minutes.
 //
-// The test bounds how the cost grows with the line, not how long the scrub
-// takes: a line four times as long costs four times as much when the scrub
-// is linear and sixteen times when it is quadratic, on any machine and
-// under -race alike. A wall-clock budget cannot tell a quadratic scrub from
-// a starved runner: under -race this scrub takes about 20s of CPU, and a
-// 30s budget failed on a loaded host.
+// Two bounds, both on CPU time, because a wall-clock budget cannot tell a
+// slow scrub from a starved runner (under -race this scrub takes 13s to 20s
+// of CPU for 256 KiB, and a 30s wall-clock budget failed on a loaded host):
+//
+//   - how the cost grows: a line four times as long costs four times as
+//     much when the scrub is linear and sixteen times when it is quadratic,
+//     on any machine and under -race alike. It is read on a short pair of
+//     lines, so that a quadratic scrub fails in seconds;
+//   - what 256 KiB costs: no more than the hook's timeout. A scrub that is
+//     linear and many times slower passes the first bound and fails this one.
 func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
 	const (
-		fullSize = 256 * 1024
-		// The shorter line is fullSize/sizeRatio: linear growth is
-		// sizeRatio, quadratic is its square.
+		// The pair the growth is read on. The longer line is sizeRatio
+		// times the shorter: linear growth is sizeRatio, quadratic is its
+		// square.
+		shortSize = 16 * 1024
 		sizeRatio = 4
 		// Between the two. A scrub with a linear and a quadratic part goes
-		// over it once the quadratic part is twice the linear one at
-		// fullSize.
+		// over it once the quadratic part is twice the linear one on the
+		// longer line.
 		maxGrowth = 8
+		// A growth over maxGrowth and up to this is read again, up to
+		// maxRounds rounds: contention only ever adds CPU time (a shared
+		// core, a cold cache; under load one reading in ten came out 1.6x
+		// to 1.8x the others), so a line's cost is the lowest of its
+		// readings. A growth over this fails at once: no reading of a
+		// linear scrub came near it, and a quadratic scrub's rounds are
+		// the slow ones.
+		retryGrowth = 12
+		maxRounds   = 3
 		// A reading shorter than this is repeated until it adds up to it.
 		minReading = 200 * time.Millisecond
-		// Contention only ever adds CPU time (a shared core, a cold cache:
-		// one reading in ten under load came out 1.6x the others), so a
-		// line's cost is the lowest of its readings, and another round is
-		// read only while the growth is over the bound. A quadratic scrub
-		// is over it in every round.
-		maxRounds = 3
+		// The line the ceiling is read on.
+		ceilingSize = 256 * 1024
+		// What -race multiplies this scrub's CPU time by, at most: 17x to
+		// 20x measured.
+		raceSlowdown = 20
 	)
+	// The ceiling: the hook this scrub runs under gives up after
+	// hookTimeoutSeconds. The line takes 0.6s to 1.2s of CPU, twice that at
+	// worst on a contended core, so the ceiling is four times clear of a
+	// correct scrub and fails one many times slower.
+	ceiling := hookTimeoutSeconds * time.Second
+	if raceEnabled {
+		ceiling *= raceSlowdown
+	}
 	line := func(size int) string {
 		var b strings.Builder
 		for b.Len() < size {
@@ -693,27 +714,42 @@ func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
 		}
 		return b.String()
 	}
-	short, full := line(fullSize/sizeRatio), line(fullSize)
-	var shortCost, fullCost time.Duration
+	short, long := line(shortSize), line(shortSize*sizeRatio)
+	// One scrub is discarded: the first one in a process also pays for the
+	// patterns' first use, which would count against the short line alone
+	// and hide growth.
+	scrubInlineSecrets(short)
+	var shortCost, longCost time.Duration
 	growth := 0.0
 	rounds := 0
 	for rounds < maxRounds {
 		rounds++
-		shortRead, fullRead := scrubCPUTime(t, short, minReading), scrubCPUTime(t, full, minReading)
-		if rounds == 1 || shortRead < shortCost {
-			shortCost = shortRead
+		// The short line is read on both sides of the long one, and the
+		// lower reading kept, so that one slow short reading cannot pass a
+		// scrub whose growth is over the bound.
+		shortBefore := scrubCPUTime(t, short, minReading)
+		longRead := scrubCPUTime(t, long, minReading)
+		shortRead := min(shortBefore, scrubCPUTime(t, short, minReading))
+		if rounds == 1 {
+			shortCost, longCost = shortRead, longRead
 		}
-		if rounds == 1 || fullRead < fullCost {
-			fullCost = fullRead
-		}
-		growth = float64(fullCost) / float64(shortCost)
-		t.Logf("round %d: scrub CPU time %s for %d KiB, %s for %d KiB; lowest so far %s and %s, growth %.1fx for %dx the line", rounds, shortRead, len(short)/1024, fullRead, len(full)/1024, shortCost, fullCost, growth, sizeRatio)
-		if growth <= maxGrowth {
+		shortCost, longCost = min(shortCost, shortRead), min(longCost, longRead)
+		growth = float64(longCost) / float64(shortCost)
+		t.Logf("round %d: scrub CPU time %s for %d KiB, %s for %d KiB; lowest so far %s and %s, growth %.1fx for %dx the line", rounds, shortRead, len(short)/1024, longRead, len(long)/1024, shortCost, longCost, growth, sizeRatio)
+		if growth <= maxGrowth || growth > retryGrowth {
 			break
 		}
 	}
 	if growth > maxGrowth {
-		t.Errorf("a line %dx as long cost %.1fx the CPU time (%s, then %s, each the lowest of %d readings): linear is %dx, quadratic %dx, the bound %dx", sizeRatio, growth, shortCost, fullCost, rounds, sizeRatio, sizeRatio*sizeRatio, maxGrowth)
+		// Fatal: the ceiling's line is the long one to scrub, and a scrub
+		// that has already failed should not spend the test's timeout on it.
+		t.Fatalf("a line %dx as long cost %.1fx the CPU time (%s, then %s, each the lowest reading; rounds read: %d): linear is %dx, quadratic %dx, the bound %dx", sizeRatio, growth, shortCost, longCost, rounds, sizeRatio, sizeRatio*sizeRatio, maxGrowth)
+	}
+	ceilingLine := line(ceilingSize)
+	ceilingCost := scrubCPUTime(t, ceilingLine, minReading)
+	t.Logf("scrub CPU time %s for %d KiB, the ceiling %s", ceilingCost, len(ceilingLine)/1024, ceiling)
+	if ceilingCost > ceiling {
+		t.Errorf("a %d KiB line took %s of CPU to scrub, over the %s ceiling: the hook's %ds timeout, times %d when the build is -race", len(ceilingLine)/1024, ceilingCost, ceiling, hookTimeoutSeconds, raceSlowdown)
 	}
 	// The lead is still honoured inside the window.
 	if got := scrubInlineSecrets(`"authorization": "Bearer abcdEFGH1234ijkl5678"`); strings.Contains(got, "abcdEFGH1234ijkl5678") {
@@ -723,10 +759,8 @@ func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
 
 // scrubCPUTime is the CPU time one scrubInlineSecrets(s) takes: the scrub is
 // repeated until the readings add up to atLeast, and their mean returned.
-// CPU time, not wall time, so that a runner sharing its cores does not count
-// against the scrub. It is the whole process's, the garbage collector and
-// the race detector included, which grow with the line as the scrub does;
-// this package's tests do not run in parallel.
+// CPU time, not wall time, so that the time the scrub waits for a core on a
+// shared runner does not count against it.
 func scrubCPUTime(t *testing.T, s string, atLeast time.Duration) time.Duration {
 	t.Helper()
 	start := processCPUTime(t)
@@ -738,7 +772,13 @@ func scrubCPUTime(t *testing.T, s string, atLeast time.Duration) time.Duration {
 	}
 }
 
-// processCPUTime is the user and system CPU time this process has used.
+// processCPUTime is the user and system CPU time this process has used, on
+// every thread. The gateway's threadCPU reads one locked thread instead,
+// which only Linux can and which skips elsewhere; this clock also reads on
+// macOS, so the test runs there. The price is that it counts the garbage
+// collector and the race detector's own threads, about a quarter on top of
+// the scrub; both grow with the line as the scrub does, and this package's
+// tests do not run in parallel, so no other test's work is in a reading.
 func processCPUTime(t *testing.T) time.Duration {
 	t.Helper()
 	var ru syscall.Rusage
