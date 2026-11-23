@@ -497,16 +497,24 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         import yaml
 
         for path, text in self._added:
-            if self.synced_directory and not fnmatch.fnmatchcase(path.rsplit("/", 1)[0], self.synced_directory):
+            directory = path.rpartition("/")[0]
+            # fnmatch's `*` crosses `/`, so the depth is compared as well.
+            if self.synced_directory and (
+                directory.count("/") != self.synced_directory.count("/")
+                or not fnmatch.fnmatchcase(directory, self.synced_directory)
+            ):
                 return f"{path} is outside {self.synced_directory}, the directory the reconciler applies"
-            if not self.synced_namespace:
-                continue
             try:
                 docs = [doc for doc in yaml.safe_load_all(text) if doc]
             except yaml.YAMLError as exc:
                 return f"{path} is not YAML the reconciler can apply: {exc}"
+            if not docs:
+                return f"{path} declares no object for the reconciler to apply"
+            if not self.synced_namespace:
+                continue
             for doc in docs:
-                namespace = str(((doc.get("metadata") or {}) if isinstance(doc, dict) else {}).get("namespace") or "")
+                metadata = doc.get("metadata") if isinstance(doc, dict) else None
+                namespace = str((metadata if isinstance(metadata, dict) else {}).get("namespace") or "")
                 if namespace != self.synced_namespace:
                     return f"{path} puts an object in namespace {namespace or '(none)'!r}, not {self.synced_namespace!r}"
         return ""

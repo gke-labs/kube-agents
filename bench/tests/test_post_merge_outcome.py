@@ -434,3 +434,26 @@ def test_a_fix_in_another_namespace_fails_before_any_merge(world, monkeypatch):
     assert status == "fail" and "'seeded-reliability'" in reason
     assert not any(url.endswith("/merge") for _, url in world.forge.writes)
 
+
+@pytest.mark.parametrize(
+    "path, text, why",
+    [
+        ("clusters/other/seeded-a/seeded-post-merge/b.yaml", "kind: PodDisruptionBudget\nmetadata: {namespace: seeded-post-merge}\n", "outside"),
+        ("clusters/seeded-a/seeded-post-merge/b.yaml", "# only a comment\n---\n", "declares no object"),
+        ("clusters/seeded-a/seeded-post-merge/b.yaml", "kind: PodDisruptionBudget\nmetadata: order-ledger-pdb\n", "namespace '(none)'"),
+    ],
+)
+def test_a_fix_the_reconciler_cannot_apply_fails_and_never_crashes(world, monkeypatch, path, text, why):
+    real_get = world.forge.get
+
+    def get(url, token, timeout):
+        if "/files" in url:
+            return 200, [{"filename": path, "status": "added", "patch": "@@"}]
+        return real_get(url, token, timeout)
+
+    monkeypatch.setattr(post_merge, "_forge_get_json", get)
+    monkeypatch.setattr(post_merge, "_added_file_text", lambda entry: text)
+    status, reason = _verifier(**SYNCED)._merge_and_apply(5)
+    assert status == "fail" and why in reason
+    assert not any(url.endswith("/merge") for _, url in world.forge.writes)
+

@@ -403,40 +403,46 @@ def restore_post_merge_budget(
     path = f"{directory}/{POST_MERGE_BUDGET_FILE}"
     budget = _post_merge_budget()
     entry, text = _file_text(repo, path, branch, token)
-    if text == budget.BUDGET_CONTENT:
-        return
-    print(f"  {path} {'missing' if entry is None else 'changed'}, put back as seeded")
+    changed = text != budget.BUDGET_CONTENT
+    if changed:
+        print(f"  {path} {'missing' if entry is None else 'changed'}, put back as seeded")
     if dry_run:
         return
-    body = {
-        "message": POST_MERGE_RESTORE_MESSAGE.format(path=path, scope=scope),
-        "content": base64.b64encode(budget.BUDGET_CONTENT.encode()).decode(),
-        "branch": branch,
-    }
-    if entry is not None:
-        body["sha"] = entry["sha"]
-    try:
-        write("PUT", f"/repos/{repo}/contents/{urllib.parse.quote(path)}", token, body)
-    except CALL_FAULTS as exc:
-        print(f"  {path} was not restored ({describe(exc)})", file=sys.stderr)
-        record["steady_files_unrestored"].append(path)
-        return
-    # The wait needs the runner's read-only kubeconfig for the fixture's role;
-    # the lease-time reset runs before the runner writes them, and then the
-    # branch alone is restored and the per-unit resets wait.
+    if changed:
+        body = {
+            "message": POST_MERGE_RESTORE_MESSAGE.format(path=path, scope=scope),
+            "content": base64.b64encode(budget.BUDGET_CONTENT.encode()).decode(),
+            "branch": branch,
+        }
+        if entry is not None:
+            body["sha"] = entry["sha"]
+        try:
+            write("PUT", f"/repos/{repo}/contents/{urllib.parse.quote(path)}", token, body)
+        except CALL_FAULTS as exc:
+            print(f"  {path} was not restored ({describe(exc)})", file=sys.stderr)
+            record["steady_files_unrestored"].append(path)
+            return
+    # The cluster is read on every reset where the fixture is provisioned,
+    # the branch already seeded included: an earlier reset may have restored
+    # the branch and timed out, or had no kubeconfig to wait with. The read
+    # needs the runner's read-only kubeconfig for the fixture's role, which the
+    # lease-time reset runs before; that reset restores the branch alone, and
+    # the per-unit resets, which run after the runner wrote them, wait.
     kubeconfigs = os.environ.get(budget.KUBECONFIG_DIR_ENV, "")
     if not kubeconfigs or not (pathlib.Path(kubeconfigs) / f"{budget.FIXTURE_ROLE}.kubeconfig").is_file():
-        print(f"  {path} restored on the branch; no fleet kubeconfig to wait for Config Sync with")
-        record["steady_files_restored"].append(path)
+        if changed:
+            print(f"  {path} restored on the branch; no fleet kubeconfig to wait for Config Sync with")
+            record["steady_files_restored"].append(path)
         return
     deadline = clock() + POST_MERGE_SYNC_WAIT_SECONDS
     while not budget.is_seeded(budget.budget_state()):
         if clock() + POST_MERGE_SYNC_POLL_SECONDS > deadline:
-            print(f"  {path} restored, but Config Sync did not apply it within {POST_MERGE_SYNC_WAIT_SECONDS:.0f}s", file=sys.stderr)
+            print(f"  {path} is on the branch, but Config Sync did not apply it within {POST_MERGE_SYNC_WAIT_SECONDS:.0f}s", file=sys.stderr)
             record["steady_files_unrestored"].append(path)
             return
         pause(POST_MERGE_SYNC_POLL_SECONDS)
-    record["steady_files_restored"].append(path)
+    if changed:
+        record["steady_files_restored"].append(path)
 
 
 def planted_stack_files(kcc_cluster: str = "") -> tuple[str, ...]:

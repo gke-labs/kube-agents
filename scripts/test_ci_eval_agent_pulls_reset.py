@@ -997,6 +997,25 @@ class PostMergeSteadyStateTest(unittest.TestCase):
         self.assertEqual(record["steady_files_unrestored"], [self.BUDGET])
         self.assertFalse(record["clean"])
 
+    def test_a_seeded_branch_still_waits_for_the_cluster(self):
+        # An earlier reset restored the branch and timed out (or had no
+        # kubeconfig): this one must read the cluster, not trust the branch.
+        import itertools
+
+        with self._with_kubeconfig(itertools.repeat({})):
+            record, _, _ = run_reset(_WritableGitHub(files={self.DECLARATION: "x", self.BUDGET: self.seeded}))
+        self.assertEqual(record["steady_files_unrestored"], [self.BUDGET])
+        self.assertFalse(record["clean"])
+
+    def test_a_seeded_branch_and_cluster_is_a_quiet_clean(self):
+        applied = {"metadata": {"labels": {"app": "order-ledger"}}, "spec": {"maxUnavailable": 1}}
+        with self._with_kubeconfig([applied]):
+            github = _WritableGitHub(files={self.DECLARATION: "x", self.BUDGET: self.seeded})
+            record, _, _ = run_reset(github)
+        self.assertEqual(self.puts(github), [])
+        self.assertEqual((record["steady_files_restored"], record["steady_files_unrestored"]), ([], []))
+        self.assertTrue(record["clean"])
+
     def test_the_directory_is_the_one_the_setup_stack_restores(self):
         main = (helper.POST_MERGE_BUDGET_MODULE.parent / "main.tf").read_text()
         self.assertEqual(helper.POST_MERGE_DIRECTORY, "clusters/{cluster}/seeded-post-merge")
