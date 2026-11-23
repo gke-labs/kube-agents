@@ -1024,3 +1024,46 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLi
 		t.Fatalf("syncA2AConditions did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
 	}
 }
+
+// The ProfileSupervisorForm latch (#5301) has its own term in the unchanged-
+// status early return, as BusProvisioned does: a settled pass that reaches the
+// switch and changes nothing else still saves it. Without the term the latch
+// lived only in memory, so a gateway roll on the next release closed the gate
+// and moved the dispatcher back for the length of the roll.
+func TestTheSupervisorFormLatchIsPersistedWhenNothingElseChanged(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	agent.Generation = 3
+	agent.Status.Phase = "Ready"
+	agent.Status.ObservedGeneration = 3
+	agent.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Reconciled",
+		Message:            "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready",
+		ObservedGeneration: 3, LastTransitionTime: metav1.Now()}}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
+			a2aGatewayWorkload(agent, 1), a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	ctx := context.Background()
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+		t.Fatal(err)
+	}
+	if meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
+		t.Fatal("precondition: the latch is set before any pass wanted it")
+	}
+	state := a2aStateFrom(t, ctx, r, agent)
+	state.profileSupervisorFormLatch = true
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), state); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if !meta.IsStatusConditionTrue(stored.Status.Conditions, a2aProfileSupervisorFormCondition) {
+		t.Error("the supervisor-form latch was not persisted on a pass where nothing else about the status changed")
+	}
+}

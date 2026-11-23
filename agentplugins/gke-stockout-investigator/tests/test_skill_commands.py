@@ -2,11 +2,10 @@
 
     python3 -m unittest discover -s agentplugins/gke-stockout-investigator/tests -v
 
-A worker runs as `hermes chat -q`, where the command scanner refuses a command
-whose program is a shell variable (`$G add`) and the refusal is final. The
-platform image's skill check does not read this skill, which ships in the
-plugin's own image, and its `git` steps sit in inline code, which that check
-skips. tests/test_skill_inline_commands.py also reads this skill's inline code.
+The skills call a program by its name or path, never through a shell variable
+(`$G add`). The convention dates from a command scanner that refused the
+variable form; the image no longer runs that scanner and the convention stays.
+tests/test_skill_inline_commands.py also reads this skill's inline code.
 """
 
 import re

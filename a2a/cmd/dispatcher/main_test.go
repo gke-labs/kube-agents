@@ -409,10 +409,7 @@ func TestAStopBeforeDispatchingIsACleanStop(t *testing.T) {
 	s := settings{natsURL: "nats://127.0.0.1:1", namespace: ns, configMap: name}
 	cfg := lib.DispatchConfig{Version: "test", Namespace: ns, ProfileNamespace: "kube-agents-profiles", Ceiling: 6,
 		InteractiveReserve: 2, ChildReserve: 2, LeaseSeconds: 3, RenewSeconds: 1, RestartGraceSeconds: 2, AcceptTimeoutSeconds: 1,
-		Profiles: []lib.DispatchProfile{{Name: "tse", Tiers: []string{"read"}, Concurrency: 1, QueueTimeoutSeconds: 60, ActiveDeadlineSeconds: 60,
-			Durables: []lib.DispatchDurable{
-				{Tier: "read", Kind: lib.SubmitKindTop, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)},
-				{Tier: "read", Kind: lib.SubmitKindChild, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindChild)}}}}}
+		Profiles: []lib.DispatchProfile{{Name: "tse", Tiers: []string{"read"}, Concurrency: 1, QueueTimeoutSeconds: 60, ActiveDeadlineSeconds: 60}}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
