@@ -298,6 +298,22 @@ def _stream_state(root: str, audit_id: str) -> tuple[str, str | None]:
     return liveness, error
 
 
+def _refuse_shadow(args: argparse.Namespace, shadow: bool) -> None:
+    """Refuse a question about a shadow run's stream unless `--include-shadow` asks for it."""
+    if shadow and not args.include_shadow:
+        raise QueryError(
+            f"{args.stream} is a shadow run's stream: a canary's results, not a live "
+            "audit's. Answer from the live audit's stream instead.",
+            shadow=True,
+        )
+
+
+def _refuse_shadow_stream(root: str, args: argparse.Namespace) -> None:
+    """`_refuse_shadow` for a subcommand that hasn't projected the stream yet."""
+    _, _, shadow = _stream_state_and_shadow(root, args.stream)
+    _refuse_shadow(args, shadow)
+
+
 def _stream_state_and_shadow(root: str, audit_id: str) -> tuple[str, str | None, bool]:
     """`_stream_state`, and whether the projection reads the stream as a shadow run's."""
     try:
@@ -691,6 +707,10 @@ def cmd_diff(args: argparse.Namespace) -> dict:
     """
     root = _root_of(args)
     repo = _resolve_repo(root, args.stream, args.repo)
+    # Before the ring checks, whose refusals list the ring's stamps: a shadow
+    # stream is refused first, as `runs` refuses it (`load_envelope` below
+    # refuses each envelope too).
+    _refuse_shadow_stream(root, args)
     ring = _ring(root, args.stream, repo)
     if not ring:
         raise QueryError(f"{args.stream}: the run ring is empty, so there is nothing to diff")
@@ -768,12 +788,7 @@ def cmd_runs(args: argparse.Namespace) -> dict:
     # lease -- and a lease that makes liveness `running` does not clear it.
     # The ring still lists; the error makes the exit 2, as it does there.
     liveness, error, shadow = _stream_state_and_shadow(root, args.stream)
-    if shadow and not args.include_shadow:
-        raise QueryError(
-            f"{args.stream} is a shadow run's stream: a canary's results, not a live "
-            "audit's. Answer from the live audit's stream instead.",
-            shadow=True,
-        )
+    _refuse_shadow(args, shadow)
     return {
         "root": root,
         "audit_id": args.stream,

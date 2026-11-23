@@ -470,7 +470,7 @@ class TestShadowStreams(StoreTestCase):
         self.assertEqual(payload["shadow_hidden"], 0)
 
     def test_a_question_about_it_is_refused_without_the_opt_in(self):
-        for argv in (("show", self.SHADOW), ("findings", self.SHADOW), ("finding", self.SHADOW, "b"), ("checks", self.SHADOW), ("runs", self.SHADOW)):
+        for argv in (("show", self.SHADOW), ("findings", self.SHADOW), ("finding", self.SHADOW, "b"), ("checks", self.SHADOW), ("runs", self.SHADOW), ("diff", self.SHADOW)):
             with self.subTest(argv=argv):
                 payload = self.refused(*argv)
                 self.assertIs(payload["shadow"], True)
@@ -480,6 +480,10 @@ class TestShadowStreams(StoreTestCase):
         payload = self.ok("findings", self.SHADOW, report_query.INCLUDE_SHADOW_FLAG)
         self.assertEqual([row["id"] for row in payload["findings"]], ["b"])
         self.assertEqual(self.ok("runs", self.SHADOW, report_query.INCLUDE_SHADOW_FLAG)["count"], 1)
+        # A diff with the opt-in reaches the ring's own answer: one run, nothing to diff.
+        payload = self.refused("diff", self.SHADOW, report_query.INCLUDE_SHADOW_FLAG)
+        self.assertNotIn("shadow", payload)
+        self.assertIn("oldest entry", payload["error"])
 
     def test_a_live_stream_is_answered_as_before(self):
         self.assertEqual([row["id"] for row in self.ok("findings", AUDIT)["findings"]], ["a"])
