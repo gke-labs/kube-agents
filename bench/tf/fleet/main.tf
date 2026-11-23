@@ -882,18 +882,21 @@ resource "google_container_cluster" "seeded_c" {
 # unchanged: size alone differed in the incident behind the facets) and
 # sets one kubelet key, pod_pids_limit, to 4096. GKE sets no pod PID limit
 # unless asked, so the facet reads a difference whether it treats an absent
-# key as unset or as the default, and a PID cap on a node that runs only
-# system pods changes nothing anyone measures. An integer and not the
-# cpu_cfs_quota = false this block first carried: the pinned provider
-# (8.4.0) force-sends an explicit false only when it creates a pool, reads
-# a pool without the key as false, and so planned nothing and sent nothing
-# on a pool that already existed; the key never reached the forty projects
-# older than the block. A non-zero integer is sent on create and on update
-# alike. Both fields update in place: GKE recreates the pool's one node,
-# the pool keeps its identity, and the cluster's createTime does not move,
-# so the drift SOP's 24-hour cohort gate is untouched and no
-# reconcile-allow entry is needed. The fixture role is drift-pool-outlier
-# (fixtures.json); the facets and the case that reads it are the follow-up.
+# key as unset or as the default, and a PID cap on a node whose only
+# workload pods are the pause containers defects-c.tf plants changes
+# nothing anyone measures. An integer and not the cpu_cfs_quota = false
+# this block first carried: the pinned provider (8.4.0) force-sends an
+# explicit false only when it creates a pool, reads a pool without the key
+# as false, and so planned nothing and sent nothing on a pool that already
+# existed; the key never reached a project older than the block. A
+# non-zero integer is sent on create and on update alike. A pool created
+# with the earlier key may keep it beside this one: the update request
+# leaves it out, and no assertion reads it. Both fields update in place:
+# GKE recreates the pool's one node, the pool keeps its identity, and the
+# cluster's createTime does not move, so the drift SOP's 24-hour cohort
+# gate is untouched and no reconcile-allow entry is needed. The fixture
+# role is drift-pool-outlier (fixtures.json); the facets and the case that
+# reads it are the follow-up.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
   location   = var.zone
