@@ -46,7 +46,9 @@ where `bench/kube_agents_bench/fixture_drift.py` turns each `drifted` role
 into a `fixture-drift:<role>` infrastructure record for the cases that need
 it. Detection is this script's whole job: it repairs nothing. The reconcile's
 re-apply (hack/fleet_reconcile.py) repairs drift, and only the reconcile's
-reset of the VM repairs a rotated serial console (`serial_contains`).
+reset of the startup-fail VM repairs that VM's rotated serial console
+(`serial_contains`); the serial-flood VM's own flood pass repairs its missing
+filler, and a one-off hand reset is the repair when that flood breaks.
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline
@@ -317,8 +319,10 @@ READY_AT = "ready at"
 # Ops a `--wait` cannot see converge, so their drift does not hold the pass:
 # the clock clears an age, in hours (and the one drift `ready_after_hours`
 # writes, a timestamp that is not one, is a second snapshot under the prefix
-# or a broken one, which a hand deletion clears), only a reboot of the VM
-# (the next reconcile's reset) puts a rotated line back on a serial console,
+# or a broken one, which a hand deletion clears); a `serial_contains` drift
+# clears per role on a clock no scan should wait on (only a reboot puts the
+# startup-fail VM's failure line back, and the serial-flood VM's flood pass
+# restores its filler a few minutes after a boot, longer than a pass waits);
 # only the next reconcile's re-run of the planter deletes a re-created source
 # disk, and only an operator's replace puts the seeded file back.
 OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_READY_AFTER_HOURS, OP_SERIAL_CONTAINS, OP_SOURCE_DISK_GONE, OP_AS_SEEDED})

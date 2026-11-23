@@ -1275,11 +1275,12 @@ resource "google_compute_instance" "serial_flood" {
       # counter; nothing secret is written to it.
       cat >/usr/local/sbin/serial-flood <<'FLOOD'
       #!/bin/bash
-      # One bounded pass: 40960 counted filler lines, about 2 MiB, to serial
-      # port 1, then stop. Twice the 1 MiB console buffer, so one pass
-      # pushes every earlier line out.
-      for i in $(seq 1 40960); do
-        printf 'eval fixture: serial-flood filler %05d of 40960\n' "$i"
+      # One bounded pass: FLOOD_LINES counted filler lines, about 2 MiB, to
+      # serial port 1, then stop. Twice the 1 MiB console buffer, so one
+      # pass pushes every earlier line out.
+      readonly FLOOD_LINES=40960
+      for i in $(seq 1 "$FLOOD_LINES"); do
+        printf 'eval fixture: serial-flood filler %05d of %d\n' "$i" "$FLOOD_LINES"
       done > /dev/ttyS0
       FLOOD
       chmod 0755 /usr/local/sbin/serial-flood

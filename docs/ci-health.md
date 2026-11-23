@@ -1597,7 +1597,7 @@ impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
 firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots list`,
 `gcloud compute disks list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress`,
+reads of the project-scoped roles (`startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`,
 `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and the `gcloud compute reservations list` read of the
@@ -1682,7 +1682,12 @@ merged, beside the re-apply line when a planted role drifts too, and the issue c
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
 applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
 failure line gone from its serial buffer, is cleared by the re-apply too, because the
-reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
+reconcile resets the VM after each project; a `rotated-console-vm` line reading
+`serial_contains`, the flood filler gone from the serial-flood VM's buffer, is the one
+`serial_contains` drift a re-apply does not clear — the reconcile plans nothing for a VM
+that is already there and never resets this one — and the remedy is a one-off hand reset
+(`gcloud compute instances reset serial-flood-<prefix>`), which re-runs the startup script
+and whose flood pass restores the designed state within about five minutes; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time

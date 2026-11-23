@@ -1411,13 +1411,13 @@
           "path": "metadata.items[?(@.key=='startup-script')].key",
           "op": "any_eq",
           "value": "startup-script",
-          "why": "the failing startup script is what puts a failure line on the console for the flood to rotate out, and what installs the flood itself; a VM whose startup-script metadata was removed boots clean and floods nothing at the next boot"
+          "why": "the startup-script metadata is the fixture's declaration of the failing boot; the systemd units persist on the boot disk, so the VM floods at the next boot with or without it, and this assertion catches the drifted declaration, not a stopped flood"
         },
         {
           "subject": "instance/serial-flood-*",
           "op": "serial_contains",
           "value": "eval fixture: serial-flood filler",
-          "why": "one flood pass is about twice the buffer, so filler in the buffer means the boot's failure lines have rotated out -- the state the rotated-console notes grade; a console without it still shows the boot, which is the startup-fail shape, not this one. No reconcile reset repairs this role: the rotated console is the designed state, and the VM's own daily pass renews the filler against the guest agent's slow output"
+          "why": "one flood pass is about twice the buffer, so filler in the buffer means the boot's failure lines have rotated out -- the state the rotated-console notes grade; a console without it still shows the boot, which is the startup-fail shape, not this one. For a few minutes after a boot the console shows the failure line and not yet the filler, so one scan in that window can read the role drifted; the next flood pass heals it. No reconcile reset repairs this role: the rotated console is the designed state, and the VM's own daily pass renews the filler against the guest agent's slow output"
         }
       ]
     },
