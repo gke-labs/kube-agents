@@ -859,6 +859,20 @@ CRONJOB_HISTORY_LIMIT_MAX = 10
 #: The Job conditions that mean "this Job is over". `SuccessCriteriaMet` is
 #: what a Job with a `successPolicy` gets instead of `Complete`.
 JOB_TERMINAL_CONDITIONS = ("Complete", "Failed", "SuccessCriteriaMet")
+#: The finished Jobs that a spawner creates as `<stem>-<uuid>` are one finding, `Job/<stem>`
+#: (SOP §3.9). The rule that makes a family is the one of the generated-name Deployments
+#: (`_name_families`): a member's name is in no file, so a finding on a member names nothing
+#: that an owner can change.
+JOB_FAMILY_KIND = "Job"
+#: What a single finished Job's excerpt says after its finish time, and what a family's says
+#: after its count.
+JOB_NO_TTL_TEXT = "no ttlSecondsAfterFinished"
+#: What a Job family's excerpt says after its figures: `%(stem)s`, `%(count)d` and `%(plural)s`.
+#: The first sentence is the one of a Deployment family, so the report reads both alike.
+JOB_FAMILY_SENTENCE = (
+    " `Job/%(stem)s` is not an object in the cluster: it stands for %(count)d generated-name Job%(plural)s `%(stem)s-<uuid>`."
+    " A member's name does not last, so set `ttlSecondsAfterFinished` in the template that creates the Jobs, not on a member."
+)
 # A monthly release cycle, and a pre-provisioned environment awaiting its first
 # deploy (SOP §3.10).
 IDLE_NAMESPACE_MIN_AGE_DAYS = 30
@@ -2738,6 +2752,79 @@ def _job_finished_at(status: dict) -> str:
     return max((c for c in candidates if c), default="")
 
 
+def _name_families(named: dict[str, dict[str, dict]], declared, *, no_index: bool) -> dict[tuple[str, str], dict]:
+    """`(namespace, name) -> family`, for each member of a family among the objects of one kind.
+
+    `named[namespace][name]` is the metadata of each object of the kind. A family is the
+    objects of one namespace named `<stem>-<uuid>` with one stem; one member is a family. Its
+    `owner` and `labels` are what each member carries alike: they tell a reader where the
+    template is, and take no part in the grouping.
+
+    The rule is the one of the generated-name Deployments (`_generated_families`). An object
+    that has the stem's own name keeps that name, and the members then stay single: two
+    findings may not share one identity. An object with a name that lasts is no member: one
+    that the repository declares (`declared`, `(namespace, name)` pairs), or one that carries
+    a Helm release annotation or an Argo CD tracking annotation. The other objects of its
+    stem then stay single too.
+    """
+    families: dict[tuple[str, str], dict] = {}
+    for ns, objects in named.items():
+        stems: dict[str, list[str]] = {}
+        lasting: set[str] = set()
+        for name, meta in objects.items():
+            match = GENERATED_NAME_RE.match(name)
+            if not match or match.group("stem") in objects:
+                continue
+            if (ns, name) in declared or release_of(meta):
+                lasting.add(match.group("stem"))
+                continue
+            stems.setdefault(match.group("stem"), []).append(name)
+        for stem, members in stems.items():
+            if stem in lasting or len(members) < GENERATED_FAMILY_MIN_MEMBERS:
+                continue
+            metas = [objects[member] for member in members]
+            owners = {_owner_key(meta.get("ownerReferences") or []) for meta in metas}
+            owner = next(iter(owners)) if len(owners) == 1 else None
+            labels = []
+            for label in FAMILY_POINTER_LABELS:
+                values = {str((meta.get("labels") or {}).get(label) or "") for meta in metas}
+                if len(values) == 1 and "" not in values:
+                    labels.append(f"{label}: {values.pop()}")
+            family = {
+                "stem": stem,
+                "members": sorted(members),
+                # An owner with a generated name of its own does not last either.
+                "owner": f"{owner[0]}/{owner[1]}" if owner and not GENERATED_NAME_RE.match(owner[1]) else "",
+                "labels": labels,
+                "no_index": no_index,
+            }
+            for member in members:
+                families[(ns, member)] = family
+    return families
+
+
+def _job_family_excerpt(family: dict, finished: list[tuple[str, float]]) -> str:
+    """What a Job family's finding says: how many members this check files, when the oldest
+    finished, and that the fix is in the template. `finished` is the finish time and the age
+    in days of each member that the check files; a member with a TTL, or one that finished
+    less than `TERMINAL_MIN_AGE_DAYS` ago, is not in it."""
+    count = len(finished)
+    plural = "s" if count != 1 else ""
+    done, age = max(finished, key=lambda item: item[1])
+    text = f"{count} finished Job{plural} `{family['stem']}-<uuid>`, {JOB_NO_TTL_TEXT}, the oldest finished {done}{_ago(age)}."
+    text += JOB_FAMILY_SENTENCE % {"stem": family["stem"], "count": count, "plural": plural}
+    carried = []
+    if family["owner"]:
+        carried.append(f"is owned by `{family['owner']}`")
+    if family["labels"]:
+        carried.append("carries " + " and ".join(f"`{label}`" for label in family["labels"]))
+    if carried:
+        text += f" Each member {' and '.join(carried)}."
+    if family["no_index"]:
+        text += FAMILY_NO_INDEX_SENTENCE
+    return text
+
+
 def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
     terminal = [p for p in context["pods"] if (p.get("status") or {}).get("phase") in POD_TERMINAL_PHASES]
     by_ns: dict[str, list[dict]] = {}
@@ -2763,6 +2850,16 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
             severity = "major" if len(pods) > TERMINAL_PODS_MAJOR_NS or total > TERMINAL_PODS_MAJOR_TOTAL else "minor"
             hits.append({"namespace": ns, "object": f"Namespace/{ns}", "excerpt": f"{len(pods)} terminal pods, oldest from {oldest}{_ago(oldest_age)}", "severity": severity})
 
+    # Each Job of a namespace by its name, for the family rule: a Job that this check does not
+    # file (one with a TTL, a young one) still says that a name is taken or that a stem lasts.
+    named: dict[str, dict[str, dict]] = {}
+    for job in context["jobs"]:
+        meta = job.get("metadata", {})
+        named.setdefault(meta.get("namespace", ""), {})[meta.get("name", "")] = meta
+    families = _name_families(named, context.get("declared_jobs") or (), no_index=context.get("declarations_read") is False)
+    # `(namespace, stem) -> (the family's hit, the family, each filed member's finish time and age)`. The hit
+    # stands where the first member's would, and gets its excerpt after the loop.
+    family_hits: dict[tuple[str, str], tuple[dict, dict, list[tuple[str, float]]]] = {}
     for job in context["jobs"]:
         meta, spec, status = job.get("metadata", {}), job.get("spec", {}), job.get("status", {})
         ns = meta.get("namespace", "")
@@ -2780,7 +2877,19 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
         age = _age_days(done, now=now)
         if age is None or age < TERMINAL_MIN_AGE_DAYS:
             continue
-        hits.append({"namespace": ns, "object": f"Job/{meta.get('name', '')}", "excerpt": f"finished {done}{_ago(age)}, no ttlSecondsAfterFinished", "severity": "minor"})
+        family = families.get((ns, meta.get("name", "")))
+        if family is None:
+            hits.append({"namespace": ns, "object": f"Job/{meta.get('name', '')}", "excerpt": f"finished {done}{_ago(age)}, {JOB_NO_TTL_TEXT}", "severity": "minor"})
+            continue
+        key = (ns, family["stem"])
+        if key not in family_hits:
+            # `_family`: the stem is in no cluster and in no repository, so `_emit` looks for no declaration.
+            hit = {"namespace": ns, "object": f"{JOB_FAMILY_KIND}/{family['stem']}", "severity": "minor", "_family": True}
+            hits.append(hit)
+            family_hits[key] = (hit, family, [])
+        family_hits[key][2].append((done, age))
+    for hit, family, finished in family_hits.values():
+        hit["excerpt"] = _job_family_excerpt(family, finished)
 
     for cj in context["cronjobs"]:
         meta, spec = cj.get("metadata", {}), cj.get("spec", {})
@@ -5011,6 +5120,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     context["declared_deployments"] = {
         (key[2], key[3]) for key in declarations or () if key[0] == name and key[1] == GENERATED_FAMILY_KIND
     }
+    # The same for a finished Job of a `<stem>-<uuid>` family (3.9).
+    context["declared_jobs"] = {(key[2], key[3]) for key in declarations or () if key[0] == name and key[1] == JOB_FAMILY_KIND}
     # Whether the grouping had any declaration to hold a `<stem>-<uuid>` name against; a family's excerpt says when it had none.
     context["declarations_read"] = bool(declarations)
     fleet_facts = _fleet_facts(context)
