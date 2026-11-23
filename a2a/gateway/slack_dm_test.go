@@ -421,7 +421,8 @@ func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
 	d.awaitPost(t, "the queued notice in the question's thread", "D1", "100.1", "queued")
 	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "102.1", "100.1")
-	d.awaitPost(t, "the stop in the question's thread", "D1", "100.1", "taken out of the line")
+	// The stop edits the queued notice rather than posting.
+	waitFor(t, "the stop took the question out of the line", func() bool { return capLineLen(d.r) == 0 })
 	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "103.1", "100.1")
 	d.awaitPost(t, "the plain notice in the refused question's thread", "D1", "100.1", "nothing is running")
 	for _, p := range d.posts() {
@@ -464,7 +465,7 @@ func TestSlackChannelThreadParkedAtTheCapCarriesUnmentionedReplies(t *testing.T)
 	})
 
 	d.adapter.events <- slackMsg("channel", "C1", "U1", "stop", "502.1", "500.1")
-	d.awaitPost(t, "the unmentioned stop took the turn out of the line", "C1", "500.1", "taken out of the line")
+	waitFor(t, "the unmentioned stop took the turn out of the line", func() bool { return !d.r.g.parkedAtCap(conv) })
 	if d.r.g.parkedAtCap(conv) {
 		t.Fatal("the turn is still in line after the stop")
 	}

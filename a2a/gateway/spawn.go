@@ -940,9 +940,9 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	live -= evicted
 	switch {
 	case own != nil:
-		if g.capKeepOrGiveUp(own, &after) {
-			return true
-		}
+		// Kept, or out of the line with its own give-up post.
+		g.capKeepOrGiveUp(own, &after)
+		return true
 	case parkable && g.capPark(rec.Key, parked, &after):
 		return true
 	}

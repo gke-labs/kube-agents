@@ -68,22 +68,35 @@ const (
 
 // The queued notice: one post per parked turn, edited in place as the line
 // moves and once more when the turn leaves it. Worded as the platform
-// route's busy notice is (busy.go), with no promise about time.
+// route's busy notice is (busy.go), saying only that the wait is bounded.
 const (
-	sessionQueuedNext = "⏳ **queued** — every session worker is busy and yours is next in line; I'll start as soon as there's room"
-	sessionQueuedOne  = "⏳ **queued** — every session worker is busy and 1 conversation is ahead of yours; I'll start as soon as there's room"
-	sessionQueuedMany = "⏳ **queued** — every session worker is busy and %d conversations are ahead of yours; I'll start as soon as there's room"
+	sessionQueuedNext = "⏳ **queued** — every session worker is busy and you're next in line; I'll start if one frees up in the next few minutes"
+	sessionQueuedOne  = "⏳ **queued** — every session worker is busy and 1 conversation is ahead of yours; I'll start if one frees up in the next few minutes"
+	sessionQueuedMany = "⏳ **queued** — every session worker is busy and %d conversations are ahead of yours; I'll start if one frees up in the next few minutes"
 
-	sessionQueuedStarting = "▶️ **starting** — a session worker is free"
+	sessionQueuedStarting = "**waited for a session worker** — the task follows"
 	sessionQueuedStopped  = "🛑 **stopped** — taken out of the line; nothing was started"
 	sessionQueuedGaveUp   = "🚦 **not started** — waited too long for a session worker"
-	sessionQueuedLeft     = "⏳ **no longer queued**"
-	sessionQueuedRestart  = "🚦 **not started** — the gateway restarted"
+	sessionQueuedLeft     = "🚦 **not started** — something went wrong while this waited; send it again"
+	sessionQueuedRestart  = "🚦 **not started**"
 
-	sessionQueueStoppedNotice  = "🛑 stopped — this conversation was waiting for a session worker; it has been taken out of the line and nothing was started"
-	sessionQueueRestartNotice  = "🚦 not started: the gateway restarted while this conversation waited for a session worker — send it again"
+	sessionQueueStoppedNotice  = "🛑 stopped — taken out of the line; nothing was started"
+	sessionQueueRestartNotice  = "🚦 not started: the gateway stopped while this waited for a session worker — send it again"
+	sessionQueueGaveUpNotice   = "🚦 not started: every session worker stayed busy while this waited, so I took it out of the line — send it again later, or `stop` a conversation you started to free one"
 	sessionQueueFollowUpNotice = "🚦 not started: this conversation is already waiting for a session worker with %d messages behind it — send this one once it starts"
 )
+
+// sessionQueueGaveUp is the post for a turn that waited out the line's
+// bound, naming the later messages dropped with it.
+func sessionQueueGaveUp(dropped int) string {
+	switch dropped {
+	case 0:
+		return sessionQueueGaveUpNotice
+	case 1:
+		return sessionQueueGaveUpNotice + " (along with the message after it)"
+	}
+	return fmt.Sprintf("%s (along with the %d messages after it)", sessionQueueGaveUpNotice, dropped)
+}
 
 // sessionQueuedNotice is the queued notice for a turn with ahead turns in
 // front of it.
@@ -301,7 +314,7 @@ func (g *Gateway) capAdmit(w *capWaiter) func() {
 
 // capKeepOrGiveUp is the check's answer to a waiter's retry that found no
 // room: back in line at its place, or, past the wait bound, out of it with
-// its notice closed (the refusal itself is the caller's). Reports whether
+// its notice closed and the give-up posted. Reports whether
 // it stays. The waiters behind the head meet the bound in expireCapWaiters.
 func (g *Gateway) capKeepOrGiveUp(w *capWaiter, after *[]func()) bool {
 	g.capMu.Lock()
@@ -312,12 +325,13 @@ func (g *Gateway) capKeepOrGiveUp(w *capWaiter, after *[]func()) bool {
 	}
 	g.dequeueLocked(w)
 	// Its later messages wait on nothing now and are dropped, as for a
-	// waiter behind it that expires (expireCapWaiters); the cap's refusal,
-	// posted by the caller, tells the person to send again.
+	// waiter behind it that expires (expireCapWaiters); the give-up post
+	// tells the person to send again and names what was dropped.
 	dropped := len(w.followUps)
 	w.followUps = nil
 	g.log.Warn("session cap: queued turn waited out its bound", "conversation", w.key, "waited", time.Since(w.parkedAt).Round(time.Second), "droppedFollowUps", dropped)
 	*after = append(*after, func() {
+		g.post(w.key, sessionQueueGaveUp(dropped))
 		g.closeCapNotice(w, sessionQueuedGaveUp)
 		g.kickCapQueue()
 	})
@@ -534,8 +548,9 @@ func (g *Gateway) routeParked(rec *SessionRecord, msg InboundMessage, backend st
 		g.dequeueLocked(w)
 		g.capMu.Unlock()
 		g.log.Info("session cap: queued turn stopped", "conversation", rec.Key)
-		g.closeCapNotice(w, sessionQueuedStopped)
-		g.post(rec.Key, sessionQueueStoppedNotice)
+		if !g.closeCapNotice(w, sessionQueuedStopped) {
+			g.post(rec.Key, sessionQueueStoppedNotice)
+		}
 		g.kickCapQueue()
 	case msg.Intent == "" && chattext.IsStatusQuery(msg.Text, false):
 		g.capMu.Unlock()
@@ -553,13 +568,13 @@ func (g *Gateway) routeParked(rec *SessionRecord, msg InboundMessage, backend st
 }
 
 // expireCapWaiters refuses every waiter behind the head whose wait has passed
-// sessionCapWaitMax: out of the line, the cap's refusal posted and its notice
+// sessionCapWaitMax: out of the line, the give-up posted and its notice
 // closed as capKeepOrGiveUp and the check do for the head, so no waiter
 // outlasts the bound because it never reached the front. The head is left to
 // its own try, which meets the bound under the cap check (capKeepOrGiveUp);
 // the head is the oldest waiter, so it is never kept past the bound by this.
 // Its later messages wait on nothing now and are dropped, as at a stop; the
-// refusal tells the person to send again. Only the line's loop calls it.
+// give-up names them and tells the person to send again. Only the line's loop calls it.
 func (g *Gateway) expireCapWaiters(ctx context.Context) {
 	bound := g.capWaitMax()
 	var expired []*capWaiter
@@ -579,15 +594,9 @@ func (g *Gateway) expireCapWaiters(ctx context.Context) {
 	if len(expired) == 0 {
 		return
 	}
-	// The refusal names the count as the check would; with the count
-	// unreadable, the cap stands in, as the line only holds turns at it.
-	live := g.cfg.MaxSessions
-	if pods, err := g.spawner.SessionPods(ctx); err == nil {
-		live = liveSessionCount(pods, g.capHoldSnapshot("", time.Now()))
-	}
 	for _, w := range expired {
 		g.log.Warn("session cap: queued turn waited out its bound", "conversation", w.key, "waited", time.Since(w.parkedAt).Round(time.Second))
-		g.post(w.key, sessionCapRefusal(live, g.cfg.MaxSessions))
+		g.post(w.key, sessionQueueGaveUp(len(w.followUps)))
 		g.closeCapNotice(w, sessionQueuedGaveUp)
 	}
 }

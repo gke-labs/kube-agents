@@ -182,7 +182,7 @@ func TestAWaitPastTheBoundGetsTheCapRefusal(t *testing.T) {
 	conv := "discord:g1/t-waited"
 	say(r, conv, "m1", "check the fleet")
 	waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
-	waitFor(t, "today's refusal", postedContaining(r, "🚦 not started: 1 session worker is already running (cap 1)"))
+	waitFor(t, "the give-up", postedContaining(r, sessionQueueGaveUpNotice))
 	waitFor(t, "the notice closed", noticeReads(r, conv, sessionQueuedGaveUp))
 	if n := len(spawn.calls()); n != 0 {
 		t.Fatalf("%d spawns", n)
@@ -241,7 +241,7 @@ func TestAWaiterBehindTheHeadIsRefusedPastTheBound(t *testing.T) {
 	}
 
 	r.g.kickCapQueue()
-	refusal := sessionCapRefusal(1, 1)
+	refusal := sessionQueueGaveUp(0)
 	for _, conv := range convs[1:3] {
 		waitFor(t, conv+"'s refusal", func() bool { return slices.Contains(r.adapter.postTextsFor(conv), refusal) })
 		waitFor(t, conv+"'s notice closed", noticeReads(r, conv, sessionQueuedGaveUp))
@@ -328,8 +328,10 @@ func TestAStopTakesAWaitingTurnOutOfTheLine(t *testing.T) {
 			say(r, conv, "m1", "check the fleet")
 			waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
 			r.adapter.inbox <- tc.msg(conv)
-			waitFor(t, "the stop said", postedContaining(r, sessionQueueStoppedNotice))
 			waitFor(t, "the notice closed", noticeReads(r, conv, sessionQueuedStopped))
+			if slices.Contains(r.adapter.postTextsFor(conv), sessionQueueStoppedNotice) {
+				t.Fatal("the stop was said twice: the notice's edit and a post")
+			}
 			free()
 			time.Sleep(200 * time.Millisecond)
 			if n := len(spawn.calls()); n != 0 {
@@ -644,8 +646,8 @@ func TestAHeadThatGivesUpDropsItsFollowUps(t *testing.T) {
 
 	r.g.capWaitOverride.Store(1)
 	r.g.kickCapQueue()
-	refusal := sessionCapRefusal(1, 1)
-	waitFor(t, "the cap's refusal", func() bool { return slices.Contains(r.adapter.postTextsFor(conv), refusal) })
+	refusal := sessionQueueGaveUp(1)
+	waitFor(t, "the give-up, naming the dropped follow-up", func() bool { return slices.Contains(r.adapter.postTextsFor(conv), refusal) })
 	waitFor(t, "the notice closed", noticeReads(r, conv, sessionQueuedGaveUp))
 
 	// A slot frees: nothing of the conversation's is left to take it.
@@ -691,7 +693,7 @@ func TestARetryBehindAStopIsDropped(t *testing.T) {
 	waitRetrying(t, r, conv)
 	release()
 
-	waitFor(t, "the stop said", postedContaining(r, sessionQueueStoppedNotice))
+	waitFor(t, "the notice closed on stopped", noticeReads(r, conv, sessionQueuedStopped))
 	time.Sleep(300 * time.Millisecond)
 	if n := len(spawn.calls()); n != 0 {
 		t.Fatalf("%d spawns; the stopped turn started", n)
@@ -780,4 +782,11 @@ func TestAKeptTryEndingAfterTheNextIsQueuedLeavesTheWaiterInLine(t *testing.T) {
 	if !r.g.parkedAtCap(conv) {
 		t.Fatal("the waiter left the line as the kept try ended, with its next try in flight")
 	}
+}
+
+// capLineLen is how many turns are in the session-cap line.
+func capLineLen(r *rig) int {
+	r.g.capMu.Lock()
+	defer r.g.capMu.Unlock()
+	return len(r.g.capQueue)
 }
