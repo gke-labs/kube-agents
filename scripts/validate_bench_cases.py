@@ -380,12 +380,14 @@ FIXTURE_NOT_READY = {
     # PID limit, is not shown as the fault in live tests and is a setting at
     # the platform's default, which fixture rule 9 does not take as a fixture.
     # A fixture for the node's own PIDPressure needs a node of its own and a
-    # privileged pod that lowers kernel.pid_max; a form of it that the fleet
-    # could carry is not shown. #5410 owns the gap.
+    # privileged pod that lowers kernel.pid_max. In one test each, a Deployment
+    # of that pod made hundreds of refused pods an hour, and one pod with no
+    # controller made none. It is not on the fleet. #5410 owns the gap.
     "node-pid-pressure-fork-exhaustion": (
         "#5410: the check is on hold under #2581; the shape that the case reads is the platform's "
         "default (fixture rule 9); a fixture for the node's PIDPressure needs a node of its own "
-        "and a privileged pod that lowers kernel.pid_max, in a form that the fleet can carry"
+        "and a privileged pod that lowers kernel.pid_max, which is not on the fleet and which no "
+        "issue plans"
     ),
     # Needs the order of two times on one node: a workload container that
     # starts before a per-node agent's pod is Ready. That order is evidence

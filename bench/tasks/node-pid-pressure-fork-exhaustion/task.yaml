@@ -3,9 +3,8 @@
 # sets PIDPressure and evicts. Parked as FIXTURE_NOT_READY
 # (gke-labs/kube-agents#5410; gke-labs/kube-agents#2581 plans the check as
 # `node-pid-pressure` and holds it): the shape that the case reads is not
-# shown as the fault and is the platform's default, and a fixture for the
-# node's own PIDPressure is not shown in a form that the fleet could carry, so
-# the case carries no suite line.
+# shown as the fault and is the platform's default, and no fixture for the
+# node's own PIDPressure is on the fleet, so the case carries no suite line.
 # What live tests showed (2026-11-20 and 2026-11-21 UTC, scratch clusters, GKE
 # Standard 1.35.8, one run each): a pool has no pod PID limit by default, but
 # each container showed `pids.max = 629145`, 15 percent of the node's 4194304.
@@ -19,9 +18,11 @@
 # the seven, and the node read NotReady for between 17 and 77 seconds.
 # PIDPressure can be made on purpose (a privileged pod that lowers
 # `kernel.pid_max` on one node); the kubelet then evicted a pod and the
-# condition cleared after five minutes. A later test (2026-11-23, one run)
-# kept the condition coming back for an hour with a Deployment as the holder,
-# at the cost of hundreds of pods that the kubelet refused.
+# condition cleared after five minutes. Later tests of that way (2026-11-23,
+# one run each): a Deployment as the holder kept the condition coming back for
+# an hour, at the cost of hundreds of pods that the kubelet refused and of one
+# evicted pod of GKE's own metrics collector; one pod with no controller made
+# the condition for about five minutes with no refused pod.
 # The shape that this case reads exists on the fleet and nothing new is
 # planted: role `multi-process-container`, Deployment multi-process-worker in
 # seeded-shapes on slot a, a shell supervisor forking two workers under a 32Mi
@@ -34,22 +35,24 @@
 # reports PIDPressure. The first half flips this case; the second reads
 # nothing here. The test results were put to #2581's owners
 # (https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7112363582),
-# and an owner answered that the check is on hold and that the first half and
-# the removal of `expected_fail` "wait for a test that shows such a workload
-# using up a node's process IDs"
+# and an owner answered that the check is on hold, that the first half and the
+# removal of `expected_fail` "wait for a test that shows such a workload using
+# up a node's process IDs", and that "The `PIDPressure=True` reader can come
+# later as a small change of its own"
 # (https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7113974758).
-# A fixture for the second half needs a node of its own and a privileged pod
-# that lowers `kernel.pid_max`. The objective below keeps the form of the
-# first plan, a finding on that workload; the pull request that brings a
-# fixture rewrites it, and the un-park pull request restores the `suite:` and
-# `suite_part:` lines. `expected_fail` stays: the marker waits for a check
-# that a fixture can flip. The readiness rule group-oom-kill and the case
+# A fixture for that reader needs a node of its own and a privileged pod that
+# lowers `kernel.pid_max`; it is not on the fleet, and no issue plans it. The
+# objective below keeps the form of the first plan, a finding on that
+# workload; the pull request that brings a fixture rewrites it, and the
+# un-park pull request restores the `suite:` and `suite_part:` lines.
+# `expected_fail` stays: the marker waits for a check that a fixture can flip.
+# The readiness rule group-oom-kill and the case
 # upgrades-fleet-readiness-multi-process-container assert it is the fleet's
 # only forking container, so no second forking plant may land. Domain
 # `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
-name: "Node PID exhaustion (parked: the check is on hold; the shape that the case reads is the platform's default; a fixture for PIDPressure is not shown in a form that the fleet could carry)"
+name: "Node PID exhaustion (parked: the check is on hold; the shape that the case reads is the platform's default; no fixture for PIDPressure is on the fleet)"
 domain: fleet-audits
 expected_fail: true
 audit_streams:
