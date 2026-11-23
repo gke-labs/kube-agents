@@ -14,6 +14,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -702,6 +703,17 @@ type Config struct {
 	// Namespace and WorkerImage configure the dark spawn path.
 	Namespace   string
 	WorkerImage string
+	// SessionHarness is the harness every session pod runs, passed to it as
+	// A2A_HARNESS (A2A_SESSION_HARNESS, from the PlatformAgent's
+	// spec.harness.sessionWorker.type). Empty is the worker's default,
+	// Claude Code, and adds nothing to the pod.
+	SessionHarness string
+	// SessionHarnessRefused is an A2A_SESSION_HARNESS value outside
+	// sessionHarnesses (CRD or image skew). The gateway is shared by every
+	// conversation, so it keeps serving and spawns sessions on the default
+	// harness, and main logs this at error level, rather than refusing to
+	// start and taking the whole chat surface down.
+	SessionHarnessRefused string
 
 	// SessionServiceAccount is the ServiceAccount every session pod runs
 	// as, rendered by the operator as <agent>-a2a-session and passed here
@@ -996,6 +1008,7 @@ func FromEnv() (*Config, error) {
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
+		SessionHarness:   os.Getenv(envSessionHarness),
 
 		SessionServiceAccount:  os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:     os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
@@ -1125,6 +1138,9 @@ func FromEnv() (*Config, error) {
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
+	}
+	if cfg.SessionHarness != "" && !sessionHarnesses[cfg.SessionHarness] {
+		cfg.SessionHarnessRefused, cfg.SessionHarness = cfg.SessionHarness, ""
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
@@ -1564,3 +1580,10 @@ func (c *Config) sessionResources() corev1.ResourceRequirements {
 		},
 	}
 }
+
+// envSessionHarness names the session worker's harness (Config.SessionHarness).
+const envSessionHarness = "A2A_SESSION_HARNESS"
+
+// sessionHarnesses are the harnesses the gateway spawns session pods for.
+// Antigravity joins when its worker isolation lands.
+var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
