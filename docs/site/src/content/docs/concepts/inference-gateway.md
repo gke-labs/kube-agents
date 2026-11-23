@@ -255,9 +255,10 @@ A few fields are left as they came. They are kept only where the provider APIs p
 
 - in the assistant's own turn, a thinking block's text and signature, which the provider checks against each other. The model wrote that text from input the hook had already redacted;
 - redacted thinking and a thought signature, in the same turn;
+- provider-encrypted content, which the provider checks byte for byte. That is a Responses reasoning item's `encrypted_content`, and in the assistant's turn a web search result's `encrypted_content`, the `reasoning_details` data and signature, and the `thought_signature` LiteLLM carries on the message and its tool calls;
 - binary payloads of a listed type (common images, PDF, audio and video) that decode as base64 and start the way their media type does. A payload of any other type is refused.
 
-A request the hook cannot walk is refused. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at a payload position that is not binary base64. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
+A request the hook cannot walk is refused. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64. Two payload positions are not among them: the content parts of a Responses `input` item (`input_file`, `input_image`) and the parts inside a Gemini function response. A base64 payload there is forwarded as it came, unread, since the text rules cannot read base64. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 
 The rendered default config does not change while the value is off.
 
