@@ -1736,7 +1736,7 @@ class CollectFleetTest(unittest.TestCase):
 
 
 class AutopilotNotApplicableTest(unittest.TestCase):
-    """The eleven `standard_only` facets have to be declared, not just dropped.
+    """The twelve `standard_only` facets have to be declared, not just dropped.
 
     `compute_drift` skips them for an Autopilot cohort, which is right — each
     reads a `.nodePools[]` field, or a node-management or dataplane setting
@@ -1833,7 +1833,7 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertFalse(hasattr(fd.Facet, "autopilot_excluded"))
 
     def test_an_autopilot_cluster_is_compared_on_the_eight_that_are_configurable(self):
-        """The other half of #1226, and the reason the eleven can be declared
+        """The other half of #1226, and the reason the twelve can be declared
         at all. An Autopilot cluster is a full member of its cluster-level
         cohort, so `binary-authorization` and the seven like it run on it --
         against Standard peers where those are what the fleet holds."""
@@ -1863,8 +1863,8 @@ class UnvotedFacetsTest(unittest.TestCase):
     full roster, so a slug in none of `commands`, `checks_not_applicable` or a
     `limitations` sentence reports the cluster `partial` on every run with
     nothing saying what is missing. `cohort_limitations` speaks only for
-    clusters nothing compared at all, and a cluster compared on fifteen facets
-    out of nineteen fell between the two.
+    clusters nothing compared at all, and a cluster compared on sixteen facets
+    out of twenty fell between the two.
     """
 
     POOL_FACETS = ["boot-disk", "image-type", "integrity-monitoring", "pool-autoscaling", "secure-boot"]
@@ -1989,7 +1989,7 @@ class CohortLimitationsTest(unittest.TestCase):
 
     def test_a_standard_cluster_short_of_node_level_peers_says_which_class_it_lost(self):
         """The narrow sentence #1226 specifies. `std-a` is compared on the
-        eight configurable facets in cohort `prod` and on none of the eleven
+        eight configurable facets in cohort `prod` and on none of the twelve
         node-level ones, because it is the only Standard cluster there -- so
         the sentence has to say that rather than "no facet compared", which
         would understate the coverage the run actually got."""
@@ -2002,7 +2002,7 @@ class CohortLimitationsTest(unittest.TestCase):
     def test_an_autopilot_cluster_short_of_node_level_peers_has_nothing_to_report(self):
         """The asymmetry that keeps an Autopilot minority from pinning the
         ledger. `auto-a` and `auto-b` are two in `(autopilot, prod)`, under the
-        floor -- but the eleven facets that cohort would have compared are
+        floor -- but the twelve facets that cohort would have compared are
         already `checks_not_applicable` on Autopilot, so nothing went
         uncompared and a `limitations` string here would invent a coverage gap
         the mode had already settled."""
@@ -2204,7 +2204,7 @@ class CohortLimitationsTest(unittest.TestCase):
         }
         gaps = audit_report.coverage_gaps(doc)
         # Two sentences, two gaps: `auto-test`, which nothing compared, and
-        # `std-a`, which lost the eleven node-level facets. The two Autopilot
+        # `std-a`, which lost the twelve node-level facets. The two Autopilot
         # clusters produce neither, because what their undersized node cohort
         # would have compared is inapplicable on their mode.
         self.assertEqual(len(gaps), 2)
@@ -2215,7 +2215,7 @@ class CohortLimitationsTest(unittest.TestCase):
 class NoEnvironmentLabelTest(unittest.TestCase):
     """§4.14 — the one check that fires outside a cohort.
 
-    Every facet is a majority vote, so §2.4's floor silences all nineteen for a
+    Every facet is a majority vote, so §2.4's floor silences all twenty for a
     cluster with too few peers, and §2.3 gives an unlabelled cluster no peers at
     all. The cluster whose labelling diverges most from the fleet was therefore
     the one cluster `label-keys` could never see: `cohort_limitations` said so
@@ -2281,7 +2281,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         two clusters that straddle the mode split: the cluster-level cohort
         `(test)` reaches the floor with `host` in it and the node-level
         `(standard, test)` does not, so labelling `host` starts the eight
-        configurable facets comparing and leaves the eleven node-level ones
+        configurable facets comparing and leaves the twelve node-level ones
         exactly as they were. §4.14 intersects the two and publishes nothing;
         the gap sentence read only the cluster-level cohorts, so it prescribed
         `environment=test` beside a finding that had just withheld it."""
@@ -2355,7 +2355,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         put five in the cluster-level `unknown` cohort, so the eight
         configurable facets compare -- against a group whose only shared
         property is the omission. The Standard pair's node-level cohort is two,
-        so the eleven node-level facets compare nothing for them. A Standard
+        so the twelve node-level facets compare nothing for them. A Standard
         `seeded` trio gives a value that closes both.
         """
         fleet = [cluster(f"ap-{i}", autopilot=True, labels={}) for i in range(3)]
@@ -2378,7 +2378,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         self.assertEqual(sorted(candidates), [K("std-0"), K("std-1")])
 
     def test_an_autopilot_cluster_on_that_fleet_gets_no_finding(self):
-        """Its eleven are `checks_not_applicable`, so a short
+        """Its twelve are `checks_not_applicable`, so a short
         `(autopilot, unknown)` cohort withholds nothing from it and no label
         would be closing a gap. It is compared on all eight it owes."""
         candidates = self.check(self._straddling_shape())[1]
@@ -2415,7 +2415,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         held by two Standard ones and closes both. Prescribing `ap` would be
         the no-op §3.7 of the cost SOP withholds, and worse than the no-op
         because the operator would see eight facets start comparing and take
-        the other eleven for a different problem."""
+        the other twelve for a different problem."""
         fleet = [cluster(f"ap-{i}", autopilot=True, labels={"environment": "ap"})
                  for i in range(2)]
         fleet += [cluster(f"seeded-{i}", labels={"environment": "seeded"}) for i in range(2)]
@@ -2434,7 +2434,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         self.assertIn("(`prod` would also reach it, on 2)", excerpt)
 
     def test_the_abstaining_count_is_the_clusters_own_roster(self):
-        """An Autopilot cluster owes eight facets, not nineteen — the eleven
+        """An Autopilot cluster owes eight facets, not twenty — the twelve
         `standard_only` ones are declared inapplicable elsewhere and counting
         them here would overstate what the label buys."""
         fleet = [cluster(f"ap-{i}", autopilot=True, labels={"environment": "test"})
@@ -2579,15 +2579,78 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         self.assertEqual([f["object"] for f in self.boot_disk(candidates, "a")], ["NodePool/declared-zonal-pool"])
         self.assertIn("observed: pd-ssd/20", self.boot_disk(candidates, "a")[0]["excerpt"])
 
-    def test_a_shape_three_pools_share_is_a_pool_role_and_not_drift(self):
+    def test_a_shape_three_pools_share_in_a_small_cohort_is_dropped_by_the_ladder(self):
         """Three data pools on a larger disk, one per cluster, among nine
-        pools: r = 0.67 and k = 3, three rungs, so the ladder drops them. A
-        role that recurs is §3.5's undeclared cohort, not an outlier."""
+        pools: r = 0.67 and k = 3, three rungs, so nothing is filed."""
         fleet = [cluster(f"c{i}", nodePools=[pool("system"), pool("app"), pool("data", disk_gb=500)]) for i in range(3)]
         checks_run, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertIn("boot-disk", checks_run[K("c0")])
         for i in range(3):
             self.assertEqual(self.boot_disk(candidates, f"c{i}"), [])
+
+    def test_a_shape_three_pools_share_in_a_large_cohort_is_filed_one_level_down(self):
+        """§3.5's `k >= 3` is one rung, not a suppression. Three data pools
+        among forty-two are r = 0.93, so the only step is `k`, and each is
+        filed at `minor`. §4.15 says so rather than promising silence."""
+        fleet = [
+            cluster(f"c{i}", nodePools=[pool(f"p{j}") for j in range(13)] + [pool("data", disk_gb=500)])
+            for i in range(3)
+        ]
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        for i in range(3):
+            (finding,) = self.boot_disk(candidates, f"c{i}")
+            self.assertEqual(finding["object"], "NodePool/data")
+            self.assertEqual(finding["severity"], "minor")
+            self.assertIn("(base major, k=3>=3)", finding["excerpt"])
+
+    def test_one_cluster_with_many_pools_does_not_set_the_baseline(self):
+        """Twenty of twenty-two pools agree, and all twenty are on one
+        cluster of three. Counted by pools alone, the two one-pool clusters
+        are outliers against a majority that is one cluster agreeing with
+        itself; the baseline has to span two-thirds of the voting clusters."""
+        fleet = [
+            cluster("big", nodePools=[pool(f"p{j}", disk_gb=200) for j in range(20)]),
+            cluster("s1"),
+            cluster("s2"),
+        ]
+        checks_run, candidates = fd.compute_drift(fleet, now=NOW)
+        for name in ("big", "s1", "s2"):
+            self.assertEqual(self.boot_disk(candidates, name), [])
+            self.assertNotIn("boot-disk", checks_run[K(name)])
+        entry = self.manifest(fleet)[T("s1")]
+        self.assertIn("`boot-disk` (22 readable value(s), commonest on 20 in 1 of 3 clusters)", entry["limitations"])
+
+    def test_a_baseline_held_in_two_thirds_of_the_clusters_stands(self):
+        fleet = [
+            cluster("a", nodePools=[pool(f"p{j}") for j in range(10)]),
+            cluster("b"),
+            cluster("c", nodePools=[pool("p", disk_gb=50)]),
+        ]
+        self.assertEqual(fd.pool_baseline_span(fd.facet_tokens(fd.FACETS_BY_SLUG["boot-disk"], fleet)), (2, 3))
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual([f["object"] for f in self.boot_disk(candidates, "c")], ["NodePool/p"])
+
+    def test_an_inferred_environment_costs_the_pool_finding_one_level(self):
+        """§3.5's inferred-environment rung, on the pool vote. The cohort is
+        keyed on environment, and the outlier's membership rests on its name."""
+        fleet = self.seeded_fleet()
+        fleet[2] = cluster("prod-c", labels={}, nodePools=[pool("default-pool", disk_gb=50)])
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        (finding,) = self.boot_disk(candidates, "prod-c")
+        self.assertEqual(finding["severity"], "minor")
+        self.assertIn("inferred environment", finding["excerpt"])
+
+    def test_no_environment_in_the_cohort_key_charges_no_inferred_step(self):
+        """Under the `mode-only` strategy no membership rests on an
+        environment, so a name that reads as one costs nothing."""
+        fleet = self.seeded_fleet()
+        for c in fleet:
+            c["resourceLabels"] = {}
+        fleet[2]["name"] = "prod-c"
+        self.assertNotEqual(fd.decide_cohort_strategy(fleet), "environment")
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        (finding,) = self.boot_disk(candidates, "prod-c")
+        self.assertEqual(finding["severity"], "major")
 
     def test_a_windows_pool_does_not_vote(self):
         fleet = self.seeded_fleet()
@@ -2634,7 +2697,7 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         entry = entries[T("c0")]
         self.assertEqual([f for f in entry["candidates"] if f["check"] == "boot-disk"], [])
         self.assertIn("reached no baseline", entry["limitations"])
-        self.assertIn("`boot-disk` (4 readable value(s), commonest on 1)", entry["limitations"])
+        self.assertIn("`boot-disk` (4 readable value(s), commonest on 1 in 1 of 4 clusters)", entry["limitations"])
 
     def test_the_finding_id_names_the_cluster_and_the_pool(self):
         import audit_report

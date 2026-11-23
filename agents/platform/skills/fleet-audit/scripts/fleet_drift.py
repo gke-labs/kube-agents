@@ -218,6 +218,10 @@ CLUSTER_VOTERS = "clusters"
 POOL_VOTERS = "node pools"
 CLUSTER_OBJECT_KIND = "Cluster"
 POOL_OBJECT_KIND = "NodePool"
+# A pool's token joins its two halves with this, and a pool GKE returned
+# without a name is keyed by this prefix and its index in the listing.
+BOOT_DISK_TOKEN_SEPARATOR = "/"
+UNNAMED_POOL_PREFIX = "#"
 
 # The one check here that is not a facet. Every `Facet` is comparative and so
 # runs only inside a cohort that reached `COHORT_FLOOR`; this one asks why a
@@ -731,7 +735,7 @@ def pool_boot_disk(p: dict) -> str | None:
     disk_type, size_gb = config.get("diskType"), config.get("diskSizeGb")
     if not disk_type or not size_gb:
         return None
-    return f"{disk_type}/{size_gb}"
+    return f"{disk_type}{BOOT_DISK_TOKEN_SEPARATOR}{size_gb}"
 
 
 def votable_pools(c: dict) -> list[tuple[str, dict]]:
@@ -739,7 +743,7 @@ def votable_pools(c: dict) -> list[tuple[str, dict]]:
     its vote is keyed by. Windows pools are left out, as §4.12 leaves them out
     of `image-type`: their disk is sized for a different image."""
     return [
-        (str(p.get("name") or f"#{index}"), p)
+        (str(p.get("name") or f"{UNNAMED_POOL_PREFIX}{index}"), p)
         for index, p in enumerate(c.get("nodePools") or [])
         if not _is_windows_pool(p)
     ]
@@ -944,6 +948,25 @@ def facet_tokens(facet: Facet, members: list[dict]) -> dict[tuple, str]:
         if token is not None:
             tokens[ckey(c)] = token
     return tokens
+
+
+def pool_baseline_span(tokens: dict[tuple, str]) -> tuple[int, int]:
+    """For a pool vote, `(clusters holding the commonest token, clusters that
+    voted)`. Pools are not spread evenly over clusters, so a count of pools
+    alone lets one cluster with twenty pools agree with itself and outvote two
+    clusters with one pool each."""
+    if not tokens:
+        return 0, 0
+    t_star = Counter(tokens.values()).most_common(1)[0][0]
+    holders = {cluster_key for (cluster_key, _), token in tokens.items() if token == t_star}
+    return len(holders), len({cluster_key for cluster_key, _ in tokens})
+
+
+def pool_baseline_spans_cohort(tokens: dict[tuple, str]) -> bool:
+    """§4.15's second condition on a pool baseline: the pools that hold it sit
+    in at least `BASELINE_MIN_RATIO` of the clusters that voted."""
+    holders, voters = pool_baseline_span(tokens)
+    return voters > 0 and holders / voters >= BASELINE_MIN_RATIO
 
 
 def compute_baseline(tokens: dict[str, str]) -> tuple[str, int, int, float] | None:
@@ -1734,9 +1757,13 @@ def unvoted_facets(
                 for slug in slugs:
                     tokens = facet_tokens(FACETS_BY_SLUG[slug], cohort)
                     top = Counter(tokens.values()).most_common(1)
+                    span = ""
+                    if FACETS_BY_SLUG[slug].pool_token is not None and top:
+                        holders, voters = pool_baseline_span(tokens)
+                        span = f" in {holders} of {voters} clusters"
                     detail.append(
                         f"`{slug}` ({len(tokens)} readable value(s)"
-                        + (f", commonest on {top[0][1]}" if top else "")
+                        + (f", commonest on {top[0][1]}{span}" if top else "")
                         + ")"
                     )
                 parts.append(
@@ -1906,6 +1933,8 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                     continue
                 t_star, m, n, r = baseline
                 if facet.pool_token is not None:
+                    if not pool_baseline_spans_cohort(tokens):
+                        continue
                     for cluster_key in _vote_pools(facet, members, tokens, baseline, cohort_label, env_of if env_matters else None, checks_run, candidates):
                         outlier_facet_count[cluster_key] += 1
                     continue
