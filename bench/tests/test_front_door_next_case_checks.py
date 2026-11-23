@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+from devops_bench.verification.runner import VerifierAgent
+from devops_bench.verification.spec import parse_entries
 from kube_agents_bench import transcript
 from kube_agents_bench.verifiers import ReportContainsVerifier
 
@@ -158,22 +160,43 @@ def test_the_routed_fleet_question_is_graded_on_the_specialists_answer(delivered
 
 
 SMOKE = "agent-kanban-smoke"
+LIST = "gcloud container clusters list"
+
+
+def _bash(command: str) -> dict:
+    # The session route's trajectory entry for its own call: no result recorded.
+    return {"name": "Bash", "args": {"command": command, "description": "List GKE clusters"}, "result": None, "status": "completed"}
+
+
+def _smoke_passes(delivered: str, trajectory: list[dict] | None = None) -> bool:
+    """Every check of the smoke, its any-of compound included, on one run."""
+    spec = yaml.safe_load((TASKS / SMOKE / "task.yaml").read_text(encoding="utf-8"))
+    entries, errors = parse_entries(spec["verification_spec"])
+    assert not errors
+    transcript.set(ACK, trajectory or [], final_message=f"{ACK}\n\n{delivered}")
+    return all(VerifierAgent().run_entry(e, timeout_sec=1.0).status == "pass" for e in entries)
 
 
 @pytest.mark.parametrize(
-    ("delivered", "passes"),
+    ("delivered", "trajectory", "passes"),
     [
-        pytest.param(RESULT + "seeded-a\nseeded-b\nseeded-c\nplatform-agent-host", True, id="the specialist's list"),
-        pytest.param("seeded-a, seeded-b and seeded-c.", False, id="the front door answered with no card result"),
+        pytest.param(RESULT + "seeded-a\nseeded-b\nseeded-c\nplatform-agent-host", [], True, id="the specialist's list"),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [], False, id="the front door answered with no card result"),
         pytest.param(
             "seeded-a, seeded-b and seeded-c.\n\n" + RESULT + "seeded-a only.",
+            [],
             False,
             id="the names outside the card result",
         ),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST)], True, id="the session's own live read"),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST + " --format=value(name)")], True, id="the read with a flag"),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [_bash("kubectl get nodes")], False, id="a read that isn't the fleet list"),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST + "; echo seeded-a")], False, id="a chained command"),
+        pytest.param("platform-agent-host only.", [_bash(LIST)], False, id="the read without the planted names"),
     ],
 )
-def test_the_smoke_is_graded_on_the_specialists_answer(delivered: str, passes: bool) -> None:
-    assert _passes(SMOKE, delivered) is passes
+def test_the_smoke_is_graded_on_a_live_read_of_the_fleet(delivered: str, trajectory: list[dict], passes: bool) -> None:
+    assert _smoke_passes(delivered, trajectory) is passes
 
 
 ACK_CASE = "chat-voice-ack-names-target"
