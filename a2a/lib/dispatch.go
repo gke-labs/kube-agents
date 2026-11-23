@@ -414,7 +414,8 @@ type DispatchConfig struct {
 	// TaskSupervisorSubject, ProfileSupervisorFormProfile for the six-token
 	// ProfileSupervisorSubject. The operator sets it only once every reader
 	// that can run watches both forms. A dispatcher from before the field
-	// ignores it and keeps the five-token form, which readers still watch.
+	// ignores it and keeps the five-token form, which readers watch until
+	// the install's cutoff (EnvProfileSupervisorCutoff).
 	ProfileSupervisorForm string `json:"profileSupervisorForm,omitempty"`
 	// JobLabels go on every Job the dispatcher creates: the operator's
 	// agent labels, by which a teardown deletes only this install's Jobs,

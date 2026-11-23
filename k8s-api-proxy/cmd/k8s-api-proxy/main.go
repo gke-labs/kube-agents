@@ -18,6 +18,7 @@ import (
 
 	"k8s.io/client-go/rest"
 
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/certreload"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/tokenreview"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/upstream"
@@ -32,6 +33,12 @@ const (
 	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
 	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
 	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
+	tlsCertFileEnv          = "KUBE_PROXY_TLS_CERT_FILE"
+	tlsCertFileFlag         = "tls-cert-file"
+	tlsKeyFileEnv           = "KUBE_PROXY_TLS_KEY_FILE"
+	tlsKeyFileFlag          = "tls-key-file"
+	defaultTLSCertFile      = "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"
+	defaultTLSKeyFile       = "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"
 	binaryName              = "k8s-api-proxy"
 	// devVersion is what a build without the release's -ldflags reports.
 	devVersion = "dev"
@@ -178,8 +185,8 @@ func main() {
 		showVersion              = flag.Bool("version", false, "Print the release or commit this binary was built for and exit")
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
 		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
-		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
-		tlsKeyFile               = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
+		tlsCertFile              = flag.String(tlsCertFileFlag, envOrDefault(tlsCertFileEnv, defaultTLSCertFile), "TLS server certificate chain PEM file, re-read when it changes; give the same path as --"+tlsKeyFileFlag+" for one PEM file holding the chain and its private key (empty for plain HTTP)")
+		tlsKeyFile               = flag.String(tlsKeyFileFlag, envOrDefault(tlsKeyFileEnv, defaultTLSKeyFile), "TLS server private key PEM file, re-read when it changes; the --"+tlsCertFileFlag+" path when that file holds the key (empty for plain HTTP)")
 		modeRaw                  = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
 		hostClusterIDF           = flag.String("host-cluster-id", envOrDefault("KUBE_PROXY_HOST_CLUSTER_ID", ""), "Optional gke_ cluster ID to route through the in-cluster ServiceAccount instead of Google credentials")
 		redactSecrets            = flag.Bool("redact-secrets", envBoolOrDefault("KUBE_PROXY_REDACT_SECRETS", true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
@@ -203,6 +210,13 @@ func main() {
 	if *showVersion {
 		fmt.Println(versionString())
 		return
+	}
+
+	// TLS needs both paths; either one empty serves plain HTTP. The same path for both
+	// means one PEM file holds the certificate chain and its private key.
+	certFile, keyFile := *tlsCertFile, *tlsKeyFile
+	if certFile == "" || keyFile == "" {
+		certFile, keyFile = "", ""
 	}
 
 	mode, err := k8sapiproxy.ParseMode(*modeRaw)
@@ -336,9 +350,20 @@ func main() {
 	}
 
 	listen := srv.ListenAndServe
-	if *tlsCertFile != "" && *tlsKeyFile != "" {
+	if certFile != "" {
+		serverCert, err := certreload.NewServerCertificate(certFile, keyFile, certreload.Options{
+			OnReloadError: func(err error) {
+				logger.Warn("serving the previous TLS certificate: the changed certificate or key could not be loaded", "err", err)
+				metrics.RecordCertificateReloadFailure()
+			},
+		})
+		if err != nil {
+			log.Fatalf("failed to load the TLS server certificate: %v", err)
+		}
+		srv.TLSConfig.GetCertificate = serverCert.GetCertificate
 		log.Printf("starting %s (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
-		listen = func() error { return srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile) }
+		// Empty file names make the server take certificates from TLSConfig.GetCertificate.
+		listen = func() error { return srv.ListenAndServeTLS("", "") }
 	} else {
 		log.Printf("starting %s (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 	}
