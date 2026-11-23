@@ -211,8 +211,19 @@ func TestDelegateTargetsHoldEveryoneInTheSession(t *testing.T) {
 	}
 }
 
-// A wake runs without the delegate tool, so its submission carries no list.
+// A wake runs without the delegate tool, so its submission carries no list,
+// unless the gateway let it delegate again (#6861): then it carries the list
+// a human turn by the same requester gets.
 func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		wakeDelegate bool
+	}{{"a wake", false}, {"a wake the gateway let delegate", true}} {
+		t.Run(tc.name, func(t *testing.T) { wakeDelegateTargets(t, tc.wakeDelegate) })
+	}
+}
+
+func wakeDelegateTargets(t *testing.T, wakeDelegate bool) {
 	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	rec := &SessionRecord{Key: "discord:g1/t-wk", ContextID: "ctx-wk", Kind: "group"}
@@ -222,7 +233,7 @@ func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
 	r.awaitTask(t, session)
 	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
 	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
-		Requester: TaskRequester{Backend: "discord", Subject: "u1"}})
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, WakeDelegate: wakeDelegate})
 	if !ok {
 		t.Fatal("the wake wasn't submitted")
 	}
@@ -233,8 +244,12 @@ func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
 		}
 		return wake != nil
 	})
-	if _, found, _ := lib.DelegateTargetsOf(messageParts(t, wake)); found {
-		t.Fatal("a wake carried delegate targets")
+	targets, found, _ := lib.DelegateTargetsOf(messageParts(t, wake))
+	if found != wakeDelegate {
+		t.Fatalf("wake (delegate=%v) carried delegate targets: %v", wakeDelegate, found)
+	}
+	if wakeDelegate && !slices.Contains(targetNames(targets), targetPlatform) {
+		t.Fatalf("a wake that may delegate carried %v, want platform listed", targetNames(targets))
 	}
 }
 

@@ -382,6 +382,12 @@ type TaskRef struct {
 	// which copy it from here rather than from anything the session wrote.
 	// False on entries written before it existed.
 	ChangeRequested bool `json:"changeRequested,omitempty"`
+	// WakeDelegate marks a wake the gateway let delegate again
+	// (wakeMayDelegate): its pod is started with the delegate tool on
+	// (delegateToolFor), and its submission's via says so to a reused pod's
+	// adapter. False on every other entry, and on wakes written before it
+	// existed, which ran without the tool.
+	WakeDelegate bool `json:"wakeDelegate,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
 	// for the task holding the conversation, set only after the publish
 	// succeeded. It is what lets a supervisor path reached long

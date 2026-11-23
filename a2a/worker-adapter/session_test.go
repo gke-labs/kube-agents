@@ -380,7 +380,7 @@ func authorityWithVia(t *testing.T, c *lib.Client, taskID, session string) json.
 	return raw
 }
 
-func TestDelegateOffForTaskReadsTheWakeMark(t *testing.T) {
+func TestDelegateOffForTaskReadsTheWakeMarkAndItsDelegateGrant(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		authority string
@@ -390,6 +390,15 @@ func TestDelegateOffForTaskReadsTheWakeMark(t *testing.T) {
 		{"a human turn", `{"requester":{"principal":"p"},"grants":null}`, false},
 		{"via null", `{"via":null,"grants":null}`, false},
 		{"a wake", `{"via":{"taskId":"t","session":"s"},"grants":null}`, true},
+		// The gateway let this wake delegate again (wakeMayDelegate, #6861).
+		{"a wake the gateway let delegate", `{"via":{"taskId":"t","session":"s","delegate":true},"grants":null}`, false},
+		{"a wake marked false", `{"via":{"taskId":"t","session":"s","delegate":false},"grants":null}`, true},
+		// A delegated child, a profile parent's included, never carries the
+		// mark, so it keeps running without the tool.
+		{"a profile parent's child", `{"via":{"taskId":"t","session":"s","profileChain":["triage"],"scope":"project/p"},"grants":null}`, true},
+		// A mark of the wrong type doesn't grant the tool.
+		{"a mark that isn't a bool", `{"via":{"taskId":"t","session":"s","delegate":"true"},"grants":null}`, true},
+		{"a via that isn't an object", `{"via":"task-1","grants":null}`, true},
 		{"an unreadable block", `{"via":`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

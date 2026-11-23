@@ -136,11 +136,11 @@ func TestADelegatingTurnIsOneTaskToTheObserver(t *testing.T) {
 		// result, so its wake gives the whole answer; a chat room did.
 		guide string
 	}{
-		{"the A2A door", a2aBackend, "a2a:agent-1001/ctx-one", doorDelegation, wakeReplyGuideFull},
+		{"the A2A door", a2aBackend, "a2a:agent-1001/ctx-one", doorDelegation, wakeReplyGuideFor(true, true)},
 		{"the inject door", injectBackend, injectKeyPrefix + "case-one", func(t *testing.T) func(*Config) {
 			return func(c *Config) { armInjectMap(t, c) }
-		}, wakeReplyGuideFull},
-		{"a chat backend", "", "discord:g1/t-one", func(*testing.T) func(*Config) { return nil }, wakeReplyGuide},
+		}, wakeReplyGuideFor(true, true)},
+		{"a chat backend", "", "discord:g1/t-one", func(*testing.T) func(*Config) { return nil }, wakeReplyGuideFor(false, true)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, spawn, obs := startObservedRig(t, tc.tweak(t))

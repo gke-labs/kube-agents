@@ -3297,6 +3297,9 @@ type taskStart struct {
 	// turn only when it arrived with IntentConfirm; a child or a wake
 	// copies its chain's entry, never anything the session wrote.
 	ChangeRequested bool
+	// WakeDelegate goes onto a wake's entry (TaskRef.WakeDelegate). Set
+	// only by startWake, from wakeMayDelegate.
+	WakeDelegate bool
 }
 
 // childKeepsLine reports whether a task keeps its rolling line on a backend
@@ -3408,9 +3411,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A turn for the conversation's own session pod carries the agents its
 	// requester may delegate to, which the pod's delegate tool names. Per
 	// turn, so a reused pod sees profiles as they come and go.
-	// A wake runs without the tool, so it carries none.
+	// A wake the gateway didn't let delegate again runs without the tool, so
+	// it carries none; one it did (WakeDelegate, #6861) carries the list a
+	// human turn by its requester would, checked against the same authors.
 	var extra []lib.Part
-	if ts.Route == nil && ts.Role != taskRoleWake && ownSession {
+	if ts.Route == nil && (ts.Role != taskRoleWake || ts.WakeDelegate) && ownSession {
 		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
 		if unknown && approximate {
 			// The record's people overflow the cap, but the pod's seeded set
@@ -3533,6 +3538,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Request:      ts.Request,
 		// What a child of this task inherits (handleDelegateRequest).
 		ChangeRequested: ts.ChangeRequested,
+		WakeDelegate:    ts.WakeDelegate,
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID

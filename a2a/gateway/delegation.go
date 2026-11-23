@@ -854,7 +854,7 @@ func capAsk(text string) string {
 // and then ended otherwise wakes with those answers, then its reason under
 // wakeEndMarker. With none the body is the result or the reason alone, as
 // before.
-func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer, cardsPending bool) string {
+func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer, cardsPending, mayDelegate bool) string {
 	outcome, completed, body := "completed", true, result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
@@ -885,10 +885,7 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	} else if body = strings.TrimSpace(body); body != "" {
 		text += "\n" + fenceWakeBody("", body, extraReserve)
 	}
-	if fullAnswer {
-		return text + "\n" + wakeReplyGuideFull
-	}
-	return text + "\n" + wakeReplyGuide
+	return text + "\n" + wakeReplyGuideFor(fullAnswer, mayDelegate)
 }
 
 // wakeCardsPendingNote is added to a completed wake when the delegated child
@@ -922,18 +919,41 @@ func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
 // receives only the wake's reply as the root's deliverable (spec-chatops-
 // gateway, "To a program behind a door"), and a chat whose child terminal
 // was found by a heal saw only a status card, so there the wake gives the
-// whole answer. Either way the wake's pod has no delegate
-// tool (delegateToolFor): an interim answer such as "still checking, the
-// results will post here" is reported as that, not asked again, which is how
-// a wake used to loop to the depth bound with nothing answered.
+// whole answer.
+//
+// Each guide ends on whether the wake may delegate (wakeMayDelegate). Most
+// wakes may since #6861, within the depth bound; their guide says not to ask
+// again for what is still coming. An interim answer such as "still checking,
+// the results will post here" read as a reason to ask again is how a wake
+// used to loop to the depth bound with nothing answered (#2819). A wake that
+// may not (at the bound, or with a card report still to come) is told so.
 const (
-	wakeReplyGuide     = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
-	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+	wakeReplyGuideChat = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly."
+	wakeReplyGuideDoor = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it. If it failed, or says more is still running or will follow later, say so plainly."
+	wakeNoDelegate     = " You can't delegate on this turn."
+	wakeMayDelegateTo  = " Don't delegate again for anything it says is still running or will follow; delegate again only when their question still needs a different next step, such as a change they asked for that the result didn't make."
+
+	wakeReplyGuide     = wakeReplyGuideChat + wakeNoDelegate
+	wakeReplyGuideFull = wakeReplyGuideDoor + wakeNoDelegate
 )
 
-// wakeReplyGuideMax is the longer of the two guides, which the result
-// body's budget reserves room for.
-var wakeReplyGuideMax = max(len(wakeReplyGuide), len(wakeReplyGuideFull))
+// wakeReplyGuideFor is the guide that closes a wake's text: for a chat or a
+// door (fullAnswer), and for a wake that may delegate again or may not.
+func wakeReplyGuideFor(fullAnswer, mayDelegate bool) string {
+	guide, end := wakeReplyGuideChat, wakeNoDelegate
+	if fullAnswer {
+		guide = wakeReplyGuideDoor
+	}
+	if mayDelegate {
+		end = wakeMayDelegateTo
+	}
+	return guide + end
+}
+
+// wakeReplyGuideMax is the longest of the guides, which the result body's
+// budget reserves room for.
+var wakeReplyGuideMax = max(len(wakeReplyGuideFor(false, false)), len(wakeReplyGuideFor(true, false)),
+	len(wakeReplyGuideFor(false, true)), len(wakeReplyGuideFor(true, true)))
 
 // wakeFollowUpMarker opens each follow-up's answer in a wake body that
 // carries a child's turns, numbered from the first follow-up.
@@ -1189,14 +1209,43 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	}
 	// The delegating turn's request, carried down a longer chain: the
 	// human's question, not an intermediate wake's gateway-authored text.
-	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted), cardsPending)
+	mayDelegate := g.wakeMayDelegate(parent, child, cardsPending)
+	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted), cardsPending, mayDelegate)
 	// The wake reads the child's result, which steers into the child
 	// shaped, and continues the parent's turn: it carries both entries'
 	// steer authors, so a delegation from it is checked against them.
 	var steered TaskRef
 	steered.carrySteerAuthors(parent)
 	steered.carrySteerAuthors(child)
-	return g.startWake(ctx, rec, child, parent, authority, steered, text, log)
+	return g.startWake(ctx, rec, child, parent, authority, steered, text, mayDelegate, log)
+}
+
+// wakeMayDelegate reports whether the wake that follows child may delegate
+// again (#6861; bnaylor, 2026-11-20: a woken session may delegate again,
+// within the existing depth cap). It may when all of these hold:
+//
+//   - parent is a session turn or a wake: a session's chain. A profile task
+//     waits open for its child and is never woken (its parent has a tier),
+//     so a profile chain never gets here; checked anyway, so it can't.
+//   - the wake's depth, the child's, is under DelegationDepthMax. The
+//     gateway refuses a delegation from a turn at the bound regardless
+//     (handleDelegateRequest); this keeps the tool off where it could only
+//     be refused.
+//   - no Cluster Agent card report is still to come (cardsPending). Such a
+//     report posts on its own, and asking again for it is the loop the
+//     delegate tool was taken off wakes for (#2819).
+//
+// Everything a delegation from the wake asks for is checked as any turn's
+// is: the wake is the parent handleDelegateRequest reads, under the
+// requester and steer authors it carries.
+func (g *Gateway) wakeMayDelegate(parent, child TaskRef, cardsPending bool) bool {
+	if parent.Tier != "" {
+		return false
+	}
+	if child.Depth >= g.cfg.DelegationDepthMax {
+		return false
+	}
+	return !cardsPending
 }
 
 // wakeParent is what a wake needs from the turn that delegated: its entry,
@@ -1228,14 +1277,18 @@ func (g *Gateway) wakeParent(rec *SessionRecord, child TaskRef, log *slog.Logger
 // wakeBatch's for a fan-out, whose last child to end is child. steered
 // carries the steer authors the wake inherits. It reports whether the wake
 // reached the bus, and when it did not, why.
-func (g *Gateway) startWake(ctx context.Context, rec *SessionRecord, child, parent TaskRef, authority Authority, steered TaskRef, text string, log *slog.Logger) (bool, string) {
+func (g *Gateway) startWake(ctx context.Context, rec *SessionRecord, child, parent TaskRef, authority Authority, steered TaskRef, text string, mayDelegate bool, log *slog.Logger) (bool, string) {
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
 	}
 	// The wake goes to the parent's pod when it is live and can take it
 	// (reuseLivePod): the same incarnation, so its author set is the
 	// parent's already and nothing is re-seeded. Its adapter runs the wake
-	// with the delegate tool off, from the via above.
+	// with the delegate tool on only when the via says so (Delegate, from
+	// wakeMayDelegate), and off otherwise.
+	if authority.Via != nil {
+		authority.Via.Delegate = mayDelegate
+	}
 	if !g.reuseLivePod(ctx, rec) {
 		// Otherwise the wake's pod is a fresh incarnation. It reads the
 		// transcript primer like any other, and its text also carries the
@@ -1269,6 +1322,7 @@ func (g *Gateway) startWake(ctx context.Context, rec *SessionRecord, child, pare
 		Request:              parent.Request,
 		// The delegating turn's, as the child's was.
 		ChangeRequested: parent.ChangeRequested,
+		WakeDelegate:    mayDelegate,
 	})
 	if !ok {
 		// startTaskWith has said why. A wake that never reached the bus

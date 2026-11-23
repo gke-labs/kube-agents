@@ -136,7 +136,7 @@ func batchChildName(ref TaskRef) string {
 // that failed, timed out or was stopped is listed with that outcome, never
 // left out. Then the cards note when a child handed work to cards, the
 // question guide when one asked, and the reply guide, as wakeText closes.
-func batchWakeText(ask string, kids []TaskRef, fullAnswer, cards bool) string {
+func batchWakeText(ask string, kids []TaskRef, fullAnswer, cards, mayDelegate bool) string {
 	slices.SortStableFunc(kids, func(a, b TaskRef) int { return a.BatchIndex - b.BatchIndex })
 	var lines []string
 	if ask = strings.TrimSpace(ask); ask != "" {
@@ -167,11 +167,7 @@ func batchWakeText(ask string, kids []TaskRef, fullAnswer, cards bool) string {
 	if asked {
 		lines = append(lines, wakeBatchQuestionGuide)
 	}
-	if fullAnswer {
-		lines = append(lines, wakeReplyGuideFull)
-	} else {
-		lines = append(lines, wakeReplyGuide)
-	}
+	lines = append(lines, wakeReplyGuideFor(fullAnswer, mayDelegate))
 	return strings.Join(lines, "\n")
 }
 
@@ -262,8 +258,9 @@ func (g *Gateway) wakeBatch(ctx context.Context, rec *SessionRecord, parent, las
 			cards = cards || k.BatchEnd.Cards
 		}
 	}
-	text := batchWakeText(parentRef.Request, kids, full, cards)
-	woken, why = g.startWake(ctx, rec, last, parentRef, authority, steered, text, log)
+	mayDelegate := g.wakeMayDelegate(parentRef, last, cards)
+	text := batchWakeText(parentRef.Request, kids, full, cards, mayDelegate)
+	woken, why = g.startWake(ctx, rec, last, parentRef, authority, steered, text, mayDelegate, log)
 	if woken {
 		// The wake carries the results now, and the record outlives the
 		// stream copy of each (SessionTTL past the TASKS retention), so the

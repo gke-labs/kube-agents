@@ -682,8 +682,9 @@ func podLifetime(cfg *Config, reuse bool) time.Duration {
 // delegateToolEnv is the pod's delegate tool setting. A one-task pod gets
 // the setting for the task it is started for (delegateToolFor). A reused pod
 // runs human turns and wakes alike, so it gets the tool, and its adapter
-// turns it off for each task that is a wake, from the submission's own
-// authority block (workeradapter.delegateOffForTask): the wake's `via`.
+// turns it off for each wake the gateway didn't let delegate again, from the
+// submission's own authority block (workeradapter.delegateOffForTask): the
+// wake's `via`, without `delegate: true`.
 func (s *podSpawner) delegateToolEnv(rec *SessionRecord, taskID string) string {
 	if s.cfg.reusePod(rec) {
 		return delegateToolOn
@@ -1343,16 +1344,18 @@ func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, task
 }
 
 // delegateToolFor is the session's delegate tool setting for the task a pod
-// is started for: off on a wake turn, on otherwise. A wake reports what a
-// delegation came back with. Given the tool, a wake that reads an interim
-// answer ("still checking, the results will post here") asks again, each
-// ask wakes another pod, and the chain ends at the depth bound with nothing
-// answered. Without it the wake can only answer. A message the person sends
-// while the wake runs is a steer into the wake, so it is answered without
-// the tool too; one sent after the wake ends is a new human turn and has it.
+// is started for: on for a human turn, and on a wake only when the gateway
+// let it delegate again (TaskRef.WakeDelegate, from wakeMayDelegate; #6861).
+// A wake at the depth bound, or with a card report still to come, runs
+// without it: given the tool, a wake that reads an interim answer ("still
+// checking, the results will post here") asks again, each ask wakes another
+// pod, and the chain ends at the bound with nothing answered (#2819). A
+// message the person sends while the wake runs is a steer into the wake, so
+// it is answered under the wake's setting; one sent after the wake ends is a
+// new human turn and has the tool.
 func delegateToolFor(rec *SessionRecord, taskID string) string {
 	for _, ref := range rec.Tasks {
-		if ref.ID == taskID && ref.Role == taskRoleWake {
+		if ref.ID == taskID && ref.Role == taskRoleWake && !ref.WakeDelegate {
 			return "off"
 		}
 	}

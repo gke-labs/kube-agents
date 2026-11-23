@@ -201,7 +201,7 @@ func TestAFanOutWakesOnceWithEveryResult(t *testing.T) {
 			t.Fatalf("wake text lacks %q:\n%s", want, got)
 		}
 	}
-	if !strings.HasSuffix(got, "\n"+wakeReplyGuide) {
+	if !strings.HasSuffix(got, "\n"+wakeReplyGuideFor(false, true)) {
 		t.Fatalf("wake text does not close with the reply guide:\n%s", got)
 	}
 	var auth Authority
@@ -734,7 +734,7 @@ func TestAHealFinishesAFanOut(t *testing.T) {
 	got := envText(t, r2.awaitTask(t, spawn2.calls()[0].Session))
 	if !strings.Contains(got, "1. platform, which completed:\n```\none done\n```") ||
 		!strings.Contains(got, "2. platform, which failed:\n```\nreason: quota - exceeded\n```") ||
-		!strings.HasSuffix(got, wakeReplyGuideFull) {
+		!strings.HasSuffix(got, wakeReplyGuideFor(true, true)) {
 		t.Fatalf("wake text = %s", got)
 	}
 	if wakeEntries(t, r2, conv) != 1 {
@@ -802,7 +802,7 @@ func TestAFanOutWakeFencesEachResult(t *testing.T) {
 		{ID: "k1", Addressee: targetPlatform, BatchIndex: 1, BatchEnd: &BatchEnd{State: lib.StateCompleted, Text: body}},
 		{ID: "k2", Addressee: targetPlatform, BatchIndex: 2, BatchEnd: &BatchEnd{State: lib.StateCompleted, Text: "fine"}},
 	}
-	got := batchWakeText("", kids, false, false)
+	got := batchWakeText("", kids, false, false, false)
 	want := "1. platform, which completed:\n`````\n" + body + "\n`````\n2. platform"
 	if !strings.Contains(got, want) {
 		t.Fatalf("wake text = %s", got)

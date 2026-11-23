@@ -635,20 +635,26 @@ func TestSpawnRendersTheCapabilityContractFromTheGatewaysOwnConfig(t *testing.T)
 // A wake reports what a delegation came back with. Given the delegate tool,
 // a wake that reads an interim answer ("still checking, the results will
 // post here") delegates again, and the chain loops to the depth bound with
-// nothing answered. So a wake's pod has the tool off; a human turn's keeps it.
-func TestAWakePodHasNoDelegateTool(t *testing.T) {
+// nothing answered (#2819). So a wake's pod has the tool off unless the
+// gateway let that wake delegate again (TaskRef.WakeDelegate, #6861); a
+// human turn's keeps it.
+func TestAWakePodHasNoDelegateToolUnlessTheGatewayLetsItDelegate(t *testing.T) {
 	for _, tc := range []struct {
 		name, role, want string
+		wakeDelegate     bool
 	}{
-		{"a human turn", "", "on"},
-		{"a wake", taskRoleWake, "off"},
+		{"a human turn", "", "on", false},
+		{"a wake", taskRoleWake, "off", false},
+		{"a wake the gateway let delegate", taskRoleWake, "on", true},
+		// The mark means nothing on any other entry: only a wake reads it.
+		{"a human turn marked anyway", "", "on", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := k8sfake.NewSimpleClientset()
 			cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session", TaskDeadline: time.Minute}
 			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-wake", Addressee: "chat-otter-wake",
-				Tasks: []TaskRef{{ID: "task-1", Addressee: "chat-otter-wake", Role: tc.role}}}
+				Tasks: []TaskRef{{ID: "task-1", Addressee: "chat-otter-wake", Role: tc.role, WakeDelegate: tc.wakeDelegate}}}
 			if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
 				t.Fatal(err)
 			}

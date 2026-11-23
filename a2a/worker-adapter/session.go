@@ -331,16 +331,19 @@ func (w *taskWatcher) unreadable(subject, what string, cause error) error {
 // The gateway sets `via` on the two tasks it mints for a delegation
 // (gateway/delegation.go): the delegated child, which runs on its own
 // `delegate:` pod, and the wake, which reports back to the session that
-// delegated. In a reused session pod the one that arrives is the wake. It
-// exists to report what a delegation came back with; given the tool it can
-// read an interim answer as a reason to ask again, and the chain loops to the
-// depth bound with nothing answered (#2819). The child runs without the tool
-// by the same rule. Only the gateway can publish a submission, so the signal
-// is the gateway's.
+// delegated. In a reused session pod the one that arrives is the wake. A
+// via means no tool unless it also carries `delegate: true`, which the
+// gateway sets only on a wake it let delegate again (gateway wakeMayDelegate,
+// #6861): a session wake under the depth bound with no card report still to
+// come. Without that, a wake that reads an interim answer as a reason to ask
+// again loops to the depth bound with nothing answered (#2819). The child,
+// and an older gateway's wake, carry no `delegate` and run without the tool.
+// Only the gateway can publish a submission, so the signal is the gateway's.
 //
 // No authority block at all is an older gateway's or a hand-run task's, and
-// is no wake. One that does not parse is treated as a wake: the tool is the
-// thing to withhold when the submission cannot be read.
+// is no wake. One that does not parse, or a via that isn't an object, is
+// treated as a wake without the grant: the tool is the thing to withhold
+// when the submission cannot be read.
 func delegateOffForTask(origin *lib.Envelope) bool {
 	if len(origin.Authority) == 0 {
 		return false
@@ -351,5 +354,14 @@ func delegateOffForTask(origin *lib.Envelope) bool {
 	if err := json.Unmarshal(origin.Authority, &block); err != nil {
 		return true
 	}
-	return len(block.Via) > 0 && string(block.Via) != "null"
+	if len(block.Via) == 0 || string(block.Via) == "null" {
+		return false
+	}
+	var via struct {
+		Delegate bool `json:"delegate"`
+	}
+	if err := json.Unmarshal(block.Via, &via); err != nil {
+		return true
+	}
+	return !via.Delegate
 }
