@@ -1329,13 +1329,14 @@ class BrokerCallTest(unittest.TestCase):
         self.assertEqual(printed["baseBranch"], "main")
 
     def test_a_refusal_part_that_is_a_number_is_kept_beside_a_detail_that_is_left_out(self):
-        error = vcs.VcsError("the forge refused the change", code=422, detail=self.nested_lists(vcs.MAX_PRINT_DEPTH))
+        # The number is a `revision`: a `code` that is not a text is no code (`vcs_client.VcsError`).
+        error = vcs.VcsError("the forge refused the change", revision=422, detail=self.nested_lists(vcs.MAX_PRINT_DEPTH))
         with mock.patch.object(vcs_client, "call", side_effect=error):
             code, printed = self.main_with_the_broker_answer(return_value={})
         self.assertEqual(code, 1)
         self.assertEqual(
             printed,
-            {"error": "the forge refused the change", "code": 422, "detail": "left out: nested too deep to print"},
+            {"error": "the forge refused the change", "revision": 422, "detail": "left out: nested too deep to print"},
         )
 
     def test_an_encoder_that_gives_up_before_the_bound_gives_the_same_two_answers(self):
