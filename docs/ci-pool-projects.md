@@ -661,7 +661,7 @@ it is idempotent and replaces the key only when the stored one no longer matches
 read-only key or GitHub's host keys changed. It is also the repair for a budget a stopped
 `post-merge-verified-fixed` run left off the default branch. Whoever runs it holds `roles/secretmanager.admin` on
 the project and admin on the repository. To rotate the key, delete it from the repository's deploy
-keys and run the script again.
+keys and run the script again. Every run also deletes any other key under its title, so a duplicate or one given write access does not outlive the next run. The secret's accessor defaults to the fleet reconciler (`FLEET_RECONCILER_SA` in the provisioning script); a third argument names another IAM member, such as the identity that applies a dev fleet. The verifier's `post_merge_sync` check fails a project whose secret has no enabled version, whose reconciler lacks the grant, or whose repository lacks the declaration or the budget, and prints the script as the repair.
 
 ## 6. The seeded dirty fleet
 

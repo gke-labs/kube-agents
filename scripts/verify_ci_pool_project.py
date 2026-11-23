@@ -174,6 +174,7 @@ CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 # The eval nightlies' Gemini Developer API key, its secret and the secret's
 # grants (scripts/provision_ci_pool_gemini_key.sh), read as metadata and IAM.
 CHECK_GEMINI_KEY = "gemini_api_key"
+CHECK_POST_MERGE_SYNC = "post_merge_sync"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
 # the minter GSA's signing right and its Workload Identity binding, read with
@@ -197,6 +198,7 @@ CHECK_IDS = (
     CHECK_GITLAB_WORKLOAD_MANIFEST,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_GEMINI_KEY,
+    CHECK_POST_MERGE_SYNC,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
 )
@@ -227,6 +229,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GITLAB_WORKLOAD_MANIFEST: "GitLab Workload Declaration",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_GEMINI_KEY: "Gemini Developer API Key",
+    CHECK_POST_MERGE_SYNC: "Post-merge Sync Deploy Key & Seeds",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
 }
@@ -234,7 +237,7 @@ CHECK_DISPLAY_NAMES = {
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST})
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST, CHECK_POST_MERGE_SYNC})
 # The GitLab lane's twin of the workload check reads gitlab.com over HTTPS
 # with a token (GITLAB_VERIFY_TOKEN, else the pool's ledger token from Secret
 # Manager), no `gh` and no project-level `gcloud` read, so it sits in neither
@@ -248,7 +251,9 @@ GITLAB_CHECKS = frozenset({CHECK_GITLAB_WORKLOAD_MANIFEST})
 # every check but the mapping, which reads the checkout and the remote ref,
 # the default-branch read, and the GitHub checks in GITHUB_CHECKS, whose reads
 # are all `gh`.
-GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS - GITLAB_CHECKS
+# The post-merge sync check reads both: the secret over gcloud, the seeded
+# files over gh.
+GCP_CHECKS = (frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS - GITLAB_CHECKS) | {CHECK_POST_MERGE_SYNC}
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # GitHub-reading checks that need a credential the health bot must not hold
@@ -542,6 +547,17 @@ GEMINI_KEY_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor"
 GEMINI_KEY_ERR_EXCERPT = 200
 # The state of a secret version the nightly's `versions access latest` reads.
 GEMINI_KEY_VERSION_ENABLED = "ENABLED"
+# The post-merge sync's repository side (scripts/provision_ci_pool_post_merge_sync.sh,
+# docs/ci-pool-projects.md 5.13): the deploy key's secret, the fleet
+# reconciler's accessor grant on it, and the two files Config Sync syncs into
+# seeded-post-merge. A test pins these to the script.
+POST_MERGE_SYNC_SCRIPT = "scripts/provision_ci_pool_post_merge_sync.sh"
+POST_MERGE_SYNC_SECRET = "kube-agents-eval-gitops-deploy-key"
+POST_MERGE_SYNC_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor"
+POST_MERGE_SYNC_SEEDED_PATHS = (
+    "clusters/seeded-a/seeded-post-merge/order-ledger.yaml",
+    "clusters/seeded-a/seeded-post-merge/order-ledger-pdb.yaml",
+)
 # Client restrictions on an API key: a key that carries any of them accepts
 # calls only from that browser, server address or app, so the agent pod's
 # calls are refused.
@@ -4668,6 +4684,78 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
     return CheckResult(name, passed, message, details, warnings, findings, read=True)
 
 
+def check_post_merge_sync(project_id: str) -> CheckResult:
+    """The post-merge sync's repository side: an enabled latest version of the
+    deploy key's secret, the fleet reconciler's accessor grant on it, and the
+    order-ledger declaration and budget in the GitOps repository. Metadata and
+    presence only: no read returns the key or a file's body. A read that is
+    refused or times out leaves its part unverified, as elsewhere.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_POST_MERGE_SYNC]
+    repair = f"{POST_MERGE_SYNC_SCRIPT} {project_id}"
+    secret = POST_MERGE_SYNC_SECRET
+    details: List[str] = []
+    warnings: List[str] = []
+    problems: List[str] = []
+
+    def gcloud_json(cmd: List[str], what: str) -> Tuple[Optional[object], bool]:
+        """(parsed JSON or None when absent, read)."""
+        rc, out, err = run_cmd(cmd)
+        if rc != 0:
+            if _record_unreadable(err, f"{what} absent", f"Could not read {what} in {project_id}", details, warnings):
+                return None, False
+            return None, True
+        try:
+            return json.loads(out or "null"), True
+        except ValueError as exc:
+            warnings.append(Unread(f"Could not read {what} in {project_id}: gcloud printed no JSON ({exc})"))
+            return None, False
+
+    versions, versions_read = gcloud_json(
+        ["gcloud", "secrets", "versions", "list", secret, f"--project={project_id}", "--limit=1", "--format=json"],
+        f"the latest version of secret {secret}",
+    )
+    if versions_read:
+        latest = (versions or [{}])[0].get("state", "") if versions is not None else ""
+        if latest == GEMINI_KEY_VERSION_ENABLED:
+            details.append(f"✓ Secret {secret} has an enabled latest version")
+        else:
+            problems.append(f"secret {secret} has no enabled latest version ({latest or 'absent'})")
+    if versions_read and versions is not None:
+        policy, policy_read = gcloud_json(
+            ["gcloud", "secrets", "get-iam-policy", secret, f"--project={project_id}", "--format=json"],
+            f"the IAM policy of secret {secret}",
+        )
+        if policy_read:
+            held = {
+                member
+                for binding in (policy or {}).get("bindings", [])
+                if binding.get("role") == POST_MERGE_SYNC_ACCESSOR_ROLE
+                for member in binding.get("members", [])
+            }
+            if FLEET_RECONCILER_MEMBER in held:
+                details.append(f"✓ the fleet reconciler holds {POST_MERGE_SYNC_ACCESSOR_ROLE} on {secret}")
+            else:
+                problems.append(f"the fleet reconciler lacks {POST_MERGE_SYNC_ACCESSOR_ROLE} on secret {secret}")
+    repo_slug = _gitops_repo_slug(project_id)
+    for path in POST_MERGE_SYNC_SEEDED_PATHS:
+        state, out = _gitops_path_state(repo_slug, path)
+        if state == GITHUB_PATH_PRESENT:
+            details.append(f"✓ {repo_slug} carries {path}")
+        elif state == GITHUB_PATH_ABSENT:
+            problems.append(f"{repo_slug} has no {path}")
+        elif state == GITHUB_PATH_FAILED:
+            problems.append(f"could not read {path} in {repo_slug}: {out}")
+        else:
+            warnings.append(Unread(f"Not checked: {path} in {repo_slug} could not be read: {out}"))
+    if problems:
+        details.extend(problems)
+        return CheckResult(name, False, f"{'; '.join(problems)} (run {repair})", details, warnings)
+    if warnings:
+        return CheckResult(name, True, "Partly unverified", details, warnings, read=False)
+    return CheckResult(name, True, "Deploy key secret, reconciler grant, declaration and budget in place", details, warnings, read=True)
+
+
 def _probe_github_app_identity(
     project_id: str, location: str, version: str, app_id: int, timeout: int = 15
 ) -> Tuple[str, str]:
@@ -5249,6 +5337,7 @@ def run_checks(
     run(CHECK_GITLAB_WORKLOAD_MANIFEST, lambda: check_gitlab_workload_manifest(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     run(CHECK_GEMINI_KEY, lambda: check_gemini_api_key(project_id))
+    run(CHECK_POST_MERGE_SYNC, lambda: check_post_merge_sync(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
     elif CHECK_TOKEN_MINTER_KMS in wanted:

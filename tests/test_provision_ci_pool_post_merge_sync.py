@@ -110,7 +110,7 @@ class ProvisionPostMergeSyncTest(unittest.TestCase):
             fake.write_text(body)
             fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
 
-    def _run(self, *, declaration_absent=False, secret_exists=False, stored=None, deploy_keys=()):
+    def _run(self, *, declaration_absent=False, secret_exists=False, stored=None, deploy_keys=(), extra_args=()):
         overrides = {
             "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
             "FAKE_LOG": str(self.log),
@@ -126,7 +126,7 @@ class ProvisionPostMergeSyncTest(unittest.TestCase):
         if stored is not None:
             overrides["FAKE_STORED"] = stored
         env = get_isolated_test_env(overrides=overrides, absent=absent)
-        proc = subprocess.run(["bash", str(_SCRIPT), _PROJECT], capture_output=True, text=True, env=env, check=False)
+        proc = subprocess.run(["bash", str(_SCRIPT), _PROJECT, *extra_args], capture_output=True, text=True, env=env, check=False)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return proc, calls
 
@@ -191,6 +191,56 @@ class ProvisionPostMergeSyncTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         version = self._calls(calls, "gcloud", "secrets", "versions", "add", _SECRET)
         self.assertEqual(_KNOWN_HOSTS, json.loads(version[0]["stdin"])["known_hosts"])
+
+    def test_the_converged_path_deletes_every_other_key_under_the_title(self):
+        keys = [
+            {"id": 7, "key": "ssh-ed25519 PUB-old", "read_only": True},
+            {"id": 8, "key": "ssh-ed25519 PUB-stray", "read_only": True},
+            {"id": 9, "key": "ssh-ed25519 PUB-old", "read_only": False},
+        ]
+        proc, calls = self._run(secret_exists=True, stored=_stored(), deploy_keys=keys)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual([], self._calls(calls, "gh", "repo", "deploy-key", "add"))
+        deleted = [c["argv"][3] for c in self._calls(calls, "gh", "api", "-X", "DELETE")]
+        self.assertEqual([f"repos/{_REPO}/keys/8", f"repos/{_REPO}/keys/9"], deleted)
+
+    def test_the_accessor_is_an_argument(self):
+        member = "user:dev@example.com"
+        proc, calls = self._run(extra_args=(_REPO, member))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        grant = self._calls(calls, "gcloud", "secrets", "add-iam-policy-binding", _SECRET)[0]["argv"]
+        self.assertIn(f"--member={member}", grant)
+
+    def test_an_accessor_that_is_not_a_member_is_refused(self):
+        proc, _ = self._run(extra_args=(_REPO, "dev@example.com"))
+        self.assertNotEqual(0, proc.returncode)
+
+    def test_the_declaration_is_the_fleet_stacks_deployment(self):
+        defects = (_FLEET_TF / "defects-a.tf").read_text()
+        if '"order_ledger"' not in defects:
+            self.skipTest("bench/tf/fleet does not plant order-ledger on this branch")
+        import yaml
+
+        block = defects[defects.index('resource "kubernetes_deployment_v1" "order_ledger"') :]
+        block = block[: block.index("\n}\n")]
+        content = re.search(r"^readonly DECLARATION_CONTENT='(.*?)'$", _SCRIPT.read_text(), re.MULTILINE | re.DOTALL).group(1)
+        doc = yaml.safe_load(content)
+        spec, pod = doc["spec"], doc["spec"]["template"]["spec"]
+        container = pod["containers"][0]
+        expected = {
+            'name      = "order-ledger"': doc["metadata"]["name"] == "order-ledger",
+            f"replicas = {spec['replicas']}": True,
+            f'match_labels = {{ app = "{spec["selector"]["matchLabels"]["app"]}" }}': True,
+            f"automount_service_account_token = {str(pod['automountServiceAccountToken']).lower()}": True,
+            f"run_as_user     = {pod['securityContext']['runAsUser']}": True,
+            f'name  = "{container["name"]}"': True,
+            f'image = "{container["image"]}"': True,
+            f'requests = {{ cpu = "{container["resources"]["requests"]["cpu"]}", memory = "{container["resources"]["requests"]["memory"]}" }}': True,
+            f'limits   = {{ memory = "{container["resources"]["limits"]["memory"]}" }}': True,
+        }
+        for line, ok in expected.items():
+            self.assertTrue(ok and line in block, line)
+        self.assertEqual("seeded-post-merge", doc["metadata"]["namespace"])
 
     def test_the_fleet_stack_reads_the_secret_this_script_writes(self):
         stack = "".join(path.read_text() for path in sorted(_FLEET_TF.glob("*.tf")))

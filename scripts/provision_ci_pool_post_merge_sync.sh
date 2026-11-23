@@ -31,8 +31,10 @@
 # stdout, stderr, a command line or an xtrace.
 #
 # Usage:
-#   ./scripts/provision_ci_pool_post_merge_sync.sh <PROJECT_ID> [<owner>/<repo>]
-# The repository defaults to the pool convention, gke-agentic/<PROJECT_ID>-infra.
+#   ./scripts/provision_ci_pool_post_merge_sync.sh <PROJECT_ID> [<owner>/<repo>] [<accessor member>]
+# The repository defaults to the pool convention, gke-agentic/<PROJECT_ID>-infra,
+# and the accessor to the fleet reconciler, FLEET_RECONCILER_SA in
+# scripts/provision_ci_pool_project.sh (a dev project names its own applier).
 # ==============================================================================
 
 set -euo pipefail
@@ -48,7 +50,8 @@ readonly DEPLOY_KEY_TITLE="seeded-fleet config-sync (read-only)"
 readonly DEPLOY_KEY_TYPE="ed25519"
 readonly DEPLOY_KEY_FILE="key"
 readonly DEPLOY_KEY_REPLICATION_POLICY="automatic"
-readonly DEPLOY_KEY_ACCESSOR="seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
+# Where the default accessor is read from: the pool's one definition of it.
+readonly PROVISION_SCRIPT="provision_ci_pool_project.sh"
 readonly DEPLOY_KEY_ACCESSOR_ROLE="roles/secretmanager.secretAccessor"
 readonly KNOWN_HOSTS_HOST="github.com"
 # What `gh api` prints on stderr for a path that is not there, and gcloud's for
@@ -121,12 +124,16 @@ die() {
   exit 1
 }
 
-[[ $# -ge 1 && $# -le 2 && -n "${1}" ]] || {
-  echo "usage: $0 <PROJECT_ID> [<owner>/<repo>]" >&2
+[[ $# -ge 1 && $# -le 3 && -n "${1}" ]] || {
+  echo "usage: $0 <PROJECT_ID> [<owner>/<repo>] [<accessor member>]" >&2
   exit "${EX_USAGE}"
 }
 readonly PROJECT_ID="$1"
 readonly GITOPS_REPO="${2:-${GITOPS_ORG}/${PROJECT_ID}${GITOPS_REPO_SUFFIX}}"
+DEFAULT_ACCESSOR="$(sed -n 's/^FLEET_RECONCILER_SA="\(.*\)"$/\1/p' "$(dirname "$0")/${PROVISION_SCRIPT}")"
+readonly DEPLOY_KEY_ACCESSOR="${3:-${DEFAULT_ACCESSOR}}"
+[[ "${DEPLOY_KEY_ACCESSOR}" == *:* ]] ||
+  die "the accessor must be an IAM member (serviceAccount:..., user:...), got '${DEPLOY_KEY_ACCESSOR}'"
 
 WORK_DIR="$(mktemp -d)"
 readonly WORK_DIR
@@ -202,6 +209,9 @@ while IFS=$'\t' read -r _ key read_only; do
   fi
 done <<<"${KEY_ROWS}"
 [[ "${STORED_HOSTS}" == "${KNOWN_HOSTS}" ]] || CONVERGED=0
+# The key the secret holds once this run is done; every other key under the
+# title is deleted below, on the converged path too.
+KEEP_PUBLIC="${STORED_PUBLIC}"
 
 # ─── Key ───────────────────────────────────────────────────────────────────────
 if [[ "${CONVERGED}" -eq 1 ]]; then
@@ -221,19 +231,22 @@ print(json.dumps({"ssh": open(sys.argv[1]).read(), "known_hosts": open(sys.argv[
 ' "${WORK_DIR}/${DEPLOY_KEY_FILE}" "${WORK_DIR}/known_hosts" |
     gcloud secrets versions add "${DEPLOY_KEY_SECRET_NAME}" --project="${PROJECT_ID}" --data-file=- >/dev/null ||
     die "could not add a version to secret ${DEPLOY_KEY_SECRET_NAME}; ${GITOPS_REPO} keeps the new key and the old ones until a re-run"
-  # The keys this run replaced: every one under the title but the new one.
-  while IFS=$'\t' read -r id _ _; do
-    [[ -n "${id}" ]] || continue
-    echo "[${PROJECT_ID}] Deleting the replaced deploy key ${id} from ${GITOPS_REPO}"
-    gh api -X DELETE "repos/${GITOPS_REPO}/keys/${id}" >/dev/null ||
-      echo "WARNING: [${PROJECT_ID}] could not delete deploy key ${id}; it no longer matches the secret" >&2
-  done <<<"${KEY_ROWS}"
+  KEEP_PUBLIC="$(cut -d' ' -f1,2 "${WORK_DIR}/${DEPLOY_KEY_FILE}.pub")"
 fi
+# Every key under the title but the read-only one the secret holds: a key
+# this run replaced, a duplicate, or one someone gave write access.
+while IFS=$'\t' read -r id key read_only; do
+  [[ -n "${id}" ]] || continue
+  [[ "${key}" == "${KEEP_PUBLIC}" && "${read_only}" == "true" ]] && continue
+  echo "[${PROJECT_ID}] Deleting deploy key ${id} from ${GITOPS_REPO}: not the read-only key the secret holds"
+  gh api -X DELETE "repos/${GITOPS_REPO}/keys/${id}" >/dev/null ||
+    echo "WARNING: [${PROJECT_ID}] could not delete deploy key ${id}; it does not match the secret" >&2
+done <<<"${KEY_ROWS}"
 
 # ─── IAM ───────────────────────────────────────────────────────────────────────
 echo "[${PROJECT_ID}] Granting ${DEPLOY_KEY_ACCESSOR_ROLE} on secret ${DEPLOY_KEY_SECRET_NAME} to ${DEPLOY_KEY_ACCESSOR}"
 gcloud secrets add-iam-policy-binding "${DEPLOY_KEY_SECRET_NAME}" --project="${PROJECT_ID}" \
-  --member="serviceAccount:${DEPLOY_KEY_ACCESSOR}" --role="${DEPLOY_KEY_ACCESSOR_ROLE}" --format=none ||
+  --member="${DEPLOY_KEY_ACCESSOR}" --role="${DEPLOY_KEY_ACCESSOR_ROLE}" --format=none ||
   die "could not grant ${DEPLOY_KEY_ACCESSOR_ROLE} on secret ${DEPLOY_KEY_SECRET_NAME}"
 
 echo "[${PROJECT_ID}] The post-merge sync can read ${GITOPS_REPO} through secret ${DEPLOY_KEY_SECRET_NAME}"

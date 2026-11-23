@@ -5545,6 +5545,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
+             mock.patch.object(checker, "check_post_merge_sync", return_value=checker.CheckResult("pm", True)), \
              mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
@@ -5573,6 +5574,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
+             mock.patch.object(checker, "check_post_merge_sync", return_value=checker.CheckResult("pm", True)), \
              mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
@@ -5591,7 +5593,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_gemini_api_key", "check_warm_cache_readers", "check_forge_pieces")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_gemini_api_key", "check_post_merge_sync", "check_warm_cache_readers", "check_forge_pieces")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -5635,7 +5637,7 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_gitlab_workload_manifest"] as gitlab_manifest, mocks["check_ledger_read_credential"] as ledger, mocks["check_gemini_api_key"] as gemini, \
+             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_gitlab_workload_manifest"] as gitlab_manifest, mocks["check_ledger_read_credential"] as ledger, mocks["check_gemini_api_key"] as gemini, mocks["check_post_merge_sync"] as post_merge, \
              mocks["check_warm_cache_readers"] as warm, mocks["check_forge_pieces"] as forge, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
@@ -5643,7 +5645,7 @@ class ChecksSelectionTest(unittest.TestCase):
             forge.assert_called_once_with("kube-agents-evals-3", "us-central1")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
             gemini.assert_called_once_with("kube-agents-evals-3")
-            for never in (mapping, fleet, app, note, manifest, gitlab_manifest, ledger):
+            for never in (mapping, fleet, app, note, manifest, gitlab_manifest, ledger, post_merge):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
             everything = checker.run_checks("kube-agents-evals-3")
@@ -5663,7 +5665,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # check alone runs on a machine with neither tool.
         with mock.patch.object(checker, "run_cmd", side_effect=AssertionError("no tool was asked for")):
             self.assertEqual(checker.check_toolchain(needs_gh=False, needs_gcloud=False), [])
-        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING, checker.CHECK_GITOPS_DEFAULT_BRANCH} - checker.GITHUB_CHECKS - checker.GITLAB_CHECKS)
+        self.assertEqual(checker.GCP_CHECKS, (frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING, checker.CHECK_GITOPS_DEFAULT_BRANCH} - checker.GITHUB_CHECKS - checker.GITLAB_CHECKS) | {checker.CHECK_POST_MERGE_SYNC})
         seen = {}
         with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
             checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_CODEBASE_MAPPING])
@@ -5683,7 +5685,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # KMS over gcloud, and the default-branch check, which the scan selects,
         # files its own unread when gh or its credential is missing so the GCP
         # checks run.
-        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION, checker.CHECK_GITOPS_WORKLOAD_MANIFEST})
+        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION, checker.CHECK_GITOPS_WORKLOAD_MANIFEST, checker.CHECK_POST_MERGE_SYNC})
         self.assertIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.POOL_STATE_CHECKS)
         self.assertNotIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.GCP_CHECKS)
 
@@ -5750,6 +5752,7 @@ class ReportDocumentTest(unittest.TestCase):
              mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("d", True)), \
              mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
+             mock.patch.object(checker, "check_post_merge_sync", return_value=checker.CheckResult("pm", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 60)
         self.assertEqual(iam.call_count, 1)
@@ -6695,6 +6698,73 @@ class GeminiApiKeyCheckTest(unittest.TestCase):
             _, result = checker.check_project_and_apis(self.PROJECT)
         self.assertFalse(result.passed)
         self.assertEqual([f.id for f in result.findings], [f"apis/{checker.GEMINI_KEY_API_TARGET}"])
+
+
+class PostMergeSyncCheckTest(unittest.TestCase):
+    """check_post_merge_sync: the deploy key's secret, the reconciler's grant on it, and the two seeded files."""
+
+    _DECL, _BUDGET = checker.POST_MERGE_SYNC_SEEDED_PATHS
+    _ENABLED = _ok(json.dumps([{"state": "ENABLED"}]))
+    _GRANTED = _ok(json.dumps({"bindings": [{"role": "roles/secretmanager.secretAccessor", "members": [checker.FLEET_RECONCILER_MEMBER]}]}))
+    _PRESENT = (checker.GITHUB_PATH_PRESENT, "{}")
+
+    def _run(self, versions=None, policy=None, paths=None):
+        answers = {"versions": versions or self._ENABLED, "get-iam-policy": policy or self._GRANTED}
+        files = {self._DECL: self._PRESENT, self._BUDGET: self._PRESENT, **(paths or {})}
+        calls = []
+
+        def run_cmd(cmd, *args, **kwargs):
+            calls.append(cmd)
+            return answers[cmd[2]]
+
+        with mock.patch.object(checker, "run_cmd", side_effect=run_cmd), mock.patch.object(
+            checker, "_gitops_path_state", side_effect=lambda repo, path, raw=False: files[path]
+        ), mock.patch.object(checker, "_gitops_repo_slug", return_value="gke-agentic/p-infra"):
+            return checker.check_post_merge_sync("p"), calls
+
+    def test_everything_in_place_passes(self):
+        result, calls = self._run()
+        self.assertTrue(result.passed, result.message)
+        self.assertTrue(all("access" not in cmd for cmd in calls), "never reads the key")
+
+    def test_a_missing_secret_fails_with_the_script_as_repair(self):
+        result, calls = self._run(versions=_fail("ERROR: NOT_FOUND: Secret not found"))
+        self.assertFalse(result.passed)
+        self.assertIn(checker.POST_MERGE_SYNC_SCRIPT, result.message)
+        self.assertFalse(any(cmd[2] == "get-iam-policy" for cmd in calls))
+
+    def test_a_disabled_latest_version_fails(self):
+        result, _ = self._run(versions=_ok(json.dumps([{"state": "DISABLED"}])))
+        self.assertFalse(result.passed)
+        self.assertIn("DISABLED", result.message)
+
+    def test_a_missing_accessor_grant_fails(self):
+        result, _ = self._run(policy=_ok(json.dumps({"bindings": []})))
+        self.assertFalse(result.passed)
+        self.assertIn("lacks roles/secretmanager.secretAccessor", result.message)
+
+    def test_a_missing_seeded_file_fails(self):
+        for path in (self._DECL, self._BUDGET):
+            with self.subTest(path=path):
+                result, _ = self._run(paths={path: (checker.GITHUB_PATH_ABSENT, "")})
+                self.assertFalse(result.passed)
+                self.assertIn(path, result.message)
+
+    def test_an_unread_file_leaves_the_check_unverified_not_failed(self):
+        result, _ = self._run(paths={self._BUDGET: (checker.GITHUB_PATH_UNREAD, "HTTP 403")})
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+
+    def test_the_constants_are_the_provisioning_scripts(self):
+        script = (checker._ROOT / checker.POST_MERGE_SYNC_SCRIPT).read_text()
+        self.assertIn(f'readonly DEPLOY_KEY_SECRET_NAME="{checker.POST_MERGE_SYNC_SECRET}"', script)
+        self.assertIn(f'readonly DEPLOY_KEY_ACCESSOR_ROLE="{checker.POST_MERGE_SYNC_ACCESSOR_ROLE}"', script)
+        self.assertIn(f'readonly DECLARATION_PATH="{self._DECL}"', script)
+        self.assertIn(f'readonly BUDGET_PATH="{self._BUDGET}"', script)
+
+    def test_it_runs_by_default_and_needs_gh(self):
+        self.assertIn(checker.CHECK_POST_MERGE_SYNC, checker.DEFAULT_CHECKS)
+        self.assertIn(checker.CHECK_POST_MERGE_SYNC, checker.GITHUB_CHECKS)
 
 
 if __name__ == "__main__":
