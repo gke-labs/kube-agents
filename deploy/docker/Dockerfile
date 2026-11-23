@@ -161,7 +161,7 @@ RUN --mount=type=bind,from=hermes-upstream,source=/,target=/mnt \
     mkdir /out && \
     bash -o pipefail -c "tar -C /mnt --numeric-owner --xattrs --xattrs-include=security.capability --exclude=node_modules/gsap -cf - . | tar -C /out --numeric-owner --xattrs --xattrs-include=security.capability -xpf -" && \
     test -z "$(find /out \( -path '*/node_modules/gsap*' -o -path '*/node_modules/@gsap' \) -print -quit)" && \
-    ! grep -rqsE 'gsapVersions|GreenSock' /out/opt/hermes/hermes_cli/web_dist /out/opt/hermes/ui-tui/dist /out/opt/hermes/plugins && \
+    { grep -rqE 'gsapVersions|GreenSock' /out/opt/hermes/hermes_cli/web_dist /out/opt/hermes/ui-tui/dist /out/opt/hermes/plugins; test $? -eq 1; } && \
     test -x /out/usr/bin/python3 && \
     touch -r /mnt/etc /etc
 
@@ -169,14 +169,16 @@ RUN --mount=type=bind,from=hermes-upstream,source=/,target=/mnt \
 # what Hermes' sets. This stage records what the pinned image really has, read
 # from inside it, and agent-base's check fails the build when the two differ:
 # a Hermes bump that adds or changes an ENV or the WORKDIR shows up there, not
-# at run time. The shell's own variables are dropped on both sides. A build
+# at run time. The shell's own variables are dropped on both sides, and so is
+# the trace context a container-driver builder gives each step, which differs
+# from one step to the next. A build
 # cannot read the rest of the config, so the check does not cover it: VOLUME is
 # carried by hand below, ENTRYPOINT, CMD and USER are this file's own, and
 # Hermes' revision label is not carried. Compare `docker inspect` of the new
 # pin with the old when bumping Hermes.
 FROM hermes-upstream AS hermes-upstream-config
 RUN mkdir /hermes-config && \
-    env | grep -vE '^(HOSTNAME|PWD|OLDPWD|SHLVL|_)=' | sort > /hermes-config/env && \
+    env | grep -vE '^(HOSTNAME|PWD|OLDPWD|SHLVL|_|TRACEPARENT|TRACESTATE)=' | sort > /hermes-config/env && \
     pwd > /hermes-config/workdir
 
 FROM scratch AS agent-base
@@ -200,7 +202,7 @@ USER root
 
 RUN --mount=type=bind,from=hermes-upstream-config,source=/hermes-config,target=/mnt \
     test -z "$(find / -xdev \( -path '*/node_modules/gsap*' -o -path '*/node_modules/@gsap' \) -print -quit)" && \
-    env | grep -vE '^(HOSTNAME|PWD|OLDPWD|SHLVL|_)=' | sort | diff /mnt/env - && \
+    env | grep -vE '^(HOSTNAME|PWD|OLDPWD|SHLVL|_|TRACEPARENT|TRACESTATE)=' | sort | diff /mnt/env - && \
     pwd | diff /mnt/workdir -
 
 # 1. Install all common system utilities and dependencies
