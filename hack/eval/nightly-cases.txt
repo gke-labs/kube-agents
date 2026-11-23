@@ -1498,6 +1498,12 @@
 # have, so here it reports infrastructure naming the cap; its evidence runs
 # come from twins that set the cap to 2. deployer: noop, read-only.
 ./tasks/session-front-door-cap-busy-notice/task.yaml
+# A DM answered after its session pod was reaped idle still has the earlier
+# turn (#2371): the harness sends the opening, waits 480s, past the 5-minute
+# DM idle TTL, then sends the reply on the same conversation, which reaches a
+# pod rehydrated from the transcript primer. deployer: noop, two front-door
+# turns, reads no cluster; needs the inject door.
+./tasks/session-recalls-context-after-idle-reap/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
