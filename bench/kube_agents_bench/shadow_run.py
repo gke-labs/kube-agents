@@ -90,6 +90,9 @@ from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 # have edited the grader's reader. Its sibling fleet-audit/scripts holds the
 # report_status helpers it imports.
 READER_PATH = "/opt/platform-template/skills/fleet-audit-reports/scripts/report_query.py"
+# The reader's helpers in the same image tree, which list the ring for the
+# fired task's entry.
+READER_HELPERS_DIR = "/opt/platform-template/skills/fleet-audit/scripts"
 # report_query.py: INCLUDE_SHADOW_FLAG. Readers refuse a shadow run's envelope
 # without it; the canary's comparison and its eval pass it.
 INCLUDE_SHADOW_FLAG = "--include-shadow"
@@ -104,14 +107,15 @@ NO_FORGE_REPO = "no_forge/local"
 READER_FINDINGS_LIMIT = 10000
 SHADOW_READ = "__SHADOW_REPORT_READ__"
 
-# Runs in the gateway's agent container: asks report_query.py for the stream's
-# newest envelope without its document (`show`), the ids of its findings
+# Runs in the gateway's agent container: asks report_query.py for one envelope
+# of the stream without its document (`show`), the ids of its findings
 # (`findings`), and, when the check reads evidence, each matched finding whole
 # (`finding`). Prints one JSON object: the envelopes in the shape
-# verifiers.report_store_command prints, or the error that kept the reader from
-# answering at all (not JSON: a reader that refused its arguments). A reader
-# answer that is an error (no run stored, a shadow envelope refused) is an
-# entry with `error`, which grades as unread.
+# verifiers.report_store_command prints, or the error that kept the read from
+# answering at all (a reader that refused its arguments, an unreadable install
+# key, a truncated findings list). A reader answer that is an error (no run
+# stored, a shadow envelope refused) is an entry with `error`, which grades as
+# unread.
 #
 # Every question names the install's own store key with --repo, decided as the
 # broker decides the one key a profile may write under
@@ -120,14 +124,27 @@ SHADOW_READ = "__SHADOW_REPORT_READ__"
 # repository is no_forge; exactly one is that one; several is the gitops_repo
 # one when the key names a registered repository, else no_forge. A list that
 # cannot be read is an error, as the broker refuses the write then.
+#
+# With a task, the envelope is the fired run's: the ring entry under that key
+# whose writer sidecar (audit_report_store.py, `runs/<stamp>.writer`, which the
+# broker stamps `builtin-schedule:<stream>:<task>`) names the task and holds the
+# SHA-256 of the entry's own bytes. It is asked for with --run, so a later run
+# of the schedule cannot stand in for it. Without a task, the newest envelope.
+# Options go before `--` and the stream and finding id after it, so no id is
+# read as an option.
 # argv: reader, root, stream, flag, limit, keys (JSON), excerpt phrases (JSON or ""),
-# scripts dir, no-forge repo, sentinel.
+# scripts dir, no-forge repo, task ("" for none), writer prefix, reader helpers dir, sentinel.
 _SHADOW_DRIVER = r"""
-import json, subprocess, sys
-reader, root, stream, flag, limit, keys, phrases, scripts, no_forge, sentinel = sys.argv[1:11]
+import hashlib, json, os, subprocess, sys
+reader, root, stream, flag, limit, keys, phrases, scripts, no_forge, task, writer_prefix, helpers, sentinel = sys.argv[1:14]
 keys = json.loads(keys)
 phrases = json.loads(phrases) if phrases else None
-out = {"envelopes": [], "error": None, "install_repo": None}
+out = {"envelopes": [], "error": None, "install_repo": None, "run": None}
+def finish(error=None):
+    if error:
+        out["error"] = error
+    print(sentinel + json.dumps(out))
+    sys.exit(0)
 try:
     sys.path.insert(0, scripts)
     import gitops_workspace
@@ -140,54 +157,82 @@ try:
         chosen = gitops_workspace.get_gitops_repo(managed) if gitops_workspace.gitops_repo_key_text() else None
         install = chosen or no_forge
 except Exception as exc:
-    print(sentinel + json.dumps(dict(out, error="the install's store key could not be read: %s: %s" % (type(exc).__name__, exc))))
-    sys.exit(0)
+    finish("the install's store key could not be read: %s: %s" % (type(exc).__name__, exc))
 out["install_repo"] = install
-def ask(*args):
-    done = subprocess.run(
-        [sys.executable, reader, *args, "--root", root, "--repo", install, flag], capture_output=True, text=True
-    )
+run = None
+if task:
+    try:
+        sys.path.insert(0, helpers)
+        import report_status as rs
+        runs_dir = os.path.join(rs.store_path(root, stream, install), rs.RUNS_DIR)
+        names = rs.list_runs(root, stream, install)
+    except Exception as exc:
+        finish("the ring under %s could not be listed: %s: %s" % (install, type(exc).__name__, exc))
+    wanted = "%s:%s:%s" % (writer_prefix, stream, task)
+    for name in reversed(names):
+        stem = name[: -len(".json")]
+        try:
+            with open(os.path.join(runs_dir, stem + ".writer"), "rb") as handle:
+                sidecar = json.loads(handle.read().decode("ascii"))
+            with open(os.path.join(runs_dir, name), "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+        except (OSError, ValueError):
+            continue
+        if isinstance(sidecar, dict) and sidecar.get("writer") == wanted and sidecar.get("sha256") == digest:
+            run = stem
+            break
+    if run is None:
+        out["envelopes"].append({"repo": install, "error": "no ring entry under %s was written by task %s" % (install, task)})
+        finish()
+    out["run"] = run
+def ask(command, positionals, options=()):
+    argv = [sys.executable, reader, command, "--root", root, "--repo", install, flag, *options]
+    if run is not None:
+        argv += ["--run", run]
+    done = subprocess.run([*argv, "--", *positionals], capture_output=True, text=True)
     try:
         payload = json.loads(done.stdout.strip().splitlines()[-1])
     except (IndexError, ValueError):
         tail = (done.stderr.strip().splitlines() or ["no output"])[-1]
-        return None, "report_query.py %s exited %d: %s" % (args[0], done.returncode, tail)
+        return None, "report_query.py %s exited %d: %s" % (command, done.returncode, tail)
     if not isinstance(payload, dict):
-        return None, "report_query.py %s printed no JSON object" % args[0]
+        return None, "report_query.py %s printed no JSON object" % command
     return payload, payload.get("error")
-show, err = ask("show", stream)
+show, err = ask("show", [stream])
 if show is None:
-    out["error"] = err
-elif err:
-    out["envelopes"].append({"error": err})
-else:
-    found, err = ask("findings", stream, "--limit", limit)
-    if found is None:
-        out["error"] = err
-    elif err:
-        out["envelopes"].append({"repo": show.get("repo"), "error": err})
-    else:
-        projected = show.get("envelope") or {}
-        entry = {key: projected.get(key) for key in keys}
-        entry["repo"] = show.get("repo")
-        if "started_at" in projected:
-            entry["started_at"] = projected["started_at"]
-        entry["finding_ids"] = [str(f.get("id", "")) for f in found.get("findings") or [] if isinstance(f, dict)]
-        if found.get("truncated"):
-            entry["error"] = "findings truncated at %s" % limit
-            entry["finished_at"] = None
-        if phrases is not None:
-            excerpts = {}
-            for fid in entry["finding_ids"]:
-                if any(p in fid for p in phrases):
-                    one, err = ask("finding", stream, fid)
-                    finding = (one or {}).get("finding") if not err else None
-                    evidence = (finding or {}).get("evidence") or {}
-                    excerpts[fid] = str(evidence.get("excerpt") or "") if isinstance(evidence, dict) else ""
-            entry["finding_excerpts"] = excerpts
-        out["envelopes"].append(entry)
-print(sentinel + json.dumps(out))
+    finish(err)
+if err:
+    out["envelopes"].append({"repo": install, "error": err})
+    finish()
+found, err = ask("findings", [stream], ["--limit", limit])
+if found is None:
+    finish(err)
+if err:
+    out["envelopes"].append({"repo": show.get("repo"), "error": err})
+    finish()
+if found.get("truncated"):
+    finish("the findings list of %s was truncated at %s; the named finding may be past it" % (stream, limit))
+projected = show.get("envelope") or {}
+entry = {key: projected.get(key) for key in keys}
+entry["repo"] = show.get("repo")
+if "started_at" in projected:
+    entry["started_at"] = projected["started_at"]
+entry["finding_ids"] = [str(f.get("id", "")) for f in found.get("findings") or [] if isinstance(f, dict)]
+if phrases is not None:
+    excerpts = {}
+    for fid in entry["finding_ids"]:
+        if any(p in fid for p in phrases):
+            one, err = ask("finding", [stream, fid])
+            finding = (one or {}).get("finding") if not err else None
+            evidence = (finding or {}).get("evidence") or {}
+            excerpts[fid] = str(evidence.get("excerpt") or "") if isinstance(evidence, dict) else ""
+    entry["finding_excerpts"] = excerpts
+out["envelopes"].append(entry)
+finish()
 """
+# audit_report_store.py: REPORT_WRITER_BUILTIN, the writer a profile task's
+# ring entries are stamped with, `builtin-schedule:<stream>:<task id>`.
+REPORT_WRITER_BUILTIN = "builtin-schedule"
 
 # audit_report.py: SHADOW_STREAM_SUFFIX, SHADOW_STREAM_RE (the report store's
 # stream-name shape, audit_report_store.AUDIT_ID_RE), SHADOW_KEY and
@@ -203,12 +248,12 @@ FORCED_ENVELOPE_KEYS = (SHADOW_KEY, SHADOW_STREAM_KEY, ENVELOPE_AUDIT_KEY)
 # The AgentSchedule, read with the runner's kubectl as resource_property reads it.
 SCHEDULE_RESOURCE = "agentschedules.kubeagents.x-k8s.io"
 # k8s-operator/api/v1alpha1/agentschedule_types.go: AgentScheduleRun.Delivery's
-# enum. A post was made or tried, or the run asked for chat and found no home
-# channel to take it: a run that posts nothing reads none of these.
-POSTING_DELIVERIES = frozenset({"posted", "post_failed", "post_unknown", "stored_no_home"})
-QUIET_DELIVERIES = frozenset({"no_delivery", "local", "silent"})
-# SQLite's datetime('now'), which findings_queue.py stamps rows with: UTC, no zone.
-SQLITE_STAMP_SEPARATOR = " "
+# enum. A post was made or tried, or the run's delivery was chat and only its
+# outcome kept it from posting: `stored_no_home` (no home channel to take it)
+# and `silent` (a clean run, which chat delivery skips; a run with findings
+# would have posted). A run whose delivery cannot post reads none of these.
+POSTING_DELIVERIES = frozenset({"posted", "post_failed", "post_unknown", "stored_no_home", "silent"})
+QUIET_DELIVERIES = frozenset({"no_delivery", "local"})
 
 
 def _window_start(
@@ -244,8 +289,11 @@ def read_state(shell: Callable[[str, float], str], path: str, timeout: float) ->
     return state if isinstance(state, dict) else None
 
 
-def shadow_read_command(stream: str, keys: tuple[str, ...], phrases: list[str] | None) -> str:
-    """The ``sh -c`` line that reads ``stream`` with the install's reader, shadow runs included."""
+def shadow_read_command(stream: str, keys: tuple[str, ...], phrases: list[str] | None, task: str | None = None) -> str:
+    """The ``sh -c`` line that reads ``stream`` with the install's reader, shadow runs included.
+
+    With ``task``, the ring entry that task wrote; without, the newest envelope.
+    """
     args = [
         READER_PATH,
         verifiers.REPORT_STORE_ROOT,
@@ -256,6 +304,9 @@ def shadow_read_command(stream: str, keys: tuple[str, ...], phrases: list[str] |
         json.dumps(phrases) if phrases is not None else "",
         INSTALL_SCRIPTS_DIR,
         NO_FORGE_REPO,
+        task or "",
+        REPORT_WRITER_BUILTIN,
+        READER_HELPERS_DIR,
         SHADOW_READ,
     ]
     return (
@@ -265,10 +316,15 @@ def shadow_read_command(stream: str, keys: tuple[str, ...], phrases: list[str] |
 
 
 def read_shadow_report(
-    shell: Callable[[str, float], str], stream: str, timeout: float, keys: tuple[str, ...], phrases: list[str] | None
+    shell: Callable[[str, float], str],
+    stream: str,
+    timeout: float,
+    keys: tuple[str, ...],
+    phrases: list[str] | None,
+    task: str | None = None,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """The stream's envelopes as the reader gives them, or None and why the reader did not answer."""
-    reply = shell(shadow_read_command(stream, keys, phrases), timeout)
+    reply = shell(shadow_read_command(stream, keys, phrases, task), timeout)
     marker = reply.find(SHADOW_READ)
     if marker < 0:
         return None, None
@@ -293,13 +349,18 @@ class ShadowReportStoredVerifier(_StoredReportVerifier):
     ``stream`` is the shadow stream: the AgentSchedule's name for a scheduled
     canary, or ``<audit>-shadow`` for a run started by hand. It must be a store
     stream name and not a live audit's stream, as ``audit_report.shadow_stream``
-    refuses one; ``audit`` keeps the roster rule. Reads the stream's newest
-    envelope under the install's own store key in the gateway pod's report
+    refuses one; ``audit`` keeps the roster rule. Reads one envelope of the
+    stream under the install's own store key in the gateway pod's report
     store, with the install's ``report_query.py --include-shadow --repo
     <key>``. The key is decided as the broker decides the only key a profile
     may write under, from the gitops-state ConfigMap the gateway mounts, so a
-    document under any other key is not this run's and is not read. It grades
-    the envelope as
+    document under any other key is not this run's and is not read. With
+    ``since_state_file``, the envelope is the fired run's own: the ring entry
+    whose writer sidecar the broker stamped ``builtin-schedule:<stream>:<task>``
+    for the ``task_id`` the stack recorded (the store-only finish records no
+    task in the envelope), read with ``--run``, so a later run of the schedule
+    can neither mask it nor pass for it; no such entry is a fail. Without a
+    state file, the newest envelope. It grades the envelope as
     ``audit_report_stored`` does (the window, the start bound, ``status``,
     ``required_envelope``, the finding and evidence phrases), holding it to
     ``shadow: true``, ``shadow_stream: <stream>`` and ``audit_id: <audit>`` as
@@ -313,8 +374,9 @@ class ShadowReportStoredVerifier(_StoredReportVerifier):
     No envelope from this run, or a reader that answered the stream holds
     none under the install's key, is a fail. A pod that cannot be read, an
     install key that cannot be read, a reader that refuses its arguments (one
-    without ``--include-shadow``), an unreadable state file or a run with no
-    start time is ``status="error"``.
+    without ``--include-shadow``), a truncated findings list, a state file
+    that is unreadable or names no task, or a run with no start time is
+    ``status="error"``.
     """
 
     type: Literal["shadow_report_stored"]
@@ -356,73 +418,111 @@ class ShadowReportStoredVerifier(_StoredReportVerifier):
     def _read_listing(
         self, shell: Callable[[str, float], str], stream: str, timeout: float, keys: tuple[str, ...], excerpts: bool
     ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        task = None
+        if self.since_state_file:
+            state = read_state(oobe.agent_shell, self.since_state_file, timeout)
+            task = (state or {}).get("task_id")
+            if not task:
+                return None, f"{self.since_state_file} names no fired task, so the run's own ring entry cannot be found"
         wanted = tuple(dict.fromkeys(("status", "finished_at", *keys)))
-        return read_shadow_report(shell, stream, timeout, wanted, self.required_finding_phrases if excerpts else None)
+        return read_shadow_report(shell, stream, timeout, wanted, self.required_finding_phrases if excerpts else None, task)
 
 
-def _sqlite_stamp(value: Any) -> datetime | None:
-    """A findings-queue stamp as an aware UTC time; None for null; ValueError when it does not parse."""
-    if value is None or value == "":
-        return None
-    stamp = datetime.fromisoformat(str(value).replace(SQLITE_STAMP_SEPARATOR, "T", 1))
-    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+# findings_queue.py: SOURCES, the writers a row names, and the check-family
+# grammar (CHECK_FAMILY_RE, CHECK_FAMILY_SEPARATOR) a listing narrows by.
+FindingSource = Literal["inventory", "event-watcher", "audit", "upgrade-readiness"]
+CHECK_FAMILY_SEPARATOR = "-"
+CHECK_FAMILY_RE = re.compile(rf"^[a-z0-9]+{re.escape(CHECK_FAMILY_SEPARATOR)}$")
+# How many row ids a reason names before it counts the rest.
+MAX_ROWS_NAMED = 10
+
+
+def _in_family(check_slug: Any, family: str) -> bool:
+    """Whether ``check_slug`` is in ``family``, as findings_queue.list_findings folds it."""
+    slug = str(check_slug or "").lower()
+    return slug.startswith(family) or slug == family[: -len(CHECK_FAMILY_SEPARATOR)]
+
+
+def _named(ids: list[str]) -> str:
+    shown = ", ".join(ids[:MAX_ROWS_NAMED])
+    return shown + (f" and {len(ids) - MAX_ROWS_NAMED} more" if len(ids) > MAX_ROWS_NAMED else "")
 
 
 @VERIFIERS.register("findings_queue_untouched")
 class FindingsQueueUntouchedVerifier(_OnboardingPollVerifier):
-    """Checks that no findings-queue row was written in the window.
+    """Checks that the run under test left the audit's findings-queue rows exactly as they were.
 
-    Reads the queue's rows (under ``project`` when given, else every row)
-    through the Session KV server's ``GET /v1/findings`` in the gateway's agent
-    container (:mod:`kube_agents_bench.findings`). A row whose ``first_seen``
-    (its insert) or ``last_verified`` (a registration of it again, or a
-    verification) is at or after the window's bound fails, and the reason names
-    each such row. The stamps are whole seconds, so the bound is floored to the
-    second: a write in the second of the fire counts.
+    The ``builtin-schedule-run-now`` stack records, before it fires the run, a
+    snapshot of the queue in ``since_state_file``: each row's id, ``source``,
+    ``check_slug`` and the SHA-256 of the whole row as the Session KV server's
+    ``GET /v1/findings`` returns it (:data:`kube_agents_bench.findings.SNAPSHOT_SCRIPT`).
+    This takes the same snapshot now, in the gateway's agent container, and
+    diffs the two over the rows the audit would write: those whose ``source``
+    is ``source`` and, with ``check_prefix`` (a check family, as the queue's
+    listing reads it), whose check is in that family. A row in scope that was
+    added, removed or changed in any column fails, naming it: a registration,
+    a registration again, a verification (an unverifiable one included, which
+    moves a row to stale and leaves ``last_verified`` alone), an absence
+    downgrade across a cluster, a patch and a surfacing mark all change the
+    row. Rows out of scope are other writers' (the event watcher, other
+    schedules, the turn) and are not read.
 
-    A queue that answers with the read's whole row cap cannot show that a row
-    is absent, so that is ``status="error"``, as are an unreadable pod, a
-    queue that refuses the read, a stamp that does not parse, and a missing
-    state file.
+    A missing or failed snapshot in the state file, a read now that fails, and
+    either snapshot at the route's row cap (absence cannot be shown past it)
+    are ``status="error"``.
     """
 
     type: Literal["findings_queue_untouched"]
-    project: str = ""
-    since_state_file: str | None = None
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    since_state_file: str = Field(min_length=1)
+    source: FindingSource
+    check_prefix: str | None = None
+
+    @field_validator("check_prefix")
+    @classmethod
+    def _a_family(cls, value: str | None) -> str | None:
+        if value is not None and not CHECK_FAMILY_RE.fullmatch(value):
+            raise ValueError(f"check_prefix {value!r} is not a check family: one segment and its separator, as 'upgrade-' is")
+        return value
+
+    def _in_scope(self, row: Any) -> bool:
+        if not isinstance(row, dict) or row.get("source") != self.source:
+            return False
+        return self.check_prefix is None or _in_family(row.get("check_slug"), self.check_prefix)
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        since, why = _window_start(self.since_state_file, self.max_clock_skew_sec, read_timeout)
-        if since is None:
-            return "error", str(why), None
-        bound = since.replace(microsecond=0)
-        read = findings.read_project(oobe.agent_shell, self.project, read_timeout)
-        if read is None:
+        state = read_state(oobe.agent_shell, self.since_state_file, read_timeout)
+        before = (state or {}).get("findings_snapshot")
+        if not isinstance(before, dict) or not isinstance(before.get("rows"), dict):
+            return "error", f"{self.since_state_file} holds no findings-queue snapshot: the stack did not take one before the fire", None
+        if before.get("error"):
+            return "error", f"the snapshot before the fire failed: {before['error']}", None
+        after = findings.read_snapshot(oobe.agent_shell, read_timeout)
+        if after is None:
             return "error", "the gateway's agent container could not be read (kubectl exec failed or the command did not run)", None
-        if read["error"]:
-            return "error", f"the findings queue could not be read: {read['error']}", None
-        rows = read["findings"]
-        scope = f"under project {self.project!r}" if self.project else "in the queue"
-        if len(rows) >= findings.ROW_LIMIT:
-            return "error", f"the read returned its cap of {findings.ROW_LIMIT} rows {scope}, so a row in the window may be past it", None
-        written: dict[str, str] = {}
-        for row in rows:
-            try:
-                stamps = {key: _sqlite_stamp(row.get(key)) for key in ("first_seen", "last_verified")}
-            except ValueError:
-                return "error", f"row {row.get('id')!r} has a stamp that does not parse: {row.get('first_seen')!r}, {row.get('last_verified')!r}", None
-            hits = [f"{key} {stamp.isoformat()}" for key, stamp in stamps.items() if stamp is not None and stamp >= bound]
-            if hits:
-                written[str(row.get("id"))] = ", ".join(hits)
-        raw = {"since": bound.isoformat(), "rows": len(rows), "written": written}
-        if written:
-            return (
-                "fail",
-                f"{len(written)} findings-queue row(s) {scope} written since {bound.isoformat()}: "
-                + "; ".join(f"{fid} ({when})" for fid, when in written.items()),
-                raw,
-            )
-        return "pass", f"none of {len(rows)} findings-queue row(s) {scope} was written since {bound.isoformat()}", raw
+        if after.get("error") or not isinstance(after.get("rows"), dict):
+            return "error", f"the findings queue could not be read: {after.get('error') or 'no rows'}", None
+        for name, snap in (("before the fire", before), ("now", after)):
+            if int(snap.get("count") or 0) >= findings.ROW_LIMIT:
+                return "error", f"the snapshot {name} holds the route's cap of {findings.ROW_LIMIT} rows, so a row past it is unseen", None
+        old = {fid: row for fid, row in before["rows"].items() if self._in_scope(row)}
+        new = {fid: row for fid, row in after["rows"].items() if self._in_scope(row)}
+        added = sorted(set(new) - set(old))
+        removed = sorted(set(old) - set(new))
+        changed = sorted(fid for fid in set(old) & set(new) if old[fid].get("hash") != new[fid].get("hash"))
+        # A row that moved into or out of scope (its source or check rewritten) is a change too.
+        moved = sorted(
+            fid for fid in (set(old) ^ set(new))
+            if fid in before["rows"] and fid in after["rows"]
+        )
+        added = [fid for fid in added if fid not in moved]
+        removed = [fid for fid in removed if fid not in moved]
+        changed = sorted(set(changed) | set(moved))
+        scope = f"source {self.source!r}" + (f", checks {self.check_prefix}*" if self.check_prefix else "")
+        raw = {"scope": scope, "rows": len(new), "added": added, "removed": removed, "changed": changed}
+        if added or removed or changed:
+            parts = [f"{label} {_named(ids)}" for label, ids in (("added", added), ("removed", removed), ("changed", changed)) if ids]
+            return "fail", f"findings-queue rows ({scope}) written since the fire: " + "; ".join(parts), raw
+        return "pass", f"all {len(new)} findings-queue row(s) ({scope}) are as they were before the fire", raw
 
 
 def read_schedule(name: str, timeout: float) -> dict[str, Any] | None:
@@ -451,12 +551,13 @@ class ScheduleReportNotPostedVerifier(_OnboardingPollVerifier):
     Reads the AgentSchedule's ``status.recentRuns``. The run graded is the one
     the ``builtin-schedule-run-now`` stack recorded as ``task_id`` in
     ``since_state_file``; without one, every run whose ``slotTime`` is at or
-    after the window's bound less ``max_clock_skew_sec`` (the operator stamps
-    the slot with its own clock). Passes when each graded run's ``delivery``
-    is one that posts nothing (``local``, ``silent``, ``no_delivery``). One
-    that posted or tried to (``posted``, ``post_failed``, ``post_unknown``), or
-    that asked for chat and found no home channel (``stored_no_home``: a run
-    that would post on an install with one), fails.
+    after the window's bound, less ``max_clock_skew_sec`` once (the operator
+    stamps the slot with its own clock). Passes when each graded run's ``delivery``
+    is one that cannot post (``local``, ``no_delivery``). One that posted or
+    tried to (``posted``, ``post_failed``, ``post_unknown``), or whose delivery
+    was chat and only the outcome kept it quiet (``stored_no_home``: no home
+    channel; ``silent``: a clean run, which chat delivery skips; either would
+    post on another install or another day), fails.
 
     No graded run (the stack's task is not in the ring, or no run in the
     window), a run whose delivery the gateway has not reported yet, an
@@ -466,6 +567,13 @@ class ScheduleReportNotPostedVerifier(_OnboardingPollVerifier):
 
     type: Literal["schedule_report_not_posted"]
     schedule: str = Field(min_length=1)
+
+    @field_validator("schedule")
+    @classmethod
+    def _a_schedule_name(cls, value: str) -> str:
+        if not SHADOW_STREAM_RE.match(value):
+            raise ValueError(f"schedule {value!r} is not an AgentSchedule name (a DNS-1123 label)")
+        return value
     since_state_file: str | None = None
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
@@ -485,7 +593,9 @@ class ScheduleReportNotPostedVerifier(_OnboardingPollVerifier):
             graded = [run for run in runs if run.get("taskID") == task]
             missing = f"the fired run {task} is not in AgentSchedule {self.schedule}'s recent runs"
         else:
-            bound = since - timedelta(seconds=self.max_clock_skew_sec)
+            # The skew once: _window_start took it off the run's start already;
+            # the stack's fire time is the pod's clock, the slot the operator's.
+            bound = since - timedelta(seconds=self.max_clock_skew_sec) if self.since_state_file else since
             graded = []
             for run in runs:
                 try:

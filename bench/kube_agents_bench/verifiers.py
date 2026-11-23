@@ -9996,7 +9996,7 @@ class AuditReportStoredVerifier(_StoredReportVerifier):
         return (onboarding.sandbox_shell, onboarding.agent_shell)
 
     def _store_where(self) -> str:
-        return "neither the sandbox nor the agent container"
+        return "the sandbox and the agent container"
 
     def _state_shell(self) -> Callable[[str, float], str]:
         return onboarding.agent_shell

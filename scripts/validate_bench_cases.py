@@ -704,8 +704,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
-    # This repository, agent-pod-reading. No field: "no row was written since
-    # the bound" is the whole assertion; `project` only narrows it.
+    # This repository, agent-pod-reading. No field: "no row of the audit's
+    # changed since the stack's snapshot" is the whole assertion; `source`
+    # (required by the verifier's model) and `check_prefix` say whose rows.
     "findings_queue_untouched": (),
     # This repository, schedule-status-reading. No field: "the fired run's
     # report went to no chat" is the whole assertion; `schedule` names the run.

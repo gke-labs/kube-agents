@@ -487,13 +487,17 @@ started by hand; never a live audit's stream), read on the gateway pod, where th
 listener writes, with the install's own `report_query.py --include-shadow` (readers refuse a shadow
 envelope without it) and `--repo` naming the install's own store key, the one key the broker lets a
 profile write under, and holds the envelope to `shadow: true`, `shadow_stream` naming the stream and
-`audit_id` naming `audit`; `required_finding_phrases` is required. Beside it, `findings_queue_untouched` fails on any
-findings-queue row registered, registered again or verified since the bound, and
-`schedule_report_not_posted` reads an AgentSchedule's `status.recentRuns` and fails when the fired run's
-delivery posted or tried to (`posted`, `post_failed`, `post_unknown`) or asked for chat with no home channel
-(`stored_no_home`); a delivery not reported yet is an error. All three take `since_state_file` as
-`audit_report_stored` does; the `builtin-schedule-run-now` stack writes it, and records the fired run's task
-for the third. `report_store_reply`, in its own module
+`audit_id` naming `audit`; `required_finding_phrases` is required. With `since_state_file` it grades the
+fired run's own ring entry, the one whose writer sidecar the broker stamped with the task the stack
+recorded, so a later run of the schedule cannot mask it. Beside it, `findings_queue_untouched` diffs the
+findings queue against the snapshot the stack took before the fire (each row's hash over every column)
+and fails on any row of the audit's (`source`, and `check_prefix` when given) added, removed or changed, so
+a registration, a verification, an absence downgrade, a patch or a surfacing mark all count while other
+writers' rows are not read; and `schedule_report_not_posted` reads an AgentSchedule's `status.recentRuns`
+and fails when the fired run's delivery posted or tried to (`posted`, `post_failed`, `post_unknown`) or
+was chat that only the outcome kept quiet (`stored_no_home`, `silent`); a delivery not reported yet is an
+error. All three take `since_state_file`, which the `builtin-schedule-run-now` stack writes with the fire
+time, the fired run's task and the queue snapshot. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the

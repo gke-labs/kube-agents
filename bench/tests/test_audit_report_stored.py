@@ -220,7 +220,9 @@ def test_evidence_phrases_without_finding_phrases_fail_at_load():
 
 def test_unreadable_pods_are_an_error(root, monkeypatch):
     monkeypatch.setattr(onboarding, "sandbox_shell", _silent_shell)
-    assert _verify().status == "error"
+    result = _verify()
+    assert result.status == "error"
+    assert result.reason == "the sandbox and the agent container could not be read"
 
 
 def test_the_case_declares_the_check():
