@@ -18,7 +18,7 @@ them.
 `skills_manifest.sha256` is this directory's content manifest, which the
 profile worker checks the image's files against at start
 ([Content manifest](../../../a2a/lib/persona/README.md#content-manifest)).
-After changing any file here, regenerate it from the repository root with `git clean -fdX -- agents/cluster/persona && go -C a2a run ./cmd/persona manifest --in ../agents/cluster/persona` (the `git clean` drops ignored files such as `__pycache__`, which the manifest must not list); `a2a/cmd/persona`'s tests fail until it matches.
+After changing any file here, run `make persona-manifests` (or `make docs-generate`, which runs it) from the repository root; `a2a/cmd/persona`'s tests fail until the manifest matches.
 
 The Hermes cluster profiles don't use it. The platform-agent image also builds
 it into `/opt/cluster-template/persona` with the rest of `agents/cluster/`, but

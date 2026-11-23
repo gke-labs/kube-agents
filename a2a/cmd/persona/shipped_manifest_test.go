@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,9 +22,9 @@ const (
 	// personaDockerfiles are their images' Dockerfiles.
 	personaDockerfiles = "../../Dockerfile.persona-*"
 	// regenerate is what a failure tells the reader to run, from the
-	// repository root, with the persona's directory: git clean -X first, so
-	// an ignored file (a __pycache__) isn't recorded.
-	regenerate = "git clean -fdX -- %[1]s && go -C a2a run ./cmd/persona manifest --in ../%[1]s"
+	// repository root: the Makefile's persona-manifests target, which
+	// docs-generate also runs.
+	regenerate = "make persona-manifests (or make docs-generate)"
 )
 
 // Every shipped persona carries a content manifest that matches it, so the
@@ -37,8 +36,7 @@ func TestShippedPersonasCarryAMatchingManifest(t *testing.T) {
 	for _, dir := range dirs {
 		p, err := persona.LoadWithOptions(dir, persona.Options{RequireIntegrity: true})
 		if err != nil {
-			rel, _ := filepath.Rel(repoRoot, dir)
-			t.Errorf("%s: %v\nregenerate its manifest from the repository root: %s", dir, err, fmt.Sprintf(regenerate, filepath.ToSlash(rel)))
+			t.Errorf("%s: %v\nregenerate the shipped personas' manifests from the repository root: %s", dir, err, regenerate)
 			continue
 		}
 		if p.Integrity != persona.IntegrityVerified {

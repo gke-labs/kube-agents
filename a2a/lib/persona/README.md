@@ -89,8 +89,9 @@ refused.
 
 The personas this repository ships commit their manifest beside them, since
 a persona image's Dockerfile is only `FROM` and `COPY`:
-`persona manifest --in <dir>` (`a2a/cmd/persona`) writes it, and that
-package's tests fail while a shipped persona's manifest doesn't match it.
+`make persona-manifests` (part of `make docs-generate`) writes them with
+`persona manifest --in <dir>` (`a2a/cmd/persona`), and that package's tests
+fail while a shipped persona's manifest doesn't match it.
 
 A worker that predates this check refuses `skills_manifest.sha256` as a
 top-level file the format does not define. A persona image must not carry
