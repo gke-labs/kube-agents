@@ -172,10 +172,12 @@ func renderedCalloutReservedAddressees(t *testing.T, agent *agentv1alpha1.Platfo
 }
 
 // bridgeGrantAddressees is every addressee the bridge identity's grants name,
-// read off the subjects themselves rather than off a constant: the `<x>` in
-// `a2a.tasks.<x>.*.in` and `a2a.tasks.<x>.*.events`, in `a2a.cap.verify.<x>`
-// and in `a2a.cap.reply.<x>.>`. Widening the grant to a second addressee adds
-// it here with no test edit. See grantAddressees for what fails the test.
+// read off the subjects themselves rather than off a constant: the token after
+// the literal prefix of one of addresseeSubjectFamilies, whatever tail follows.
+// Today's grants are `a2a.tasks.<x>.*.in`, `a2a.tasks.<x>.*.events`,
+// `a2a.cap.verify.<x>` and `a2a.cap.reply.<x>.>`. Widening the grant to a
+// second addressee adds it here with no test edit. See grantAddressees for
+// what fails the test.
 func bridgeGrantAddressees(t *testing.T) []string {
 	t.Helper()
 	id := bridgeIdentity()
@@ -199,11 +201,17 @@ var addresseeSubjectFamilies = [][]string{
 // can reserve it: any `*` or `>` at or before the addressee position of one of
 // addresseeSubjectFamilies, whatever the subject's token count, so a short
 // `a2a.tasks.>` fails as surely as `a2a.tasks.*.*.in`. A grant inside a family
-// with a literal addressee names that addressee whatever follows it, so a tail
-// this test has not seen cannot hide one. A subject outside every family, or
-// one that ends before the addressee position, names none. Finding no
-// addressee at all is an error too, which would make every check on the result
-// pass vacuously.
+// with a literal token at the addressee position is read as naming that token,
+// whatever follows it, so a tail this test has not seen cannot hide an
+// addressee. A subject outside every family, or one that ends before the
+// addressee position, names none. Finding no addressee at all is an error too,
+// which would make every check on the result pass vacuously.
+//
+// One shape is read too widely, on purpose: in a profile task's supervisor
+// subject, `a2a.tasks.p.<profile>.<task>.supervisor`, the token at the
+// addressee position is the `p` marker, not an addressee. No bridge grant has
+// that shape. One that did would be read as naming `p` and would fail the
+// reservation test, which is the moment to teach this reader the shape.
 func grantAddressees(subjects []string) ([]string, error) {
 	var out []string
 	for _, subject := range subjects {
