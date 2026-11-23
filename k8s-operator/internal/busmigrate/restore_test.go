@@ -228,6 +228,15 @@ func TestARestoredStreamOutsideItsPolicyIsDeleted(t *testing.T) {
 	}
 	defer nc.Close()
 	js, _ := nc.JetStream()
+	// A second stream, as a bus always has: when a delete removes an
+	// account's last stream, nats-server removes the account's then empty
+	// streams directory in a goroutine it does not wait for, and an add
+	// that lands in that removal fails with "error creating store for
+	// stream". The test adds TASKS again straight after its delete, which
+	// the restore itself never does without retrying (cli.go's restoreAll).
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "KEPT", Subjects: []string{"kept.>"}}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := js.AddStream(&nats.StreamConfig{Name: "TASKS", Subjects: []string{"other.>"}}); err != nil {
 		t.Fatal(err)
 	}
