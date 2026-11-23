@@ -39,6 +39,19 @@ HELM_SHA256_LINUX_ARM64="b54c04b4e0b2540bbdc08c17a121dab70e9a2ed0de5705528fec68a
 # had nothing to do with helm.
 readonly HELM_DOWNLOAD_RETRIES=5
 
+# ─── Cluster credentials ─────────────────────────────────────────────────────
+# get_cluster_credentials retries `gcloud container clusters get-credentials`
+# when the GKE API answers 503. One such answer used to fail a presubmit run
+# at its auth step, before any build or test. The call only writes a kubeconfig
+# entry, so a repeat is safe. The delay grows by one step per attempt: four
+# attempts wait 5s, 10s and 15s, 30 seconds in all.
+readonly GKE_GET_CREDENTIALS_ATTEMPTS=4
+readonly GKE_GET_CREDENTIALS_RETRY_DELAY_SECONDS=5
+# What a 503 looks like on gcloud's stderr: "ResponseError: code=503,
+# message=The service is currently unavailable.", or the UNAVAILABLE status
+# name. Any other failure is returned on the first attempt.
+readonly GKE_GET_CREDENTIALS_UNAVAILABLE_RE='code=503|UNAVAILABLE|service is currently unavailable'
+
 # ─── Gateway log capture ─────────────────────────────────────────────────────
 # collect_gateway_log keeps the tail of the platform-agent-gateway log as an
 # artifact of every eval run, green ones included. The failure-only dump used
@@ -364,6 +377,38 @@ REPLAY_SHADOW_COLLECTOR_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/re
 REPLAY_CACHE_FETCH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-proxy/fetch_cache.py"
 # A directory in this checkout, for the commit it is at (_replay_checkout_commit).
 REPLAY_CHECKOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# get_cluster_credentials <cluster> [get-credentials flag...]
+#
+# Runs `gcloud container clusters get-credentials` with the arguments given,
+# up to GKE_GET_CREDENTIALS_ATTEMPTS times while the failure is a 503
+# (GKE_GET_CREDENTIALS_UNAVAILABLE_RE). Prints gcloud's stderr after every
+# attempt, and returns gcloud's own exit status for the last one. The `||`
+# keeps a failed attempt from ending a `set -e` caller before the retry.
+get_cluster_credentials() {
+  local attempt rc delay stderr_file
+  stderr_file="$(mktemp)"
+  for ((attempt = 1; attempt <= GKE_GET_CREDENTIALS_ATTEMPTS; attempt++)); do
+    rc=0
+    gcloud container clusters get-credentials "$@" 2>"${stderr_file}" || rc=$?
+    cat "${stderr_file}" >&2
+    if [ "${rc}" -eq 0 ]; then
+      break
+    fi
+    if ! grep -Eq "${GKE_GET_CREDENTIALS_UNAVAILABLE_RE}" "${stderr_file}"; then
+      break
+    fi
+    if [ "${attempt}" -ge "${GKE_GET_CREDENTIALS_ATTEMPTS}" ]; then
+      echo "ERROR: get-credentials got a 503 from the GKE API on all ${GKE_GET_CREDENTIALS_ATTEMPTS} attempts; giving up (exit ${rc})." >&2
+      break
+    fi
+    delay=$((GKE_GET_CREDENTIALS_RETRY_DELAY_SECONDS * attempt))
+    echo "WARNING: get-credentials attempt ${attempt} of ${GKE_GET_CREDENTIALS_ATTEMPTS} got a 503 from the GKE API, retrying in ${delay}s..." >&2
+    sleep "${delay}"
+  done
+  rm -f "${stderr_file}"
+  return "${rc}"
+}
 
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
