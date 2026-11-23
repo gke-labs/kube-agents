@@ -27783,6 +27783,188 @@ class TestScopeNotesFitTheBody(unittest.TestCase):
         self.assertNotIn("x" * (audit_report.MAX_CELL_CHARS + 1), body)
 
 
+class TestNotedSetSpeaksOnce(HarnessTestCase):
+    """A scheduled run speaks once when its set of noted objects changes.
+
+    The notes ride on every run's JSON line and stored report. This class is
+    about `silent_ok` alone: a fleet with one long-lived noted VM must not
+    wake the channel every morning, and a new noted object, or one whose note
+    cleared, must reach the channel on one run (`noted_set_changed`). The
+    baseline is the last scheduled run's set, stored on the envelope under
+    `SCHEDULED_NOTED_IDS_KEY` and carried forward by on-demand runs.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.harness.replies = {"issue-list": issues_view([])}
+
+    def manifest_path(self, noted):
+        manifest = _full_manifest()
+        if noted:
+            manifest["clusters"][0]["notes"] = ROTATED_NOTE
+            manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                {
+                    "check": "netpol-missing",
+                    "namespace": "payments",
+                    "object": "Namespace/a",
+                    "command": NOTED_READ,
+                }
+            ]
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def finish(self, *, noted, scheduled=True):
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            ["--manifest-file", self.manifest_path(noted)],
+            scheduled=scheduled,
+        )
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json()
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+
+    def test_a_first_noted_run_speaks_and_stores_the_set(self):
+        first = self.finish(noted=True)
+        self.assertEqual(first["status"], "CLEAN")
+        self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(first["silent_ok"])
+        self.assertEqual(
+            self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [derived_id(fid="a")]
+        )
+
+    def test_an_unchanged_noted_run_is_silent_and_keeps_the_notes_on_its_line(self):
+        self.finish(noted=True)
+        second = self.finish(noted=True)
+        self.assertTrue(second["silent_ok"])
+        self.assertNotIn(audit_report.NOTED_CHANGED_KEY, second)
+        # The note still rides the line and the stored report; only the
+        # channel stays quiet.
+        self.assertEqual(second["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+
+    def test_a_cleared_noted_run_speaks_once(self):
+        self.finish(noted=True)
+        self.finish(noted=True)
+        cleared = self.finish(noted=False)
+        self.assertIs(cleared[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(cleared["silent_ok"])
+        self.assertEqual(self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
+        self.assertTrue(self.finish(noted=False)["silent_ok"])
+
+    def test_a_never_noted_fleet_unchanged_stays_silent(self):
+        first = self.finish(noted=False)
+        self.assertTrue(first["silent_ok"])
+        self.assertNotIn(audit_report.NOTED_CHANGED_KEY, first)
+        self.assertEqual(self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
+        self.assertTrue(self.finish(noted=False)["silent_ok"])
+
+    def test_an_on_demand_run_does_not_take_the_news_from_the_channel(self):
+        on_demand = self.finish(noted=True, scheduled=False)
+        self.assertFalse(on_demand["silent_ok"])
+        # The on-demand run copied the baseline forward, so the channel still
+        # hears the change on the next scheduled run, and only once.
+        first = self.finish(noted=True)
+        self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(first["silent_ok"])
+        self.assertTrue(self.finish(noted=True)["silent_ok"])
+
+    def test_the_baseline_reads_like_the_published_ids_baseline(self):
+        # A record from before the key, or from another id scheme, gives no
+        # baseline, and a noted run then speaks; a store with no run gives
+        # the empty set, and a never-noted run stays quiet.
+        scheme = {"id_scheme": audit_report.ID_SCHEME}
+        self.assertIsNone(audit_report.scheduled_noted_baseline(None))
+        self.assertIsNone(audit_report.scheduled_noted_baseline(scheme))
+        self.assertIsNone(
+            audit_report.scheduled_noted_baseline(
+                {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: None}
+            )
+        )
+        self.assertIsNone(
+            audit_report.scheduled_noted_baseline(
+                {"id_scheme": "other", audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            )
+        )
+        self.assertEqual(audit_report.scheduled_noted_baseline({}), [])
+        self.assertEqual(
+            audit_report.scheduled_noted_baseline(
+                {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            ),
+            ["x"],
+        )
+        self.assertTrue(audit_report.noted_set_changed({"x"}, None))
+        self.assertFalse(audit_report.noted_set_changed(set(), None))
+        self.assertFalse(
+            audit_report.noted_set_changed(
+                {"x"}, {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            )
+        )
+        self.assertTrue(
+            audit_report.noted_set_changed(
+                set(), {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            )
+        )
+
+
+class TestNotedSetSpeaksOnceOnALedger(HarnessTestCase):
+    """The same rule on a findings run over an open ledger (the UPDATED
+    branch): an unchanged noted set does not wake the channel, and a noted
+    object that joins does, once."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = make_finding(fid="a", severity="major")
+        self.zeta = derived_id(obj="Namespace/zeta")
+        self.harness.replies = {"issue-list": self.issue_list()}
+
+    def seed(self, noted_baseline):
+        body = published_body(make_doc(findings=[self.a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+                audit_report.SCHEDULED_NOTED_IDS_KEY: noted_baseline,
+            },
+        )
+
+    def finish(self):
+        manifest = _full_manifest()
+        manifest["clusters"][0]["notes"] = (
+            "netpol-missing: the status of 1 object is not visible: Namespace/zeta."
+        )
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/zeta"}
+        ]
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        rc = self.run_finish(
+            make_doc(findings=[self.a]), ["--manifest-file", str(path)], scheduled=True
+        )
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json()
+
+    def test_an_unchanged_noted_set_is_silent(self):
+        self.seed([self.zeta])
+        out = self.finish()
+        self.assertEqual((out["status"], out["new"], out["resolved"]), ("UPDATED", 0, 0))
+        self.assertTrue(out["silent_ok"])
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored[audit_report.SCHEDULED_NOTED_IDS_KEY], [self.zeta])
+
+    def test_a_noted_object_that_joins_speaks(self):
+        self.seed([])
+        out = self.finish()
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertIs(out[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(out["silent_ok"])
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
 
@@ -37049,6 +37231,45 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(latest[audit_report.SCHEDULED_PUBLISHED_IDS_KEY], latest["current_ids"])
         self.assertEqual(latest[audit_report.SCHEDULED_COVERAGE_GAPS_KEY], [])
         self.assertEqual(latest[audit_report.SCHEDULED_REPORTED_UNDER_GAP_KEY], [])
+
+    def test_a_store_ledger_run_speaks_once_when_the_noted_set_changes(self):
+        """The store-ledger path applies the noted-set rule as the forge path
+        does: the set speaks when it changes, and an unchanged set is silent."""
+        def run(noted):
+            manifest = _full_manifest()
+            if noted:
+                manifest["clusters"][0]["notes"] = (
+                    "netpol-missing: the status of 1 object is not visible: Namespace/zeta."
+                )
+                manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                    {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/zeta"}
+                ]
+            manifest_path = self.tmp_path / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.start()
+            path = audit_report.findings_path_for(AUDIT)
+            Path(path).write_text(json.dumps(make_doc(findings=[])), encoding="utf-8")
+            self.new_process()
+            rc = self.run_main(
+                ["finish", "--audit", AUDIT, "--findings-file", path,
+                 "--manifest-file", str(manifest_path), "--scheduled"]
+            )
+            self.assertEqual(rc, 0, self.err)
+            return self.stdout_json()
+
+        first = run(noted=True)
+        self.assertEqual(first["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(first["silent_ok"])
+        self.assertEqual(
+            self.latest()[audit_report.SCHEDULED_NOTED_IDS_KEY],
+            [derived_id(obj="Namespace/zeta")],
+        )
+        self.assertTrue(run(noted=True)["silent_ok"])
+        cleared = run(noted=False)
+        self.assertIs(cleared[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(cleared["silent_ok"])
+        self.assertTrue(run(noted=False)["silent_ok"])
 
     def test_a_store_ledger_run_speaks_on_a_change_an_on_demand_run_saw_first(self):
         """An on-demand run resolves the finding. The next scheduled run

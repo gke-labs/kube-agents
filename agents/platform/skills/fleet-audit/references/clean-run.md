@@ -71,8 +71,8 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, nothing retired unread, no new or changed coverage gap, no held close, no
-> remediation pull request opened or
+> new, nothing resolved, nothing retired unread, no new or changed coverage gap, no change in the
+> set of noted objects, no held close, no remediation pull request opened or
 > closed, and — on a stream that passes `--manifest-file` — no collector candidate the document
 > dropped.
 
@@ -142,6 +142,11 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 - **A dropped collector candidate** — on a stream that passes `--manifest-file`, the collector
   flagged something the document did not carry. The check reads as having run and found nothing;
   the JSON line's `unpublished_candidates` says otherwise, and it must not arrive as silence.
+- **`noted_changed: true`** — the set of noted objects is not the set of the last scheduled run:
+  a check read a new object it could not see, or an object a note named is visible again. The
+  channel hears each change once. When the set is the same, the notes do not stop `silent_ok`:
+  one long-lived noted object does not wake the channel each day, and the notes stay on the JSON
+  line and in the stored report ([`finish`](finish.md)).
 
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: when the
 report store's record of the open ledger is missing, unreadable, written for a different issue, or

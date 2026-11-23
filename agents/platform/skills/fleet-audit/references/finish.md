@@ -84,8 +84,12 @@ findings a clean run was refused its close over (empty on every other outcome; s
 of the previous findings a clean close retired unread because their cluster was in neither scope
 list (see [The clean run](clean-run.md#the-clean-run)). On every status, the line also carries `notes` when a
 target has one: a list of `{target, note}`, each one a sentence from the collector about what a check
-read on that target but could not see. A note is not a coverage gap: `partial` does not count it,
-and it does not change `silent_ok`. Relay each note in your report on every status, and do not report
+read on that target but could not see. A note is not a coverage gap: `partial` does not count it.
+The set of noted objects speaks once: a scheduled run is not silent when its set of noted objects
+is different from the set of the last scheduled run — a new noted object, or one whose note
+cleared — and its line then carries `noted_changed: true`. When the set is the same, the notes do
+not stop `silent_ok`, so one long-lived noted object does not wake the channel each day. The
+comparison uses the objects' identities, not the note text. Relay each note in your report on every status, and do not report
 the objects it names as clean. The one exception is a scheduled run with `silent_ok: true`: it
 answers `[SILENT]` and does not report the notes in chat, and they stay in the stored report. On
 any other scheduled run the chat relay posts the report `finish` leaves, which lists the notes too. A previous finding on such an object did not go away in this run's

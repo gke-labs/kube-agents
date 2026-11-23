@@ -1961,6 +1961,19 @@ SCHEDULED_COVERAGE_GAPS_KEY = "scheduled_coverage_gaps"
 # first, new or resolved, still reaches the channel. None when no record
 # shows them; a scheduled run then speaks (`scheduled_published_baseline`).
 SCHEDULED_PUBLISHED_IDS_KEY = "scheduled_published_ids"
+# On the stored envelope only: the ledger ids (`published_id`) of the objects
+# that the last scheduled run's targets' notes named (`noted_ids`). Kept and
+# copied forward like `SCHEDULED_COVERAGE_GAPS_KEY`. A scheduled run whose
+# noted set is not this set speaks once (`noted_set_changed`): a new noted
+# object, and one whose note cleared, each reach the channel on one run,
+# and an unchanged noted object does not wake the channel every morning.
+# None when no record shows the set; a scheduled run with a noted object
+# then speaks (`scheduled_noted_baseline`).
+SCHEDULED_NOTED_IDS_KEY = "scheduled_noted_ids"
+# On the JSON line only when True: the run is not silent because its set of
+# noted objects is not the set the last scheduled run stored. The notes
+# themselves are under `notes` (`NOTES_RESULT_KEY`) as on every run.
+NOTED_CHANGED_KEY = "noted_changed"
 # On the stored envelope only: the ids under `REPORTED_UNDER_GAP_KEY` that a
 # scheduled run reported. A scheduled run does not report these again; an id
 # that only an on-demand run reported is still news to the channel.
@@ -4720,6 +4733,7 @@ def report_envelope(
     scheduled: bool = False,
     scheduled_coverage_gaps: list[str] | None = None,
     scheduled_published_ids: list[str] | None = None,
+    scheduled_noted_ids: list[str] | None = None,
     scheduled_reported_under_gap: list[str] | None = None,
     started_at: str | None | object = RUN_START_UNREAD,
     open_issue_number: int | None = None,
@@ -4771,8 +4785,10 @@ def report_envelope(
     --scheduled`). `scheduled_coverage_gaps` is the gap list of the last
     scheduled run (`next_scheduled_value`), or None when no record shows it.
     `scheduled_published_ids` is the id set the last scheduled run published
-    (`next_scheduled_value`), or None. `scheduled_reported_under_gap` is the
-    part of `reported_under_gap` that a scheduled run reported.
+    (`next_scheduled_value`), or None. `scheduled_noted_ids` is the noted set
+    of the last scheduled run (`next_scheduled_value` over `noted_ids`), or
+    None. `scheduled_reported_under_gap` is the part of `reported_under_gap`
+    that a scheduled run reported.
     """
     return {
         "audit_id": audit_id,
@@ -4800,6 +4816,9 @@ def report_envelope(
         ),
         SCHEDULED_PUBLISHED_IDS_KEY: (
             sorted(set(scheduled_published_ids)) if scheduled_published_ids is not None else None
+        ),
+        SCHEDULED_NOTED_IDS_KEY: (
+            sorted(set(scheduled_noted_ids)) if scheduled_noted_ids is not None else None
         ),
         SCHEDULED_REPORTED_UNDER_GAP_KEY: sorted(set(scheduled_reported_under_gap or [])),
         **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
@@ -5421,7 +5440,8 @@ def render_chat_report(
         )
     # The targets' notes, before the ledger line, which stays last for the
     # Slack headline. A `[SILENT]` run posts no report, so its notes stay in
-    # the store.
+    # the store — and a run whose noted set changed is not silent
+    # (`noted_set_changed`), so the change reaches the channel once.
     notes = scope_notes(data)
     if notes:
         lines.append(f"- {NOTES_LEAD}: " + "; ".join(notes))
@@ -10705,6 +10725,48 @@ def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
         return None
     stored = (memory or {}).get(SCHEDULED_PUBLISHED_IDS_KEY)
     return [str(fid) for fid in stored] if isinstance(stored, list) else None
+
+
+def scheduled_noted_baseline(memory: dict | None) -> list[str] | None:
+    """The noted ids of the last scheduled run, as `memory` shows them, or None.
+
+    `{}` is a store that holds no run of this stream: no scheduled run noted
+    anything, so the answer is the empty list. None is "not known": no
+    trusted record, or a record written before `finish` stored this key. A
+    record written under another `id_scheme` also gives None, because the
+    noted ids are ledger ids and a compare across schemes would call every
+    object new. The baseline is carried forward the way the published-ids
+    baseline is (`next_scheduled_value`), so an on-demand run between two
+    scheduled runs does not swallow the change.
+    """
+    if memory == {}:
+        return []
+    if (memory or {}).get("id_scheme") != ID_SCHEME:
+        return None
+    stored = (memory or {}).get(SCHEDULED_NOTED_IDS_KEY)
+    return [str(fid) for fid in stored] if isinstance(stored, list) else None
+
+
+def noted_set_changed(noted: set[str], memory: dict | None) -> bool:
+    """Whether this run's set of noted objects is news to the channel.
+
+    The channel hears a noted object once: on the run where its note first
+    names it, and once more on the run where it clears. Between those runs
+    the set is the last scheduled run's set, and the notes alone do not keep
+    a scheduled run from `[SILENT]` — a fleet with one long-lived noted VM
+    would otherwise wake the channel every morning. The comparison is on the
+    objects' ledger ids (`noted_ids`), never on the note text: a reworded
+    note about the same objects is not a change.
+
+    With no record of the last scheduled run's set (None — a lost store, or
+    a record from before the key), a run with a noted object speaks, and a
+    run with none stays quiet: it has no note to relay, and a cleared set it
+    cannot know about is not announced.
+    """
+    baseline = scheduled_noted_baseline(memory)
+    if baseline is None:
+        return bool(noted)
+    return set(noted) != set(baseline)
 
 
 def first_stored_record(directory, trusted: Callable[[dict], bool]) -> dict | None:
@@ -24896,6 +24958,11 @@ def _finish_without_forge(
     ids_moved = scheduled and (
         scheduled_ids is None or set(stored_ids) != set(scheduled_ids)
     )
+    # The set of noted objects speaks once when it changes, against the last
+    # scheduled run's set (`noted_set_changed`); an unchanged noted object
+    # does not wake the channel.
+    noted = noted_ids(manifest)
+    noted_moved = noted_set_changed(noted, record)
     # An id that left under a gap is not resolved. An id that an on-demand
     # run with full coverage resolved is resolved, also when this run has a gap.
     since_scheduled = since_last_scheduled(
@@ -24913,6 +24980,7 @@ def _finish_without_forge(
         or new_ids
         or resolved_ids
         or ids_moved
+        or noted_moved
         or gaps
         or unpublished
         or wholly_dropped
@@ -24947,6 +25015,7 @@ def _finish_without_forge(
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
         **since_scheduled,
+        **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
@@ -24974,6 +25043,7 @@ def _finish_without_forge(
         scheduled=scheduled,
         scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(record)),
         scheduled_published_ids=next_scheduled_value(scheduled, stored_ids, scheduled_ids),
+        scheduled_noted_ids=next_scheduled_value(scheduled, noted, scheduled_noted_baseline(record)),
         not_rechecked=unread_entries,
         started_at=run_started,
     )
@@ -25004,7 +25074,7 @@ def _finish_without_forge(
         since_scheduled=since_scheduled_line(payload, delta_known),
         unread=unread,
         stored=stored,
-        noted=noted_ids(manifest),
+        noted=noted,
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -25421,6 +25491,11 @@ def _finish_store_ledger(
     # a scheduled run speaks.
     scheduled_memory = memory if memory else ({} if delta_known else None)
     scheduled_ids = scheduled_published_baseline(scheduled_memory)
+    # The set of noted objects speaks once when it changes, against the last
+    # scheduled run's set (`noted_set_changed`); an unchanged noted object
+    # does not wake the channel.
+    noted = noted_ids(manifest)
+    noted_moved = noted_set_changed(noted, scheduled_memory)
     # As on the forge path, an id stays under `reported_under_gap` until a run
     # publishes it again or a run with full coverage does not find it.
     if gaps or stale_scheme:
@@ -25657,6 +25732,7 @@ def _finish_store_ledger(
     quiet = not (
         not delta_known
         or ids_moved
+        or noted_moved
         or reported_new
         or reported_resolved
         or coverage_moved
@@ -25690,6 +25766,7 @@ def _finish_store_ledger(
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **({RETIRED_UNLISTED_KEY: sorted(retired_ids)} if retired else {}),
         **since_scheduled,
+        **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
         **collector_payload(plan.uncorroborated),
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
@@ -25723,6 +25800,9 @@ def _finish_store_ledger(
         scheduled=scheduled,
         scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
         scheduled_published_ids=next_scheduled_ids,
+        scheduled_noted_ids=next_scheduled_value(
+            scheduled, noted, scheduled_noted_baseline(scheduled_memory)
+        ),
         scheduled_reported_under_gap=next_scheduled_reported,
         not_rechecked=not_rechecked,
         started_at=run_started,
@@ -25752,7 +25832,7 @@ def _finish_store_ledger(
         prs=payload,
         unaccounted=unaccounted_ids,
         noun=noun,
-        noted=noted_ids(manifest),
+        noted=noted,
     )
     append_chat_report(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -26862,6 +26942,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # The partial all-clear comment goes on the issue, which every run
     # writes to, so it compares with the last stored run of either kind.
     coverage_moved_on_issue = coverage_changed(gaps, memory)
+    # Whether the set of noted objects changed since the last scheduled run.
+    # Both silence verdicts below use it: the set speaks once when it changes
+    # (`noted_set_changed`) — a new noted object, or one whose note cleared —
+    # and an unchanged noted object does not wake the channel. The notes
+    # themselves stay on the JSON line, the ledger and the stored report on
+    # every run.
+    noted = noted_ids(manifest)
+    noted_moved = noted_set_changed(noted, scheduled_memory)
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
@@ -27437,6 +27525,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             clean_resolved
             or retired
             or ids_moved
+            or noted_moved
             or coverage_moved
             or unreported_under_gap
             or prs_closed
@@ -27494,6 +27583,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             # Only on a scheduled run that speaks because its ids moved
             # (`SINCE_SCHEDULED_KEY`).
             **since_scheduled,
+            # Only when the run speaks because the noted set changed.
+            **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
             **timer_payload(),
@@ -27590,6 +27681,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 sorted(set(stored_ids) | published_ids)
                 if scheduled and body_untouched
                 else next_scheduled_ids
+            ),
+            scheduled_noted_ids=next_scheduled_value(
+                scheduled, noted, scheduled_noted_baseline(scheduled_memory)
             ),
             scheduled_reported_under_gap=next_scheduled_reported,
             open_issue_number=open_issue,
@@ -28035,6 +28129,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     quiet = not (
         not delta_known
         or ids_moved
+        or noted_moved
         or reported_new
         or reported_resolved
         or coverage_moved
@@ -28125,6 +28220,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # Same key as the CLEAN branch; see the note there.
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **since_scheduled,
+        **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }
@@ -28155,6 +28251,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         scheduled=scheduled,
         scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
         scheduled_published_ids=next_scheduled_ids,
+        scheduled_noted_ids=next_scheduled_value(
+            scheduled, noted, scheduled_noted_baseline(scheduled_memory)
+        ),
         scheduled_reported_under_gap=next_scheduled_reported,
         # Their places, which the note and id-only tiers do not render.
         not_rechecked=unread_entries,
