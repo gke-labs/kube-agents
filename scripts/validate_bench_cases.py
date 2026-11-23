@@ -375,6 +375,18 @@ FIXTURE_NOT_READY = {
         "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
         "$9 an hour standing or about $7 a run on a per-run cluster"
     ),
+    # #2581 holds the check (its owner's answer of 2026-11-23). The shape that
+    # the case reads, the fleet's multi-process workload on a pool with no pod
+    # PID limit, is not shown as the fault in live tests and is a setting at
+    # the platform's default, which fixture rule 9 does not take as a fixture.
+    # A fixture for the node's own PIDPressure needs a node of its own and a
+    # privileged pod that lowers kernel.pid_max; a form of it that the fleet
+    # could carry is not shown. #5410 owns the gap.
+    "node-pid-pressure-fork-exhaustion": (
+        "#5410: the check is on hold under #2581; the shape that the case reads is the platform's "
+        "default (fixture rule 9); a fixture for the node's PIDPressure needs a node of its own "
+        "and a privileged pod that lowers kernel.pid_max, in a form that the fleet can carry"
+    ),
     # Needs the order of two times on one node: a workload container that
     # starts before a per-node agent's pod is Ready. That order is evidence
     # only on a node made after the agent's DaemonSet, and a workload's restart

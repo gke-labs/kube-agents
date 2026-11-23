@@ -1,8 +1,11 @@
 # Node OS, kubelet and auto-repair (gce-compute-fleet-audit): workloads leak
 # threads or processes until a node's process IDs run out, and the kubelet
-# sets PIDPressure and evicts. A declared gap: expected_fail until the check
-# lands (gke-labs/kube-agents#5410; gke-labs/kube-agents#2581 plans it as
-# `node-pid-pressure`).
+# sets PIDPressure and evicts. Parked as FIXTURE_NOT_READY
+# (gke-labs/kube-agents#5410; gke-labs/kube-agents#2581 plans the check as
+# `node-pid-pressure` and holds it): the shape that the case reads is not
+# shown as the fault and is the platform's default, and a fixture for the
+# node's own PIDPressure is not shown in a form that the fleet could carry, so
+# the case carries no suite line.
 # What live tests showed (2026-11-20 and 2026-11-21 UTC, scratch clusters, GKE
 # Standard 1.35.8, one run each): a pool has no pod PID limit by default, but
 # each container showed `pids.max = 629145`, 15 percent of the node's 4194304.
@@ -16,37 +19,38 @@
 # the seven, and the node read NotReady for between 17 and 77 seconds.
 # PIDPressure can be made on purpose (a privileged pod that lowers
 # `kernel.pid_max` on one node); the kubelet then evicted a pod and the
-# condition cleared after five minutes, so a standing plant of it is not
-# shown.
+# condition cleared after five minutes. A later test (2026-11-23, one run)
+# kept the condition coming back for an hour with a Deployment as the holder,
+# at the cost of hundreds of pods that the kubelet refused.
 # The shape that this case reads exists on the fleet and nothing new is
 # planted: role `multi-process-container`, Deployment multi-process-worker in
 # seeded-shapes on slot a, a shell supervisor forking two workers under a 32Mi
 # memory limit, on the default pool, whose kubelet configuration sets no pod
 # PID limit. By that text it cannot hold many processes, and the tests above
 # do not show a workload of that shape as the fault. The pool setting is also
-# the platform's default.
+# the platform's default, which fixture rule 9 does not take as a fixture.
 # #2581 states the check's form under its design decisions: it names a
 # multi-process workload on a pool with no pod PID limit, and a node that
 # reports PIDPressure. The first half flips this case; the second reads
-# nothing here. The tests above contradict the first half as the fault, and
-# that contradiction is a question for #2581's owners (eval-fix-loop, "The
-# premise"), posted there with the test results:
-# https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7112363582.
-# Fixture rule 9 has no state for a case that waits on such a question: by its
-# words a setting at the platform's default is not a fixture. The case keeps
-# its lane lines, as before this change, until the owners answer. If they drop
-# the first half, no fixture on the fleet makes the other half fire, and the
-# case parks; if that half lands, the case passes on the shape that
-# `expected_output` names and on no more. The readiness rule group-oom-kill
-# and the case upgrades-fleet-readiness-multi-process-container assert it is
-# the fleet's only forking container, so no second forking plant may land.
-# Domain `fleet-audits` as the other GCE compute cases.
+# nothing here. The test results were put to #2581's owners
+# (https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7112363582),
+# and an owner answered that the check is on hold and that the first half and
+# the removal of `expected_fail` "wait for a test that shows such a workload
+# using up a node's process IDs"
+# (https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7113974758).
+# A fixture for the second half needs a node of its own and a privileged pod
+# that lowers `kernel.pid_max`. The objective below keeps the form of the
+# first plan, a finding on that workload; the pull request that brings a
+# fixture rewrites it, and the un-park pull request restores the `suite:` and
+# `suite_part:` lines. `expected_fail` stays: the marker waits for a check
+# that a fixture can flip. The readiness rule group-oom-kill and the case
+# upgrades-fleet-readiness-multi-process-container assert it is the fleet's
+# only forking container, so no second forking plant may land. Domain
+# `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
-name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit, the platform's default; a question to the check's owners is open)"
+name: "Node PID exhaustion (parked: the check is on hold; the shape that the case reads is the platform's default; a fixture for PIDPressure is not shown in a form that the fleet could carry)"
 domain: fleet-audits
-suite: validated-capabilities
-suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -56,14 +60,12 @@ prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.
 expected_output: >-
-  Reads the fleet's existing multi-process workload on a pool with no pod PID
-  limit. Customer failure, as live tests showed it: seven leaking containers
-  used all process IDs of the 256 GB node, and the kubelet set PIDPressure and
-  evicted; one container did not. Validated means: the ledger issue carries a
-  finding that names Deployment `multi-process-worker` in namespace
-  `seeded-shapes` as a multi-process workload on pool `default-pool`, whose
-  kubelet configuration sets no pod PID limit; the tests do not show that
-  shape as the fault. The closing response is the SOP's one line with the
+  Parked. Reads the fleet's existing multi-process workload on a pool with no
+  pod PID limit. Customer failure, as live tests showed it: seven leaking
+  containers used all process IDs of the 256 GB node, and the kubelet set
+  PIDPressure and evicted; one container did not. Validated needs a fixture for
+  that state; the present objective accepts a finding that names
+  `multi-process-worker`. The closing response is the SOP's one line with the
   ledger URL.
 infrastructure:
   deployer: noop
