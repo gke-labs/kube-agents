@@ -1283,8 +1283,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		return a.completeWith(resultText)
 	case sawResult:
 		state := lib.StateFailed
+		// The token is the driver's: Claude's is a subtype word, but a driver may
+		// carry error detail here (PrepareTurn), so it is scrubbed like the rest.
 		return Result{State: state}, a.finalize(state,
-			fmt.Sprintf("reason: %s", resultErr), resultText)
+			fmt.Sprintf("reason: %s", a.scrub(resultErr)), resultText)
 	case deadlineHit:
 		state := lib.StateFailed
 		return Result{State: state}, a.finalize(state, "reason: deadline-exceeded", "")
