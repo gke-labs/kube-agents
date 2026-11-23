@@ -32,7 +32,19 @@ SOURCES = (
     "agents/platform/scripts/gitops_preflight.py",
     "agents/platform/scripts/credential_proxy_client.py",
     "agents/platform/scripts/vcs_client.py",
+    # The compliance audit's collector and its closure (#5623).
+    "agents/platform/skills/fleet-audit/scripts/collect.py",
+    "agents/platform/skills/fleet-audit/scripts/kcc_health.py",
+    "agents/platform/scripts/fleet_scope_args.py",
+    "agents/platform/scripts/collector_run.py",
+    "agents/platform/scripts/broker_admission.py",
 )
+
+# The readiness modules collect.py's webhook check imports, copied to the path
+# it derives from its own: parents[2]/fleet-upgrade-verification/scripts.
+READINESS_SRC = REPO_ROOT / "agents/platform/skills/fleet-upgrade-verification/scripts"
+READINESS_DEST = "/opt/kube-agents/fleet-upgrade-verification/scripts/"
+READINESS_FILES = ("upgrade_readiness.py", "upgrade_shape_tables.py", "known_issues.json", "removed_apis.json")
 
 
 def scripts_dir(tmp: str) -> Path:
@@ -95,6 +107,47 @@ class WorkerFleetAuditScriptsTest(unittest.TestCase):
                 cwd=d, env=env, check=True, capture_output=True, text=True,
             )
             self.assertIn("--dry-run", out.stdout)
+
+    def test_the_readiness_copy_is_exactly_its_sources(self):
+        """The worker copies the readiness files and the whole readiness_rules
+        package to READINESS_DEST, the path collect.py derives from its own
+        place, and nothing from the skill's tests or testdata."""
+        text = re.sub(r"\\\n\s*", " ", WORKER_DOCKERFILE.read_text())
+        files = rules = None
+        for line in text.splitlines():
+            words = line.split()
+            if words[:1] == ["COPY"] and words[-1] == READINESS_DEST:
+                files = [w for w in words[1:-1] if not w.startswith("--")]
+            if words[:1] == ["COPY"] and words[-1] == READINESS_DEST + "readiness_rules/":
+                rules = [w for w in words[1:-1] if not w.startswith("--")]
+        self.assertEqual(sorted(files or []), sorted(str((READINESS_SRC / f).relative_to(REPO_ROOT)) for f in READINESS_FILES))
+        self.assertEqual(rules, [str((READINESS_SRC / "readiness_rules").relative_to(REPO_ROOT)) + "/"])
+        self.assertFalse(list((READINESS_SRC / "readiness_rules").glob("test_*.py")), "readiness_rules/ carries tests the copy would ship")
+        self.assertEqual(
+            Path(DEST).parents[1] / "fleet-upgrade-verification" / "scripts",
+            Path(READINESS_DEST),
+            "the readiness destination is not where collect.py looks (parents[2] of the script)",
+        )
+
+    def test_the_collector_runs_from_the_image_layout(self):
+        """collect.py imports from the flat directory, finds the readiness
+        modules where the image puts them, and answers --help."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = scripts_dir(tmp)
+            for src in SOURCES:
+                shutil.copy(REPO_ROOT / src, d / Path(src).name)
+            readiness = Path(tmp) / READINESS_DEST.strip("/")
+            readiness.mkdir(parents=True)
+            for name in READINESS_FILES:
+                shutil.copy(READINESS_SRC / name, readiness / name)
+            shutil.copytree(READINESS_SRC / "readiness_rules", readiness / "readiness_rules")
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": tmp, "PYTHONDONTWRITEBYTECODE": "1"}
+            subprocess.run(
+                [sys.executable, "-c", "import sys; sys.path[:0] = ['.']; import collect; assert collect._upgrade_readiness() is not None"],
+                cwd=d, env=env, check=True, capture_output=True, text=True,
+            )
+            out = subprocess.run([sys.executable, "collect.py", "--help"], cwd=d, env=env, check=True, capture_output=True, text=True)
+            self.assertIn("compliance-audit", out.stdout)
 
     def test_a_dry_run_finish_completes_from_one_directory(self):
         # A real finish on the --dry-run path, which reaches the lazy imports
