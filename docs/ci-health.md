@@ -547,8 +547,7 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. Two more, `ci-kube-agents-validated-capabilities-1` and `-2`, are
 not pool jobs but the validated-capabilities lane's weekly slices, one a suite part, watched here because
-their record is their logs bucket and nothing else reads a failed build of them. The first slice is
-also watched as `ci-kube-agents-certification-1`, the name its job has until `oss-test-infra` renames it. Another,
+their record is their logs bucket and nothing else reads a failed build of them. Another,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
 and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
 `ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
@@ -1090,9 +1089,11 @@ with two identities:
   from GitHub; and the candidate fixes, open pull requests touching the same
   files and commits on those files merged since the first red night. It writes
   only to the runner's disk.
-- **Route**, as the publisher (`CI_HEALTH_SA`): one call to Gemini on Vertex AI
-  through the job's Workload Identity, model `NIGHTLY_TRIAGE_MODEL`
-  (`gemini-4-argon` unless the repository variable names another), billed to
+- **Route**, as the publisher (`CI_HEALTH_SA`): one call on Vertex AI through
+  the job's Workload Identity to the model the repository secret
+  `NIGHTLY_TRIAGE_MODEL` names (a secret, not a variable, so the public job
+  log prints it as `***`; no default: the workflow file is public and names
+  no model), billed to
   `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
   capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
   then grading lines) and the answer at 16,384, thinking included. The model returns a
@@ -1138,13 +1139,18 @@ meanwhile stays. The filer files for triage only into a separate issues
 repository, the route step writes to no other, and the job's own token holds
 no issue write.
 
-Unarmed, the job dry-runs on the issues the filer filed that tick (which the
-filer assigned as before) and prints what it would assign; a manual run of the
+Unarmed, with a model named, the job dry-runs on the issues the filer filed
+that tick (which the filer assigned as before) and prints what it would assign; a manual run of the
 workflow with `triage_issues` set to issue numbers of the issues repository
 does the same for those issues. Setting the repository variable
-`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true`;
-`CI_HEALTH_MUTE=true` disarms both. Switched off while issues still wait,
-the tick routes each by the rule without a model call. The call needs
+`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true` and
+a model named in the `NIGHTLY_TRIAGE_MODEL` secret; without the name the
+filer keeps assigning by its rule, the job dry-runs by the rule, and the
+comment each waiting issue gets names the switch when it is off and the
+missing model name when the switch is on;
+`CI_HEALTH_MUTE=true` disarms the filer and the triage alike. Switched off, or with no model named,
+while issues still wait, the tick routes each by the rule without a model
+call. The call needs
 `roles/aiplatform.user` for `CI_HEALTH_SA` on `NIGHTLY_TRIAGE_PROJECT`, with
 the Vertex AI API enabled there; until then every call fails and every issue
 goes by the rule.

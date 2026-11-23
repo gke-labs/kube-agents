@@ -40,6 +40,8 @@ _DELETING_FROM_THE_START = "from-the-start"
 _DELETION_TIMESTAMP = "2026-11-20T01:43:05Z"
 _POISONED_HISTORY = json.dumps([{"revision": 1, "status": "failed"}])
 _TRANSIENT_5XX = "the server is currently unable to handle the request"
+# What the kubectl stand-in answers when the namespace's conditions are read.
+_NAMESPACE_CONDITIONS = "NamespaceContentRemaining=True SomeResourcesRemain: Some resources are remaining: pods. has 1 resource instances"
 
 
 def _deploy_text():
@@ -85,6 +87,7 @@ class CiDeployHelmRetryTest(unittest.TestCase):
         profiles_namespace_read_exit=0,
         kubectl_wait_exit=0,
         helm_uninstall_exit=0,
+        namespace_conditions_exit=0,
     ):
         """Run the lifted deploy block with recording stubs.
 
@@ -103,6 +106,7 @@ class CiDeployHelmRetryTest(unittest.TestCase):
         profiles_namespace_read_exit: exit code for that read.
         kubectl_wait_exit: exit code for `kubectl wait`.
         helm_uninstall_exit: exit code for `helm uninstall`.
+        namespace_conditions_exit: exit code for the read of the namespace's conditions.
         """
         if history_responses is None:
             if history_exit is None:
@@ -200,6 +204,7 @@ case "$1" in
       exit {kubectl_readyz_exit}
     fi
     if [ "$2" = "namespace" ]; then
+      case "$*" in *conditions*) printf '%s\\n' "{_NAMESPACE_CONDITIONS}"; exit {namespace_conditions_exit} ;; esac
       case "{profiles_namespace_deleting}" in
         {_DELETING_FROM_THE_START}) printf '%s' "{_DELETION_TIMESTAMP}" ;;
         {_DELETING_AFTER_UNINSTALL}) if grep -q "^helm uninstall" "{log}"; then printf '%s' "{_DELETION_TIMESTAMP}"; fi ;;
@@ -643,6 +648,39 @@ MODE_NEXT_MAX_SESSIONS=6
         self.assertNotEqual(rc, 0)
         self.assertEqual([c for c in calls if c.startswith("helm upgrade")], [], f"calls: {calls}")
         self.assertIn(f"the profile namespace {_PROFILES_NAMESPACE}", err)
+
+    def test_a_failed_wait_prints_what_holds_the_profile_namespace(self):
+        # The namespace's conditions name the kinds of objects and the finalizers that remain.
+        rc, calls, out, err = self._run_deploy_block(
+            [(0, "Release kube-agents installed", "")],
+            profiles_namespace_deleting=_DELETING_FROM_THE_START,
+            kubectl_wait_exit=1,
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertIn(_NAMESPACE_CONDITIONS, err)
+        wait = next(i for i, c in enumerate(calls) if c.startswith("kubectl wait"))
+        reads = [i for i, c in enumerate(calls) if c.startswith(f"kubectl get namespace {_PROFILES_NAMESPACE} ") and "conditions" in c]
+        self.assertEqual(len(reads), 1, f"calls: {calls}")
+        self.assertLess(wait, reads[0], "the conditions are read after the wait failed")
+
+    def test_a_failed_read_of_the_conditions_does_not_change_the_stop(self):
+        rc, calls, out, err = self._run_deploy_block(
+            [(0, "Release kube-agents installed", "")],
+            profiles_namespace_deleting=_DELETING_FROM_THE_START,
+            kubectl_wait_exit=1,
+            namespace_conditions_exit=7,
+        )
+        self.assertEqual(rc, 1, "the stop keeps its own status")
+        self.assertEqual([c for c in calls if c.startswith("helm upgrade")], [], f"calls: {calls}")
+        self.assertIn(f"the profile namespace {_PROFILES_NAMESPACE}", err)
+
+    def test_a_wait_that_ends_reads_no_conditions(self):
+        rc, calls, out, err = self._run_deploy_block(
+            [(0, "Release kube-agents installed", "")],
+            profiles_namespace_deleting=_DELETING_FROM_THE_START,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([c for c in calls if "conditions" in c], [], f"calls: {calls}")
 
     def test_a_failed_read_of_the_profile_namespace_leaves_the_decision_to_the_install(self):
         rc, calls, out, err = self._run_deploy_block(

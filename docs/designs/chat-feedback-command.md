@@ -268,8 +268,8 @@ state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedbac
 deterministically, with the environment, usage, performance and feedback sections `scripts/feedback-summary.sh`
 prints from a workstation (epic #3426's share surface; the script alone adds the cluster scale
 counts, LiteLLM's live figures and recent task rows): environment (tag, mode, model from
-`status.inference` or `unavailable`, Kubernetes version, install age, readiness, active
-interfaces), the `status.usage` counters, the credential broker's top five tool and subcommand
+`status.inference` or `unavailable`, its reasoning effort or `unset`, Kubernetes version, install
+age, readiness, active interfaces), the `status.usage` counters, the credential broker's top five tool and subcommand
 pairs from `status.usage.topTools` (the operator's reading of the broker's counter,
 [`usage-counters-producer.md`](usage-counters-producer.md); the script reads the broker's
 metrics directly when it can and falls back to the same status list), a roll-up of the
@@ -289,7 +289,7 @@ that the line reads `unavailable`. It reads the
 `PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
 grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
 needs no grant. The token and spend totals are the operator's, on the resource, so the block
-prints them; latency is not the gateway's to see and the block says where it is. Before posting, the block less its model line is audited as the script audits its own: every
+prints them; latency is not the gateway's to see and the block says where it is. Before posting, the block less its model, reasoning effort and origin lines is audited as the script audits its own: every
 string leaf of the spec's naming subtrees plus the resource's name and namespace, as whole
 tokens, with booleans, numbers, short strings and the template's own vocabulary skipped; a
 hit posts a fixed refusal instead, and a resource that cannot be read posts a fixed
@@ -315,7 +315,7 @@ else, acks with a line saying the block will post into the thread and that their
 context-less read of the host cluster, and the agent's local Role grants `get` on the
 `PlatformAgent`, while `exec` is a write verb to the broker's command policy. The block therefore carries the environment
 and usage sections and prints `unavailable` for tokens, spend, latency and the task roll-up;
-those stay with `scripts/feedback-summary.sh`. The block less its model and origin lines is audited as
+those stay with `scripts/feedback-summary.sh`. The block less its model, reasoning effort and origin lines is audited as
 the script audits its own; a clean block, less the rating form the pasted block ends with (an empty form in an issue reads as a rating nobody gave), is the card's `result`, verbatim, and a hit is a
 `BLOCKED` line that says how many identifiers were found and never which. The worker files
 nothing on this card.

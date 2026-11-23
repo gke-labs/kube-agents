@@ -28,6 +28,9 @@ ten seconds whether or not the fetch succeeds, so a rotated key works without a 
 library cannot use (an unsupported type, an encryption key) are skipped. A key set that cannot be
 fetched is a 503, except that a key already cached keeps verifying for up to six hours past the
 set's expiry.
+`Config.CAFile` names a PEM bundle of the roots the key set's server is verified against
+instead of the system roots; it is re-read when it changes, like the server certificate below, and
+the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
@@ -92,15 +95,29 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
+and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
+empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
+give its path to both flags. Files without a matching certificate and key stop the proxy at
+startup. The files are reloaded
+without a restart (`pkg/certreload`): at most once a second, a TLS handshake checks their size,
+modification time, device and inode (so a Secret or projected volume's `..data` symlink swap is
+seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
+not load, such as one read mid-rotation, is logged, counted in
+`kubeagents_kube_proxy_certificate_reload_failures_total`, and the last good certificate keeps
+being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
+`Transport` verifies each new connection against the current bundle, with hostname and IP SAN
+checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
+
 Cached responses and coalesced fetches are shared across callers, which is safe while the
 `UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
 transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
 authenticated caller is part of the cache and coalescing keys, so requests share a response or a
 fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
 the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
-partition needs the cache off (`Config.Cache` nil). Invalidation is not partitioned: a `401` or
-`403` in one partition evicts that resource's entries in every partition, which costs the others
-refetches but never serves one partition another's response.
+partition needs the cache off (`Config.Cache` nil). A write evicts the resource's entries
+in every partition, since the data changed for every caller; a `401` or `403` evicts them in the
+caller's partition only, since only that credential's access changed.
 
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an

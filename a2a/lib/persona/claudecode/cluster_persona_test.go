@@ -295,7 +295,7 @@ var (
 			// is the cluster's, and the repository is reached only through
 			// the skill, for the repository the task names.
 			{"You cannot read the repository, so read", "Unless the task names the managed repository (then the `version-control` skill reads it), read", 1},
-			{"**You have no GitOps repository to read, and you are not meant to find one.** You hold a read-only view of one cluster — no checkout, no clone, no forge access. Do not go looking for one.", "**You have no GitOps checkout, and you are not meant to go looking for one.** You hold a read-only view of one cluster; the only way to the repository is the `version-control` skill, and only for the repository the task names.", 1},
+			{"**You have no GitOps repository to read, and you are not meant to find one.** You hold a read-only view of one cluster — no checkout, no clone, no forge access. Do not go looking for one.", "**You have no GitOps checkout, and you are not meant to go looking for one.** You hold a read-only view of one cluster; the only way to the repository is the `version-control` skill, and only for the repository the task names, or, when it names none, the one managed repository `identity` lists.", 1},
 			{"You work under a strict read-only boundary: no patches applied, no Pull Requests opened, nothing written to the cluster. The fix ships as a Pull Request against the GitOps repository and somebody else opens it —", "You work under a strict read-only boundary on the cluster: no patches applied, nothing written to it. The fix ships as a pull request against the GitOps repository, and somebody else opens it unless the task asks you for that change (`instructions.md` §2) —", 1},
 		},
 		"gke-stall-detection": {

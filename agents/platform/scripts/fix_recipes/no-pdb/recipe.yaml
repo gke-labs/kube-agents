@@ -1,7 +1,7 @@
 # A missing PodDisruptionBudget for a workload with two or more replicas: the
-# fleet audit's `no-pdb` finding, whose fix it writes in code
-# (`audit_report._pdb_manifest`). Read by `fix_recipes/registry.py`, which
-# accepts flat `key: value` lines only.
+# fleet audit's `no-pdb` finding, whose fix `fix.py` beside this file writes
+# (the audit calls it through `audit_report._pdb_manifest`). Read by
+# `fix_recipes/registry.py`, which accepts flat `key: value` lines only.
 kind: no-pdb
 # What kube-agents calls these fixes in text it writes.
 name: disruption-budget fixes
@@ -19,3 +19,9 @@ recheck_siblings: pdb-overlapping blocking-pdb
 # The end-to-end case that grades the fix on the cluster after it merges; empty
 # until that case exists.
 eval_case: ""
+# Without a reconciler to ask, the fix is applied once a PodDisruptionBudget
+# in the namespace selects the workload; the health window then watches it.
+applied: object_present
+applied_resource: poddisruptionbudgets.policy
+applied_noun: budget
+health: restart_flat

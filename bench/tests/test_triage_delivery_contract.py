@@ -131,6 +131,8 @@ CONTRACTS = [
     (TASKS / "autoops-crashloop-config-triage" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "autoops-missing-service-triage" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "autoops-warning-event-triage-state-stamp" / "task.yaml", TRIAGE_TEMPLATE),
+    (TASKS / "workload-image-pull-refused-node-identity" / "task.yaml", TRIAGE_TEMPLATE),
+    (TASKS / "workload-image-pull-refused-pull-secret" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "gitops-drift-out-of-band-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-noise-filtered-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-deleted-policy-triage" / "task.yaml", DRIFT_TEMPLATE),

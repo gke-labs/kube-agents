@@ -6,14 +6,18 @@ rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
 (`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
 A recipe's safety checks are its `checks.py`, which the broker's label gate
-loads through :func:`checks_module`.
+and the sandbox's pre-flight (`fleet-audit/scripts/fix_preflight.py`) both load
+through :func:`checks_module`.
 Those are the lists; the code that handles one kind's fix is still per kind
-(`automerge_eligibility.FIX_TYPE`, `post_merge_check.DIRECT_OBJECTS`,
-`audit_report.GENERATED_FIX_CHECK`), so a recipe alone
-gets a dial row and post-merge records but no broker label.
+(`automerge_eligibility.FIX_TYPE`, `audit_report.GENERATED_FIX_CHECK`,
+`fix_preflight.CHANGES`), so a recipe alone gets a dial row and post-merge
+records but no broker label. How the post-merge check sees the fix applied, and
+whether it holds a health window, is declared here (`applied`, `health`) and run
+by `fix_recipes/probes.py`.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
-through `automation_rules`, and neither may depend on PyYAML being there. So
+(through `automation_rules`, and the proxy also through
+`automerge_eligibility`), and neither may depend on PyYAML being there. So
 `recipe.yaml` is a strict subset of YAML: one `key: value` per line, `#`
 comments, a value plain or in double quotes. Anything else refuses the file,
 and a refused or missing recipe is an import-time error, caught by the tests,
@@ -27,6 +31,29 @@ kinds the one-finding re-check reads in the target namespace (separated by
 commas, as `kubectl get` takes them), and the collector checks a fix could
 trip (separated by spaces); `recheck.py` builds its
 `RECHECKS` from them.
+
+The verification fields, all optional:
+
+- `applied`: how the post-merge check sees the fix on the cluster when no
+  GitOps reconciler can say. `object_present`: an object of
+  `applied_resource` in the record's namespace, one whose selector selects the
+  workload when the record names a workload, else the object the record names.
+  `field_equals`: the object the record names, read as `applied_resource`, has
+  `applied_field` (a dotted path of plain keys: no list index, and no key with a
+  `.` in it) equal to `applied_value`. That object must exist before the fix,
+  since the probe reads it by name and a missing one fails the record; a fix
+  that creates its object uses `object_present`. Empty: the fix is
+  seen only through a reconciler. `applied_noun` names the object in the
+  reading (`budget`); it defaults to `object`.
+- `health`: `restart_flat` (the default) holds the health window on the
+  workload the record names; `none` passes the window on the run after the fix
+  is applied, for a fix whose object is not a workload.
+
+A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
+`generator(kind)`, and stdlib only for the same reason. `no-pdb` has one:
+the audit calls it through `audit_report._pdb_manifest`, and the broker
+re-runs it to verify a pull request
+(`automerge_eligibility.verify_added_manifest`).
 """
 
 from __future__ import annotations
@@ -35,19 +62,32 @@ import functools
 import importlib.util
 import json
 import re
-from types import ModuleType
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 RECIPE_FILE = "recipe.yaml"
+# A recipe's fix generator, beside its recipe.yaml (optional until every kind has one).
+FIX_FILE = "fix.py"
 #: A recipe's safety checks: `read_kinds` (one namespace read) and
 #: `checks(change, live)`, each result named and `pass`, `fail` or `unknown`.
 CHECKS_FILE = "checks.py"
 # Larger than any recipe; a cap so a stray file costs a glance to refuse.
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
-OPTIONAL = ("owner", "eval_case", "recheck_kinds", "recheck_siblings")
+OPTIONAL = ("owner", "eval_case", "recheck_kinds", "recheck_siblings", "applied", "applied_resource", "applied_noun",
+            "applied_field", "applied_value", "health")
+#: The stock probes `fix_recipes/probes.py` runs, and the health windows the post-merge check holds.
+APPLIED_PROBES = ("object_present", "field_equals")
+HEALTH_PROBES = ("restart_flat", "none")
+#: What `applied` needs beside it.
+APPLIED_NEEDS = {"object_present": ("applied_resource",),
+                 "field_equals": ("applied_resource", "applied_field", "applied_value")}
+#: A kubectl resource name (`poddisruptionbudgets.policy`; a plural may hold hyphens, as a DNS label may),
+#: a dotted field path (`spec.maxUnavailable`).
+RESOURCE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[a-z0-9]+(?:-[a-z0-9]+)*)*")
+FIELD_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*")
 # The same shapes `automation_rules` accepts for a rule's `fix` and `environments`.
 KIND_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ENVIRONMENT_RE = re.compile(r"[a-z0-9]([-_a-z0-9]{0,61}[a-z0-9])?")
@@ -71,6 +111,12 @@ class Recipe(NamedTuple):
     eval_case: str = ""
     recheck_kinds: str = ""
     recheck_siblings: str = ""
+    applied: str = ""
+    applied_resource: str = ""
+    applied_noun: str = ""
+    applied_field: str = ""
+    applied_value: str = ""
+    health: str = "restart_flat"
 
     def siblings(self) -> tuple[str, ...]:
         """The collector checks the fix could trip, in the order the re-check runs them."""
@@ -131,7 +177,28 @@ def parse(text: str, where: str = RECIPE_FILE) -> Recipe:
         raise RecipeError(f"{where}: `recheck_kinds` must be kubectl resource names separated by commas")
     if not ENVIRONMENT_RE.fullmatch(fields["dial_environment"]):
         raise RecipeError(f"{where}: `dial_environment` must be an environment label value such as `dev`")
+    _check_verification(fields, where)
     return Recipe(**fields)
+
+
+def _check_verification(fields: dict[str, str], where: str) -> None:
+    applied = fields.get("applied", "")
+    if applied and applied not in APPLIED_PROBES:
+        raise RecipeError(f"{where}: `applied` must be one of {', '.join(APPLIED_PROBES)}")
+    needed = APPLIED_NEEDS.get(applied, ())
+    for key in ("applied_resource", "applied_field", "applied_value"):
+        if key in needed and not fields.get(key):
+            raise RecipeError(f"{where}: `applied: {applied}` needs `{key}`")
+        if key not in needed and key in fields:
+            raise RecipeError(f"{where}: `{key}` means nothing without an `applied` probe that reads it")
+    if "applied_noun" in fields and not applied:
+        raise RecipeError(f"{where}: `applied_noun` means nothing without `applied`")
+    if fields.get("applied_resource") and not RESOURCE_RE.fullmatch(fields["applied_resource"]):
+        raise RecipeError(f"{where}: `applied_resource` must be a resource name such as `poddisruptionbudgets.policy`")
+    if fields.get("applied_field") and not FIELD_PATH_RE.fullmatch(fields["applied_field"]):
+        raise RecipeError(f"{where}: `applied_field` must be a dotted field path such as `spec.maxUnavailable`")
+    if "health" in fields and fields["health"] not in HEALTH_PROBES:
+        raise RecipeError(f"{where}: `health` must be one of {', '.join(HEALTH_PROBES)}")
 
 
 def load(root: Path = HERE) -> tuple[Recipe, ...]:
@@ -155,6 +222,35 @@ def recipes() -> tuple[Recipe, ...]:
 
 def kinds() -> frozenset[str]:
     return frozenset(recipe.kind for recipe in recipes())
+
+
+def recipe(kind: str) -> Recipe | None:
+    """The recipe for `kind`, or None for a kind the registry does not list."""
+    return next((found for found in recipes() if found.kind == kind), None)
+
+def generator(kind: str, root: Path = HERE) -> ModuleType:
+    """The `fix.py` of `kind`'s recipe, loaded once per file.
+
+    Loaded from its path: a kind is a check id such as `no-pdb`, and a hyphen
+    is not an importable package name. RecipeError for a kind with no valid
+    recipe or no `fix.py`.
+    """
+    if not KIND_RE.fullmatch(kind) or not (root / kind / RECIPE_FILE).is_file():
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    if kind not in {found.kind for found in (recipes() if root == HERE else load(root))}:
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    path = root / kind / FIX_FILE
+    if not path.is_file():
+        raise RecipeError(f"{kind}/{FIX_FILE}: missing")
+    return _load_fix(path.resolve(), kind)
+
+
+@functools.cache
+def _load_fix(path: Path, kind: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(f"fix_recipes.{kind.replace('-', '_')}_fix", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @functools.lru_cache(maxsize=None)

@@ -258,45 +258,15 @@ agent:
 # pattern-flagged command outright, which would stop the audits doing their job.
 # `approve` waives the PROMPT for those commands.
 #
-# It does not waive the Tirith content scan. Upstream conflated the two — it ran
-# the scanner only on the `deny` arm, so `cron_mode: approve` shipped every
-# command in every cron run unscanned — and the image patch at
-# deploy/docker/patches/cron_tirith_scan.py separates them again. The scan now
-# runs on both arms, and a finding refuses that one command (the run continues;
-# the gateway logs the refusal, but the execution ledger has no per-command rows
-# and the saved output holds only the run's final response, so neither records
-# it unless the model says so).
-#
-# The worked example is github-issue-resolver, which ran every 30 minutes over
-# issue text written by anyone with a GitHub account until github-repo-watcher
-# replaced it with a token-free poller — that triage turn is now a kanban worker
-# rather than a cron run, so read the scan's coverage from
-# deploy/docker/patches/cron_tirith_scan.py, not from this example. Two things
-# the scan buys, both measured against the shipped image on 2026-08-08:
-#
-#   * Homograph and confusable-Unicode content, which DANGEROUS_PATTERNS does
-#     not look for at all. A Cyrillic-e `kubernetеs.io` is refused by the scan
-#     and invisible to the pattern layer.
-#   * The pattern-matched obfuscation shapes — `curl | sh`, base64-to-shell —
-#     which the pattern layer *does* recognise but which `cron_mode: approve`
-#     waives, since approve is exactly the instruction not to block on them.
-#     Tirith independently refuses these, so the waiver no longer ships them.
-#
-# What Tirith alone does not catch, but the companion gate
-# deploy/docker/patches/cron_risk_gate.py (THREAT-002) intercepts and blocks:
-# execute_code tool execution, pure-ASCII lookalike TLDs (e.g. `kubernetes.io.evil-cdn.co`),
-# raw terminal escape / C0/C1 control sequence injection (_ESC), and state-mutating
-# commands under risk: "high" read-only command policy.
-#
-# cron_scan is stated rather than left to its default so this block reads as the
-# posture it is. Set it to false only for a profile whose watchdogs trip the
-# Tirith scanner for a reason someone has examined and accepted (`cron_scan: false`
-# opts out of the Tirith AST scan only; the cron_risk_gate evasion checks remain
-# unconditional); `security.tirith_enabled: false` is the blunter lever and takes
-# interactive sessions down with it.
+# It does not waive the checks in deploy/docker/patches/cron_risk_gate.py
+# (THREAT-002), which run on every cron command whatever this key says and
+# refuse: execute_code, pure-ASCII lookalike TLDs (e.g.
+# `kubernetes.io.evil-cdn.co`), raw terminal escape / C0/C1 control sequence
+# injection (_ESC), and state-mutating commands under the risk: "high"
+# read-only command policy. A refusal stops that one command; the run continues.
+# The hardline floor and any approvals.deny globs apply as well.
 approvals:
   cron_mode: approve
-  cron_scan: true
 
 # Enable DuckDuckGo web search
 web:

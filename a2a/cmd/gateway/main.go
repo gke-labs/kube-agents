@@ -1,4 +1,4 @@
-// The a2a chatops gateway: chat in (every armed backend of Google Chat, Slack
+// The a2a chatops gateway: chat in (every armed backend of Google Chat, Slack, Teams
 // and Discord, behind one mux beside the console), tasks on the bus out.
 //
 // PLAYGROUND POSTURE: bot token as a plain Secret, no exporter, no breaker,
@@ -99,6 +99,24 @@ func buildAdapters(cfg *gateway.Config, backends map[string]gateway.Adapter, nat
 	return buildAdaptersWith(backends, console, log)
 }
 
+// a2aDoorOptions carries the A2A door's configuration from the environment
+// to the door: the card's public URL and addressee, the task deadline, and
+// each sign-in class's arming and allowlist. One function, so a class the
+// config reads cannot be left out of the door that would check it.
+func a2aDoorOptions(cfg *gateway.Config, log *slog.Logger) gateway.A2ADoorOptions {
+	return gateway.A2ADoorOptions{
+		PublicURL:          cfg.A2ADoorPublicURL,
+		DefaultAddressee:   cfg.DefaultAddressee,
+		TaskDeadline:       cfg.TaskDeadline,
+		GoogleClientID:     cfg.A2ADoorGoogleClientID,
+		GoogleAllowedUsers: cfg.A2ADoorAllowedUsers,
+		EntraTenantID:      cfg.A2ADoorEntraTenantID,
+		EntraClientID:      cfg.A2ADoorEntraClientID,
+		EntraAllowedUsers:  cfg.A2ADoorEntraAllowedUsers,
+		Logger:             log,
+	}
+}
+
 // buildAdaptersWith is buildAdapters around a console adapter already
 // dialed, which realMain keeps for the console's chat.notify route. A lone
 // real backend is the mux's primary; with two or more no one backend is.
@@ -142,6 +160,15 @@ func buildBackendAdapters(cfg *gateway.Config, metrics *gateway.Metrics, log *sl
 			// allowlist still decides who is served.
 			sl.SetTestUsers(cfg.SlackTestUsers)
 			adapters[backend] = sl
+		case gateway.BackendTeams:
+			tm, err := gateway.NewTeamsAdapter(cfg.TeamsRelayURL, cfg.TeamsTokenPath, cfg.TeamsTenantID, cfg.TeamsAdaptiveCards, log)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", backend, err)
+			}
+			// The allowlist, so a sender listed by either of their ids is
+			// handed over under the listed one; the gateway still decides.
+			tm.SetAllowedUsers(cfg.TeamsAllowedUsers, cfg.TeamsAllowAllUsers)
+			adapters[backend] = tm
 		case gateway.BackendDiscord:
 			dc, err := gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 			if err != nil {
@@ -210,6 +237,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		lib.WithLogger(log),
 		lib.WithAgreementPolicy(gateway.SupervisorAgreement(cfg)),
 		lib.WithNATSOptions(natsOpts...),
+		// Unset until the operator renders it from the latched profile
+		// supervisor form (#5301); a malformed value reads as unset.
+		lib.WithProfileSupervisorCutoff(lib.ProfileSupervisorCutoffFromEnv(os.Getenv, log)),
 	)
 	if err != nil {
 		log.Error("nats connect", "err", err)
@@ -254,14 +284,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// beside any backend or alone, routed by its own key prefix, its
 	// callers resolved through its own map. See a2a/gateway/a2adoor.go.
 	if cfg.A2ADoorArmed() {
-		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
-			PublicURL:          cfg.A2ADoorPublicURL,
-			DefaultAddressee:   cfg.DefaultAddressee,
-			TaskDeadline:       cfg.TaskDeadline,
-			GoogleClientID:     cfg.A2ADoorGoogleClientID,
-			GoogleAllowedUsers: cfg.A2ADoorAllowedUsers,
-			Logger:             log,
-		})
+		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, a2aDoorOptions(cfg, log))
 		if err != nil {
 			log.Error("A2A door", "err", err)
 			return err
@@ -463,6 +486,18 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 			return nil
 		}
 		n.SetConversations(conversations(slack))
+		return n
+	}
+	if teams, ok := backend.(*gateway.TeamsAdapter); ok {
+		if cfg.TeamsHomeChannel == "" {
+			log.Warn("chat.notify home posts not armed: no Teams home channel configured; conversation posts are")
+		}
+		n, err := gateway.NewTeamsNotifier(teams, cfg.TeamsHomeChannel, log)
+		if err != nil {
+			log.Error("chat.notify route not armed", "err", err)
+			return nil
+		}
+		n.SetConversations(conversations(teams))
 		return n
 	}
 	gchat, ok := backend.(*gateway.GoogleChatAdapter)

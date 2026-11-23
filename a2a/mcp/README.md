@@ -4,9 +4,9 @@ A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one ins
 
 It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
-## Turn it on
+## Turning it off
 
-The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's, which the chart sets from `operator.mcpServer.enabled`. With it set, the operator renders, beside the console server:
+The server runs by default beside the console server:
 
 - `<agent>-a2a-mcp`: a Deployment running `/mcp` from the `a2a-console` image, and a ClusterIP Service on port 8089;
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;
@@ -14,7 +14,7 @@ The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator
 
 The operator also renders the server's ServiceAccount, `<agent>-a2a-mcp`, and its token Secret, `<agent>-a2a-mcp-token`. If either name is already taken by an object the operator does not control, the server is not rendered and the PlatformAgent carries the `A2AMCPServer` condition ([conditions](../../docs/site/src/content/docs/operator/platformagent-crd.md)).
 
-Unset the flag and all of it is removed, the token included.
+Set `operator.mcpServer.enabled: false` in the chart (or `A2A_MCP_DOOR=false` on the operator) to turn it off; all of its objects are removed, the token included.
 
 ## Connect a client
 
@@ -100,6 +100,8 @@ The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear
 Both go into the console frame as the gateway's `ConsoleInFrame` reads them (`addressee`, `parameters`). Without them the frame is the same as before. An `addressee` is refused on a stop word, a bare `/feedback` or `/feedback summary`, and any `/session` text, a message after it included, since those are commands for the conversation rather than tasks. An addressed turn is a new task for the profile, never a session. Everything else is the gateway's to check: it refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards on `DIRECTORY` by profile.
 
 The gateway publishes a profile's task on `a2a.submit`, which the console account can't read, so the turn can't find its task from the submission the way a plain turn does. Instead, the gateway's status line for a profile turn (`⏳ submitted…`) names the task, the profile it went to and the inbound frame whose turn started it (`taskId`, `addressee`, `inReplyTo`). The turn takes only the line that answers its own frame, so another turn's line on the same conversation (an earlier turn's that came late, or another client's) is not taken for it, and follows that task's events and terminal on `TASKS`, as it follows its own. A turn still running when the wait ends returns the task as `<profile>/<task-id>`. Read it with `task_control get` under that reference, which always resolves. A bare task id resolves only while this server still holds the task as running, since otherwise it is looked up from the task's submission, which the console can't see.
+
+On an install with `A2A_PROFILE_SUPERVISOR_CUTOFF` set, a task is read as a profile task when its addressee has a live agent card, unless one of this server's turns learned its kind. That covers any typed `<addressee>/<task-id>` reference to a task no turn learned, so an old session task whose name a profile has since taken reads as still running if its gateway terminal was stored after the cutoff.
 
 Two known limits:
 

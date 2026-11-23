@@ -466,8 +466,9 @@ or more than one namespace match could change the answer, and kept in `changed_p
 path narrows the namespace matches and never empties them, and a diff it cannot read whole, or one with
 no file naming the workload, is said as `the workload's files unknown` in `sync_state`), asking the broker
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
-object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
-`sync_state`. Once applied it records `applied_at` and the Ready pods' restart counts
+object the fix adds, by the `applied` probe its kind's `recipe.yaml` declares (`fix_recipes/probes.py`; for
+`no-pdb`, `object_present`: a PodDisruptionBudget selecting the workload). The reading goes in
+`sync_state`. A kind whose recipe declares `health: none` holds no health window: its record passes on the run after it is applied, and a workload is read only when the record names one, for the `object_present` match. Once applied it records `applied_at` and the Ready pods' restart counts
 (`health_baseline`), with the counts of pods not Ready yet kept apart (`~`-prefixed keys) so a restart from
 before the apply is never counted. Every later run reads the workload again: the first reading that is not healthy fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings, each on its own run, with the last one past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under `HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod of the workload (other than one being deleted, or one that has ended in phase `Failed` or `Succeeded`, such as an evicted pod) is Ready, and no container, sidecars and init containers included, restarted past its baseline or was OOMKilled since the apply. A workload scaled to zero replicas is healthy with no pods. A rollout or scale still under way, or a pod that was not Ready at the apply and is still starting, is not settled rather than red: the run waits and the count starts again. A pod that was Ready at the apply, or has been seen Ready since (it then joins `health_baseline`), and is not Ready fails it, even while another pod is starting. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the reason in `health_detail` and the time in `health_at`. A workload that is gone, an unreadable restart baseline or an unreadable apply time fails at once with the reason. Any other read failure is kept, resets the count and is retried. From `HEALTH_SETTLE_LIMIT` (30 minutes) past the window, a run whose own reading is not settled, or fails, fails it as not settled; a healthy reading still counts.
 
@@ -537,7 +538,10 @@ eight days.
 fix and environment, as a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its
 thresholds (`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A table
 that does not exist yet answers an empty list; a table missing a column the count needs, or a database
-that cannot be read, answers `503`.
+that cannot be read, answers `503`. The Decision Memory sweep (`github_scan_gate.py`'s
+`sweep_memory_proposals`) also reads `post_merge_records` directly from Session KV's SQLite file
+(`SESSION_KV_DB_PATH`) when evaluating post-merge soak outcomes for remediation pull requests, and
+falls back to forge merge soak and diff inspection when no verified `post_merge_records` outcome exists.
 
 #### `incidents`
 

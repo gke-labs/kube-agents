@@ -106,6 +106,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
 	nats := buildA2ANATSStatefulSet(agent, "c")
 	provision := buildA2AProvisionJob(agent)
+	provisionThird := a2aProvisionJobForm(agent, true)
 	// The bus migration's pin and unpin Jobs share one builder, its
 	// snapshot, restore and rollback pods another, and its hashing pod a
 	// third; none mounts the agent's claim.
@@ -130,6 +131,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
 		{"buildA2ACuratorDeployment", a2aCurator.Name, a2aCurator.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
+		{"a2aProvisionJobForm", provisionThird.Name, provisionThird.Spec.Template.Spec},
 		{"buildBusMigrationJob", busPin.Name, busPin.Spec.Template.Spec},
 		{"buildBusStreamPod", busRestore.Name, busRestore.Spec},
 		{"buildBusHashPod", busHash.Name, busHash.Spec},

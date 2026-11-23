@@ -41,10 +41,14 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
+      # Every build goes through .github/scripts/cloud_build_submit.sh, which runs
+      # `gcloud builds submit` and submits once more when BuildKit died on
+      # "flightcontrol: exceeded retry timeout" (#3911). Any other failure still
+      # fails the step.
       - name: Build and Push Platform Agent (GCP Cloud Build)
         id: gcp-platform
         run: |
-          gcloud builds submit \
+          .github/scripts/cloud_build_submit.sh \
             --config=deploy/docker/cloudbuild.yaml \
             --substitutions="_IMAGE_URI=$GCP_REGISTRY/platform-agent:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_BUILDCACHE_URI=$GCP_REGISTRY/platform-agent:buildcache,_KUBE_AGENTS_VERSION=$GITHUB_SHA" \
             .
@@ -54,7 +58,7 @@ jobs:
       - name: Build and Push Replay Proxy (GCP Cloud Build)
         id: gcp-replay-proxy
         run: |
-          gcloud builds submit examples/inference-replay/replay-proxy \
+          .github/scripts/cloud_build_submit.sh examples/inference-replay/replay-proxy \
             --tag="$GCP_REGISTRY/replay-proxy:$GITHUB_SHA"
           gcloud artifacts docker tags add \
             "$GCP_REGISTRY/replay-proxy:$GITHUB_SHA" \
@@ -65,7 +69,7 @@ jobs:
       - name: Build and Push Credential Sidecar (GCP Cloud Build)
         id: gcp-credential-proxy
         run: |
-          gcloud builds submit \
+          .github/scripts/cloud_build_submit.sh \
             --config=deploy/docker/cloudbuild.yaml \
             --substitutions="_IMAGE_URI=$GCP_REGISTRY/credential-proxy:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_BUILDCACHE_URI=$GCP_REGISTRY/credential-proxy:buildcache" \
             .
@@ -75,7 +79,7 @@ jobs:
       - name: Build and Push Kube Proxy (GCP Cloud Build)
         id: gcp-kube-proxy
         run: |
-          gcloud builds submit \
+          .github/scripts/cloud_build_submit.sh \
             --config=deploy/kube-proxy/cloudbuild.yaml \
             --substitutions="_IMAGE_URI=$GCP_REGISTRY/kube-proxy:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/kube-proxy:latest,_KUBE_AGENTS_VERSION=$GITHUB_SHA" \
             .
@@ -85,7 +89,7 @@ jobs:
       - name: Build and Push Agent Sandbox (GCP Cloud Build)
         id: gcp-agent-sandbox
         run: |
-          gcloud builds submit \
+          .github/scripts/cloud_build_submit.sh \
             --config=deploy/sandbox/cloudbuild.yaml \
             --substitutions="_IMAGE_URI=$GCP_REGISTRY/agent-sandbox:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/agent-sandbox:latest" \
             .
@@ -95,7 +99,7 @@ jobs:
       - name: Build and Push Pubsub Platform Plugin (GCP Cloud Build)
         id: gcp-pubsub-platform
         run: |
-          gcloud builds submit agentplugins/pubsub-platform \
+          .github/scripts/cloud_build_submit.sh agentplugins/pubsub-platform \
             --tag="$GCP_REGISTRY/pubsub-platform:$GITHUB_SHA"
           gcloud artifacts docker tags add \
             "$GCP_REGISTRY/pubsub-platform:$GITHUB_SHA" \
@@ -106,7 +110,7 @@ jobs:
       - name: Build and Push GKE Stockout Investigator Plugin (GCP Cloud Build)
         id: gcp-stockout-investigator
         run: |
-          gcloud builds submit agentplugins/gke-stockout-investigator \
+          .github/scripts/cloud_build_submit.sh agentplugins/gke-stockout-investigator \
             --tag="$GCP_REGISTRY/gke-stockout-investigator:$GITHUB_SHA"
           gcloud artifacts docker tags add \
             "$GCP_REGISTRY/gke-stockout-investigator:$GITHUB_SHA" \
@@ -116,6 +120,18 @@ jobs:
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # Refresh the registry login just before signing (#6447). cosign is the
+      # only reader of the docker login above (every push happens inside
+      # Cloud Build, and tags go through gcloud), and that login holds a
+      # one-hour access token. When the builds run long, signing starts after
+      # it has expired: signing fails UNAUTHORIZED and the remaining images
+      # stay unsigned. gcloud itself is unaffected, because it reads the auth
+      # step's credentials file, which refreshes; so log docker in again with a
+      # token gcloud mints now. The token goes over stdin, never into argv or
+      # the log.
+      - name: Refresh the registry login for signing
+        run: gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://us-docker.pkg.dev
 
       - name: Sign the images
         env:

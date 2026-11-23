@@ -1471,9 +1471,13 @@ spec:
             - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway,system:serviceaccount:kubeagents-system:platformagent-a2a-mcp
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
+            - name: CREDENTIAL_PROXY_MCP_AUDIENCE
+              value: kubeagents-credential-proxy-mcp
+            - name: CREDENTIAL_PROXY_MCP_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-mcp
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
             - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
@@ -1713,6 +1717,9 @@ spec:
         - podSelector:
             matchLabels:
               app: platformagent-a2a-gateway
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-mcp
       ports:
         - port: 8765
           protocol: TCP
@@ -3029,7 +3036,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "9841d88bd24b3a94",
+      "version": "a061086025c30f47",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3114,6 +3121,7 @@ data:
               "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
               "chat.notify.gchat",
               "chat.notify.slack",
+              "chat.notify.teams",
               "chat.notify.console",
               "_INBOX.agent.>"
             ],
@@ -3203,10 +3211,12 @@ data:
               "chat.console.*.confirm",
               "chat.notify.gchat",
               "chat.notify.slack",
+              "chat.notify.teams",
               "chat.notify.console",
               "chat.board.reply.gateway.>",
               "a2a.trigger.*.submit",
               "a2a.trigger.*.status",
+              "a2a.trigger.*.stop",
               "chat.incident.reply.gateway.>",
               "_INBOX.gateway.>"
             ],
@@ -3261,7 +3271,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 9841d88bd24b3a94
+    kubeagents.x-k8s.io/a2a-authmap-version: a061086025c30f47
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3840,6 +3850,7 @@ stringData:
           { stream: { account: APP, subject: "a2a.cap.verify.*" } }
           { stream: { account: APP, subject: "chat.notify.gchat" } }
           { stream: { account: APP, subject: "chat.notify.slack" } }
+          { stream: { account: APP, subject: "chat.notify.teams" } }
           { stream: { account: APP, subject: "chat.notify.console" } }
           { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
           { stream: { account: APP, subject: "chat.incident.reply.gateway.>" } }
@@ -3942,10 +3953,12 @@ stringData:
                   "chat.console.*.confirm",
                   "chat.notify.gchat",
                   "chat.notify.slack",
+                  "chat.notify.teams",
                   "chat.notify.console",
                   "chat.board.reply.gateway.>",
                   "a2a.trigger.*.submit",
                   "a2a.trigger.*.status",
+                  "a2a.trigger.*.stop",
                   "chat.incident.reply.gateway.>",
                   "_INBOX.gateway.>"
                 ]
@@ -4170,6 +4183,7 @@ stringData:
           { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
           { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
           { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+          { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
           { stream: "chat.notify.console", accounts: [ TRUSTED ] }
           { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
           { stream: "chat.incident.reply.gateway.>", accounts: [ TRUSTED ] }
@@ -4965,6 +4979,9 @@ spec:
             matchLabels:
               app.kubernetes.io/part-of: a2a-next
               kubeagents.x-k8s.io/a2a-component: seed
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-mcp
       ports:
         - port: 4222
           protocol: TCP
@@ -5159,6 +5176,31 @@ spec:
   policyTypes:
     - Ingress
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp-netpol
+  name: platformagent-a2a-mcp-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-mcp
+  policyTypes:
+    - Ingress
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5302,6 +5344,230 @@ status:
   loadBalancer: {}
 ---
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  token: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp-token
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-mcp
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: platformagent-a2a-mcp
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: mcp
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - command:
+            - /mcp
+          env:
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: MCP_BUS_USER
+              value: console-mcp
+            - name: MCP_BUS_PASSWORD_FILE
+              value: /var/run/secrets/a2a-mcp-bus/console-mcp-password
+            - name: MCP_TOKEN_FILE
+              value: /var/run/secrets/a2a-mcp/token
+            - name: MCP_LISTEN
+              value: :8089
+            - name: MCP_AGENT_NAME
+              value: platformagent
+            - name: MCP_NAMESPACE
+              value: kubeagents-system
+            - name: GOMEMLIMIT
+              value: "228170137"
+            - name: A2A_MCP_BROKER_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: A2A_MCP_BROKER_TOKEN_FILE
+              value: /var/run/secrets/a2a-mcp-broker/token
+          image: ghcr.io/gke-labs/kube-agents/a2a-console:latest
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /healthz
+              port: 8089
+            periodSeconds: 10
+          name: mcp
+          ports:
+            - containerPort: 8089
+              name: http
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8089
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 64Mi
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 64Mi
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          startupProbe:
+            failureThreshold: 60
+            httpGet:
+              path: /healthz
+              port: 8089
+            periodSeconds: 5
+          volumeMounts:
+            - mountPath: /var/run/secrets/a2a-mcp-bus
+              name: bus-key
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-mcp
+              name: mcp-token
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-mcp-broker
+              name: mcp-broker-token
+              readOnly: true
+          workingDir: /
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-mcp
+      volumes:
+        - name: bus-key
+          secret:
+            items:
+              - key: console-mcp-password
+                mode: 288
+                path: console-mcp-password
+            secretName: platformagent-a2a-nats-creds
+        - name: mcp-token
+          secret:
+            items:
+              - key: token
+                mode: 288
+                path: token
+            secretName: platformagent-a2a-mcp-token
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+        - name: mcp-broker-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-mcp
+                  expirationSeconds: 3600
+                  path: token
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: http
+      port: 8089
+      targetPort: 8089
+  selector:
+    app: platformagent-a2a-mcp
+  type: ClusterIP
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   labels:
@@ -5340,7 +5606,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "39"
+    pods: "40"
 status: {}
 ---
 apiVersion: v1
