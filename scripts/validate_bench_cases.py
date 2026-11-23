@@ -376,14 +376,14 @@ FIXTURE_NOT_READY = {
         "$9 an hour standing or about $7 a run on a per-run cluster"
     ),
     # A check that reads a command for --chunk-size=0 names a shape that live
-    # tests do not show as the fault: a lister with a pause did no harm with
-    # pages or with none, and a flood slowed a second client with pages too,
-    # about half as much in the one matched pair. A fixture for the measured
-    # harm needs listers at a rate that slows a cluster, which a shared fleet
-    # cluster may not carry; a check on real requests also needs a record of
-    # them there (API server logs; Data Access audit logs were not tested).
-    # Not tried, so the cost is a judgment. #5413 owns the gap; its text
-    # predates the tests.
+    # tests do not show as the fault: a lister with a pause did little or no
+    # harm with pages or with none, and a flood slowed a second client with
+    # pages too, about half as much in the one matched pair. A fixture for the
+    # measured harm needs listers at a rate that slows a cluster, which a
+    # shared fleet cluster may not carry; a check on real requests also needs
+    # a record of them there (API server logs; Data Access audit logs were not
+    # tested). Not tried, so the cost is a judgment. #5413 owns the gap; its
+    # text predates the tests.
     "control-plane-unpaginated-heavy-list-oom": (
         "#5413: a fixture needs listers at a rate that slows a cluster, which a shared fleet "
         "cluster may not carry, and for a check on real requests a record of them there; live "

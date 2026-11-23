@@ -1,6 +1,6 @@
 # Control plane, setup, cost and CLI (gce-compute-fleet-audit): programs list
 # every object of a large type cluster-wide, again and again, and the API
-# server slows down for other clients. Parked as FIXTURE_NOT_READY
+# server answers other clients more slowly. Parked as FIXTURE_NOT_READY
 # (gke-labs/kube-agents#5413, which proposes `apiserver-heavy-list-call`): the
 # tests below do not show the shape of the first plan, a command with
 # `--chunk-size=0`, as the fault, and no kept record that is on by default
@@ -24,38 +24,43 @@
 # `limit`, or with `limit=500` page after page; no run used kubectl or
 # `--chunk-size=0`. The objects were ConfigMaps of 50 KiB, about 103 MB or
 # about 516 MB in one list. A second service account, in the listers' own
-# priority level and on their nodes, read one small object every 2 seconds;
-# the times below are its own unless a line says otherwise.
-# - A lister with a pause of 5 seconds between lists did not slow the second
-#   account. At 103 MB one lister of each form ran together: its median stayed
-#   at 0.021 s. At 516 MB, on a control plane that GKE had resized, one paged
-#   lister alone: 0.019 s to 0.020 s; one unpaged lister alone: 0.020 s to
-#   0.021 s.
+# priority level and on their nodes, read one small object every 2 seconds; it
+# is the one other client that the tests timed, and the times below are its
+# own unless a line says otherwise. The unpaged flood at 516 MB ran three
+# times; each other result is from one run.
+# - A lister with a pause of 5 seconds between lists slowed the second account
+#   little or not at all. At 103 MB one lister of each form ran together: its
+#   median stayed at 0.021 s. At 516 MB on a control plane that GKE had not
+#   resized, one of each form together: 0.022 s to 0.035 s, worst 0.145 s to
+#   1.1 s. At 516 MB on a control plane that GKE had resized, one paged lister
+#   alone: 0.019 s to 0.020 s; one unpaged lister alone: 0.020 s to 0.021 s.
 # - A flood of ten unpaged listers with no pause at 103 MB, beside those two:
 #   the second account's read went from a median of 0.012 s to 0.27 s by the
 #   API server's own timing; none failed; two requests of GKE's own components
 #   timed out in their queue.
-# - The unpaged flood at 516 MB ran three times. On a fresh cluster the API
-#   server gave no answer for about 5 minutes, 12 of the second account's 28
-#   reads timed out and 60 requests were refused; the last point below says
+# - The unpaged flood at 516 MB. On a cluster that GKE had not resized, the
+#   API server gave no answer for about 5 minutes, 12 of the second account's
+#   28 reads timed out and 60 requests were refused; the last point below says
 #   why that run cannot be put on the listers. On a second cluster, after GKE
-#   had resized it: 0.017 s to 0.555 s, worst 10.7 s, 4 requests refused. On a
-#   third, after GKE had resized it, with its paged counterpart back to back
-#   on the same objects: with no pages 226 lists, 0.020 s to 0.296 s, worst
-#   7.3 s; with pages 222 lists, 0.020 s to 0.140 s, worst 0.48 s; no request
-#   refused in either. So in the one matched pair the missing page limit about
-#   doubled the median delay and made the worst read about fifteen times
-#   longer; pages did not remove the delay.
+#   had resized it: 0.017 s to 0.555 s, worst 10.7 s, 4 requests refused (the
+#   object that the second account read was missing there, so its reads were
+#   answered 404). On a third, after GKE had resized it, with its paged
+#   counterpart back to back on the same objects: with no pages 226 lists,
+#   0.020 s to 0.296 s, worst 7.3 s; with pages 222 lists, 0.020 s to 0.140 s,
+#   worst 0.48 s; no request refused in either. So in the one matched pair the
+#   missing page limit about doubled the median delay and made the worst read
+#   about fifteen times longer; pages did not remove the delay.
 # - The API server's start time did not change during any of the five full
 #   runs, so none showed the out-of-memory kill of the first plan's text.
-# - About 516 MB of ConfigMaps alone, with no lister, kept a fresh control
-#   plane unstable for about 20 minutes: the controller manager's lease
-#   changed holder twice and the API server gave no answer for about 4
-#   minutes, until GKE resized the cluster by itself (operation
-#   RESIZE_CLUSTER). A second fresh cluster stalled for about 5 minutes under
-#   one lister of each form and was resized by GKE too; that operation's audit
-#   entry names no user. The cause was not read. So a stall at that size
-#   cannot be put on a lister without a control.
+# - With about 516 MB of ConfigMaps and no lister, a fresh control plane was
+#   unstable for about 20 minutes: the controller manager's lease changed
+#   holder twice and the API server gave no answer for about 4 minutes, until
+#   GKE resized the cluster by itself (operation RESIZE_CLUSTER). A second
+#   fresh cluster stalled for about 5 minutes under one lister of each form
+#   and was resized by GKE too; that operation's audit entry names no user.
+#   The cause was not read; that the data's size did it is an inference from
+#   one cluster. So a stall at that size cannot be put on a lister without a
+#   control.
 # What names the caller: no kept record that is on by default. The API
 # server's metrics have no label for one caller. Admin Activity audit logs
 # held the writes and no list. The API server's page of its request queues
@@ -68,16 +73,16 @@
 # aren't written unless explicitly enabled" (GKE, audit logging); not tested.
 # So a check that reads a command for `--chunk-size=0` names a shape that the
 # tests do not show as the fault: the page limit changed the size of the harm
-# in the one matched pair, and it was neither needed for the harm nor enough
-# to prevent it; a suspended CronJob lists nothing at all (fixture rule 9).
-# What a correct check would name, which rate and which size, is not settled.
-# A fixture for the measured harm needs listers at a rate that slows a
-# cluster, which a shared fleet cluster may not carry, and a check on real
-# requests needs a record of them on that cluster. That fixture is not tried,
-# so its cost is a judgment and not a reading. Nothing is planted. The
-# objective below keeps the form of the first plan, a finding that names
-# CronJob `legacy-inventory-poller`, which is in no fleet file; the pull
-# request that brings a fixture rewrites it, and the un-park pull request
+# in the one matched pair; a missing page limit was not needed for the harm,
+# and a page limit did not prevent it; a suspended CronJob lists nothing at
+# all (fixture rule 9). What a correct check would name, which rate and which
+# size, is not settled. A fixture for the measured harm needs listers at a
+# rate that slows a cluster, which a shared fleet cluster may not carry, and a
+# check on real requests needs a record of them on that cluster. That fixture
+# is not tried, so its cost is a judgment and not a reading. Nothing is
+# planted. The objective below keeps the form of the first plan, a finding
+# that names CronJob `legacy-inventory-poller`, which is in no fleet file; the
+# pull request that brings a fixture rewrites it, and the un-park pull request
 # restores the lines `suite: validated-capabilities` and `suite_part: 2`.
 # `expected_fail` stays. `fixtures: []`: the run plants nothing and reads no
 # fixture, so no fixture's drift may excuse it; no safeguard reads a fixture
@@ -97,11 +102,11 @@ prompt: >-
 expected_output: >-
   Parked. Customer failure, as live tests showed it: a flood of cluster-wide
   lists slowed a second client of the listers' own priority level, with pages
-  less than with none; one lister with a pause did not. Validated needs a
-  fixture with listers at a rate that slows a cluster and, for a check on real
-  requests, a record of them; the present objective accepts a finding that
-  names CronJob `legacy-inventory-poller`. The closing response is the SOP's
-  one line with the ledger URL.
+  less than with none; one lister with a pause slowed it little or not at all.
+  Validated needs a fixture with listers at a rate that slows a cluster and,
+  for a check on real requests, a record of them; the present objective accepts
+  a finding that names CronJob `legacy-inventory-poller`. The closing response
+  is the SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
 validated: false
