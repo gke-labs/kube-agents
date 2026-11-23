@@ -3447,14 +3447,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
 	// A chat thread's kept reports are forgotten once this turn is on the
 	// bus (below), not here: a publish that fails leaves them for the retry.
-	threadReportsRead := 0
+	var threadReportRead uint64
 	if ts.Role == "" {
-		if report, n, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+		if report, seq, ok := g.relayedReport(rec, ts.ReplyTo); ok {
 			if part, err := lib.PushedReportPart(report); err != nil {
 				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
 			} else {
 				extra = append(extra, part)
-				threadReportsRead = n
+				threadReportRead = seq
 			}
 		}
 	}
@@ -3626,11 +3626,12 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 		return "", false
 	}
-	if threadReportsRead > 0 {
+	if threadReportRead > 0 {
 		// The turn under the thread's newest report is on the bus: the
-		// reports it read are forgotten, so the next turn there is not under
-		// a report it was not about; one kept during the publish stays.
-		g.reports.forgetUpTo(rec.Key, threadReportsRead)
+		// reports through the one it read are forgotten, so the next turn
+		// there is not under a report it was not about; one kept during the
+		// publish stays, at the cap too.
+		g.reports.forgetThrough(rec.Key, threadReportRead)
 	}
 
 	// The submission is on the subject now, which is the first moment
