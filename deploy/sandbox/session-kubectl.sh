@@ -19,15 +19,13 @@
 # against <agent>-kube-proxy, in steps:
 #   1. the kubeconfig context is ensured, as before;
 #   2. kubectl runs under the memory admission (deploy/sandbox/kubectl-admit.py),
-#      which execs it, or runs it as its child for a read it charges, so the
-#      admission's exit code is kubectl's. It runs as this script's child, not
-#      exec'd, so steps after it see the exit code. It runs in the foreground:
-#      a background job's stdin would be /dev/null, and `kubectl apply -f -`
-#      reads stdin. A stop reaches it anyway: the worker adapter signals the
-#      harness's whole process group. On a session pod the admission never
-#      refuses a command for being busy (KUBECTL_ADMIT_ON_BUSY=run); it refuses
-#      only a read larger than the pod could ever hold;
-#   3. post-run steps, if any, read the exit code here.
+#      exec'd, so a signal sent to this pid reaches it. The admission in turn
+#      execs kubectl, or, for a read it charges, runs kubectl as its child and
+#      forwards TERM, INT and HUP to it; either way its exit code is kubectl's.
+#      On a session pod it never refuses a command for being busy
+#      (KUBECTL_ADMIT_ON_BUSY=run); it refuses only a read larger than the pod
+#      could ever hold. A step that needs kubectl's exit code afterwards runs
+#      the admission as a child instead, only where that step can fire.
 # The wrapper exits with kubectl's code.
 #
 # Without KUBE_PROXY_URL, a broker URL sends kubectl to the broker (a profile
@@ -47,10 +45,8 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
     fi
     ;;
   esac
-  KUBECTL_ADMIT_RUN_DIR=/tmp/kube-agents-session KUBECTL_ADMIT_GUARD_PATH=/usr/local/libexec/shell-memory-guard KUBECTL_ADMIT_ON_BUSY=run \
-    python3 -I /usr/local/libexec/kubectl-admit "$@"
-  rc=$?
-  exit "$rc"
+  export KUBECTL_ADMIT_RUN_DIR=/tmp/kube-agents-session KUBECTL_ADMIT_GUARD_PATH=/usr/local/libexec/shell-memory-guard KUBECTL_ADMIT_ON_BUSY=run
+  exec python3 -I /usr/local/libexec/kubectl-admit "$@"
 fi
 if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then
   exec "$CLIENT" kubectl "$@"

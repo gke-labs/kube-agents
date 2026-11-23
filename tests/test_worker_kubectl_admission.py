@@ -34,7 +34,7 @@ SETTINGS = ("KUBECTL_ADMIT_RUN_DIR", "KUBECTL_ADMIT_GUARD_PATH", "KUBECTL_ADMIT_
 # Prints which stub ran, its arguments and the admission's settings, as one JSON line.
 STUB = """#!{python}
 import json, os, sys
-print(json.dumps({{"ran": {name!r}, "argv": sys.argv[1:],
+print(json.dumps({{"ran": {name!r}, "argv": sys.argv[1:], "pid": os.getpid(),
                   "env": {{k: os.environ.get(k) for k in {settings!r}}}}}))
 sys.exit(int(os.environ.get("STUB_RC", "0")))
 """
@@ -106,6 +106,17 @@ class WorkerWrapperTest(unittest.TestCase):
                                      capture_output=True, text=True, timeout=30)
                 self.assertEqual(out.returncode, rc)
                 self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["ran"], "admit")
+
+    def test_the_admission_runs_in_the_wrappers_own_process(self):
+        # exec'd, not a child: a signal sent only to the wrapper's pid (a backgrounded
+        # port-forward or `logs -f`) reaches the admission, and through it kubectl.
+        base = {"PATH": self.path, "HOME": str(self.home), "KUBE_PROXY_URL": PROXY}
+        proc = subprocess.Popen(["/bin/sh", str(self.wrapper), "get", "ns"], env=base,
+                                stdout=subprocess.PIPE, text=True)
+        out, _ = proc.communicate(timeout=30)
+        got = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(got["ran"], "admit")
+        self.assertEqual(got["pid"], proc.pid)
 
     def test_without_a_kube_proxy_the_broker_runs_kubectl_and_the_admission_never_does(self):
         got = self.run_wrapper({"CREDENTIAL_PROXY_URL": "http://broker"}, "get", "pods", "-A")
