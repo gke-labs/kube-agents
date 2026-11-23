@@ -10192,6 +10192,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             self.assertIn("Tool 'gke-gcloud-auth-plugin' is still missing", proc.stderr + proc.stdout)
 
 
+# How the error banner names the log's tee when that is the command it blames.
+_TEE_NAMED_IN_BANNER = '): tee "'
+
+
 class RunLifecycleApplyTrapTest(unittest.TestCase):
     """Verifies that run_lifecycle_apply does not trigger duplicate ERR traps or
     misleading 'tee' error banners when lifecycle.sh fails (#1298)."""
@@ -10315,6 +10319,9 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
     def _wait_for(self, condition, what, proc):
         deadline = time.monotonic() + _INSTALLER_RUN_TIMEOUT_SECONDS
         while not condition():
+            # A run that ended cannot meet the condition later: say so at once.
+            if proc.poll() is not None and not condition():
+                raise AssertionError(f"{what}: the run ended with {proc.returncode} first")
             if time.monotonic() > deadline:
                 os.killpg(proc.pid, signal.SIGKILL)
                 raise AssertionError(f"{what} within {_INSTALLER_RUN_TIMEOUT_SECONDS}s")
@@ -10400,7 +10407,7 @@ run_lifecycle_apply "{repo_dir}" "{log_file}"
         # other apply that exits non-zero is.
         self.assertEqual(returncode, 1, stderr)
         self.assertIn("(exit code 1): ./lifecycle.sh apply -auto-approve -input=false", stderr)
-        self.assertNotIn("tee ", stderr)
+        self.assertNotIn(_TEE_NAMED_IN_BANNER, stderr)
 
     def test_a_failure_inside_a_sourced_library_names_its_file_and_function(self):
         """The abort banner points at the frame that failed.
