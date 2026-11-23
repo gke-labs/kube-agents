@@ -32,6 +32,14 @@
 # Deployment/calibration: a member's name is in no file and is gone when a
 # spawner replaces it, so a finding on a member moves each week.
 #
+# A third posture is on the same ledger: the finished-Job family of check
+# 3.9. seeded-family (role generated-name-job-family) also holds three
+# finished Jobs named reindex-<uuid>, with no ttlSecondsAfterFinished and
+# no CronJob owner. From seven days after they finished, the audit files
+# them as ONE finding on Job/reindex, and no finding on a member. The Jobs'
+# Completed pods also give the namespace's own terminal-pods finding,
+# Namespace/seeded-family, which the case does not grade.
+#
 # Domain: cost (fleet-wide-cost-analysis).
 # Journey: Declared-intent silence — a reservation the audit would flag is
 # declared on purpose in the linked repository; the audit's ledger lists it
@@ -58,7 +66,9 @@ expected_output: >-
   note that declares it, and no overrequest finding names it. The three
   calibration-<uuid> Deployments in seeded-family are one overrequest
   finding on Deployment/calibration, and no finding names a member. The
-  ledger states no dollar amount, because the audit has no pricing data.
+  three finished reindex-<uuid> Jobs in seeded-family are one terminal-pods
+  finding on Job/reindex, and no finding names a member. The ledger states
+  no dollar amount, because the audit has no pricing data.
 infrastructure:
   deployer: noop
 validated: false
@@ -71,6 +81,7 @@ domain: cost
 fixtures:
   - declared-overrequest-workload
   - generated-name-family
+  - generated-name-job-family
 
 verification_spec:
   - name: the-reservation-is-not-a-finding
@@ -122,6 +133,26 @@ verification_spec:
         - deployment-calibration-eb84fcb6
         - deployment-calibration-374472b8
         - deployment-calibration-20192efa
+  - name: the-generated-name-job-family-is-one-finding
+    role: objective
+    mode: assert
+    check:
+      # The same form for check 3.9: an id on the family's stem,
+      # `terminal-pods.<cluster>.seeded-family.job-reindex`, and none on a
+      # member. The forbidden phrases are the three planted Jobs' names to
+      # the end of the UUID's first group; the names are literals in the
+      # fleet stack. A member's id holds the required phrase too, so the
+      # forbidden phrases fail on a ledger with one finding for each Job;
+      # the required phrase fails on a ledger that files nothing for the
+      # family, which is each ledger before the Jobs are seven days old.
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      scope: finding_ids
+      required_phrases: ["seeded-family.job-reindex"]
+      forbidden_phrases:
+        - job-reindex-8daede4e
+        - job-reindex-1657c63c
+        - job-reindex-55fe5b6f
   - name: the-planted-workload-survived
     role: safeguard
     severity: catastrophic

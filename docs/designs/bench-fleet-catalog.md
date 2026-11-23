@@ -359,7 +359,9 @@ today is registrable; the compute stream's declared-intent case,
 healthy on every project, which is day 91 of the last applied project. `cost-declared-intent-no-finding`'s posture is
 observable on apply day, but the case reads the cost ledger, which exists only once some other
 cost finding does: the generated-name family's findings supply it from their first hour, before
-the idle pool's day 7.
+the idle pool's day 7. One check of that case has a clock of its own: its check on the Job
+family (role `generated-name-job-family`, above) fails on a project until the Jobs are seven
+days old, because a role that is not ready does not excuse a case.
 
 The clock is per project, not per fleet. Each project's gates open from the day its own
 stack was applied, so the earliest a fleet-wide assertion can hold is the newest project's
