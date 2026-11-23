@@ -542,11 +542,14 @@ def empty_record() -> dict:
     record shape (new_record there), so the artifact reads the same on either
     forge; scripts/test_ci_gitlab_forge.py pins the two equal. The stack_files
     lists stay empty here: the GitLab path deletes no file a stack planted, and
-    the one stack that plants one writes to GitHub only."""
+    the one stack that plants one writes to GitHub only. So do the steady_files
+    lists: the post-merge fixture's budget lives in the GitHub repository Config
+    Sync reads."""
     return {
         "open_before": 0, "kept_open": [], "labelled": [], "closed": [], "unclosed": [],
         "branches_before": 0, "deleted": [], "undeleted": [], "kept_branches": [],
         "stack_files_deleted": [], "stack_files_undeleted": [], "stack_files_kept": [],
+        "steady_files_restored": [], "steady_files_unrestored": [],
         "open_after": None, "branches_after": None, "clean": False,
     }
 
