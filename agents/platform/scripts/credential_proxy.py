@@ -849,6 +849,10 @@ WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
 # rather than relayed in part.
 WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
+WATCHER_K8S_TIMEOUT_CODE = "UPSTREAM_TIMEOUT"
+WATCHER_K8S_TIMEOUT_ERROR = "the API server did not answer within the relay deadline"
+WATCHER_K8S_UNRELAYABLE_CODE = "UPSTREAM_UNRELAYABLE"
+WATCHER_K8S_UNRELAYABLE_ERROR = "the upstream answer could not be relayed"
 # The header the shim's get-credentials check sends on its one relay read
 # (credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, held equal by a test).
 # It only narrows: with it, a clusters-get for a cluster that
@@ -17113,8 +17117,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         credential. `watcher_policy.evaluate_k8s` is the table. A watch is
         streamed through as the API server sends it. A Pod's metadata is read
         whole and relayed as its projection (`project_pod_metadata`).
-        Everything else is streamed too, with the Cloud API relay's deadline
-        on each read.
+        Everything else is read whole under the Cloud API relay's total
+        deadline and response cap before headers are sent.
         """
         request_id = str(uuid.uuid4())
         if self.command != watcher_policy.METHOD_GET:
@@ -17202,25 +17206,36 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         authorization = self._relay_authorization("watcher k8s", request_id)
         if authorization is None:
             return
-        read_timeout = WATCHER_WATCH_READ_TIMEOUT_S if watching else API_RELAY_DEADLINE_S
         # Built inside the try: a cached CA that will not load is a TLS failure
         # like any other, answered 502 and forgotten, not an unanswered request.
         connection: http.client.HTTPConnection | None = None
         started = time.monotonic()
+        deadline = started + API_RELAY_DEADLINE_S
         answered = False
         # The API server's status line arrived: the cached host and CA reached
         # it, so a failure after this point is not theirs to be forgotten for.
         upstream_answered = False
         try:
             connection = self._watcher_k8s_connection(host, ca_pem)
-            connection.connect()
-            connection.sock.settimeout(read_timeout)
+            try:
+                connection.connect()
+            except TimeoutError as exc:
+                raise ApiRelayConnectTimeout(
+                    f"connect to {host} did not complete in {API_RELAY_CONNECT_TIMEOUT_S}s"
+                ) from exc
+            sock = connection.sock
+            sock.settimeout(
+                WATCHER_WATCH_READ_TIMEOUT_S if watching else GoogleApiRelay._remaining(deadline)
+            )
             target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
             connection.putrequest(watcher_policy.METHOD_GET, target_path, skip_accept_encoding=True)
             connection.putheader("Authorization", authorization)
             if accept:
                 connection.putheader("Accept", accept)
             connection.endheaders()
+            sock.settimeout(
+                WATCHER_WATCH_READ_TIMEOUT_S if watching else GoogleApiRelay._remaining(deadline)
+            )
             response = connection.getresponse()
             upstream_answered = True
             if HTTPStatus.MULTIPLE_CHOICES <= response.status < HTTPStatus.BAD_REQUEST:
@@ -17230,29 +17245,57 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
                 )
                 return
-            if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
-                # Read whole and projected: the Pod's ObjectMeta carries every
-                # annotation and managedFields, and only the owner lookup's
-                # fields leave the broker. A non-200 answer is the API server's
-                # Status, which carries no Pod data, and is relayed as it is.
-                body = response.read(WATCHER_POD_METADATA_MAX_BYTES + 1)
-                if len(body) > WATCHER_POD_METADATA_MAX_BYTES:
-                    LOGGER.warning("watcher k8s pod metadata too large request_id=%s", request_id)
-                    self._json(
-                        HTTPStatus.BAD_GATEWAY,
-                        {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
-                    )
-                    return
-                if response.status == HTTPStatus.OK:
-                    projected = watcher_policy.project_pod_metadata(body)
-                    if projected is None:
-                        LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+            if not watching:
+                # Non-watch reads are bounded like GoogleApiRelay.fetch: re-arm
+                # the total deadline before each read1 chunk, cap Pod metadata
+                # at WATCHER_POD_METADATA_MAX_BYTES and other non-watch reads
+                # at API_RELAY_MAX_RESPONSE_BYTES, and fail on a Content-Length
+                # body cut short before sending status headers downstream.
+                max_bytes = (
+                    WATCHER_POD_METADATA_MAX_BYTES
+                    if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA
+                    else API_RELAY_MAX_RESPONSE_BYTES
+                )
+                chunks: list[bytes] = []
+                received = 0
+                while True:
+                    if response.isclosed():
+                        break
+                    sock.settimeout(GoogleApiRelay._remaining(deadline))
+                    chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > max_bytes:
+                        LOGGER.warning(
+                            "watcher k8s response too large request_id=%s rule=%s status=%d cap_bytes=%d",
+                            request_id,
+                            decision.rule_id,
+                            response.status,
+                            max_bytes,
+                        )
                         self._json(
                             HTTPStatus.BAD_GATEWAY,
-                            {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                            {"error": WATCHER_K8S_UNRELAYABLE_ERROR, "code": WATCHER_K8S_UNRELAYABLE_CODE},
                         )
                         return
-                    body = projected
+                    chunks.append(chunk)
+                if response.length:
+                    raise http.client.IncompleteRead(b"".join(chunks), response.length)
+                body = b"".join(chunks)
+                content_type = response.getheader("Content-Type", "")
+                if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
+                    if response.status == HTTPStatus.OK:
+                        projected = watcher_policy.project_pod_metadata(body)
+                        if projected is None:
+                            LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+                            self._json(
+                                HTTPStatus.BAD_GATEWAY,
+                                {"error": WATCHER_K8S_UNRELAYABLE_ERROR, "code": WATCHER_K8S_UNRELAYABLE_CODE},
+                            )
+                            return
+                        body = projected
+                    content_type = watcher_policy.POD_METADATA_MEDIA_TYPE
                 LOGGER.info(
                     "watcher k8s forwarded request_id=%s rule=%s status=%d bytes=%d",
                     request_id,
@@ -17262,7 +17305,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 self.send_response(response.status)
                 answered = True
-                self.send_header("Content-Type", watcher_policy.POD_METADATA_MEDIA_TYPE)
+                if content_type:
+                    self.send_header("Content-Type", sanitize_header(content_type))
                 # Framed by its length, so the connection stays reusable, and
                 # closed with the answer when the request's body went unread.
                 self.send_header("Content-Length", str(len(body)))
@@ -17288,8 +17332,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             sent = 0
+            cut_by_limit = False
             while True:
                 if watching and time.monotonic() - started > WATCHER_WATCH_MAX_S:
+                    cut_by_limit = True
                     break
                 chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
                 if not chunk:
@@ -17311,9 +17357,31 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         sent,
                     )
                     self.close_connection = True
+                    cut_by_limit = True
                     break
                 sent += len(chunk)
+            if not cut_by_limit and response.length:
+                raise http.client.IncompleteRead(b"", response.length)
             LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
+        except TimeoutError:
+            LOGGER.warning(
+                "watcher k8s upstream timeout request_id=%s host=%s deadline_s=%d",
+                request_id,
+                host,
+                API_RELAY_DEADLINE_S,
+            )
+            if answered:
+                self.close_connection = True
+            else:
+                if not upstream_answered:
+                    key = (target["project"], target["location"], target["cluster"])
+                    with self.watcher_endpoints_lock:
+                        self.watcher_endpoints.pop(key, None)
+                with contextlib.suppress(OSError):
+                    self._json(
+                        HTTPStatus.GATEWAY_TIMEOUT,
+                        {"error": WATCHER_K8S_TIMEOUT_ERROR, "code": WATCHER_K8S_TIMEOUT_CODE},
+                    )
         except (OSError, http.client.HTTPException) as exc:
             # Before our status line, an answer, and the cached address is
             # forgotten in case it is what failed: only when the API server's
