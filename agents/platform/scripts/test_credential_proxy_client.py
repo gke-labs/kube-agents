@@ -4735,6 +4735,65 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
         sent["relay"]._get_once.assert_not_called()
 
 
+class KubectlWriteAttemptRecordTest(unittest.TestCase):
+    """A session pod's kubectl write attempt, recorded by the kubectl wrapper
+    after a non-zero exit while kube-proxy is read-only (deploy/sandbox/
+    session-kubectl.sh); the worker adapter stops the turn on it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.record = self.tmp / "write-refusals"
+        self.record.write_bytes(b"")
+
+    def run_record(self, argv, code, mode="read-only-dry-run", record=True, task="task-s1"):
+        env = {credential_proxy_client.KUBE_PROXY_MODE_ENV: mode,
+               credential_proxy_client.REFUSAL_FILE_ENV: str(self.record) if record else "",
+               credential_proxy_client.REFUSAL_TASK_ENV: task}
+        with patch.dict("os.environ", env, clear=False), patch("sys.stderr", new=io.StringIO()):
+            credential_proxy_client.record_kubectl_write_attempt(list(argv), code)
+        text = self.record.read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()]
+
+    def test_a_failed_write_under_a_read_only_proxy_appends_one_record(self):
+        records = self.run_record(["kubectl", "scale", "deploy/x", "--replicas=3"], 1)
+        self.assertEqual(1, len(records), records)
+        self.assertEqual(
+            {"write_refusal": True, "rule": "kube-proxy.write-attempt", "verb": "scale", "route": "kube-proxy", "task": "task-s1"},
+            {k: v for k, v in records[0].items() if k != "time"},
+        )
+
+    def test_nothing_is_recorded_without_every_condition(self):
+        write = ["kubectl", "delete", "pod", "p"]
+        for name, kwargs in (
+            ("exit 0", {"argv": write, "code": 0}),
+            ("a read", {"argv": ["kubectl", "get", "pods"], "code": 1}),
+            ("a local render", {"argv": ["kubectl", "apply", "-f", "x", "--dry-run=client"], "code": 1}),
+            ("a server dry run the proxy allows", {"argv": ["kubectl", "apply", "-f", "x", "--dry-run=server"], "code": 1}),
+            ("a writable proxy", {"argv": write, "code": 1, "mode": "read-write"}),
+            ("no mode from the gateway", {"argv": write, "code": 1, "mode": ""}),
+            ("no record file", {"argv": write, "code": 1, "record": False}),
+        ):
+            with self.subTest(name):
+                self.assertEqual([], self.run_record(**kwargs))
+
+    def test_the_command_line_entry_reads_the_code_then_kubectls_arguments(self):
+        env = {credential_proxy_client.KUBE_PROXY_MODE_ENV: "read-only-dry-run",
+               credential_proxy_client.REFUSAL_FILE_ENV: str(self.record),
+               credential_proxy_client.REFUSAL_TASK_ENV: "task-s2"}
+        argv = ["credential-proxy-exec", "--record-kubectl-write-attempt", "1", "rollout", "restart", "deploy/x"]
+        with patch.dict("os.environ", env, clear=False), patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as done:
+            credential_proxy_client.main()
+        self.assertEqual(0, done.exception.code)
+        records = [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(["rollout restart"], [r["verb"] for r in records])
+        bad = ["credential-proxy-exec", "--record-kubectl-write-attempt", "not-a-number", "delete", "pod", "p"]
+        with patch.dict("os.environ", env, clear=False), patch.object(sys, "argv", bad), self.assertRaises(SystemExit) as done:
+            credential_proxy_client.main()
+        self.assertEqual(0, done.exception.code)
+        self.assertEqual(1, len(self.record.read_text(encoding="utf-8").splitlines()))
+
+
 class WriteRefusalRecordTest(unittest.TestCase):
     """The client's out-of-band record of a definitive write refusal, which a
     profile worker stops its task on (a2a/worker-adapter/refusal.go)."""

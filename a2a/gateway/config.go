@@ -719,8 +719,13 @@ type Config struct {
 	KubeProxyURL           string
 	KubeProxyCAConfigMap   string
 	KubeProxyHostContext   string
-	UniverseDomain         string
-	ImagePullRefs          []string
+	// KubeProxyMode is the policy mode the operator gives kube-proxy
+	// (A2A_KUBE_PROXY_MODE). Session pods get it as KUBE_PROXY_MODE, and
+	// their kubectl wrapper records a failed write attempt only under a
+	// read-only mode. Empty records nothing.
+	KubeProxyMode  string
+	UniverseDomain string
+	ImagePullRefs  []string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -988,6 +993,7 @@ func FromEnv() (*Config, error) {
 		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
 		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
 		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
+		KubeProxyMode:          os.Getenv("A2A_KUBE_PROXY_MODE"),
 		UniverseDomain:         strings.TrimSpace(os.Getenv(envGoogleCloudUniverseDomain)),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),

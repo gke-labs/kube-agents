@@ -1665,6 +1665,39 @@ def kubectl_verb_is_mutating(verb_words) -> bool:
     return head in KUBECTL_MUTATING_VERBS
 
 
+# The kube-proxy modes under which a session pod's mutating kubectl call can
+# only fail (k8s-api-proxy/pkg/k8sapiproxy/policy.go). Under read-only-dry-run a
+# server-side dry run is allowed through, so it is not an attempted change.
+KUBE_PROXY_MODE_READ_ONLY = "read-only"
+KUBE_PROXY_MODE_READ_ONLY_DRY_RUN = "read-only-dry-run"
+_SERVER_DRY_RUN = "server"
+
+
+def kubectl_write_attempt(argv: list[str], proxy_mode: str) -> tuple[str, ...] | None:
+    """The verb of a kubectl ``argv`` that tries a change ``proxy_mode`` refuses, or None.
+
+    Reads the argv alone, never what the command printed. The verb is resolved
+    as the policy resolves it (``_kubectl_verb_and_flag``), mutating as
+    ``kubectl_verb_is_mutating`` has it, and a local render is no change. Any
+    mode but the two read-only ones answers None, so a proxy that allows writes
+    never makes a failed write look refused.
+    """
+    if proxy_mode not in (KUBE_PROXY_MODE_READ_ONLY, KUBE_PROXY_MODE_READ_ONLY_DRY_RUN):
+        return None
+    if not argv or argv[0] != "kubectl" or local_render(argv):
+        return None
+    verb, _ = _kubectl_verb_and_flag(argv)
+    if not kubectl_verb_is_mutating(verb):
+        return None
+    if proxy_mode == KUBE_PROXY_MODE_READ_ONLY_DRY_RUN:
+        own = argv[: argv.index("--")] if "--" in argv else argv
+        dry_runs = [t for t in own if t == "--dry-run" or t.startswith("--dry-run=")]
+        if dry_runs and dry_runs[-1].partition("=")[2].lower() == _SERVER_DRY_RUN:
+            return None
+    # The verb words alone, not the object they name.
+    return verb[:2] if verb[0] in KUBECTL_MUTATING_SUBVERBS else verb[:1]
+
+
 def _refused_flags(tool: str) -> frozenset[str]:
     """Every flag the policy refuses by name for `tool`, whatever the command."""
     if tool == "kubectl":

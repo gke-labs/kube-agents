@@ -94,34 +94,21 @@ RUN apt-get update \
     && echo "${KUBECTL_SHA256}  /usr/local/libexec/kubectl" | sha256sum -c - \
     && chmod 0755 /usr/local/libexec/kubectl \
     && python3 -I /tmp/check_kubectl_base_path.py /usr/local/libexec/kubectl \
-    && rm /tmp/check_kubectl_base_path.py \
-    && printf '%s\n' \
-         '#!/bin/sh' \
-         'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
-         '  case " $* " in' \
-         '  *" --context"*)' \
-         '    /usr/local/libexec/kubectl-context-registered "$@" 2>/dev/null || PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
-         '    ;;' \
-         '  *)' \
-         '    if [ ! -f "${HOME}/.kube/config" ]; then' \
-         '      PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
-         '    fi' \
-         '    ;;' \
-         '  esac' \
-         '  exec /usr/local/libexec/kubectl "$@"' \
-         'fi' \
-         'if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then' \
-         '  exec /opt/credential-proxy/libexec/credential-proxy-exec kubectl "$@"' \
-         'fi' \
-         'exec /usr/local/libexec/kubectl "$@"' \
-         >/usr/local/bin/kubectl \
-    && chmod 0755 /usr/local/bin/kubectl
+    && rm /tmp/check_kubectl_base_path.py
+# The kubectl wrapper: deploy/sandbox/session-kubectl.sh says what it does on
+# each kind of pod.
+COPY --chmod=0755 deploy/sandbox/session-kubectl.sh /usr/local/bin/kubectl
 # credential-proxy-exec is a launcher that imports the client as a module, so
 # Python loads the client from bytecode compiled here and does not compile its
 # source at every brokered call (deploy/sandbox/Dockerfile says more).
 COPY --chmod=0755 deploy/shared/credential-proxy-exec.py /opt/credential-proxy/libexec/credential-proxy-exec
 COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential_proxy_client.py
-RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py \
+# The command policy, beside the client, for the kubectl wrapper's write-attempt
+# record (credential_proxy_client.record_kubectl_write_attempt). Standard
+# library only; the import below fails the build if that stops being true.
+COPY --chmod=0644 agents/platform/scripts/command_policy.py /opt/credential-proxy/libexec/command_policy.py
+RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py /opt/credential-proxy/libexec/command_policy.py \
+    && PYTHONDONTWRITEBYTECODE=1 python3 -I -c "import sys; sys.path.insert(0, '/opt/credential-proxy/libexec'); import command_policy" \
     && python3 -v /opt/credential-proxy/libexec/credential-proxy-exec --help 2>&1 \
        | grep "code object from '/opt/credential-proxy/libexec/__pycache__/credential_proxy_client\.cpython-[0-9]*\.pyc'" >/dev/null
 # The version-control skill a profile persona carries (its scripts/vcs.py, a

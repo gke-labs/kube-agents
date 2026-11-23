@@ -153,6 +153,9 @@ type refusalRun struct {
 	expectStop   bool
 	recordFile   string
 	noRecordFile bool
+	// sessionDir runs the task as a session pod's turn: the adapter makes
+	// the record file itself in this directory (Config.WriteRefusalDir).
+	sessionDir string
 }
 
 // run returns the task's outcome, its terminal text and the stub's pid and
@@ -173,7 +176,9 @@ func (r refusalRun) run(t *testing.T) (runOutcome, string, string, string) {
 	}
 	cfg := adapterConfig(url, r.taskID, session, refusalStub(t, r.records, r.first, r.rest, pause, pidFile, markerFile))
 	cfg.StopOnWriteRefusal = r.stop
-	if !r.noRecordFile {
+	if r.sessionDir != "" {
+		cfg.WriteRefusalDir = r.sessionDir
+	} else if !r.noRecordFile {
 		recordFile := r.recordFile
 		if recordFile == "" {
 			recordFile = filepath.Join(dir, writeRefusalFileName)
@@ -413,6 +418,90 @@ func TestWriteRefusalStopIsOnForProfilePods(t *testing.T) {
 	session.applyDefaults()
 	if !profile.StopOnWriteRefusal || session.StopOnWriteRefusal {
 		t.Fatalf("profile=%v session=%v", profile.StopOnWriteRefusal, session.StopOnWriteRefusal)
+	}
+}
+
+// TestWriteRefusalStopIsOnForSessionPodsWithARecordDir: a session pod given a
+// record directory (one with the cluster view) stops at a write refusal.
+func TestWriteRefusalStopIsOnForSessionPodsWithARecordDir(t *testing.T) {
+	session := Config{Session: "chat-a", WriteRefusalDir: "/scratch/.kube-agents"}
+	session.applyDefaults()
+	if !session.StopOnWriteRefusal {
+		t.Fatal("a session pod with a record directory does not stop at a write refusal")
+	}
+}
+
+// TestSessionTurnStopsAtAWriteAttempt: on a session pod the adapter makes the
+// turn's record file in its directory, the kubectl wrapper's write-attempt
+// record stops the harness, and the reason says a change was attempted and
+// not made, without claiming a server refused it.
+func TestSessionTurnStopsAtAWriteAttempt(t *testing.T) {
+	const task = "task-session-attempt-1"
+	dir := filepath.Join(t.TempDir(), ".kube-agents")
+	out, text, pidFile, markerFile := refusalRun{
+		taskID:     task,
+		records:    []string{refusalRecord(t, true, writeAttemptRule, "scale", task)},
+		first:      claudeToolCall(t, "toolu_1", "kubectl scale deploy/kube-dns -n kube-system --replicas=3", "Error from server (Forbidden)", true),
+		stop:       true,
+		expectStop: true,
+		sessionDir: dir,
+	}.run(t)
+	if out.err != nil || out.res.State != lib.StateRejected {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	waitDead(t, pidFile)
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Fatal("the harness ran on past the write attempt")
+	}
+	if !strings.HasPrefix(text, "reason: write-refused - ") || !strings.Contains(text, "kubectl scale was not made, because writes are refused here") {
+		t.Fatalf("terminal %q", text)
+	}
+	for _, claim := range []string{"rule refused", "credential broker", "Forbidden", "kube-dns"} {
+		if strings.Contains(text, claim) {
+			t.Fatalf("terminal carries %q: %q", claim, text)
+		}
+	}
+}
+
+// TestSessionTurnIgnoresAnEarlierTurnsRecord: a record left from an earlier
+// turn of a reused pod is gone when the next turn starts, so the next turn
+// runs to its end.
+func TestSessionTurnIgnoresAnEarlierTurnsRecord(t *testing.T) {
+	const task = "task-session-attempt-2"
+	dir := filepath.Join(t.TempDir(), ".kube-agents")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := refusalRecord(t, true, writeAttemptRule, "scale", task) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, writeRefusalFileName), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, _, markerFile := refusalRun{
+		taskID:     task,
+		first:      innocuousCall(t, "toolu_1"),
+		stop:       true,
+		sessionDir: dir,
+	}.run(t)
+	assertCompleted(t, out, markerFile)
+}
+
+// TestMakeTurnWriteRefusalFile: each turn's record file starts empty, 0600,
+// whatever the turn before left.
+func TestMakeTurnWriteRefusalFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".kube-agents")
+	path, err := makeTurnWriteRefusalFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"write_refusal":true}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again, err := makeTurnWriteRefusalFile(dir)
+	if err != nil || again != path {
+		t.Fatalf("second turn: %q %v", again, err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() != 0 || info.Mode().Perm() != 0o600 {
+		t.Fatalf("record file not made empty 0600: %v %v", info, err)
 	}
 }
 

@@ -142,7 +142,7 @@ var reasonSentences = map[string]string{
 
 // reasonDetailShown names the tokens whose detail is written for the
 // person: the verifier's rule (capability.Reason), the dispatcher's
-// admission wording, a delegation's own why. That detail is shown, cut
+// admission wording, a delegation's own why, a write refusal's verb. That detail is shown, cut
 // before any session id (reasonSessionMarker).
 var reasonDetailShown = map[string]bool{
 	"capability-refused":     true,
@@ -150,6 +150,9 @@ var reasonDetailShown = map[string]bool{
 	"parameters-invalid":     true,
 	"queue-timeout":          true,
 	"delegation-not-started": true,
+	// A task stopped at its first write refusal (worker-adapter
+	// writeRefusedReason): the refused verb, and that the change was not made.
+	"write-refused": true,
 }
 
 // KV access rides withRetry with these shapes: enough to ride out a

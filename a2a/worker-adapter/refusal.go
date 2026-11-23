@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"syscall"
 )
@@ -142,9 +143,39 @@ func readWriteRefusal(path, taskID string) (*writeRefusal, error) {
 // refused write can be proposed as a pull request instead.
 const kubernetesReadOnlyRule = "kubernetes.read-only"
 
+// writeAttemptRule is a session pod's kubectl write attempt, recorded by the
+// kubectl wrapper from the argv and a non-zero exit while kube-proxy is
+// read-only (deploy/sandbox/session-kubectl.sh,
+// credential_proxy_client.record_kubectl_write_attempt). The wrapper does not
+// see which side refused, so its reason says the change was attempted and not
+// made, not that a server refused it.
+const writeAttemptRule = "kube-proxy.write-attempt"
+
+// makeTurnWriteRefusalFile makes a session turn's record file empty in dir,
+// replacing any earlier turn's, and returns its path.
+func makeTurnWriteRefusalFile(dir string) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, writeRefusalFileName)
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- the adapter's own per-turn file
+	if err != nil {
+		return "", err
+	}
+	return path, f.Close()
+}
+
 // writeRefusedReason is the terminal message of a task stopped at a write
 // refusal, in the `reason: <token> - <detail>` shape.
 func writeRefusedReason(r *writeRefusal) string {
+	if r.rule == writeAttemptRule {
+		return "reason: write-refused" + reasonDetailSeparator +
+			"the turn stopped after it attempted a change: kubectl " + r.verb +
+			" was not made, because writes are refused here, and it was not retried another way; it can be proposed as a pull request."
+	}
 	if r.rule == kubernetesReadOnlyRule {
 		return "reason: write-refused" + reasonDetailSeparator +
 			"the task stopped after a write refusal: the command policy's " + r.rule + " rule refused the verb " + r.verb +

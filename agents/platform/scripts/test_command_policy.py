@@ -2999,3 +2999,49 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KubectlWriteAttemptTest(unittest.TestCase):
+    """command_policy.kubectl_write_attempt: what a session pod's kubectl wrapper
+    counts as an attempted change under a read-only kube-proxy."""
+
+    RO, RODR = command_policy.KUBE_PROXY_MODE_READ_ONLY, command_policy.KUBE_PROXY_MODE_READ_ONLY_DRY_RUN
+
+    def attempt(self, line, mode):
+        return command_policy.kubectl_write_attempt(shlex.split(line), mode)
+
+    def test_a_mutating_verb_is_an_attempt_under_both_read_only_modes(self):
+        for line, verb in (
+            ("kubectl scale deploy/x --replicas=2", ("scale",)),
+            ("kubectl -n kube-system delete pod p", ("delete",)),
+            ("kubectl rollout restart deploy/x", ("rollout", "restart")),
+            ("kubectl apply -f x.yaml --dry-run=server --dry-run=none", ("apply",)),
+        ):
+            for mode in (self.RO, self.RODR):
+                with self.subTest(line=line, mode=mode):
+                    self.assertEqual(verb, self.attempt(line, mode))
+
+    def test_reads_and_local_renders_are_not_attempts(self):
+        for line in (
+            "kubectl get pods -A",
+            "kubectl rollout status deploy/x",
+            "kubectl apply -f x.yaml --dry-run=client",
+            "kubectl create deploy x --image=nginx -o yaml --dry-run=client",
+            "kubectl scale --help",
+        ):
+            for mode in (self.RO, self.RODR):
+                with self.subTest(line=line, mode=mode):
+                    self.assertIsNone(self.attempt(line, mode))
+
+    def test_a_server_dry_run_is_an_attempt_only_where_the_proxy_refuses_it(self):
+        line = "kubectl apply -f x.yaml --dry-run=server"
+        self.assertIsNone(self.attempt(line, self.RODR))
+        self.assertEqual(("apply",), self.attempt(line, self.RO))
+
+    def test_no_attempt_unless_the_proxy_is_read_only(self):
+        for mode in ("read-write", "", "READ-ONLY", "unknown"):
+            with self.subTest(mode=mode):
+                self.assertIsNone(self.attempt("kubectl delete pod p", mode))
+
+    def test_the_verb_carries_no_object_name(self):
+        self.assertEqual(("scale",), self.attempt("kubectl scale deploy/secret-name --replicas=0", self.RODR))

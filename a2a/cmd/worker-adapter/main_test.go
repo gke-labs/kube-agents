@@ -697,3 +697,23 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 		t.Errorf("resetPaths(\"\") = %q, want none", got)
 	}
 }
+
+// TestSessionWriteRefusalDir: only a session pod with the cluster view keeps a
+// per-turn write-refusal record, under its workdir.
+func TestSessionWriteRefusalDir(t *testing.T) {
+	for _, tc := range []struct {
+		name, session, clusterView, want string
+	}{
+		{"session with the cluster view", "chat-a", "true", "/scratch/.kube-agents"},
+		{"session without the cluster view", "chat-a", "", ""},
+		{"cluster view spelled otherwise", "chat-a", "TRUE", ""},
+		{"no session (a profile pod)", "", "true", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(lib.EnvClusterView, tc.clusterView)
+			if got := sessionWriteRefusalDir(tc.session, "/scratch"); got != tc.want {
+				t.Fatalf("sessionWriteRefusalDir(%q) = %q, want %q", tc.session, got, tc.want)
+			}
+		})
+	}
+}

@@ -76,6 +76,15 @@ func TestTerminalNoticeCarriesNoToken(t *testing.T) {
 			"🚫 the executor rejected the task — the cluster name is empty"},
 		{"rejected with a known token and the executor's detail", lib.StateRejected, "reason: no-text-parts - the submission message carries nothing hermes can be asked",
 			"🚫 the executor rejected the task — " + reasonSentences["no-text-parts"]},
+		// A task stopped at its first write refusal shows the verb and that the
+		// change was not made, from a profile worker (the broker's rule) and
+		// from a session pod (the kubectl wrapper's write attempt) alike.
+		{"rejected at a profile task's write refusal", lib.StateRejected,
+			"reason: write-refused - the task stopped after a write refusal: the command policy's kubernetes.read-only rule refused the verb scale. The change was not made and was not retried another way; it can be proposed as a pull request.",
+			"🚫 the executor rejected the task — the task stopped after a write refusal: the command policy's kubernetes.read-only rule refused the verb scale. The change was not made and was not retried another way; it can be proposed as a pull request."},
+		{"rejected at a session turn's write attempt", lib.StateRejected,
+			"reason: write-refused - the turn stopped after it attempted a change: kubectl scale was not made, because writes are refused here, and it was not retried another way; it can be proposed as a pull request.",
+			"🚫 the executor rejected the task — the turn stopped after it attempted a change: kubectl scale was not made, because writes are refused here, and it was not retried another way; it can be proposed as a pull request."},
 		{"rejected with an unknown bare token", lib.StateRejected, "reason: something-new", "🚫 the executor rejected the task"},
 		{"rejected with plain text", lib.StateRejected, "no capability", "🚫 the executor rejected the task: no capability"},
 		{"rejected with nothing", lib.StateRejected, "", "🚫 the executor rejected the task"},

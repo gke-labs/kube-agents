@@ -277,6 +277,11 @@ REFUSAL_RECORD_ROUTE = "route"
 REFUSAL_RECORD_TIME = "time"
 REFUSAL_RECORD_TASK = "task"
 REFUSAL_RECORD_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A session pod's kubectl write attempt (record_kubectl_write_attempt): its rule,
+# its route, and the env naming the kube-proxy mode the gateway passes the pod.
+WRITE_ATTEMPT_RULE = "kube-proxy.write-attempt"
+KUBE_PROXY_ROUTE = "kube-proxy"
+KUBE_PROXY_MODE_ENV = "KUBE_PROXY_MODE"
 _REFUSAL_RULE_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
 _REFUSAL_VERB_WORDS = 3
 # The line a malformed exec URL writes, once per process, when the stateful
@@ -1978,11 +1983,40 @@ def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
     """
     if status != 403 or not isinstance(payload, dict) or payload.get(WRITE_REFUSAL_KEY) is not True:
         return
-    target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
-    if not target:
-        return
     rule = payload.get(REFUSAL_RECORD_RULE)
     if not isinstance(rule, str) or not _REFUSAL_RULE_RE.match(rule):
+        return
+    _append_refusal_record(rule, verb_words, route)
+
+
+def record_kubectl_write_attempt(argv: list[str], exit_code: int) -> None:
+    """Record a session pod's kubectl call that tried a change and failed.
+
+    A session pod's kubectl reaches the cluster through kube-proxy, not the
+    broker, so no broker answer marks its refusal. The kubectl wrapper calls
+    this after a non-zero exit. The record is written when KUBE_PROXY_MODE_ENV,
+    which the gateway sets from the mode the operator gives kube-proxy, is a
+    read-only mode and the argv tries a change that mode refuses
+    (command_policy.kubectl_write_attempt). It reads the argv and the exit
+    code, never what kubectl printed, and a failure before kubectl reached the
+    proxy records the same: a change was attempted and not made. Never raises.
+    """
+    if exit_code == 0 or not os.environ.get(REFUSAL_FILE_ENV, "").strip():
+        return
+    try:
+        import command_policy  # shipped beside this module on session pods only
+    except ImportError:
+        return
+    verb = command_policy.kubectl_write_attempt(argv, os.environ.get(KUBE_PROXY_MODE_ENV, "").strip())
+    if verb is None:
+        return
+    _append_refusal_record(WRITE_ATTEMPT_RULE, list(verb), KUBE_PROXY_ROUTE)
+
+
+def _append_refusal_record(rule: str, verb_words, route: str) -> None:
+    """Append one write-refusal record to the file REFUSAL_FILE_ENV names, if set."""
+    target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
+    if not target:
         return
     words = verb_words if isinstance(verb_words, list) else []
     verb = " ".join(_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in words[:_REFUSAL_VERB_WORDS] if str(w))
@@ -2980,6 +3014,14 @@ def main():
     form, and `--ensure-kubectl-context`. Ends with SystemExit. The
     images' launcher imports this module, so its precompiled bytecode
     is used, and calls this."""
+    if len(sys.argv) >= 3 and sys.argv[1] == "--record-kubectl-write-attempt":
+        # The session kubectl wrapper: <exit code> then kubectl's own arguments.
+        try:
+            code = int(sys.argv[2])
+        except ValueError:
+            raise SystemExit(0) from None
+        record_kubectl_write_attempt(["kubectl", *sys.argv[3:]], code)
+        raise SystemExit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
         try:
             ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])

@@ -611,6 +611,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			if s.cfg.KubeProxyHostContext != "" {
 				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
 			}
+			if s.cfg.KubeProxyMode != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_MODE", Value: s.cfg.KubeProxyMode})
+			}
 		}
 		if s.cfg.KubeProxyCAConfigMap != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})

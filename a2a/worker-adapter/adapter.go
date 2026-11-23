@@ -158,6 +158,13 @@ type Config struct {
 	// which the profile worker makes beside the task token. Empty reads
 	// nothing, and the task is never stopped at a refusal.
 	WriteRefusalFile string
+	// WriteRefusalDir is a session pod's directory for each turn's record
+	// file: the adapter makes the file empty there before every turn's
+	// harness starts and names it, with the turn's task id, in the harness's
+	// environment, so a record from one turn never stops the next. Setting
+	// it on a session pod turns StopOnWriteRefusal on (applyDefaults). Empty
+	// on a profile pod, whose worker makes its file beside the task token.
+	WriteRefusalDir string
 
 	// TaskDeadline bounds the harness wall clock below the pod's own
 	// activeDeadlineSeconds so the failure is ours to report, not the
@@ -263,7 +270,7 @@ func (c *Config) applyDefaults() {
 	if c.Scope == "" {
 		c.Scope = capability.NamespaceScope(c.Namespace)
 	}
-	if c.ProfileExecutor {
+	if c.ProfileExecutor || (c.Session != "" && c.WriteRefusalDir != "") {
 		c.StopOnWriteRefusal = true
 	}
 }
@@ -863,6 +870,18 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			state := lib.StateFailed
 			ferr := a.finalize(state, "reason: harness-settings-failed - "+err.Error(), "")
 			return broken(Result{State: state}, ferr)
+		}
+	}
+
+	if cfg.StopOnWriteRefusal && cfg.WriteRefusalDir != "" {
+		path, err := makeTurnWriteRefusalFile(cfg.WriteRefusalDir)
+		if err != nil {
+			// Fails safe: with no record file the turn just runs on, and
+			// every write it attempts is still refused.
+			log.Warn("could not make the turn's write-refusal record; the turn won't stop at a write refusal", "task", a.taskID, "err", err)
+		} else {
+			a.cfg.WriteRefusalFile = path
+			env = append(slices.Clone(env), EnvWriteRefusalFile+"="+path, EnvWriteRefusalTask+"="+a.taskID)
 		}
 	}
 
