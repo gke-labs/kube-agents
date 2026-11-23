@@ -419,8 +419,12 @@ func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
 }
 
 func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
-	relay := newFakeTeamsRelay(t, testTeamsActivity("f:9", "<at>Kage</at> how many nodes?"))
+	event := testTeamsActivity("f:9", "<at>Kage</at> how many nodes?")
+	event["timestamp"] = time.Now().Add(-1500 * time.Millisecond).UTC().Format(time.RFC3339Nano)
+	relay := newFakeTeamsRelay(t, event)
 	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan InboundMessage, 1)
 	done := make(chan error, 1)
@@ -446,6 +450,37 @@ func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
 		if tok != "projected-token" {
 			t.Fatalf("relay saw token %q", tok)
 		}
+	}
+	// The pull that carried the activity is counted under events, and the
+	// turn's lag from the activity's own timestamp is observed once. Whether
+	// an empty long poll followed before the cancel is timing, not asserted.
+	if got := counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEvents)); got != 1 {
+		t.Errorf("events pulls %v, want 1", got)
+	}
+	if got := counterValue(t, m.teamsEventsReceived); got != 1 {
+		t.Errorf("events received %v, want 1", got)
+	}
+	if got := histogramCount(t, m.teamsIngressLag.WithLabelValues()); got != 1 {
+		t.Errorf("ingress lag observations %d, want 1", got)
+	}
+}
+
+func TestTeamsPostIsTimedUnderTheCreateOperation(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
+	if _, err := a.Post("teams:"+testTeamsChannel, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Edit("teams:"+testTeamsChannel, "1794603936403-reply", "hello again"); err != nil {
+		t.Fatal(err)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodCreate, teamsCallOK)); got != 1 {
+		t.Errorf("create ok observations %d, want 1", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodUpdate, teamsCallOK)); got != 1 {
+		t.Errorf("update ok observations %d, want 1", got)
 	}
 }
 
