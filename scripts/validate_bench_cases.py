@@ -376,16 +376,18 @@ FIXTURE_NOT_READY = {
         "$9 an hour standing or about $7 a run on a per-run cluster"
     ),
     # A check that reads a command for --chunk-size=0 names a shape that live
-    # tests do not show as the fault: one lister did no harm with pages or with
-    # none, and a flood slowed other clients with pages too. A check on real
-    # requests needs a record that names the caller, which GKE keeps only with
-    # API server logs or Data Access audit logs turned on, and a lister at a
-    # rate that slows a cluster, which a shared fleet cluster may not carry.
-    # Neither is tried. #5413 owns the gap.
+    # tests do not show as the fault: a lister with a pause did no harm with
+    # pages or with none, and a flood slowed a second client with pages too,
+    # about half as much in the one matched pair. A fixture for the measured
+    # harm needs listers at a rate that slows a cluster, which a shared fleet
+    # cluster may not carry; a check on real requests also needs a record of
+    # them there (API server logs; Data Access audit logs were not tested).
+    # Not tried, so the cost is a judgment. #5413 owns the gap; its text
+    # predates the tests.
     "control-plane-unpaginated-heavy-list-oom": (
-        "#5413: needs a real periodic lister and a record that names it (API server logs or "
-        "Data Access audit logs on a fleet cluster); the command shape with --chunk-size=0 is "
-        "not the fault in live tests (fixture rule 9)"
+        "#5413: a fixture needs listers at a rate that slows a cluster, which a shared fleet "
+        "cluster may not carry, and for a check on real requests a record of them there; live "
+        "tests do not show a command with --chunk-size=0 as the fault (fixture rule 9)"
     ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the
