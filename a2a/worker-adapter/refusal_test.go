@@ -453,7 +453,7 @@ func TestSessionTurnStopsAtAWriteAttempt(t *testing.T) {
 	if _, err := os.Stat(markerFile); err == nil {
 		t.Fatal("the harness ran on past the write attempt")
 	}
-	if !strings.HasPrefix(text, "reason: write-refused - ") || !strings.Contains(text, "kubectl scale was not made, because writes are refused here") {
+	if !strings.HasPrefix(text, "reason: write-refused - ") || !strings.Contains(text, "kubectl scale was not made; writes are refused here.") {
 		t.Fatalf("terminal %q", text)
 	}
 	for _, claim := range []string{"rule refused", "credential broker", "Forbidden", "kube-dns"} {
@@ -537,5 +537,33 @@ func TestMakeWriteRefusalFile(t *testing.T) {
 	w.makeWriteRefusalFile(&off)()
 	if off.WriteRefusalFile != "" || len(off.HarnessEnv) != 0 {
 		t.Fatalf("stop off made a record file: %+v", off)
+	}
+}
+
+// TestSessionReadCountsOnlyTheWrappersOwnRecord: on a session pod, where the
+// reason's verb is shown in chat, a record claiming another rule or carrying
+// a verb no kubectl write has is skipped, and a later genuine record still
+// counts.
+func TestSessionReadCountsOnlyTheWrappersOwnRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), writeRefusalFileName)
+	forged := refusalRecord(t, true, "kubernetes.read-only", "scale", "t1")
+	odd := refusalRecord(t, true, writeAttemptRule, "http://x.example/y", "t1")
+	genuine := refusalRecord(t, true, writeAttemptRule, "rollout restart", "t1")
+	if err := os.WriteFile(path, []byte(forged+"\n"+odd+"\n"+genuine+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := readWriteRefusalFor(path, "t1", true)
+	if err != nil || r == nil || r.rule != writeAttemptRule || r.verb != "rollout restart" {
+		t.Fatalf("session read = %+v, %v; want the wrapper's rollout restart", r, err)
+	}
+	if err := os.WriteFile(path, []byte(forged+"\n"+odd+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := readWriteRefusalFor(path, "t1", true); err != nil || r != nil {
+		t.Fatalf("session read of forged records = %+v, %v; want none", r, err)
+	}
+	// A profile pod's read is unchanged: the broker's rule counts.
+	if r, err := readWriteRefusalFor(path, "t1", false); err != nil || r == nil || r.rule != "kubernetes.read-only" {
+		t.Fatalf("profile read = %+v, %v", r, err)
 	}
 }

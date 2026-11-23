@@ -55,7 +55,9 @@ RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
 
 # The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
 # kubectl at /usr/local/libexec/kubectl with a /usr/local/bin/kubectl wrapper
-# that routes through <agent>-kube-proxy when KUBE_PROXY_URL is set, and gcloud
+# (deploy/sandbox/session-kubectl.sh) that routes through <agent>-kube-proxy
+# when KUBE_PROXY_URL is set, recording a failed write attempt under a
+# read-only kube-proxy, and through the broker otherwise, and gcloud
 # on PATH as the credential broker's shim, which forwards an argv to the broker
 # and prints its refusal as `policy rule: <rule>`. The shim is Python, so
 # python3 is installed, with python3-yaml beside it: the shim parses the
