@@ -549,7 +549,8 @@ Resolved findings on cleanly scanned (`status: "ok"`) clusters are retired
 under their own headline in the same post ("**1 pod placement problem has
 cleared**", then up to three names), while clusters whose scan failed or that
 were not reached retain their ledger entries so transient errors do not erase
-state and re-page tomorrow. Lines about the scan itself follow the headlines. A run
+state and re-page tomorrow. Lines about the scan itself follow the headlines in
+plain text. A run
 with a finding due writes and publishes its own report, partial or not. The
 JSON report carries a `coverage` block: `clusters_swept`, `clusters_read`, and
 the projects `not_reached` or with `scan_errors` this run (each with its
@@ -563,7 +564,7 @@ or clusters not reached hold it back. So on a fleet too big for one run,
 keep the previous report. When `NATS_URL` is set, the watch also writes the
 JSON report it just saved to the `topology-skew`
 (`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
-fails, it warns once in chat, logs the error and remediation commands to
+fails, it logs the error and remediation commands to
 `logs/leeway_watch.log`, and retries silently with `latest.json` on a later run
 that reads every project in full without a failure, until the write recovers.
 A report too large for one bus message (NATS's 1 MiB `max_payload`, less 64

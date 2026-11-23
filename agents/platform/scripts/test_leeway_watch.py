@@ -351,7 +351,8 @@ class GateAndReportingTests(unittest.TestCase):
         }
         code_ok, out_ok = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], t3)), now=t3)
         self.assertEqual(code_ok, 0)
-        self.assertIn("**The topology skew check read every project cleanly again.**", out_ok)
+        self.assertIn("The topology skew check read every project cleanly again.", out_ok)
+        self.assertNotIn("**The topology skew check read every project cleanly again.**", out_ok)
         self.assertIn("**1 pod placement problem has cleared**\n- checkout-api (shop) on seeded-d\n", out_ok)
         ledger_after = watch.load_ledger(self.home)
         self.assertEqual(ledger_after[watch.FINDINGS_KEY], {})
@@ -1006,17 +1007,21 @@ class GateAndReportingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
             watch.shutil, "which", return_value="/usr/local/bin/a2a"
         ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
-            # Day 0: finding is due, report writes, topic publish fails -> report line AND single-line warning printed once.
+            # Day 0: finding is due, report writes, topic publish fails -> only the due finding posts to chat; failure is logged.
             code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
             self.assertEqual(code0, 0)
             lines0 = out0.strip().splitlines()
-            self.assertEqual(len(lines0), 4)
+            self.assertEqual(len(lines0), 3)
             self.assertIn("**1 pod placement problem on cluster seeded-d (new)**", lines0[0])
-            self.assertEqual(lines0[3], watch.TOPIC_PUBLISH_FAILED_LINE)
+            self.assertNotIn("agent bus", out0)
             for plumbing in ("Error: nats:", "TopicsStateSubjectMissing", "nats stream edit TOPICS-STATE", "kubectl"):
-                self.assertNotIn(plumbing, lines0[3])
+                self.assertNotIn(plumbing, out0)
                 self.assertIn(plumbing, self.log_text())
             self.assertEqual(len(a2a_calls), 1)
+            self.assertEqual(
+                watch.load_ledger(self.home)[watch.ANNOUNCED_KEY].get(watch.ANNOUNCED_TOPIC_PUBLISH_KEY),
+                watch.ERROR_KIND_TOPIC_PUBLISH,
+            )
 
             # Day 1: quiet tick retries latest.json and fails again -> no duplicate warning spam.
             t1 = T0 + timedelta(days=1)
@@ -1105,10 +1110,11 @@ class GateAndReportingTests(unittest.TestCase):
             self.assertEqual(code1, 0)
             self.assertIn("**1 pod placement problem has cleared**", out1)
             self.assertIn(
-                "**The topology skew check couldn't read the configured clusters.** "
+                "The topology skew check couldn't read the configured clusters. "
                 "Existing findings there are kept until the next clean read.",
                 out1,
             )
+            self.assertNotIn("**The topology skew check couldn't read", out1)
             self.assertEqual(len(published_payloads), 1)
             ledger1 = watch.load_ledger(self.home)
             self.assertEqual(
@@ -1282,17 +1288,13 @@ class GateAndReportingTests(unittest.TestCase):
         ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
             code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
             self.assertEqual(code0, 0)
-            self.assertIn(watch.TOPIC_PUBLISH_FAILED_LINE, out0)
+            self.assertNotIn("agent bus", out0)
+            self.assertNotIn("TimeoutExpired", out0)
             self.assertIn(
                 "publishing to blackboard topic topology-skew failed "
                 "(TimeoutExpired: a2a topics write topology-skew timed out after 30s)",
                 self.log_text(),
             )
-            warn_line = [ln for ln in out0.splitlines() if "agent bus" in ln][0]
-            self.assertNotIn("--text", warn_line)
-            self.assertNotIn("--data", warn_line)
-            self.assertNotIn("pod placement problem", warn_line)
-            self.assertNotIn("TimeoutExpired", warn_line)
 
             t1 = T0 + timedelta(days=1)
             code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t1)
@@ -2359,7 +2361,7 @@ class BatchTests(unittest.TestCase):
             lines = self.tick(1, first_fails)
         failed = next(clusters_arg(a) for a, _ in self.calls if "p1/l/c00" in clusters_arg(a))
         detail = f"{20 - len(failed)} of 20 clusters read — {len(failed)} failed (leeway crashed)"
-        self.assertEqual(lines[-1], self.partial(1, f"the configured clusters: {detail}"))
+        self.assertEqual(lines[-1], watch.plain_status_line(self.partial(1, f"the configured clusters: {detail}")))
         self.assertEqual(self.finding_clusters(), sorted(failed), "findings retire only on clusters read")
         self.assertEqual(watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {watch.EXPLICIT_TARGET_LABEL: detail})
 
@@ -2419,7 +2421,10 @@ class BatchTests(unittest.TestCase):
         parts = [f"{len(killed)} failed (the sandbox run timed out after 900s)"]
         if left:
             parts.append(f"{left} not tried this run (reading stops at the first timeout)")
-        self.assertEqual(lines[-1], self.partial(1, f"p1: {read} of 30 clusters read — {' — '.join(parts)}"))
+        self.assertEqual(
+            lines[-1],
+            watch.plain_status_line(self.partial(1, f"p1: {read} of 30 clusters read — {' — '.join(parts)}")),
+        )
         # Findings retire on the clusters read and on the cluster p1 no longer lists.
         self.assertEqual(self.finding_clusters(), sorted(set(self.roster["p1"]) - self.ok))
         ledger = watch.load_ledger(self.home)
@@ -2616,13 +2621,13 @@ class BatchTests(unittest.TestCase):
             # web clears and api is new on p1 while p2 fails: three kinds of line in one post.
             lines = self.tick(1, fails("p2"), findings={c1: make_topology_finding(name="api")})
         headlines = [i for i, line in enumerate(lines) if line.startswith("**")]
-        self.assertEqual(len(headlines), 3)
+        self.assertEqual(len(headlines), 2)
         self.assertEqual(headlines[0], 0)
         self.assertTrue(lines[0].startswith("**1 pod placement problem on cluster "), lines)
         self.assertEqual(lines[headlines[1]], "**1 pod placement problem has cleared**")
         self.assertEqual(
             lines[-1],
-            "**The topology skew check couldn't read p2.** Existing findings there are kept until the next clean read.",
+            "The topology skew check couldn't read p2. Existing findings there are kept until the next clean read.",
         )
 
     def test_the_topic_summary_is_the_headline_as_plain_text(self) -> None:
@@ -3879,6 +3884,7 @@ class PlainStatusAndDryRunTests(unittest.TestCase):
                 "DUE_SUMMARY_NO_SHARE",
                 "DUE_CLUSTER_PREFIX",
                 "TOPIC_PUBLISH_CLEARED_LINE",
+                "TOPIC_PUBLISH_FAILED_LINE",
             ):
                 self.assertFalse(hasattr(watch, removed), removed)
 
@@ -4027,6 +4033,62 @@ class PlainStatusAndDryRunTests(unittest.TestCase):
         )
         self.assertEqual(self.log_text(), "")
         self.assertFalse((self.home / watch.FAILURE_MARKER_FILE_NAME).exists())
+
+    def test_status_lines_are_plain_text_when_following_an_earlier_line(self) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / watch.FAILURE_MARKER_FILE_NAME).write_text(watch.FAILED_REASON_ERROR + "\n", encoding="utf-8")
+        rep_p1_due = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]}],
+            T0,
+        )
+
+        def p2_fails(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "p1/us-central1/seeded-d" in argv[-1]:
+                return completed_json(rep_p1_due)
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="denied")
+
+        buf_with_due = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False), mock.patch.object(
+            watch,
+            "roster_clusters_by_project",
+            return_value={"p1": ["p1/us-central1/seeded-d"], "p2": ["p2/us-central1/broken"]},
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=p2_fails), redirect_stdout(buf_with_due):
+            watch.tick(now=T0)
+        lines_with_due = buf_with_due.getvalue().splitlines()
+        self.assertEqual([line for line in lines_with_due if line.startswith("**")], [lines_with_due[0]])
+        self.assertEqual(
+            lines_with_due[-2:],
+            [
+                "The topology skew check is running again.",
+                "The topology skew check couldn't read p2. Existing findings there are kept until the next clean read.",
+            ],
+        )
+
+        # When no finding is due or cleared, the first status line leads in bold and any later status line is plain text.
+        (self.home / watch.FAILURE_MARKER_FILE_NAME).write_text(watch.FAILED_REASON_ERROR + "\n", encoding="utf-8")
+        rep_clean = make_report(
+            [
+                {"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]},
+                {"cluster": "p2/us-central1/broken", "status": "ok", "topology_findings": []},
+            ],
+            T0 + timedelta(days=1),
+        )
+        buf_status_only = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False), mock.patch.object(
+            watch,
+            "roster_clusters_by_project",
+            return_value={"p1": ["p1/us-central1/seeded-d"], "p2": ["p2/us-central1/broken"]},
+        ), mock.patch.object(watch.sandbox_exec, "run", return_value=completed_json(rep_clean)), redirect_stdout(
+            buf_status_only
+        ):
+            watch.tick(now=T0 + timedelta(days=1))
+        self.assertEqual(
+            buf_status_only.getvalue().splitlines(),
+            [
+                "**The topology skew check is running again.**",
+                "The topology skew check read every project cleanly again.",
+            ],
+        )
 
 
 if __name__ == "__main__":

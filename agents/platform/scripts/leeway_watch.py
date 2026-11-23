@@ -149,10 +149,10 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   change only when a finding comes due, and otherwise keep the previous report
   until a run reads every project in full. When
   `NATS_URL` is set, the JSON report is also published to the A2A blackboard
-  topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
-  once in chat on failure, logging the `a2a` error and remediation commands to
-  `logs/leeway_watch.log`, and retrying silently on a later tick that reads
-  every target in full without failing. A report too large for one bus message
+  topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), logging
+  any `a2a` error and remediation commands to `logs/leeway_watch.log` and
+  retrying silently on a later tick that reads every target in full without
+  failing. A report too large for one bus message
   (`TOPIC_ARTIFACT_BUDGET_BYTES`: the NATS limit less the envelope reserve and
   encoding slack) is published capped (`cap_topic_report`): the fleet's most
   severe findings in order, up to the first that does not fit, each kept in its
@@ -178,7 +178,7 @@ open; the report's path on the pod is not in it. Findings on clusters
 whose scan succeeded (`status == "ok"`) and that are no longer present are
 retired from `ledger.json` under their own headline in the same post, counting
 the cleared problems, then up to three of them by name. Lines about the scan
-itself (a partial scan, a recovery, a failed publish) follow both. A finding on a cluster its
+itself (a partial scan, a recovery) follow both in plain text. A finding on a cluster its
 project's cluster list no longer names retires once that list was read.
 Clusters whose scan failed (`status == "error"`), that were not reached, or
 whose project could not be scanned retain their existing ledger entries so a
@@ -595,6 +595,7 @@ FAILED_WHAT_WRITE = "writing the ledger or the report"
 # "and N more". Names and items are cut so the message stays bounded however
 # many findings or however long a workload name.
 CHAT_HEADLINE = "**{text}**"
+CHAT_HEADLINE_PLACEHOLDER = "{text}"
 CHAT_ITEM = "- {text}"
 CHAT_MORE_ITEM = "- and {count} more"
 CHAT_LINE_SEPARATOR = "\n"
@@ -678,10 +679,6 @@ ZONE_CAUSE_PHRASES: dict[str, str] = {
     "domain_outage": "it takes no new pods because its nodes are not ready",
     "consolidation": "it has no nodes left",
 }
-TOPIC_PUBLISH_FAILED_LINE = (
-    "**The topology skew check couldn't publish its report to the agent bus.** "
-    "An admin can check the agent's log for details; it will retry on the next full scan."
-)
 TOPIC_PUBLISH_FAILED_LOG = (
     "{prefix} watch: publishing to blackboard topic {topic} failed ({detail}); "
     "on upgraded installs, check `kubectl describe platformagent` for TopicsStateSubjectMissing "
@@ -1470,10 +1467,20 @@ def topic_summary(message: str) -> str:
     """A chat message's headline as plain text: the summary other agents read
     on the blackboard topic, which carries the report itself as data."""
     headline = message.split(CHAT_LINE_SEPARATOR, 1)[0]
-    bold_open, bold_close = CHAT_HEADLINE.split("{text}")
+    bold_open, bold_close = CHAT_HEADLINE.split(CHAT_HEADLINE_PLACEHOLDER)
     if headline.startswith(bold_open) and headline.endswith(bold_close):
         headline = headline[len(bold_open) : len(headline) - len(bold_close)]
     return headline
+
+
+def plain_status_line(line: str) -> str:
+    """Strip the bold headline markers from a status line that follows an earlier line in the post."""
+    bold_open, bold_close = CHAT_HEADLINE.split(CHAT_HEADLINE_PLACEHOLDER)
+    if line.startswith(bold_open):
+        end = line.find(bold_close, len(bold_open))
+        if end != -1:
+            return line[len(bold_open) : end] + line[end + len(bold_close) :]
+    return line
 
 
 def chat_message(headline: str, items: list[str], tail: str = "") -> str:
@@ -1917,9 +1924,8 @@ def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, 
 def record_topic_publish_result(
     err_detail: str | None,
     announced: dict[str, Any],
-    lines: list[str],
 ) -> None:
-    """Announce blackboard topic publish failure once via the ledger's announced map, logging details."""
+    """Record blackboard topic publish failure in the ledger's announced map for retry and log details."""
     if err_detail is not None:
         script_log.append(
             WATCH_LOG_FILE,
@@ -1932,8 +1938,6 @@ def record_topic_publish_result(
                 )
             ],
         )
-        if announced.get(ANNOUNCED_TOPIC_PUBLISH_KEY) != ERROR_KIND_TOPIC_PUBLISH:
-            lines.append(TOPIC_PUBLISH_FAILED_LINE)
         announced[ANNOUNCED_TOPIC_PUBLISH_KEY] = ERROR_KIND_TOPIC_PUBLISH
     elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced:
         del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
@@ -2822,7 +2826,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             _, err_detail = publish_blackboard_topic(
                 topic_summary(report_line), md_path.with_suffix(REPORT_JSON_SUFFIX)
             )
-            record_topic_publish_result(err_detail, announced, lines)
+            record_topic_publish_result(err_detail, announced)
         elif retired_labels and scan_errors:
             # A finding retired on a readable cluster during a partial scan (a
             # failure, or clusters not reached) makes `latest.json` stale; defer
@@ -2842,14 +2846,14 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
                 topic_summary(retired_line) if retired_line else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
             )
             _, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
-            record_topic_publish_result(err_detail, announced, lines)
+            record_topic_publish_result(err_detail, announced)
         elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not scan_errors:
             latest_json = home / REPORTS_DIR_NAME / LATEST_JSON_LINK_NAME
             if latest_json.is_file():
                 _, err_detail = publish_blackboard_topic(
                     A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX), latest_json
                 )
-                record_topic_publish_result(err_detail, announced, lines)
+                record_topic_publish_result(err_detail, announced)
             else:
                 del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
 
@@ -2867,7 +2871,12 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             updated_ledger[ANNOUNCED_KEY] = announced
         save_ledger(home, updated_ledger)
         messages = [message for message in (report_line, retired_line) if message]
-        lines = messages + clear_tick_failure(home, dry_run=dry_run) + lines
+        status_lines = clear_tick_failure(home, dry_run=dry_run) + lines
+        if messages:
+            status_lines = [plain_status_line(line) for line in status_lines]
+        elif len(status_lines) > 1:
+            status_lines = [status_lines[0], *(plain_status_line(line) for line in status_lines[1:])]
+        lines = messages + status_lines
     except WriteFailed as exc:
         for line in record_tick_failure(home, exc, dry_run=dry_run):
             print(line)
