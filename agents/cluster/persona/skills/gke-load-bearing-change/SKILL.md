@@ -56,7 +56,7 @@ Four steps, and they do not depend on what kind of object changed. Step 3 is whe
 
 **1. Establish what the revert would actually put back.** Not the one field the request names — the whole declared state as it would land. Two fields are often taken together (a `runAsNonRoot` and the `runAsUser` beside it), and a revert that restores one without the other produces a third state nobody has ever run.
 
-**You have no GitOps checkout, and you are not meant to go looking for one.** You hold a read-only view of one cluster; the only way to the repository is the `version-control` skill, and only for the repository the task names.
+**You have no GitOps checkout, and you are not meant to go looking for one.** You hold a read-only view of one cluster; the only way to the repository is the `version-control` skill, and only for the repository the task names, or, when it names none, the one managed repository `identity` lists.
 
 **Read `managedFields` for ownership, and know what it cannot give you.** It records which paths each manager owns and never the value they held, so it tells you which fields the out-of-band manager took and which the GitOps manager still owns, and nothing about what the revert would restore:
 
