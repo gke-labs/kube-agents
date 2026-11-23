@@ -126,11 +126,18 @@ const (
 	// server it is appended alongside).
 	delegateToolID = "mcp__" + workeradapter.DelegateMCPServer + "__" + workeradapter.DelegateToolName
 	// delegatePrompt tells the model the tool exists and when to reach for
-	// it; the tool's own schema (mcp.go) covers how to call it.
+	// it; the tool's own schema (mcp.go) covers how to call it. Only session
+	// pods carry it (an AgentProfile pool sets A2A_DELEGATE_TOOL=off). Its
+	// last sentence is for a session with the cluster view: its own reads
+	// pull it toward reading first, and an ask that also needs a change then
+	// splits into read delegations whose change never reaches platform
+	// (#6859). Handing the whole ask over in one turn is the shorter path
+	// whether or not a later turn could delegate again.
 	delegatePrompt = "You can hand a task to another agent with the `delegate` tool. Its addressee field lists the agents you may use this turn: usually `platform`, the platform agent, which can read and act on the fleet, and any agent profile this conversation can reach. If it says no agent is available, don't call it. " +
 		"When the person asks for one of those agents by name, delegate to it under that name. " +
 		"The gateway checks that the user may reach that agent before anything runs. Calling `delegate` ends your turn; the agent's result arrives as your next turn, so say what you are delegating and why in one line first. " +
-		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can."
+		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can. " +
+		"When the ask needs a change made, such as applying something or opening a pull request, hand the whole ask to `platform` in this turn, with the reads it depends on, rather than reading first and handing off the change afterwards: one handoff is the shorter path, and `platform` makes those reads itself."
 
 	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey
 	// is not a credential: the gateway here runs keyless and the harness only

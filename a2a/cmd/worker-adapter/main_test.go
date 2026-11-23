@@ -717,3 +717,49 @@ func TestSessionWriteRefusalDir(t *testing.T) {
 		})
 	}
 }
+
+// A session with the cluster view reads for itself, and that pulls an ask
+// that also needs a change toward reading first: the reads fan out to read
+// delegations and the change never reaches platform (#6859,
+// pdb-remediation-pr 0/3 with the view, 3/3 without). The delegate prompt
+// says to hand such an ask over whole, in the turn it arrives. It rests that
+// on the shorter path, not on a wake turn being unable to delegate, which a
+// later change makes false (#6861). A pod without the delegate tool gets no
+// such line, since it has nothing to hand over with.
+func TestTheClusterViewSessionHandsAChangeRequiringAskToPlatformWhole(t *testing.T) {
+	prompt := func() string {
+		argv := harnessCommand()
+		for i, a := range argv {
+			if a == "--append-system-prompt" && i+1 < len(argv) {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+	t.Setenv(lib.EnvClusterView, "true")
+	t.Setenv(lib.EnvDelegateTool, "")
+	p := prompt()
+	for _, want := range []string{
+		"needs a change made",
+		"opening a pull request",
+		"hand the whole ask to `platform` in this turn",
+		"with the reads it depends on",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("view-on session prompt lacks %q: %q", want, p)
+		}
+	}
+	for _, never := range []string{"can't delegate again", "cannot delegate again", "only one delegation"} {
+		if strings.Contains(strings.ToLower(p), never) {
+			t.Errorf("view-on session prompt rests the handoff on %q, which re-delegation on a wake makes false: %q", never, p)
+		}
+	}
+	// Read-only asks keep the view's latency win: the read-it-yourself line stays.
+	if !strings.Contains(p, "answer yourself when you can") {
+		t.Errorf("view-on session prompt dropped the answer-yourself line: %q", p)
+	}
+	t.Setenv(lib.EnvDelegateTool, "off")
+	if p := prompt(); strings.Contains(p, "hand the whole ask") {
+		t.Errorf("a pod without the delegate tool is told to hand asks over: %q", p)
+	}
+}
