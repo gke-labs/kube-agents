@@ -969,7 +969,8 @@ released from the serialization at the conversation's next turn once it is older
 first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
 conversation saying so. Both subjects, not just `…events`: the fold reads them together,
 and assertion 9 exists because a task whose only event is its supervisor's terminal is not
-empty. That release publishes no terminal: age alone is not
+empty, unless that terminal is a five-token one on a profile task stored after the
+install's `A2A_PROFILE_SUPERVISOR_CUTOFF`, which is not folded, so the task is empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
