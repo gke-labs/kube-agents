@@ -39,6 +39,10 @@
 # audit: labels so the next audit does not bind the finding to it. Plus one
 # budget it applies and deletes on the seeded cluster.
 #
+# THE RECIPE'S CASE. This is no-pdb's end-to-end case: its recipe.yaml names it
+# (eval_case), and the check grades a record of that kind (recipe: no-pdb).
+# bench/tests/test_recipe_eval_cases.py holds the two to each other.
+#
 # ONE FIX, THIS RUN'S. post_merge_outcome merges the single pull request the
 # reply names, and needs the record this install's pr_opened plugin wrote for
 # it. So the case accepts no earlier run's pull request (no
@@ -91,3 +95,4 @@ verification_spec:
           outcome: verified_fixed
           report: silent
           apply_fixture_role: no-pdb-workload
+          recipe: no-pdb
