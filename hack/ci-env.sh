@@ -388,8 +388,9 @@ REPLAY_CHECKOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #
 # Every attempt chooses the endpoint again. gke_dns_endpoint_flag reads the
 # cluster from the same API and gives an empty flag when that read fails, so
-# a flag chosen during the outage could put the IP endpoint in the kubeconfig
-# of a cluster that needs the DNS one.
+# a retry does not reuse a flag chosen during the outage. A read that fails
+# on an attempt whose get-credentials call passes still gives the IP
+# endpoint, as it did before the retry.
 get_cluster_credentials() {
   local cluster=$1 region=$2 project=$3
   local attempt rc delay stderr_file

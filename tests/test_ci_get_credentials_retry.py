@@ -39,7 +39,10 @@ AUTH_STEP_RE = re.compile(
 )
 # A direct call for the host cluster: the single-shot form the helper replaces.
 DIRECT_CALL_RE = re.compile(r'^\s*gcloud container clusters get-credentials "\$\{?(?:HOST_)?CLUSTER_NAME\}?"', re.MULTILINE)
-HOST_CALL = "container clusters get-credentials platform-agent-host --region us-central1 --project kube-agents-evals --quiet"
+# The region and project the test gives ci-env.sh, so its defaults can change.
+REGION = "region-under-test"
+PROJECT = "project-under-test"
+HOST_CALL = f"container clusters get-credentials platform-agent-host --region {REGION} --project {PROJECT} --quiet"
 
 UNAVAILABLE = "ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=503, message=The service is currently unavailable."
 PERMISSION_DENIED = "ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=403, message=Permission denied on resource project."
@@ -118,6 +121,8 @@ class GetCredentialsRetryTest(unittest.TestCase):
                 "HOME": tmp,
                 "TMPDIR": tmp,
                 "STUB_LOG": tmp,
+                "REGION": REGION,
+                "PROJECT_ID": PROJECT,
                 "STUB_FAILURES": str(failures),
                 "STUB_ERROR": error,
                 "STUB_EXIT": str(exit_code),
