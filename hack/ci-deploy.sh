@@ -3239,6 +3239,50 @@ echo "Front door: ${EVAL_FRONT_DOOR} (EVAL_FRONT_DOOR; session sizing ${EVAL_FRO
 # it later), and the compare reads a missing file as platform.
 mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
 echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+
+# verify_front_door checks the route the install resolved against the one the
+# switch asked for (#6942), so the record says which front door the run
+# graded rather than which it asked for. Today the operator's route is the
+# spec's (resolveA2ADefaultRoute), so a mismatch means the chart or the CR
+# lost the setting; once the operator's route can fall back from an explicit
+# `session` (the session cap's guards in #6487), it also catches a run that
+# asked for session and would grade platform. It reads the
+# A2A_DEFAULT_ADDRESSEE the operator rendered on the gateway's pod template,
+# retrying a read that fails as the bridge's template read does, rewrites
+# front-door.txt with both routes, and fails the deploy on a mismatch or a
+# route it can't read.
+verify_front_door() {
+  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved="" out errfile attempt
+  # kubectl's stderr goes to its own file, never into the value parsed: a read
+  # that succeeds with a warning on stderr still yields the route. An empty
+  # read is retried as a failed one is.
+  errfile="$(mktemp)"
+  for ((attempt = 1; attempt <= BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
+    if out="$(kubectl get "${gateway}" -n "${NAMESPACE}" \
+      -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>"${errfile}")"; then
+      resolved="$(awk 'NF { print; exit }' <<<"${out}")"
+      if [ -n "${resolved}" ]; then
+        break
+      fi
+      echo "front door: ${gateway} has no A2A_DEFAULT_ADDRESSEE yet (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS})" >&2
+    else
+      echo "front door: reading ${gateway} failed (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS}): $(cat "${errfile}")" >&2
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  rm -f "${errfile}"
+  printf 'requested=%s\nresolved=%s\n' "${EVAL_FRONT_DOOR}" "${resolved:-unknown}" \
+    >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+  if [ -z "${resolved}" ]; then
+    echo "ERROR: front door: could not read A2A_DEFAULT_ADDRESSEE on ${gateway}, so the route this install resolved is unknown; EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}." >&2
+    return 1
+  fi
+  if [ "${resolved}" != "${EVAL_FRONT_DOOR}" ]; then
+    echo "ERROR: front door: EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}, but the install resolved ${resolved} (A2A_DEFAULT_ADDRESSEE on ${gateway}); the run would grade the ${resolved} route. Check spec.harness.tuning.defaultRoute on the PlatformAgent, and the operator's conditions for a route it held back." >&2
+    return 1
+  fi
+  echo "✓ front door: the install resolved ${resolved}, as EVAL_FRONT_DOOR asked"
+}
 if [ -z "${MODE_NEXT_MAX_SESSIONS}" ]; then
   echo "spec.harness.tuning.maxSessions: not set (EVAL_FRONT_DOOR_SESSIONS=shipped); the install default applies, and the provision sizes TASKS for it"
 elif [ "${EVAL_FRONT_DOOR}" = "session" ]; then
@@ -3345,6 +3389,13 @@ gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
 # has rolled for the bridge by now, and the CR stays out of Degraded with
 # the console on.
 gate_web_console
+
+# The route the install resolved, against the one asked for (#6942): after the
+# gates, so the gateway's rendered env is the one the eval will run against.
+if ! verify_front_door; then
+  report_cr_status "front-door-mismatch"
+  exit 1
+fi
 
 # What the run has to show for itself, for the artifact log: the CR status,
 # the A2A stack, the ungated gateway, and the entrypoint's
