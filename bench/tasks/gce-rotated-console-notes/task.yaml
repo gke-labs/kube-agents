@@ -1,0 +1,109 @@
+# FIXTURE_NOT_READY: the rotated-console-vm role is not on the pool yet.
+# The role (bench/tf/fleet/fixtures.json on the fixture's pull request for
+# #5389) plants `serial-flood-<cluster_prefix>`, a standalone VM whose
+# startup script fails at boot ("eval fixture: planted rotated-console
+# failure", exit 1) and whose systemd timer then writes one bounded pass of
+# counted filler lines ("eval fixture: serial-flood filler ...") to serial
+# port 1, two minutes after boot and every 24 hours after. One pass is about
+# twice the 1 MiB serial buffer, so the boot's failure lines rotate out
+# minutes after boot and only the filler remains. The reconcile does not
+# reset this VM: the rotated console is its healthy state.
+#
+# The check this case grades is the GCE compute SOP's rotated-console rule,
+# not a finding: the collector (skills/gce-compute-fleet-audit/scripts/
+# compute_fleet_audit.py) reads the serial console of every instance that
+# runs a startup script, and on one whose boot has rotated out it files
+# nothing — it names the instance in the target's `notes`
+# (ROTATED_SERIAL_NOTE) and lists it under `noted_objects`. `finish` carries
+# the note on its JSON line, and the SOP tells the worker to relay each
+# entry in the report. The planted failure is invisible by design: a run
+# that files a gce-startup-script-status finding on this VM invented
+# evidence its console does not show, and a run that calls the VM clean
+# cleared a check it could not see.
+#
+# Where each check reads, and why:
+# - The report, for the note: the ledger's Notes cell is clipped to the
+#   table-cell budget (MAX_CELL_CHARS), which ends before ROTATED_SERIAL_NOTE
+#   reaches the instance names, so the body cannot be required to name the
+#   VM; the note on the JSON line carries the names, and the report relays
+#   it.
+# - The ledger body, for the absence of a finding: only a finding's object
+#   path (`ComputeInstance/<zone>/serial-flood-...`) puts the name after a
+#   slash, while the notes and evidence name it after a space — the same
+#   discriminator gce-startup-script-failure documents. The ledger exists on
+#   every repetition because the startup-fail VM's finding is always filed.
+#
+# Registered in scripts/validate_bench_cases.py FIXTURE_NOT_READY, citing
+# #5389, until the fleet re-apply plants the role on every pool project.
+# Red/green runs for the eval-driven loop come on a dev install whose fleet
+# carries the fixture (apply bench/tf/fleet from the fixture branch), not on
+# the pool.
+#
+# Isolation class: read-only on the project; writes the ledger issue to the
+# eval GitOps repo, as every fleet-audit stream does.
+id: gce-rotated-console-notes
+name: GCE compute audit notes the VM whose serial console rotated, and files nothing on it
+prompt: >-
+  Run the GCE compute fleet audit, following the gce-compute-fleet-audit SOP.
+expected_output: >-
+  The report relays the target's note naming the serial-flood VM as read but
+  not visible. The ledger carries no finding on that VM, and the report does
+  not call it clean. The closing response is the SOP's one line, carrying
+  the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
+
+# Documentation, and the roles the lease-time fixture-drift pass reads for
+# this case (bench/kube_agents_bench/fixture_drift.py). rotated-console-vm
+# is the graded state; startup-fail-vm is what keeps a ledger open for the
+# forbidden-phrase check to read (a drifted startup-fail VM can close the
+# ledger and error that check for a reason that is not this case's).
+fixtures:
+  - rotated-console-vm
+  - startup-fail-vm
+
+verification_spec:
+  # The note reaches the reader: the report names the flood VM as read but
+  # not visible. The name is required verbatim ("serial-flood-" prefixes the
+  # VM on every pool project); the not-visible wording may be the note's own
+  # ("is not visible", "has rotated out") or a close relay of it.
+  - name: the-report-names-the-flood-vm-as-not-visible
+    role: objective
+    # assert, not converge: the report is written once, at the close.
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["serial-flood-"]
+      any_of_phrases:
+        - "not visible"
+        - "rotated"
+        - "could not be seen"
+        - "could not see"
+  # Its failure is invisible, so no finding is filed on it: only a finding's
+  # object path puts the VM's name after a slash (see the header).
+  - name: no-finding-is-filed-on-the-flood-vm
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      forbidden_phrases: ["/serial-flood-"]
+  # The report does not call the VM clean: a clean claim on the same line as
+  # the name, or a success claim about its startup script. The patterns stay
+  # on one line so the note relay ("do not report as clean" wordings
+  # included) does not trip them.
+  - name: the-report-does-not-call-the-flood-vm-clean
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '(?i)serial-flood-[^\n]{0,120}\b(?:is|was|looks?|reads?|came back)\s+(?:all\s+)?(?:clean|healthy|fine|ok(?:ay)?)\b'
+        - '(?i)serial-flood-[^\n]{0,120}\b(?:startup[ -]?script|script|boot)\b[^\n]{0,60}\b(?:succeeded|passed|completed successfully|ran successfully|no (?:failure|error)s?)\b'

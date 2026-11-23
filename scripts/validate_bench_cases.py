@@ -566,6 +566,12 @@ FIXTURE_NOT_READY = {
         "snapshots date from 2026-11-18, so the compute audit first sees them on "
         "2027-02-17 and the case cannot be red or green before then"
     ),
+    "gce-rotated-console-notes": (
+        "#5389: needs the rotated-console-vm role (serial-flood-<cluster_prefix>, the VM "
+        "whose serial console rotates minutes after boot) applied to every pool project; "
+        "the fixture's pull request is not merged, and merging plants nothing until the "
+        "fleet re-apply; red/green runs come on a dev install whose fleet carries it"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
