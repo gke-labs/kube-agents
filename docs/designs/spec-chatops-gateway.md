@@ -3490,7 +3490,11 @@ which reads the gateway's inbound-message counter. Each armed door renders a cop
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every install now so that it is not (decided
-10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+10/6 on #2473). It is Ingress-only. The gateway's own dials are governed by a second policy,
+`<name>-a2a-gateway-egress` (#6553), which renders and goes with the fence: cluster DNS, the
+bus's client port, the broker's port, the Kubernetes API server, and TCP 443 except to private,
+link-local and shared addresses, for Slack, Discord and the A2A door's token check. Google Chat
+reaches Google through the broker's relay.
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
 once the gateway has bound its event relay and 503 until then, with the reason as the body

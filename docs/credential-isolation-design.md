@@ -132,7 +132,9 @@ are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
 kubectl cost table the shell's admission charges, which the operator passes only as a short
-lowercase word, before either reaches that Pod. The three
+lowercase word, before either reaches that Pod. The tier also goes, normalised the same way, to
+the A2A gateway, which sets it on the session Pods it starts under the cluster view, since their
+kubectl runs the same admission. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
