@@ -3231,6 +3231,32 @@ echo "Front door: ${EVAL_FRONT_DOOR} (EVAL_FRONT_DOOR; session sizing ${EVAL_FRO
 # it later), and the compare reads a missing file as platform.
 mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
 echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+
+# verify_front_door checks the route the install resolved against the one the
+# switch asked for (#6942). The operator can resolve a different route from
+# an explicit spec.harness.tuning.defaultRoute (resolveA2ADefaultRoute falls
+# back to platform under its guards), and a run that asked for session but
+# routes plain turns to platform would grade the wrong front door while its
+# record said session. It reads the A2A_DEFAULT_ADDRESSEE the operator
+# rendered on the gateway, rewrites front-door.txt with both routes, and
+# fails the deploy on a mismatch or an unreadable route.
+verify_front_door() {
+  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved
+  resolved="$(kubectl get "${gateway}" -n "${NAMESPACE}" \
+    -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>/dev/null |
+    awk 'NF { print; exit }')" || resolved=""
+  printf 'requested=%s\nresolved=%s\n' "${EVAL_FRONT_DOOR}" "${resolved:-unknown}" \
+    >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+  if [ -z "${resolved}" ]; then
+    echo "ERROR: front door: could not read A2A_DEFAULT_ADDRESSEE on ${gateway}, so the route this install resolved is unknown; EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}." >&2
+    return 1
+  fi
+  if [ "${resolved}" != "${EVAL_FRONT_DOOR}" ]; then
+    echo "ERROR: front door: EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}, but the install resolved ${resolved} (A2A_DEFAULT_ADDRESSEE on ${gateway}); the run would grade the ${resolved} route. Check the PlatformAgent's SessionCapFitted condition and resolveA2ADefaultRoute's guards." >&2
+    return 1
+  fi
+  echo "✓ front door: the install resolved ${resolved}, as EVAL_FRONT_DOOR asked"
+}
 if [ -z "${MODE_NEXT_MAX_SESSIONS}" ]; then
   echo "spec.harness.tuning.maxSessions: not set (EVAL_FRONT_DOOR_SESSIONS=shipped); the install default applies, and the provision sizes TASKS for it"
 elif [ "${EVAL_FRONT_DOOR}" = "session" ]; then
@@ -3337,6 +3363,13 @@ gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
 # has rolled for the bridge by now, and the CR stays out of Degraded with
 # the console on.
 gate_web_console
+
+# The route the install resolved, against the one asked for (#6942): after the
+# gates, so the gateway's rendered env is the one the eval will run against.
+if ! verify_front_door; then
+  report_cr_status "front-door-mismatch"
+  exit 1
+fi
 
 # What the run has to show for itself, for the artifact log: the CR status,
 # the A2A stack, the ungated gateway, and the entrypoint's

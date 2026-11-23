@@ -1954,3 +1954,62 @@ class CrStatusReportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _front_door_record(tmp: str) -> str:
+    return pathlib.Path(tmp, "front-door.txt").read_text(encoding="utf-8")
+
+
+def verify_front_door_run(asked: str, rendered: str | None, tmp: str) -> subprocess.CompletedProcess:
+    """ci-deploy's verify_front_door over a stub kubectl that renders
+    A2A_DEFAULT_ADDRESSEE as `rendered` (None: the read fails)."""
+    stub = (
+        'kubectl() { return 1; }'
+        if rendered is None
+        else f'kubectl() {{ printf "\\n{rendered}\\n"; }}'
+    )
+    return run_bash(
+        "\n".join(
+            [
+                stub,
+                f'EVAL_FRONT_DOOR="{asked}"',
+                'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                'NAMESPACE="kubeagents-system"',
+                f'DEPLOY_ARTIFACT_DIR="{tmp}"',
+                lifted_to_line("verify_front_door() {", "}", "verify_front_door"),
+                "verify_front_door",
+            ]
+        )
+    )
+
+
+class FrontDoorVerifiedTest(unittest.TestCase):
+    """#6942: the deploy checks the route the install resolved against
+    EVAL_FRONT_DOOR, records both, and fails on a mismatch, so a run that asked
+    for session but routes plain turns to platform never grades as the
+    session run."""
+
+    def test_a_matching_route_passes_and_records_both(self) -> None:
+        for route in ("platform", "session"):
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as tmp:
+                result = verify_front_door_run(route, route, tmp)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(_front_door_record(tmp), f"requested={route}\nresolved={route}\n")
+
+    def test_a_route_the_install_resolved_differently_fails_the_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "platform", tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("asked for session, but the install resolved platform", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=platform\n")
+
+    def test_an_unreadable_route_fails_the_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", None, tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not read A2A_DEFAULT_ADDRESSEE", result.stderr)
+            self.assertIn("resolved=unknown", _front_door_record(tmp))
+
+    def test_the_deploy_calls_it_after_the_gates(self) -> None:
+        deploy = text(_CI_DEPLOY)
+        self.assertLess(deploy.index("\ngate_web_console\n"), deploy.index("if ! verify_front_door; then"))
