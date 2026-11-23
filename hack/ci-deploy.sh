@@ -1716,7 +1716,7 @@ fi
 # between its turns; shipped leaves the cap at the install default, what a
 # customer install gets, and an eviction, a wait or a refusal there is a
 # finding about that default.
-EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
+EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-session}"
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
 platform | session) ;;
@@ -1768,6 +1768,7 @@ if [ "${EVAL_FRONT_DOOR}" = "session" ]; then
     MODE_NEXT_MAX_SESSIONS=""
   fi
 fi
+MODE_NEXT_MAX_SESSIONS=2 # DO NOT MERGE: twin-only, a cap of two so the case can fill it
 MAX_SESSIONS_HELM_SETS=()
 if [ -n "${MODE_NEXT_MAX_SESSIONS}" ]; then
   MAX_SESSIONS_HELM_SETS=(--set "${MAX_SESSIONS_HELM_VALUE}=${MODE_NEXT_MAX_SESSIONS}")
