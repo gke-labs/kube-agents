@@ -60,8 +60,8 @@ class LaneReportTest(unittest.TestCase):
         self.conversation("t_00000002", (True, False))
         report, summary = self.report({NIGHT: [{"case": "case-a", "rep": 1, "outcome": "pass"},
                                                {"case": "case-a", "rep": 2, "outcome": "pass"}]})
-        self.assertEqual(report["served_conversations"], {"match": 1, "mismatch": 1, "unknown": 0})
-        self.assertEqual(report["mismatched_conversations"][0]["run"], "case-a#2")
+        self.assertEqual(report["served_conversations"], {"passed": 1, "failed": 1, "unknown": 0})
+        self.assertEqual(report["failed_conversations"][0]["run"], "case-a#2")
         case = report["cases"]["case-a"]
         self.assertEqual((case["lane"]["passes"], case["lane"]["scored"]), (1, 2))
         self.assertEqual(case["nightly"][NIGHT], {"passes": 2, "scored": 2, "outcomes": ["pass", "pass"]})
@@ -87,23 +87,29 @@ class LaneReportTest(unittest.TestCase):
         self.assertEqual((report["commit"], report["commit_source"]), ("", ""))
         self.assertTrue(summary.startswith("replayed on an unknown commit"), summary)
 
-    def test_a_served_run_with_no_verdict_is_unknown_not_a_mismatch(self):
+    def test_a_served_run_with_no_verdict_is_unknown_not_failed(self):
         for outcome in ("infra", "blocked", "not_applicable"):
             with self.subTest(outcome=outcome):
                 self.setUp()
                 self.world.run("case-a", 1, outcome, ["t_00000001"])
                 self.conversation("t_00000001", (True, True))
                 report, _ = self.report({NIGHT: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
-                self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
+                self.assertEqual(report["served_conversations"], {"passed": 0, "failed": 0, "unknown": 1})
                 self.assertEqual(report["unknown_reasons"], {"no_verdict": 1})
 
-    def test_a_conversation_whose_recording_night_is_in_no_record_is_unknown_and_says_why(self):
+    def test_a_conversation_whose_recording_night_is_in_no_record_is_still_graded_by_its_own_run(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.run("case-a", 2, "fail", ["t_00000002"])
         self.conversation("t_00000001", (True, True), recorded_from="1790000000000000999")
+        self.conversation("t_00000002", (True, True), recorded_from="1790000000000000999")
         report, summary = self.report({NIGHT: []})
-        self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
-        self.assertEqual(report["unknown_reasons"], {"recording_build_unrecorded": 1})
-        self.assertIn("recording_build_unrecorded", summary)
+        self.assertEqual(report["served_conversations"], {"passed": 1, "failed": 1, "unknown": 0})
+        self.assertEqual(report["unknown_reasons"], {})
+        self.assertEqual(report["failed_conversations"][0]["recorded_build"], "1790000000000000999")
+        self.assertIn("served conversations by the replayed run's verdict", summary)
+        # Its own words, not analyze_replay's match/mismatch, which mean a run disagreed with its recording.
+        self.assertIn("'passed': 1, 'failed': 1", summary)
+        self.assertNotIn("mismatch", summary)
 
     def test_an_answer_first_written_by_an_older_night_still_gets_a_verdict(self):
         # The fetch reads runs back to the lifecycle (fetch_cache.py), so a night
@@ -112,7 +118,7 @@ class LaneReportTest(unittest.TestCase):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
         self.conversation("t_00000001", (True, True), recorded_from=old_night)
         report, _ = self.report({NIGHT: [], old_night: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
-        self.assertEqual(report["served_conversations"], {"match": 1, "mismatch": 0, "unknown": 0})
+        self.assertEqual(report["served_conversations"], {"passed": 1, "failed": 0, "unknown": 0})
         self.assertEqual(report["cases"]["case-a"]["nightly"], {old_night: {"passes": 1, "scored": 1, "outcomes": ["pass"]}})
 
     def test_a_case_is_graded_against_the_newest_night_on_the_commit_not_the_night_that_wrote_its_answers(self):
@@ -195,7 +201,7 @@ class LaneReportTest(unittest.TestCase):
         self.world.run("case-a", 1, "fail", ["t_00000001"])
         self.conversation("t_00000001", (False, False))
         report, summary = self.report({NIGHT: []})
-        self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 0})
+        self.assertEqual(report["served_conversations"], {"passed": 0, "failed": 0, "unknown": 0})
         self.assertIn("served nothing", summary)
 
     def arms(self, live_reps, replayed_from, cases):
