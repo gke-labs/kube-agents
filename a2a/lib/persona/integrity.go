@@ -313,11 +313,14 @@ func FormatIntegrityManifest(files map[string][]byte) []byte {
 // it, so a manifest can't describe it.
 func WriteIntegrityManifest(dir string) error {
 	files := map[string][]byte{}
-	err := filepath.WalkDir(dir, func(full string, d fs.DirEntry, err error) error {
+	// The trailing separator walks into a dir that is itself a symlink, as
+	// the check does (scanForIntegrity).
+	root := dir + string(filepath.Separator)
+	err := filepath.WalkDir(root, func(full string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, _ := filepath.Rel(dir, full)
+		rel, _ := filepath.Rel(root, full)
 		rel = filepath.ToSlash(rel)
 		switch {
 		case rel == ".", d.IsDir() && d.Type()&fs.ModeSymlink == 0:

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,8 +22,10 @@ const (
 	repoRoot = "../../.."
 	// personaDockerfiles are their images' Dockerfiles.
 	personaDockerfiles = "../../Dockerfile.persona-*"
-	// regenerate is what a failure tells the reader to run, from a2a/.
-	regenerate = "go run ./cmd/persona manifest --in ../agents/<name>/persona"
+	// regenerate is what a failure tells the reader to run, from the
+	// repository root, with the persona's directory: git clean -X first, so
+	// an ignored file (a __pycache__) isn't recorded.
+	regenerate = "git clean -fdX -- %[1]s && go -C a2a run ./cmd/persona manifest --in ../%[1]s"
 )
 
 // Every shipped persona carries a content manifest that matches it, so the
@@ -34,7 +37,8 @@ func TestShippedPersonasCarryAMatchingManifest(t *testing.T) {
 	for _, dir := range dirs {
 		p, err := persona.LoadWithOptions(dir, persona.Options{RequireIntegrity: true})
 		if err != nil {
-			t.Errorf("%s: %v\nregenerate its manifest: %s", dir, err, regenerate)
+			rel, _ := filepath.Rel(repoRoot, dir)
+			t.Errorf("%s: %v\nregenerate its manifest from the repository root: %s", dir, err, fmt.Sprintf(regenerate, filepath.ToSlash(rel)))
 			continue
 		}
 		if p.Integrity != persona.IntegrityVerified {
@@ -186,4 +190,21 @@ func shippedPersonaDirs(t *testing.T) []string {
 		dirs = append(dirs, d)
 	}
 	return dirs
+}
+
+// manifest works on a persona directory given as a symlink, as the
+// worker's check reads one.
+func TestManifestCommandFollowsASymlinkedDir(t *testing.T) {
+	dir := copyDir(t, "../../lib/persona/testdata/example")
+	link := filepath.Join(t.TempDir(), "persona")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb strings.Builder
+	if code := run([]string{"manifest", "--in", link}, &out, &errb); code != 0 {
+		t.Fatalf("manifest through a symlink = %d: %s", code, errb.String())
+	}
+	if code := run([]string{"validate", "--require-integrity", "--in", dir}, &out, &errb); code != 0 {
+		t.Fatalf("validate of the target = %d: %s", code, errb.String())
+	}
 }

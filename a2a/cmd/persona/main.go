@@ -84,8 +84,8 @@ func validate(args []string, stderr io.Writer) error {
 }
 
 // manifestCmd writes --in's content manifest, then loads the persona with
-// the manifest required, so a persona that doesn't load is reported rather
-// than given a manifest.
+// the manifest required, so a persona that doesn't load fails the command
+// (its new manifest stays; fix the persona and run it again).
 func manifestCmd(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("manifest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
