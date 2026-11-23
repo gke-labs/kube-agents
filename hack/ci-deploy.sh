@@ -3233,18 +3233,27 @@ mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
 echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
 
 # verify_front_door checks the route the install resolved against the one the
-# switch asked for (#6942). The operator can resolve a different route from
-# an explicit spec.harness.tuning.defaultRoute (resolveA2ADefaultRoute falls
-# back to platform under its guards), and a run that asked for session but
-# routes plain turns to platform would grade the wrong front door while its
-# record said session. It reads the A2A_DEFAULT_ADDRESSEE the operator
-# rendered on the gateway, rewrites front-door.txt with both routes, and
-# fails the deploy on a mismatch or an unreadable route.
+# switch asked for (#6942), so the record says which front door the run
+# graded rather than which it asked for. Today the operator's route is the
+# spec's (resolveA2ADefaultRoute), so a mismatch means the chart or the CR
+# lost the setting; once the operator's route can fall back from an explicit
+# `session` (the session cap's guards in #6487), it also catches a run that
+# asked for session and would grade platform. It reads the
+# A2A_DEFAULT_ADDRESSEE the operator rendered on the gateway's pod template,
+# retrying a read that fails as the bridge's template read does, rewrites
+# front-door.txt with both routes, and fails the deploy on a mismatch or a
+# route it can't read.
 verify_front_door() {
-  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved
-  resolved="$(kubectl get "${gateway}" -n "${NAMESPACE}" \
-    -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>/dev/null |
-    awk 'NF { print; exit }')" || resolved=""
+  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved="" out attempt
+  for ((attempt = 1; attempt <= BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
+    if out="$(kubectl get "${gateway}" -n "${NAMESPACE}" \
+      -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>&1)"; then
+      resolved="$(awk 'NF { print; exit }' <<<"${out}")"
+      break
+    fi
+    echo "front door: reading ${gateway} failed (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS}): ${out}" >&2
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
   printf 'requested=%s\nresolved=%s\n' "${EVAL_FRONT_DOOR}" "${resolved:-unknown}" \
     >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
   if [ -z "${resolved}" ]; then
@@ -3252,7 +3261,7 @@ verify_front_door() {
     return 1
   fi
   if [ "${resolved}" != "${EVAL_FRONT_DOOR}" ]; then
-    echo "ERROR: front door: EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}, but the install resolved ${resolved} (A2A_DEFAULT_ADDRESSEE on ${gateway}); the run would grade the ${resolved} route. Check the PlatformAgent's SessionCapFitted condition and resolveA2ADefaultRoute's guards." >&2
+    echo "ERROR: front door: EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}, but the install resolved ${resolved} (A2A_DEFAULT_ADDRESSEE on ${gateway}); the run would grade the ${resolved} route. Check spec.harness.tuning.defaultRoute on the PlatformAgent, and the operator's conditions for a route it held back." >&2
     return 1
   fi
   echo "✓ front door: the install resolved ${resolved}, as EVAL_FRONT_DOOR asked"
