@@ -78,6 +78,14 @@ const (
 	// worker and only when EnvHarness is unset. It once picked the persona
 	// adapter alone.
 	EnvProfileHarness = "PROFILE_HARNESS"
+	// EnvPersonaIntegrity sets whether a profile worker requires its persona
+	// to carry a build-time content manifest (persona.IntegrityManifestFile).
+	// PersonaIntegrityRequired refuses a persona without one; unset loads it
+	// unchecked and logs that. A manifest that is present is checked either
+	// way, and any other value stops the worker.
+	EnvPersonaIntegrity = "A2A_PERSONA_INTEGRITY"
+	// PersonaIntegrityRequired is EnvPersonaIntegrity's one value.
+	PersonaIntegrityRequired = "required"
 	// EnvPrimerFile names the file the spawner mounts the conversation's
 	// transcript primer at (the pod's rehydration-primer annotation, through
 	// the downward API). A pod spawned cold for a conversation that already

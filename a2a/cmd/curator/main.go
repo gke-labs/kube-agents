@@ -1,6 +1,6 @@
 // Command curator is the Go OKF Curator and Dreamer daemon and CLI for kube-agents.
 // It subscribes to NATS JetStream (a2a.topics.shared.annotations on TOPICS-JOURNAL
-// and _INBOX.agent.curator.outcomes), synthesizes and updates Operational Knowledge
+// and a2a.topics.agent.platform.curator-outcomes), synthesizes and updates Operational Knowledge
 // Framework (OKF) records (DEC-* and LES-*), indexes them verbatim into Hindsight
 // (kube-agents-decisions) with in-place status transitions, graduates multi-cluster
 // recurrences into fleet-wide decisions, and broadcasts the active digest to
@@ -262,49 +262,12 @@ func runDaemonContext(ctx context.Context, args []string) error {
 	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL")
 	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
 	threshold := fs.Int("recurrence-threshold", defaultRecurrenceFloor, "clusters required to graduate a lesson to a fleet-wide decision")
-	statusListen := fs.String("status-listen", strings.TrimSpace(os.Getenv("CURATOR_STATUS_LISTEN")), "optional HTTP address serving /healthz and /readyz (for example, :8080)")
+	statusListen := fs.String("status-listen", strings.TrimSpace(os.Getenv("CURATOR_STATUS_LISTEN")), "optional HTTP address serving /healthz, /readyz, and /metrics (for example, :8080)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	var ready atomic.Bool
-	var statusSrv *http.Server
-	if *statusListen != "" {
-		ln, lnErr := net.Listen("tcp", *statusListen)
-		if lnErr != nil {
-			return fmt.Errorf("listen status %s: %w", *statusListen, lnErr)
-		}
-		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok\n"))
-		})
-		mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-			if !ready.Load() {
-				http.Error(w, "not ready", http.StatusServiceUnavailable)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ready\n"))
-		})
-		statusSrv = &http.Server{
-			Handler:           mux,
-			ReadHeaderTimeout: statusReadHeaderTimeout,
-		}
-		go func() {
-			if sErr := statusSrv.Serve(ln); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
-				log.Error("curator status server failed", "err", sErr)
-			}
-		}()
-		defer func() {
-			shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = statusSrv.Shutdown(shCtx)
-			_ = statusSrv.Close()
-		}()
-	}
 
 	client, err := connectNATS(ctx, "daemon", log)
 	if err != nil {
@@ -334,6 +297,45 @@ func runDaemonContext(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	var ready atomic.Bool
+	var statusSrv *http.Server
+	if *statusListen != "" {
+		ln, lnErr := net.Listen("tcp", *statusListen)
+		if lnErr != nil {
+			return fmt.Errorf("listen status %s: %w", *statusListen, lnErr)
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		})
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+			if !ready.Load() {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready\n"))
+		})
+		mux.Handle("/metrics", cur.MetricsHandler())
+		statusSrv = &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: statusReadHeaderTimeout,
+		}
+		go func() {
+			if sErr := statusSrv.Serve(ln); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
+				log.Error("curator status server failed", "err", sErr)
+			}
+		}()
+		defer func() {
+			shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = statusSrv.Shutdown(shCtx)
+			_ = statusSrv.Close()
+		}()
+	}
+
 	if err := cur.Start(ctx); err != nil {
 		return err
 	}

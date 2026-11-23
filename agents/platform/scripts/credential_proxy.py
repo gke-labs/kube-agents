@@ -1278,6 +1278,18 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 VCS_PROVIDER_LABEL = "provider"
 VCS_PROVIDER_NONE = "none"
+DECISION_MEMORY_CHECKS_METRIC = "kubeagents_credential_proxy_decision_memory_checks_total"
+DECISION_MEMORY_VERDICT_LABEL = "verdict"
+DECISION_MEMORY_VERDICT_ALLOW = "allow"
+DECISION_MEMORY_VERDICT_WARN = "warn"
+DECISION_MEMORY_VERDICT_BLOCK = "block"
+DECISION_MEMORY_VERDICT_ERROR = "error"
+DECISION_MEMORY_VERDICTS = frozenset({
+    DECISION_MEMORY_VERDICT_ALLOW,
+    DECISION_MEMORY_VERDICT_WARN,
+    DECISION_MEMORY_VERDICT_BLOCK,
+    DECISION_MEMORY_VERDICT_ERROR,
+})
 # The one-time claim token minted with each `proposal-create` answer, under
 # CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
 # (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
@@ -8831,7 +8843,8 @@ VCS_SCRATCH_DIR = "vcs"
 # its scratch directory (`--output`), from a bare clone.
 #
 # `diff-tree` is on it for one caller: `publish` diffs the incoming tip's tree
-# against the policy base's merge-base before pushing.
+# against the policy base's merge-base before pushing. `log` is on it so `publish`
+# inspects incoming commit author and committer addresses before pushing.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "archive",
@@ -8841,6 +8854,7 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "diff-tree",
         "fetch",
         "init",
+        "log",
         "ls-remote",
         "ls-tree",
         "merge-base",
@@ -13477,6 +13491,7 @@ def build_vcs_broker(
     executor: CommandExecutor,
     base_branch: str = "",
     pinned_bases: Mapping[tuple[str, str], str] | None = None,
+    metrics: ProxyMetrics | None = None,
 ):
     """The version-control broker. Always built; there is no switch.
 
@@ -13513,6 +13528,14 @@ def build_vcs_broker(
         # describe and a namespaced kubectl get, through the same executor,
         # kubeconfig selection and output cap as a caller's.
         cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
+        on_decision_memory_check=(
+            metrics.record_decision_memory_check if metrics is not None else None
+        ),
+        allowed_commit_emails=lambda host, viewer_login: vcs_readings.install_commit_emails(
+            host,
+            viewer_login,
+            os.environ.get(vcs_readings.GITHUB_APP_ID_ENV, "").strip() or None,
+        ),
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -14228,6 +14251,7 @@ class ProxyMetrics:
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str, str], int] = {}
+        self._decision_memory_checks: dict[str, int] = {}
         # The sweep's last reading of each kind, None until the first; a
         # withheld reading leaves the previous one here.
         self._outcomes: vcs_readings.OutcomesReading | None = None
@@ -14346,6 +14370,12 @@ class ProxyMetrics:
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
+    def record_decision_memory_check(self, verdict: str) -> None:
+        if verdict not in DECISION_MEMORY_VERDICTS:
+            verdict = DECISION_MEMORY_VERDICT_ERROR
+        with self._lock:
+            self._decision_memory_checks[verdict] = self._decision_memory_checks.get(verdict, 0) + 1
+
     def set_readings(
         self,
         outcomes: vcs_readings.OutcomesReading | None,
@@ -14463,6 +14493,7 @@ class ProxyMetrics:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
+            decision_memory_checks = sorted(self._decision_memory_checks.items())
             outcomes = self._outcomes
             details = self._details
             reading_failures = sorted(self._reading_failures.items())
@@ -14585,6 +14616,14 @@ class ProxyMetrics:
                 f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
                 f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
                 f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
+            )
+        lines += [
+            f"# HELP {DECISION_MEMORY_CHECKS_METRIC} Stage B OKF decision-memory guard checks evaluated on /v1/vcs/publish, by verdict (allow, warn, block, error).",
+            f"# TYPE {DECISION_MEMORY_CHECKS_METRIC} counter",
+        ]
+        for verdict, count in decision_memory_checks:
+            lines.append(
+                f'{DECISION_MEMORY_CHECKS_METRIC}{{{DECISION_MEMORY_VERDICT_LABEL}="{_escape_label_value(verdict)}"}} {count}'
             )
         # Wall clock, as the readings' `taken_at` is.
         self._render_readings(lines, outcomes, details, reading_failures, time.time())
@@ -19199,6 +19238,7 @@ def serve(args: argparse.Namespace) -> None:
             executor,
             base_branch=CredentialProxyHandler.base_branch,
             pinned_bases=CredentialProxyHandler.pinned_bases,
+            metrics=CredentialProxyHandler.metrics,
         )
     # What the gate's soft watermark reclaims: vcs scratch no request of this
     # process holds (the vcs broker swept a dead process's at start), and on

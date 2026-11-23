@@ -27,6 +27,8 @@
 // pool. It answers /readyz on lib.ProfileWorkerStatusPort once it's
 // listening. It exits 0 when it stops (at SIGTERM, or after one task with
 // PROFILE_WORKER_ONE_SHOT), and 1 if it can't start.
+// A2A_PERSONA_INTEGRITY=required refuses a persona without a build-time
+// content manifest; any other non-empty value exits 1.
 package main
 
 import (
@@ -182,13 +184,20 @@ func run() int {
 		// The harness configFromEnv selected: its driver names it.
 		harness := cfg.Driver.Harness()
 		cfg = profileModeConfig(cfg)
+		requireIntegrity, err := workeradapter.ParsePersonaIntegrity(os.Getenv(lib.EnvPersonaIntegrity))
+		if err != nil {
+			log.Error("profile worker failed", "err", err)
+			return 1
+		}
 		pw := workeradapter.ProfileWorkerConfig{
 			Tier:       os.Getenv(lib.EnvProfileTier),
 			OneShot:    oneShot == "1" || oneShot == "true",
 			ReadyAddr:  fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
 			PersonaDir: lib.ProfilePersonaDir,
-			Harness:    harness,
-			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
+			// Whether the persona must carry a build-time content manifest.
+			RequirePersonaIntegrity: requireIntegrity,
+			Harness:                 harness,
+			ConfigRoot:              envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
 			// The persona's MCP servers through the broker's relay (#5495).
