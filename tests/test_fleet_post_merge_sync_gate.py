@@ -51,17 +51,19 @@ class PostMergeSyncGateTest(unittest.TestCase):
         checked = 0
         for name in _GATED_FILES:
             blocks = _blocks(name)
-            if blocks is None:
-                continue
+            # A listed file that moved or emptied would drop out unchecked.
+            self.assertIsNotNone(blocks, f"{name} is listed as gated but is not in bench/tf/fleet")
+            self.assertTrue(blocks, f"{name} declares no resource or data block")
             for address, first in blocks.items():
                 checked += 1
                 self.assertEqual(first, _GATE, f"{name}: {address} is not gated by post_merge_sync_projects")
         for name, addresses in _GATED_ADDRESSES.items():
             blocks = _blocks(name) or {}
             for address in addresses:
-                if address in blocks:
-                    checked += 1
-                    self.assertEqual(blocks[address], _GATE, f"{name}: {address} is not gated")
+                # A renamed resource would otherwise plant on every project unseen.
+                self.assertIn(address, blocks, f"{name}: {address} is listed as gated but is not declared")
+                checked += 1
+                self.assertEqual(blocks[address], _GATE, f"{name}: {address} is not gated")
         self.assertGreater(checked, 0)
 
     def test_no_secret_is_read_outside_the_switch(self):
