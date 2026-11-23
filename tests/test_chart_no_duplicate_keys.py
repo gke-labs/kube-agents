@@ -3,8 +3,7 @@
 A label written by hand above `include "kube-agents.labels"` renders the
 key twice in one mapping when the helper emits it too. PyYAML's default
 loaders keep the last value and say nothing, so a render test that uses
-`yaml.safe_load_all` passes. A strict YAML parser, and Argo CD, refuse the
-manifest.
+`yaml.safe_load_all` passes. A strict YAML parser refuses the manifest.
 
 This test loads every rendered document with a loader that refuses a
 duplicate key. It covers the value sets in `_VALUE_SETS` only: a template
