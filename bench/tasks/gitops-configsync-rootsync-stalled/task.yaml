@@ -18,13 +18,14 @@
 # reconciler became unschedulable. The live object's other status blocks
 # (source, rendering, sync) are not planted; the check does not read them.
 #
-# What the case does not cover, by the same live test: a reconciler that is
-# OOM-killed in a loop from its start. Each restart counts as progress, so in
-# the 11 minutes tested that RootSync reported `Reconciling` True with reason
-# `Deployment` ("InProgress: Available: 0/1"), `Stalled` was not True, and
-# check 2.17 does not read `Reconciling` alone. Not tested: a reconciler that
-# worked and then runs out of memory, and one blocked by an admission webhook.
-# The scenario this case comes from is named "Config Sync RootSync /
+# What the case does not cover, by the same live tests: a reconciler that is
+# killed for memory in a loop. In the loops tested (up to 23 minutes) its
+# Deployment kept `Progressing` True and that RootSync did not read `Stalled`; it
+# read `Reconciling` True with reason `Deployment` while the pod was down and
+# `Reconciling` False between two kills. The check finds that state on the
+# reconciler's pod, and gitops-configsync-rootsync-oomkilled grades it on
+# this same stack. Not tested: a reconciler blocked by an admission webhook.
+# The scenario both cases come from is named "Config Sync RootSync /
 # RepoSync Reconciler Stalled or OOMKilled"; this case validates its stalled
 # half, and its name says only that.
 #

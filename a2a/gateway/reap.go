@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -351,7 +352,7 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		if ref.Role == "" && strings.TrimSpace(ref.Request) != "" {
 			said = ref.Request
 		}
-		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
+		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID, g.profileRead(rec, ref.ID, ref.Addressee))
 		if err != nil && !isTaskNotFound(err) {
 			// The stream didn't answer (a transport error, a consumer
 			// refusal, the turn's budget running out): leave the turn out
@@ -512,25 +513,96 @@ func noFirstEventPastGrace(active *ActiveTask, streamEmpty bool, grace time.Dura
 // taskStreamEmpty reports whether nothing is on either of a task's replay
 // subjects in the retention window. It is the test the replay makes before
 // it opens a consumer (TasksGet answers TaskNotFound exactly when this
-// answers true), made with direct gets and no consumer, so a caller that
-// only needs to know whether the task has a first event does not spend one
-// of the TASKS stream's consumer slots on a five-second ephemeral. An error
-// is the read failing, not the subjects being empty.
-func (g *Gateway) taskStreamEmpty(ctx context.Context, addressee, taskID string) (bool, error) {
+// answers true, but for the case lib.TaskReplayHeads names), made with
+// direct gets and no consumer, so a caller that only needs to know whether
+// the task has a first event does not spend one of the TASKS stream's
+// consumer slots on a five-second ephemeral. The task is read as the
+// replay reads it (taskIsProfile), so a five-token supervisor message the
+// cutoff refuses on a profile task is not a first event here either. An error is the read failing, not the subjects being empty.
+func (g *Gateway) taskStreamEmpty(ctx context.Context, rec *SessionRecord, taskID string) (bool, error) {
+	addressee := rec.AddresseeFor(taskID)
+	heads, err := g.client.TaskReplayHeads(ctx, nil, addressee, taskID, g.profileRead(rec, taskID, addressee))
+	if err != nil {
+		return false, err
+	}
+	return len(heads) == 0, nil
+}
+
+// taskProbe is what the newest message on each of a task's replay subjects
+// says, read with direct gets and no consumer (probeTask).
+type taskProbe struct {
+	// empty is nothing on any of the subjects in the retention window.
+	empty bool
+	// final is a terminal status on one of them, the newest message there.
+	final bool
+	// state is the terminal's state when final, else the newest status
+	// among the subjects' newest messages, else working: a task with events
+	// on its stream and no status among the newest is under way.
+	state lib.TaskState
+}
+
+// The probe reads only each subject's newest message. A terminal followed
+// by a later write on the same subject reads as running, and a child whose
+// newest message is an artifact reads as working even after an
+// input-required status: the heal's spot check (healFanOut) covers the
+// first, and the second only shows in the status answer.
+//
+// probeTask reads a task's state from the newest message on each of its
+// replay subjects (lib.TaskReplaySubjects) with direct gets, the read
+// taskStreamEmpty makes, so a fan-out's status and heal learn which children
+// are running, ended or not yet started without opening a replay consumer
+// per child (#6646). Only a terminal needs the full replay, for its folded
+// final message, and the caller makes that read for those children alone.
+// An error is the read failing, not the subjects being empty.
+func (g *Gateway) probeTask(ctx context.Context, stream jetstream.Stream, addressee, taskID string, opts ...lib.ReadOption) (taskProbe, error) {
+	p := taskProbe{empty: true, state: lib.StateWorking}
+	var newest, finalSeq uint64
+	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
+		// Screened as the replay screens each envelope (LastEnvelopeOn), so
+		// an envelope the fold drops is dropped here too, a profile task's
+		// five-token supervisor terminal past the install's cutoff among
+		// them (opts, lib.AcceptsSupervisorEvent; #5301). That includes a
+		// status whose payload names another task: ParseEnvelope refuses
+		// it, and LastEnvelopeOn skips it.
+		env, seq, err := g.client.LastEnvelopeOn(ctx, stream, subject, opts...)
+		if err != nil {
+			return taskProbe{}, err
+		}
+		if seq == 0 {
+			continue // nothing on this subject
+		}
+		p.empty = false
+		if env == nil || env.Kind != lib.KindStatusUpdate {
+			continue
+		}
+		var status lib.StatusUpdate
+		if json.Unmarshal(env.Payload, &status) != nil {
+			continue
+		}
+		if status.Final {
+			// Two terminals (an executor's and a supervisor's that raced
+			// it): the first in stream order is the task's, as the fold has
+			// it, and the later one its post-final drop.
+			if !p.final || seq < finalSeq {
+				p.final, p.state, finalSeq = true, status.Status.State, seq
+			}
+			continue
+		}
+		if !p.final && seq > newest {
+			newest, p.state = seq, status.Status.State
+		}
+	}
+	return p, nil
+}
+
+// tasksStream is the TASKS stream handle a pass of probes shares, so one
+// pass makes one STREAM.INFO round trip, not one per task.
+func (g *Gateway) tasksStream(ctx context.Context) (jetstream.Stream, error) {
 	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
 	if err != nil {
-		return false, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
+		return nil, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
 	}
-	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
-		_, err := stream.GetLastMsgForSubject(ctx, subject)
-		if err == nil {
-			return false, nil
-		}
-		if !errors.Is(err, jetstream.ErrMsgNotFound) {
-			return false, fmt.Errorf("newest message on %s: %w", subject, err)
-		}
-	}
-	return true, nil
+	return stream, nil
 }
 
 // noticeCeilingGraces bounds the no-first-event notice from above, in
@@ -592,7 +664,7 @@ func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) boo
 	if g.noticeStreamReadHook != nil {
 		g.noticeStreamReadHook(active.TaskID)
 	}
-	empty, err := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	empty, err := g.taskStreamEmpty(ctx, rec, active.TaskID)
 	return err == nil && noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, now)
 }
 

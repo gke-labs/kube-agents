@@ -188,8 +188,40 @@ func TestAMalformedEventTriggerSubmitIsRefused(t *testing.T) {
 // TestTheTriggerSubmitFixtureIsWhatTheOperatorSends, since the modules can't
 // import each other) decode strictly into lib.TriggerSubmit and pass the
 // gateway's check, so the two spellings can't drift apart.
+// The script run's fixture (rendered-trigger-submit-script.json) is held the
+// same way, and carries its script on the trigger.
 func TestTheOperatorsTriggerSubmissionIsALibTriggerSubmit(t *testing.T) {
-	raw, err := os.ReadFile("testdata/rendered-trigger-submit.json")
+	for file, script := range map[string]string{
+		"testdata/rendered-trigger-submit.json":        "",
+		"testdata/rendered-trigger-submit-script.json": "compliance-audit",
+	} {
+		s := readOperatorTriggerSubmit(t, file)
+		if err := ValidateTriggerSubmit(TriggerSourceSchedule, s); err != nil {
+			t.Fatalf("%s: the operator's submission fails the gateway's check: %v", file, err)
+		}
+		if s.Trigger.Script != script {
+			t.Errorf("%s: script = %q, want %q", file, s.Trigger.Script, script)
+		}
+	}
+}
+
+// An operator rolled back past spec.script reads a script schedule with no
+// prompt and no script (its types have no such field), and sends an empty
+// prompt with no script: the gateway refuses that, so the rollback never runs
+// a script schedule as a model turn.
+func TestARolledBackOperatorsScriptScheduleIsRefused(t *testing.T) {
+	s := readOperatorTriggerSubmit(t, "testdata/rendered-trigger-submit-script.json")
+	s.Trigger.Script, s.Prompt = "", ""
+	if err := ValidateTriggerSubmit(TriggerSourceSchedule, s); err == nil || !strings.Contains(err.Error(), "prompt is empty") {
+		t.Fatalf("an empty-prompt submission without its script: err = %v, want the empty prompt refused", err)
+	}
+}
+
+// readOperatorTriggerSubmit decodes an operator fixture strictly, as the
+// gateway does.
+func readOperatorTriggerSubmit(t *testing.T, file string) TriggerSubmit {
+	t.Helper()
+	raw, err := os.ReadFile(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,11 +229,9 @@ func TestTheOperatorsTriggerSubmissionIsALibTriggerSubmit(t *testing.T) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&s); err != nil {
-		t.Fatalf("the operator's submission doesn't decode as lib.TriggerSubmit: %v", err)
+		t.Fatalf("%s: the operator's submission doesn't decode as lib.TriggerSubmit: %v", file, err)
 	}
-	if err := ValidateTriggerSubmit(TriggerSourceSchedule, s); err != nil {
-		t.Fatalf("the operator's submission fails the gateway's check: %v", err)
-	}
+	return s
 }
 
 // The prompt bound counts characters, as the CRD's maxLength does: a prompt at

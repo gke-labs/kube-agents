@@ -10,7 +10,9 @@ name: CodeQL
 # fact. A `pull_request` workflow runs for a fork too, and code scanning
 # "always allows the uploading of results when the `pull_request` event
 # triggers the action run" even though the fork's token is read-only (docs:
-# Error: 403 "Resource not accessible by integration").
+# Error: 403 "Resource not accessible by integration"). That held for a run on
+# the pull request's own merge ref and not for one GitHub resolved to the base
+# branch; the `analyze` job's condition says when that happens.
 #
 # This workflow replaces default setup rather than running beside it: GitHub
 # rejects an advanced-setup upload while default setup is enabled for the
@@ -98,7 +100,23 @@ jobs:
     # spend four analyses' runner-minutes on every sync. On a pull
     # request from a fork `github.repository` is this repository, the base,
     # so the guard does not skip the run this workflow exists for.
-    if: github.repository == 'gke-labs/kube-agents'
+    #
+    # The second clause skips a pull request run whose ref is not the pull
+    # request's. A push to a pull request that is in the merge queue starts
+    # its `synchronize` runs only after the queue has merged it (seen on two
+    # pull requests). GitHub then resolves the run to the base branch:
+    # `github.ref` is `refs/heads/main` and the checkout is the queue's merge
+    # commit, while the payload still says the pull request is open, so only
+    # the ref tells. Code scanning refused a fork's read-only upload for that
+    # ref, so every leg of such a run failed at upload with "Resource not
+    # accessible by integration". Nothing is lost by the skip: the queue's
+    # merge commit is on the base branch, and the push run analyses that tree
+    # with a token that can upload. tests/test_workflow_pins_and_fork_guards.py
+    # pins this condition, because a wrong edit to it skips the push and
+    # schedule runs without a red check.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      (github.event_name != 'pull_request' || startsWith(github.ref, 'refs/pull/'))
     runs-on: ubuntu-latest
     # Local timings on 8 vCPUs: Python about 10 minutes, Go about 9 with the
     # explicit build. A standard runner has 4, so an hour leaves room for a

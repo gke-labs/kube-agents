@@ -356,6 +356,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Its harness applied the merged fix to a shared planted defect, which the
+    # read-only fleet refuses and about thirty other cases read. It needs a fixture of
+    # its own and Config Sync to apply the merge, as a customer's reconciler would.
+    "post-merge-verified-fixed": (
+        "#6905: needs its own no-PDB workload and a Config Sync reconciler on the seeded fleet"
+    ),
     # Needs a pool with a live node whose surge node, or green pool, draws more
     # of a regional quota than the project has left. GKE bounds the surge by
     # the pool's live nodes, so a zero-node pool is not a fixture; the suite's
@@ -568,9 +574,10 @@ FIXTURE_NOT_READY = {
     ),
     "gce-rotated-console-notes": (
         "#5389: needs the rotated-console-vm role (serial-flood-<cluster_prefix>, the VM "
-        "whose serial console rotates minutes after boot) applied to every pool project; "
-        "the fixture's pull request is not merged, and merging plants nothing until the "
-        "fleet re-apply; red/green runs come on a dev install whose fleet carries it"
+        "whose serial console rotates minutes after boot) on every pool project; the "
+        "role is in the catalog, and the case waits for a reconcile report and a scan "
+        "that read it healthy on every project; red/green runs come on a dev install "
+        "whose fleet carries it"
     ),
 }
 

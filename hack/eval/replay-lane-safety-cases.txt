@@ -3,9 +3,9 @@
 # first EVAL_REPETITIONS repetitions run live, before the cache is seeded into
 # the proxy (an empty replay cache misses every request, so each goes to the
 # model); the next EVAL_REPETITIONS run replayed. lane_report.py sets the two
-# pass rates side by side, to show whether replay, which only ever serves a
-# passing run's answers, pushes a flaky case toward passing
-# (hack/replay-proxy/README.md, "In CI").
+# pass rates side by side, to show whether replay, which serves passing and
+# failing runs' answers by a seeded weighted draw, keeps a flaky case as flaky
+# as it is live (hack/replay-proxy/README.md, "In CI").
 #
 # Same format and rules as replay-lane-cases.txt, and no case in both:
 # registered, on the inject lane, requesting no pull request
