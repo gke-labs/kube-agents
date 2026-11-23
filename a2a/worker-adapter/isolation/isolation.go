@@ -141,7 +141,7 @@ func (t Table) PrepareTurn(workspace, home string) ([]string, error) {
 	if err := checkRoot("home", home); err != nil {
 		return nil, err
 	}
-	if rel, err := filepath.Rel(filepath.Clean(workspace), filepath.Clean(home)); err == nil && (rel == "." || !strings.HasPrefix(rel, "..")) {
+	if rel, err := filepath.Rel(filepath.Clean(workspace), filepath.Clean(home)); err == nil && !outside(rel) {
 		return nil, fmt.Errorf("isolation: home %q is at or under the workspace %q", home, workspace)
 	}
 	brain, err := brainDir(home)
@@ -157,6 +157,13 @@ func (t Table) PrepareTurn(workspace, home string) ([]string, error) {
 	}
 	r, err := t.scrubBrain(brain)
 	return append(removed, r...), err
+}
+
+// outside reports whether rel, a filepath.Rel result, leaves its base: it
+// is ".." or starts with "../". A child whose name merely starts with two
+// dots, such as "..cache", is inside.
+func outside(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // brainDir returns home's BrainDir after checking that no directory between

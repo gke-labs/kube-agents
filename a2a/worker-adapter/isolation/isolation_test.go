@@ -335,7 +335,8 @@ func must(t *testing.T, err error) {
 func TestPrepareTurnRefusesAHomeAtOrUnderTheWorkspace(t *testing.T) {
 	ws := tempDir(t)
 	write(t, filepath.Join(ws, ".gemini", "antigravity-cli", "brain", "c1", "transcript.jsonl"), "{}")
-	for _, home := range []string{ws, filepath.Join(ws, "home"), ws + "/"} {
+	// "..cache" only starts with two dots: it is a child of the workspace.
+	for _, home := range []string{ws, filepath.Join(ws, "home"), ws + "/", filepath.Join(ws, "..cache"), filepath.Join(ws, "...")} {
 		if _, err := table(t).PrepareTurn(ws, home); err == nil {
 			t.Errorf("PrepareTurn(%q, %q) succeeded; want an error", ws, home)
 		}
