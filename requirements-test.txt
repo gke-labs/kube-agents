@@ -75,10 +75,8 @@ pyyaml
 # transitive pull.
 cryptography
 
-# deploy/docker/check_skill_commands.py and tests/test_skill_inline_commands.py
-# parse SKILL.md with markdown-it-py.
-# The image build runs it under /opt/hermes/.venv, which gets the package from
-# hermes-agent through rich; nothing above pulls it in.
+# tests/test_skill_inline_commands.py parses SKILL.md with markdown-it-py;
+# nothing above pulls it in.
 markdown-it-py
 
 # agents/chat/scripts/cron_idle_policy.py and cron_catch_up_policy.py compute a

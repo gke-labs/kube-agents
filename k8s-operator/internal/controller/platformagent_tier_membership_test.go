@@ -77,6 +77,7 @@ func TestTierMembershipAdmission(t *testing.T) {
 		{"an unattended Tier in another namespace isn't this install's", []agentv1alpha1.TierMember{m("slack", "U1", "nightly-elsewhere")}, ""},
 		{"a legacy tier", []agentv1alpha1.TierMember{m("gchat", "a", "developer-team")}, "compiled-in tier"},
 		{"a Google Chat person twice, in two cases", []agentv1alpha1.TierMember{m("gchat", "Alice@x.com", "read"), m("gchat", "alice@x.com", "oncall")}, "Duplicate value"},
+		{"an Entra person twice, in two cases", []agentv1alpha1.TierMember{m("a2a-entra", "1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D", "read"), m("a2a-entra", "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "oncall")}, "Duplicate value"},
 		{"one Slack id in two cases is two people", []agentv1alpha1.TierMember{m("slack", "U1", "read"), m("slack", "u1", "oncall")}, ""},
 		{"one id on two backends is two people", []agentv1alpha1.TierMember{m("slack", "1", "read"), m("discord", "1", "oncall")}, ""},
 	} {

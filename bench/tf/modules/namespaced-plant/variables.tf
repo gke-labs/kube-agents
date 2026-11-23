@@ -47,3 +47,14 @@ variable "manifest" {
   type        = string
   description = "The namespaced objects to create after the namespace exists, one YAML document stream rendered by the root stack."
 }
+
+variable "settle_seconds" {
+  type        = number
+  description = "Seconds the apply waits after the plant before it returns. For a case that grades the alert the plant raises. Keep it well under the max_age_sec the calling case sets on its fold check, which counts back from the turn that follows the apply."
+  default     = 0
+
+  validation {
+    condition     = var.settle_seconds >= 0 && var.settle_seconds <= 600 && floor(var.settle_seconds) == var.settle_seconds
+    error_message = "settle_seconds must be a whole number of seconds between 0 and 600."
+  }
+}

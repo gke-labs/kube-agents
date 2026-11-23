@@ -1280,8 +1280,124 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
         body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
         self.assertRegex(
             body,
-            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend \{\s*return func",
+            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend[^{]*\{\s*return func",
             "the Google class's roster falls through to principalMapFor, whose default is the chat map",
+        )
+
+
+class A3TheA2ADoorsEntraClassAssertsOnlyAVerifiedObjectID(unittest.TestCase):
+    """A3 on the A2A door's Microsoft Entra class, the Google class's
+    conditions read against a token the door checks itself.
+
+    A bearer shaped like a JWT is checked against the tenant's published
+    signing keys, with the algorithm pinned before any key is read; its
+    issuer and tenant must be the install's and its audience the install's
+    application; the object id is the principal, admitted only if it is on
+    the door's own Entra allowlist, at the door before it holds any state
+    and again in the gateway; the class's prefix is one no eval caller can
+    spell; and its roster never resolves through the chat map.
+    """
+
+    def test_A3_an_entra_token_is_checked_against_the_tenants_keys_with_the_algorithm_pinned(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "verify")
+        self.assertRegex(
+            body,
+            r'if header\.Alg != a2aEntraAlgorithm \{\s*return id, fmt\.Errorf\("%w',
+            "a token naming another signing algorithm is no longer refused",
+        )
+        self.assertLess(
+            body.index("header.Alg != a2aEntraAlgorithm"),
+            body.index("v.key(ctx, header.Kid)"),
+            "the algorithm is no longer pinned before a key is read",
+        )
+        self.assertIn("rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature)", body)
+        self.assertLess(
+            body.index("rsa.VerifyPKCS1v15"),
+            body.index("v.identity(claims)"),
+            "the claims are read before the signature is verified",
+        )
+        self.assertEqual(
+            re.search(r'\ba2aEntraAlgorithm\s*=\s*"([^"]*)"', h.text("a2a_door_entra")).group(1),
+            "RS256",
+            "the pinned algorithm is no longer RS256",
+        )
+
+    def test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "identity")
+        self.assertRegex(
+            body,
+            r"if !issued \|\| !strings\.EqualFold\(claims\.Tid, v\.tenantID\) \{\s*return id, fmt\.Errorf",
+            "a token of another tenant is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r"if !audience \{\s*return id, fmt\.Errorf",
+            "a token issued for another application is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'"%w: it has expired"',
+            "an expired token is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'if strings\.TrimSpace\(claims\.Scp\) == "" \{\s*return id, fmt\.Errorf',
+            "a token that grants no delegated scope (an ID token) is no longer refused",
+        )
+
+    def test_A3_a_bearer_that_is_not_a_jwt_never_reaches_the_tenants_keys(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "verify")
+        self.assertRegex(
+            body,
+            r"if !entraTokenShaped\(token\) \{\s*return id, fmt\.Errorf",
+            "a bearer not shaped like a JWT is no longer refused before anything is read",
+        )
+        self.assertLess(
+            body.index("entraTokenShaped(token)"),
+            body.index("v.key("),
+            "the shape check no longer runs before the key lookup",
+        )
+
+    def test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra_identity"), "resolveA2AEntraPrincipal")
+        self.assertIn("strings.CutPrefix(authorID, a2aEntraCallerPrefix)", body)
+        self.assertRegex(
+            body,
+            r'if !ok \|\| objectID == "" \{\s*return ""',
+            "an id without the class's prefix is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'if !g\.a2aEntraAllowed\[strings\.ToLower\(objectID\)\] \{\s*return ""',
+            "an object id off the door's Entra allowlist is no longer refused",
+        )
+
+    def test_A3_the_door_refuses_an_entra_account_off_the_allowlist_before_holding_state(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "identifyEntra")
+        self.assertRegex(
+            body,
+            r"if err == nil && !d\.entraAllowed\[strings\.ToLower\(id\.objectID\)\] \{[^}]*return \"\", false",
+            "the door no longer refuses a verified Entra account off its allowlist before it creates state for it",
+        )
+
+    def test_A3_no_eval_caller_can_spell_an_entra_caller(self) -> None:
+        found = re.search(r'\ba2aEntraCallerPrefix\s*=\s*"([^"]*)"', h.text("a2a_door_entra"))
+        self.assertIsNotNone(found, "a2aEntraCallerPrefix is no longer a string constant in a2adoor_entra.go")
+        prefix = found.group(1)
+        self.assertTrue(
+            prefix.startswith(":"),
+            f"a2aEntraCallerPrefix is {prefix!r}: without the leading colon an eval caller "
+            "naming a context that carries the object id spells an Entra caller's conversation key",
+        )
+        google = re.search(r'\ba2aGoogleCallerPrefix\s*=\s*"([^"]*)"', h.text("a2a_door_google")).group(1)
+        self.assertNotEqual(prefix, google, "the two verified classes share a caller prefix")
+
+    def test_A3_the_entra_class_roster_does_not_resolve_through_the_chat_map(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
+        self.assertRegex(
+            body,
+            r"if backend == consoleBackend[^{]*\|\| backend == a2aEntraBackend[^{]*\{\s*return func",
+            "the Entra class's roster falls through to principalMapFor, whose default is the chat map",
         )
 
 
@@ -2014,6 +2130,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
+    NOTIFY_TEAMS_PROBE = "chat.notify.teams"
     NOTIFY_CONSOLE_PROBE = "chat.notify.console"
     NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
 
@@ -2021,7 +2138,8 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """The chat.notify route: only the agent asks, only the gateway answers.
 
         The gateway posts what arrives on `chat.notify.gchat` (or, on a
-        Slack-armed gateway, `chat.notify.slack`) to the home channel as the
+        Slack-armed gateway, `chat.notify.slack`; on a Teams-armed one,
+        `chat.notify.teams`) to the home channel as the
         install's bot, and what arrives on `chat.notify.console` into a console
         conversation, so a second writer there is a second
         principal that can make the bot speak; and the agent takes the answer
@@ -2034,6 +2152,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         for probe, want in (
             (self.NOTIFY_PROBE, ["agent"]),
             (self.NOTIFY_SLACK_PROBE, ["agent"]),
+            (self.NOTIFY_TEAMS_PROBE, ["agent"]),
             (self.NOTIFY_CONSOLE_PROBE, ["agent"]),
             (self.NOTIFY_REPLY_PROBE, ["gateway"]),
         ):
@@ -2821,11 +2940,25 @@ class A3TheA2AChatRoleIsTheA2AGatewaysAlone(unittest.TestCase):
             "the operator renders the a2a-chat binding under a name the broker does not read: "
             "the binding is dropped and the audience alone decides",
         )
+        # Every audience render carries the binding beside it: the Chat-armed
+        # block and the Teams-only block each render the pair, so a binding
+        # found somewhere in the file does not show the block that lost it.
         render = h.text("manifests_go")
-        self.assertRegex(
+        audiences = re.findall(
+            r"Name:\s*credentialProxyA2AChatAudienceEnvVar,\s*Value:\s*credentialProxyA2AChatAudience",
             render,
-            r"Name:\s*credentialProxyA2AChatCallersEnvVar,\s*Value:\s*a2aGatewayBrokerCaller\(agent\)",
-            "the broker env no longer names the A2A gateway's ServiceAccount as the a2a-chat caller",
+        )
+        paired_bindings = re.findall(
+            r"Name:\s*credentialProxyA2AChatAudienceEnvVar,\s*Value:\s*credentialProxyA2AChatAudience\}\s*,\s*"
+            r"corev1\.EnvVar\{Name:\s*credentialProxyA2AChatCallersEnvVar,\s*Value:\s*a2aGatewayBrokerCaller\(agent\)",
+            render,
+        )
+        self.assertGreaterEqual(len(audiences), 1, "the broker env no longer arms the a2a-chat audience")
+        self.assertEqual(
+            len(paired_bindings),
+            len(audiences),
+            "every a2a-chat audience render in the broker env must bind "
+            "credentialProxyA2AChatCallersEnvVar to a2aGatewayBrokerCaller(agent)",
         )
 
     def test_A3_the_exec_tier_keeps_the_a2a_chat_binding(self) -> None:

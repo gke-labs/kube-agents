@@ -305,10 +305,12 @@ def local_imports(path: Path, universe: set[str]) -> set[str]:
     `import gitops_workspace` are different nodes.
     """
     if path.is_dir():
-        # A package: what its modules import, so a sibling import inside it is
-        # held to the allowlist like a top-level script's. Recursive, so a
-        # recipe's own module (`fix_recipes/<kind>/checks.py`) counts too.
-        return set().union(*(local_imports(p, universe) for p in sorted(path.rglob("*.py"))))
+        # A package: what its modules import, down to each recipe's own
+        # modules (`fix_recipes/<kind>/fix.py`, `checks.py`), so a sibling
+        # import anywhere inside it is held to the allowlist like a top-level
+        # script's. Tests are stripped from the image.
+        modules = sorted(p for p in path.rglob("*.py") if not p.name.startswith("test_"))
+        return set().union(*(local_imports(p, universe) for p in modules))
     if path.suffix != ".py":
         return set()
     found = set()
@@ -560,6 +562,15 @@ class SandboxDelivery(unittest.TestCase):
         """
         offenders = []
         candidates = [SCRIPTS / n for n in self.baked]
+        # A baked package directory: every file in it, as the image's own
+        # `grep -rl` guard reads it.
+        candidates += [
+            p
+            for n in self.baked
+            if (SCRIPTS / n).is_dir()
+            for p in sorted((SCRIPTS / n).rglob("*"))
+            if p.is_file() and not p.name.startswith("test_") and "__pycache__" not in p.parts
+        ]
         candidates += [
             p
             for p in REPO.glob("agents/platform/skills/*/scripts/*")

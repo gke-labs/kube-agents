@@ -52,6 +52,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -370,6 +371,7 @@ const (
 	// same in a2a/gateway/allowlist.go; the conformance suite pins it.
 	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
 	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
+	a2aTargetAllowedUsersTeamsEnvVar = "A2A_TARGET_ALLOWED_USERS_TEAMS"
 
 	// a2aTierMembershipEnvVar carries spec.tiers.membership to the gateway
 	// as backend:user=tier, comma-separated, plaintext like the allowlists:
@@ -706,6 +708,42 @@ const (
 	a2aGchatRelayURLEnvVar      = "A2A_GCHAT_RELAY_URL"
 	a2aGchatAllowedUsersEnvVar  = "A2A_GCHAT_ALLOWED_USERS"
 	a2aGchatAllowAllUsersEnvVar = "A2A_GCHAT_ALLOW_ALL_USERS"
+	// The Microsoft Teams backend the operator renders under mode: next when
+	// spec.integration.teams is enabled (a2aTeamsArmed). Names are the
+	// gateway's (a2a/gateway/config.go, FromEnv); the relay is the broker's
+	// Teams queue and passthrough (credential_proxy.py, TeamsRelay), which
+	// the Hermes consumer reads as TEAMS_RELAY_URL when Teams stays on Hermes.
+	// a2aTeamsBackendEnvVar is the operator's own switch for the gateway's
+	// Teams backend (a2aTeamsArmed): "true" on the controller-manager
+	// Deployment arms it for every PlatformAgent with Teams enabled; unset,
+	// Teams stays on the Hermes consumer. A switch rather than a CR field
+	// while the backend is new: the Hermes path is what Teams customers
+	// run, and an upgrade must not move them without an operator's hand.
+	a2aTeamsBackendEnvVar = "A2A_TEAMS_BACKEND"
+	// a2aNotifyPlatformTeams is Teams' name in A2A_NOTIFY_PLATFORM and
+	// A2A_NOTIFY_CONVERSATIONS, as Hermes spells it (`hermes send --to teams`).
+	a2aNotifyPlatformTeams = "teams"
+
+	a2aTeamsRelayURLEnvVar      = "A2A_TEAMS_RELAY_URL"
+	a2aTeamsAllowedUsersEnvVar  = "A2A_TEAMS_ALLOWED_USERS"
+	a2aTeamsAllowAllUsersEnvVar = "A2A_TEAMS_ALLOW_ALL_USERS"
+	a2aTeamsHomeChannelEnvVar   = "A2A_TEAMS_HOME_CHANNEL"
+	a2aTeamsTenantIDEnvVar      = "A2A_TEAMS_TENANT_ID"
+	a2aTeamsAdaptiveCardsEnvVar = "A2A_TEAMS_ADAPTIVE_CARDS"
+	// The gateway's rule for a Teams home conversation id
+	// (a2a/gateway/teams.go, teamsIsHomeConversationID): one of the two shapes
+	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
+	// personal chat), with something after the prefix, no whitespace of any
+	// script inside, and none of the characters the broker's activity path
+	// refuses (a decoded channel link carries "/General?groupId=…"); a Chat
+	// space name, a Slack channel id or a URL is none of these.
+	a2aTeamsHomeGroupPrefix    = "19:"
+	a2aTeamsHomePersonalPrefix = "a:"
+	a2aTeamsHomeRefused        = "/?#%\\"
+	// A thread's own id carries this; a home must be a channel, group or
+	// personal chat, since every message in a thread shares one key.
+	a2aTeamsHomeThreadToken = ";messageid="
+	a2aTeamsTokenPathEnvVar = "A2A_TEAMS_TOKEN_PATH" // #nosec G101 -- an environment variable name, not a credential
 	// The home space the gateway's chat.notify route posts to
 	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
 	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
@@ -767,6 +805,9 @@ const (
 	// gateway's ServiceAccount in the broker (#6090), rendered beside the
 	// audience above and only with it.
 	credentialProxyA2AChatCallersEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS" // #nosec G101 -- Environment variable name, not a credential
+	// The broker admits the a2a-chat role on its Teams routes only while
+	// this reads "true": the gateway's teams backend is the queue's consumer.
+	credentialProxyTeamsA2ACallerEnvVar = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER" // #nosec G101 -- Environment variable name, not a credential
 
 	// The A2AGateway condition. Older operators published it while a next
 	// install's gateway ran nothing for want of a chat backend: withheld
@@ -1543,9 +1584,10 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
-// a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
-// gateway. An absent list, or the allow-all spelling allowAllUsers accepts,
-// renders nothing: the gateway reads no var as "all authenticated users",
+// a2aTargetAllowlistEnv renders the CR's Chat, Slack and, with the gateway's
+// Teams backend armed, Teams allowlists for the gateway. An absent list, or
+// the allow-all spelling allowAllUsers accepts (for Teams, the CRD's explicit
+// allowAllUsers switch), renders nothing: the gateway reads no var as "all authenticated users",
 // which is what the CR field promises. Any other list renders, even one that
 // is blank after trimming: the gateway reads a set-but-empty var as a list
 // with no members, so a list of blanks admits nobody, the rule #2207 set for
@@ -1574,6 +1616,12 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	}
 	if integ.Slack != nil && !allowAllUsers(integ.Slack.AllowedUsers) {
 		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
+	}
+	// Teams: the same list the ingress gate reads (lowercased, as the
+	// gateway compares it), unless the CR's explicit allow-all switch is on;
+	// an empty list with the switch off renders empty and admits nobody.
+	if a2aTeamsArmed(agent) && !(integ.Teams.AllowAllUsers != nil && *integ.Teams.AllowAllUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersTeamsEnvVar, Value: join(integ.Teams.AllowedUsers, true)})
 	}
 	return env
 }
@@ -1663,6 +1711,9 @@ func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	if a2aSlackNotifyArmed(agent) {
 		platforms = append(platforms, a2aNotifyPlatformSlack)
 	}
+	if a2aTeamsNotifyArmed(agent) {
+		platforms = append(platforms, a2aNotifyPlatformTeams)
+	}
 	return platforms
 }
 
@@ -1679,6 +1730,9 @@ func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	}
 	if a2aSlackNotifyArmed(agent) && a2aSlackHomeChannel(agent) != "" {
 		platforms = append(platforms, a2aNotifyPlatformSlack)
+	}
+	if a2aTeamsHasHome(agent) {
+		platforms = append(platforms, a2aNotifyPlatformTeams)
 	}
 	return platforms
 }
@@ -1700,6 +1754,42 @@ func a2aGchatHasEffectiveHome(agent *agentv1alpha1.PlatformAgent, rec homeChanne
 // reads it; the pod template never reads the record (a2aNotifyHomePlatforms).
 func a2aSlackHasHome(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) bool {
 	return a2aSlackNotifyArmed(agent) && a2aSlackHomeEffective(agent, rec) != ""
+}
+
+// a2aTeamsNotifyArmed is whether the gateway arms Teams' chat.notify route:
+// whenever it holds Teams, unless teams.homeChannel is set but is not a
+// conversation id, which the gateway refuses at start (NewTeamsNotifier),
+// dropping the whole route. The agent is then not told to report to it.
+func a2aTeamsNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aTeamsArmed(agent) {
+		return false
+	}
+	return strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel) == "" || a2aTeamsHomeConversation(agent) != ""
+}
+
+// a2aTeamsHomeConversation is teams.homeChannel trimmed, when it is a Teams
+// conversation id by the gateway's rule (one token, no whitespace inside, in
+// one of the two shapes Teams issues), and "" otherwise.
+func a2aTeamsHomeConversation(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Integration == nil || agent.Spec.Integration.Teams == nil {
+		return ""
+	}
+	home := strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel)
+	if home == "" || strings.ContainsAny(home, a2aTeamsHomeRefused) || strings.Contains(strings.ToLower(home), a2aTeamsHomeThreadToken) || strings.IndexFunc(home, unicode.IsSpace) >= 0 {
+		return ""
+	}
+	for _, prefix := range []string{a2aTeamsHomeGroupPrefix, a2aTeamsHomePersonalPrefix} {
+		if body, ok := strings.CutPrefix(home, prefix); ok && body != "" {
+			return home
+		}
+	}
+	return ""
+}
+
+// a2aTeamsHasHome is whether Teams' chat.notify route is armed with a home
+// conversation to post to.
+func a2aTeamsHasHome(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aTeamsNotifyArmed(agent) && a2aTeamsHomeConversation(agent) != ""
 }
 
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
@@ -1763,8 +1853,7 @@ func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return slackEnabled(agent)
 }
 
-// teamsEnabled is the enabled test for Teams, which only Hermes serves: the
-// A2A gateway has no Teams backend, so an enabled Teams is always on Hermes.
+// teamsEnabled is the enabled test for Teams, in one place.
 func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Integration == nil {
 		return false
@@ -1773,14 +1862,53 @@ func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return teams != nil && teams.Enabled != nil && *teams.Enabled
 }
 
+// a2aTeamsArmed reports whether this install's Teams is consumed by the A2A
+// stack: the gateway's teams backend, on the broker's Teams relay, when the
+// operator runs with A2A_TEAMS_BACKEND=true and the CR enables Teams. Unlike
+// Chat and Slack, the arm is not the CR alone: spec.mode is "next" on every
+// stored object (the webhook rewrites the rest), so a mode test would move
+// every Teams install off the Hermes consumer on the upgrade that brings the
+// backend. One consumer per install either way: the broker's queue is one,
+// and two pullers would split its activities, so the Hermes env
+// (TEAMS_RELAY_URL) renders only while this is false (teamsOnHermes).
+func a2aTeamsArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	return teamsEnabled(agent) && os.Getenv(a2aTeamsBackendEnvVar) == "true"
+}
+
+// teamsOnHermes reports a Teams integration served by the Hermes consumer:
+// enabled, and not armed on the A2A gateway.
+func teamsOnHermes(agent *agentv1alpha1.PlatformAgent) bool {
+	return teamsEnabled(agent) && !a2aTeamsArmed(agent)
+}
+
 // peopleReadingEnabled reports whether the usage poller reads the A2A
 // gateway's people reading for the install: only while no chat platform it
 // enables is served through Hermes, since the gateway counts only the
 // people who write through it, and a count beside a Hermes-served platform
 // would say nobody wrote while that platform's users were writing. Google
-// Chat and Slack are always on the A2A gateway, so only Teams counts.
+// Chat and Slack are always on the A2A gateway, so only a Teams on Hermes
+// counts.
 func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return !teamsEnabled(agent)
+	return !teamsOnHermes(agent)
+}
+
+// a2aChatRelayToken is the projected ServiceAccount token the gateway
+// presents to the broker's chat relays (the a2a-chat audience), mounted for
+// the Google Chat backend, the Teams backend, or both: one volume, one path.
+func a2aChatRelayToken() ([]corev1.VolumeMount, []corev1.Volume) {
+	mounts := []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
+	volumes := []corev1.Volume{{
+		Name: a2aGchatTokenVolume,
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr.To(int32(0400)),
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience:          credentialProxyA2AChatAudience,
+				ExpirationSeconds: ptr.To(int64(a2aGchatTokenTTLSeconds)),
+				Path:              a2aGchatTokenKey,
+			}}},
+		}},
+	}}
+	return mounts, volumes
 }
 
 // slackEnabled is the enabled test the Slack render sites make, in one place.
@@ -2740,6 +2868,7 @@ accounts {
       { stream: { account: APP, subject: "a2a.cap.verify.*" } }
       { stream: { account: APP, subject: "chat.notify.gchat" } }
       { stream: { account: APP, subject: "chat.notify.slack" } }
+      { stream: { account: APP, subject: "chat.notify.teams" } }
       { stream: { account: APP, subject: "chat.notify.console" } }
       { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
       { stream: { account: APP, subject: "chat.incident.reply.gateway.>" } }
@@ -2778,6 +2907,7 @@ accounts {
       { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
       { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
       { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
       { stream: "chat.notify.console", accounts: [ TRUSTED ] }
       { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
       { stream: "chat.incident.reply.gateway.>", accounts: [ TRUSTED ] }
@@ -3774,6 +3904,28 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
+	return a2aProvisionScriptForm(agent, false)
+}
+
+// a2aProvisionScriptForm is a2aProvisionScript with the relay durable's third
+// filter, a profile task's six-token supervisor subject, when profileForm is
+// set (#5301, a2aProfileSupervisorFormFor).
+func a2aProvisionScriptForm(agent *agentv1alpha1.PlatformAgent, profileForm bool) string {
+	relayFilters := `--filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `'`
+	relayCheck := ""
+	if profileForm {
+		relayFilters += ` --filter='` + a2aGatewayProfileSupervisorFilter + `'`
+		// fixed_durable leaves a durable that won't take new settings as it
+		// is, with a WARN and exit 0. For the third filter that isn't enough:
+		// the operator switches the dispatcher to the six-token subject when
+		// this Job succeeds, so the run fails, and the Job retries, unless the
+		// relay durable reads the filter back (#5301).
+		relayCheck = `
+if ! $NATS consumer info TASKS ` + a2aGatewayRelayDurable + ` --json 2>/dev/null | grep -qF '"` + a2aGatewayProfileSupervisorFilter + `"'; then
+  echo "TASKS ` + a2aGatewayRelayDurable + ` does not filter ` + a2aGatewayProfileSupervisorFilter + ` after this run; the dispatcher stays on the five-token supervisor subject until it does" >&2
+  exit 1
+fi`
+	}
 	server := a2aNATSAddress(agent)
 	// The reserve the refusal quotes is this CR's, not the default table's:
 	// a CR that declares a bridge at 6 is told the 44 it was sized for, and
@@ -4053,9 +4205,9 @@ fixed_durable() { # name reader [consumer add flags...]
   echo "WARN: TASKS ${name} exists but could not be brought to this render's settings; the ${reader} refuses to bind it and names the difference" >&2
 }
 fixed_durable ` + a2aGatewayRelayDurable + ` gateway --pull \
-  --filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `' \
+  ` + relayFilters + ` \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \
-  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults
+  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults` + relayCheck + `
 fixed_durable ` + a2aBridgeDurable() + ` bridge --pull \
   --filter='` + a2aBridgeIntakeFilter() + `' \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
@@ -4492,7 +4644,15 @@ fi
 // existing install is a manual `nats stream edit` — stage 1 accepts that and
 // says it here rather than implying the digest-rename re-provisions.
 func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
-	script := a2aProvisionScript(agent)
+	return a2aProvisionJobForm(agent, false)
+}
+
+// a2aProvisionJobForm is buildA2AProvisionJob with the relay durable's
+// third filter when profileForm is set (#5301). The script is part of the
+// Job's digested name, so the filter's arrival is a new Job and a fresh run,
+// and the durable add updates the existing durable to three filters.
+func a2aProvisionJobForm(agent *agentv1alpha1.PlatformAgent, profileForm bool) *batchv1.Job {
+	script := a2aProvisionScriptForm(agent, profileForm)
 
 	job := &batchv1.Job{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "batch/v1", Kind: "Job"},
@@ -5265,17 +5425,21 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	} {
 		n += int64(ptr.Deref(sts.Spec.Replicas, 1))
 	}
-	// The workloads rendered on a condition, which the next-mode golden (the
-	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
-	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
-	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
-	// workloads behind an operator flag (the MCP door) come from
+	// The workloads rendered on a condition, which the settled golden (the
+	// example CR, no operator flags) cannot show when off or behind a flag;
+	// TestA2AStandingPodsCountTheConditionalWorkloads names each. The credential
+	// proxy's exec tier is a CR field (spec.deployment.credentialProxy.exec.replicas,
+	// unset as 0); the workloads behind an opt-in operator flag come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
-	// The profile dispatcher, on unless A2A_PROFILE_DISPATCHER is "false"
-	// (operator.profileDispatcher.enabled in the chart).
+	// The profile dispatcher and the MCP server, each on unless its flag is
+	// "false" (operator.profileDispatcher.enabled and operator.mcpServer.enabled
+	// in the chart).
 	if a2aDispatcherEnabled() {
 		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
+	}
+	if a2aMCPDoorEnabled() {
+		n += int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
 	}
 	n += a2aFlaggedStandingPods(agent)
 	// The gateway's standbys and its rollout's surge pod, under the election
@@ -6459,7 +6623,9 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 // ValidatingAdmissionPolicy kube-agents-a2a-gateway-pod
 // (config/admission/a2a-gateway-pod-policy.yaml) holds this subject's pod
 // creates to the session pod spawn.go builds: the session ServiceAccount, no
-// automount, the session token audiences, no Secret, the session labels. The
+// automount, the session token audiences, no Secret volume and no Secret read
+// but the session's own inference key (ANTHROPIC_API_KEY from key api-key of
+// <name>-inference-key-a2a-session), the session labels. The
 // chart installs it only under admissionPolicy.enabled on Kubernetes >= 1.30
 // and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
 // this grant is as wide as written.
@@ -7029,6 +7195,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
 		}
+		// The kubectl admission's tier, normalised as for the shell sandbox;
+		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
+		if tier, ok := kubectlCostTier(agent); ok {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aKubectlCostTierEnv, Value: tier})
+		}
 		// The exec tier's address, while it renders, for the session pods'
 		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
 		if credentialProxyExecTierEnabled(agent) {
@@ -7048,7 +7219,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// when it is not armed, so every other render is byte-identical to what
 	// it was.
 	var backendEnv []corev1.EnvVar
-	if !a2aSlackArmed(agent) && !a2aChatArmed(agent) {
+	if !a2aSlackArmed(agent) && !a2aChatArmed(agent) && !a2aTeamsArmed(agent) {
 		backendEnv = []corev1.EnvVar{
 			// Created by hand at install time (the bot token is operator
 			// input, never repo content); the reference is optional so the
@@ -7167,18 +7338,38 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if gchat.AnswerFeedback != nil && !*gchat.AnswerFeedback {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
-		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
-		chatVolumes = []corev1.Volume{{
-			Name: a2aGchatTokenVolume,
-			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-				DefaultMode: ptr.To(int32(0400)),
-				Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-					Audience:          credentialProxyA2AChatAudience,
-					ExpirationSeconds: ptr.To(int64(a2aGchatTokenTTLSeconds)),
-					Path:              a2aGchatTokenKey,
-				}}},
-			}},
-		}}
+		chatMounts, chatVolumes = a2aChatRelayToken()
+	}
+	// The Teams backend, beside Chat's or alone: the same relay token, the
+	// Teams relay URL, the CR's allowlist on Chat's terms (a2aAllowlist) and
+	// its allow-all switch as the CRD defines it (an empty list with the
+	// switch off admits nobody). The tenant and home channel render only when set; the
+	// card switch only when off, so a default CR renders nothing extra.
+	if a2aTeamsArmed(agent) {
+		teams := agent.Spec.Integration.Teams
+		chatEnv = append(chatEnv,
+			corev1.EnvVar{Name: a2aTeamsRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
+			// The same projected token as Chat's, named so the path and the
+			// mount are one fact here rather than two defaults agreeing.
+			corev1.EnvVar{Name: a2aTeamsTokenPathEnvVar, Value: a2aGchatTokenPath},
+			corev1.EnvVar{Name: a2aTeamsAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(teams.AllowedUsers), ",")},
+			// The explicit switch, as the Hermes render reads it: an empty
+			// list with the switch off (the default) admits nobody, which is
+			// the CRD's documented meaning, unlike Chat's raw-list rule.
+			corev1.EnvVar{Name: a2aTeamsAllowAllUsersEnvVar, Value: strconv.FormatBool(teams.AllowAllUsers != nil && *teams.AllowAllUsers)},
+		)
+		if teams.TenantId != "" {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsTenantIDEnvVar, Value: teams.TenantId})
+		}
+		if home := strings.TrimSpace(teams.HomeChannel); home != "" {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsHomeChannelEnvVar, Value: home})
+		}
+		if teams.AdaptiveCards != nil && !*teams.AdaptiveCards {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAdaptiveCardsEnvVar, Value: strconv.FormatBool(false)})
+		}
+		if len(chatVolumes) == 0 {
+			chatMounts, chatVolumes = a2aChatRelayToken()
+		}
 	}
 
 	// The container env, in the order it has always had: the bus, the
@@ -7446,6 +7637,15 @@ type a2aProvisionState struct {
 	failed  bool
 	message string
 
+	// profileSupervisorFormLatch is whether the ProfileSupervisorForm latch
+	// is wanted (#5301): the dispatcher writes the six-token form. Written
+	// by the status writers, as BusProvisioned is, so a settled pass saves it.
+	profileSupervisorFormLatch bool
+	// profileSupervisorFormHeldBy names a reader holding the install on the
+	// five-token form because it runs an image other than this operator's
+	// render; the condition says so (ReaderNotOnReleaseImage).
+	profileSupervisorFormHeldBy string
+
 	// busMeta is the JetStream meta group check's finding on a pass that
 	// made it (checkA2ABusMeta), for the A2ABusMetaGroup condition.
 	busMeta a2aBusMetaState
@@ -7666,7 +7866,11 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// the render path then creates; a stale miss skips it for one pass on the
 	// refusal path only (on the render path reconcileA2A picks it up).
 	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err == nil {
-		fences = append(fences, a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace))
+		fences = append(fences,
+			a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace),
+			// Its egress policy goes with it, on the same terms (#6553).
+			r.a2aGatewayEgressPolicy(ctx, agent, dnsClusterIPs),
+		)
 		gatewayFenced = true
 	} else if !errors.IsNotFound(err) {
 		return false, false, err
@@ -8067,7 +8271,16 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		state.dispatcherCeiling = &ceiling
 	}
-	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining)
+	// How far the move to the six-token profile supervisor subject has got
+	// (#5301, platformagent_a2a_supervisor_form.go): the relay's third
+	// filter in the provision Job, and the dispatcher's switch after it.
+	profileSupervisorFilter, profileSupervisorForm, profileSupervisorHeldBy, err := r.a2aProfileSupervisorFormAndHold(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	state.profileSupervisorFormLatch = profileSupervisorForm != ""
+	state.profileSupervisorFormHeldBy = profileSupervisorHeldBy
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining, profileSupervisorForm)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
 		return state, err
@@ -8079,7 +8292,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// spec-digested name; a changed render — script or pod spec — is a new
 	// name and a fresh run. The superseded generation is swept below rather
 	// than left to its TTL, for the reason the sweep's own comment gives.
-	job := buildA2AProvisionJob(agent)
+	job := a2aProvisionJobForm(agent, profileSupervisorFilter)
 	state.jobName = job.Name
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err
@@ -8473,6 +8686,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err := r.applyManaged(ctx, agent, fence); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", fence.Name, err)
 		}
+		if err := r.applyA2AGatewayEgress(ctx, agent, r.a2aSessionDNSClusterIPs(ctx, agent)); err != nil {
+			return state, err
+		}
 	}
 	// The secret-env digest, on the same terms as the agent gateway and the
 	// broker (platformagent_secret_hash.go). On a Slack-armed install this pod,
@@ -8520,8 +8736,8 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	return state, nil
 }
 
-// removeA2AGatewayFence takes the gateway's own fence away on a pass that
-// holds the gateway for the callout. That happens only while the Deployment
+// removeA2AGatewayFence takes the gateway's own fence, and its egress policy
+// (#6553), away on a pass that holds the gateway for the callout. That happens only while the Deployment
 // is absent (on a live NotFound), so the order the doors' removal needs
 // (after the apply) does not arise. Absent is not the same as no pod
 // listening: a Deployment deleted by hand leaves its ReplicaSet and pod to
@@ -8535,9 +8751,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 // skip theirs (removeA2AInjectBackend): this runs on every held pass, and
 // the render that follows the hold applies the fence over it.
 func (r *PlatformAgentReconciler) removeA2AGatewayFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}
-	if err := r.deleteA2AObjectIfOwned(ctx, agent, np, r.Client, nil); err != nil {
-		return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy: %w", err)
+	for _, name := range []string{a2aGatewayNetpolName(agent), a2aGatewayEgressName(agent)} {
+		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}}
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, np, r.Client, nil); err != nil {
+			return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy %s: %w", name, err)
+		}
 	}
 	return nil
 }

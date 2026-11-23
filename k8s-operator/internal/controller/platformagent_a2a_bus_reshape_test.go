@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
@@ -501,6 +502,74 @@ func TestTheReshapeRecordsAreForgottenWithTheCR(t *testing.T) {
 	}
 	if _, ok := r.heldBusMigrationWarned.Load(key); ok {
 		t.Error("the hold Warning record outlived the CR")
+	}
+}
+
+// On a served CRD that drops status.busMigration, the start's write comes
+// back without the run. Nothing is recorded on the StatefulSet, so the
+// request isn't read as answered (#6600), and the same pass refuses it,
+// naming the CRD, rather than leaving that to a pass nothing asks for
+// (#6692). A later pass refuses it too, without trying the start again or
+// repeating the Event. The earlier record the failed write leaves in place
+// decides nothing: whether it is no run, a finished run of another leg, or a
+// finished reshape for another request, none of them answers this one. A
+// pruning CRD also strips the record on read, so in a cluster the earlier
+// record is always none; the other two cases hold the check's leg and
+// request parts, which a later change could otherwise narrow to "no run".
+func TestAReshapeStartAPruningCRDDroppedIsNotRecorded(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		earlier *agentv1alpha1.BusMigrationStatus
+	}{
+		{"no earlier run", nil},
+		{"an earlier run of another leg", &agentv1alpha1.BusMigrationStatus{
+			Leg: string(busMigrationGrow), RunID: "1-grow", Phase: string(busMigrationDone)}},
+		{"an earlier reshape for another request", &agentv1alpha1.BusMigrationStatus{
+			Leg: string(busMigrationReshape), RunID: "1" + busReshapeRunSuffix("older"), Phase: string(busMigrationDone)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
+			m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "first"}
+			m.agent.Status.BusMigration = c.earlier.DeepCopy()
+			starts := 0
+			pruning := interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					// A write that starts this request carries its run ID.
+					if data, err := patch.Data(obj); err == nil && sub == "status" && strings.Contains(string(data), busReshapeRunSuffix("first")) {
+						starts++
+					}
+					if err := cl.SubResource(sub).Patch(ctx, obj, patch, opts...); err != nil {
+						return err
+					}
+					if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && sub == "status" {
+						pa.Status.BusMigration = nil // the served CRD pruned it
+					}
+					return nil
+				},
+			})
+			m.r.Client = pruning
+			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+				t.Fatal(err)
+			}
+			if got := m.stsReshapeRecord(); got != "" {
+				t.Errorf("StatefulSet record %q after a start the CRD dropped, want none", got)
+			}
+			if ev := m.reshapeEvents(); len(ev) != 1 || !strings.Contains(ev[0], "drops status.busMigration") {
+				t.Errorf("events after the dropped start %q, want one naming the CRD that drops status.busMigration", ev)
+			}
+			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+				t.Fatal(err)
+			}
+			if got := m.stsReshapeRecord(); got != "" {
+				t.Errorf("StatefulSet record %q after the next pass, want none", got)
+			}
+			if ev := m.reshapeEvents(); len(ev) != 0 {
+				t.Errorf("events after the next pass %q, want none: the first pass's Event stands", ev)
+			}
+			if starts != 1 {
+				t.Errorf("%d status writes started this reshape, want 1: the next pass refuses rather than trying again", starts)
+			}
+		})
 	}
 }
 

@@ -129,8 +129,9 @@ verification_spec:
   # whose scan printed "not scanned" did exactly that: a `--manifests-dir` scan
   # of a `vcs.py clone` copy produced the clean report. Any `--manifests-dir`
   # run fails this check, also one beside `--repo` (a rendered chart, which the
-  # eval repository does not carry). A scan chained after another command on
-  # one log line of a filed card is not read, a limit of `worker_commands`.
+  # eval repository does not carry). A scan chained after another command is
+  # on no log row of a filed card; the forbidden run reads it in the card's
+  # typed call, unless that call holds a heredoc.
   - name: the-scan-read-the-repository-itself
     role: objective
     mode: assert

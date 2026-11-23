@@ -218,13 +218,15 @@ environment with the feature off and nothing in the log saying so.
 `HELM_UPGRADE_INSTALL` is checked there the same way, though it is no
 `install.sh` flag: the installer's tfvars generator refuses a spelling it does
 not recognise, and that refusal would otherwise come after the teardown.
+`PLATFORM_AGENT_SIZING_PROFILE` is also validated against `small`, `medium`,
+`fleet`, or `auto` before teardown and forwarded via `--sizing-profile`.
 
 Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `GOOGLE_CHAT_MODE`, `GOOGLE_CHAT_HOME_CHANNEL`,
 `GOOGLE_CHAT_HOME_CHANNEL_POLICY`,
 `CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
 `SLACK_HOME_CHANNEL_NAME`, `SLACK_HOME_CHANNEL_POLICY`, `PLATFORM_AGENT_CUSTOM_ROLES`,
-`REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
+`PLATFORM_AGENT_SIZING_PROFILE`, `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
 `KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`,
 `HELM_UPGRADE_INSTALL`, `CARD_STOP_ENABLED`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,

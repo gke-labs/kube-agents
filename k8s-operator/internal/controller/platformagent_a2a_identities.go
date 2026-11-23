@@ -212,13 +212,13 @@ func withTasksFixedDurableDeny(base []string) []string {
 func a2aCapBucketReadDeny() (publish, subscribe []string) {
 	stream := "KV_" + a2aCapBucket
 	return []string{
-			"$JS.API.*.*." + stream,
-			"$JS.API.*.*." + stream + ".>",
-			"$JS.API.*.*.*." + stream,
-			"$JS.API.*.*.*." + stream + ".>",
-		}, []string{
-			"$KV." + a2aCapBucket + ".>",
-		}
+		"$JS.API.*.*." + stream,
+		"$JS.API.*.*." + stream + ".>",
+		"$JS.API.*.*.*." + stream,
+		"$JS.API.*.*.*." + stream + ".>",
+	}, []string{
+		"$KV." + a2aCapBucket + ".>",
+	}
 }
 
 // a2aCapBucket is the KV bucket the capability chain lives in, created by the
@@ -265,6 +265,7 @@ const (
 	a2aNotifySubjectGchat   = "chat.notify.gchat"
 	a2aNotifySubjectSlack   = "chat.notify.slack"
 	a2aNotifySubjectConsole = "chat.notify.console"
+	a2aNotifySubjectTeams   = "chat.notify.teams"
 	a2aNotifyReplySubjects  = "chat.notify.reply.agent.>"
 
 	// The board route (a2a/gateway/board.go, a2a/hermes-bridge/board.go,
@@ -387,10 +388,15 @@ const a2aBridgeAddressee = "platform"
 // addressee's input. TestTheFixedDurablesMatchTheirReaders holds both
 // against the a2a sources.
 const (
-	a2aGatewayRelayDurable       = "gateway-relay"
-	a2aGatewayEventsFilter       = "a2a.tasks.*.*.events"
-	a2aGatewaySupervisorFilter   = "a2a.tasks.*.*.supervisor"
-	a2aGatewayRelayMaxAckPending = 8192
+	a2aGatewayRelayDurable     = "gateway-relay"
+	a2aGatewayEventsFilter     = "a2a.tasks.*.*.events"
+	a2aGatewaySupervisorFilter = "a2a.tasks.*.*.supervisor"
+	// a2aGatewayProfileSupervisorFilter is the relay's third filter, a
+	// profile task's six-token supervisor subject (#5301). The gateway
+	// accepts the durable with or without it (#5644); the provision Job
+	// adds it only once every reader that can run watches both forms.
+	a2aGatewayProfileSupervisorFilter = "a2a.tasks.p.*.*.supervisor"
+	a2aGatewayRelayMaxAckPending      = 8192
 )
 
 // a2aBridgeDurable is the bridge's intake durable, and a2aBridgeIntakeFilter
@@ -419,9 +425,11 @@ const a2aGatewayUser = "gateway"
 const (
 	a2aTriggerSubmitWildcard  = "a2a.trigger.*.submit"
 	a2aTriggerStatusWildcard  = "a2a.trigger.*.status"
+	a2aTriggerStopSubjects    = "a2a.trigger.*.stop"
 	a2aTriggerReplySubjects   = "a2a.trigger.reply.>"
 	a2aTriggerScheduleSubmit  = "a2a.trigger." + triggerScheduleSource + ".submit"
 	a2aTriggerScheduleStatus  = "a2a.trigger." + triggerScheduleSource + ".status"
+	a2aTriggerScheduleStop    = "a2a.trigger." + triggerScheduleSource + ".stop"
 	a2aTriggerScheduleReplies = "a2a.trigger.reply." + triggerScheduleSource + ".>"
 )
 
@@ -510,11 +518,12 @@ func operatorIdentity() (a2aIdentity, bool) {
 	}
 	// With schedules on (A2A_AGENT_SCHEDULES, the switch that registers the
 	// AgentSchedule reconciler), the operator is the schedule source on
-	// attested trigger ingress (#5617): it submits a due run and asks
-	// after the runs it started, and reads the gateway's answers in its
-	// source's reply namespace. Nothing else holds the schedule source.
+	// attested trigger ingress (#5617): it submits a due run, asks after
+	// the runs it started and stops one on request (#6052), and reads the
+	// gateway's answers in its source's reply namespace. Nothing else holds
+	// the schedule source.
 	if a2aAgentSchedulesEnabled() {
-		id.publish = append(id.publish, a2aTriggerScheduleSubmit, a2aTriggerScheduleStatus)
+		id.publish = append(id.publish, a2aTriggerScheduleSubmit, a2aTriggerScheduleStatus, a2aTriggerScheduleStop)
 		id.subscribe = append(id.subscribe, a2aTriggerScheduleReplies)
 	}
 	// With a dispatcher, the operator also makes and removes the profiles'
@@ -753,14 +762,18 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
 			a2aNotifySubjectSlack,
+			a2aNotifySubjectTeams,
 			a2aNotifySubjectConsole,
 			// The bridge's answer to a board request.
 			a2aBoardReplySubjects,
-			// Attested trigger ingress (#5617): every source's submissions
-			// and status queries. The callout binds a source's subject to
-			// its ServiceAccount, so the subject token names the caller.
+			// Attested trigger ingress (#5617): every source's submissions,
+			// status queries and stops (#6052). The callout binds a source's
+			// subject to its ServiceAccount, so the subject token names the
+			// caller, and the gateway answers a stop only for that source's
+			// own recorded runs.
 			a2aTriggerSubmitWildcard,
 			a2aTriggerStatusWildcard,
+			a2aTriggerStopSubjects,
 			// The bridge's answer to an incident write.
 			a2aIncidentReplySubjects,
 			"_INBOX.gateway.>",
@@ -1038,7 +1051,7 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	// task plane: a notify mints no capability and starts no executor, and
 	// the gateway posts it to the home channel or to a conversation it holds a
 	// live session record for, and nowhere else.
-	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)
+	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{

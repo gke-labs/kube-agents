@@ -1871,9 +1871,9 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.
 
-        The operator renders the CR's integration.{googleChat,slack}.allowedUsers
-        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK}; the gateway
-        reads the same two names and checks a session's request to delegate to
+        The operator renders the CR's integration.{googleChat,slack,teams}.allowedUsers
+        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK,TEAMS}; the gateway
+        reads the same three names and checks a session's request to delegate to
         the platform agent against them. The gateway reads an absent variable
         as "all authenticated users", by design (an absent CR list means the
         same), so a rename on either side is not a refusal anyone sees: every
@@ -1887,6 +1887,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         for const, env in (
             ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
             ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
+            ("a2aTargetAllowedUsersTeamsEnvVar", "EnvTargetAllowedUsersTeams"),
         ):
             with self.subTest(pair=const):
                 rendered = self._one_match(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
@@ -2816,6 +2817,38 @@ class C2FailClosed(unittest.TestCase):
             )
         # The commercial domain itself is still the default universe.
         self.assertEqual(client.DEFAULT_UNIVERSE_DOMAIN, client.normalize_universe_domain("googleapis.com"))
+
+    def test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts(self) -> None:
+        """A universe domain from the environment is held to the metadata server's answer.
+
+        The environment's value decides which hosts get the broker's credential.
+        A value that the host's metadata server contradicts would send that
+        credential to another universe, or to commercial hosts under other
+        names (`clients6.google.com` is well-formed and is not under
+        `googleapis.com`). The start check refuses it, in both directions; a
+        value the metadata server confirms, and a host with no universe route,
+        start as before.
+        """
+        proxy = h.credential_proxy
+
+        def check(configured, answer):
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answer
+            try:
+                proxy.check_universe_domain_against_metadata(configured, sleep=lambda _s: None)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                with self.assertRaises(RuntimeError):
+                    check(configured, (reported, True))
+        check("universe.example.test", ("universe.example.test", True))
+        check("universe.example.test", (None, True))
 
 
 class C3UntrustedByDefault(unittest.TestCase):

@@ -150,7 +150,7 @@ class RelayRefused(Exception):
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
-    """A 3xx from the relay is an error, not a place to re-send the token to."""
+    """A 3xx is an error, not a place to re-send the call's headers to."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
         return None
@@ -159,7 +159,10 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 # For the gateway's own API, which is on loopback. No proxy from the
 # environment: a proxy cannot reach this pod's loopback, so the turn would
 # fail, and the proxy would get the alert's prompt and the call's headers.
-_GATEWAY_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# No redirect: urllib follows a 301, 302 or 303 answer to a POST with a GET
+# that keeps the Authorization header and has no body, so neither call of the
+# API can work through one.
+_GATEWAY_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
 
 class PubsubRelay:
