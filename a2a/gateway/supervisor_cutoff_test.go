@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ func startCutoffRig(t *testing.T, cutoff time.Time) *cutoffRig {
 	logs, text := &syncBuffer{}, &lockedBuffer{}
 	obs := &recordingObserver{fakeAdapter: newFakeAdapter()}
 	cfg := &Config{NATSURL: url, PrincipalMapPath: mapFile, DefaultAddressee: "platform", IdleTTL: 30 * time.Minute,
-		AttributionSalt: []byte("test-salt"), FirstEventGrace: time.Hour}
+		AttributionSalt: []byte("test-salt"), FirstEventGrace: time.Hour, Namespace: "kubeagents-system"}
 	g, err := New(Options{Client: client, Adapter: obs, Config: cfg, Backend: "discord",
 		Logger: slog.New(slog.NewJSONHandler(io.MultiWriter(logs, text), nil))})
 	if err != nil {
@@ -297,6 +298,164 @@ func TestTaskIsProfileReadsTheRecordNotTheName(t *testing.T) {
 	} {
 		if got := g.taskIsProfile(rec, c.taskID, c.addressee); got != c.want {
 			t.Errorf("taskIsProfile(%s under %s) = %v, want %v", c.taskID, c.addressee, got, c.want)
+		}
+	}
+}
+
+// cutoffWorking publishes the executor's working status for taskID, so the
+// task has a first event whatever its supervisor terminal does.
+func (r *cutoffRig) cutoffWorking(t *testing.T, addressee, taskID string) {
+	t.Helper()
+	payload, err := json.Marshal(lib.StatusUpdate{TaskID: taskID, ContextID: "ctx-" + taskID, Status: lib.TaskStatus{State: lib.StateWorking}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: addressee, AgentType: "test-executor"}, taskID, "ctx-"+taskID, "corr-"+taskID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject(addressee, taskID), env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Every other gateway read that takes taskIsProfile's answer reads the
+// profile/session pair as the relay and the heals do: under a cutoff, a
+// five-token supervisor terminal stored after it is not a profile task's
+// terminal and is a session task's. Each row's read would take the profile
+// task's terminal if it were handed false, and the drop count is checked
+// beside what the read shows. Records are written without the task index, so
+// the relay never routes these events itself.
+func TestEveryGatewayReadTakesTheCutoffForAProfileTask(t *testing.T) {
+	r := startCutoffRig(t, time.Now().Add(-time.Minute))
+	ctx := context.Background()
+	schedule := lib.ScheduleRef{Namespace: "kubeagents-system", Name: "compliance-audit"}
+	triggerQuery := func(taskID string) []byte {
+		data, err := json.Marshal(lib.TriggerStatus{Schedule: schedule, TaskID: taskID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	triggerRecord := func(rec *SessionRecord, taskID string) *SessionRecord {
+		rec.Key = triggerConversationKey(lib.TriggerSourceSchedule, schedule)
+		rec.TriggerRuns = []TriggerRun{{Key: "k-" + taskID, Task: taskID, Published: true}}
+		return rec
+	}
+	for _, c := range []struct {
+		name string
+		// noWorking leaves the task with its supervisor terminal alone.
+		noWorking bool
+		// shape adjusts the record before it is stored.
+		shape func(rec *SessionRecord, taskID string) *SessionRecord
+		// read calls the entry point and reports whether it took the
+		// terminal, or "" when only the drop count tells.
+		read func(rec *SessionRecord, taskID string) (took bool, observable bool)
+	}{
+		{name: "probeConversation", read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			st, err := r.g.probeConversation(ctx, rec.Key, taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return st.Final, true
+		}},
+		{name: "answerStatusByReplay", read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			r.g.answerStatusByReplay(ctx, rec)
+			r.adapter.mu.Lock()
+			defer r.adapter.mu.Unlock()
+			for i := len(r.adapter.posts) - 1; i >= 0; i-- {
+				if p := r.adapter.posts[i]; p.Conversation == rec.Key {
+					return strings.Contains(p.Text, "**"+string(lib.StateFailed)+"**"), true
+				}
+			}
+			t.Fatalf("%s: no status posted", rec.Key)
+			return false, false
+		}},
+		{name: "healStoppedTasks", shape: func(rec *SessionRecord, taskID string) *SessionRecord {
+			rec.Tasks[0].StopPending = true
+			return rec
+		}, read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			return r.g.healStoppedTasks(ctx, rec), true
+		}},
+		{name: "trigger status", shape: triggerRecord, read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			reply := r.g.handleTriggerStatus(ctx, lib.TriggerStatusSubject(lib.TriggerSourceSchedule), triggerQuery(taskID))
+			if !reply.Found || reply.Refused != nil {
+				t.Fatalf("%s: status reply %+v", taskID, reply)
+			}
+			return reply.Terminal, true
+		}},
+		{name: "trigger stop", shape: func(rec *SessionRecord, taskID string) *SessionRecord {
+			// Canceled already: a task read as running answers stopped
+			// and writes nothing; one read as ended answers already final.
+			rec.Tasks[0].Canceled = true
+			return triggerRecord(rec, taskID)
+		}, read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			reply := r.g.handleTriggerStop(ctx, lib.TriggerStopSubject(lib.TriggerSourceSchedule), triggerQuery(taskID))
+			if reply.Refused != nil {
+				t.Fatalf("%s: stop refused %+v", taskID, reply.Refused)
+			}
+			return reply.Result == lib.TriggerStopAlreadyFinal, true
+		}},
+		{name: "busy readTask", read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			active := &ActiveTask{TaskID: taskID, SubmittedAt: time.Now().Add(-2 * r.g.cfg.FirstEventGrace)}
+			return r.g.busyTaskLeftOut(ctx, &busyTasksStream{g: r.g}, rec, active, rec.Addressee, time.Now()), true
+		}},
+		{name: "taskStreamEmpty", noWorking: true, read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			empty, err := r.g.taskStreamEmpty(ctx, rec, taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return !empty, true
+		}},
+		{name: "chainUsage", read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			r.g.chainUsage(ctx, rec, taskID, "", nil)
+			return false, false
+		}},
+		{name: "rehydration primer", shape: func(rec *SessionRecord, taskID string) *SessionRecord {
+			rec.Tasks[0].Requester = &TaskRequester{Backend: "discord", Subject: "s"}
+			return rec
+		}, read: func(rec *SessionRecord, taskID string) (bool, bool) {
+			primer, _, _, _ := r.g.buildRehydrationPrimer(ctx, rec, "")
+			return strings.Contains(primer, "executor-lost"), true
+		}},
+	} {
+		for _, profile := range []bool{true, false} {
+			addressee, kind := cutoffSessionAddressee, "session"
+			if profile {
+				addressee, kind = cutoffProfileAddressee, "profile"
+			}
+			taskID := "task-" + strings.ToLower(strings.ReplaceAll(c.name, " ", "-")) + "-" + kind
+			if !c.noWorking {
+				r.cutoffWorking(t, addressee, taskID)
+			}
+			if err := r.bus.Publish(ctx, lib.TaskSupervisorSubject(addressee, taskID), supervisorTerminalEnvelope(t, taskID)); err != nil {
+				t.Fatal(err)
+			}
+			rec := cutoffRecord("discord:every/"+taskID, addressee, taskID, profile)
+			if c.shape != nil {
+				rec = c.shape(rec, taskID)
+			}
+			if err := r.g.reg.Put(ctx, rec); err != nil {
+				t.Fatal(err)
+			}
+			before := r.client.ProfileSupervisorDrops()
+			took, observable := c.read(rec, taskID)
+			dropped := r.client.ProfileSupervisorDrops() - before
+			if profile {
+				if observable && took {
+					t.Errorf("%s: the profile task's five-token terminal after the cutoff was taken", c.name)
+				}
+				if dropped == 0 {
+					t.Errorf("%s: no drop counted for the profile task", c.name)
+				}
+				continue
+			}
+			if observable && !took {
+				t.Errorf("%s: the session task's supervisor terminal was not taken", c.name)
+			}
+			if dropped != 0 {
+				t.Errorf("%s: %d drops counted for the session task", c.name, dropped)
+			}
 		}
 	}
 }

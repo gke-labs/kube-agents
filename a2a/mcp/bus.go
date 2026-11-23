@@ -119,6 +119,9 @@ type NATSBus struct {
 	// events listens to the console conversations this server knows and
 	// keeps their reports and results.
 	events *Events
+	// kinds is what this server's turns learned of their tasks' kinds, for
+	// the supervisor cutoff (cutoffScreen).
+	kinds taskKinds
 }
 
 // statusRead is one status read in flight: st is its answer once done is
