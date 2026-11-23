@@ -688,6 +688,12 @@ func New(o Options) (*Gateway, error) {
 		relayDurable:     o.RelayDurable,
 		relayPrecreated:  o.Config.RelayPrecreated && o.RelayDurable == relayDurable,
 	}
+	// The relay's reports are also stored in the session-state bucket, so a
+	// reply under one outlives a restart (reports.go, reportstore.go).
+	g.reports.log = log
+	if o.Client != nil {
+		g.reports.durable = gatewayReports{g: g}
+	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
 			g.handleInbound(msg)
@@ -1004,6 +1010,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	g.startProfileDirectory(ctx)
 	g.startTriggerIngress(ctx)
 	go g.reapLoop(ctx)
+	if g.reports.durable != nil {
+		go g.reportPruneLoop(ctx)
+	}
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
 	}

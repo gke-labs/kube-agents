@@ -452,8 +452,11 @@ turn) or one thread the reply carries the newest. This is how a card filed in a 
 child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
 reply never reads, and the relay carries the report across. The relay rides a human turn on every
 route; this executor frames it on the platform route (the install's default), and a conversation
-on its own session pod (the a2a-worker) does not read it yet. Then, with no relayed part (the gateway restarted
-since the post, or the post was one it does not keep), the bridge asks session-kv for the row the poster stored
+on its own session pod (the a2a-worker) does not read it yet. The gateway also stores each report it keeps in its
+session-state bucket for 14 days (a thread's newest at the thread's `(chat_id, thread_id)`, a console report at
+`(key, key#root)`, the addresses below), so a gateway restart or failover does not lose it: the first opening turn in
+a thread after one carries the thread's newest report once more. Then, with no relayed part (the post was one
+the gateway does not keep, the thread's turn already carried it, or the gateway could not read its bucket), the bridge asks session-kv for the row the poster stored
 (`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's recent-reports
 index or its Google Chat first-reply recovery): first, when the submission carries a `replyTo`
 part, by the Hermes session and `<conversation key>#<task>`, which is how the notifier keys a
