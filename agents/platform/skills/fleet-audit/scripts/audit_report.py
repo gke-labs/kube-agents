@@ -3877,22 +3877,21 @@ def task_is_shadow() -> bool | None:
     return raw.strip().lower() not in SHADOW_TASK_FALSE
 
 
-def run_is_shadow(audit_id: str) -> bool | None:
-    """What the run now in flight recorded at `start`: True for a shadow run, False for a live one.
+def run_is_shadow(audit_id: str) -> bool:
+    """Whether this stream's last `start` was a shadow run's; read to block a live publish, so it fails closed.
 
-    None when there is no record, it isn't this stream's, or it wasn't
-    written by the run now in flight (`written_in_this_run`, as
-    `this_runs_decision` reads it): a run that is over can't steer a later one.
+    True while the stream's run record says shadow, whether or not that run is
+    still in flight: a shadow `finish` that died releases its in-flight note,
+    and its retry must not publish live by leaving the flag out. The record
+    goes when the next `start` replaces it, so a live run begins with a live
+    `start`. A live record never refuses `--store-only`: a shadow publish
+    writes nothing live (`shadow_mode`).
     """
     try:
         record = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    if not isinstance(record, dict) or record.get("audit") != audit_id:
-        return None
-    if not written_in_this_run(audit_id, record.get(RUN_RECORD_STARTED_KEY)):
-        return None
-    return record.get(RUN_RECORD_SHADOW_KEY) is True
+        return False
+    return isinstance(record, dict) and record.get("audit") == audit_id and record.get(RUN_RECORD_SHADOW_KEY) is True
 
 
 def shadow_store_repo(audit_id: str) -> str:
@@ -3928,9 +3927,10 @@ def shadow_mode(args: argparse.Namespace, command: str) -> bool:
     flag = bool(getattr(args, "store_only", False))
     dry_run = bool(getattr(args, "dry_run", False))
     runtime = task_is_shadow()
-    # `finish` follows what its `start` recorded when the runtime is silent.
-    if runtime is None and command == "finish":
-        runtime = run_is_shadow(validate_audit_id(args.audit))
+    # With the runtime silent, a `finish` after a shadow `start` is a shadow
+    # run's (`run_is_shadow`, fail-closed); a live record decides nothing.
+    if runtime is None and command == "finish" and run_is_shadow(validate_audit_id(args.audit)):
+        runtime = True
     if flag and dry_run:
         raise ValidationError(
             f"{STORE_ONLY_FLAG} and --dry-run: pass one. --dry-run writes nothing; "
@@ -3943,8 +3943,8 @@ def shadow_mode(args: argparse.Namespace, command: str) -> bool:
         )
     if runtime is False and flag:
         raise ValidationError(
-            f"{STORE_ONLY_FLAG}: this run is live ({SHADOW_TASK_ENV} is false, or this "
-            "run's `start` was live), so it publishes as a live run; leave the flag out."
+            f"{STORE_ONLY_FLAG}: this task is live ({SHADOW_TASK_ENV} is false), so it "
+            "publishes as a live run; leave the flag out."
         )
     return flag
 

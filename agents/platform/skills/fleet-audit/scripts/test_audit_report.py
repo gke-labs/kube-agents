@@ -35318,32 +35318,32 @@ class TestShadowRun(BaseTestCase):
         self.assertFalse((self.reports_dir / AUDIT).exists())
         self.assertEqual(self.only_search_clones(), [])
 
-    def test_a_live_start_refuses_a_store_only_finish(self):
+    def test_a_live_record_doesnt_refuse_a_store_only_finish(self):
+        # Store-only writes nothing live, so a live run's record doesn't refuse it.
         os.environ.pop(audit_report.SHADOW_TASK_ENV)
-        # A live run in flight: its claim, then its record, as a live `start` leaves them.
-        audit_report.claim_in_flight(AUDIT)
         self.record_run(audit=AUDIT)
-        self.assertIs(audit_report.run_is_shadow(AUDIT), False)
-        path = audit_report.findings_path_for(AUDIT)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
-        self.assertNotEqual(
-            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, audit_report.STORE_ONLY_FLAG]), 0
-        )
-        self.assertFalse(self.shadow_store().exists())
+        self.assertFalse(audit_report.run_is_shadow(AUDIT))
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
 
     def test_the_runtime_word_fails_closed(self):
         for value, want in (("true", True), ("1", True), ("yes", True), ("TRUE", True), ("false", False), ("0", False), ("", None)):
             with self.subTest(value=value), patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: value}):
                 self.assertIs(audit_report.task_is_shadow(), want)
 
-    def test_a_finished_runs_record_doesnt_steer_a_later_call(self):
-        # A shadow run started by hand and finished: its record stays, but the
-        # run is over, so a later standalone finish isn't held to it.
+    def test_a_shadow_runs_record_still_blocks_a_live_publish_after_its_note_is_gone(self):
+        # A shadow finish that died released its in-flight note; the retry
+        # without the flag must not publish live. Only a new `start` replaces the record.
         os.environ.pop(audit_report.SHADOW_TASK_ENV)
-        self.finish(make_doc(findings=THREE_SEVERITIES))
-        self.assertTrue(Path(audit_report.run_record_path_for(AUDIT)).exists())
-        self.assertIsNone(audit_report.run_is_shadow(AUDIT))
+        self.start(audit_report.STORE_ONLY_FLAG)
+        audit_report.release_in_flight(AUDIT)
+        self.assertTrue(audit_report.run_is_shadow(AUDIT))
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.only_search_clones(), [])
 
     def test_remediate_refuses_in_a_run_started_as_a_shadow_run(self):
         os.environ.pop(audit_report.SHADOW_TASK_ENV)
