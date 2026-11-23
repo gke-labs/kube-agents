@@ -3802,11 +3802,6 @@ class PlainStatusAndDryRunTests(unittest.TestCase):
             "status": "ok",
             "topology_findings": [make_topology_finding()],
         }
-        c_clean = {
-            "cluster": "p1/us-central1/seeded-d",
-            "status": "ok",
-            "topology_findings": [],
-        }
         with mock.patch.object(watch, "roster_clusters_by_project", return_value={"p1": ["p1/us-central1/seeded-d"]}):
             # 1. Seed the ledger with one finding via a real tick, plus a second finding on another cluster that will resolve.
             rep_seed = make_report(
@@ -3886,7 +3881,119 @@ class PlainStatusAndDryRunTests(unittest.TestCase):
                 "TOPIC_PUBLISH_CLEARED_LINE",
             ):
                 self.assertFalse(hasattr(watch, removed), removed)
-            _ = c_clean
+
+    def test_dry_run_partial_scan_writes_nothing_to_log(self) -> None:
+        rep_p1 = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]}],
+            T0,
+        )
+
+        def run_side_effect(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "p1/us-central1/seeded-d" in argv[-1]:
+                return completed_json(rep_p1)
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="permission denied")
+
+        buf = io.StringIO()
+        with mock.patch.object(
+            watch,
+            "roster_clusters_by_project",
+            return_value={"p1": ["p1/us-central1/seeded-d"], "p2": ["p2/us-central1/broken"]},
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=run_side_effect), redirect_stdout(buf):
+            code = watch.tick(dry_run=True, now=T0)
+        self.assertEqual(code, 0)
+        self.assertIn("**1 pod placement problem on cluster seeded-d (new)**", buf.getvalue())
+        self.assertEqual(self.log_text(), "")
+        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
+
+    def test_legacy_no_report_marker_suppresses_duplicate_post_after_upgrade(self) -> None:
+        self.write_roster("30 8 * * *")
+        self.home.mkdir(parents=True, exist_ok=True)
+        marker = self.home / watch.FAILURE_MARKER_FILE_NAME
+        for cause, expected_reason in (
+            (watch.NO_REPORT_TIMED_OUT_CAUSE, watch.FAILED_REASON_TIMED_OUT),
+            (watch.NO_REPORT_FAILED_CAUSE, watch.FAILED_REASON_ERROR),
+            (watch.NO_REPORT_MIXED_CAUSE, watch.FAILED_REASON_MIXED),
+        ):
+            with self.subTest(cause=cause):
+                marker.write_text(watch.NO_REPORT_DETAIL.format(cause=cause) + "\n", encoding="utf-8")
+                kinds = (
+                    {watch.ERROR_KIND_TIMEOUT}
+                    if expected_reason == watch.FAILED_REASON_TIMED_OUT
+                    else {watch.ERROR_KIND_SCAN_FAILED}
+                    if expected_reason == watch.FAILED_REASON_ERROR
+                    else {watch.ERROR_KIND_TIMEOUT, watch.ERROR_KIND_SCAN_FAILED}
+                )
+                self.assertEqual(
+                    watch.record_tick_failure(self.home, watch.NoReportReturned(kinds), dry_run=False),
+                    [],
+                )
+
+    def test_announce_failed_targets_translates_unresolved_scope_row_in_chat(self) -> None:
+        announced: dict[str, Any] = {}
+        failures = {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW: "resolved-scope.json is missing"}
+        lines = watch.announce_failed_targets(
+            announced,
+            failures,
+            {},
+            {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW, "p1"},
+            {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW: watch.ERROR_KIND_SCAN_FAILED},
+        )
+        self.assertEqual(
+            lines,
+            [
+                "**The topology skew check couldn't read the declared scope's member projects.** "
+                "Existing findings there are kept until the next clean read."
+            ],
+        )
+        self.assertNotIn(watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW, lines[0])
+        self.assertIn("declared-scope: resolved-scope.json is missing", self.log_text())
+        self.assertEqual(
+            announced[watch.ANNOUNCED_FAILED_TARGETS_KEY],
+            {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW: None},
+        )
+
+    def test_tick_times_out_in_projects_lookup_and_single_target_sweep(self) -> None:
+        self.write_roster("30 8 * * *")
+        expected = (
+            "**The topology skew check didn't run today.** Reading the clusters took too long. "
+            "It will try again tomorrow."
+        )
+        # 1. `gcloud config get-value project` in `projects()` times out.
+        buf_proj = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}, clear=False), mock.patch.object(
+            watch, "declared_scope", return_value=None
+        ), mock.patch.object(
+            watch, "roster_projects", return_value=set()
+        ), mock.patch.object(
+            watch, "roster_clusters_by_project", return_value={}
+        ), mock.patch.object(
+            watch.sandbox_exec,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd=list(watch.CONFIG_PROJECT_ARGV), timeout=30),
+        ), redirect_stdout(
+            buf_proj
+        ):
+            code = watch.tick(now=T0)
+        self.assertEqual(code, 0)
+        self.assertEqual(buf_proj.getvalue().strip(), expected)
+        self.assertIn("SandboxTimedOut: the sandbox run timed out after 30s", self.log_text())
+
+        (self.home / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+        # 2. Single-project sweep times out in its single leeway call (`len(scan_errors) == 1 and calls == whole_calls <= 1`).
+        buf_single = io.StringIO()
+        with mock.patch.object(
+            watch, "roster_clusters_by_project", return_value={"p1": ["p1/us-central1/seeded-d"]}
+        ), mock.patch.object(
+            watch.sandbox_exec,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd=["leeway", "report"], timeout=90),
+        ), redirect_stdout(
+            buf_single
+        ):
+            code = watch.tick(now=T0)
+        self.assertEqual(code, 0)
+        self.assertEqual(buf_single.getvalue().strip(), expected)
+        self.assertIn("SandboxTimedOut: p1: the sandbox run timed out after", self.log_text())
 
 
 if __name__ == "__main__":

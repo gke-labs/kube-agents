@@ -357,6 +357,8 @@ CAUSE_MAX_CHARS = 160
 CAUSE_ELLIPSIS = "…"
 # How LEEWAY_WATCH_CLUSTERS is named when it takes more than one call.
 EXPLICIT_TARGET_LABEL = "the configured clusters"
+# How an unresolved declared scope (`fleet_scope_targets.UNRESOLVED_SCOPE_ROW`) is named in chat.
+UNRESOLVED_SCOPE_TARGET_LABEL = "the declared scope's member projects"
 # A project the resolved scope names but holds no cluster list for (spec.mode: next).
 UNREAD_PROJECT_DETAIL = "{target} was not swept: {reason}"
 
@@ -576,6 +578,14 @@ FAILED_REASONS_NEED_ADMIN = frozenset(
         FAILED_REASON_LEDGER,
     }
 )
+# Legacy `last-failure.txt` markers from before plain-text reasons held the raw
+# `NO_REPORT_DETAIL` sentence; normalize them so the first tick after upgrade
+# suppresses a duplicate post when the underlying no-report failure continues.
+LEGACY_NO_REPORT_REASONS: dict[str, str] = {
+    NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE): FAILED_REASON_TIMED_OUT,
+    NO_REPORT_DETAIL.format(cause=NO_REPORT_FAILED_CAUSE): FAILED_REASON_ERROR,
+    NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE): FAILED_REASON_MIXED,
+}
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
@@ -1904,7 +1914,6 @@ def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, 
 
 
 def record_topic_publish_result(
-    published: bool,
     err_detail: str | None,
     announced: dict[str, Any],
     lines: list[str],
@@ -1932,6 +1941,24 @@ def record_topic_publish_result(
 # --- failure marker ----------------------------------------------------------
 
 
+def no_report_kinds(kinds: frozenset[str] | set[str], previous: str = "") -> tuple[bool, bool]:
+    """Return `(timed_out, failed)` for a no-report sweep, merging `kinds` with `previous`."""
+    mixed = NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE)
+    timed_out = ERROR_KIND_TIMEOUT in kinds or previous in (
+        mixed,
+        NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE),
+        FAILED_REASON_MIXED,
+        FAILED_REASON_TIMED_OUT,
+    )
+    failed = bool(kinds - {ERROR_KIND_TIMEOUT}) or previous in (
+        mixed,
+        NO_REPORT_DETAIL.format(cause=NO_REPORT_FAILED_CAUSE),
+        FAILED_REASON_MIXED,
+        FAILED_REASON_ERROR,
+    )
+    return timed_out, failed
+
+
 def failure_detail(exc: Exception, previous: str = "") -> str:
     """A tick failure's detail for the agent's log: the exception's class and
     message, or the plain sentence alone when no call returned a report, naming
@@ -1954,12 +1981,10 @@ def failure_reason(exc: Exception, previous: str = "") -> str:
     if isinstance(exc, SandboxTimedOut):
         return FAILED_REASON_TIMED_OUT
     if isinstance(exc, NoReportReturned):
-        detail = no_report_detail(exc.kinds, previous)
-        if detail == NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE):
+        timed_out, failed = no_report_kinds(exc.kinds, previous)
+        if timed_out and failed:
             return FAILED_REASON_MIXED
-        if detail == NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE):
-            return FAILED_REASON_TIMED_OUT
-        return FAILED_REASON_ERROR
+        return FAILED_REASON_TIMED_OUT if timed_out else FAILED_REASON_ERROR
     return FAILED_REASON_ERROR
 
 
@@ -1979,9 +2004,10 @@ def next_attempt(admin: bool) -> str:
 def previous_tick_failure(home: Path) -> str:
     """The reason (or legacy detail) the failure marker holds; empty when the last tick ran."""
     try:
-        return (home / FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip()
+        raw = (home / FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+    return LEGACY_NO_REPORT_REASONS.get(raw, raw)
 
 
 def record_tick_failure(home: Path, exc: Exception, *, dry_run: bool) -> list[str]:
@@ -2280,21 +2306,9 @@ def no_report_detail(kinds: frozenset[str] | set[str], previous: str = "") -> st
     """The no-report sentence for the kinds of failure a run met: timeouts,
     other failures, or both, together with those the `previous` no-report
     sentence or plain reason named. It names no target and no count."""
-    mixed = NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE)
-    timed_out = ERROR_KIND_TIMEOUT in kinds or previous in (
-        mixed,
-        NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE),
-        FAILED_REASON_MIXED,
-        FAILED_REASON_TIMED_OUT,
-    )
-    failed = bool(kinds - {ERROR_KIND_TIMEOUT}) or previous in (
-        mixed,
-        NO_REPORT_DETAIL.format(cause=NO_REPORT_FAILED_CAUSE),
-        FAILED_REASON_MIXED,
-        FAILED_REASON_ERROR,
-    )
+    timed_out, failed = no_report_kinds(kinds, previous)
     if timed_out and failed:
-        return mixed
+        return NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE)
     return NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE if timed_out else NO_REPORT_FAILED_CAUSE)
 
 
@@ -2565,7 +2579,11 @@ def announce_failed_targets(
             WATCH_LOG_FILE,
             [PARTIAL_LOG.format(prefix=LINE_PREFIX, errors=len(failures), reasons=reasons)],
         )
-        lines.append(PARTIAL_LINE.format(targets=format_name_list(named)))
+        display_targets = [
+            UNRESOLVED_SCOPE_TARGET_LABEL if target == fleet_scope_targets.UNRESOLVED_SCOPE_ROW else target
+            for target in named
+        ]
+        lines.append(PARTIAL_LINE.format(targets=format_name_list(display_targets)))
     still_open: dict[str, set[str]] = {}
     closed = False
     for target in sorted(set(episodes) | set(failures)):
@@ -2637,8 +2655,6 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             print(line)
         return 0
 
-    lines: list[str] = []
-
     raw_findings, ok_clusters, cluster_errors = extract_findings(report)
     report = filter_report_findings(report)
     active_findings, _, _ = extract_findings(report)
@@ -2655,16 +2671,6 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         COVERAGE_NOT_REACHED_FIELD: dict(sorted(not_reached.items())),
         COVERAGE_SCAN_ERRORS_FIELD: dict(sorted(all_errors.items())),
     }
-    announced = dict(ledger.get(ANNOUNCED_KEY) or {})
-    lines.extend(
-        announce_failed_targets(
-            announced,
-            all_errors,
-            target_reads,
-            set(scan_errors) | set(target_reads),
-            error_kinds,
-        )
-    )
 
     prior_findings: dict[str, Any] = dict(ledger.get(FINDINGS_KEY) or {})
     next_findings: dict[str, Any] = {}
@@ -2762,6 +2768,18 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             print(DRY_RUN_NOTHING_DUE.format(count=len(active_findings)))
         return 0
 
+    lines: list[str] = []
+    announced = dict(ledger.get(ANNOUNCED_KEY) or {})
+    lines.extend(
+        announce_failed_targets(
+            announced,
+            all_errors,
+            target_reads,
+            set(scan_errors) | set(target_reads),
+            error_kinds,
+        )
+    )
+
     current_thresholds: list[int | float] = [
         min_severity_rank(),
         min_drift(),
@@ -2799,10 +2817,10 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             due_items = [active_findings[k] for k in sorted(due_reasons)]
             next_date = (moment + timedelta(days=days)).strftime(DATE_FORMAT)
             report_line = due_message(due_items, [due_reasons[k] for k in sorted(due_reasons)], next_date)
-            published, err_detail = publish_blackboard_topic(
+            _, err_detail = publish_blackboard_topic(
                 topic_summary(report_line), md_path.with_suffix(REPORT_JSON_SUFFIX)
             )
-            record_topic_publish_result(published, err_detail, announced, lines)
+            record_topic_publish_result(err_detail, announced, lines)
         elif retired_labels and scan_errors:
             # A finding retired on a readable cluster during a partial scan (a
             # failure, or clusters not reached) makes `latest.json` stale; defer
@@ -2821,15 +2839,15 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             summary_line = (
                 topic_summary(retired_line) if retired_line else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
             )
-            published, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
-            record_topic_publish_result(published, err_detail, announced, lines)
+            _, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
+            record_topic_publish_result(err_detail, announced, lines)
         elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not scan_errors:
             latest_json = home / REPORTS_DIR_NAME / LATEST_JSON_LINK_NAME
             if latest_json.is_file():
-                published, err_detail = publish_blackboard_topic(
+                _, err_detail = publish_blackboard_topic(
                     A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX), latest_json
                 )
-                record_topic_publish_result(published, err_detail, announced, lines)
+                record_topic_publish_result(err_detail, announced, lines)
             else:
                 del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
 
