@@ -112,7 +112,11 @@ verification_spec:
         - type: tool_called
           tool_names: ["Bash"]
           arguments:
-            command: 'gcloud container clusters list(?:\s[^|;&`$<>]*)?'
+            # Flags allowed, and a trailing 2>&1. No pipe, chain, substitution,
+            # redirect to a file or second line: the session's Bash rule runs
+            # one gcloud command per call, and a second command could print
+            # the names without the read.
+            command: 'gcloud container clusters list(?:[ \t][^|;&`$<>\n]*?)?(?:[ \t]+2>&1)?[ \t]*'
         - type: report_contains
           required_patterns:
             - 'result of delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-a)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-b)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-c)'
