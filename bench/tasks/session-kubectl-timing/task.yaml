@@ -1,0 +1,66 @@
+# TWIN-ONLY (do not merge): a kubectl-heavy session turn for measuring the
+# session kubectl wrapper's per-call overhead (deploy/sandbox/session-kubectl.sh,
+# timing lines on the session pod's stderr). Not a capability case; grading is
+# not the point, so the one check is lenient.
+#
+# Structure copied from chat-routing-this-cluster-namespaces. Planted defect
+# required: none. Isolation class: read-only. deployer: noop.
+id: session-kubectl-timing
+name: The session runs a fixed list of kubectl reads itself
+prompt: >-
+  Use your own kubectl in this session to run each of the following read-only
+  commands. Run them yourself: do not delegate, do not file a card and do not
+  ask another agent. Run them one at a time, one command per shell call, in
+  this order, and do not combine them into a script or a loop. It does not
+  matter if a command fails or prints nothing; just move on to the next one.
+  1. kubectl get pods -n kube-system
+  2. kubectl get nodes
+  3. kubectl get pods -n default
+  4. kubectl get namespaces
+  5. kubectl get deploy -n kube-system -o name
+  6. kubectl get pods -A
+  7. kubectl get svc -n default
+  8. kubectl get svc -A -o name
+  9. kubectl get svc -n kube-system -o wide
+  10. kubectl get deploy -A
+  11. kubectl get configmaps -n kube-system -o name
+  12. kubectl get pv
+  13. kubectl get serviceaccounts -n default
+  14. kubectl get clusterrolebindings -o name
+  15. kubectl get daemonsets -n kube-system
+  16. kubectl get nodes -o wide
+  17. kubectl get replicasets -n kube-system -o name
+  18. kubectl get namespaces -o name
+  19. kubectl get events -n default
+  20. kubectl get configmaps -A -o name
+  21. kubectl get endpoints -n default
+  22. kubectl get daemonsets -A
+  23. kubectl get pods -n kube-system -o wide
+  24. kubectl get serviceaccounts -A -o name
+  25. kubectl get roles -n kube-system -o name
+  26. kubectl get clusterroles -o name
+  27. kubectl get jobs -n kube-system
+  28. kubectl get pvc -A
+  29. kubectl describe ns default
+  30. kubectl get ns default
+  When you have run all thirty, reply with the word done and, on the same
+  line, how many of the commands you ran.
+expected_output: >-
+  The session runs the thirty kubectl commands itself, one at a time, and
+  replies "done" with a count.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  - name: the-session-replies-done
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - '(?i)\bdone\b'
