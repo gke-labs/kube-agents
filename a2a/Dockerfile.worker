@@ -136,6 +136,32 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/repo_ref.py \
      /opt/credential-proxy/libexec/
+# The fleet-audit report scripts, for the fleet-audit AgentProfile's persona
+# (agents/fleet-audit/persona, #5623): copied from their sources at build time,
+# flat in one directory, since a script's own directory is where Python finds
+# the others when the persona's skill runs `python3 /opt/kube-agents/scripts/fleet-audit/
+# audit_report.py`. They're the closure audit_report.py imports on its
+# `finish --dry-run` path (a live finish needs more, which the PR that runs one
+# adds); the RUN below fails the build if one no longer imports from here alone,
+# and tests/test_worker_fleet_audit_scripts.py runs that finish on a document.
+# Every worker carries them; they act only with the task's own confined
+# credential, so a cluster or tse worker gains nothing it couldn't already do.
+# They're under lib.ScriptRoot (/opt/kube-agents/scripts/), the one root a
+# script row may name, root-owned and not worker-writable as script mode
+# requires. tests/test_worker_fleet_audit_scripts.py holds this list to its
+# sources, and the directory to that root.
+COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
+     agents/platform/skills/fleet-audit/scripts/report_status.py \
+     agents/platform/skills/fleet-audit/scripts/manifest_delta.py \
+     agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/repo_ref.py \
+     agents/platform/scripts/gitops_preflight.py \
+     agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/vcs_client.py \
+     /opt/kube-agents/scripts/fleet-audit/
+RUN cd /opt/kube-agents/scripts/fleet-audit \
+    && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report" \
+    && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run
 # git for that skill's local half: the working copy `clone` unpacks from a
 # bundle, and `commit` and `publish` on it. It holds no credential; the profile
 # namespace's NetworkPolicy bounds the pod's egress. deploy/shared/worker-gitconfig,

@@ -228,9 +228,9 @@ steps:
   # which copies the credential broker's shim client from agents/platform/scripts - each
   # Dockerfile's header says which. One step rather than six: they share the Go
   # module download layer, which the daemon serves to the ones after the first.
-  # The cluster and tse AgentProfiles' personas (a2a/Dockerfile.persona-cluster
-  # and a2a/Dockerfile.persona-tse, contexts agents/cluster/persona and
-  # agents/tse/persona, as docker-publish-ghcr.yml builds them) ride along:
+  # The cluster, tse and fleet-audit AgentProfiles' personas
+  # (a2a/Dockerfile.persona-cluster, -tse and -fleet-audit, contexts
+  # agents/<name>/persona, as docker-publish-ghcr.yml builds them) ride along:
   # busybox images with one COPY each, so they add seconds, not minutes.
   # Nothing here depends on the platform image, so the step starts at once,
   # like sandbox and operator; the bridge, which does, is the step after.
@@ -268,6 +268,8 @@ steps:
         build_and_push persona-cluster "$_PERSONA_CLUSTER_URI" agents/cluster/persona
         # The tse profile's persona, the same shape (#3842).
         build_and_push persona-tse "$_PERSONA_TSE_URI" agents/tse/persona
+        # The fleet-audit profile's persona, the same shape (#5623).
+        build_and_push persona-fleet-audit "$_PERSONA_FLEET_AUDIT_URI" agents/fleet-audit/persona
 
   # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
   # flag and the same no-op rule. It is FROM the platform-agent image of THIS
@@ -409,6 +411,7 @@ substitutions:
   _A2A_DISPATCHER_URI: ""
   _PERSONA_CLUSTER_URI: ""
   _PERSONA_TSE_URI: ""
+  _PERSONA_FLEET_AUDIT_URI: ""
   # Empty means the replay-shadow-proxy step is a no-op; hack/ci-deploy.sh sets
   # it under EVAL_REPLAY_SHADOW=true.
   _REPLAY_SHADOW_PROXY_URI: ""
