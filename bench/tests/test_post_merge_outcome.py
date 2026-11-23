@@ -403,7 +403,7 @@ def test_the_tick_runs_the_cron_script_under_the_jobs_lock(tmp_path, monkeypatch
     assert "ticked" in out[0] and f"{post_merge.TICK_READ} 3" in out[0]
 
 
-SYNCED = {"synced_directory": "clusters/*seeded-a/seeded-post-merge", "synced_namespace": "seeded-post-merge"}
+SYNCED = {"synced_directory": "clusters/*-a/seeded-post-merge", "synced_namespace": "seeded-post-merge"}
 
 
 def test_a_fix_in_the_synced_directory_and_namespace_merges(world, monkeypatch):
@@ -423,7 +423,7 @@ def test_a_fix_outside_the_synced_directory_fails_before_any_merge(world, monkey
     monkeypatch.setattr(post_merge, "_forge_get_json", get)
     monkeypatch.setattr(post_merge, "_added_file_text", lambda entry: MANIFEST)
     status, reason = _verifier(**SYNCED)._merge_and_apply(5)
-    assert status == "fail" and "outside clusters/*seeded-a/seeded-post-merge" in reason
+    assert status == "fail" and "outside clusters/*-a/seeded-post-merge" in reason
     assert not any(url.endswith("/merge") for _, url in world.forge.writes)
 
 

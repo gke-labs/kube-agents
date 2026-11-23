@@ -286,7 +286,7 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     # The fixture role whose cluster runs the reconciler that applies the merge.
     apply_fixture_role: str = Field(min_length=1)
     # Where the reconciler applies from, a glob on the added file's directory
-    # (`clusters/*seeded-a/seeded-post-merge` covers a dev fleet's prefix),
+    # (`clusters/*-a/seeded-post-merge` covers a dev fleet's `<prefix>-a`),
     # and the one namespace it applies to. A fix outside either is a graded
     # fail before any merge. Empty skips the check.
     synced_directory: str = ""
