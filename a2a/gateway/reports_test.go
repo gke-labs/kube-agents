@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -91,16 +92,187 @@ func TestRelayedReportIsReadByTheChainsRoot(t *testing.T) {
 	}}
 	g.reports.put(rec.Key, "task-root", "the helper's report")
 	for _, id := range []string{"task-root", "task-child"} {
-		got, ok := g.relayedReport(rec, id)
+		got, _, ok := g.relayedReport(rec, id)
 		if !ok || got != (lib.PushedReport{TaskID: "task-root", Text: "the helper's report"}) {
 			t.Fatalf("by %s: %+v %v, want the report under the root", id, got, ok)
 		}
 	}
-	if _, ok := g.relayedReport(rec, "task-other"); ok {
+	if _, _, ok := g.relayedReport(rec, "task-other"); ok {
 		t.Fatal("an unknown task found a report")
 	}
-	if _, ok := g.relayedReport(rec, ""); ok {
+	if _, _, ok := g.relayedReport(rec, ""); ok {
 		t.Fatal("a turn naming no task read a report")
+	}
+}
+
+func TestPushedReportsLatestAndForgetThrough(t *testing.T) {
+	var p pushedReports
+	if _, _, ok := p.latest("slack:C1/1699.1"); ok {
+		t.Fatal("an empty cache had a latest report")
+	}
+	p.put("slack:C1/1699.1", "", "the first card's report")
+	p.put("slack:C1/1699.1", "task-x", "the second card's report")
+	p.put("console:tab-k", "task-root", "a console report")
+	got, seq, ok := p.latest("slack:C1/1699.1")
+	if !ok || got != "the second card's report" || seq != 2 {
+		t.Fatalf("latest = %q %d %v, want the second card's report, numbered 2", got, seq, ok)
+	}
+	if got, _, ok := p.latest("slack:C1/1699.1"); !ok || got != "the second card's report" {
+		t.Fatalf("latest read twice = %q %v, want the same report (a read forgets nothing)", got, ok)
+	}
+	// A report kept between the read and the forget stays for the next turn.
+	p.put("slack:C1/1699.1", "", "the third card's report")
+	p.forgetThrough("slack:C1/1699.1", seq)
+	if got, seq, ok := p.latest("slack:C1/1699.1"); !ok || got != "the third card's report" || seq != 4 {
+		t.Fatalf("after forgetThrough: %q %d %v, want the third card's report alone, numbered 4", got, seq, ok)
+	}
+	p.forgetThrough("slack:C1/1699.1", 4)
+	if _, _, ok := p.latest("slack:C1/1699.1"); ok {
+		t.Fatal("the thread's reports were kept after forgetting them all")
+	}
+	if p.bytes != len("a console report") || len(p.order) != 1 || p.order[0] != "console:tab-k" {
+		t.Fatalf("after forgetting: bytes %d, order %v; want the console report alone", p.bytes, p.order)
+	}
+	if got, ok := p.byRoot("console:tab-k", "task-root"); !ok || got != "a console report" {
+		t.Fatalf("the console report was touched: %q %v", got, ok)
+	}
+	p.forget("slack:C1/never-kept")
+	p.forgetThrough("slack:C1/never-kept", 3)
+}
+
+// At the per-conversation cap a put evicts the oldest report, so a count
+// of the reports read would name a report kept since the read; the number
+// does not. Eight kept, the newest read, one more kept, the read ones
+// forgotten: the ninth stays, and the bytes follow.
+func TestForgetThroughAtTheCapKeepsTheReportKeptDuringThePublish(t *testing.T) {
+	var p pushedReports
+	for i := 1; i <= pushedReportsPerConversation; i++ {
+		p.put("slack:C1/1699.1", "", fmt.Sprintf("report %d", i))
+	}
+	_, seq, ok := p.latest("slack:C1/1699.1")
+	if !ok || seq != pushedReportsPerConversation {
+		t.Fatalf("latest numbered %d %v, want %d", seq, ok, pushedReportsPerConversation)
+	}
+	p.put("slack:C1/1699.1", "", "the report kept during the publish")
+	p.forgetThrough("slack:C1/1699.1", seq)
+	got, _, ok := p.latest("slack:C1/1699.1")
+	if !ok || got != "the report kept during the publish" || len(p.byConversation["slack:C1/1699.1"]) != 1 {
+		t.Fatalf("after the forget: %q %v, %d kept; want the ninth report alone", got, ok, len(p.byConversation["slack:C1/1699.1"]))
+	}
+	if p.bytes != len("the report kept during the publish") {
+		t.Fatalf("bytes %d, want the ninth report's %d", p.bytes, len("the report kept during the publish"))
+	}
+}
+
+// A reply in a chat thread names no task; it is under the newest report
+// kept for the thread's key, with the number the caller forgets through once the
+// turn is on the bus. A key every top-level message shares (a whole space,
+// a thread-less DM) is no thread, and a console turn naming no task is
+// under nothing.
+func TestRelayedReportForAThreadKeyIsTheNewestKept(t *testing.T) {
+	g := &Gateway{}
+	for _, key := range []string{"slack:C1/1699.1", "gchat:spaces/A/threads/B", "gchat:space/spaces/A", "slack:dm/D1", "console:tab-k"} {
+		g.reports.put(key, "", "the first card's report")
+		g.reports.put(key, "", "the newest card's report")
+	}
+	for _, key := range []string{"slack:C1/1699.1", "gchat:spaces/A/threads/B"} {
+		got, seq, ok := g.relayedReport(&SessionRecord{Key: key}, "")
+		if !ok || seq == 0 || got != (lib.PushedReport{Text: "the newest card's report"}) {
+			t.Fatalf("%s: %+v %d %v, want the newest report under the thread with its number", key, got, seq, ok)
+		}
+	}
+	for _, key := range []string{"gchat:space/spaces/A", "slack:dm/D1", "console:tab-k"} {
+		if got, n, ok := g.relayedReport(&SessionRecord{Key: key}, ""); ok || n != 0 {
+			t.Fatalf("%s: a turn naming no task read %+v %d", key, got, n)
+		}
+	}
+}
+
+// A thread turn whose publish fails leaves the thread's kept report for the
+// retry: the forget follows the publish, not the read.
+func TestAFailedPublishLeavesTheThreadsReportForTheRetry(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	const thread = "slack:C1/1701.1"
+	r.g.reports.put(thread, "", "card report: np-quartz-7 is at 92%")
+	_, before, _ := r.g.reports.latest(thread)
+	deleteTasksStream(t, r.url)
+	// busyTurn runs the turn to its end before returning: with the stream
+	// gone, PublishSeq fails and the turn is dropped (noticeBusUnreachable).
+	busyTurn(r, thread, "slack", "and the other pool?")
+	rec, err := r.g.reg.Get(context.Background(), thread)
+	if err != nil || rec == nil || rec.ActiveTask != nil {
+		t.Fatalf("after the failed publish the turn is still active: %+v %v", rec, err)
+	}
+	if got, after, ok := r.g.reports.latest(thread); !ok || after != before || got != "card report: np-quartz-7 is at 92%" {
+		t.Fatalf("after the failed publish: %q %d %v, want the same report still kept (numbered %d)", got, after, ok, before)
+	}
+}
+
+// A message steered into a chat thread's running task carries no report
+// and forgets the thread's kept reports, so a later opening turn there is
+// not under a report it was not about.
+func TestASteerIntoAThreadForgetsItsKeptReports(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	const thread = "slack:C1/1700.1"
+	rec := seedFixedRouteTask(t, r, thread, time.Minute)
+	r.g.reports.put(thread, "", "card report: np-quartz-7 is at 92%")
+	busyTurn(r, thread, "slack", "apply option B")
+	waitFor(t, "the steer forgot the thread's reports", func() bool {
+		_, _, ok := r.g.reports.latest(thread)
+		return !ok
+	})
+	if _, _, ok := r.g.relayedReport(rec, ""); ok {
+		t.Fatal("the thread still had a report to carry after the steer")
+	}
+}
+
+// A human turn in a Slack thread the notify route posted a card's report
+// into carries that report to the executor with no task named; once it is
+// on the bus the thread's reports are forgotten, so the turn after it
+// carries none; one in a whole space carries none.
+func TestASlackThreadReplyCarriesTheNewestRelayedReportOnce(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	const thread = "slack:C1/1699.1"
+	r.g.reports.put(thread, "", "card report: np-quartz-7 is at 92%")
+	r.g.reports.put("gchat:space/spaces/A", "", "a report under a whole space")
+	busyTurn(r, thread, "slack", "and the other pool?")
+	origin := r.awaitTask(t, "platform")
+	got, found, err := lib.PushedReportOf(messageParts(t, origin))
+	if err != nil || !found || got != (lib.PushedReport{Text: "card report: np-quartz-7 is at 92%"}) {
+		t.Fatalf("pushedReport part = %+v found=%v err=%v, want the thread's newest report", got, found, err)
+	}
+	seen := map[string]bool{origin.TaskID: true}
+	next := func(name, conv, text string) *lib.Envelope {
+		busyTurn(r, conv, "slack", text)
+		var env *lib.Envelope
+		waitFor(t, name, func() bool {
+			for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+				if e.Kind == lib.KindMessage && !seen[e.TaskID] {
+					env = e
+					return true
+				}
+			}
+			return false
+		})
+		seen[env.TaskID] = true
+		return env
+	}
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first turn released", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), thread)
+		return rec != nil && rec.ActiveTask == nil
+	})
+	if _, found, _ := lib.PushedReportOf(messageParts(t, next("the turn after the reply", thread, "and after that?"))); found {
+		t.Fatal("the turn after the reply carried the report again")
+	}
+	if _, found, _ := lib.PushedReportOf(messageParts(t, next("the whole-space turn", "gchat:space/spaces/A", "and the other pool?"))); found {
+		t.Fatal("a turn in a whole space carried a report")
 	}
 }
 

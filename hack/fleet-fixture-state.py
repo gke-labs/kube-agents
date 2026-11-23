@@ -206,6 +206,13 @@ DISKS_COLLECTION = "disks"
 # What gcloud prints, with exit 0, when a part of a list did not answer (a zone
 # that failed, a refused request): the list is then not the whole project's.
 PARTIAL_LIST_WARNING = "Some requests did not succeed"
+# Under that warning gcloud lists each part that failed as one item with this
+# start, and this is the reason when it lists none.
+PARTIAL_LIST_ITEM_START = "- "
+PARTIAL_LIST_NO_ITEM = "gcloud named no failed part"
+# The exit status of a tool that is there and cannot be started, as a shell
+# has it for a file that is not executable.
+STATUS_CANNOT_EXECUTE = 126
 
 # Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
 # discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;
@@ -657,6 +664,10 @@ def _run(cmd: list[str], timeout: float) -> tuple[int, str, str]:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        # Not executable, the wrong binary format, a path through a file: the
+        # read failed before the tool ran, and the text says how.
+        return STATUS_CANNOT_EXECUTE, "", str(exc)
     except subprocess.TimeoutExpired:
         return 124, "", f"timed out after {timeout:g}s: {' '.join(cmd)}"
     return proc.returncode, proc.stdout, proc.stderr
@@ -718,6 +729,20 @@ def _objects(kind: str, out: str) -> list[dict]:
     raise Unreadable(f"kubectl get {kind} printed an unexpected document")
 
 
+def _partial_list_reasons(err: str) -> str:
+    """Why gcloud read a list only in part: the items under its warning, one for
+    each part that failed. The last line of stderr is not the reason: after an
+    answer with no item, gcloud ends with a warning about the filter's key."""
+    lines = err.splitlines()
+    start = next(i for i, line in enumerate(lines) if PARTIAL_LIST_WARNING in line)
+    items = [
+        line.strip()[len(PARTIAL_LIST_ITEM_START):].strip()
+        for line in lines[start + 1 :]
+        if line.strip().startswith(PARTIAL_LIST_ITEM_START)
+    ]
+    return "; ".join(items) or PARTIAL_LIST_NO_ITEM
+
+
 def _compute_list(project: str, collection: str, name_filter: str) -> list[dict]:
     """`gcloud compute <collection> list` in `project`, filtered on the name.
     None there is an observation (an empty list), which an assertion may fail
@@ -733,7 +758,7 @@ def _compute_list(project: str, collection: str, name_filter: str) -> list[dict]
     if PARTIAL_LIST_WARNING in err:
         # An empty or short list here is not an observation: an `absent` or
         # `none_eq` assertion would pass on what gcloud could not read.
-        raise Unreadable(f"compute {collection} list was partial: {err.strip().splitlines()[-1]}")
+        raise Unreadable(f"compute {collection} list was partial: {_partial_list_reasons(err)}")
     try:
         doc = json.loads(out)
     except ValueError as exc:

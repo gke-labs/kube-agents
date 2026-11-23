@@ -39,6 +39,13 @@ const (
 	// that reservation key on.
 	A2ABusTokenAudience = "a2a-bus"
 
+	// WatcherTokenAudience is the audience the gateway's watchers present to
+	// the credential proxy for the watcher role.
+	WatcherTokenAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	// WatcherTokenVolumeName is the reserved volume name the operator projects
+	// the watcher token under for the agent-api-auth container alone.
+	WatcherTokenVolumeName = "watcher-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
+
 	// The suffixes that build the names of the bus objects the operator
 	// renders off the PlatformAgent's own name. Here for the same reason as
 	// the audience: the webhook has to recognise the Secrets that carry bus
@@ -333,12 +340,12 @@ func IsSensitiveEnvVar(name string) bool {
 // The watchers' broker token is the second member, in either mode: it is
 // projected into the gateway's agent-api-auth container alone, and any other
 // container holding it holds the broker's watcher role (every fleet cluster's
-// events and named objects). The controller's watcherTokenSourceNames strips
-// it, and any volume projecting its audience under another name, at render;
-// this is the name half's admission message. The source half is render-only.
+// events and named objects). BusCredentialRoutes below is the source half of
+// both reservations, and the controller's watcherTokenSourceNames strips both
+// halves at render and reports them on VolumesDropped.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token":                  {},
-	"watcher-credential-proxy-token": {},
+	"a2a-bus-token":        {},
+	WatcherTokenVolumeName: {},
 }
 
 // ReservedVolumePrefixes lists volume name prefixes reserved for operator-managed
@@ -349,7 +356,7 @@ var ReservedVolumePrefixes = []string{
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
-// used to reach the bus credential without naming the reserved volume.
+// used to reach the bus or watcher credential without naming the reserved volume.
 type BusCredentialRouteKind string
 
 const (
@@ -357,6 +364,10 @@ const (
 	// audience is A2ABusTokenAudience: a valid bus token for the pod's
 	// ServiceAccount, under whatever volume name the CR chose.
 	BusCredentialRouteAudience BusCredentialRouteKind = "audience"
+	// BusCredentialRouteWatcherAudience is a projected serviceAccountToken source
+	// whose audience is WatcherTokenAudience: a valid watcher-role token for the
+	// credential proxy, under whatever volume name the CR chose.
+	BusCredentialRouteWatcherAudience BusCredentialRouteKind = "watcher-audience"
 	// BusCredentialRouteSecret is a volume that mounts one of the Secrets the
 	// operator renders with a bus credential in it (A2ACredentialSecretNames),
 	// either as a `secret` volume or as a projected `secret` source.
@@ -436,8 +447,13 @@ func BusCredentialRoutes(v corev1.Volume, agentName string) []BusCredentialRoute
 	}
 	if v.Projected != nil {
 		for i, src := range v.Projected.Sources {
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == A2ABusTokenAudience {
-				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+			if src.ServiceAccountToken != nil {
+				switch src.ServiceAccountToken.Audience {
+				case A2ABusTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+				case WatcherTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteWatcherAudience, Source: i})
+				}
 			}
 			if src.Secret != nil && isCredential(src.Secret.Name) {
 				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i, Secret: src.Secret.Name})
@@ -2822,12 +2838,13 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
-// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
-// config states it.
+// InferenceStatus reports the Platform Agent's default model, and the reasoning effort
+// configured on it, as the install's LiteLLM config states them.
 //
 // A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
-// only, so a project id, a region or an account id never appears here. Both fields are
-// absent when the config states no default model.
+// only, so a project id, a region or an account id never appears here. The provider and
+// model are absent when the config states no default model; the reasoning effort is
+// absent whenever the entry states none.
 type InferenceStatus struct {
 	// Provider is the LiteLLM provider slug, the text before the first "/" of the
 	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
@@ -2838,6 +2855,13 @@ type InferenceStatus struct {
 	// for a resource reference.
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+	// the default model's entry, as typed: low, medium or high from the chart, or
+	// whatever a hand-edited config says. Absent when the entry states none, so the
+	// model thinks at its own default, and absent while the served CRD predates it.
+	// +optional
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
@@ -3488,7 +3512,8 @@ type AgentUsageStatus struct {
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
 	// chat platform the install enables is served through Hermes (Microsoft
-	// Teams), and while the served CRD
+	// Teams, unless the operator arms the gateway's Teams backend), and
+	// while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional

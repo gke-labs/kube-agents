@@ -120,8 +120,12 @@ test: manifests generate fmt vet test-python ## Run tests.
 # already reaches agents/*/scripts. That sweep reaches this directory too, so
 # the leader-elect test runs on every pull request through python-tests.yml
 # and not only when a change touches k8s-operator/**.
+#
+# The tests run with KUBECONFIG set to an empty file, as each file of that
+# sweep does, so an unstubbed kubectl or helm call finds no cluster.
 test-python: ## Run the operator's own Python tests (internal/controller).
-	cd internal/controller && python3 -m unittest discover -s . -p 'test_*.py'
+	kubeconfig=$$(mktemp) && trap 'rm -f "$$kubeconfig"' EXIT INT TERM && \
+	cd internal/controller && KUBECONFIG="$$kubeconfig" python3 -m unittest discover -s . -p 'test_*.py'
 
 ##@ Build
 
