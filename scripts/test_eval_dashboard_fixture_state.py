@@ -1002,6 +1002,32 @@ class NotChecked(ScanHarness):
         self.assertEqual(fixture_state.checked_projects(doc), 0)
         self.assertEqual(fixture_state.read_map(doc), {})
 
+    def test_a_tool_that_cannot_be_started_is_not_checked_with_the_reason(self):
+        # There and not executable, or the wrong binary format: the call fails before the tool runs.
+        def cannot_start(cmd, **kwargs):
+            raise PermissionError(13, "Permission denied", cmd[0])
+
+        def wrong_format(cmd, **kwargs):
+            raise OSError(8, "Exec format error", cmd[0])
+
+        def missing(cmd, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+        self.assertEqual(
+            fixture_state._run(["bash", "x"], {}, 5, cannot_start),
+            (126, "", "PermissionError: [Errno 13] Permission denied: 'bash'"),
+        )
+        self.assertEqual(fixture_state._run(["bash", "x"], {}, 5, wrong_format)[0], 126)
+        self.assertEqual(fixture_state._run(["bash", "x"], {}, 5, missing)[0], 127, "a missing tool keeps its own status")
+        self.world_path.write_text(json.dumps(healthy_world(PROJECT)))
+        entry = fixture_state.scan_project(
+            PROJECT, self.roles, self.workdir, 60, impersonate=False, environ=self.environ(), runner=cannot_start
+        )
+        self.assertEqual({role["state"] for role in entry["roles"].values()}, {"not_checked"})
+        self.assertEqual(
+            entry["error"], "hack/fleet-kubeconfigs.sh failed (126): PermissionError: [Errno 13] Permission denied: 'bash'"
+        )
+
     def test_a_runner_that_hangs_is_not_checked_within_the_ceiling(self):
         doc, _ = self.scan(healthy_world(PROJECT), timeout=2, STUB_LIST_SLEEP="10")
         self.assertEqual(set(self.states(doc).values()), {"not_checked"})

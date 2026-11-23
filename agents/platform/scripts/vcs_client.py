@@ -165,7 +165,9 @@ class VcsError(RuntimeError):
         ceiling: int | None = None,
     ):
         super().__init__(message)
-        self.code = code or None
+        # The far side composes a refusal: a `code` that is not a text is no
+        # code. The callers look a code up in a set, which a list cannot enter.
+        self.code = code if isinstance(code, str) and code else None
         self.detail = detail or None
         # The commit the broker read, on a refusal that has one (`PATH_NOT_FOUND`).
         self.revision = revision or None
@@ -215,6 +217,15 @@ BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 #: not send a write again without a look.
 ANSWER_TOO_DEEP_TEXT = (
     "the broker's answer is nested too deep to read; the request reached the broker and may have taken effect"
+)
+
+#: The values of a `publish` answer that must be a text with characters in
+#: it, because they are a key and a value of the working copy's record, and
+#: what a caller reads when one of them is not. The publish was done, so the
+#: text does not say "retry".
+PUBLISH_ANSWER_TEXT_FIELDS = ("branch", "revision")
+PUBLISH_ANSWER_UNUSABLE_TEXT = (
+    "the broker's answer has no usable `{field}`; the request reached the broker and may have taken effect"
 )
 
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
@@ -383,6 +394,8 @@ def _call(verb: str, payload: dict) -> dict:
     except credential_proxy_client.WorkspaceRequestError as exc:
         payload = exc.payload or {}
         code = payload.get("code")
+        if not isinstance(code, str) or not code:
+            code = None
         if code is None and exc.status == 404:
             # This is the version skew, and it is the shape an older broker
             # actually answers with. A credential-proxy that has the `/v1/vcs/`
@@ -1708,6 +1721,14 @@ def publish(
         answer = call("publish", publish_payload)
     finally:
         bundle_file.unlink(missing_ok=True)
+
+    # The record below has the answer's branch as a key and its revision as a
+    # value. One that is not a text, or is empty, cannot go there, and the
+    # record then stays as it was: a made-up name in it is worse than this error.
+    for field in PUBLISH_ANSWER_TEXT_FIELDS:
+        value = answer.get(field)
+        if not isinstance(value, str) or not value:
+            raise VcsError(PUBLISH_ANSWER_UNUSABLE_TEXT.format(field=field))
 
     # The published tip becomes this branch's base. A second publish of the same
     # branch then sends only what came after it, and its ancestry check is

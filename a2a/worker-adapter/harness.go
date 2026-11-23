@@ -1,8 +1,9 @@
 // Package workeradapter is the in-pod shim between the bus and the harness
 // (spec-subagent-profiles.md, "The adapter"): it fetches its one task by
-// subject, publishes the lifecycle events, drives the harness over the
-// headless stream-json contract, forwards steering and follow-ups onto the
-// harness stdin, and exits with a code matching the terminal state. One task
+// subject, publishes the lifecycle events, drives the harness over its
+// headless contract (Driver: Claude Code's stream-json unless Config.Driver
+// names another), forwards steering and follow-ups onto the harness stdin,
+// and exits with a code matching the terminal state. One task
 // per process, unless the pod is a reused session pod (Config.SessionReuse),
 // which runs each turn of its conversation in turn; either way the pod exists
 // because the message is already durable.
@@ -10,7 +11,6 @@ package workeradapter
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,8 +23,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // DefaultHarnessPath is where the worker image carries the harness: the
@@ -33,11 +31,6 @@ import (
 const DefaultHarnessPath = "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
 
 const (
-	// harnessResumeFlag continues an earlier harness session by id. The
-	// pinned binary takes it with --print (`claude -p --resume <id>`), and
-	// the agent SDK passes it alongside --input-format stream-json, the
-	// shape harnessCommand builds.
-	harnessResumeFlag = "--resume"
 	// stderrTailBytes is how much of the harness's stderr is kept for a
 	// failure message. A tail rather than the whole stream: the useful part
 	// of a crash is its end, and the value rides a status event onto the bus.
@@ -90,148 +83,6 @@ var (
 	reapKilledChildren = reapChildren
 )
 
-// harnessEvent is one stream-json line from the harness stdout. Only the
-// fields the mapper consults; unknown fields and unknown types pass through
-// the decoder untouched and are ignored, mirroring the envelope's own
-// unknown-field rule.
-type harnessEvent struct {
-	Type    string `json:"type"`
-	Subtype string `json:"subtype"`
-	// type:"assistant" carries an API Message; content blocks are inspected
-	// for text / thinking / tool_use.
-	Message *harnessMessage `json:"message,omitempty"`
-	// type:"result" fields.
-	Result  string `json:"result,omitempty"`
-	IsError bool   `json:"is_error,omitempty"`
-	// What the turn cost, on a result line: the harness's own token counts
-	// for the turn, the turn's wall time, and the harness's running price
-	// for the whole process. Usage and DurationMs are per turn;
-	// TotalCostUSD is cumulative across every result line the process has
-	// emitted, plus what a resumed session had already spent, so the
-	// adapter publishes the difference between consecutive lines
-	// (adapter.turnCost), never the figure itself. Each is optional, and
-	// each is held raw and decoded on its own (telemetry, model): telemetry
-	// in a shape the adapter does not expect is dropped field by field,
-	// never the result line that carries the deliverable. The adapter
-	// publishes what decodes as the usage artifact (payload spec "Reserved
-	// artifact names") and nothing when nothing does.
-	Usage        json.RawMessage `json:"usage,omitempty"`
-	TotalCostUSD json.RawMessage `json:"total_cost_usd,omitempty"`
-	DurationMs   json.RawMessage `json:"duration_ms,omitempty"`
-	// type:"system" subtype:"init".
-	SessionID string `json:"session_id,omitempty"`
-	// Model is the model the harness runs, named once on the init line and
-	// carried onto every turn's usage. Raw for the same reason.
-	Model json.RawMessage `json:"model,omitempty"`
-}
-
-// harnessUsage is a result line's token counts. The three prompt figures
-// are what the model read for the turn, split by cache state; the usage
-// artifact sums them as inputTokens, since a cached read is still a read.
-// float64 so a count written with a fraction still decodes; the part
-// carries whole tokens.
-type harnessUsage struct {
-	InputTokens              float64 `json:"input_tokens,omitempty"`
-	OutputTokens             float64 `json:"output_tokens,omitempty"`
-	CacheCreationInputTokens float64 `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     float64 `json:"cache_read_input_tokens,omitempty"`
-}
-
-// model is the init line's model name, and whether the line carried one in
-// a shape the adapter reads; an absent model is "" and not dropped.
-func (ev harnessEvent) model() (name string, dropped bool) {
-	if len(ev.Model) == 0 {
-		return "", false
-	}
-	if json.Unmarshal(ev.Model, &name) != nil {
-		return "", true
-	}
-	return name, false
-}
-
-// resultTelemetry is one result line's figures for the usage artifact, read
-// field by field so one off-shape field costs that field alone: the
-// per-turn usage (model from the init line, every prompt token as input, the
-// wall time as the harness reported it; zero where the line had nothing),
-// the running total and whether the line carried one, and the names of the
-// fields that were present but did not decode, for the one warning the
-// adapter logs per line. The cost is not in the usage: it is the running
-// total's difference, which the adapter keeps.
-type resultTelemetry struct {
-	usage    lib.Usage
-	total    float64
-	hasTotal bool
-	dropped  []string
-}
-
-func (ev harnessEvent) telemetry(model string) resultTelemetry {
-	t := resultTelemetry{usage: lib.Usage{Model: model}}
-	// Each figure passes lib.UsageFigure: a negative or overflowing number
-	// is that field dropped and named, never a refused part or a wrapped
-	// value, so the line's other figures still reach the bus.
-	var ms float64
-	var ok bool
-	switch {
-	case len(ev.DurationMs) == 0:
-	case json.Unmarshal(ev.DurationMs, &ms) != nil:
-		t.dropped = append(t.dropped, "duration_ms")
-	default:
-		if t.usage.DurationMs, ok = lib.UsageFigure(ms); !ok {
-			t.dropped = append(t.dropped, "duration_ms")
-		}
-	}
-	var counts harnessUsage
-	switch {
-	case len(ev.Usage) == 0:
-	case json.Unmarshal(ev.Usage, &counts) != nil:
-		t.dropped = append(t.dropped, "usage")
-	default:
-		if t.usage.InputTokens, ok = lib.UsageFigure(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens); !ok {
-			t.dropped = append(t.dropped, "usage.input_tokens")
-		}
-		if t.usage.OutputTokens, ok = lib.UsageFigure(counts.OutputTokens); !ok {
-			t.dropped = append(t.dropped, "usage.output_tokens")
-		}
-	}
-	// A null total is a line that carried none, not a total of zero: a zero
-	// would read as the total going down and rebase the baseline.
-	var total *float64
-	switch {
-	case len(ev.TotalCostUSD) == 0:
-	case json.Unmarshal(ev.TotalCostUSD, &total) != nil:
-		t.dropped = append(t.dropped, "total_cost_usd")
-	case total != nil:
-		t.total, t.hasTotal = *total, true
-	}
-	return t
-}
-
-type harnessMessage struct {
-	Content []harnessBlock `json:"content"`
-}
-
-type harnessBlock struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitempty"`
-	Thinking string          `json:"thinking,omitempty"`
-	Name     string          `json:"name,omitempty"`  // tool_use
-	Input    json.RawMessage `json:"input,omitempty"` // tool_use
-}
-
-// userMessage is the stream-json stdin shape for both the opening prompt and
-// every steer: the SDK serializes user turns exactly like this, and a line
-// written mid-run is absorbed at the harness's next turn boundary - which is
-// the payload spec's steering rule made concrete.
-type userMessage struct {
-	Type    string          `json:"type"`
-	Message userMessageBody `json:"message"`
-}
-
-type userMessageBody struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
 // harnessProc supervises one harness subprocess: stdin writer, stdout
 // scanner, stderr tail, process-group kill.
 type harnessProc struct {
@@ -240,7 +91,11 @@ type harnessProc struct {
 	closeInput func()
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
-	events     <-chan harnessEvent
+	// events carries each stdout line's events, one slice per line, so the
+	// adapter handles a line's events together, as it always has.
+	events <-chan []Event
+	// encode is the driver's stdin line for a user message.
+	encode func(string) ([]byte, error)
 	// scanDone closes when the stdout scanner has hit EOF - Wait must not
 	// run before it, or the pipe teardown races the last buffered events
 	// (the result line, typically) out of existence.
@@ -268,13 +123,19 @@ type harnessProc struct {
 	killTimers []*time.Timer
 }
 
-// startHarness launches argv with the given extra environment appended to
-// the parent's, writes the opening prompt as the first stdin line, and
-// starts the stdout scanner. The process runs in its own process group so a
+// startHarness is startHarnessWith for Claude Code.
+func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
+	return startHarnessWith(claudeDriver{}, argv, env, prompt, reapBound, log)
+}
+
+// startHarnessWith launches argv with the given extra environment appended to
+// the parent's, writes the opening prompt as the first stdin line in d's
+// format, and starts the stdout scanner, which reads lines through d's
+// decoder. The process runs in its own process group so a
 // kill reaches the harness's own children. reapBound caps how long every reap
 // of the harness, here after a failed start or in supervise, waits for its
 // stderr to close once the harness itself has exited.
-func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
+func startHarnessWith(d Driver, argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty harness command")
 	}
@@ -306,7 +167,8 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 		return nil, fmt.Errorf("spawn harness: %w", err)
 	}
 
-	events := make(chan harnessEvent, harnessEventDepth)
+	events := make(chan []Event, harnessEventDepth)
+	dec := d.NewDecoder()
 	scanDone := make(chan struct{})
 	var scanFailed error
 	var scanMu sync.Mutex
@@ -314,6 +176,7 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 		cmd:      cmd,
 		stdin:    stdin,
 		events:   events,
+		encode:   d.EncodeUser,
 		scanDone: scanDone,
 		scanErr: func() error {
 			scanMu.Lock()
@@ -347,15 +210,17 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 			if len(line) == 0 {
 				continue
 			}
-			var ev harnessEvent
-			if err := json.Unmarshal(line, &ev); err != nil {
-				// Non-JSON chatter on stdout is logged, never fatal - the
-				// harness owns its stdout and the contract owns only the
-				// JSON lines.
+			evs, err := dec.Decode(line)
+			if err != nil {
+				// A line the driver can't read (for Claude, non-JSON chatter)
+				// is logged, never fatal - the harness owns its stdout and
+				// the contract owns only the lines it defines.
 				log.Warn("harness emitted non-JSON stdout line", "line", truncate(string(line), chatterEchoCap))
 				continue
 			}
-			events <- ev
+			// A line with no events still goes through: the adapter checks
+			// for an abandon on every stdout line, as it always has.
+			events <- evs
 		}
 		if err := sc.Err(); err != nil {
 			scanMu.Lock()
@@ -501,10 +366,7 @@ func (p *harnessProc) writeUser(text string) error {
 	if p.stdinDead.Load() {
 		return fmt.Errorf("harness stdin closed")
 	}
-	line, err := json.Marshal(userMessage{
-		Type:    "user",
-		Message: userMessageBody{Role: "user", Content: text},
-	})
+	line, err := p.encode(text)
 	if err != nil {
 		return err
 	}
@@ -688,16 +550,4 @@ func removeUserSettings(path string) error {
 		return fmt.Errorf("remove the harness's user settings %s: %w", path, err)
 	}
 	return nil
-}
-
-// withResume is argv continuing harness session id, or argv unchanged when
-// there is none. It copies rather than appending in place: argv is the pod's
-// shared Config value, and every task builds its own from it.
-func withResume(argv []string, id string) []string {
-	if id == "" {
-		return argv
-	}
-	out := make([]string, 0, len(argv)+2)
-	out = append(out, argv...)
-	return append(out, harnessResumeFlag, id)
 }

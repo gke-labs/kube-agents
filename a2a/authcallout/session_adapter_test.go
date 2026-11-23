@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -118,7 +119,7 @@ echo '{"type":"result","subtype":"success","result":"the thing is done"}'
 		}
 	}
 	for _, n := range names {
-		if !strings.HasPrefix(n, podA+"-") && n != relayDurable && n != "test-reader" {
+		if !strings.HasPrefix(n, podA+"-") && n != relayDurable && n != testReaderName {
 			t.Errorf("consumer %q is not this session's, the gateway's relay, or the provisioner's; a session created something outside its naming contract", n)
 		}
 	}
@@ -761,30 +762,51 @@ func publishInboundAs(t *testing.T, h *harness, addressee, taskID, correlationID
 	return ack.Sequence
 }
 
+// testReaderName is the consumer readEventsOn reads through.
+const testReaderName = "test-reader"
+
 // readEvents drains a task's events subject as the gateway, which may read
 // what the session may only write.
 func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envelope {
 	t.Helper()
-	js, err := jetstream.New(gatewayConn(t, h))
+	out, err := readEventsOn(t, gatewayConn(t, h), addressee, taskID, 15*time.Second)
 	if err != nil {
-		t.Fatalf("jetstream: %v", err)
+		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	return out
+}
+
+// readEventsOn is readEvents over a gateway connection the caller holds. A
+// read that fails is returned rather than ending the test, for a caller that
+// reads again, and within bounds its requests. Each read starts from the
+// subject's first event: the reader consumer is dropped first, because a named
+// consumer keeps its position while it is in use, and a read whose reply was
+// lost would otherwise have taken those events for good.
+func readEventsOn(t *testing.T, nc *nats.Conn, addressee, taskID string, within time.Duration) ([]*lib.Envelope, error) {
+	t.Helper()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, fmt.Errorf("jetstream: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), within)
 	defer cancel()
+	if err := js.DeleteConsumer(ctx, lib.TasksStream, testReaderName); err != nil && !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		return nil, fmt.Errorf("drop the reader consumer: %w", err)
+	}
 	cons, err := js.CreateOrUpdateConsumer(ctx, lib.TasksStream, jetstream.ConsumerConfig{
 		// Named, so the consumer-naming assertion above can tell the test's
 		// own reader from something the session created.
-		Name:          "test-reader",
+		Name:          testReaderName,
 		FilterSubject: lib.TaskEventsSubject(addressee, taskID),
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		AckPolicy:     jetstream.AckNonePolicy,
 	})
 	if err != nil {
-		t.Fatalf("reader consumer: %v", err)
+		return nil, fmt.Errorf("reader consumer: %w", err)
 	}
 	batch, err := cons.FetchNoWait(256)
 	if err != nil {
-		t.Fatalf("fetch: %v", err)
+		return nil, fmt.Errorf("fetch: %w", err)
 	}
 	var out []*lib.Envelope
 	for msg := range batch.Messages() {
@@ -795,7 +817,10 @@ func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envel
 		}
 		out = append(out, env)
 	}
-	return out
+	if err := batch.Error(); err != nil {
+		return out, fmt.Errorf("fetch: %w", err)
+	}
+	return out, nil
 }
 
 func consumerNames(t *testing.T, h *harness) []string {

@@ -36,6 +36,8 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # timeout-minutes in deploy-environment.yml is sized to this budget and to
 # teardown_common.sh's second run of a failed uninstall.sh.
 readonly PROVISION_STOCKOUT_PATTERN='does not have enough resources available to fulfill request|ZONE_RESOURCE_POOL_EXHAUSTED'
+readonly PLATFORM_AGENT_SIZING_PROFILE_VALUES="small medium fleet auto"
+readonly PLATFORM_AGENT_SIZING_PROFILE_CHOICES="small | medium | fleet | auto"
 PROVISION_STOCKOUT_ATTEMPTS="${PROVISION_STOCKOUT_ATTEMPTS:-3}"
 PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
 # Each knob has to be a plain decimal: a word makes the attempt comparison
@@ -209,6 +211,21 @@ if provision_is_truthy "${SLACK_ENABLED:-}"; then
   if [ -n "${SLACK_MISSING}" ]; then
     echo "::error title=Slack is enabled with no tokens::SLACK_ENABLED is set on this environment but${SLACK_MISSING} reached this job empty, and install.sh refuses --enable-slack without both. Refusing to tear down '${GKE_CLUSTER_NAME:-this environment}' for an install that cannot complete. Check the secret is set on the GitHub environment this job binds to, and that the calling pipeline still invokes this workflow with \`secrets: inherit\`."
     echo "==> Slack enabled with missing:${SLACK_MISSING}." >&2
+    INSTALL_REFUSAL_STATUS=1
+  fi
+fi
+
+if [ -n "${PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+  _sizing_valid="false"
+  for _sizing_choice in $PLATFORM_AGENT_SIZING_PROFILE_VALUES; do
+    if [ "$PLATFORM_AGENT_SIZING_PROFILE" = "$_sizing_choice" ]; then
+      _sizing_valid="true"
+      break
+    fi
+  done
+  if [ "$_sizing_valid" != "true" ]; then
+    echo "::error title=PLATFORM_AGENT_SIZING_PROFILE is invalid::'${PLATFORM_AGENT_SIZING_PROFILE}' is not ${PLATFORM_AGENT_SIZING_PROFILE_CHOICES}, and install.sh refuses it after the teardown. Refusing before the teardown rather than after."
+    echo "==> PLATFORM_AGENT_SIZING_PROFILE='${PLATFORM_AGENT_SIZING_PROFILE}' is not valid (use ${PLATFORM_AGENT_SIZING_PROFILE_CHOICES})." >&2
     INSTALL_REFUSAL_STATUS=1
   fi
 fi
@@ -391,6 +408,10 @@ fi
 
 if [ -n "${PLATFORM_AGENT_PERMISSION_SET:-}" ]; then
   INSTALL_ARGS+=(--permission-set="${PLATFORM_AGENT_PERMISSION_SET}")
+fi
+
+if [ -n "${PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+  INSTALL_ARGS+=(--sizing-profile="${PLATFORM_AGENT_SIZING_PROFILE}")
 fi
 
 if [ -n "${REGISTRY_PREFIX:-}" ]; then

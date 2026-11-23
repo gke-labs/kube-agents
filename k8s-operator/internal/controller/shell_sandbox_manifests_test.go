@@ -1825,9 +1825,6 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
-		// The watchers' broker token: mounted into the agent container it
-		// would hand the model the broker's watcher role.
-		watcherTokenVolume,
 		"vcs-forge-credentials-0",
 		"vcs-forge-ca-0",
 	} {

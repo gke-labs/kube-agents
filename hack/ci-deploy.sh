@@ -404,6 +404,10 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 readonly PROFILES_NAMESPACE_SUFFIX="-profiles"
 readonly NAMESPACE_DELETION_JSONPATH='{.metadata.deletionTimestamp}'
 readonly PROFILES_NAMESPACE_DELETE_TIMEOUT="120s"
+# What the guard prints when that wait fails: each condition of the namespace
+# on a line. They name the kinds of objects that remain, with a count, and the
+# finalizers that hold it.
+readonly NAMESPACE_CONDITIONS_JSONPATH='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
 # The NATS StatefulSet the operator renders, and the claims its
 # volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
 # (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
@@ -2422,6 +2426,9 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     echo "The profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} is Terminating (since ${PROFILES_NAMESPACE_DELETING}); waiting up to ${PROFILES_NAMESPACE_DELETE_TIMEOUT} for it to go before install attempt ${attempt}."
     if ! kubectl wait --for=delete "namespace/${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --timeout="${PROFILES_NAMESPACE_DELETE_TIMEOUT}"; then
       echo "ERROR: the wait for the profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} to go failed (limit ${PROFILES_NAMESPACE_DELETE_TIMEOUT}; kubectl's line is above); install attempt ${attempt} would fail on it (#6602)." >&2
+      echo "The namespace's conditions:" >&2
+      kubectl get namespace "${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --ignore-not-found \
+        -o jsonpath="${NAMESPACE_CONDITIONS_JSONPATH}" >&2 || true
       rm -f "${HELM_INSTALL_OUT}"
       exit 1
     fi

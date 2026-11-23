@@ -711,8 +711,11 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # /setup-files in their own DM every attachment reaches this method, and on the
 # install where this was reported no user had. The second half of the fix is the
 # advice itself: agents/platform/scripts/google_chat_relay_patch.py stubs
-# /setup-files out, and the operator sets GOOGLE_CHAT_RELAY_URL on every install
-# with Google Chat enabled, so on all of them that instruction is a dead end. The
+# /setup-files out where the relay patch is armed (GOOGLE_CHAT_RELAY_URL set, and
+# sitecustomize.py on PYTHONPATH), so there that instruction is a dead end. (The
+# operator set the variable on every install with Google Chat enabled. It renders
+# it no longer: the A2A gateway is Google Chat's one consumer, and the Hermes
+# google_chat platform does not run on an operator install.) The
 # notice branches on the _credential_proxy_relay_patched marker that patch leaves
 # on the class, and gives the reason instead. The direct branch is for an image
 # run outside the operator; it is kept rather than folded away because deleting
