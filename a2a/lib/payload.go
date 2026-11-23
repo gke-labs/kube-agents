@@ -543,6 +543,110 @@ func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
 	return *found, true, nil
 }
 
+// ScopeClusters is the scopeClusters data part a delegating profile
+// parent's submission carries beside delegateTargets: one bounded page of
+// the install's in-scope clusters, each one a `cluster` child delegation
+// would be accepted for, in (project, location, cluster) order. Count is
+// how many clusters are in scope in all, so Truncated is Count past the
+// page. Cursor is reserved for a later paging contract and is always empty
+// for now; a reader ignores it.
+type ScopeClusters struct {
+	Count     int            `json:"count"`
+	Clusters  []ScopeCluster `json:"clusters"`
+	Truncated bool           `json:"truncated"`
+	Cursor    string         `json:"cursor"`
+}
+
+// ScopeCluster is one cluster on a scopeClusters page: the target a
+// `cluster` delegation names it by.
+type ScopeCluster struct {
+	Project  string `json:"project"`
+	Location string `json:"location"`
+	Cluster  string `json:"cluster"`
+}
+
+// ScopeClustersPageMax is the most clusters one scopeClusters page carries:
+// the widest batch any gateway accepts (DelegateBatchMax). A gateway caps its
+// page at its own delegation width under this bound, so the page is one
+// batch's worth of targets. ScopeClustersMaxBytes bounds the encoded part,
+// which the session pod hands its tool server in one environment variable.
+const (
+	ScopeClustersPageMax  = DelegateBatchMax
+	ScopeClustersMaxBytes = 4 * 1024
+)
+
+const scopeClustersKey = "scopeClusters"
+
+func validateScopeClusters(s ScopeClusters) error {
+	if len(s.Clusters) > ScopeClustersPageMax {
+		return fmt.Errorf("scope clusters: a page of %d, at most %d", len(s.Clusters), ScopeClustersPageMax)
+	}
+	if s.Count < len(s.Clusters) {
+		return fmt.Errorf("scope clusters: count %d is under the page's %d", s.Count, len(s.Clusters))
+	}
+	if s.Truncated != (s.Count > len(s.Clusters)) {
+		return fmt.Errorf("scope clusters: truncated is %t with count %d and a page of %d", s.Truncated, s.Count, len(s.Clusters))
+	}
+	if s.Cursor != "" {
+		return errors.New("scope clusters: the cursor is reserved and must be empty")
+	}
+	for _, c := range s.Clusters {
+		if !validDNS1123Label(c.Project) || !validDNS1123Label(c.Location) || !validDNS1123Label(c.Cluster) {
+			return fmt.Errorf("scope clusters: %q/%q/%q is not a cluster target", c.Project, c.Location, c.Cluster)
+		}
+	}
+	if raw, err := json.Marshal(s); err != nil || len(raw) > ScopeClustersMaxBytes {
+		return fmt.Errorf("scope clusters: encoded past %d bytes", ScopeClustersMaxBytes)
+	}
+	return nil
+}
+
+// ScopeClustersPart is s as a data part, refused when s breaks the bounds.
+func ScopeClustersPart(s ScopeClusters) (Part, error) {
+	if s.Clusters == nil {
+		s.Clusters = []ScopeCluster{}
+	}
+	if err := validateScopeClusters(s); err != nil {
+		return Part{}, err
+	}
+	data, err := json.Marshal(map[string]ScopeClusters{scopeClustersKey: s})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ScopeClustersOf finds the scopeClusters part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader shows no
+// page.
+func ScopeClustersOf(parts []Part) (ScopeClusters, bool, error) {
+	var found *ScopeClusters
+	for _, p := range parts {
+		raw, ok := wrappedData(p, scopeClustersKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return ScopeClusters{}, true, errors.New("scope clusters: more than one scopeClusters part")
+		}
+		var s ScopeClusters
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return ScopeClusters{}, true, fmt.Errorf("scope clusters: %w", err)
+		}
+		if s.Clusters == nil {
+			return ScopeClusters{}, true, errors.New("scope clusters: the part carries no clusters list")
+		}
+		if err := validateScopeClusters(s); err != nil {
+			return ScopeClusters{}, true, err
+		}
+		found = &s
+	}
+	if found == nil {
+		return ScopeClusters{}, false, nil
+	}
+	return *found, true, nil
+}
+
 // ReplyTo is the replyTo data part: the task whose stored report this turn
 // answers (spec-a2a-payloads.md, "Task parameters and child results");
 // written by the gateway only.
