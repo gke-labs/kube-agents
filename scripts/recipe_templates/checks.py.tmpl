@@ -1,9 +1,12 @@
 """The {kind} fix's safety checks: live facts that must hold before it may merge unattended.
 
-The broker's label gate and the sandbox's pre-flight both load this file
+The sandbox's pre-flight loads this file
 (`fix_recipes.registry.checks_module`, `fleet-audit/scripts/fix_preflight.py`)
-and run `checks` on their own read of the target namespace. Stdlib only: the
-credential proxy loads this file.
+and runs `checks` on its own read of the target namespace. The broker's label
+gate runs it too, but today it labels only no-pdb fixes
+(`automerge_eligibility.FIX_TYPE`): wiring this kind into the gate edits
+shared plumbing, which `recipe-check --base` flags for platform review. Stdlib
+only: the credential proxy loads this file.
 """
 
 from __future__ import annotations

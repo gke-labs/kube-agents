@@ -118,6 +118,27 @@ class RecipeCheckTest(unittest.TestCase):
     def test_a_diff_git_cannot_make_warns_rather_than_fails(self):
         self.assertEqual(check_recipes.changed_files("no-such-ref-anywhere"), [])
 
+    def test_main_with_a_base_flags_plumbing_and_only_strict_fails(self):
+        from unittest import mock
+
+        changed = ["agents/platform/scripts/fix_recipes/no-pdb/recipe.yaml", "agents/platform/scripts/dial_state.py"]
+        with mock.patch.object(check_recipes, "changed_files", return_value=changed) as diff, \
+                mock.patch("builtins.print") as out:
+            self.assertEqual(check_recipes.main(["--base", "HEAD^1"]), 0)
+            self.assertEqual(check_recipes.main(["--base", "HEAD^1", "--strict"]), 1)
+            self.assertEqual(check_recipes.main([]), 0)
+        self.assertEqual(diff.call_count, 2, "no --base, no diff")
+        warnings = [c.args[0] for c in out.call_args_list if c.args[0].startswith("::warning file=")]
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("dial_state.py", warnings[0])
+
+    def test_main_with_a_base_git_cannot_diff_still_passes(self):
+        from unittest import mock
+
+        with mock.patch("builtins.print") as out:
+            self.assertEqual(check_recipes.main(["--base", "no-such-ref-anywhere", "--strict"]), 0)
+        self.assertTrue(any("could not diff" in c.args[0] for c in out.call_args_list))
+
     def test_an_unreadable_recipe_is_reported(self):
         (self.tree.recipes / "no-pdb").mkdir()
         (self.tree.recipes / "no-pdb" / "recipe.yaml").write_text("kind: no-pdb\n")

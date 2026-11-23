@@ -126,6 +126,13 @@ def _graded(task: Path) -> set[str]:
         return set()
 
 
+#: The keys a verification check nests checks under. A copy of
+#: kube_agents_bench.cases._CHECK_CHILD_KEYS, which this script cannot import:
+#: it runs without the bench install (devops-bench). The bench suite's
+#: test_recipe_eval_cases.py holds the two equal.
+CHECK_CHILD_KEYS = ("checks", "check")
+
+
 def case_recipes(task: Path) -> set[str]:
     """The `recipe` of every post_merge_outcome check in a case, however deep it is nested."""
     found: set[str] = set()
@@ -137,7 +144,7 @@ def case_recipes(task: Path) -> set[str]:
         elif isinstance(node, dict):
             if node.get("type") == "post_merge_outcome" and isinstance(node.get("recipe"), str):
                 found.add(node["recipe"])
-            for key in ("check", "checks"):
+            for key in CHECK_CHILD_KEYS:
                 walk(node.get(key))
 
     spec = yaml.safe_load(task.read_text(encoding="utf-8")) or {}

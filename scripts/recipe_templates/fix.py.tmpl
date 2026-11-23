@@ -1,9 +1,11 @@
 """The {kind} fix, written by code: the same input always gives the same bytes.
 
-The broker trusts a fix pull request only when re-running `generate` on the
+Auto-merge trusts a fix pull request only when re-running `generate` on the
 inputs the file names (`read_inputs`) gives the file byte for byte
-(`automerge_eligibility.verify_added_manifest`). Stdlib only: the credential
-proxy loads this file.
+(`automerge_eligibility.verify_added_manifest`). Today the broker labels only
+no-pdb fixes (`automerge_eligibility.FIX_TYPE`); wiring this kind in edits
+shared plumbing, which `recipe-check --base` flags for platform review. Stdlib
+only: the credential proxy loads this file.
 """
 
 from __future__ import annotations
