@@ -599,7 +599,7 @@ when the broker's 403 carries `write_refusal: true`;
 [the dispatch design](spec-profiles-dispatch.md) states which refusals those are. The
 adapter reads the file after each tool result, stops the harness as a cancel does, and
 publishes terminal `failed` with `reason: write-refused`, naming the record's rule and
-verb and nothing of the output, which the chat shows after the failed notice. Nothing the
+verb and nothing of the output; the chat shows the failed notice. Nothing the
 harness prints after the refusal is published. It is `failed`, not `rejected`, because work
 ran before the refusal; a delegating parent reads its reason, and the eval harness grades it.
 A version-control refusal (a write without the task's permit) never stops the task: the
