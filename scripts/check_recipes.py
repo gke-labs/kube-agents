@@ -83,7 +83,7 @@ def recipe_problems(recipes_dir: Path = RECIPES, tasks_dir: Path = TASKS) -> lis
             task = tasks_dir / recipe.eval_case / "task.yaml"
             if not task.is_file():
                 problems.append(f"{where}: eval case {recipe.eval_case!r} has no bench/tasks/{recipe.eval_case}/task.yaml")
-            elif recipe.kind not in case_recipes(task):
+            elif recipe.kind not in _graded(task):
                 problems.append(
                     f"{where}: bench/tasks/{recipe.eval_case}/task.yaml has no post_merge_outcome check "
                     f"with `recipe: {recipe.kind}`"
@@ -91,26 +91,39 @@ def recipe_problems(recipes_dir: Path = RECIPES, tasks_dir: Path = TASKS) -> lis
         for path in sorted((recipes_dir / recipe.kind).iterdir()):
             if not path.is_file():
                 continue
-            text = path.read_text(encoding="utf-8")
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                if path.suffix in (".py", ".yaml"):
+                    problems.append(f"{where}/{path.name}: is not UTF-8 text")
+                continue  # a stray binary such as .DS_Store carries no scaffold line
             if MARKER in text:
                 problems.append(f"{where}/{path.name}: still has scaffold lines marked {MARKER}")
             if path.name in REQUIRED_NAMES:
-                defined = _top_level_names(text)
+                try:
+                    defined = _top_level_names(text)
+                except SyntaxError as exc:
+                    problems.append(f"{where}/{path.name}: does not parse: {exc.msg} (line {exc.lineno})")
+                    continue
                 missing = [n for n in REQUIRED_NAMES[path.name] if n not in defined]
                 if missing:
                     problems.append(f"{where}/{path.name}: does not define {', '.join(missing)}")
     kinds = {recipe.kind for recipe in recipes}
     for task in sorted(tasks_dir.glob("*/task.yaml")):
-        try:
-            graded = case_recipes(task)
-        except yaml.YAMLError:
-            continue  # bench-case-check reports a case that does not parse
-        for kind in sorted(graded - kinds):
+        for kind in sorted(_graded(task) - kinds):
             problems.append(
                 f"bench/tasks/{task.parent.name}/task.yaml: its post_merge_outcome check grades recipe {kind!r}, "
                 f"which has no fix_recipes/{kind}/recipe.yaml"
             )
     return problems
+
+
+def _graded(task: Path) -> set[str]:
+    """case_recipes, or nothing for a case that does not parse: bench-case-check reports that."""
+    try:
+        return case_recipes(task)
+    except yaml.YAMLError:
+        return set()
 
 
 def case_recipes(task: Path) -> set[str]:
@@ -140,6 +153,8 @@ def _top_level_names(text: str) -> set[str]:
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             names.update(t.id for t in targets if isinstance(t, ast.Name))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
     return names
 
 
@@ -154,10 +169,15 @@ def plumbing_flags(changed: list[str]) -> list[str]:
 
 
 def changed_files(base: str) -> list[str]:
+    """The files changed since `base`; empty, with a warning, when git cannot say (the flag only warns)."""
     # From the merge-base, so a base branch that moved on is not counted as this change.
-    out = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], cwd=REPO, check=True,
-                         capture_output=True, text=True).stdout
-    return [line for line in out.splitlines() if line]
+    result = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], cwd=REPO,
+                            capture_output=True, text=True)
+    if result.returncode:
+        print(f"::warning::recipe-check could not diff against {base}, so it skipped the shared-plumbing flag: "
+              f"{(result.stderr.strip().splitlines() or ['git diff failed'])[0]}")
+        return []
+    return [line for line in result.stdout.splitlines() if line]
 
 
 def main(argv: list[str] | None = None) -> int:

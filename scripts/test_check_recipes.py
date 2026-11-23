@@ -100,6 +100,24 @@ class RecipeCheckTest(unittest.TestCase):
         self.assertIn("checks.py: still has scaffold lines", problems)
         self.assertNotIn("checks.py: does not define", problems)
 
+    def test_broken_files_are_reported_not_raised(self):
+        self.tree.recipe("no-pdb", case="bad-case", extra={
+            "fix.py": "def generate(:\n",
+            "checks.py": "from shared import read_kinds, checks, unanswered\n",
+        })
+        (self.tree.recipes / "no-pdb" / ".DS_Store").write_bytes(b"\xff\xfe\x00")
+        (self.tree.tasks / "bad-case").mkdir()
+        (self.tree.tasks / "bad-case" / "task.yaml").write_text("id: [unclosed\n")
+        problems = "\n".join(self.tree.problems())
+        self.assertIn("fix.py: does not parse", problems)
+        self.assertIn("bad-case/task.yaml has no post_merge_outcome check", problems)
+        # An imported name is defined; a stray binary is skipped.
+        self.assertNotIn("checks.py", problems)
+        self.assertNotIn(".DS_Store", problems)
+
+    def test_a_diff_git_cannot_make_warns_rather_than_fails(self):
+        self.assertEqual(check_recipes.changed_files("no-such-ref-anywhere"), [])
+
     def test_an_unreadable_recipe_is_reported(self):
         (self.tree.recipes / "no-pdb").mkdir()
         (self.tree.recipes / "no-pdb" / "recipe.yaml").write_text("kind: no-pdb\n")

@@ -552,15 +552,16 @@ jobs:
       # edits a recipe and the shared plumbing beside it (a warning, for a
       # platform owner's review). The checkout is the pull request's merge
       # commit, one deep; its first parent is the base it merged onto, so a
-      # second commit of depth gives exactly the pull request's change. The
-      # ref comes in through env, never spliced into the script.
+      # second commit of depth gives exactly the pull request's change. It
+      # fetches that commit by SHA, not the merge ref, which GitHub may have
+      # rebuilt since checkout (main moved, or an old job re-ran).
       - name: Check the fix recipes
         env:
-          PR_REF: ${{ github.event_name == 'pull_request' && github.ref || '' }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
         run: |
           base=""
-          if [ -n "$PR_REF" ]; then
-            git fetch --no-tags --depth=2 origin "$PR_REF"
+          if [ "$IS_PR" = "true" ]; then
+            git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
             base="HEAD^1"
           fi
           make recipe-check RECIPE_CHECK_BASE="$base"
