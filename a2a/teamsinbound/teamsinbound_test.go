@@ -1,6 +1,7 @@
 package teamsinbound
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -407,6 +408,49 @@ func TestAFailedRefreshIsRetriedAfterAMinuteNotAfterADay(t *testing.T) {
 	r.now = r.now.Add(2 * time.Minute)
 	if rec := r.post(t, r.ms.mint(t, "key-2", signingAlgorithm, claimsAt(r.now)), activityJSON(nil)); rec.Code != http.StatusAccepted {
 		t.Fatalf("after recovery under the rotated key: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestARefusalIsLoggedOncePerReasonPerMinuteWithTheHeldBackCount(t *testing.T) {
+	r := newRig(t)
+	var buf bytes.Buffer
+	r.srv.log = slog.New(slog.NewJSONHandler(&buf, nil))
+	r.srv.now = func() time.Time { return r.now }
+	lines := func() []string {
+		var out []string
+		for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			if strings.Contains(l, "request refused") {
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+	// Three refusals under one reason inside the minute: one line.
+	for i := 0; i < 3; i++ {
+		if rec := r.post(t, "", activityJSON(nil)); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("no bearer: %d", rec.Code)
+		}
+	}
+	if got := lines(); len(got) != 1 || !strings.Contains(got[0], `"reason":"no_bearer"`) || !strings.Contains(got[0], `"held_back":0`) {
+		t.Fatalf("inside the minute: want one no_bearer line with held_back 0, got %q", got)
+	}
+	// Another reason inside the same minute has its own line.
+	if rec := r.post(t, "junk", activityJSON(nil)); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("junk bearer: %d", rec.Code)
+	}
+	if got := lines(); len(got) != 2 || !strings.Contains(got[1], `"reason":"token"`) {
+		t.Fatalf("second reason: want its own line, got %q", got)
+	}
+	// After the minute the next refusal logs again and says how many were held back.
+	r.now = r.now.Add(refusalLogInterval)
+	if rec := r.post(t, "", activityJSON(nil)); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("after the minute: %d", rec.Code)
+	}
+	if got := lines(); len(got) != 3 || !strings.Contains(got[2], `"reason":"no_bearer"`) || !strings.Contains(got[2], `"held_back":2`) {
+		t.Fatalf("after the minute: want a no_bearer line with held_back 2, got %q", got)
+	}
+	if strings.Contains(buf.String(), "junk") {
+		t.Fatal("the log carried the bearer")
 	}
 }
 

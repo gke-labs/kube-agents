@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -32,6 +33,11 @@ const (
 	// an attachment reference is tens of KiB at most, and the broker caps
 	// its own intake too. Past this the request is refused unread.
 	maxBodyBytes = 256 << 10
+	// refusalLogInterval bounds the log: at most one warning per refusal
+	// reason in this window, carrying the count held back since the last,
+	// so a scanner hammering the public endpoint cannot flood the log while
+	// a misconfigured install still names its reason within a minute.
+	refusalLogInterval = time.Minute
 	// relayTimeout bounds the hand-off to the broker. Bot Framework waits
 	// fifteen seconds for the endpoint; this leaves room for the token
 	// check and the answer.
@@ -82,6 +88,12 @@ type Server struct {
 	registry *prometheus.Registry
 	requests *prometheus.CounterVec
 	refusals *prometheus.CounterVec
+	now      func() time.Time
+
+	// refusalMu guards the per-reason log window below.
+	refusalMu   sync.Mutex
+	refusalLast map[string]time.Time
+	refusalHeld map[string]int
 }
 
 // NewServer wires a receiver from its config. The verifier is created here
@@ -114,6 +126,10 @@ func NewServer(cfg Config, log *slog.Logger) *Server {
 		registry: reg,
 		requests: requests,
 		refusals: refusals,
+		now:      time.Now,
+
+		refusalLast: map[string]time.Time{},
+		refusalHeld: map[string]int{},
 	}
 }
 
@@ -214,11 +230,33 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// refuse answers a refusal and counts it.
+// refuse answers a refusal, counts it, and logs it at most once per
+// refusalLogInterval per reason, with the count held back since the last
+// line. The message never carries the token or the body.
 func (s *Server) refuse(w http.ResponseWriter, status int, reason, msg string) {
 	s.requests.WithLabelValues(outcomeRefused).Inc()
 	s.refusals.WithLabelValues(reason).Inc()
+	if held, ok := s.refusalLogDue(reason); ok {
+		s.log.Warn("teams inbound: request refused", "reason", reason, "status", status, "detail", msg, "held_back", held)
+	}
 	http.Error(w, msg, status)
+}
+
+// refusalLogDue reports whether a refusal under reason gets a log line now,
+// and how many were held back since the last one.
+func (s *Server) refusalLogDue(reason string) (int, bool) {
+	s.refusalMu.Lock()
+	defer s.refusalMu.Unlock()
+	now := s.now()
+	last, seen := s.refusalLast[reason]
+	if seen && now.Sub(last) < refusalLogInterval {
+		s.refusalHeld[reason]++
+		return 0, false
+	}
+	held := s.refusalHeld[reason]
+	s.refusalHeld[reason] = 0
+	s.refusalLast[reason] = now
+	return held, true
 }
 
 // forward posts the activity to the broker's Teams intake under the pod's

@@ -183,7 +183,7 @@ spec:
 The Teams inbound receiver's status listener (teamsInboundStatusPort in the
 operator): requests by outcome and refusals by reason, the one signal that a
 misconfigured receiver is dropping Teams messages, since it answers each
-refusal with a status code and logs nothing. Rendered while the receiver is
+refusal with a status code and logs at most one line a minute per reason. Rendered while the receiver is
 (spec.integration.teams.inbound), on its own selector; the operator's
 receiver NetworkPolicy admits the collector on that port and on no other.
 */}}
