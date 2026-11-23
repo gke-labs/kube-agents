@@ -776,7 +776,7 @@ func taskParameters(origin *lib.Envelope) (map[string]string, error) {
 
 // scriptMarker is the script a held task is marked with, and what marks
 // it: the task credential's trigger, else the submission's own (its
-// authority block's trigger, which admission checked). Neither is "" for a
+// authority block's trigger, which admission checked). Both are "" for a
 // model task.
 func scriptMarker(h *held) (from, script string, err error) {
 	if h.proxyToken != "" {

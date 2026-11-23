@@ -34,6 +34,9 @@ const (
 	// submits and asks (lib.TriggerSubmitSubject, lib.TriggerStatusSubject).
 	triggerSubmitSubject = "a2a.trigger." + triggerScheduleSource + ".submit"
 	triggerStatusSubject = "a2a.trigger." + triggerScheduleSource + ".status"
+	// triggerStopSubject is where the operator stops a run it started
+	// (lib.TriggerStopSubject, #6052).
+	triggerStopSubject = "a2a.trigger." + triggerScheduleSource + ".stop"
 	// triggerReplyPrefix opens the operator's reply subjects
 	// (lib.TriggerReplySubject): never its _INBOX.
 	triggerReplyPrefix = "a2a.trigger.reply." + triggerScheduleSource + "."
@@ -105,6 +108,20 @@ type triggerStatusWire struct {
 	TaskID   string          `json:"taskId"`
 }
 
+// triggerStopReplyWire is lib.TriggerStopReply. The stop itself is
+// triggerStatusWire, as lib.TriggerStop is lib.TriggerStatus.
+type triggerStopReplyWire struct {
+	Result  string              `json:"result,omitempty"`
+	Refused *triggerRefusalWire `json:"refused,omitempty"`
+}
+
+// The stop's outcomes (lib.TriggerStop*).
+const (
+	triggerStopStopped      = "stopped"
+	triggerStopAlreadyFinal = "already_final"
+	triggerStopUnknownRun   = "unknown_run"
+)
+
 // triggerStatusReplyWire is lib.TriggerStatusReply.
 type triggerStatusReplyWire struct {
 	Found    bool                `json:"found"`
@@ -114,6 +131,10 @@ type triggerStatusReplyWire struct {
 	Refused  *triggerRefusalWire `json:"refused,omitempty"`
 	Delivery string              `json:"delivery,omitempty"`
 }
+
+// errTriggerStopRefused is a stop the gateway refused for good: the stop
+// itself is wrong (a malformed one), so asking again won't help.
+var errTriggerStopRefused = errors.New("the gateway refused the stop")
 
 // errTriggerRefused is a refusal that isn't worth retrying at the next slot:
 // the submission itself is wrong (InvalidSchedule).
@@ -204,6 +225,28 @@ func (s *natsScheduleSubmitter) Submit(ctx context.Context, sub ScheduleSubmissi
 }
 
 // State asks the gateway what state the schedule's run is in.
+// Stop asks the gateway to end one of the schedule's runs, and returns its
+// outcome (triggerStop*). A gateway that doesn't answer, an older one without
+// the stop, say, is ErrScheduleGatewayUnavailable.
+func (s *natsScheduleSubmitter) Stop(ctx context.Context, sched *agentv1alpha1.AgentSchedule, taskID string) (string, error) {
+	var reply triggerStopReplyWire
+	q := triggerStatusWire{Schedule: scheduleRefWire{Namespace: sched.Namespace, Name: sched.Name}, TaskID: taskID}
+	if err := s.request(ctx, sched.Namespace, triggerStopSubject, q, &reply); err != nil {
+		return "", err
+	}
+	if r := reply.Refused; r != nil {
+		if r.Reason == triggerRefusedUnavailable {
+			return "", fmt.Errorf("%w: stop refused (%s): %s", ErrScheduleGatewayUnavailable, r.Reason, r.Detail)
+		}
+		return "", fmt.Errorf("%w (%s): %s", errTriggerStopRefused, r.Reason, r.Detail)
+	}
+	switch reply.Result {
+	case triggerStopStopped, triggerStopAlreadyFinal, triggerStopUnknownRun:
+		return reply.Result, nil
+	}
+	return "", fmt.Errorf("%w: the stop's answer %q is not one this operator knows", ErrScheduleGatewayUnavailable, reply.Result)
+}
+
 func (s *natsScheduleSubmitter) State(ctx context.Context, sched *agentv1alpha1.AgentSchedule, taskID string) (ScheduleTaskState, error) {
 	var reply triggerStatusReplyWire
 	q := triggerStatusWire{Schedule: scheduleRefWire{Namespace: sched.Namespace, Name: sched.Name}, TaskID: taskID}

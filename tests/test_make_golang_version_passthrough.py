@@ -85,6 +85,11 @@ class GolangVersionPassthroughTest(unittest.TestCase):
         for words in docker_builds(extra_env={VERSION_VAR: VERSION_OF_A_GOLANG_CONTAINER}):
             self.assertFalse([word for word in words if word.startswith(f"{VERSION_VAR}=")], " ".join(words))
 
+    def test_the_variable_of_a_golang_container_is_not_a_pin_under_make_e(self):
+        # Under `make -e` a plain assignment in the makefile loses to the environment.
+        for words in docker_builds("-e", extra_env={VERSION_VAR: VERSION_OF_A_GOLANG_CONTAINER}):
+            self.assertFalse([word for word in words if word.startswith(f"{VERSION_VAR}=")], " ".join(words))
+
 
 if __name__ == "__main__":
     unittest.main()

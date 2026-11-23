@@ -561,6 +561,10 @@ func TestTheReservedListNamesTheA2AChatVariables(t *testing.T) {
 		{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "projects/p/subscriptions/theirs"},
 		{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: "kubeagents-credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: "system:serviceaccount:ns:theirs"},
+		// The Teams caller word: a CR that set it on an install whose Teams
+		// stays on Hermes would open the broker's Teams routes to the
+		// a2a-chat role, the reach the word exists to close.
+		{Name: credentialProxyTeamsA2ACallerEnvVar, Value: "true"},
 		{Name: "HARMLESS_PLUGIN_SETTING", Value: "kept"},
 	})
 	for _, name := range []string{
@@ -569,6 +573,7 @@ func TestTheReservedListNamesTheA2AChatVariables(t *testing.T) {
 		"GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
 		"CREDENTIAL_PROXY_SESSION_CALLERS",
+		credentialProxyTeamsA2ACallerEnvVar,
 	} {
 		if _, count := envValueCount(merged, name); count != 0 {
 			t.Errorf("%s survived the merge from spec.deployment.env", name)

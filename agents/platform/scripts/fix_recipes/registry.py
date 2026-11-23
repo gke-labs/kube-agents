@@ -16,7 +16,8 @@ whether it holds a health window, is declared here (`applied`, `health`) and run
 by `fix_recipes/probes.py`.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
-through `automation_rules`, and neither may depend on PyYAML being there. So
+(through `automation_rules`, and the proxy also through
+`automerge_eligibility`), and neither may depend on PyYAML being there. So
 `recipe.yaml` is a strict subset of YAML: one `key: value` per line, `#`
 comments, a value plain or in double quotes. Anything else refuses the file,
 and a refused or missing recipe is an import-time error, caught by the tests,
@@ -49,7 +50,10 @@ The verification fields, all optional:
   is applied, for a fix whose object is not a workload.
 
 A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
-`generator(kind)`; `no-pdb` has one, which `audit_report._pdb_manifest` calls.
+`generator(kind)`, and stdlib only for the same reason. `no-pdb` has one:
+the audit calls it through `audit_report._pdb_manifest`, and the broker
+re-runs it to verify a pull request
+(`automerge_eligibility.verify_added_manifest`).
 """
 
 from __future__ import annotations

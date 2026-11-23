@@ -396,6 +396,11 @@ type Gateway struct {
 	// case preserved: Slack member ids compare exactly).
 	slackAllowed  map[string]bool
 	slackAllowAll bool
+	// teamsAllowed and teamsAllowAll gate the teams backend's identity the
+	// way gchatAllowed does Chat's: the Entra object id is the principal,
+	// compared lowercased, and the allowlist is the whole verification config.
+	teamsAllowed  map[string]bool
+	teamsAllowAll bool
 	// a2aGoogleAllowed gates the A2A door's Google-verified callers
 	// (Config.A2ADoorAllowedUsers, lowercased at build). Empty admits
 	// nobody; there is no allow-all.
@@ -497,14 +502,14 @@ func New(o Options) (*Gateway, error) {
 		// render looks exactly the same, and the difference between the
 		// two must not be silence.
 		if o.Config.A2ADoorArmed() {
-			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair or Chat relay is armed, " +
+			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 				"so nothing but the two doors and the console can reach this install (the read route still reports inject-only)")
 		} else {
-			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
+			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 				"so nothing but the eval door can reach this install (inject-only)")
 		}
 	} else if backend == a2aBackend {
-		log.Warn("the gateway is running on the A2A door alone: no Discord token, Slack pair or Chat relay is armed, " +
+		log.Warn("the gateway is running on the A2A door alone: no Discord token, Slack pair, Chat relay or Teams relay is armed, " +
 			"so nothing but the A2A door and the console can reach this install")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
@@ -590,6 +595,15 @@ func New(o Options) (*Gateway, error) {
 			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
 		}
 	}
+	teamsAllowed := map[string]bool{}
+	for _, u := range o.Config.TeamsAllowedUsers {
+		if u = strings.TrimSpace(u); u != "" {
+			teamsAllowed[strings.ToLower(u)] = true
+		}
+	}
+	if o.Config.TeamsRelayURL != "" && len(teamsAllowed) == 0 && !o.Config.TeamsAllowAllUsers {
+		log.Warn("teams allowlist is empty and allow-all is off; every inbound Teams message will be dropped at verification")
+	}
 	slackAllowed := map[string]bool{}
 	for _, u := range o.Config.SlackAllowedUsers {
 		if u = strings.TrimSpace(u); u != "" {
@@ -666,6 +680,8 @@ func New(o Options) (*Gateway, error) {
 		tierMembers:      tierMembers,
 		slackAllowed:     slackAllowed,
 		slackAllowAll:    o.Config.SlackAllowAllUsers,
+		teamsAllowed:     teamsAllowed,
+		teamsAllowAll:    o.Config.TeamsAllowAllUsers,
 		a2aGoogleAllowed: a2aGoogleAllowed,
 		a2aEntraAllowed:  a2aEntraAllowed,
 		droppedNotices:   map[string]bool{},
@@ -2741,6 +2757,13 @@ func conversationIsOwnThread(backend, conversation string) bool {
 	case slackBackend:
 		_, threadTS, ok := slackChannelThread(conversation)
 		return ok && threadTS != ""
+	case teamsBackend:
+		// A channel thread carries its ;messageid= suffix. A bare channel id
+		// names the whole channel, and a personal or group chat has no
+		// threads: every message there shares one key, so the generic
+		// wording (sessionOnAck) is the true one.
+		id, ok := strings.CutPrefix(conversation, teamsKeyPrefix)
+		return ok && strings.Contains(id, teamsThreadToken)
 	}
 	return false
 }
@@ -3422,12 +3445,16 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// (promptFromMessage) frames this one; the a2a-worker (textFromParts),
 	// which runs session pods and profile tasks, does not read it yet; the
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
+	// A chat thread's kept reports are forgotten once this turn is on the
+	// bus (below), not here: a publish that fails leaves them for the retry.
+	var threadReportRead uint64
 	if ts.Role == "" {
-		if report, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+		if report, seq, ok := g.relayedReport(rec, ts.ReplyTo); ok {
 			if part, err := lib.PushedReportPart(report); err != nil {
 				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
 			} else {
 				extra = append(extra, part)
+				threadReportRead = seq
 			}
 		}
 	}
@@ -3599,6 +3626,13 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 		return "", false
 	}
+	if threadReportRead > 0 {
+		// The turn under the thread's newest report is on the bus: the
+		// reports through the one it read are forgotten, so the next turn
+		// there is not under a report it was not about; one kept during the
+		// publish stays, at the cap too.
+		g.reports.forgetThrough(rec.Key, threadReportRead)
+	}
 
 	// The submission is on the subject now, which is the first moment
 	// anything can be said to have been handed to an executor. An observer
@@ -3755,6 +3789,14 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.log.Error("steer publish failed", "taskId", active.TaskID, "err", err)
 		g.post(rec.Key, noticeSteerNotSent)
 		return
+	}
+	// A message steered into a chat thread's running task is the human
+	// talking in the thread to the session already at work there: the
+	// thread's kept reports are forgotten, so they do not ride a later,
+	// unrelated opening turn (pushedReports). A report kept since that task
+	// opened is not carried either; the executor's own lookup serves it.
+	if lib.ThreadKeyedConversation(rec.Key) {
+		g.reports.forget(rec.Key)
 	}
 	// The steer is on the stream, and what happens next is the route's
 	// contract (spec: gateway-authored posts): a session worker absorbs it at
