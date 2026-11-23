@@ -497,7 +497,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 	// One drain, oldest first, within the bus reader's byte budget: a window
 	// past the budget stops before its newest messages, and the error says
 	// so (ErrReadByteBudget).
-	derr := b.readSwarmWindow(ctx, s, start, since, reads, &order, submittedAt, &sawOlder)
+	derr := b.readSwarmWindow(ctx, s, start, since, reads, &order, submittedAt, &sawOlder, b.swarmSupervisorScreen(ctx))
 	read.oldestDropped = start > state.FirstSeq && !sawOlder
 	addresseeOf := make(map[string]string, len(order))
 	for _, rd := range order {
@@ -531,7 +531,8 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 // by the drain's byte budget; a submission's conversation reference and
 // prompt are capped as well.
 func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start uint64, since time.Time,
-	reads map[TaskRef]*swarmTaskRead, order *[]*swarmTaskRead, submittedAt map[TaskRef]time.Time, sawOlder *bool) error {
+	reads map[TaskRef]*swarmTaskRead, order *[]*swarmTaskRead, submittedAt map[TaskRef]time.Time, sawOlder *bool,
+	accept func(addressee, subject string, storedAt time.Time) bool) error {
 	_, derr := b.drainConsumer(ctx, s, jetstream.ConsumerConfig{
 		FilterSubject: taskSubjects,
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
@@ -546,6 +547,7 @@ func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start
 		if md, err := msg.Metadata(); err == nil {
 			at, seq = md.Timestamp, md.Sequence.Stream
 		}
+		storedAt := at
 		ref := TaskRef{Addressee: addressee, TaskID: taskID}
 		if !at.IsZero() && at.Before(since) {
 			*sawOlder = true
@@ -571,6 +573,9 @@ func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start
 			rd.firstAt = at
 		}
 		if class != lib.TaskClassIn {
+			if !accept(addressee, msg.Subject(), storedAt) {
+				return
+			}
 			noteQuestion(rd, env, seq)
 			rd.events = append(rd.events, env)
 			return
@@ -615,6 +620,26 @@ func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start
 		}
 	})
 	return derr
+}
+
+// swarmSupervisorScreen is the cutoff filter for one swarm read
+// (lib.AcceptsSupervisorEvent), by addressee: a task here is known only from
+// the stream, so an addressee with a live agent card is a profile
+// (refIsProfile), with DIRECTORY read at most once per swarm read and only
+// when a five-token supervisor message stored after the cutoff is met. On an
+// unlatched install every message passes.
+func (b *NATSBus) swarmSupervisorScreen(ctx context.Context) func(addressee, subject string, storedAt time.Time) bool {
+	cutoff := b.client.ProfileSupervisorCutoff()
+	if cutoff.IsZero() {
+		return func(string, string, time.Time) bool { return true }
+	}
+	isProfile := b.directoryProfiles(ctx)
+	return func(addressee, subject string, storedAt time.Time) bool {
+		if lib.AcceptsSupervisorEvent(cutoff, subject, storedAt, true) {
+			return true
+		}
+		return b.client.AcceptSupervisorEvent(subject, storedAt, isProfile(addressee))
+	}
 }
 
 // noteQuestion records the task's latest input-required status message and

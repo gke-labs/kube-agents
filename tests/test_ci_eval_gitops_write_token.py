@@ -16,9 +16,18 @@ import re
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import (
+    RENEWAL_AFTER_STALL_SECONDS,
+    RENEWAL_NAP_SETTLE_SECONDS,
+    RENEWAL_NAP_STOP_BOUND_SECONDS,
+    RENEWAL_NAP_TICK_SECONDS,
+    RENEWAL_WRITE_STALL_SECONDS,
+    STALLED_RENEWAL_WRITE,
+    get_isolated_test_env,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
@@ -157,6 +166,54 @@ class GitopsWriteTokenTest(_Harness):
         body = self._bodies()[0]
         self.assertEqual(body["repositories"], ["kube-agents-evals-2-infra"])
         self.assertEqual(body["permissions"], {"pull_requests": "write", "contents": "write", "issues": "write"})
+
+    def test_a_stop_during_a_nap_returns_at_once_and_leaves_no_nap(self):
+        # With the real sleep and a long tick: a stop that waited the nap out,
+        # or a nap left running with the run's output open, takes the tick.
+        began = time.monotonic()
+        proc = self._run(
+            """\
+            unset -f sleep
+            LEDGER_TOKEN_RENEW_TICK_SECONDS="${NAP_TICK_SECONDS}"
+            start_gitops_write_token "case rep 1" "${TOKEN_FILE}" >/dev/null
+            sleep "${NAP_SETTLE_SECONDS}"
+            stop_gitops_write_token "${TOKEN_FILE}"
+            [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+            """,
+            NAP_TICK_SECONDS=str(RENEWAL_NAP_TICK_SECONDS),
+            NAP_SETTLE_SECONDS=str(RENEWAL_NAP_SETTLE_SECONDS),
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertLess(elapsed, RENEWAL_NAP_STOP_BOUND_SECONDS)
+
+    def test_a_stop_during_a_renewal_write_leaves_no_token_behind(self):
+        # The stop used to kill the renewer outright: its write went on without
+        # it and left a live token in the .next file after the stop's rm.
+        proc = self._run(
+            STALLED_RENEWAL_WRITE
+            + textwrap.dedent(
+                """\
+                start_gitops_write_token "case rep 1" "${TOKEN_FILE}" >/dev/null
+                : > "${STALL}"
+                for _ in $(seq 1 50); do [ -e "${STALLED}" ] && break; command sleep 0.2; done
+                [ -e "${STALLED}" ] && echo "WRITE=stalled" || echo "WRITE=never"
+                stop_gitops_write_token "${TOKEN_FILE}"
+                command sleep "${AFTER_STALL_SECONDS}"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+                [ -e "${TOKEN_FILE}.next" ] && echo "NEXT=left" || echo "NEXT=removed"
+                """
+            ),
+            STALL=str(self.tmp / "stall"),
+            STALLED=str(self.tmp / "stalled"),
+            WRITE_STALL_SECONDS=str(RENEWAL_WRITE_STALL_SECONDS),
+            AFTER_STALL_SECONDS=str(RENEWAL_AFTER_STALL_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("WRITE=stalled", proc.stdout)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertIn("NEXT=removed", proc.stdout)
 
     def test_a_refused_mint_writes_nothing_and_says_so(self):
         proc = self._run(

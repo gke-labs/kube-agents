@@ -61,7 +61,12 @@ started late holds only the waves that fit (`batch_size`), and none starts
 with less than one wave left. Clusters after that point are not reached this
 run. Every cluster in a call is stamped in `cluster_runs` however the call
 ended; the least recently stamped go first, and clusters stamped together are
-shuffled by the run's date so batch membership changes from run to run.
+shuffled by the run's date so batch membership changes from run to run. On a
+tick that swept at least one target, `cluster_runs` entries for clusters outside
+the current sweep's targets (`LEEWAY_WATCH_CLUSTERS` or the target projects)
+whose timestamp is unparseable or older than twice the refresh window
+(`2 * LEEWAY_WATCH_REFRESH_DAYS`) are dropped so clusters removed from
+`LEEWAY_WATCH_CLUSTERS` or from projects that leave the scope do not accumulate.
 Projects go least recently swept first (`project_runs`). A project whose turn
 starts with a full call's time is stamped then, so it rotates behind the
 others whatever the turn produces. Its turn ends at its first sandbox timeout,
@@ -234,6 +239,8 @@ REFRESH_DAYS_ENV = "LEEWAY_WATCH_REFRESH_DAYS"
 REFRESH_DAYS_DEFAULT = 7
 REFRESH_DAYS_MAX = 365
 REFRESH_SLACK_SECONDS = 10 * 60
+# Age-based retention multiplier for `cluster_runs` rotation stamps (`2 * refresh_days()`).
+CLUSTER_RUNS_RETENTION_MULTIPLIER = 2
 
 # Alert filtering thresholds (optional environment overrides).
 MIN_SEVERITY_ENV = "LEEWAY_WATCH_MIN_SEVERITY"
@@ -2332,6 +2339,28 @@ def forget_unlisted_clusters(cluster_runs: dict[str, Any], project: str, triples
         del cluster_runs[stale]
 
 
+def prune_stale_cluster_runs(
+    cluster_runs: dict[str, Any],
+    now: datetime,
+    *,
+    active_clusters: set[str] | None = None,
+    active_projects: set[str] | None = None,
+) -> None:
+    """Drop `cluster_runs` stamps for out-of-scope clusters that are unparseable
+    or older than `CLUSTER_RUNS_RETENTION_MULTIPLIER * refresh_days()`."""
+    cutoff = now - timedelta(days=CLUSTER_RUNS_RETENTION_MULTIPLIER * refresh_days())
+    kept_clusters = active_clusters or set()
+    kept_prefixes = tuple(p + CLUSTER_KEY_SEPARATOR for p in (active_projects or ()))
+    for cluster in [
+        c
+        for c, raw in cluster_runs.items()
+        if c not in kept_clusters
+        and not c.startswith(kept_prefixes)
+        and ((stamped := parse_iso(raw)) is None or stamped < cutoff)
+    ]:
+        del cluster_runs[cluster]
+
+
 def sweep_fleet(
     ledger: dict[str, Any],
     now: datetime,
@@ -2383,6 +2412,7 @@ def sweep_fleet(
         if swept.detail is not None and swept.kind is not None:
             scan_errors[EXPLICIT_TARGET_LABEL] = swept.detail
             error_kinds[EXPLICIT_TARGET_LABEL] = swept.kind
+        prune_stale_cluster_runs(cluster_runs, now, active_clusters=requested_clusters)
         return (
             merge_reports(reports, now),
             project_runs,
@@ -2485,6 +2515,14 @@ def sweep_fleet(
                 raise SandboxTimedOut(detail)
             raise RuntimeError(detail)
         raise NoReportReturned(failure_kinds)
+
+    if target_reads:
+        prune_stale_cluster_runs(
+            cluster_runs,
+            now,
+            active_clusters=requested_clusters,
+            active_projects=set(target_projects),
+        )
 
     return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, requested_clusters
 

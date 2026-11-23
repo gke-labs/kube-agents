@@ -7,7 +7,7 @@ which `audit_report.py finish --manifest-file` cross-checks the published
 document against; the checks it runs are defined in
 governance/stockout_prevention_sop.md.
 
-**All twelve checks are converted.** Ten read structures this repository's
+**All thirteen checks are converted.** Eleven read structures this repository's
 other collectors already read with confidence — a `ComputeClass`/`Deployment`/
 `StatefulSet`/`StorageClass`/`Node` dump, the node pools (the discovery
 `clusters list` item's `nodePools`, else `gcloud container node-pools list`),
@@ -15,6 +15,7 @@ other collectors already read with confidence — a `ComputeClass`/`Deployment`/
 --format=json(quotas)`: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
 `ccc-large-vm-scarcity`, `ccc-priority-starvation`,
 `ccc-mixed-disk-generations`, `ccc-hyperdisk-incompatible`,
+`ccc-unbacked-manual-fallback`,
 `quota-exhaustion-risk`, `single-zone-nodepool`, `reservation-mismatch-risk`,
 `dangling-compute-class`.
 
@@ -59,8 +60,9 @@ the shape anywhere, and a guess encoded as tested code looks like a fact:
 
 The rest need a read this collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
-and workload shapes for 3.3, and the region's unreserved production workloads
-for 3.10(c)'s qualifier.
+and workload shapes for 3.3, the region's unreserved production workloads
+for 3.10(c)'s qualifier, and the cluster's default-class setting for 3.13's
+`default` class.
 
 The ComputeClass field names and family-generation lists below (Gen 2 vs
 Gen 4/Hyperdisk-compatible in `ccc-mixed-disk-generations`, the
@@ -240,6 +242,48 @@ RESERVATION_IDLE_RATIO = 0.5
 RESERVATION_IDLE_MIN_INSTANCES = 4
 # "Alternative family fallbacks" (§3.3, §3.8) means at least a second family.
 MIN_FALLBACK_FAMILIES = 2
+# §3.13: with fewer rules than this a class has no later rule to fall back to.
+MIN_RULES_WITH_A_FALLBACK = 2
+UNBACKED_MANUAL_FALLBACK = "ccc-unbacked-manual-fallback"
+# The `needs_triage` marker on a §3.13 finding. Its fix adds node pools or
+# turns node pool auto-creation on, and which of the two is the owners' call,
+# so the automatic sweep leaves it to `/remediate`. The string matches
+# `TRIAGE_REASONS` in audit_report.py.
+MANUAL_POOL_TRIAGE = "manual-pool-fallback"
+# The fields of a priority rule that §3.13 judges, in the order its excerpt
+# names an option by.
+RULE_LABEL_FIELDS = ("nodepools", "machineType", "machineFamily")
+# The sentences of a §3.13 finding's detail. Each pair is (one, several).
+OPTION_NOUN = ("option", "options")
+HAVE = ("has", "have")
+THEM = ("it", "them")
+IT_NAMES = ("it names", "they name")
+LEAVE_AND_LIST = ("leaves automatic node pool creation off and lists", "leave automatic node pool creation off and list")
+OPTION_LIST_SEPARATOR = ", "
+OPTION_LIST_LAST = " and "
+SENTENCE_SEPARATOR = " "
+OPTIONS_LISTED = "This class lists {count} machine options in order."
+ONLY_OPTIONS_BACKED = "Only {options} {have} a node pool."
+OPTIONS_BACKED = "{options} {have} a node pool."
+OPTIONS_UNBACKED = "{options} {have} none, and automatic node pool creation is off, so GKE cannot create {them}."
+POOLS_CANNOT_GROW = "If {pools} cannot grow, pods that use this class wait."
+NO_OPTION_BACKED = "{options} {have} no node pool, and automatic node pool creation is off, so GKE cannot create {them}."
+NAMED_POOLS_MISSING = ("{options} names no node pool that exists.", "{options} name no node pool that exists.")
+SPARE_POOLS = (
+    "Node pool {pools} has this class's label and matches {options}.",
+    "Node pools {pools} have this class's label and match {options}.",
+)
+NO_OPTION = "no option"
+NO_CHECKED_OPTION = "no option that was checked"
+PODS_WAIT = "Pods that use this class wait."
+NO_NODE_ADDED = "GKE adds no node for {options}."
+OPTIONS_UNCHECKED = "{options} could not be checked: {names} no node pool and no machine type."
+# The name GKE gives the cluster-level default ComputeClass.
+CLUSTER_DEFAULT_CLASS = "default"
+# What `_priority_family` returns for the N1 machine types whose names do not
+# lead with the family (`custom-4-8192`, `f1-micro`, `g1-small`), and the family they are.
+N1_TYPE_PREFIXES = frozenset({"custom", "f1", "g1"})
+N1_FAMILY = "n1"
 ERROR_EXCERPT_CHARS = 300
 STDERR_EXCERPT_CHARS = 200
 # `2026-09-30T14:43:39`: an RFC 3339 log timestamp cut to whole seconds.
@@ -515,6 +559,7 @@ IMPACT = {
     "ccc-priority-starvation": "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities.",
     "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
     "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
+    UNBACKED_MANUAL_FALLBACK: "Automatic node pool creation is off for this class, so GKE uses only the node pools that exist. A machine option with no node pool is one that GKE cannot use, and pods that use this class wait when its node pools cannot take them.",
     "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
     # Both arms of §3.9 set their own `impact` on the hit -- and a pool
     # matching both gets both sentences -- so this entry is the fallback
@@ -535,6 +580,7 @@ SEVERITY = {
     "ccc-priority-starvation": "critical",
     "ccc-mixed-disk-generations": "critical",
     "ccc-hyperdisk-incompatible": "critical",
+    UNBACKED_MANUAL_FALLBACK: "major",
     "quota-exhaustion-risk": "critical",
     "single-zone-nodepool": "major",
     "reservation-mismatch-risk": "major",  # overridden to critical for a broken/bypassed binding
@@ -1272,6 +1318,158 @@ def check_ccc_hyperdisk_incompatible(cc: dict, uses_hyperdisk: bool) -> dict | N
     if incompatible:
         return {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"fallback includes Hyperdisk-incompatible families {sorted(incompatible)}"}
     return None
+
+
+def _manual_fallback_class(cc: dict) -> bool:
+    """§3.13's scope: node pool auto-creation is not on and the class lists a
+    rule to fall back to.
+
+    `is not True`, as `check_dangling_compute_class` reads the field: the CRD
+    defaults it to off. A class in Autopilot mode (`spec.autopilot.enabled`)
+    is out of scope: GKE creates its nodes, so it has no manual pool to lack.
+    """
+    spec = cc.get("spec") or {}
+    if (spec.get("nodePoolAutoCreation") or {}).get("enabled") is True or (spec.get("autopilot") or {}).get("enabled") is True:
+        return False
+    return len(spec.get("priorities") or []) >= MIN_RULES_WITH_A_FALLBACK
+
+
+def _class_pools(class_name: str, node_pools: list[dict]) -> list[dict]:
+    """The node pools that carry the class label."""
+    return [pool for pool in node_pools if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == class_name]
+
+
+def _cluster_default_class(cc: dict) -> bool:
+    """The class §3.13 leaves to the SOP's by-hand list. Where a cluster's
+    default-class setting is on, node pools serve the class named `default`
+    without the class label, and this collector does not read that setting."""
+    return (cc.get("metadata") or {}).get("name") == CLUSTER_DEFAULT_CLASS
+
+
+def _pool_family(machine_type: str) -> str:
+    """A pool's machine family. Compute Engine names an N1 custom type with no
+    family prefix (`custom-4-8192`) and the N1 shared-core types `f1-micro`
+    and `g1-small`; every other family leads its types (`n2-custom-4-8192`)."""
+    family = _priority_family({"machineType": machine_type})
+    return N1_FAMILY if family in N1_TYPE_PREFIXES else family
+
+
+def _rule_pools(rule: dict, class_name: str, node_pools: list[dict]) -> list[str] | None:
+    """The names of the node pools that back one priority rule, or None when
+    the rule names neither pools nor a machine, so the pool list cannot answer.
+
+    A `nodepools` rule is backed by a pool it names; one existing name is
+    enough. A `machineType` or `machineFamily` rule is backed by a pool that
+    carries the class label and has that type or family; a pool without the
+    label is not the class's.
+    """
+    named = rule.get("nodepools") or []
+    if named:
+        existing = {pool.get("name") for pool in node_pools}
+        return [pool_name for pool_name in named if pool_name in existing]
+    if _priority_names_no_machine(rule):
+        return None
+    own = [(pool.get("name") or "", (pool.get("config") or {}).get("machineType") or "") for pool in _class_pools(class_name, node_pools)]
+    if rule.get("machineType"):
+        return [pool_name for pool_name, machine_type in own if machine_type == rule["machineType"]]
+    return [pool_name for pool_name, machine_type in own if _pool_family(machine_type) == rule["machineFamily"]]
+
+
+def _and_list(parts: list[str]) -> str:
+    """`a`, `a and b`, `a, b and c`."""
+    if len(parts) <= 1:
+        return "".join(parts)
+    return f"{OPTION_LIST_SEPARATOR.join(parts[:-1])}{OPTION_LIST_LAST}{parts[-1]}"
+
+
+def _option_what(rule: dict) -> str:
+    """What one option asks for, as the finding names it: its node pools, its
+    machine type or its machine family; empty for a rule that names none."""
+    for field in RULE_LABEL_FIELDS:
+        if rule.get(field):
+            value = rule[field]
+            return OPTION_LIST_SEPARATOR.join(value) if isinstance(value, list) else str(value)
+    return ""
+
+
+def _options(positions: list[int], priorities: list[dict], pools_of: list[list[str] | None] | None = None) -> str:
+    """`option 1 (default-pool)`, `options 2 (n4) and 3 (c3)`: the options at
+    these 1-based places, each with what it asks for when it names something.
+    With `pools_of`, an option that names node pools shows the ones that
+    exist, not the names it lists."""
+    named = []
+    for position in positions:
+        rule = priorities[position - 1]
+        what = OPTION_LIST_SEPARATOR.join(pools_of[position - 1] or []) if pools_of and rule.get("nodepools") else _option_what(rule)
+        named.append(f"{position} ({what})" if what else str(position))
+    return f"{OPTION_NOUN[len(positions) > 1]} {_and_list(named)}"
+
+
+def _sentence_start(text: str) -> str:
+    """The text with its first letter in upper case and the rest as it is."""
+    return text[:1].upper() + text[1:]
+
+
+def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict | None:
+    """§3.13: a class in `_manual_fallback_class`'s scope with a priority rule
+    no node pool backs. GKE creates no pool for that rule, so the fallback the
+    class lists does not exist.
+
+    A rule `_rule_pools` cannot judge is neither counted as backed nor
+    flagged; the excerpt names it. The cluster default class is not judged
+    here (`_cluster_default_class`).
+
+    The excerpt is the finding's detail on the ledger, written for a reader
+    who does not know ComputeClasses: a priority rule is an "option".
+    """
+    if not _manual_fallback_class(cc) or _cluster_default_class(cc):
+        return None
+    name = cc["metadata"]["name"]
+    priorities = cc["spec"]["priorities"]
+    pools_of = [_rule_pools(rule, name, node_pools) for rule in priorities]
+    unbacked = [position for position, pools in enumerate(pools_of, 1) if pools == []]
+    backed = [position for position, pools in enumerate(pools_of, 1) if pools]
+    unjudged = [position for position, pools in enumerate(pools_of, 1) if pools is None]
+    if not unbacked:
+        return None
+    # An option that names node pools is not one GKE would create a pool for,
+    # so a missing named pool gets its own sentence.
+    named_missing = [position for position in unbacked if priorities[position - 1].get("nodepools")]
+    no_pool = [position for position in unbacked if position not in named_missing]
+    many = len(no_pool) > 1
+    all_checked = not unjudged
+    backing = list(dict.fromkeys(pool_name for position in backed for pool_name in pools_of[position - 1]))
+    # A node pool with the class's label that is behind no option. Pods may
+    # still run on it, so with one the detail says only what GKE does not do.
+    spare = [
+        (pool.get("name") or "", (pool.get("config") or {}).get("machineType") or "")
+        for pool in _class_pools(name, node_pools)
+        if pool.get("name") not in backing
+    ]
+    sentences = [OPTIONS_LISTED.format(count=len(priorities))]
+    if backed:
+        # "Only" speaks for every option, so it needs every option checked.
+        options_backed = _options(backed, priorities, pools_of)
+        template = ONLY_OPTIONS_BACKED if all_checked else OPTIONS_BACKED
+        sentences.append(template.format(options=options_backed if all_checked else _sentence_start(options_backed), have=HAVE[len(backed) > 1]))
+        if no_pool:
+            sentences.append(OPTIONS_UNBACKED.format(options=_sentence_start(_options(no_pool, priorities)), have=HAVE[many], them=THEM[many]))
+    elif no_pool:
+        sentences.append(NO_OPTION_BACKED.format(options=_sentence_start(_options(no_pool, priorities)), have=HAVE[many], them=THEM[many]))
+    if named_missing:
+        sentences.append(NAMED_POOLS_MISSING[len(named_missing) > 1].format(options=_sentence_start(_options(named_missing, priorities))))
+    if unjudged:
+        several = len(unjudged) > 1
+        sentences.append(OPTIONS_UNCHECKED.format(options=_sentence_start(_options(unjudged, priorities)), names=IT_NAMES[several]))
+    if spare:
+        pools = _and_list([f"{pool_name} ({machine_type})" if machine_type else pool_name for pool_name, machine_type in spare])
+        sentences.append(SPARE_POOLS[len(spare) > 1].format(pools=pools, options=NO_OPTION if all_checked else NO_CHECKED_OPTION))
+        sentences.append(NO_NODE_ADDED.format(options=_options(unbacked, priorities)))
+    elif all_checked:
+        # What follows for pods is said only where every option was checked:
+        # an option the pool list cannot answer may still place them.
+        sentences.append(POOLS_CANNOT_GROW.format(pools=_and_list(backing)) if backed else PODS_WAIT)
+    return {"object": f"ComputeClass/{name}", "excerpt": SENTENCE_SEPARATOR.join(sentences), "needs_triage": MANUAL_POOL_TRIAGE}
 
 
 def _reads_pool_labels(workload: dict, compute_classes_by_name: dict[str, dict]) -> bool:
@@ -2193,8 +2391,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
     # One record for the five kinds, as the one dump was: the two reads' command
     # lines, and a digest over both outputs.
+    class_read_command = f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}"
     dump_record = _record(
-        f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}; {paged_command_text(PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}",
+        f"{class_read_command}; {paged_command_text(PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}",
         Run(result.argv, 0, cc_result.stdout + "\n" + result.stdout, "", cc_result.duration_s + result.duration_s),
     )
 
@@ -2224,9 +2423,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     autopilot = bool(cluster.get("autopilot"))
     # Not attempted on Autopilot: `node-pools list` answers HTTP 400 there
     # ("Autopilot node pools cannot be accessed or modified"), so the record
-    # would be a guaranteed failure for a read whose only consumers -- §3.9's
-    # single-zone-nodepool and the node pool labels below -- cannot apply to a
-    # cluster with no user node pools anyway.
+    # would be a guaranteed failure for a read that has nothing to say there:
+    # §3.9's single-zone-nodepool and the node pool labels below need a user
+    # node pool, and §3.13 does not apply because GKE creates the nodes for
+    # every class.
     #
     # `pools_readable` rather than testing `node_pools` for emptiness. A read
     # that failed and a Standard cluster that genuinely holds no pools both
@@ -2355,6 +2555,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     span_decides: list[str] = []
     machine_unnamed: list[str] = []
     size_unknown: list[str] = []
+    manual_fallback_unread: list[str] = []
     for cc in compute_classes:
         cc_meta = cc.get("metadata") or {}
         # §3.2 and §3.10 do not flag non-production.
@@ -2387,6 +2588,13 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         for hit in [check_ccc_hyperdisk_incompatible(cc, cc_meta["name"] in cc_referenced_by_hyperdisk)]:
             if hit:
                 candidates.append(_emit("ccc-hyperdisk-incompatible", hit))
+        if pools_readable:
+            for hit in [check_ccc_unbacked_manual_fallback(cc, node_pools)]:
+                if hit:
+                    # The two reads the verdict rests on: the classes and the pool list.
+                    candidates.append(_emit(UNBACKED_MANUAL_FALLBACK, {**hit, "command": f"{class_read_command}; {pools_record['command']}"}))
+        elif not autopilot and _manual_fallback_class(cc) and not _cluster_default_class(cc):
+            manual_fallback_unread.append(f"ComputeClass/{cc_meta['name']}")
         if not non_production:
             for hit in [check_reservation_affinity(cc)]:
                 if hit:
@@ -2429,12 +2637,22 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 ),
             }
         )
+        not_applicable.append(
+            {
+                "check": UNBACKED_MANUAL_FALLBACK,
+                "reason": (
+                    "GKE Autopilot: GKE creates the nodes for every ComputeClass, "
+                    "so no machine option waits on a node pool."
+                ),
+            }
+        )
     elif pools_readable:
         # Recorded even when the cluster holds no pools. Zero pools is a real
         # answer to "is any pool single-zone" -- no -- and dropping the check
         # for it makes an empty Standard cluster indistinguishable from one
         # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
+        commands[UNBACKED_MANUAL_FALLBACK] = dump_record
         # The live backlog, read only where the check runs: one more
         # server-filtered read per cluster, Pending pods only.
         unschedulable_pods, backlog_failure = read_unschedulable_pods(run=run, env=env)
@@ -2499,6 +2717,19 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"run either, spot-scarcity-risk read no Spot node pool, and "
             f"reservation-mismatch-risk compared no node pool with the reservation it names"
         )
+        if manual_fallback_unread:
+            # No class in scope is an answer the dump alone gives; a class in
+            # scope needs the pools this read would have listed.
+            unevaluated[UNBACKED_MANUAL_FALLBACK] = (
+                f"{_and_list(manual_fallback_unread)} {LEAVE_AND_LIST[len(manual_fallback_unread) > 1]} machine options, "
+                f"and the node pools those options need were not read: {pools_failure}"
+            )
+            limitations.append(
+                f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {OPTION_LIST_SEPARATOR.join(manual_fallback_unread)}: "
+                f"the node pools were not read"
+            )
+        else:
+            commands[UNBACKED_MANUAL_FALLBACK] = dump_record
 
     if span_decides:
         # §3.1 with the zone span unread: these classes vary too few
