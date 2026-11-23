@@ -3,7 +3,6 @@ Subject: Roll a node pool back with clusters upgrade --node-pool
 Why: the troubleshooting reference rolls a node pool back with `gcloud container node-pools upgrade`, a command that does not exist; node pools upgrade through `clusters upgrade --node-pool`, as the skill's own runbook template says. The patch also adds the Standard-only qualifier.
 Local-Issue: none (#2353)
 Eval-Case: none (came with the migration to overlays, a byte-identical move)
-Upstream-Issue: none filed yet
 Retire-When: upstream's rollback uses `clusters upgrade --node-pool`
 
 diff --git a/references/troubleshooting.md b/references/troubleshooting.md

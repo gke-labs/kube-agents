@@ -123,10 +123,12 @@ better responsiveness, now free, because the cost is API calls rather than token
 
 A card is dispatched to a kanban worker, and a worker run is deliberately **not** a cron run
 (`deploy/docker/patches/cron_run_scope.py`). Anything keyed on cron context therefore does not reach
-the work the card produces — including `approvals.cron_mode` and the Tirith content scan that
-`deploy/docker/patches/cron_tirith_scan.py` splices inside `if _is_cron_approval_context():`. That
-patch's motivating example was precisely this issue-triage turn, whose input is text written by
-anyone with a GitHub account.
+the work the card produces — including `approvals.cron_mode` and the content scan that an image
+patch then spliced inside `if _is_cron_approval_context():`. That patch's motivating example was
+precisely this issue-triage turn, whose input is text written by anyone with a GitHub account. The
+image has since dropped that scan and the third-party scanner behind it; the measurements below
+are of the image named, and what still holds is that a worker takes the interactive branch, where
+a pattern-flagged command meets a prompt that nobody answers.
 
 Read from source alone, the approval gate looks like it falls through to `approved: True` for a
 worker run, with no content scan and no pattern check. Following the chain in the deployed image
@@ -144,11 +146,11 @@ The chain does not stop there. The worker is spawned as a `hermes -p <profile> c
 **subprocess**, so it enters `cli.py`'s `main()`, which sets `HERMES_INTERACTIVE=1` on its own
 environment unconditionally — there is no branch or early return between the top of `main()` and
 that assignment. `_is_interactive_cli()` is therefore true by the time any tool call is dispatched,
-`check_all_command_guards` takes the interactive branch, and the Tirith scan runs there. With no TTY
+`check_all_command_guards` takes the interactive branch, and the content scan ran there. With no TTY
 the approval prompt defaults to Deny, which makes a worker _more_ restrictive than a cron run, not
 less. Exercised in the pod against the profile's real config, both a homograph command and a
-plain-ASCII `curl … | sh` are blocked under `HERMES_INTERACTIVE=1` and under `HERMES_CRON_SESSION=1`,
-while a benign command is approved under both.
+plain-ASCII `curl … | sh` were blocked under `HERMES_INTERACTIVE=1` and under `HERMES_CRON_SESSION=1`,
+while a benign command was approved under both.
 
 Two things are worth keeping straight about how far that goes.
 

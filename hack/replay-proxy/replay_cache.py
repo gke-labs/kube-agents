@@ -18,8 +18,8 @@ a miss) and serves it in the shape an OpenAI-compatible client expects. The
 older layout, one `answers/<fingerprint>.json` per key, is still read: a key
 with no alternates serves that file as its one answer. The replay lane's
 download may write `weights/<fingerprint>.json` beside a key's alternates,
-how often passing runs produced each (AnswerCache.weights), which replay
-serves them in proportion to.
+how often graded runs produced each (AnswerCache.weights), which replay
+draws them in proportion to.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ CACHE_LAYOUT_PATTERN = (
     rf"|(?:{re.escape(VARIANTS_DIR)}|{re.escape(ALTS_DIR)})/{CACHE_HEX}{VARIANT_JOINER}{CACHE_HEX}{re.escape(JSON_SUFFIX)})\Z"
 )
 DISK_VARIANT_JOINER = "/"
-# How often passing runs produced each of a key's alternates,
+# How often graded runs produced each of a key's alternates,
 # weights/<fingerprint>.json holding {answer identity: count}: written only by
 # the replay lane's download (fetch_cache.py), never by record mode or the
 # publisher, so it is in the directory's layout (CACHE_REL_RE, what the lane
@@ -282,7 +282,7 @@ class AnswerCache:
         return []
 
     def weights(self, fingerprint: str) -> Dict[str, int]:
-        """How often passing runs produced each alternate of a fingerprint (weights/), by identity.
+        """How often graded runs produced each alternate of a fingerprint (weights/), by identity.
 
         Empty when there is no file or it is not a map; an entry that is not
         a positive integer is left out, and one above MAX_ANSWER_WEIGHT is

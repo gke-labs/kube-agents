@@ -404,6 +404,10 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 readonly PROFILES_NAMESPACE_SUFFIX="-profiles"
 readonly NAMESPACE_DELETION_JSONPATH='{.metadata.deletionTimestamp}'
 readonly PROFILES_NAMESPACE_DELETE_TIMEOUT="120s"
+# What the guard prints when that wait fails: each condition of the namespace
+# on a line. They name the kinds of objects that remain, with a count, and the
+# finalizers that hold it.
+readonly NAMESPACE_CONDITIONS_JSONPATH='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
 # The NATS StatefulSet the operator renders, and the claims its
 # volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
 # (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
@@ -770,6 +774,9 @@ readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
 # The tse AgentProfile's persona image (a2a/Dockerfile.persona-tse, context
 # agents/tse/persona), built the same way (#3842).
 readonly PERSONA_TSE_IMAGE_NAME="persona-tse"
+# The fleet-audit AgentProfile's persona image (a2a/Dockerfile.persona-fleet-audit,
+# context agents/fleet-audit/persona), built the same way (#5623).
+readonly PERSONA_FLEET_AUDIT_IMAGE_NAME="persona-fleet-audit"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -1712,9 +1719,11 @@ fi
 # session run sizes its session cap: fair (the default) gives it one session
 # per parallel conversation plus FRONT_DOOR_SESSION_HEADROOM, so the cap's
 # eviction (the gateway evicts the longest-idle pod at the cap, or refuses;
-# nothing queues) doesn't land on a multi-turn case between its turns; shipped
-# leaves the cap at the install default, what a customer install gets, and an
-# eviction or refusal there is a finding about that default.
+# with the session-cap queue (#6882), a turn waits in line instead, for up to
+# five minutes, before the refusal) doesn't land on a multi-turn case between
+# its turns; shipped leaves the cap at the install default, what a customer
+# install gets, and an eviction, a wait or a refusal there is a finding about
+# that default.
 EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
@@ -2000,6 +2009,7 @@ A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
 A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
 PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
 PERSONA_TSE_URI="${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}:${TAG}"
+PERSONA_FLEET_AUDIT_URI="${A2A_IMAGE_PREFIX}/${PERSONA_FLEET_AUDIT_IMAGE_NAME}:${TAG}"
 A2A_OPERATOR_ENV_ARGS=(
   --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
   --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -2047,6 +2057,10 @@ A2A_OPERATOR_ENV_ARGS=(
   --set-string "profiles.tse.persona.image.tag=${TAG}"
   --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
   --set-string "profiles.tse.harness.image.tag=${TAG}"
+  --set-string "profiles.fleetAudit.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_FLEET_AUDIT_IMAGE_NAME}"
+  --set-string "profiles.fleetAudit.persona.image.tag=${TAG}"
+  --set-string "profiles.fleetAudit.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+  --set-string "profiles.fleetAudit.harness.image.tag=${TAG}"
   # The A2A door, for the card-wait stopped ask (above).
   --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
   --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
@@ -2062,7 +2076,7 @@ A2A_OPERATOR_ENV_ARGS=(
 # a rebuild would not be grading the thing the release ships.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
-  echo "the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+  echo "the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster, tse and fleet-audit personas and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
 else
   STEP_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, sandbox, operator) ==="
@@ -2089,8 +2103,8 @@ else
   # The web console, built on every lane for the same reason: the deploy
   # installs it on every lane, at the reference section 2a gave the chart.
   WEB_CONSOLE_BUILD_SUBSTITUTIONS=",_WEB_CONSOLE_URI=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}:${TAG}"
-  A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI}"
-  echo "also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar"
+  A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI},_PERSONA_FLEET_AUDIT_URI=${PERSONA_FLEET_AUDIT_URI}"
+  echo "also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster, tse and fleet-audit personas and the Hermes bridge sidecar"
   REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
   if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
     REPLAY_SHADOW_BUILD_SUBSTITUTIONS=",_REPLAY_SHADOW_PROXY_URI=${REPLAY_SHADOW_PROXY_URI}"
@@ -2422,6 +2436,9 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     echo "The profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} is Terminating (since ${PROFILES_NAMESPACE_DELETING}); waiting up to ${PROFILES_NAMESPACE_DELETE_TIMEOUT} for it to go before install attempt ${attempt}."
     if ! kubectl wait --for=delete "namespace/${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --timeout="${PROFILES_NAMESPACE_DELETE_TIMEOUT}"; then
       echo "ERROR: the wait for the profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} to go failed (limit ${PROFILES_NAMESPACE_DELETE_TIMEOUT}; kubectl's line is above); install attempt ${attempt} would fail on it (#6602)." >&2
+      echo "The namespace's conditions:" >&2
+      kubectl get namespace "${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --ignore-not-found \
+        -o jsonpath="${NAMESPACE_CONDITIONS_JSONPATH}" >&2 || true
       rm -f "${HELM_INSTALL_OUT}"
       exit 1
     fi
@@ -3222,6 +3239,50 @@ echo "Front door: ${EVAL_FRONT_DOOR} (EVAL_FRONT_DOOR; session sizing ${EVAL_FRO
 # it later), and the compare reads a missing file as platform.
 mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
 echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+
+# verify_front_door checks the route the install resolved against the one the
+# switch asked for (#6942), so the record says which front door the run
+# graded rather than which it asked for. Today the operator's route is the
+# spec's (resolveA2ADefaultRoute), so a mismatch means the chart or the CR
+# lost the setting; once the operator's route can fall back from an explicit
+# `session` (the session cap's guards in #6487), it also catches a run that
+# asked for session and would grade platform. It reads the
+# A2A_DEFAULT_ADDRESSEE the operator rendered on the gateway's pod template,
+# retrying a read that fails as the bridge's template read does, rewrites
+# front-door.txt with both routes, and fails the deploy on a mismatch or a
+# route it can't read.
+verify_front_door() {
+  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved="" out errfile attempt
+  # kubectl's stderr goes to its own file, never into the value parsed: a read
+  # that succeeds with a warning on stderr still yields the route. An empty
+  # read is retried as a failed one is.
+  errfile="$(mktemp)"
+  for ((attempt = 1; attempt <= BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
+    if out="$(kubectl get "${gateway}" -n "${NAMESPACE}" \
+      -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>"${errfile}")"; then
+      resolved="$(awk 'NF { print; exit }' <<<"${out}")"
+      if [ -n "${resolved}" ]; then
+        break
+      fi
+      echo "front door: ${gateway} has no A2A_DEFAULT_ADDRESSEE yet (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS})" >&2
+    else
+      echo "front door: reading ${gateway} failed (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS}): $(cat "${errfile}")" >&2
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  rm -f "${errfile}"
+  printf 'requested=%s\nresolved=%s\n' "${EVAL_FRONT_DOOR}" "${resolved:-unknown}" \
+    >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+  if [ -z "${resolved}" ]; then
+    echo "ERROR: front door: could not read A2A_DEFAULT_ADDRESSEE on ${gateway}, so the route this install resolved is unknown; EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}." >&2
+    return 1
+  fi
+  if [ "${resolved}" != "${EVAL_FRONT_DOOR}" ]; then
+    echo "ERROR: front door: EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}, but the install resolved ${resolved} (A2A_DEFAULT_ADDRESSEE on ${gateway}); the run would grade the ${resolved} route. Check spec.harness.tuning.defaultRoute on the PlatformAgent, and the operator's conditions for a route it held back." >&2
+    return 1
+  fi
+  echo "✓ front door: the install resolved ${resolved}, as EVAL_FRONT_DOOR asked"
+}
 if [ -z "${MODE_NEXT_MAX_SESSIONS}" ]; then
   echo "spec.harness.tuning.maxSessions: not set (EVAL_FRONT_DOOR_SESSIONS=shipped); the install default applies, and the provision sizes TASKS for it"
 elif [ "${EVAL_FRONT_DOOR}" = "session" ]; then
@@ -3328,6 +3389,13 @@ gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
 # has rolled for the bridge by now, and the CR stays out of Degraded with
 # the console on.
 gate_web_console
+
+# The route the install resolved, against the one asked for (#6942): after the
+# gates, so the gateway's rendered env is the one the eval will run against.
+if ! verify_front_door; then
+  report_cr_status "front-door-mismatch"
+  exit 1
+fi
 
 # What the run has to show for itself, for the artifact log: the CR status,
 # the A2A stack, the ungated gateway, and the entrypoint's

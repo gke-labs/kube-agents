@@ -10,6 +10,7 @@ import os
 from dataclasses import replace
 import queue
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -111,6 +112,27 @@ _STATE_DB_FD_SUFFIXES = ("state.db", "state.db-wal", "state.db-shm")
 
 # The process's own descriptor table, one symlink per open descriptor.
 _SELF_FD_DIR = Path("/proc/self/fd")
+
+
+def _a_half_closed_peer_reports_a_hang_up() -> bool:
+    """Whether this kernel reports POLLHUP on a socket whose peer shut only its
+    writing half. Linux does not; macOS does."""
+    ours, theirs = socket.socketpair()
+    try:
+        theirs.shutdown(socket.SHUT_WR)
+        poller = select.poll()
+        poller.register(ours, select.POLLIN)
+        return any(events & select.POLLHUP for _, events in poller.poll(0))
+    finally:
+        ours.close()
+        theirs.close()
+
+
+_NEEDS_NO_HANG_UP_FOR_A_HALF_CLOSED_PEER = (
+    "needs a kernel that reports no POLLHUP for a peer that shut only its writing half, as "
+    "Linux does: the broker reads POLLHUP as a caller that is gone, and the test shows that "
+    "the command of a half-closed caller runs to its end"
+)
 
 # A state.db busy timeout short enough to wait out inside a test, in seconds.
 # The lookup reads it from the module at call time, so patching it reaches the
@@ -2419,7 +2441,13 @@ class GitHardeningTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(seed_work), "push", "origin", "release-trunk"], check=True, capture_output=True)
 
         clone_dir = Path(executor.workspace_dir) / "clone_trunk"
-        subprocess.run(["git", "clone", str(bare_remote), str(clone_dir)], check=True, capture_output=True)
+        # The files ref format: the broker reads refs/remotes/origin/HEAD as a file, and a
+        # git whose default is reftable keeps no such file (#6593 is the broker's gap).
+        # The variable wins over the host's config and environment; an older git ignores it.
+        subprocess.run(
+            ["git", "clone", str(bare_remote), str(clone_dir)],
+            check=True, capture_output=True, env={**os.environ, "GIT_DEFAULT_REF_FORMAT": "files"},
+        )
         # Push to release-trunk is detected and refused as a protected rollout/base branch even without lease checks
         executor.require_git_lease = False
         v = executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
@@ -5502,7 +5530,7 @@ class CommandExecutorTest(unittest.TestCase):
         # bytes captured, so it never exceeds the cap.
         executor = self.fake_kubectl(
             self.executor(max_output_bytes=4096),
-            body="head -c 100000 /dev/zero | tr '\\0' '\\377'",
+            body="head -c 100000 /dev/zero | LC_ALL=C tr '\\0' '\\377'",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
@@ -5545,7 +5573,9 @@ class CommandExecutorTest(unittest.TestCase):
         # decoded text's UTF-8 size, not only on the bytes captured.
         executor = self.fake_kubectl(
             self.executor(max_output_bytes=64 << 10),
-            body="head -c 200000 /dev/zero | tr '\\0' '\\377'",
+            # LC_ALL=C: in a UTF-8 locale the tr of macOS writes \377 as the two bytes of
+            # U+00FF, which is valid UTF-8.
+            body="head -c 200000 /dev/zero | LC_ALL=C tr '\\0' '\\377'",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
@@ -6037,10 +6067,15 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertEqual("done\n", result.stdout)
 
+    # Never on Linux, where the broker runs: there the test must run.
+    @unittest.skipIf(
+        sys.platform != "linux" and _a_half_closed_peer_reports_a_hang_up(),
+        _NEEDS_NO_HANG_UP_FOR_A_HALF_CLOSED_PEER,
+    )
     def test_a_half_closed_caller_is_not_taken_for_a_hang_up(self):
         # A peer that shut its writing half after the request is still there,
         # waiting for the response; it reads as EOF, and EOF alone must not
-        # end its command. Only a peer that closed for good reports POLLHUP.
+        # end its command. On Linux only a peer that closed for good reports POLLHUP.
         executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
         ours, theirs = socket.socketpair()
         self.addCleanup(ours.close)
@@ -12411,8 +12446,8 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "proposal-reviews", "proposal-claim", "issue-list", "issue-view", "branch-view",
-             "revision-contains"},
+             "proposal-commits", "proposal-reviews", "proposal-closer", "proposal-claim",
+             "issue-list", "issue-view", "branch-view", "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -13641,6 +13676,29 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
         with mock.patch.object(credential_proxy.urllib.request, "urlopen", explode):
             with self.assertRaises(credential_proxy.AuthenticationError):
                 authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_an_answer_that_is_not_http_is_a_rejection_not_a_dropped_connection(self):
+        # An error of `http.client` is not an `OSError`. One that leaves `_review`
+        # ends the caller's request with no answer, where the caller is owed a 401.
+        class CutShort(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"status":')
+
+        for label, answer in (
+            ("a status line that is not HTTP", http.client.BadStatusLine("garbage")),
+            ("a body that ends early", [CutShort()]),
+        ):
+            with self.subTest(label):
+                # `urlopen` goes through an opener's `open` too, so this stands in for both.
+                with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=answer):
+                    with self.assertRaises(credential_proxy.AuthenticationError):
+                        self._authenticator().authenticate(self._headers("Bearer agent-token"))
 
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
@@ -19240,6 +19298,32 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(self.upstream_requests))
 
+    def test_the_get_credentials_check_is_refused_for_a_held_cluster(self):
+        # spec.hold answers on the same route, under its own rule, and
+        # the cluster's describe without the header stays a control-plane read.
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "scope.json").write_text("{}", encoding="utf-8")
+        (directory / "hold.json").write_text(json.dumps({"clusters": [
+            {"projectId": "acme-prod", "location": "us-central1", "clusterName": "paused"}], "reason": "INC-9"}),
+            encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(directory / "scope.json"),
+            holds=scope_exclude.Holds(path=lambda: str(directory / "hold.json")),
+        )
+        self.reply["body"] = b'{"name":"paused","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="paused"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, body["rule"])
+        self.assertIn("INC-9", body["message"])
+        self.assertEqual([], self.upstream_requests)
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="paused"))
+        self.assertEqual(200, status)
+
     def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
         self._exclude("acme-prod", "us-central1", "secret-cluster")
         self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
@@ -22950,6 +23034,44 @@ class ExcludedClusterPathTest(unittest.TestCase):
                 result = executor.execute(["kubectl", "get", "pods"])
                 self.assertNotIn("ExcludedCluster", result.stderr)
 
+    def hold(self, document):
+        """Rewrite hold.json, as an edit to spec.hold lands in its ConfigMap mount."""
+        text = json.dumps(document)
+        self.hold_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(text)
+        os.utime(self.hold_file, ns=(stamp, stamp))
+
+    def held_executor(self):
+        import scope_exclude
+
+        self.hold_file = Path(self.temp_dir.name) / "hold.json"
+        executor = self.executor()
+        executor.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(self.scope_file), holds=scope_exclude.Holds(path=lambda: str(self.hold_file)))
+        return executor
+
+    def test_a_held_cluster_is_refused_until_the_hold_is_lifted_and_its_describe_stays_allowed(self):
+        import scope_exclude
+
+        executor = self.held_executor()
+        self.hold({"clusters": [{"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": self.EXCLUDED}],
+                   "reason": "INC-7"})
+        for call in (
+            lambda: executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)),
+            lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True),
+        ):
+            with self.assertRaises(scope_exclude.HeldCluster) as caught:
+                call()
+            self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, caught.exception.rule)
+            self.assertIn("INC-7", str(caught.exception))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.hold({})
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+
     def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
         """Control-plane reads are the project's, and stay allowed."""
         self.exclude(self.EXCLUDED)
@@ -22957,6 +23079,253 @@ class ExcludedClusterPathTest(unittest.TestCase):
         result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
                                    f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
         self.assertEqual(0, result.exit_code, result.stderr)
+
+
+class DecisionMemoryChecksMetricTest(unittest.TestCase):
+    """`build_vcs_broker(..., metrics=...)` records Stage B OKF verdicts only for repos with knowledge."""
+
+    REPOSITORY = "https://local.test/acme/infra"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        self.bare = self.base / "remotes" / "acme" / "infra"
+        self.bare.parent.mkdir(parents=True, exist_ok=True)
+        self._git(self.base, "init", "--bare", "--initial-branch=main", str(self.bare))
+        self.seed = self.base / "seed"
+        self._git(self.base, "clone", "--quiet", str(self.bare), str(self.seed))
+        self._git(self.seed, "checkout", "-B", "main")
+        (self.seed / "README.md").write_text("seed\n", encoding="utf-8")
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "initial commit")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+    def _git(self, cwd: Path, *args: str, env_override: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env = {**self.git_env, **(env_override or {})}
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+
+    def _make_broker(self, metrics: credential_proxy.ProxyMetrics, *, pinned_bases=None):
+        state_dir = self.base / f"state-{len(pinned_bases or {})}"
+        executor = CommandExecutor(
+            timeout_seconds=15,
+            max_output_bytes=1 << 20,
+            state_dir=str(state_dir),
+        )
+        executor.environment["GIT_ALLOW_PROTOCOL"] = "https:file"
+        with mock.patch.object(credential_proxy, "warn_on_credential_reach"):
+            broker = credential_proxy.build_vcs_broker(
+                executor,
+                pinned_bases=pinned_bases,
+                metrics=metrics,
+            )
+
+        class _LocalForge(providers.Forge):
+            name = "local"
+            hosts = ("local.test",)
+
+            def __init__(self, remote_root: Path):
+                super().__init__()
+                self.remote_root = remote_root
+                self.credential = mock.Mock()
+                self.credential.git_config.return_value = ()
+                self.credential.headers.return_value = {}
+
+            @classmethod
+            def for_config(cls, config):
+                return ()
+
+            def parse(self, url: str) -> str:
+                return "/".join(providers.repo_segments(url, self.hosts))
+
+            def clone_url(self, repo: str) -> str:
+                return str(self.remote_root / repo)
+
+        broker.registry.hosts["local.test"] = _LocalForge(self.base / "remotes")
+        return broker
+
+    def _bundle_change(self, broker, name: str, branch: str, files: dict[str, str], *, commit_email: str = "kube-agents@users.noreply.invalid"):
+        cloned = broker.clone({"repository": self.REPOSITORY})
+        work = self.base / name
+        bundle_in = self.base / f"{name}-in.bundle"
+        bundle_in.write_bytes(base64.b64decode(cloned["bundleBase64"]))
+        self._git(self.base, "clone", "--quiet", "--branch", cloned["branch"], str(bundle_in), str(work))
+        self._git(work, "checkout", "--quiet", "-b", branch)
+        for rel, content in files.items():
+            dest = work / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        self._git(work, "add", "-A")
+        self._git(
+            work,
+            "commit",
+            "--quiet",
+            "-m",
+            f"change {name}",
+            env_override={"GIT_AUTHOR_EMAIL": commit_email, "GIT_COMMITTER_EMAIL": commit_email},
+        )
+        out_bundle = self.base / f"{name}-out.bundle"
+        self._git(work, "bundle", "create", str(out_bundle), f"{cloned['revision']}..refs/heads/{branch}")
+        return {
+            "repository": self.REPOSITORY,
+            "branch": branch,
+            "target": "main",
+            "baseRevision": cloned["revision"],
+            "bundleBase64": base64.b64encode(out_bundle.read_bytes()).decode("ascii"),
+        }
+
+    def _post_publish(self, broker, metrics: credential_proxy.ProxyMetrics, payload: dict):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/publish"
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:shell", uid="u", groups=(), role=credential_proxy.CALLER_ROLE_SHELL
+        )
+        handler.metrics = metrics
+        handler.max_request_bytes = 1 << 20
+        handler.replies = []
+        handler._json = lambda status, body: handler.replies.append((status, body))
+        handler._request_slot = contextlib.nullcontext
+        handler._repository_is_permitted = lambda repository, forge: True
+        handler.vcs = broker
+        encoded = json.dumps(payload).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        with mock.patch.object(vcs_broker, "write_mode", return_value=("propose", "propose")):
+            handler._handle_vcs_post()
+        return handler.replies[0]
+
+    def test_publish_records_allow_warn_block_and_error_verdicts_only_when_knowledge_exists(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+
+        # 0. Repo without knowledge/ or .kube-agents/intent.yaml -> allow stays 0.
+        payload_nok = self._bundle_change(broker, "nok", "platform-agent/nok", {"docs.txt": "plain\n"})
+        status0, body0 = self._post_publish(broker, metrics, payload_nok)
+        self.assertEqual(status0, HTTPStatus.OK, body0)
+        self.assertNotIn(f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{', metrics.render())
+
+        # Seed knowledge/ decisions (active block + proposed warn) on main.
+        dec_dir = self.seed / "knowledge" / "decisions"
+        dec_dir.mkdir(parents=True, exist_ok=True)
+        (dec_dir / "DEC-2026-001.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-001\n"
+            "title: Keep checkout memory >= 1Gi\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/prod/*.yaml\n"
+            "guard:\n  rule: memory >= 1Gi\n  severity: block\n  expect:\n"
+            "    file: clusters/prod/*.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: \">=\"\n"
+            "    value: 1Gi\n"
+            "---\n\nKeep memory >= 1Gi.\n",
+            encoding="utf-8",
+        )
+        (dec_dir / "DEC-2026-002.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-002\n"
+            "title: Keep staging replicas >= 2\n"
+            "status: proposed\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/staging/*.yaml\n"
+            "guard:\n  rule: replicas >= 2\n  severity: warn\n  expect:\n"
+            "    file: clusters/staging/*.yaml\n"
+            "    path: spec.replicas\n"
+            "    op: \">=\"\n"
+            "    value: 2\n"
+            "---\n\nKeep staging replicas >= 2.\n",
+            encoding="utf-8",
+        )
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "seed knowledge rules")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+        # 1. Clean publish on repo with knowledge/ -> allow
+        payload_allow = self._bundle_change(broker, "allow", "platform-agent/allow", {"notes.txt": "ok\n"})
+        status1, _ = self._post_publish(broker, metrics, payload_allow)
+        self.assertEqual(status1, HTTPStatus.OK)
+
+        # 2. Proposed rule warning -> warn
+        payload_warn = self._bundle_change(
+            broker,
+            "warn",
+            "platform-agent/warn",
+            {"clusters/staging/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 1\n"},
+        )
+        status2, body2 = self._post_publish(broker, metrics, payload_warn)
+        self.assertEqual(status2, HTTPStatus.OK)
+        self.assertIn("DEC-2026-002", body2.get("decisionMemoryMarkdown", ""))
+
+        # 3. Active block rule -> block (409)
+        payload_block = self._bundle_change(
+            broker,
+            "block",
+            "platform-agent/block",
+            {
+                "clusters/prod/checkout.yaml": (
+                    "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n"
+                    "      containers:\n      - name: checkout\n        resources:\n          requests:\n            memory: 256Mi\n"
+                )
+            },
+        )
+        status3, body3 = self._post_publish(broker, metrics, payload_block)
+        self.assertEqual(status3, HTTPStatus.CONFLICT)
+        self.assertEqual(body3.get("code"), vcs_broker.DECISION_MEMORY_BLOCKED)
+
+        # 4. Unresolvable base branch for Decision Memory guard -> error (502)
+        payload_err = self._bundle_change(broker, "err", "platform-agent/err", {"notes2.txt": "err\n"})
+        bad_broker = self._make_broker(metrics)
+        bad_broker._default_branch_of_remote = lambda *_a, **_kw: ""
+        status4, body4 = self._post_publish(bad_broker, metrics, payload_err)
+        self.assertEqual(status4, HTTPStatus.BAD_GATEWAY, body4)
+        self.assertEqual(body4.get("code"), vcs_broker.DECISION_MEMORY_CHECK_FAILED)
+
+        # 5. Non-DM error (NOT_FAST_FORWARD) -> does not change counters
+        bad_ff = dict(payload_allow, baseRevision="0" * 40)
+        status5, body5 = self._post_publish(broker, metrics, bad_ff)
+        self.assertEqual(status5, HTTPStatus.CONFLICT)
+        self.assertEqual(body5.get("code"), "NOT_FAST_FORWARD")
+
+        rendered = metrics.render()
+        for verdict in ("allow", "warn", "block", "error"):
+            self.assertIn(
+                f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{verdict="{verdict}"}} 1',
+                rendered,
+            )
+
+    def test_build_vcs_broker_refuses_spoofed_commit_email_over_http(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+        spoofed = self._bundle_change(
+            broker,
+            "spoof",
+            "platform-agent/spoof",
+            {"notes.txt": "spoofed\n"},
+            commit_email="reviewer@company.com",
+        )
+        status, body = self._post_publish(broker, metrics, spoofed)
+        self.assertEqual(status, HTTPStatus.FORBIDDEN, body)
+        self.assertEqual(body.get("code"), "FORBIDDEN_COMMIT_IDENTITY")
+        self.assertIn("reviewer@company.com", body.get("error", ""))
 
 
 if __name__ == "__main__":

@@ -66,6 +66,10 @@ ANSWER_HASH = "answer_hash"
 # In record mode: replay_cache.stored_hash of the answer as it would be saved,
 # on every line with an answer, saved or not: the name of its alternate.
 STORED_ANSWER_HASH = "stored_answer_hash"
+# On a line the model answered (not a served one): the response's raw
+# finish_reason, null when it named none, so cut-off and filtered replies can be
+# counted from the lines.
+FINISH_REASON = "finish_reason"
 # Why replay would not have saved the answer; empty on a served line, whose
 # answer is a saved one and is never judged as a new one.
 UNSTORABLE = "unstorable"
@@ -98,6 +102,11 @@ UNSTORABLE_OBSERVE_TOO_LARGE = "observe_too_large"
 UNSTORABLE_UPSTREAM_INCOMPLETE = "upstream_incomplete"
 UNSTORABLE_CLIENT_DISCONNECTED = "client_disconnected"
 UNSTORABLE_NO_ANSWER = "no_answer"
+# The response names a finish_reason other than `stop` or `tool_calls`
+# (replay_proxy.STORABLE_FINISH_REASONS): cut off at the token limit
+# (`length`), filtered (`content_filter`), a reply the model did not finish.
+# A response naming none is stored, served as `stop`.
+UNSTORABLE_UNFINISHED = "unfinished_reply"
 UNSTORABLE_NO_MODEL_GROUP = "no_model_group_header"
 UNSTORABLE_OTHER_MODEL_GROUP = "answered_by_other_model_group"
 UNSTORABLE_FALLBACK = "fallback_attempted"
@@ -158,19 +167,23 @@ VIA_ANSWER_SLOTS = "answer_slots"
 # On a served line: which of the key's saved answers was served (the
 # alternate's name, the STORED_ANSWER_HASH of the line that saved it; empty for the
 # older layout's single answer), and how
-# many answers the key had. Replay hands a key's answers out in turn, by weight.
+# many answers the key had. Replay picks among a key's answers by a seeded weighted draw.
 SERVED_ALTERNATE = "served_alternate"
 ALTERNATES = "alternates"
 # On a served line: the key the answer was served from, its own FINGERPRINT on
 # an exact hit and the slot's key on an answer_slots hit; the key whose
 # answers SERVED_ALTERNATE and ALTERNATES count.
 SERVED_KEY = "served_key"
-# On a served line: the served answer's weight, how often passing runs
+# On a served line: the served answer's weight, how often graded runs
 # produced it (1 when the replay cache gave no count), and the sum over the
-# key's answers. Replay serves each answer in proportion to its weight, so over
-# a key's lookups an answer's share is about SERVED_WEIGHT / ALTERNATES_WEIGHT.
+# key's answers. Replay draws each answer in proportion to its weight, so over
+# many lookups an answer's share is about SERVED_WEIGHT / ALTERNATES_WEIGHT.
 SERVED_WEIGHT = "served_weight"
 ALTERNATES_WEIGHT = "alternates_weight"
+# On a served line: what seeded the draw (replay_proxy.SEED_EVAL_RUN, the
+# request's eval run tag, the key and the pod's count of that pair's lookups;
+# replay_proxy.SEED_TURN, the key and the pod's count of untagged lookups of it).
+SERVED_SEED = "served_seed"
 # In record mode: whether this request's answer was saved (false when the same
 # answer to the key was already saved, or the answer was unstorable).
 RECORDED = "recorded"

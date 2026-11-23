@@ -1975,6 +1975,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(a["status"], "ready")
         self.assertEqual(a["webhooks"]["blocking"], [])
         self.assertEqual(a["webhooks"]["evaluated"], 1)
+        self.assertEqual([f["webhook"] for f in a["webhooks"]["answered"]], ["healthy-gate/ok.example.com"])
         self.assertEqual(a["webhooks"]["fail_open"], 1)
         self.assertEqual(a["skew"]["pools"][0]["verdict"], "ok")
         self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})

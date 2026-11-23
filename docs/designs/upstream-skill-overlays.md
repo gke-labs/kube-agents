@@ -119,7 +119,6 @@ Why: the platform persona proposes a fix in its reply unless asked to
 submit it (SOUL.md §3, item 3); upstream opens a PR on every crashloop walk.
 Local-Issue: #2037
 Eval-Case: none (came with the migration to overlays, a byte-identical move)
-Upstream-Issue: none (specific to this repository)
 Retire-When: never; the persona rule is ours
 
 diff --git a/SKILL.md b/SKILL.md
@@ -133,6 +132,14 @@ diff --git a/SKILL.md b/SKILL.md
 +    "open a PR", a card whose task says so), check whether a branch or Pull
  ...
 ```
+
+The `Retire-When:` line is the one decision line of the header. It occurs one time, and its first word says if `google/skills` must carry the fix. Only `upstream` says yes.
+
+| Form                             | Meaning                                                                                      |
+| -------------------------------- | -------------------------------------------------------------------------------------------- |
+| `Retire-When: never; <reason>`   | Specific to this repository. The patch stays.                                                |
+| `Retire-When: local <change>`    | Specific to this repository. A change in this repository retires the patch.                  |
+| `Retire-When: upstream <change>` | General. That upstream change retires the patch. `upstream's` also passes as the first word. |
 
 ### Patch order
 
@@ -188,7 +195,7 @@ How a sync works, in a scratch repository so the working tree changes only when 
 2. Commit the new upstream copy on a separate branch from the same root.
 3. Rebase the patch commits onto the new upstream copy with `git rebase --empty=drop`.
 4. Write the new upstream copy and `upstream.lock`, re-export the surviving commits as the patch files, and regenerate the skill.
-5. Report each patch dropped as empty (retired), and each `append.md` whose text the new upstream copy already contains, for a person to delete. The sync PR lists retired patches with their `Why:`, so a reviewer sees what upstream adopted and can restore a patch from history if upstream later reverts it; a retired patch whose `Retire-When:` says never deserves a second look.
+5. Report each patch dropped as empty (retired), and each `append.md` whose text the new upstream copy already contains, for a person to delete. The sync PR lists retired patches with their `Why:`, so a reviewer sees what upstream adopted and can restore a patch from history if upstream later reverts it; a retired patch whose `Retire-When:` line starts with `never;` or `local` deserves a second look.
 
 - The scratch repository lives in a git-ignored `.skill-sync/<skill>/` until the sync finishes. The sync goes one patch at a time, like a git rebase: when a patch stops, the person running the sync fixes the conflicted text there and runs `make skills-continue SKILL=<skill>`, which rewrites that patch in place (same file, number and `Why:`) and moves on to the next.
 - A patch is deleted only when upstream adopted it exactly (retired automatically) or the person resolving a conflict decides upstream's new version makes it unnecessary.
@@ -262,11 +269,11 @@ flowchart LR
 - Any automatic rule would pick a side and silently drop either our correction or upstream's improvement, so the decision stays with a person and everything around it is automated.
 - An AI assistant can propose the resolution: it reads the stopped patch's `Why:` header, upstream's change and the conflicting lines, and suggests the merged text, which a person reviews and commits as the patch's new content. The patch stays a plain diff; AI helps only at conflict time.
 - Every sync PR comes with an eval-driven development record (`.agents/rules/eval_driven_development.md`): a case that fails on `main` for the reason the sync addresses, then passes three times with the sync, registered in the nightly roster. See [Eval evidence for syncs and patches](#eval-evidence-for-syncs-and-patches).
-- Upstreaming shrinks the work: a general fix (the NetworkPolicy two-step, the `answer_query` quota) is filed as a `google/skills` issue and recorded in `Upstream-Issue:`; once upstream carries it, the next sync reports it retired.
+- Upstreaming shrinks the work: a general fix (the NetworkPolicy two-step, the `answer_query` quota) has `Retire-When: upstream <change>` and is filed as a `google/skills` issue; once upstream carries it, the next sync reports it retired.
 
 ### The presubmit check
 
-- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte. It also fails a patch whose `Eval-Case:` header line is missing, empty or starts with `TODO`. An id in that line must be a case folder in `bench/tasks/`. The same target also fails any shipped skill document over 40,000 characters (`scripts/check_skill_size.py`), a mirrored skill included.
+- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte. It also fails a patch whose `Eval-Case:` header line is missing, empty or starts with `TODO`. An id in that line must be a case folder in `bench/tasks/`. It fails a patch whose `Retire-When:` line is missing, occurs two times or has none of the three forms, and a patch that has an `Upstream-Issue:` line, which the header no longer carries. One run reports all the header failures of a skill. The same target also fails any shipped skill document over 40,000 characters (`scripts/check_skill_size.py`), a mirrored skill included.
 - Reads only committed files: no network, so it cannot fail because GitHub is slow.
 - Patches are refreshed on every sync, so the check applies them without merging; a patch that needs a merge to apply is itself a failure.
 
@@ -343,6 +350,8 @@ What `make skills-check` reports when a step is skipped:
 | A patch no longer applies (an earlier patch it depends on was deleted, or a hand edit clashes) | the overlay cannot be applied in filename order   | delete it too, regenerate, then redo its edit with `make skills-refresh` |
 | A patch's `Eval-Case:` line is missing or was not filled in                                    | no such line, or one that is empty or `TODO`      | name the pull request's case(s), or `none (<reason>)`                    |
 | An `Eval-Case:` id is mistyped, its case was renamed or removed, or `none` has no reason       | the value names no folder in `bench/tasks/`       | name the case's folder, or `none (<reason>)`                             |
+| A patch's `Retire-When:` line is missing, was not filled in, or has a different first word     | no line, two lines, or none of the three forms    | write one line in one of the three forms                                 |
+| A patch has an `Upstream-Issue:` line                                                          | the line that `Retire-When:` replaced             | delete the line                                                          |
 
 ### Skills this repository writes
 
@@ -424,7 +433,6 @@ PR 3 rewrites the `AGENTS.md` Skills Guidelines line for the overlay. PR 4 also 
 - The `skill_sync` source in `tests/conformance/_harness.py` and its C4 test, repointed at the new script; the test stops being a known violation.
 - The Cluster Agent's `gke-workload-security` check, moved from the old script's tests to `tests/test_skill_content.py`.
 - The `Makefile` shellcheck comment and `.prettierignore`.
-- The message in `deploy/docker/check_skill_commands.py`.
 - Comments in two bench tasks, `agents/platform/scripts/gke_endpoint.py` and `scripts/skill_overlay.py`, and the `edit-mirrored-skill` skill.
 - The marker line in the five footers names the old script. Migration keeps it verbatim in `append.md` so the generated tree stays byte-identical; a follow-up rewords it.
 

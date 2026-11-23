@@ -3,7 +3,6 @@ Subject: Route Helm charts to gitops-helm-chart instead of helm
 Why: the agent's shell holds no cluster credential and reaches no chart repository, so a helm install or upgrade it is told to run fails, and the next move observed was asking the broker for an access token to hand to helm. A chart change here goes into the GitOps repository as a pull request through gitops-helm-chart, a skill this repository has and upstream does not, so the helm lines and the table's Helm mentions are replaced with that route.
 Local-Issue: #2938
 Eval-Case: helm-chart-no-reconciler-stops
-Upstream-Issue: none (specific to this repository)
 Retire-When: never; gitops-helm-chart is this repository's skill and the read-only shell is this repository's design
 
 diff --git a/references/cli-reference.md b/references/cli-reference.md

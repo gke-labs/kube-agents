@@ -1,8 +1,8 @@
 # k8s-api-proxy
 
 The Kubernetes API proxy for the agent sandbox and A2A session pods (`<agent>-kube-proxy` deployment). Each caller's
-`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
-authenticates the caller (a `CallerAuthenticator`; the binary uses `pkg/tokenreview`), applies a per-request policy
+`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...` by default, without `--upstream-url`), and the proxy
+authenticates the caller (a `CallerAuthenticator`; the binary defaults to `pkg/tokenreview`), applies a per-request policy
 (`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
 caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), impersonation,
 `Audit-ID` and `Connection`-named headers (`pkg/k8sapiproxy/headers.go`), forwards the request to
@@ -11,7 +11,7 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
 `cmd/k8s-api-proxy` builds the production server binary.
 
-`tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's `CallerAuthenticator`: it accepts a bearer token
+`tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
@@ -28,9 +28,11 @@ ten seconds whether or not the fetch succeeds, so a rotated key works without a 
 library cannot use (an unsupported type, an encryption key) are skipped. A key set that cannot be
 fetched is a 503, except that a key already cached keeps verifying for up to six hours past the
 set's expiry.
+`Config.CAFile` names a PEM bundle of the roots the key set's server is verified against
+instead of the system roots; it is re-read when it changes, like the server certificate below, and
+the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
 
-`pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
-`gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
+`upstream.Transport` (`upstream.New`, distinct from `upstream.StaticTransport` below) sends `in-cluster`, and the proxy's `--host-cluster-id` `gke_` cluster, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
 Application Default Credentials): it describes the cluster through the Container API and picks its
 endpoint by rules 1, 2 and 4 of
@@ -92,6 +94,20 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
+and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
+empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
+give its path to both flags. Files without a matching certificate and key stop the proxy at
+startup. The files are reloaded
+without a restart (`pkg/certreload`): at most once a second, a TLS handshake checks their size,
+modification time, device and inode (so a Secret or projected volume's `..data` symlink swap is
+seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
+not load, such as one read mid-rotation, is logged, counted in
+`kubeagents_kube_proxy_certificate_reload_failures_total`, and the last good certificate keeps
+being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
+`Transport` verifies each new connection against the current bundle, with hostname and IP SAN
+checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
+
 Cached responses and coalesced fetches are shared across callers, which is safe while the
 `UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
 transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
@@ -108,6 +124,22 @@ archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` 
 archive was built for; the `kube-proxy` image prints the commit it was built from, and a local build
 prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
 it carry none.
+
+For standalone sidecar or loopback bridge deployments outside a host cluster, `cmd/k8s-api-proxy`
+provides three opt-in flags. `--auth-mode=none` (`KUBE_PROXY_AUTH_MODE`; default `token-review`)
+skips `TokenReview` setup, records `caller_username` as `unauthenticated`, logs a startup warning,
+and rejects `--allowed-callers`, `CREDENTIAL_PROXY_SESSION_AUDIENCE`, and
+`CREDENTIAL_PROXY_SESSION_CALLERS`. `--auth-mode=none` requires `--listen-addr`
+(`KUBE_PROXY_LISTEN_ADDR`) to be set explicitly, for example `127.0.0.1:8443` on a host loopback
+bridge. `--upstream-url=<url>` (`KUBE_PROXY_UPSTREAM_URL`) forwards
+`in-cluster` requests to one static `http://` or `https://` endpoint through `upstream.NewStatic`
+(`StaticConfig`, `StaticTransport`) without cloud credentials. It rejects `--host-cluster-id`,
+`--container-api-url`, `--scope-file`, `--hold-file`, `--exclude-host-cluster-id`, and
+`CREDENTIAL_PROXY_SCOPED_SA_POOL`, and sets `Config.DefaultClusterID` to `in-cluster` so bare
+`/api/...` and `/clusters/in-cluster/...` paths both work (`SplitClusterPathWithDefault`).
+`--deny-streaming` (`KUBE_PROXY_DENY_STREAMING`, `Policy.DenyStreaming`) refuses `watch` requests,
+`log` `follow` streams (`ReasonStreamingBlocked`), and protocol upgrades with `403 Forbidden`, and
+rejects `--allow-upgrade-subresources`.
 
 It is a self-contained Go module. Run its checks from this directory:
 

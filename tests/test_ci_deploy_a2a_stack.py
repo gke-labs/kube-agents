@@ -87,8 +87,9 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_DISPATCHER_URI",
     "_PERSONA_CLUSTER_URI",
     "_PERSONA_TSE_URI",
+    "_PERSONA_FLEET_AUDIT_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse", "persona-fleet-audit")
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 # The retired flag, in the spellings a job environment could still carry.
@@ -401,6 +402,8 @@ class A2AStackTest(unittest.TestCase):
             ("profiles.cluster.harness", "a2a-worker"),
             ("profiles.tse.persona", "persona-tse"),
             ("profiles.tse.harness", "a2a-worker"),
+            ("profiles.fleetAudit.persona", "persona-fleet-audit"),
+            ("profiles.fleetAudit.harness", "a2a-worker"),
         ):
             expected += [
                 "--set-string",
@@ -966,10 +969,26 @@ class FrontDoorSwitchTest(unittest.TestCase):
         ask = go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayAsk")
         manifests = text(_A2A_MANIFESTS)
         self.assertRegex(manifests, re.compile(r"^\s*a2aTasksReplaySessionAsks\s*=\s*a2aTasksReplayTailFactor \* a2aTasksReplayAsk$", re.MULTILINE))
+        # The session route's per-session count is the named consumers plus
+        # the replay asks, and the per-route count returns it only there.
         self.assertRegex(
             manifests,
-            r"if resolveA2ADefaultRoute\(agent\) == agentv1alpha1\.DefaultRouteSession \{\s*"
-            r"return a2aSessionConsumersPerSession \+ a2aTasksReplaySessionAsks",
+            re.compile(
+                r"^\s*a2aTasksConsumersPerSessionOnSessionRoute\s*=\s*a2aSessionConsumersPerSession \+ a2aTasksReplaySessionAsks$",
+                re.MULTILINE,
+            ),
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSessionOn\(route string\) int \{\s*"
+            r"if route == agentv1alpha1\.DefaultRouteSession \{\s*"
+            r"return a2aTasksConsumersPerSessionOnSessionRoute\s*\}\s*"
+            r"return a2aSessionConsumersPerSession\s*\}",
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSession\(agent \*agentv1alpha1\.PlatformAgent\) int \{\s*"
+            r"return a2aTasksConsumersPerSessionOn\(resolveA2ADefaultRoute\(agent\)\)",
         )
         self.assertEqual(int(consts["A2A_SESSION_REPLAY_ASKS"]), tail * ask)
 
@@ -1884,6 +1903,10 @@ class BridgeImageBuildTest(unittest.TestCase):
         uri = f"{_AR_REPO}/persona-tse:{_TAG}"
         expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse agents/tse/persona")
         expected.append(f"docker push {uri}")
+        # The fleet-audit persona, the same way (#5623).
+        uri = f"{_AR_REPO}/persona-fleet-audit:{_TAG}"
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-fleet-audit agents/fleet-audit/persona")
+        expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_the_bridge_step_waits_for_the_platform_image_and_builds_from_it(self) -> None:
@@ -1952,5 +1975,112 @@ class CrStatusReportTest(unittest.TestCase):
             self.assertIn("secret-model-name", artifact.read_text())
 
 
+def _front_door_record(tmp: str) -> str:
+    return pathlib.Path(tmp, "front-door.txt").read_text(encoding="utf-8")
+
+
+def verify_front_door_run(
+    asked: str, rendered: str | None, tmp: str, fail_first: int = 0, empty_first: int = 0, warn: bool = False
+) -> subprocess.CompletedProcess:
+    """ci-deploy's verify_front_door over a stub kubectl. The stub answers
+    only the read the function should make (the gateway Deployment, in the
+    namespace, filtered to A2A_DEFAULT_ADDRESSEE), failing its first
+    `fail_first` calls, and renders `rendered` (None: every read fails)."""
+    answer = "return 1" if rendered is None else f'printf "\\n{rendered}\\n"'
+    stub = "\n".join(
+        [
+            # kubectl runs in a command substitution (a subshell), so the
+            # call count lives in a file.
+            f'_calls_file="{tmp}/kubectl-calls"; : >"${{_calls_file}}"',
+            "kubectl() {",
+            '  case "$*" in',
+            '    *"get deployment/platform-agent-a2a-gateway -n kubeagents-system"*\'@.name=="A2A_DEFAULT_ADDRESSEE"\'*) ;;',
+            '    *) echo "unexpected kubectl call: $*" >&2; return 2 ;;',
+            "  esac",
+            '  echo x >>"${_calls_file}"',
+            f'  if [ "$(wc -l <"${{_calls_file}}")" -le {fail_first} ]; then echo "connection refused" >&2; return 1; fi',
+            f'  if [ "$(wc -l <"${{_calls_file}}")" -le {fail_first + empty_first} ]; then return 0; fi',
+            # A warning on stderr, as a version skew or an auth plugin prints
+            # on a read that still succeeds.
+            '  echo "W1123 20:10:09 memcache.go:265] couldn\'t get current server API group list" >&2' if warn else "  :",
+            f"  {answer}",
+            "}",
+            "sleep() { :; }",
+        ]
+    )
+    return run_bash(
+        "\n".join(
+            [
+                stub,
+                f'EVAL_FRONT_DOOR="{asked}"',
+                'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                'NAMESPACE="kubeagents-system"',
+                "BRIDGE_TEMPLATE_READ_ATTEMPTS=3",
+                "MODE_NEXT_POLL_SECONDS=0",
+                f'DEPLOY_ARTIFACT_DIR="{tmp}"',
+                lifted_to_line("verify_front_door() {", "}", "verify_front_door"),
+                "verify_front_door",
+            ]
+        )
+    )
+
+
+class FrontDoorVerifiedTest(unittest.TestCase):
+    """#6942: the deploy checks the route the install resolved against
+    EVAL_FRONT_DOOR, records both, and fails on a mismatch, so a run that asked
+    for session but routes plain turns to platform never grades as the
+    session run."""
+
+    def test_a_matching_route_passes_and_records_both(self) -> None:
+        for route in ("platform", "session"):
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as tmp:
+                result = verify_front_door_run(route, route, tmp)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(_front_door_record(tmp), f"requested={route}\nresolved={route}\n")
+
+    def test_a_route_the_install_resolved_differently_fails_the_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "platform", tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("asked for session, but the install resolved platform", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=platform\n")
+
+    def test_a_read_that_fails_once_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "session", tmp, fail_first=1)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("attempt 1 of 3", result.stderr)
+            self.assertIn("connection refused", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=session\n")
+
+    def test_a_warning_on_a_good_read_is_not_the_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "session", tmp, warn=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=session\n")
+
+    def test_an_empty_read_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("platform", "platform", tmp, empty_first=2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("has no A2A_DEFAULT_ADDRESSEE yet (attempt 2 of 3)", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=platform\nresolved=platform\n")
+
+    def test_an_unreadable_route_fails_the_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", None, tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not read A2A_DEFAULT_ADDRESSEE", result.stderr)
+            self.assertIn("attempt 3 of 3", result.stderr)
+            self.assertIn("resolved=unknown", _front_door_record(tmp))
+
+    def test_the_deploy_fails_on_it_after_the_gates(self) -> None:
+        deploy = text(_CI_DEPLOY)
+        call = deploy.index("if ! verify_front_door; then")
+        self.assertLess(deploy.index("\ngate_web_console\n"), call)
+        self.assertIn("exit 1", deploy[call : deploy.index("\nfi\n", call)])
+
+
 if __name__ == "__main__":
     unittest.main()
+

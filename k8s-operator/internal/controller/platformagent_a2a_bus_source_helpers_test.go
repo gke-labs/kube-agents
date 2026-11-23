@@ -63,6 +63,16 @@ func TestTheNameHalfAndTheSourceHalfAreTwoDifferentChecks(t *testing.T) {
 	if got := a2aBusCredentialVolumeNames(clean); got != nil {
 		t.Errorf("a CR with no user volumes drops %v", got)
 	}
+	watcherOnly := a2aTestAgent()
+	watcherOnly.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		SidecarVolumes: []corev1.Volume{watcherAudienceVolume("watcher-proj")},
+	}
+	if got := a2aBusCredentialVolumeNames(watcherOnly); got != nil {
+		t.Errorf("a2aBusCredentialVolumeNames matched a watcher-audience volume: %v", got)
+	}
+	if kept := a2aStripBusCredentialSources(watcherOnly.Spec.Deployment.SidecarVolumes, watcherOnly.Name); len(kept) != 1 {
+		t.Errorf("a2aStripBusCredentialSources dropped a watcher-audience volume: %v", kept)
+	}
 	in := clean.Spec.Deployment.Sidecars
 	if out := stripContainerMountsNamed(in, nil); &out[0] != &in[0] {
 		t.Error("stripContainerMountsNamed copied the containers with nothing to drop; a clean CR should render its own slices")

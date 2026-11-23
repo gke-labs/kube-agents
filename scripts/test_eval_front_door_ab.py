@@ -154,6 +154,37 @@ class CompareTest(unittest.TestCase):
                 self.assertEqual(ab.main([str(a), str(b)]), 2)
             self.assertIn("run A deployed session and run B platform", err.getvalue())
 
+    def test_the_front_door_is_the_route_the_install_resolved(self) -> None:
+        """Since #6942 a deploy records the requested and the resolved route,
+        and the resolved one is what the run graded. A record from before it
+        holds the requested route alone, and no record means platform."""
+        cases = {
+            "session\n": "session",
+            "requested=session\nresolved=session\n": "session",
+            "requested=platform\nresolved=platform\n": "platform",
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, ab.FRONT_DOOR_FILE).write_text(text, encoding="utf-8")
+                self.assertEqual(ab.front_door(Path(tmp)), want)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(ab.front_door(Path(tmp)), "platform")
+
+    def test_a_run_that_resolved_another_route_is_refused(self) -> None:
+        """A session run whose install resolved platform graded platform: the
+        compare refuses it rather than read it as the session run, and one
+        whose resolved route is unknown can't say what it graded."""
+        for text, says in (
+            ("requested=session\nresolved=platform\n", "requested session but the install resolved platform"),
+            ("requested=session\nresolved=unknown\n", "was not recorded"),
+            ("requested=session\n", "was not recorded"),
+        ):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, ab.FRONT_DOOR_FILE).write_text(text, encoding="utf-8")
+                with self.assertRaises(ab.UnreadableRun) as raised:
+                    ab.front_door(Path(tmp))
+                self.assertIn(says, str(raised.exception))
+
     def test_booleans_are_not_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "case-x.json").write_text(
@@ -161,6 +192,96 @@ class CompareTest(unittest.TestCase):
             )
             with self.assertRaises(ab.UnreadableRun):
                 ab.read_run(Path(tmp))
+
+    def run_ab_with_words(
+        self, a_words: dict[str, list[int]], b_words: dict[str, list[int]], *extra: str
+    ) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp, "a"), Path(tmp, "b")
+            for d, words in ((a, a_words), (b, b_words)):
+                d.mkdir()
+                log = []
+                for case, reps in words.items():
+                    write_case(d, case, 3, 3)
+                    log.append(f"Task {case} Result: [PASSED]")
+                    log += [
+                        f"  rep {i + 1} shape: opens_on_verdict=1 answer_words={w}"
+                        for i, w in enumerate(reps)
+                    ]
+                (d / ab.GRADING_LOG).write_text("\n".join(log) + "\n", encoding="utf-8")
+            (b / ab.FRONT_DOOR_FILE).write_text("session\n", encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                code = ab.main([*extra, str(a), str(b)])
+            return code, out.getvalue()
+
+    def test_answer_length_is_compared_from_the_grading_logs(self) -> None:
+        """A case whose median answer on B runs over A's by more than the margin
+        is flagged wordier; within the margin it isn't."""
+        code, out = self.run_ab_with_words(
+            {"long": [100, 100, 100], "close": [200, 200, 200]},
+            {"long": [200, 200, 200], "close": [240, 240, 240]},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Answer length: 1 case wordier on B", out)
+        self.assertIn("| `long` | same | 3/3 | 3/3 | 100 | 200 | wordier |", out)
+        self.assertIn("| `close` | same | 3/3 | 3/3 | 200 | 240 |  |", out)
+
+    def test_the_length_gate_fails_a_wordier_case(self) -> None:
+        code, _ = self.run_ab_with_words(
+            {"long": [100]}, {"long": [200]}, "--length-gate"
+        )
+        self.assertEqual(code, 1)
+        code, _ = self.run_ab_with_words(
+            {"long": [100]}, {"long": [110]}, "--length-gate"
+        )
+        self.assertEqual(code, 0)
+
+    def test_infra_repetitions_are_left_out_and_the_median_is_taken(self) -> None:
+        """An infrastructure repetition's shape doesn't count, and one long
+        repetition among three moves the median, not the whole figure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / ab.GRADING_LOG).write_text(
+                "Task c Result: [PASSED]\n"
+                "  rep 1: pass -- ok\n  rep 1 shape: answer_words=100\n"
+                "  rep 2: infra -- cut short\n  rep 2 shape: answer_words=5\n"
+                "  rep 3: pass -- ok\n  rep 3 shape: answer_words=900\n"
+                "  rep 4: pass -- ok\n  rep 4 shape: answer_words=120\n"
+                "  rep 9 report: quoted text with rep 1 shape: answer_words=99999\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(ab.read_answer_words(d), {"c": 120})
+
+    def test_the_length_gate_needs_shapes_on_both_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp, "a"), Path(tmp, "b")
+            for d in (a, b):
+                d.mkdir()
+                write_case(d, "held", 3, 3)
+            (b / ab.FRONT_DOOR_FILE).write_text("session\n", encoding="utf-8")
+            errout = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(errout):
+                self.assertEqual(ab.main(["--length-gate", str(a), str(b)]), 2)
+            self.assertIn("--length-gate needs answer shapes", errout.getvalue())
+
+    def test_the_length_gate_needs_a_case_with_shapes_on_both_runs(self) -> None:
+        """Shapes for different cases on the two runs compare nothing, which
+        the gate refuses rather than passes."""
+        code, _ = self.run_ab_with_words(
+            {"x": [100], "y": []}, {"x": [], "y": [100]}, "--length-gate"
+        )
+        self.assertEqual(code, 2)
+
+    def test_a_small_absolute_difference_is_not_wordier(self) -> None:
+        self.assertFalse(ab.wordier(0, 5))
+        self.assertFalse(ab.wordier(10, 19))
+        self.assertTrue(ab.wordier(10, 30))
+
+    def test_runs_without_grading_logs_show_no_length_columns(self) -> None:
+        code, out, _ = self.run_ab({"held": (3, 3)}, {"held": (3, 3)})
+        self.assertEqual(code, 0)
+        self.assertNotIn("A words", out)
 
     def test_counts_that_do_not_add_up_are_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -39,7 +39,10 @@ so that the guest prints the startup-script failure line again: it prints it
 at boot only, and the serial buffer the GCE audit reads rotates it out within
 about three weeks. Only the one instance the project's state records at that
 address is reset; a reset that fails is a warning on the project's outcome,
-never a failure of it. `--no-fixture-refresh` skips the reset.
+never a failure of it. `--no-fixture-refresh` skips the reset. The serial-flood
+VM (`google_compute_instance.serial_flood`) is never reset: its designed state
+is a console whose boot lines have rotated out, which the VM renews itself,
+and a reset would put a fresh failure line on it.
 """
 
 import argparse

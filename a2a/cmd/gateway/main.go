@@ -168,6 +168,7 @@ func buildBackendAdapters(cfg *gateway.Config, metrics *gateway.Metrics, log *sl
 			// The allowlist, so a sender listed by either of their ids is
 			// handed over under the listed one; the gateway still decides.
 			tm.SetAllowedUsers(cfg.TeamsAllowedUsers, cfg.TeamsAllowAllUsers)
+			tm.SetMetrics(metrics)
 			adapters[backend] = tm
 		case gateway.BackendDiscord:
 			dc, err := gateway.NewDiscordAdapter(cfg.DiscordToken, log)
@@ -237,6 +238,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		lib.WithLogger(log),
 		lib.WithAgreementPolicy(gateway.SupervisorAgreement(cfg)),
 		lib.WithNATSOptions(natsOpts...),
+		// Unset until the operator renders it from the latched profile
+		// supervisor form (#5301); a malformed value reads as unset.
+		lib.WithProfileSupervisorCutoff(lib.ProfileSupervisorCutoffFromEnv(os.Getenv, log)),
 	)
 	if err != nil {
 		log.Error("nats connect", "err", err)
