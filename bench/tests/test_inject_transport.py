@@ -4707,3 +4707,48 @@ def test_a_confirmed_tasks_cancel_carries_no_intent(monkeypatch: pytest.MonkeyPa
     task.cancel(settle=0)
     cancels = [p for url, p in sent if url.endswith(inject.CANCEL_SUFFIX)]
     assert cancels and all(p is not None and "intent" not in p for p in cancels)
+
+
+def test_a_turn_queued_at_the_session_cap_is_followed_to_its_answer(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """At the session cap the gateway queues the turn (#6882): the POST is
+    answered with the queued refusal, and the task the turn starts once a
+    worker frees lands on the same conversation, after the queued notice. The
+    harness follows it there and grades its answer, as a chat user reads it in
+    the thread, rather than calling a queued turn one that started nothing."""
+    stub_gateway.accept_submissions = False
+    stub_gateway.refusal_code = inject.REFUSAL_QUEUED
+    stub_gateway.entries = [
+        entry(1, inject.ENTRY_POST, text="⏳ **queued** — every session worker is busy", messageId="inj-q"),
+        *[{**e, "seq": e["seq"] + 1} for e in completed_transcript(stub_gateway.task_id, "PINEAPPLE")],
+    ]
+
+    result = KubeAgentsHarness().run("/session reply with PINEAPPLE")
+
+    assert not infra(result), result.errors
+    assert result.output == "PINEAPPLE"
+    assert result.metadata["task_id"] == stub_gateway.task_id
+    assert len(stub_gateway.submissions) == 1
+
+
+def test_a_queued_turn_given_up_on_is_taken_out_of_the_line(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A queued turn whose task never appears inside the harness's backstop
+    is infrastructure, and the harness takes it out of the gateway's line
+    (a cancel naming no task), or the gateway would start it later with
+    nobody watching."""
+    monkeypatch.setattr(inject, "QUEUED_START_WAIT_SECONDS", 0.5)
+    stub_gateway.accept_submissions = False
+    stub_gateway.refusal_code = inject.REFUSAL_QUEUED
+    stub_gateway.entries = [entry(1, inject.ENTRY_POST, text="⏳ **queued** — every session worker is busy", messageId="inj-q")]
+
+    result = KubeAgentsHarness().run("/session reply with PINEAPPLE")
+
+    assert infra(result)
+    assert "did not start inside the line's bound" in result.errors[0]
+    assert "took it out of the line" in result.errors[0]
+    assert len(stub_gateway.cancels) == 1
+    assert "taskId" not in stub_gateway.cancels[0]
+    assert stub_gateway.cancels[0]["messageId"].endswith(inject.LEAVE_LINE_MESSAGE_ID_SUFFIX)
