@@ -1393,6 +1393,34 @@
         }
       ]
     },
+    "rotated-console-vm": {
+      "cluster_slot": null,
+      "namespace": null,
+      "probes": ["instance/serial-flood-*"],
+      "fixture": "serial-flood-<prefix>, a standalone e2-micro in the fleet's zone whose startup script fails at boot and whose systemd timer then writes about 2 MiB of counted filler lines to serial port 1, one bounded pass two minutes after boot and one every 24 hours after. The serial buffer keeps about 1 MiB, so the boot's failure lines rotate out minutes after boot and only the filler remains: the rotated-console state the GCE compute audit's notes have to report. hack/fleet_reconcile.py does not reset this VM -- its reset reads only the state address google_compute_instance.startup_fail -- and must not: the rotated console is this fixture's healthy state, and the VM's own daily pass renews it. Project-scoped, as startup-fail-vm is",
+      "state": [
+        {
+          "subject": "instance/serial-flood-*",
+          "path": "status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "the GCE compute audit reads the serial console of RUNNING instances only; a stopped or terminated VM has no console read, and the rotated-console case has nothing to grade"
+        },
+        {
+          "subject": "instance/serial-flood-*",
+          "path": "metadata.items[?(@.key=='startup-script')].key",
+          "op": "any_eq",
+          "value": "startup-script",
+          "why": "the failing startup script is what puts a failure line on the console for the flood to rotate out, and what installs the flood itself; a VM whose startup-script metadata was removed boots clean and floods nothing at the next boot"
+        },
+        {
+          "subject": "instance/serial-flood-*",
+          "op": "serial_contains",
+          "value": "eval fixture: serial-flood filler",
+          "why": "one flood pass is about twice the buffer, so filler in the buffer means the boot's failure lines have rotated out -- the state the rotated-console notes grade; a console without it still shows the boot, which is the startup-fail shape, not this one. No reconcile reset repairs this role: the rotated console is the designed state, and the VM's own daily pass renews the filler against the guest agent's slow output"
+        }
+      ]
+    },
     "world-open-ingress": {
       "cluster_slot": null,
       "namespace": null,

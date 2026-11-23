@@ -57,15 +57,18 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-world-open firewall rule and its VM, the peered jumbo-frame network, the two
-orphaned snapshots) is published as `<role>.confirmed` alone, and its subjects
+serial-flood VM, the world-open firewall rule and its VM, the peered
+jumbo-frame network, the two orphaned snapshots) is published as
+`<role>.confirmed` alone, and its subjects
 are read with `gcloud compute instances list`, `gcloud compute firewall-rules
 list`, `gcloud compute networks list` or `gcloud compute snapshots list` in the
 project. A cluster role can carry one such subject too, `reservation/<prefix>*`,
 read with `gcloud compute reservations list`. `serial_contains` reads an instance subject's serial port 1 output as
 well, with `gcloud compute instances get-serial-port-output`: the startup-fail
 VM's failure line is printed at boot only, and the buffer that holds it rotates
-within weeks. `source_disk_gone` reads the project's disks for the name a
+within weeks; the serial-flood VM's flood filler is the opposite designed
+state, the console whose boot lines have rotated out, which the VM itself
+renews daily. `source_disk_gone` reads the project's disks for the name a
 snapshot's `sourceDisk` ends in.
 
 One kind of assertion is a clock rather than a shape: `ready_after_hours`,
