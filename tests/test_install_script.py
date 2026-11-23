@@ -78,13 +78,15 @@ _GCLOUD_CLUSTER_FORBIDDEN = (
 )
 
 
-# For a test that runs main with no dry run: bash that prints this marker and
-# the path of each tool that step one of main would start, or use to install a
-# missing one, when the PATH has it. Such a test puts it before main and
-# expects no marker.
+# For a test that runs the main of install.sh or of upgrade.sh with no dry run:
+# bash that looks on the PATH for each tool that main would start for its work,
+# or use to install a missing one. For the first one it finds, it prints this
+# marker with the tool's name and exits, so main does not start. Such a test
+# puts it before main and expects no marker.
 _HOST_TOOL_MARKER = "host-tool="
 _HOST_TOOL_PROBE = (
-    f'for tool in git gcloud terraform brew apt-get; do command -v "$tool" >/dev/null && echo "{_HOST_TOOL_MARKER}$tool"; done\n'
+    "for tool in git gcloud kubectl helm terraform brew apt-get; do "
+    f'command -v "$tool" >/dev/null && {{ echo "{_HOST_TOOL_MARKER}$tool"; exit 97; }}; done\n'
 )
 
 
