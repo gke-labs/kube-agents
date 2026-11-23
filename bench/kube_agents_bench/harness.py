@@ -185,7 +185,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -371,6 +371,11 @@ _CARD_WAIT_SETTLE = 15.0
 # can spell the whole kubectl read.
 _INJECT_TOKEN_SECRET_SUFFIX = "-a2a-inject"
 _INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a credential
+# The gateway container's A2A_MAX_SESSIONS, which is the session cap the
+# gateway runs with (session_cap.py reads it before filling the cap).
+_SESSION_CAP_JSONPATH = (
+    'jsonpath={.spec.template.spec.containers[?(@.name=="gateway")].env[?(@.name=="A2A_MAX_SESSIONS")].value}'
+)
 # Appended to the run's message id on a delegation status turn, with the
 # turn's ordinal after it, so the ingress log tells the opening ask and each
 # follow-up apart -- and so the door's dedupe on the message id cannot fold a
@@ -2852,6 +2857,33 @@ def expand_gitops_repo_placeholder(prompt: str) -> tuple[str, str | None]:
     return prompt.replace(GITOPS_REPO_PLACEHOLDER, repo), None
 
 
+# Every bench directive this harness acts on, as the first line of a prompt
+# opens with it (each module's own constant). A first line opening with
+# ``[bench:`` and none of these is a directive the harness would otherwise
+# send to the agent as text (_unknown_directive).
+_BENCH_DIRECTIVE_PREFIX = profile_hook.BENCH_DIRECTIVE
+_KNOWN_DIRECTIVES = (
+    card_wake.QUESTION_DIRECTIVE,
+    card_wake.BLOCK_DIRECTIVE,
+    stop_hook.STOP_DIRECTIVE,
+    stop_hook.MID_TURN_DIRECTIVE,
+    stop_hook.CARD_WAIT_DIRECTIVE,
+    pushed_report.DIRECTIVE,
+    profile_hook.PROFILE_DIRECTIVE,
+    slack.HOME_POST_DIRECTIVE,
+    session_cap.DIRECTIVE,
+)
+
+
+def _unknown_directive(prompt: str) -> str:
+    """The first word of ``prompt``'s first line when it is a bench directive
+    no reader here knows, or ``""``."""
+    first = prompt.strip().partition("\n")[0]
+    if not first.startswith(_BENCH_DIRECTIVE_PREFIX) or first.startswith(_KNOWN_DIRECTIVES):
+        return ""
+    return first.split()[0]
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run where no answer can be graded, recorded as infrastructure.
 
@@ -3303,6 +3335,17 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         if replay is not None:
             return self._execute_card_wake(replay, workspace_path)
+        unknown = _unknown_directive(prompt)
+        if unknown:
+            # Sent on, the directive would reach the agent as part of an
+            # ordinary ask and the case would be graded on a run that never
+            # did what it describes.
+            return _infra_failure(
+                f"the prompt opens with {unknown!r}, a bench directive this harness does not know: "
+                "the case is newer than the grader running it (a pull request is graded with its base "
+                "commit's bench/, hack/ci-eval-pr.sh pin_grader), so the harness change has to land "
+                "on main before the case can be graded"
+            )
         if stop_hook.is_card_wait(prompt):
             # Through the A2A door whatever the lane's transport: the door's
             # turns hold for their cards, which is what the case stops.
@@ -3317,6 +3360,12 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{slack.HOME_POST_DIRECTIVE} <marker>] needs AGENT_TRANSPORT={TRANSPORT_SLACK}, got {transport!r}"
             )
+        if session_cap.is_session_cap_ask(prompt):
+            if transport != TRANSPORT_INJECT:
+                return AgentResult.errored(
+                    f"{session_cap.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+                )
+            return self._execute_session_cap(prompt)
         if transport == TRANSPORT_INJECT:
             result = self._execute_inject(prompt)
             _fold_worker_total(result.tokens)
@@ -3337,6 +3386,142 @@ class KubeAgentsHarness(AgentHarness):
         if transport == TRANSPORT_SLACK:
             return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
+
+    def _execute_session_cap(self, prompt: str) -> AgentResult:
+        """A session-cap ask (:mod:`session_cap`, #6882): fill the install's
+        session cap with busy ``/session`` conversations through the inject
+        door, send the ask on one more, and read its queued notice, the task
+        the queued turn starts and its answer off that conversation.
+
+        The install's cap is read first, off the gateway Deployment; above
+        the directive's ``max-cap``, unreadable, or never filled (the ask
+        started at once), the run is infrastructure. The gateway refusing
+        the ask at the cap is graded: :data:`session_cap.QUEUED_ENTRY` fails
+        with the refusal as the output. One tunnel, established once with
+        the inject transport's retry; a transport failure after that is
+        infrastructure, with no resend. Every filler is cancelled (a queued
+        one taken out of the line) before the run ends.
+        """
+        try:
+            ask = session_cap.parse(prompt)
+            timeout = _numeric_env("AGENT_INJECT_TIMEOUT", _INJECT_DEFAULT_TIMEOUT, float)
+            local_port = _numeric_env("AGENT_INJECT_LOCAL_PORT", str(_INJECT_DEFAULT_LOCAL_PORT), int)
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+        assert ask is not None
+        agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
+        service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
+        author = os.environ.get("AGENT_INJECT_AUTHOR", inject.DEFAULT_AUTHOR)
+        token = os.environ.get("AGENT_INJECT_TOKEN", "").strip()
+        if not token:
+            return _infra_failure("AGENT_INJECT_TOKEN is unset and the inject door authenticates every request")
+
+        gateway = agent_service + _GATEWAY_LEASE_SUFFIX
+        raw = _kubectl_read(
+            ["get", "deployment", gateway, "-o", _SESSION_CAP_JSONPATH], f"deployment {gateway}'s session cap"
+        )
+        cap = session_cap.parse_cap(raw)
+        why = session_cap.precondition(cap, ask.max_cap)
+        if why:
+            return _infra_failure(f"{session_cap.DIRECTIVE}: {why}")
+        assert cap is not None
+
+        base_url = os.environ.get("AGENT_INJECT_URL")
+        if not base_url:
+            failures = 0
+            while True:
+                try:
+                    target = _gateway_door_target(agent_service, service) or f"svc/{service}"
+                    _ensure_port_forward(local_port, service=target, remote_port=_INJECT_REMOTE_PORT)
+                    break
+                except RuntimeError as exc:
+                    failures += 1
+                    if failures >= _MAX_TRANSPORT_FAILURES:
+                        return _infra_failure(f"the inject tunnel failed to establish {failures} times running; last: {exc}")
+            base_url = f"http://127.0.0.1:{local_port}"
+
+        run_id, case_id, repetition = _inject_identity()
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
+        conversation = inject.conversation_key(run_id, case_id, repetition)
+        message_id = inject.message_id(run_id, case_id, repetition)
+        identity: dict[str, Any] = {"run_id": run_id, "case_id": case_id, "repetition": repetition, "message_id": message_id}
+
+        fillers: list[inject.InjectTask] = []
+        released: set[str] = set()
+
+        def _release_fillers() -> None:
+            """Cancel every filler's task, or take a queued filler out of
+            the line (a cancel naming no task on its conversation), once
+            each. Best effort: InjectTask.cancel logs what did not land."""
+            for filler in fillers:
+                if filler.conversation not in released:
+                    released.add(filler.conversation)
+                    filler.cancel(filler.task_id, settle=0)
+
+        try:
+            for i in range(cap):
+                filler = inject.InjectTask(
+                    base_url=base_url,
+                    conversation=f"{conversation}-fill-{i}",
+                    prompt=session_cap.filler_prompt(ask.hold_seconds),
+                    token=token,
+                    author=author,
+                    message_id=f"{message_id}/fill-{i}",
+                )
+                fillers.append(filler)
+                filler.submit()
+                if filler.refusal == inject.REFUSAL_QUEUED:
+                    # Something else holds a slot already: the cap is full.
+                    break
+                if not filler.task_id:
+                    return _infra_failure(
+                        f"{session_cap.DIRECTIVE}: filler {i} on {filler.conversation} started nothing "
+                        f"({inject.refusal_detail(filler.refusal)}): {filler.note}"
+                    )
+
+            task = inject.InjectTask(
+                base_url=base_url, conversation=conversation, prompt=ask.prompt, token=token,
+                author=author, message_id=message_id,
+            )
+            task.preflight()
+            task_id = task.submit()
+            if task_id:
+                task.cancel(task_id, settle=0)
+                return _infra_failure(
+                    f"{session_cap.DIRECTIVE}: the cap of {cap} never filled, so the ask started at once "
+                    f"(task {task_id}); a filler's task ended before it was sent"
+                )
+            if task.refusal != inject.REFUSAL_QUEUED:
+                body = task._poll("", 0, 0, probe=False)
+                entries = [e for e in body.get("entries") or [] if isinstance(e, dict)]
+                refusal = session_cap.refused_at_cap(entries)
+                if not refusal:
+                    return _infra_failure(
+                        f"{session_cap.DIRECTIVE}: {inject.refusal_detail(task.refusal)}, on {task.conversation}: {task.note}"
+                    )
+                entry = session_cap.assess(entries, "")
+                return AgentResult(output=refusal, trajectory=[entry], errors=[], metadata={"transport": TRANSPORT_INJECT, **identity})
+
+            # Queued, as it should be. Free the workers, then follow the turn.
+            _release_fillers()
+            task_id = task.await_queued_start(time.monotonic() + inject.QUEUED_START_WAIT_SECONDS)
+            if not task_id:
+                body = task._poll("", 0, 0, probe=False)
+                entries = [e for e in body.get("entries") or [] if isinstance(e, dict)]
+                detail = f"the gateway posted {task.line_refusal!r} instead" if task.line_refusal else (
+                    f"no task within {inject.QUEUED_START_WAIT_SECONDS:.0f}s of the fillers' cancel"
+                )
+                entry = session_cap.assess(entries, "", detail)
+                return AgentResult(output=task.line_refusal, trajectory=[entry], errors=[], metadata={"transport": TRANSPORT_INJECT, **identity})
+            exchange = task.await_terminal(task_id, deadline=time.monotonic() + timeout)
+        except inject.InjectUnavailable as exc:
+            return _infra_failure(f"{session_cap.DIRECTIVE}: the inject door could not be reached: {exc}")
+        finally:
+            _release_fillers()
+        result = _inject_result(exchange, identity)
+        result.trajectory.insert(0, session_cap.assess(exchange.fold.entries, task_id))
+        result.metadata["session_cap"] = cap
+        return result
 
     def _execute_card_wait(self, prompt: str) -> AgentResult:
         """A card-wait stopped ask (:data:`stop_hook.CARD_WAIT_DIRECTIVE`, #5407).
@@ -4207,6 +4392,14 @@ class KubeAgentsHarness(AgentHarness):
                             budget = floor
                     posted = time.monotonic()
                     task_id = task.submit()
+                    if not task_id and task.refusal == inject.REFUSAL_QUEUED:
+                        # Every session worker was busy and the gateway
+                        # queued the turn, as it queues a chat user's: the
+                        # task it starts when one frees is on the same
+                        # conversation. The budget is the task's, so its
+                        # clock starts at the start, not in the line.
+                        task_id = task.await_queued_start(time.monotonic() + inject.QUEUED_START_WAIT_SECONDS)
+                        posted = time.monotonic()
                     if deadline is None:
                         deadline = time.monotonic() + budget
                         if opening and task_id and not opening_post_lost:
