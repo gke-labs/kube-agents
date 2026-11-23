@@ -23,6 +23,9 @@ _PACKAGE_JSON = _HARNESS_DIR / "package.json"
 _PACKAGE_LOCK = _HARNESS_DIR / "package-lock.json"
 _DEPENDABOT = _REPO_ROOT / ".github" / "dependabot.yml"
 _HARNESS_GO = _REPO_ROOT / "a2a" / "worker-adapter" / "harness.go"
+_HARNESS_GITIGNORE = _HARNESS_DIR / ".gitignore"
+_A2A_DOCKERIGNORE = _REPO_ROOT / "a2a" / ".dockerignore"
+_ROOT_DOCKERIGNORE = _REPO_ROOT / ".dockerignore"
 
 _SDK = "@anthropic-ai/claude-agent-sdk"
 # The platform package whose binary DefaultHarnessPath names.
@@ -71,6 +74,15 @@ class WorkerHarnessLockTest(unittest.TestCase):
         self.assertEqual(len(harness), 1, "the harness directory needs exactly one npm entry")
         # Its own group, so an SDK bump is never batched with another directory's.
         self.assertEqual(list(harness[0]["groups"]), ["worker-harness"])
+
+    def test_a_local_install_stays_out_of_git_and_every_build_context(self):
+        # A developer who runs npm ci here to check a bump must not commit the
+        # tree or send it in a build context: an a2a-context build and the
+        # repository-root build of Dockerfile.worker both copy a2a/.
+        self.assertIn("node_modules/", _HARNESS_GITIGNORE.read_text().splitlines())
+        self.assertIn("worker-harness/node_modules", _A2A_DOCKERIGNORE.read_text().splitlines())
+        # A bare `node_modules/` in a .dockerignore matches only the context root.
+        self.assertIn("**/node_modules/", _ROOT_DOCKERIGNORE.read_text().splitlines())
 
 
 if __name__ == "__main__":
