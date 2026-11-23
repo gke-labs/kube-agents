@@ -33,7 +33,7 @@ kubectl -n kubeagents-system patch secret platform-agent-secrets --type merge \
 
 ## Turn Teams on
 
-Set the Teams block in your Helm values. On an install made with the installer, pass it through the composition's `extra_helm_values`, as [the quick start](/kube-agents/install/quickstart-gke/) does for operator settings: an upgrade renders the PlatformAgent resource again, so a hand edit of the resource does not last. The guide shows the same settings on the PlatformAgent resource.
+Set the Teams block in your Helm values. The guide shows the same settings on the PlatformAgent resource; prefer the values, since the chart does not know about a hand edit of the resource and a later chart apply can replace it.
 
 ```yaml
 platformAgent:
@@ -48,6 +48,12 @@ platformAgent:
       homeChannel: "<conversation id>"
       inbound:
         enabled: true
+```
+
+On an install made with `install.sh` there is no values file. Put the same keys on the `TF_VAR_extra_helm_values` line in `install.env`, as an HCL object, and run the installer again. [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes that line; there is one of it, so add these keys to whatever it already carries.
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={integration={teams={enabled=true,tenantId="<directory (tenant) id>",allowedUsers=["<entra object id>"],homeChannel="<conversation id>",inbound={enabled=true}}}}}'
 ```
 
 - `tenantId` limits the bot to your tenant. The receiver below needs it.
@@ -77,13 +83,13 @@ If your ingress can restrict sources, Microsoft publishes Bot Framework's addres
 
 ## Verify
 
-Send the bot a short message. A reply within a few seconds means the whole path works: Teams reached your address, the receiver accepted the message, and the agent answered.
+Send the bot a short message. A reply means the whole path works: Teams reached your address, the receiver accepted the message, and the agent answered.
 
 If nothing comes back:
 
-- An accepted message leaves no line in the receiver's log, so a quiet log does not tell you whether Teams reached the address. The receiver counts what it accepted in `kubeagents_teams_inbound_requests_total`; if that count has not moved, check the messaging endpoint, the certificate and the route.
+- An accepted message leaves no line in the receiver's log, so a quiet log does not tell you whether Teams reached the address. The receiver counts every request that reaches it in `kubeagents_teams_inbound_requests_total`, by `outcome`, with `accepted` for the ones it took; the install's metrics collection scrapes it with the other pods. If no outcome has moved, Teams did not reach the address: check the messaging endpoint, the certificate and the route.
 - The receiver logs each kind of refusal with its reason, such as a request from another tenant or one not signed for your bot.
-- A person outside the allowlist does get a reply, a short refusal. On the chat gateway the refusal names their id, which is the value to add to `allowedUsers`. On the default path the id is in the agent's log instead, on the line that says it rejected an unauthorized user.
+- A person outside the allowlist does get a reply, a short refusal. On the chat gateway the refusal comes the first time they write and names their id, which is the value to add to `allowedUsers`. On the default path the id is in the agent's log instead, on the line that says it rejected an unauthorized user.
 - In a channel, check that the bot's name was a mention and not plain text.
 
 ## The chat gateway
