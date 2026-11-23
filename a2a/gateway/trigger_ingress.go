@@ -575,7 +575,9 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
 	reply := lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
-	if task.Final && task.FinalMessage != nil {
+	// A completed run has no reason to record: only a run that ended
+	// otherwise (failed, rejected, canceled) carries one.
+	if task.Final && task.State != lib.StateCompleted && task.FinalMessage != nil {
 		reply.Reason = runReasonToken(joinTextParts(task.FinalMessage.Parts))
 	}
 	return reply

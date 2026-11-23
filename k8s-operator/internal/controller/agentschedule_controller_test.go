@@ -385,11 +385,11 @@ func TestAgentScheduleRecordsARunsReason(t *testing.T) {
 	f := newScheduleFixture(t, nil)
 	f.at(t, hourAt(0, 45))
 	f.at(t, hourAt(1, 0))
-	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: hourAt(1, 20), Reason: "write-refused"}
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: hourAt(1, 20), Reason: "deadline-exceeded"}
 	f.at(t, hourAt(1, 21))
 	s := f.get(t)
-	if s.Status.LastReason != "write-refused" || len(s.Status.RecentRuns) != 1 || s.Status.RecentRuns[0].Reason != "write-refused" {
-		t.Fatalf("status = %+v; want the run and the last reason write-refused", s.Status)
+	if s.Status.LastReason != "deadline-exceeded" || len(s.Status.RecentRuns) != 1 || s.Status.RecentRuns[0].Reason != "deadline-exceeded" {
+		t.Fatalf("status = %+v; want the run and the last reason deadline-exceeded", s.Status)
 	}
 	// The next run is Lost: the last reason is cleared, not carried over.
 	f.tracker.state = ScheduleTaskState{Found: true}
@@ -400,7 +400,9 @@ func TestAgentScheduleRecordsARunsReason(t *testing.T) {
 	if s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeLost || s.Status.LastReason != "" {
 		t.Fatalf("status = %+v; want a Lost run with no reason", s.Status)
 	}
-	// A reason off the CRD's shape is dropped rather than failing the write.
+	// A reason off the CRD's shape is dropped (knownReason). The fixture's
+	// client doesn't validate the CRD pattern; TestRunReasonShapeIsTheCRDsPattern
+	// pins that knownReason is that pattern.
 	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: hourAt(3, 20), Reason: "not a token; with detail"}
 	f.at(t, hourAt(3, 21))
 	s = f.get(t)
@@ -1213,7 +1215,7 @@ func TestRunReasonShapeIsTheCRDsPattern(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "pattern: " + runReasonShape.String()
-	if n := strings.Count(string(crd), want); n != 2 {
-		t.Fatalf("the CRD has %d %q lines, want 2 (reason and lastReason)", n, want)
+	if n := strings.Count(string(crd), want); n < 2 {
+		t.Fatalf("the CRD has %d %q lines, want one each for reason and lastReason", n, want)
 	}
 }

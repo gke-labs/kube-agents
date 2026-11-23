@@ -242,9 +242,9 @@ type AgentScheduleRun struct {
 	Delivery string `json:"delivery,omitempty"`
 	// Reason is why the run's task ended, as the gateway names it: the
 	// bare token of the executor's terminal reason, for example
-	// write-refused, deadline-exceeded or canceled-by-request, and never
-	// its detail. Empty when the task gave none the gateway knows, and on
-	// a Lost run.
+	// deadline-exceeded, script-timeout or canceled-by-request, and never
+	// its detail. Empty when the run completed, when the task gave no token
+	// the gateway knows, and on a Lost run.
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]{1,64}$`
 	// +optional
 	Reason string `json:"reason,omitempty"`

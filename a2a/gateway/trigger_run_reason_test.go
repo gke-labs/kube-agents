@@ -103,3 +103,30 @@ func TestATriggersStatusCarriesTheRunsReason(t *testing.T) {
 		t.Fatalf("the ended run's status = %+v, want failed with reason deadline-exceeded", got)
 	}
 }
+
+// TestACompletedRunCarriesNoReason: a run that completed records no reason,
+// even when its terminal message names a known token.
+func TestACompletedRunCarriesNoReason(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	executor := lib.Party{Session: "fleet-audit", AgentType: "test-executor"}
+	publishTerminal(t, tr.rig, &origin, executor, lib.TaskEventsSubject("fleet-audit", origin.TaskID), lib.StateCompleted,
+		"reason: deadline-exceeded")
+	var got lib.TriggerStatusReply
+	waitFor(t, "the terminal in the status", func() bool {
+		got = tr.status(t, s, reply.TaskID)
+		return got.Terminal
+	})
+	if got.State != lib.StateCompleted || got.Reason != "" {
+		t.Fatalf("the completed run's status = %+v, want completed with no reason", got)
+	}
+}
