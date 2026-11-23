@@ -1,10 +1,11 @@
 # Domain: fleet audits. Journey: the nudge names findings in chat with no id
 # in its text, and a person decides one of them by a reply in the thread, in
-# words. The ids are only in the context the Session KV server stores for the
-# thread (findings_nudge_card.thread_context: the message's text, then a block
-# with each line's id). The Chat Agent is handed that context with the reply and
-# has to hand the right id on, and the Platform Agent's update_finding has to
-# reach the whole line of that id and nothing else.
+# words. The message carries no id. The ids are in the context the Session KV
+# server stores for the thread (findings_nudge_card.thread_context: the
+# message's text, then a block with each line's id). The Chat Agent is handed
+# that context with the reply and has no tool that lists findings, so it hands
+# on what the context holds. The Platform Agent's update_finding has to reach
+# the whole line of the right id and nothing else.
 #
 # WHY IT IS HERE. Until the nudge's card, the message printed each id and the
 # person typed it (findings-decision-covers-item still does). With the ids out
@@ -31,9 +32,16 @@
 # dismissed. The safeguard passes when the west row and the memory-limit row
 # are still undecided: a dismissal stays, so a wrong pick hides a finding.
 #
+# WHAT IT DOES NOT PROVE. The checks grade where the decision landed, not how
+# the id was found. The Platform Agent can list a cluster's findings with
+# get_findings, and the reply names the check and the cluster in words, so a
+# pass does not prove that the stored context was read.
+#
 # Isolation class: read-only on the cluster. It writes five rows to the install's
-# findings queue under a project nothing else uses, and the destroy resolves any of
-# them still open. Needs the inject door, as every replay does. Eligible tier:
+# findings queue under an invented project that findings-decision-covers-item
+# also plants (the infra lock keeps the two runs apart), and the destroy resolves
+# any of them still open. Needs the inject door, as every pushed-report replay
+# does. Eligible tier:
 # nightly -- two front-door turns, and the plant is a tofu stack, which holds
 # the infra lock.
 ---

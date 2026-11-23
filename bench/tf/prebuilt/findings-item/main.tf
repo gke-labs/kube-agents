@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/findings-decision-covers-item and
+# The scenario driver for bench/tasks/findings-decision-covers-item,
+# bench/tasks/findings-decision-reply-names-no-id and
 # bench/tasks/findings-decision-leaves-unnamed-open: plant the findings-queue
 # rows of var.findings_file (findings.json by default) on the install under
 # test, every one `surfaced` except a row marked `plant_state: queued`, and
 # resolve them again on destroy.
 #
 # In findings.json, three rows share check, project and cluster, so they are one
-# gathered line of the nudge's message; the prompt names the id of only one of them.
+# gathered line of the nudge's message; findings-decision-covers-item's prompt names
+# the id of only one of them, and findings-decision-reply-names-no-id's names none.
 # The other two share the project and differ in cluster or in check, so they are
 # lines of their own, and a decision on the first line must leave them alone.
 # findings-unnamed.json has the same shape under its own project, with a fourth
@@ -32,7 +34,7 @@
 # `first_shown_at`: the item-wide decision does not read it, and marking rows as
 # the paced publisher would spend a day's addition budget on the install.
 #
-# The project and clusters are invented names only this case uses. Nothing in
+# The project and clusters are invented names only these cases use. Nothing in
 # the fleet carries them, and the teardown resolves every open row under that
 # project. A plant that fails part-way runs the same teardown before it exits,
 # because Terraform skips the destroy of a resource whose create failed.

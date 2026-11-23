@@ -3837,8 +3837,9 @@ class KubeAgentsHarness(AgentHarness):
         turn's is, off the board (:meth:`_await_delegated_cards`, up to
         ``delegation_timeout``): a follow-up turn returns before that wait, and
         without it a case that grades what the cards did (a row's state) would
-        read it while they still ran. A reply that files no card waits for
-        nothing.
+        read it while they still ran. The wait reads the cards of the
+        conversation's session, so a card the opening turn filed is waited on
+        too; a session that filed none waits for nothing.
         """
         if exchange.fold.terminal != inject.STATE_COMPLETED:
             opening.errors.append(

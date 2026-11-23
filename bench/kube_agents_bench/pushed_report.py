@@ -40,7 +40,9 @@ report answers it, and one that does not cannot.
 
 A reply turn that hands its work to cards is waited out as a first turn's
 is, off the board, before the run is graded: a case can then grade what the
-cards did (a finding's state), not only the turn's own answer.
+cards did (a finding's state), not only the turn's own answer. The wait reads
+the cards of the conversation's session, so a card the opening turn filed is
+waited on too, and it runs only under a delegation budget above zero.
 
 It runs on the inject transport only, which every CI lane uses: the API
 server has no conversation the bridge keys the row to.

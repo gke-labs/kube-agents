@@ -38,3 +38,5 @@ gitops-drift-out-of-band-triage
 upgrades-rollout-family-held-by-canary-gate
 # Added 2026-11-10 when the case joined the nightly (#5261): the shortest chain then.
 first-install-hello-filed
+# Added 2026-11-23 when the case joined the nightly (#6724): the shortest chain then.
+findings-decision-reply-names-no-id

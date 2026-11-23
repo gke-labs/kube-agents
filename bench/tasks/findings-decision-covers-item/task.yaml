@@ -20,7 +20,8 @@
 # nothing about the other rows.
 #
 # Isolation class: read-only on the cluster. It writes five rows to the install's
-# findings queue under a project nothing else uses, and the destroy resolves any of
+# findings queue under an invented project that findings-decision-reply-names-no-id
+# also plants (the infra lock keeps the two runs apart), and the destroy resolves any of
 # them still open. Eligible tier: nightly -- one front-door turn, but the plant
 # is a tofu stack, which holds the infra lock.
 ---

@@ -1209,7 +1209,8 @@
 # replay stores the context the nudge writes for prebuilt/findings-item's rows
 # and sends "dismiss the readiness probe one on bench-shop-east"; the named
 # line has to end up dismissed and the same check on bench-shop-west has to
-# stay open. Inject door only, as every replay; no fixture; the host install.
+# stay open. Inject door only, as every pushed-report replay; no fixture; the
+# host install.
 ./tasks/findings-decision-reply-names-no-id/task.yaml
 
 # The first-install hello when the report was filed as a ledger issue before
