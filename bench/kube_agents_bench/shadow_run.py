@@ -18,9 +18,11 @@ A shadow run (``audit_report.py start/finish --store-only``, which the
 runtime's ``PROFILE_TASK_DRY_RUN=true`` requires) runs beside the job it may
 replace and writes its report to the report store's shadow stream and nothing
 else: no ledger, no forge or git write, no remediation, no findings-queue row,
-no chat post. Three checks grade that, each bounded below by the fire time the
-``builtin-schedule-run-now`` stack records (``since_state_file``) or by the
-run's start:
+no chat post. Three checks grade that, against what the
+``builtin-schedule-run-now`` stack records in ``since_state_file`` before and
+after it fires the run. Two of them are bounded below by the fire time it
+records (or by the run's start, without a state file); the third diffs the
+findings queue against the snapshot it records:
 
 ``shadow_report_stored``
     The envelope the run stored on its shadow stream, which ``stream`` names:
@@ -44,9 +46,12 @@ run's start:
     The listener's HTTP routes take only the broker's audience-bound token,
     which the harness does not hold and does not need.
 ``findings_queue_untouched``
-    No findings-queue row registered, re-registered or verified in the window
-    (``first_seen`` or ``last_verified`` at or after the bound), through the
-    Session KV server's ``GET /v1/findings``, as ``findings_item_state`` reads it.
+    The audit's findings-queue rows are as they were before the fire: the
+    stack's snapshot (each row's hash over every column, through the Session
+    KV server's ``GET /v1/findings``, as ``findings_item_state`` reads the
+    queue) diffed against the same snapshot now, over the rows of the audit's
+    ``source`` (and ``check_prefix`` family). Any added, removed or changed row
+    fails; other writers' rows are read and ignored.
 ``schedule_report_not_posted``
     The fired run's report went to no chat: the AgentSchedule's own record of
     its delivery (``status.recentRuns[].delivery``, which the operator reads

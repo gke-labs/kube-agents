@@ -33,8 +33,8 @@ fetches the credentials). Four commands, each after the global flags
   clean [--stop-run] <schedule> <state>
                                remove the state file, and the annotation when it still
                                holds a token this script set; with --stop-run (a failed
-                               apply), first stop the fired run if it is still in flight,
-                               with the schedule's stop annotation
+                               apply), first stop the fired run unless it is known to have
+                               ended, with the schedule's stop annotation
 
 The annotation (``kubeagents.x-k8s.io/run-now``, AgentScheduleRunNowAnnotation)
 asks for one run: a value that differs from ``status.lastHandledRunNow`` claims a
@@ -272,25 +272,29 @@ def fire(kubectl, name, state_path):
     print(f"set {RUN_NOW_ANNOTATION}={token} on AgentSchedule {name} at {fired_at}")
 
 
-def _active_run_now(status):
-    """The run-now token the run in flight answers, when the status says (status.activeSlot.runNow)."""
-    slot = status.get("activeSlot")
-    return slot.get("runNow") if isinstance(slot, dict) else None
+def _claim_pending(status, token):
+    """Whether the schedule has claimed a run for ``token`` that the gateway has not accepted yet.
+
+    status.pendingSlot.runNow names the run-now token a claimed slot answers
+    (AgentSchedulePendingSlot.RunNow); the token is recorded as handled only
+    once the claim becomes a run or is dropped.
+    """
+    slot = status.get("pendingSlot")
+    return isinstance(slot, dict) and slot.get("runNow") == token
 
 
 def _fired_task(status, state):
     """The fired run's task, once the status names one the schedule did not have before the fire.
 
-    Only once the schedule has handled this token: before then a new task is
-    the cadence's, not the fire's. A status that names the token the run in
-    flight answers (``activeSlot.runNow``) must name this one.
+    Only once the schedule has handled this token: before then the run is at
+    most claimed (``pendingSlot.runNow`` is the token) and has no task, and a
+    new task is the cadence's, not the fire's.
     """
     if status.get("lastHandledRunNow") != state["token"]:
         return None
     known = set(state.get("known_tasks") or [])
     active = status.get("activeTaskID")
-    answers = _active_run_now(status)
-    if active and active not in known and answers in (None, state["token"]):
+    if active and active not in known:
         return active
     # A run that ended between two polls is in the ring, newest first.
     for run in status.get("recentRuns") or []:
@@ -325,9 +329,9 @@ def wait(kubectl, name, state_path, run_seconds, delivery_seconds):
             task = _fired_task(status, state)
             if task is not None:
                 state["task_id"] = task
-                if _active_run_now(status) is not None:
-                    state["active_run_now"] = _active_run_now(status)
                 kubectl.write_state(state_path, state)
+            elif _claim_pending(status, state["token"]):
+                print(f"AgentSchedule {name}: the run is claimed; waiting for the gateway to accept it")
                 print(f"AgentSchedule {name}: the fired run is task {task}")
         if task is not None and status.get("activeTaskID") != task:
             ended = _run(status, task)
@@ -354,15 +358,33 @@ def wait(kubectl, name, state_path, run_seconds, delivery_seconds):
     print(f"AgentSchedule {name}: task {task} ended {state['outcome']}, delivery {state['delivery'] or 'not reported'}")
 
 
-def _stop_fired_run(kubectl, name, state, schedule):
-    """Ask the schedule to stop the fired run when it is still the one in flight."""
-    status = _status(schedule)
+def _fired_run_ended(status, state):
+    """Whether the fired run is known to have ended, or known never to have started."""
     task = state.get("task_id") or _fired_task(status, state)
-    if not task or status.get("activeTaskID") != task:
+    if task:
+        return status.get("activeTaskID") != task
+    # Handled, with no claim left and no new task: the gateway refused it.
+    return (
+        status.get("lastHandledRunNow") == state["token"]
+        and not _claim_pending(status, state["token"])
+        and not status.get("pendingSlot")
+    )
+
+
+def _stop_fired_run(kubectl, name, state, schedule):
+    """Ask the schedule to stop the fired run unless it is known to have ended.
+
+    A stop set while the claim is still pending waits for it and then stops
+    that run (docs/designs/scheduling-on-profiles.md, stop), so a failed apply
+    just after the fire still ends the run it started.
+    """
+    status = _status(schedule)
+    if _fired_run_ended(status, state):
         return
     token = new_token()
     kubectl.annotate(name, token, key=STOP_ANNOTATION)
-    print(f"set {STOP_ANNOTATION}={token} on AgentSchedule {name}: stopping run {task}", file=sys.stderr)
+    what = state.get("task_id") or status.get("activeTaskID") or "the claimed run"
+    print(f"set {STOP_ANNOTATION}={token} on AgentSchedule {name}: stopping {what}", file=sys.stderr)
 
 
 def clean(kubectl, name, state_path, stop_run=False):

@@ -350,21 +350,18 @@ def test_a_new_ring_entry_before_the_token_is_handled_is_not_the_fired_run():
     assert json.loads(fake.files[STATE])["task_id"] == "t-fired"
 
 
-def test_an_active_slot_answering_another_token_is_not_the_fired_run():
+def test_a_claim_pending_for_another_token_is_not_the_fired_run():
+    """status.pendingSlot.runNow names the token a claim answers; a claim for another token is not ours."""
     fake = FakeKubectl()
     _fired(fake)
-
-    def other_slot(obj):
-        _status(obj, lastHandledRunNow=_token(fake), activeTaskID="t-other", activeSlot={"runNow": "someone-else"})
-
-    def ours(obj):
-        _status(obj, activeTaskID="t-ours", activeSlot={"runNow": _token(fake)})
-
-    fake.script = [other_slot, ours, _settle("t-ours", delivery="local")]
+    fake.script = [
+        lambda o: _status(o, pendingSlot={"runNow": "someone-else", "idempotencyKey": "run-now/x"}),
+        lambda o: _status(o, pendingSlot={"runNow": _token(fake), "idempotencyKey": "run-now/y"}),
+        _accept("t-ours"),
+        _settle("t-ours", delivery="local"),
+    ]
     run_now.wait(fake, NAME, STATE, 3600, 660)
-    state = json.loads(fake.files[STATE])
-    assert state["task_id"] == "t-ours"
-    assert state["active_run_now"] == state["token"]
+    assert json.loads(fake.files[STATE])["task_id"] == "t-ours"
 
 
 # ---------------------------------------------------------------- clean
@@ -405,6 +402,44 @@ def test_a_failed_apply_before_the_task_was_seen_still_stops_it():
     fake.script = [_accept("t-new")]
     run_now.clean(fake, NAME, STATE, stop_run=True)
     assert run_now.STOP_ANNOTATION in fake.object["metadata"]["annotations"]
+
+
+def test_a_failed_apply_while_the_claim_is_pending_stops_it():
+    """SIGTERM just after the fire: the claim is pending with no task; a stop set now waits for it, then stops it."""
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [lambda o: _status(o, pendingSlot={"runNow": _token(fake), "idempotencyKey": "run-now/x"})]
+    run_now.clean(fake, NAME, STATE, stop_run=True)
+    assert run_now.STOP_ANNOTATION in fake.object["metadata"]["annotations"]
+
+
+def test_a_failed_apply_before_the_token_is_handled_stops_too():
+    fake = FakeKubectl()
+    _fired(fake)
+    run_now.clean(fake, NAME, STATE, stop_run=True)
+    assert run_now.STOP_ANNOTATION in fake.object["metadata"]["annotations"]
+
+
+def test_a_run_now_the_gateway_refused_is_not_stopped():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [lambda o: _status(o, lastHandledRunNow=_token(fake), pendingSlot=None)]
+    run_now.clean(fake, NAME, STATE, stop_run=True)
+    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
+
+
+def test_the_fixtures_use_only_the_status_fields_the_crd_has():
+    """Every status key a fixture sets is an AgentScheduleStatus json field (agentschedule_types.go)."""
+    types = SCHEDULE_TYPES.read_text()
+    status_block = types[types.index("type AgentScheduleStatus struct"):]
+    status_block = status_block[: status_block.index("\n}\n")]
+    fields = set(re.findall(r'json:"([A-Za-z]+)', status_block))
+    pending = types[types.index("type AgentSchedulePendingSlot struct"):]
+    pending = pending[: pending.index("\n}\n")]
+    used = set(re.findall(r'_status\(\s*o(?:bj)?,\s*([^)]*)\)', Path(__file__).read_text()))
+    keys = {key for call in used for key in re.findall(r"(\w+)=", call)}
+    assert keys and keys <= fields, keys - fields
+    assert "runNow" in set(re.findall(r'json:"([A-Za-z]+)', pending))
 
 
 def test_a_run_that_already_ended_is_not_stopped():

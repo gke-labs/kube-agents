@@ -23,11 +23,14 @@
 # it started to end and for the gateway to say how its report was delivered,
 # and record the task, its outcome and its delivery in the state file.
 #
-# What a case reads: `since_state_file` on audit_report_stored,
-# shadow_report_stored, findings_queue_untouched and schedule_report_not_posted
-# takes the state file's `fired_at` as its lower bound; the schedule's
-# status.lastOutcome is the fired run's, since nothing else runs it before the
-# turn is graded.
+# What a case reads from the state file (`since_state_file`): `fired_at`, the
+# lower bound for audit_report_stored, shadow_report_stored and
+# schedule_report_not_posted; `task_id`, the fired run, which
+# shadow_report_stored finds by its ring entry's writer and
+# schedule_report_not_posted grades; and `findings_snapshot`, which
+# findings_queue_untouched diffs the queue against. The schedule's
+# status.lastOutcome is the fired run's, unless a cadence slot comes due
+# before the turn is graded.
 #
 # Access: kubectl get and annotate on the schedule, and kubectl exec into the
 # gateway's agent container for the clock, the state file and the findings

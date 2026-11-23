@@ -709,7 +709,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # (required by the verifier's model) and `check_prefix` say whose rows.
     "findings_queue_untouched": (),
     # This repository, schedule-status-reading. No field: "the fired run's
-    # report went to no chat" is the whole assertion; `schedule` names the run.
+    # report went to no chat" is the whole assertion; `schedule` names the
+    # AgentSchedule whose fired run is graded.
     "schedule_report_not_posted": (),
     # This repository, agent-pod-reading: how many of a workload's events the
     # session daemon folded into its newest incident. The count is the

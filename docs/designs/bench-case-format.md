@@ -496,8 +496,10 @@ a registration, a verification, an absence downgrade, a patch or a surfacing mar
 writers' rows are not read; and `schedule_report_not_posted` reads an AgentSchedule's `status.recentRuns`
 and fails when the fired run's delivery posted or tried to (`posted`, `post_failed`, `post_unknown`) or
 was chat that only the outcome kept quiet (`stored_no_home`, `silent`); a delivery not reported yet is an
-error. All three take `since_state_file`, which the `builtin-schedule-run-now` stack writes with the fire
-time, the fired run's task and the queue snapshot. `report_store_reply`, in its own module
+error. `since_state_file`, which the `builtin-schedule-run-now` stack writes with the fire time, the fired
+run's task and the queue snapshot, is required on `findings_queue_untouched` and optional on the other two.
+`shadow_report_stored` needs the image's `report_query.py` to take `--include-shadow` (#6958) and a
+store-only finish (#6956); until then it reports error. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
