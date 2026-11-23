@@ -1330,6 +1330,34 @@ class WebhookBackendTest(unittest.TestCase):
         graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], *LIVE)
         self.assertEqual((graded["blocking"], graded["outage"], graded["evaluated"]), ([], [], 1))
 
+    def test_a_webhook_whose_backend_answered_is_named_under_answered(self):
+        # The identity of a finding and nothing else: the configuration, its kind, the webhook and
+        # the Service. A reader that asks which webhooks the run checked gets the names here.
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], *LIVE, kind="MutatingWebhookConfiguration")
+        self.assertEqual(
+            graded["answered"],
+            [{"webhook": "gate/g.example.com", "config_kind": "MutatingWebhookConfiguration", "config": "gate", "name": "g.example.com", "service": "scen/gate-svc"}],
+        )
+
+    def test_evaluated_is_the_three_lists_together(self):
+        # One webhook per list beside the three that are counted and not checked: `evaluated` is
+        # the webhooks whose backend the run checked, and each of them is in exactly one list.
+        off_path = [rule(["configmaps"])]
+        hooks = [
+            hook("live.example.com", POD_GATE, policy="Fail"),
+            hook("dead-on-path.example.com", POD_GATE, policy="Fail", service=("scen", "gone-svc")),
+            hook("dead-off-path.example.com", off_path, policy="Fail", service=("scen", "gone-svc")),
+            hook("open.example.com", POD_GATE, policy="Ignore"),
+            hook("url.example.com", POD_GATE, policy="Fail", service=None, url="https://localhost:5443/v"),
+            hook("empty.example.com", [], policy="Fail"),
+        ]
+        graded = grade(hooks, *LIVE)
+        self.assertEqual([f["name"] for f in graded["answered"]], ["live.example.com"])
+        self.assertEqual([f["name"] for f in graded["blocking"]], ["dead-on-path.example.com"])
+        self.assertEqual([f["name"] for f in graded["outage"]], ["dead-off-path.example.com"])
+        self.assertEqual(graded["evaluated"], len(graded["answered"]) + len(graded["blocking"]) + len(graded["outage"]))
+        self.assertEqual((graded["fail_open"], graded["url_backends"], graded["no_rules"]), (1, 1, 1))
+
     def test_endpoint_without_a_ready_condition_counts_as_ready(self):
         graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [None])])
         self.assertEqual(graded["blocking"], [])
@@ -1411,7 +1439,7 @@ class WebhookBackendTest(unittest.TestCase):
 
     def test_fail_open_and_url_backends_are_counted_not_graded(self):
         graded = grade([hook("a.example.com", POD_GATE, policy="Ignore"), hook("e.example.com", POD_GATE, policy="Fail", service=None, url="https://localhost:5443/v")])
-        self.assertEqual((graded["blocking"], graded["outage"]), ([], []))
+        self.assertEqual((graded["blocking"], graded["outage"], graded["answered"]), ([], [], []))
         self.assertEqual((graded["fail_open"], graded["url_backends"], graded["evaluated"]), (1, 1, 0))
 
 

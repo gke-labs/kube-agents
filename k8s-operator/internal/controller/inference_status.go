@@ -26,7 +26,9 @@ import (
 // states it. The value is the litellm_params.model of the model_list entry named
 // agentModelName, split at its first separator into a provider and a name, both
 // non-empty. A resource reference keeps its resource id only, so a project id, a region
-// or an account id never reaches the status.
+// or an account id never reaches the status. The same entry's reasoning_effort rides
+// along as a third value: a non-empty string with no whitespace, as typed, or nothing;
+// a malformed effort drops the effort alone and the pair stays.
 const (
 	// litellmConfigMapName is the LiteLLM config ConfigMap the chart writes.
 	litellmConfigMapName = "litellm-config"
@@ -56,13 +58,16 @@ const (
 	inferenceNewerField = "status.inference"
 )
 
-// The info gauge: one sample at 1 per PlatformAgent whose status.inference holds both
-// fields, labelled with the agent (the usage gauges' two labels) and the pair, so
-// sum by (provider, model) over a shared project is the headcount.
+// The info gauge: one sample at 1 per PlatformAgent whose status.inference holds the
+// pair, labelled with the agent (the usage gauges' two labels), the pair and the
+// reasoning effort (empty while the status holds none), so sum by (provider, model)
+// over a shared project is the model headcount and sum by (reasoning_effort) the
+// effort headcount.
 const (
-	inferenceGaugeName          = "kubeagents_platformagent_model"
-	inferenceGaugeProviderLabel = "provider"
-	inferenceGaugeModelLabel    = "model"
+	inferenceGaugeName                 = "kubeagents_platformagent_model"
+	inferenceGaugeProviderLabel        = "provider"
+	inferenceGaugeModelLabel           = "model"
+	inferenceGaugeReasoningEffortLabel = "reasoning_effort"
 	// inferenceGaugeValue is an info gauge's constant sample value.
 	inferenceGaugeValue = 1
 )
@@ -86,12 +91,16 @@ type litellmConfig struct {
 		ModelName     string `json:"model_name"`
 		LitellmParams struct {
 			Model string `json:"model"`
+			// any, not string: a number or bool here must not fail the whole
+			// unmarshal and take the model pair with it.
+			ReasoningEffort any `json:"reasoning_effort"`
 		} `json:"litellm_params"`
 	} `json:"model_list"`
 }
 
-// inferenceModel is the provider and model pair status.inference carries.
-type inferenceModel struct{ Provider, Model string }
+// inferenceModel is the provider and model pair status.inference carries, with the
+// reasoning effort configured on the entry, or "" when it states none.
+type inferenceModel struct{ Provider, Model, ReasoningEffort string }
 
 // parseLiteLLMDefaultModel reads the default model out of a LiteLLM config file. The
 // entry named agentModelName is the answer when it exists, and a malformed model there
@@ -106,15 +115,31 @@ func parseLiteLLMDefaultModel(configYAML string) (inferenceModel, bool) {
 	}
 	for _, entry := range config.ModelList {
 		if entry.ModelName == agentModelName {
-			return splitInferenceModel(entry.LitellmParams.Model)
+			model, ok := splitInferenceModel(entry.LitellmParams.Model)
+			if ok {
+				model.ReasoningEffort = inferenceReasoningEffort(entry.LitellmParams.ReasoningEffort)
+			}
+			return model, ok
 		}
 	}
 	for _, entry := range config.ModelList {
 		if model, ok := splitInferenceModel(entry.LitellmParams.Model); ok {
+			model.ReasoningEffort = inferenceReasoningEffort(entry.LitellmParams.ReasoningEffort)
 			return model, true
 		}
 	}
 	return inferenceModel{}, false
+}
+
+// inferenceReasoningEffort is the entry's reasoning_effort as a status value: the string
+// as typed when it is non-empty and holds no whitespace, "" otherwise (absent, empty, a
+// number or bool, or a value that would not stay on one line as a label).
+func inferenceReasoningEffort(raw any) string {
+	effort, ok := raw.(string)
+	if !ok || effort == "" || strings.ContainsFunc(effort, unicode.IsSpace) {
+		return ""
+	}
+	return effort
 }
 
 // splitInferenceModel splits a LiteLLM model at its first separator. Both sides must be
@@ -315,8 +340,10 @@ func (r *PlatformAgentReconciler) inferencePruned(agent *agentv1alpha1.PlatformA
 // is nil when the write carried no block. A block written that comes back absent is
 // the served CRD pruning it, the empty pair (a definite negative) included: a CRD that
 // serves the field round-trips {} as a present empty object. A non-empty pair that
-// comes back with both fields empty is pruning too. Either is recorded, and logged
-// once per record. An echo that carries the written pair clears the record.
+// comes back with both fields empty is pruning too, and so is the written pair coming
+// back with the reasoning effort alone dropped: a served CRD from before that field
+// keeps the pair and prunes the effort. Each is recorded under the one record, and
+// logged once per record. An echo that carries everything written clears the record.
 func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wrote *inferenceModel) {
 	if wrote == nil {
 		return
@@ -325,11 +352,13 @@ func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *
 	key := usagePollKey(agent)
 	r.prunedNewerFieldsMu.Lock()
 	defer r.prunedNewerFieldsMu.Unlock()
-	if echoed != nil && echoed.Provider == wrote.Provider && echoed.Model == wrote.Model {
+	if echoed != nil && *echoed == (agentv1alpha1.InferenceStatus{Provider: wrote.Provider, Model: wrote.Model, ReasoningEffort: wrote.ReasoningEffort}) {
 		delete(r.prunedNewerFields[key], inferenceNewerField)
 		return
 	}
-	if echoed != nil && *echoed != (agentv1alpha1.InferenceStatus{}) {
+	effortPruned := echoed != nil && echoed.Provider == wrote.Provider && echoed.Model == wrote.Model &&
+		echoed.ReasoningEffort == "" && wrote.ReasoningEffort != ""
+	if echoed != nil && *echoed != (agentv1alpha1.InferenceStatus{}) && !effortPruned {
 		return
 	}
 	if r.prunedNewerFields == nil {
@@ -345,6 +374,19 @@ func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *
 		logf.FromContext(ctx).Info("the served CRD does not serve a status field this operator writes; apply this release's CRD to get it, which is probed again after the interval",
 			"platformagent", key, "field", inferenceNewerField, "reprobeAfter", usageStatusReprobeInterval.String())
 	}
+}
+
+// inferencePairUnchanged reports whether a write held by the pruning record would change
+// nothing the served CRD keeps. With the whole block pruned the served value is absent or
+// empty, so nothing stale can stand and the hold is safe. With the effort alone pruned
+// the served value still carries the pair, so the hold is safe only while that pair is
+// the new value's: a provider or model change, or a negative, writes at once, and only
+// the effort waits for the reprobe.
+func inferencePairUnchanged(served, next *agentv1alpha1.InferenceStatus) bool {
+	if served == nil || *served == (agentv1alpha1.InferenceStatus{}) {
+		return true
+	}
+	return next != nil && served.Provider == next.Provider && served.Model == next.Model
 }
 
 // inferenceStatusEqual reports whether two status.inference values serialise the same:
@@ -364,8 +406,8 @@ type inferenceGauges struct {
 
 func newInferenceGauges(reg prometheus.Registerer) *inferenceGauges {
 	g := &inferenceGauges{
-		model: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: inferenceGaugeName, Help: "A PlatformAgent's default model from status.inference, at 1; absent while the status holds no pair."},
-			[]string{usageGaugeNamespaceLabel, usageGaugeNameLabel, inferenceGaugeProviderLabel, inferenceGaugeModelLabel}),
+		model: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: inferenceGaugeName, Help: "A PlatformAgent's default model and its configured reasoning effort from status.inference, at 1; absent while the status holds no pair, reasoning_effort empty while it holds no effort."},
+			[]string{usageGaugeNamespaceLabel, usageGaugeNameLabel, inferenceGaugeProviderLabel, inferenceGaugeModelLabel, inferenceGaugeReasoningEffortLabel}),
 	}
 	reg.MustRegister(g.model)
 	return g
@@ -375,8 +417,9 @@ func newInferenceGauges(reg prometheus.Registerer) *inferenceGauges {
 var inferenceMetrics = newInferenceGauges(metrics.Registry)
 
 // publish sets the agent's one sample from status.inference, deleting its previous
-// pair first so a collector never sees two models for one agent. No sample while
-// either field is empty.
+// labels first so a collector never sees two models, or two efforts, for one agent.
+// No sample while the provider or model is empty; an empty effort is a sample with an
+// empty reasoning_effort label.
 func (g *inferenceGauges) publish(agent *agentv1alpha1.PlatformAgent) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -385,7 +428,7 @@ func (g *inferenceGauges) publish(agent *agentv1alpha1.PlatformAgent) {
 	if inference == nil || inference.Provider == "" || inference.Model == "" {
 		return
 	}
-	g.model.WithLabelValues(agent.Namespace, agent.Name, inference.Provider, inference.Model).Set(inferenceGaugeValue)
+	g.model.WithLabelValues(agent.Namespace, agent.Name, inference.Provider, inference.Model, inference.ReasoningEffort).Set(inferenceGaugeValue)
 }
 
 // forget drops the agent's sample when the CR is deleted.

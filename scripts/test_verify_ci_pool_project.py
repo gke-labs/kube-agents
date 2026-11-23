@@ -5001,8 +5001,7 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # config_connector.py and orphan_snapshot.py the ones the terraform_data
     # local-execs run, not something tofu loads; their calls are accounted for
     # on the external and terraform_data types above.
-    # config_sync.py is a writer of the same kind that no resource runs yet.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py", "config_sync.py"}
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.

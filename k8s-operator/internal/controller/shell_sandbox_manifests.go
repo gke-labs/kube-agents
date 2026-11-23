@@ -44,7 +44,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -130,11 +129,6 @@ const (
 	envPostMergeCheck = "KUBEAGENTS_POST_MERGE_CHECK"
 	envAutomerge      = "KUBEAGENTS_AUTOMERGE"
 	envDial           = "KUBEAGENTS_DIAL"
-	// The sizing tier whose column of deploy/sandbox/kubectl-costs.json the shell's
-	// kubectl admission charges ("default" when unset). An operator sets it in
-	// spec.deployment.env; deploy/sandbox/entrypoint.sh writes it to a root-owned
-	// file the admission reads, so a session cannot pick a lighter tier.
-	envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -275,10 +269,6 @@ const (
 	// from one place, and so the chart can render the sandbox's Secret from it.
 	shellSandboxPrivateKeySecretKey = "SANDBOX_SSH_PRIVATE_KEY" // #nosec G101 -- Secret key name, not a credential
 )
-
-// kubectlCostTierPattern is a tier name the entrypoint will write: a short
-// lowercase word, as the cost table's tier keys are.
-var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
 var (
 	// The /opt/defaults trees deploy/sandbox/Dockerfile ships and the
@@ -616,16 +606,11 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 				break
 			}
 		}
-		// The tier the same way: a literal only, and only a plain lowercase name,
-		// since the entrypoint writes it to a file the admission opens by name.
-		for _, v := range agent.Spec.Deployment.Env {
-			if v.Name == envKubectlCostTier && v.ValueFrom == nil {
-				if tier := strings.ToLower(strings.TrimSpace(v.Value)); kubectlCostTierPattern.MatchString(tier) {
-					env = append(env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
-				}
-				break
-			}
-		}
+	}
+	// The tier the same way: a literal only, and only a plain lowercase name,
+	// since the entrypoint writes it to a file the admission opens by name.
+	if tier, ok := kubectlCostTier(agent); ok {
+		env = append(env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
 	}
 	env = append(env, autonomySwitchEnv(agent)...)
 

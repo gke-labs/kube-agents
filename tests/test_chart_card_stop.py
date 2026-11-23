@@ -67,10 +67,10 @@ class CardStopRenderTest(unittest.TestCase):
 
     def test_enabled_beside_the_other_flags_keeps_each(self):
         env = _manager_env("--set", "operator.cardStop.enabled=true",
-                           "--set", "operator.mcpServer.enabled=true",
+                           "--set", "operator.mcpServer.enabled=false",
                            "--set", "operator.profileDispatcher.enabled=false")
         self.assertEqual([{"name": _FLAG, "value": "true"}], _flag_entries(env))
-        self.assertIn({"name": "A2A_MCP_DOOR", "value": "true"}, env)
+        self.assertIn({"name": "A2A_MCP_DOOR", "value": "false"}, env)
         self.assertIn({"name": "A2A_PROFILE_DISPATCHER", "value": "false"}, env)
 
     def test_disabled_sets_no_flag(self):

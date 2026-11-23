@@ -48,8 +48,28 @@ import (
 // holds both, and each empty home is reported, Chat first. A platform
 // without a home has its posts sent to the other's home channel when that
 // one has a home, and kept for the digest when neither has. With no record,
-// Slack's message says a mention sets the channel.
+// Slack's message says a mention sets the channel. Teams, armed by the
+// operator switch, is a third backend of the same condition: its sentence
+// names no install.env key (the installer has none), and its home takes the
+// others' posts meanwhile as theirs take its.
 func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
+	t.Setenv(a2aTeamsBackendEnvVar, "true")
+	teamsHome := func(home string) func() string {
+		return func() string {
+			a := teamsTestAgent(true)
+			a.Spec.Integration.Teams.HomeChannel = home
+			return homeChannelUnsetMessage(a, homeChannelRecord{})
+		}
+	}
+	chatAndTeams := func(chatHome, teamsHome string) func() string {
+		return func() string {
+			a := gchatTestAgent("next", true)
+			a.Spec.Integration.GoogleChat.HomeChannel = chatHome
+			a.Spec.Integration.Teams = teamsTestAgent(true).Spec.Integration.Teams
+			a.Spec.Integration.Teams.HomeChannel = teamsHome
+			return homeChannelUnsetMessage(a, homeChannelRecord{})
+		}
+	}
 	slackHome := func(mode, home string) func() string {
 		return func() string {
 			a := slackTestAgent(mode, true)
@@ -107,6 +127,13 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 			return homeChannelUnsetMessage(a, homeChannelRecord{channel: "C0123ABCD", recorded: "C0123ABCD"})
 		}, nil, nil},
 		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil, nil},
+		{"teams, no home", teamsHome(""), []string{"Microsoft Teams", "spec.integration.teams.homeChannel", "a Teams conversation id", "keeps them"}, []string{"install.env", "A2A_TEAMS_HOME_CHANNEL"}},
+		{"teams, home set", teamsHome(teamsTestHome), nil, nil},
+		// A malformed Teams home is the gateway's refusal, not this condition.
+		{"teams, malformed home", teamsHome("19:a b@thread.tacv2"), nil, nil},
+		{"chat and teams, no home", chatAndTeams("", ""), []string{"holds Google Chat", "holds Microsoft Teams", "keeps them"}, []string{"home channel meanwhile"}},
+		{"chat and teams, teams home set", chatAndTeams("", teamsTestHome), []string{"holds Google Chat", "go to Microsoft Teams' home channel meanwhile"}, []string{"holds Microsoft Teams", "keeps them"}},
+		{"chat and teams, chat home set", chatAndTeams("spaces/AAA", ""), []string{"holds Microsoft Teams", "go to Google Chat's home channel meanwhile"}, []string{"holds Google Chat", "keeps them"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.msg()
@@ -128,6 +155,9 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 			}
 			if c, sl := strings.Index(got, "holds Google Chat"), strings.Index(got, "holds Slack"); c >= 0 && sl >= 0 && c > sl {
 				t.Errorf("Chat's sentence must come first: %q", got)
+			}
+			if c, tm := strings.Index(got, "holds Google Chat"), strings.Index(got, "holds Microsoft Teams"); c >= 0 && tm >= 0 && c > tm {
+				t.Errorf("Chat's sentence must come before Teams': %q", got)
 			}
 			if !strings.Contains(got, "keeps them") && !strings.Contains(got, "home channel meanwhile") {
 				t.Errorf("message must say where the posts go meanwhile, not just that a field is empty: %q", got)

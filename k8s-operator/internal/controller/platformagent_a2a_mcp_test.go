@@ -38,13 +38,29 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// Anything but an exact "true" leaves the door shut, the inject backend's
-// rule: a typo must not open a door.
-func TestTheMCPDoorFlagFailsShut(t *testing.T) {
-	for value, want := range map[string]bool{"true": true, "": false, "TRUE": false, "1": false, "yes": false, " true": false} {
+// The MCP server is on by default when A2A_MCP_DOOR is unset or empty, follows
+// strconv.ParseBool when set, and fails closed (off, logged once) on an
+// unparseable value.
+func TestTheMCPDoorEnvVar(t *testing.T) {
+	for value, want := range map[string]bool{
+		"": true, " \n\t ": true,
+		"true": true, "TRUE": true, "True": true, " true\n": true, "1": true, "t": true, "T": true,
+		"false": false, "FALSE": false, "False": false, " false\n": false, "0": false, "f": false, "F": false,
+		"no": false, "off": false, "yes": false, "on": false, "bogus": false, " bogus ": false,
+	} {
 		t.Setenv(a2aMCPDoorEnvVar, value)
 		if got := a2aMCPDoorEnabled(); got != want {
 			t.Errorf("%s=%q: enabled = %v, want %v", a2aMCPDoorEnvVar, value, got, want)
+		}
+	}
+	for _, valid := range []string{"", "true", "TRUE", "1", "false", "FALSE", "0"} {
+		if _, logged := a2aRefusedMCPDoorValues.Load(valid); logged {
+			t.Errorf("valid %s=%q was logged as unparseable", a2aMCPDoorEnvVar, valid)
+		}
+	}
+	for _, bad := range []string{"no", "off", "bogus"} {
+		if _, logged := a2aRefusedMCPDoorValues.Load(bad); !logged {
+			t.Errorf("unparseable %s=%q was not logged", a2aMCPDoorEnvVar, bad)
 		}
 	}
 }
@@ -74,13 +90,13 @@ func TestTheBusFenceAdmitsTheMCPServerOnlyUnderItsFlag(t *testing.T) {
 		return false
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	off := buildA2ANATSNetworkPolicy(agent)
 	if admits(off, a2aNATSClientPort) || admits(off, a2aNATSWebSocketPort) {
 		t.Error("the bus fence admits the MCP pod with the flag off")
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "")
 	on := buildA2ANATSNetworkPolicy(agent)
 	if !admits(on, a2aNATSClientPort) {
 		t.Error("the bus fence does not admit the MCP pod on 4222 with the flag on")
@@ -153,18 +169,19 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	if window := sp.PeriodSeconds * sp.FailureThreshold; window < 120 {
 		t.Errorf("the startup probe allows %ds for the first bus connect, want minutes", window)
 	}
+	assertWriterEphemeral(t, "a2a mcp container", c, emptyDirLogsAllowance)
 }
 
 // The creds Secret holds every static user's password. The MCP pod gets its
 // own, console-mcp's, and nothing else, and its only other Secret is its own
 // token.
-// With broker access on (A2A_MCP_DOOR=true on a next install) it also holds
+// With broker access on (the default; off at A2A_MCP_DOOR=false) it also holds
 // exactly one projected token, for the broker's mcp audience and nothing else;
 // with it off, none.
 func TestTheMCPPodHoldsItsBusPasswordAndItsOwnTokenOnly(t *testing.T) {
 	for _, brokerOn := range []bool{false, true} {
 		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
-			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "false", true: ""}[brokerOn])
 			agent := a2aTestAgent()
 			pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
 			secrets := map[string]*corev1.SecretVolumeSource{}
@@ -363,7 +380,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 	// ours: the removal skips it rather than failing the whole reconcile,
 	// and leaves it alone.
 	t.Run("with the flag off an unowned Secret is skipped, not fatal", func(t *testing.T) {
-		t.Setenv(a2aMCPDoorEnvVar, "")
+		t.Setenv(a2aMCPDoorEnvVar, "false")
 		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
 			Data: map[string][]byte{a2aMCPAccessKey: []byte("chosen-by-someone-else")}}
 		r, cl := mcpTestReconciler(t, squatter)
@@ -409,7 +426,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 		return err == nil
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "")
 	if _, err := r.reconcileA2AMCP(ctx, agent, false); err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +447,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 		t.Fatal("the MCP server's objects are not all there with the flag on")
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	if _, err := r.reconcileA2AMCP(ctx, agent, false); err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +512,7 @@ func TestTheMCPFenceWaitsForThePodToGo(t *testing.T) {
 // ours either: with no MCP pod left, the removal skips it rather than
 // failing the reconcile, and leaves it standing.
 func TestTheFlagOffMCPRemovalSkipsAnUnownedFence(t *testing.T) {
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	ctx := context.Background()
 	agent := a2aTestAgent()
 	squatter := buildA2AMCPNetworkPolicy(agent)
@@ -552,7 +569,7 @@ func TestTheMCPRemovalReadsEachObjectOnce(t *testing.T) {
 func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
 	for _, brokerOn := range []bool{false, true} {
 		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
-			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "false", true: ""}[brokerOn])
 			agent := a2aTestAgent()
 			pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
 			if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 || len(pod.EphemeralContainers) != 0 {
@@ -590,7 +607,7 @@ func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
 func TestTheMCPPodEnvCarriesNoConsolePassword(t *testing.T) {
 	for _, brokerOn := range []bool{false, true} {
 		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
-			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "false", true: ""}[brokerOn])
 			pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
 			for _, c := range append(slices.Clone(pod.InitContainers), pod.Containers...) {
 				for _, e := range c.Env {
@@ -614,7 +631,7 @@ func TestTheMCPPodEnvCarriesNoConsolePassword(t *testing.T) {
 // the gateway; what it must not do is add the console door a second time.
 func TestTheMCPDoorLeavesTheGatewaysConsoleDoorAlone(t *testing.T) {
 	agent := a2aTestAgent()
-	for _, flag := range []string{"", "true"} {
+	for _, flag := range []string{"false", "", "true"} {
 		t.Setenv(a2aMCPDoorEnvVar, flag)
 		n, value := 0, ""
 		for _, c := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers {
@@ -639,7 +656,7 @@ func TestTheMCPDoorLeavesTheGatewaysConsoleDoorAlone(t *testing.T) {
 func TestTheMCPGoMemLimitIs85PercentOfTheContainerLimit(t *testing.T) {
 	for _, brokerOn := range []bool{false, true} {
 		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
-			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "false", true: ""}[brokerOn])
 			pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
 			if len(pod.Containers) != 1 {
 				t.Fatalf("%d containers; want one", len(pod.Containers))

@@ -46,7 +46,9 @@ where `bench/kube_agents_bench/fixture_drift.py` turns each `drifted` role
 into a `fixture-drift:<role>` infrastructure record for the cases that need
 it. Detection is this script's whole job: it repairs nothing. The reconcile's
 re-apply (hack/fleet_reconcile.py) repairs drift, and only the reconcile's
-reset of the VM repairs a rotated serial console (`serial_contains`).
+reset of the startup-fail VM repairs that VM's rotated serial console
+(`serial_contains`); the serial-flood VM's own flood pass repairs its missing
+filler, and a one-off hand reset is the repair when that flood breaks.
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline
@@ -57,15 +59,18 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-world-open firewall rule and its VM, the peered jumbo-frame network, the two
-orphaned snapshots) is published as `<role>.confirmed` alone, and its subjects
+serial-flood VM, the world-open firewall rule and its VM, the peered
+jumbo-frame network, the two orphaned snapshots) is published as
+`<role>.confirmed` alone, and its subjects
 are read with `gcloud compute instances list`, `gcloud compute firewall-rules
 list`, `gcloud compute networks list` or `gcloud compute snapshots list` in the
 project. A cluster role can carry one such subject too, `reservation/<prefix>*`,
 read with `gcloud compute reservations list`. `serial_contains` reads an instance subject's serial port 1 output as
 well, with `gcloud compute instances get-serial-port-output`: the startup-fail
 VM's failure line is printed at boot only, and the buffer that holds it rotates
-within weeks. `source_disk_gone` reads the project's disks for the name a
+within weeks; the serial-flood VM's flood filler is the opposite designed
+state, the console whose boot lines have rotated out, which the VM itself
+renews daily. `source_disk_gone` reads the project's disks for the name a
 snapshot's `sourceDisk` ends in.
 
 One kind of assertion is a clock rather than a shape: `ready_after_hours`,
@@ -206,6 +211,13 @@ DISKS_COLLECTION = "disks"
 # What gcloud prints, with exit 0, when a part of a list did not answer (a zone
 # that failed, a refused request): the list is then not the whole project's.
 PARTIAL_LIST_WARNING = "Some requests did not succeed"
+# Under that warning gcloud lists each part that failed as one item with this
+# start, and this is the reason when it lists none.
+PARTIAL_LIST_ITEM_START = "- "
+PARTIAL_LIST_NO_ITEM = "gcloud named no failed part"
+# The exit status of a tool that is there and cannot be started, as a shell
+# has it for a file that is not executable.
+STATUS_CANNOT_EXECUTE = 126
 
 # Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
 # discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;
@@ -307,8 +319,10 @@ READY_AT = "ready at"
 # Ops a `--wait` cannot see converge, so their drift does not hold the pass:
 # the clock clears an age, in hours (and the one drift `ready_after_hours`
 # writes, a timestamp that is not one, is a second snapshot under the prefix
-# or a broken one, which a hand deletion clears), only a reboot of the VM
-# (the next reconcile's reset) puts a rotated line back on a serial console,
+# or a broken one, which a hand deletion clears); a `serial_contains` drift
+# clears per role on a clock no scan should wait on (only a reboot puts the
+# startup-fail VM's failure line back, and the serial-flood VM's flood pass
+# restores its filler a few minutes after a boot, longer than a pass waits);
 # only the next reconcile's re-run of the planter deletes a re-created source
 # disk, and only an operator's replace puts the seeded file back.
 OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_READY_AFTER_HOURS, OP_SERIAL_CONTAINS, OP_SOURCE_DISK_GONE, OP_AS_SEEDED})
@@ -657,6 +671,10 @@ def _run(cmd: list[str], timeout: float) -> tuple[int, str, str]:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        # Not executable, the wrong binary format, a path through a file: the
+        # read failed before the tool ran, and the text says how.
+        return STATUS_CANNOT_EXECUTE, "", str(exc)
     except subprocess.TimeoutExpired:
         return 124, "", f"timed out after {timeout:g}s: {' '.join(cmd)}"
     return proc.returncode, proc.stdout, proc.stderr
@@ -718,6 +736,20 @@ def _objects(kind: str, out: str) -> list[dict]:
     raise Unreadable(f"kubectl get {kind} printed an unexpected document")
 
 
+def _partial_list_reasons(err: str) -> str:
+    """Why gcloud read a list only in part: the items under its warning, one for
+    each part that failed. The last line of stderr is not the reason: after an
+    answer with no item, gcloud ends with a warning about the filter's key."""
+    lines = err.splitlines()
+    start = next(i for i, line in enumerate(lines) if PARTIAL_LIST_WARNING in line)
+    items = [
+        line.strip()[len(PARTIAL_LIST_ITEM_START):].strip()
+        for line in lines[start + 1 :]
+        if line.strip().startswith(PARTIAL_LIST_ITEM_START)
+    ]
+    return "; ".join(items) or PARTIAL_LIST_NO_ITEM
+
+
 def _compute_list(project: str, collection: str, name_filter: str) -> list[dict]:
     """`gcloud compute <collection> list` in `project`, filtered on the name.
     None there is an observation (an empty list), which an assertion may fail
@@ -733,7 +765,7 @@ def _compute_list(project: str, collection: str, name_filter: str) -> list[dict]
     if PARTIAL_LIST_WARNING in err:
         # An empty or short list here is not an observation: an `absent` or
         # `none_eq` assertion would pass on what gcloud could not read.
-        raise Unreadable(f"compute {collection} list was partial: {err.strip().splitlines()[-1]}")
+        raise Unreadable(f"compute {collection} list was partial: {_partial_list_reasons(err)}")
     try:
         doc = json.loads(out)
     except ValueError as exc:

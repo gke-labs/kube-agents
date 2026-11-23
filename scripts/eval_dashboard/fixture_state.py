@@ -183,6 +183,10 @@ NO_OUTPUT = "no output"
 # reason fits on one line of a Chat message or an issue.
 ERROR_LINE_PREFIX = "ERROR"
 REASON_MAX_CHARS = 300
+# The status of a tool that is there and cannot be started (not executable, the
+# wrong binary format, a spawn that fails), as a shell has it. The text beside
+# it is the error with its class.
+STATUS_CANNOT_EXECUTE = 126
 
 # The runner's warnings that explain an unpublished role, most specific
 # first: a role named, its slot named, then the project-wide ones.
@@ -281,11 +285,14 @@ def _error_summary(text: str) -> str:
 
 
 def _run(cmd: list[str], env: dict, timeout: float, runner=subprocess.run) -> tuple[int, str, str]:
-    """(rc, stdout, stderr); rc 124 on a timeout, 127 when the binary is missing."""
+    """(rc, stdout, stderr); rc 124 on a timeout, 127 when the binary is missing,
+    126 when it is there and cannot be started."""
     try:
         proc = runner(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        return STATUS_CANNOT_EXECUTE, "", f"{type(exc).__name__}: {exc}"
     except subprocess.TimeoutExpired as exc:
         err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         return 124, "", err
