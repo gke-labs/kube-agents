@@ -1,4 +1,7 @@
-# NIGHTLY (hack/eval/nightly-cases.txt). Case 1 of gke-labs/kube-agents#6343:
+# PARKED — FIXTURE_NOT_READY in scripts/validate_bench_cases.py on #6905: it
+# needs a no-PDB workload of its own and a Config Sync reconciler on the seeded
+# fleet. When they exist, register it in hack/eval/nightly-cases.txt.
+# Case 1 of gke-labs/kube-agents#6343:
 # the eval record for the post-merge check #6311 turned on.
 #
 # WHAT THIS GRADES. The verify-after-merge loop: once a no-pdb fix the install

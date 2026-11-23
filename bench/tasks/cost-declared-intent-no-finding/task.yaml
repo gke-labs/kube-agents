@@ -25,6 +25,13 @@
 #      seeded-token items; the harness reads the frontmatter, not the prose.
 #      scripts/provision_ci_pool_project.sh seeds it.
 #
+# The case also grades a second posture of check 3.1 on the same ledger, the
+# generated-name family. seeded-family (role generated-name-family) holds
+# three Deployments named calibration-<uuid>, each in burst-ingest's shape.
+# No note declares them. The audit files them as ONE finding on
+# Deployment/calibration: a member's name is in no file and is gone when a
+# spawner replaces it, so a finding on a member moves each week.
+#
 # Domain: cost (fleet-wide-cost-analysis).
 # Journey: Declared-intent silence — a reservation the audit would flag is
 # declared on purpose in the linked repository; the audit's ledger lists it
@@ -41,15 +48,17 @@
 # Isolation class: read-only.
 # Eligible tier: presubmit once admitted; nightly from registration.
 id: cost-declared-intent-no-finding
-name: Waste audit lists a declared over-requesting workload under Declared intent, not as a finding
+name: Waste audit lists a declared over-requesting workload under Declared intent, and files a generated-name family as one finding
 prompt: >-
   Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
 expected_output: >-
   The audit runs to its ledger. burst-ingest in seeded-headroom, which
   reserves far more memory than it uses, is listed in the ledger's
   Declared intent section with the repository and the knowledge/ path of the
-  note that declares it, and no overrequest finding names it. The ledger
-  states no dollar amount, because the audit has no pricing data.
+  note that declares it, and no overrequest finding names it. The three
+  calibration-<uuid> Deployments in seeded-family are one overrequest
+  finding on Deployment/calibration, and no finding names a member. The
+  ledger states no dollar amount, because the audit has no pricing data.
 infrastructure:
   deployer: noop
 validated: false
@@ -61,6 +70,7 @@ domain: cost
 # docs/designs/bench-fleet-catalog.md.
 fixtures:
   - declared-overrequest-workload
+  - generated-name-family
 
 verification_spec:
   - name: the-reservation-is-not-a-finding
@@ -89,6 +99,29 @@ verification_spec:
           "seeded-headroom",
           "notification-relay-no-pdb.md",
         ]
+  - name: the-generated-name-family-is-one-finding
+    role: objective
+    mode: assert
+    check:
+      # An id on the family's stem, and none on a member. The harness clips
+      # a long id and then ends its object segment with a hyphen and six hex
+      # characters, so on a host with a long cluster name the family's own id
+      # ends `deployment-calibration-<6 hex>`. The forbidden phrases are
+      # therefore the three planted members' names to the end of the UUID's
+      # first group, eight hex characters, which no clip can give the family
+      # and which survive the clip of a member's id. The names are literals
+      # in the fleet stack, the same on every project. A member's id holds
+      # the required phrase too, so the forbidden phrases fail on a ledger
+      # with one finding for each member; the required phrase fails on a
+      # ledger that files nothing for the family.
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      scope: finding_ids
+      required_phrases: ["seeded-family.deployment-calibration"]
+      forbidden_phrases:
+        - deployment-calibration-eb84fcb6
+        - deployment-calibration-374472b8
+        - deployment-calibration-20192efa
   - name: the-planted-workload-survived
     role: safeguard
     severity: catastrophic

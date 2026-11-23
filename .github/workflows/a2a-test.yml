@@ -1,8 +1,9 @@
 name: A2A Module Tests
 
-# Unit and conformance tests for the a2a/ Go module. The conformance suite
-# runs against an embedded JetStream server (a test-only dependency), so this
-# job needs no cluster and no credentials.
+# Unit and conformance tests for the a2a/ Go module, and the console page's
+# vitest suite (a2a/web). The conformance suite runs against an embedded
+# JetStream server (a test-only dependency), so this job needs no cluster and
+# no credentials.
 #
 # The auth callout suite additionally wants a real Kubernetes API server, which
 # `setup-envtest` provides as a pair of local binaries - still no cluster, no
@@ -64,14 +65,17 @@ on:
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
       # lib/persona/claudecode's cluster persona tests read the persona, the
-      # cluster skills its copies must match, the two scripts its skills
-      # carry byte-identical copies of, and mcp_policy.py, whose
+      # cluster skills its copies must match, the four scripts its skills
+      # carry byte-identical copies of (scriptSources in
+      # a2a/lib/persona/claudecode), and mcp_policy.py, whose
       # PROFILE_SERVER_TOOLS bounds its servers; cmd/session-persona's
       # TestSourceSkillsTeachNoWrites reads the persona's skills too. An edit
       # to any of them alone has to run those tests.
       - "agents/cluster/persona/**"
       - "agents/platform/scripts/stall_report.py"
       - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+      - "agents/platform/scripts/workload_triage.py"
+      - "agents/platform/skills/version-control/scripts/vcs.py"
       - "agents/platform/scripts/mcp_policy.py"
       # hermes-bridge's incident_test.go reads the incident_context hook to
       # keep the bridge's copy of its frame and token list in step; an edit
@@ -143,6 +147,8 @@ jobs:
               - "agents/cluster/persona/**"
               - "agents/platform/scripts/stall_report.py"
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+              - "agents/platform/scripts/workload_triage.py"
+              - "agents/platform/skills/version-control/scripts/vcs.py"
               - "agents/platform/scripts/mcp_policy.py"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
@@ -271,6 +277,38 @@ jobs:
           # minutes under -race on this runner. 20 minutes stays inside the
           # job's 30 and leaves room for the suite to grow.
           KUBEBUILDER_ASSETS="$ASSETS" NATS_CLI="$NATS_CLI" PATH="$GO_BIN_DIR:$PATH" go test -race -timeout 20m ./...
+
+      # The console page's own unit tests (a2a/web, vitest). They ran nowhere
+      # in CI before this step (#6747): Dockerfile.console runs `npm run
+      # build`, which type-checks and bundles but runs no test, so a
+      # regression in the page's logic (which durables bus.ts polls, what
+      # derive.ts folds) merged unseen. They run inside this required check
+      # for the reason gosec does, and under the same `a2a/**` filter, which
+      # already covers a2a/web. After the Go tests, so the Node this sets up
+      # is not the one the web-console page harness above ran under.
+      #
+      # Node 24 is the version Dockerfile.console builds the page with; vitest
+      # and vite/rolldown declare Node >= 22.12, where package.json's
+      # `engines` says only >=22. `npm ci` takes the flags the Dockerfile
+      # gives it, for the reasons its comment gives. `vitest run` exits
+      # non-zero when it finds no test file, so a moved or renamed suite
+      # fails here rather than passing on nothing. `!cancelled()` runs these
+      # even when a Go step above failed, so a change that breaks both sides
+      # shows both reds rather than only the first.
+      - name: Set up Node for the console page
+        if: ${{ !cancelled() && steps.filter.outputs.a2a == 'true' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "a2a/web/package-lock.json"
+
+      - name: Run the console page's tests
+        if: ${{ !cancelled() && steps.filter.outputs.a2a == 'true' }}
+        working-directory: a2a/web
+        run: |
+          npm ci --legacy-peer-deps --registry=https://registry.npmjs.org
+          npm test
 
       # The one writer; see the twin step in k8s-operator-test.yml.
       - name: Save envtest binaries to the cache

@@ -84,6 +84,10 @@ type BusConfig struct {
 	PasswordFile string
 	Deployment   Deployment
 	Logger       *slog.Logger
+	// ProfileSupervisorCutoff is lib.EnvProfileSupervisorCutoff as read:
+	// zero on an unlatched install, where task reads take both supervisor
+	// forms for every task (lib.WithProfileSupervisorCutoff).
+	ProfileSupervisorCutoff time.Time
 }
 
 // Bus is what the status tool needs from the bus, so the tool can be tested
@@ -115,6 +119,9 @@ type NATSBus struct {
 	// events listens to the console conversations this server knows and
 	// keeps their reports and results.
 	events *Events
+	// kinds is what this server's turns learned of their tasks' kinds, for
+	// the supervisor cutoff (cutoffScreen).
+	kinds taskKinds
 }
 
 // statusRead is one status read in flight: st is its answer once done is
@@ -144,6 +151,7 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if cfg.Logger != nil {
 		opts = append(opts, lib.WithLogger(cfg.Logger))
 	}
+	opts = append(opts, lib.WithProfileSupervisorCutoff(cfg.ProfileSupervisorCutoff))
 	client, err := lib.Connect(ctx, cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
@@ -152,6 +160,14 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 		events: NewEvents(client)}
 	b.readBus = b.read
 	return b, nil
+}
+
+// logger is the configured logger, or slog's default.
+func (b *NATSBus) logger() *slog.Logger {
+	if b.cfg.Logger != nil {
+		return b.cfg.Logger
+	}
+	return slog.Default()
 }
 
 // Events is the server's listener on its conversations' posts.

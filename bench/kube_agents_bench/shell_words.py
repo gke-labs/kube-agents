@@ -8,6 +8,12 @@ attribution (``github_writes``) both read calls through it, so the two
 cannot disagree on where a command starts. It lives in its own module
 because ``verifiers`` imports ``github_writes``.
 
+A NUL character in a line stays in its word. The worker's terminal tool
+passes the line inside one argument of a shell's ``-c`` flag (read in
+hermes-agent v2026.9.14), and an argument cannot hold a NUL character, so no
+shell reads such a line. The reader does not model a shell that drops the
+character.
+
 The agent images copy this one file beside
 ``agents/platform/scripts/worker_transcript.py``, which loads it by path. So
 it imports only the standard library and nothing from this package. That
@@ -45,6 +51,21 @@ _OPERATOR_MARK_RE = re.compile(r"^\x00O(\d+)\x00$")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 # `eval` runs its words, joined by spaces, as a command line of its own (`eval "git push ..."`).
 _SHELL_EVAL = "eval"
+# `eval` joins its words with one space before the shell reads them again.
+_SHELL_EVAL_WORD_SEPARATOR = " "
+# The limits of :func:`_shell_argvs` for one typed line. They are the numbers of the secret-read
+# detector in agents/platform/scripts/worker_transcript.py, which reads the same lines. A command
+# line inside a line (after an `eval`, behind a shell's `-c` flag, in a substitution) is one
+# level; the typed line is level 0, and a command line that a person types nests a few levels.
+# The budget is in characters: each command line that the reader reads costs its length and
+# `_READ_COST_CHARS` more. Without it, a substitution inside an `eval` word, which is read as a
+# span of the line and again in the line that `eval` runs, doubles the reading at each level.
+_MAX_COMMAND_LINE_NESTING = 16
+_MAX_READ_CHARS_FACTOR = 6
+_MAX_READ_CHARS_FLOOR = 65536
+_READ_COST_CHARS = 16
+_NESTING_LIMIT_TEXT = f"more than {_MAX_COMMAND_LINE_NESTING} levels of command lines inside the line"
+_READ_LIMIT_TEXT = f"more reading than {_MAX_READ_CHARS_FACTOR} x the line's length + {_MAX_READ_CHARS_FLOOR} characters"
 # A shell program is unwrapped only where the shell would run it: as the segment's command word,
 # or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
@@ -119,6 +140,10 @@ _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
 # A backslash before a blank in a stored typed call: an escaped space or tab, or what the pod's
 # scrub leaves of an escaped backslash at a line end (`worker_transcript.fold_shell_command`).
 _ESCAPED_BLANK_RE = re.compile(r"\\[ \t]")
+# A heredoc operator anywhere in a typed call's text (`<<` or `<<-`, not the here-string `<<<`).
+# Read on the raw text, quotes and substitutions included, so a quoted `<<` or a shift in an
+# arithmetic span counts too: the caller only keeps such a call on its card log row.
+_HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(?!<)")
 # The checks below read the line as the shell reader keeps it, quotes in place and line
 # continuations gone, so a quote or a backslash that ends a name in bash ends it here too.
 # A word that reads the last argument back (`$_`, `${_}`), or a variable through another
@@ -129,6 +154,12 @@ _READ_BACK_RE = re.compile(r"\$(?:_(?![A-Za-z0-9_])|\{_(?![A-Za-z0-9_])|\{!)")
 # `${!X:=…}`), so it is refused rather than parsed.
 _BRACED_EXPANSION_OPEN = "${"
 _PLAIN_BRACED_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\}|:?-)")
+
+
+class ShellReadLimitError(ValueError):
+    """A command line is past a limit of :func:`_shell_argvs`: its command lines nest deeper than
+    ``_MAX_COMMAND_LINE_NESTING``, or they need more reading than the line's budget. The reader
+    gives no argvs for such a line, so a check that reads argvs cannot be evaluated on it."""
 
 
 def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
@@ -321,7 +352,7 @@ def _is_control_operator(word: str) -> bool:
     return isinstance(word, _ShellOperator) and (word == _SHELL_LINE_END or set(word) <= _SHELL_OPERATOR_CHARS)
 
 
-def _shell_argvs(command: str) -> list[list[str]]:
+def _shell_argvs(command: str, _nesting: int = 0, _budget: list[int] | None = None) -> list[list[str]]:
     """Each segment of a command line as an argv: comments come off and the line is tokenised
     first, so a quoted path is one word and a quoted sentence one word whatever it contains,
     then split where the shell starts a new command. A shell program anywhere on a segment
@@ -329,7 +360,16 @@ def _shell_argvs(command: str) -> list[list[str]]:
     after its ``-c``-style flag, which is read the same way and yields its own argvs; so does
     each command or process substitution and each backtick pair on the line (``OUT=$(python3
     ... --readiness)``, ``cat <(...)``), whose commands the shell runs, and the words after an
-    ``eval``, joined by spaces as ``eval`` joins them."""
+    ``eval``, joined by spaces as ``eval`` joins them. A line whose command lines nest deeper
+    than ``_MAX_COMMAND_LINE_NESTING`` levels, or need more reading than the line's budget,
+    raises :class:`ShellReadLimitError`; ``_nesting`` and ``_budget`` are the reader's own."""
+    if _budget is None:
+        _budget = [_MAX_READ_CHARS_FACTOR * len(command) + _MAX_READ_CHARS_FLOOR]
+    if _nesting > _MAX_COMMAND_LINE_NESTING:
+        raise ShellReadLimitError(_NESTING_LIMIT_TEXT)
+    _budget[0] -= len(command) + _READ_COST_CHARS
+    if _budget[0] < 0:
+        raise ShellReadLimitError(_READ_LIMIT_TEXT)
     words, spans = _shell_words_and_spans(command)
     argvs: list[list[str]] = []
     argv: list[str] = []
@@ -343,19 +383,19 @@ def _shell_argvs(command: str) -> list[list[str]]:
     for argv in list(argvs):
         index = _command_word_index(argv)
         if index is not None and argv[index] == _SHELL_EVAL:
-            argvs.extend(_shell_argvs(" ".join(argv[index + 1:])))
+            argvs.extend(_shell_argvs(_SHELL_EVAL_WORD_SEPARATOR.join(argv[index + 1:]), _nesting + 1, _budget))
             continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
         for flag_index in range(index + 1, len(argv) - 1):
             flag = argv[flag_index]
             if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                argvs.extend(_shell_argvs(argv[flag_index + 1]))
+                argvs.extend(_shell_argvs(argv[flag_index + 1], _nesting + 1, _budget))
                 break
     for span in spans:
         inner = _substitution_commands(span)
         if inner is not None:
-            argvs.extend(_shell_argvs(inner))
+            argvs.extend(_shell_argvs(inner, _nesting + 1, _budget))
     return argvs
 
 
@@ -427,6 +467,12 @@ def _typed_call_may_join(command: str) -> bool:
     if not words:
         return bool(command.strip())
     return any(isinstance(word, _ShellOperator) and word == _SHELL_LINE_END for word in words)
+
+
+def _holds_heredoc(command: str) -> bool:
+    """Whether a typed call's text holds a heredoc operator. The argv reader splits a heredoc
+    body into one argv for each line, so a line written into a file would read as a run."""
+    return bool(_HEREDOC_OPERATOR_RE.search(command))
 
 
 def _can_read_a_word_back(line: str) -> bool:

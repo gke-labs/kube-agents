@@ -364,6 +364,63 @@ func ValidateTriggerStatus(source string, s TriggerStatus) error {
 	return nil
 }
 
+// A trigger's stop (#6052): end one task the gateway started for this source.
+// The operator's reconciler asks on TriggerStopSubject(source) when an
+// AgentSchedule's stop annotation names a new token, with a reply subject in
+// the source's reply namespace, and the gateway answers only for a task it
+// recorded on that source's trigger record: it writes the task's cancel and
+// its dispatcher stop record, so a run still starting has its Job removed and
+// a running one is canceled. A source can stop nothing it didn't start.
+
+// TriggerStopSubjectSuffix ends a2a.trigger.<source>.stop.
+const TriggerStopSubjectSuffix = ".stop"
+
+// TriggerStopSubject is where source asks to stop a task.
+func TriggerStopSubject(source string) string {
+	return TriggerSubmitSubjectPrefix + source + TriggerStopSubjectSuffix
+}
+
+// ParseTriggerStopSubject returns the source of a2a.trigger.<source>.stop.
+func ParseTriggerStopSubject(subject string) (string, error) {
+	rest, ok := strings.CutPrefix(subject, TriggerSubmitSubjectPrefix)
+	if !ok {
+		return "", fmt.Errorf("subject %q is not %s<source>%s", subject, TriggerSubmitSubjectPrefix, TriggerStopSubjectSuffix)
+	}
+	source, ok := strings.CutSuffix(rest, TriggerStopSubjectSuffix)
+	if !ok || !ValidSubjectToken(source) {
+		return "", fmt.Errorf("subject %q is not %s<source>%s", subject, TriggerSubmitSubjectPrefix, TriggerStopSubjectSuffix)
+	}
+	return source, nil
+}
+
+// TriggerStop asks to end one task of one schedule. Its shape is
+// TriggerStatus's, and so are its checks.
+type TriggerStop = TriggerStatus
+
+// ValidateTriggerStop reports the first way s is malformed for source.
+func ValidateTriggerStop(source string, s TriggerStop) error {
+	return ValidateTriggerStatus(source, s)
+}
+
+// The stop's outcomes.
+const (
+	// TriggerStopStopped: the cancel and the stop record were written.
+	TriggerStopStopped = "stopped"
+	// TriggerStopAlreadyFinal: the task had already ended; nothing written.
+	TriggerStopAlreadyFinal = "already_final"
+	// TriggerStopUnknownRun: no run of this schedule's trigger record has
+	// that task, so nothing is written. A source can't stop another's task.
+	TriggerStopUnknownRun = "unknown_run"
+)
+
+// TriggerStopReply is the gateway's answer: an outcome, or a refusal (the
+// reasons of TriggerRefusal: a malformed stop, or a record that couldn't be
+// read).
+type TriggerStopReply struct {
+	Result  string          `json:"result,omitempty"`
+	Refused *TriggerRefusal `json:"refused,omitempty"`
+}
+
 // TriggerStatusReply is the gateway's answer: the task's state, or a
 // refusal (the reasons of TriggerRefusal; unknown for a task the gateway
 // never started for this schedule, or whose record is gone).

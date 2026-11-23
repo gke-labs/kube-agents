@@ -33,6 +33,7 @@ func TestDispatcherGrantsSpellTodaysSubjects(t *testing.T) {
 			"$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-cluster-unattended-child",
 			"$JS.ACK.PROFILE_SUBMITS.profile-cluster-unattended-child.>",
 			"a2a.tasks.cluster.*.supervisor",
+			"a2a.tasks.p.cluster.*.supervisor",
 			"$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.cluster.*",
 		},
 		Subscribe: []string{"a2a.stop.cluster.*"},
@@ -48,7 +49,7 @@ func TestDispatcherGrantsSpellTodaysSubjects(t *testing.T) {
 func TestADrainingProfileGetsNoDurable(t *testing.T) {
 	got := DispatcherGrants([]DispatcherGrantProfile{{Name: "old", Draining: true}})
 	want := DispatcherSubjects{
-		Publish:   []string{"a2a.tasks.old.*.supervisor", "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.old.*"},
+		Publish:   []string{"a2a.tasks.old.*.supervisor", "a2a.tasks.p.old.*.supervisor", "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.old.*"},
 		Subscribe: []string{"a2a.stop.old.*"},
 	}
 	if !reflect.DeepEqual(got, want) {

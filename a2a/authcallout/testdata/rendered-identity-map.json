@@ -1,5 +1,5 @@
 {
-  "version": "91a640efc3273649",
+  "version": "b08247ff4e3653cc",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -82,6 +82,7 @@
           "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
           "chat.notify.gchat",
           "chat.notify.slack",
+          "chat.notify.teams",
           "chat.notify.console",
           "_INBOX.agent.>"
         ],
@@ -167,10 +168,12 @@
           "chat.console.*.confirm",
           "chat.notify.gchat",
           "chat.notify.slack",
+          "chat.notify.teams",
           "chat.notify.console",
           "chat.board.reply.gateway.>",
           "a2a.trigger.*.submit",
           "a2a.trigger.*.status",
+          "a2a.trigger.*.stop",
           "_INBOX.gateway.>"
         ],
         "denyPublish": [

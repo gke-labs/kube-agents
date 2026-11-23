@@ -9,27 +9,20 @@ The path has two pieces. The [MCP server](/kube-agents/reference/a2a-mcp/) runs 
 
 ## Before you start
 
-You need four things:
+You need three things:
 
-- **An installed `PlatformAgent`.** The MCP server is a client of the install's message bus. Check with `kubectl get platformagent -A`.
-- **The MCP server turned on.** It is off by default; the next section turns it on.
+- **An installed `PlatformAgent`.** The MCP server runs by default as a client of the install's message bus. Check with `kubectl get platformagent -A`.
 - **A kubeconfig context for the cluster** the install runs on, which works from a terminal on the same machine. [Reach the cluster](#reach-the-cluster) checks it, including for a private cluster.
-- **Go 1.27 or later**, to build the bridge, on Linux or macOS. The bridge does not build for Windows yet.
+- **Linux or macOS.** The bridge comes prebuilt for both; there is no Windows build yet. Building it yourself instead needs Go 1.27 or later.
 
-## Turn on the MCP server
+## Check the MCP server
 
-The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, and the chart value `operator.mcpServer.enabled: true` sets that variable. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
+The operator renders the MCP server by default beside every `PlatformAgent` it manages (`operator.mcpServer.enabled: true` in the chart; `A2A_MCP_DOOR=false` on the operator or `operator.mcpServer.enabled: false` turns it off). On an install running a release before [the default changed](/kube-agents/install/upgrade/), enable it by setting `TF_VAR_extra_helm_values='{operator={mcpServer={enabled=true}}}'` in `install.env` and running `./upgrade.sh`. If the line already sets other values, add `mcpServer={enabled=true}` inside its `operator` object, since `install.env` holds one such line. On a hand-run `helm upgrade`, pass `--reset-then-reuse-values` or `--set operator.mcpServer.enabled=true`, since `--reuse-values` keeps an earlier release's `enabled: false` default.
 
-```bash
-TF_VAR_extra_helm_values='{operator={mcpServer={enabled=true}}}'
-```
-
-The setting applies to every `PlatformAgent` the operator manages. If the line already sets other values, add `mcpServer={enabled=true}` inside its `operator` object, since there is one such line. On a bare Helm install, pass `--set operator.mcpServer.enabled=true` or set it in your values file. An install that turned the server on with an `A2A_MCP_DOOR` entry in `operator.extraEnv` keeps working, and that entry wins over the value.
-
-Once the operator has restarted and reconciled, the install's namespace holds five objects named after the `PlatformAgent` (`platform-agent` on a default install). They are the server's Deployment, Service and ServiceAccount, its token Secret, and a NetworkPolicy that denies it all in-cluster ingress; a port-forward is not affected:
+Once the operator has reconciled, the install's namespace holds five objects named after the `PlatformAgent` (`platform-agent` on a default install). They are the server's Deployment, Service and ServiceAccount, its token Secret, and a NetworkPolicy that denies it all in-cluster ingress; a port-forward is not affected:
 
 ```bash
-kubectl -n kubeagents-system get deployment,service platform-agent-a2a-mcp
+kubectl -n kubeagents-system get deployment,service,serviceaccount platform-agent-a2a-mcp
 kubectl -n kubeagents-system get secret platform-agent-a2a-mcp-token
 kubectl -n kubeagents-system get networkpolicy platform-agent-a2a-mcp-netpol
 ```
@@ -93,7 +86,7 @@ kubectl --context <context> -n kubeagents-system get service platform-agent-a2a-
 kubectl --context <context> -n kubeagents-system auth can-i create pods/portforward
 ```
 
-When all three work, skip to [Build the bridge](#build-the-bridge).
+When all three work, skip to [Get the bridge](#get-the-bridge).
 
 ### Reaching a private cluster
 
@@ -111,7 +104,27 @@ KUBECTL_PORT_FORWARD_WEBSOCKETS=false kubectl --context <context> -n kubeagents-
 
 The bridge reads the same kubeconfig settings as `kubectl`, a `proxy-url` included, so a context that passes the checks works for the bridge too. Keep any tunnel open while your host runs the bridge.
 
-## Build the bridge
+## Get the bridge
+
+Each GitHub Release from 0.36.0 on attaches the bridge prebuilt for macOS and Linux on amd64 and arm64, as `kube-agents-mcp_<version>_<os>_<arch>.tar.gz`, covered by the release's `checksums.txt`. Download the archive for your machine and the checksums, check it, and put the binary on your `PATH`. For example, for 0.36.0 on an Apple silicon Mac:
+
+```bash
+VERSION=0.36.0 OS=darwin ARCH=arm64
+gh release download "$VERSION" --repo gke-labs/kube-agents \
+  -p "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz" -p checksums.txt
+grep "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz" checksums.txt | shasum -a 256 -c -
+tar -xzf "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz"
+mkdir -p ~/.local/bin
+install -m 0755 "kube-agents-mcp_${VERSION}_${OS}_${ARCH}/kube-agents-mcp" ~/.local/bin/
+```
+
+`~/.local/bin` must be on your `PATH`; macOS doesn't put it there, so add it in your shell's profile, or install into another directory on your `PATH`. On Linux, `sha256sum -c -` takes the place of `shasum -a 256 -c -`.
+
+Without `gh`, download the same two files from the release's page. On macOS a browser download is quarantined, and Gatekeeper can then refuse to run the bridge. Clear the flag with `xattr -d com.apple.quarantine` on the installed binary.
+
+0.35.0 also attached bridge archives, but its binary predates the version output and the step-streaming setting described below. Use 0.36.0 or later.
+
+### Build from source
 
 The bridge is a Go program in the `a2a` module of the kube-agents repository. Install it into `$(go env GOPATH)/bin`:
 
@@ -119,15 +132,15 @@ The bridge is a Go program in the `a2a` module of the kube-agents repository. In
 go install github.com/gke-labs/kube-agents/a2a/cmd/kube-agents-mcp@main
 ```
 
-The module needs Go 1.27; an older `go` command fetches the right toolchain by itself unless `GOTOOLCHAIN=local` is set. To build from a clone instead, run `go build -o kube-agents-mcp ./cmd/kube-agents-mcp` in its `a2a` directory. Check the binary:
+The module needs Go 1.27; an older `go` command fetches the right toolchain by itself unless `GOTOOLCHAIN=local` is set. To build from a clone instead, run `go build -o kube-agents-mcp ./cmd/kube-agents-mcp` in its `a2a` directory.
+
+### Check the binary
 
 ```bash
 kube-agents-mcp --version
 ```
 
 It prints `kube-agents-mcp` and a version: the release for a binary from a release archive, or for a build from source the module version Go recorded (a pseudo-version for `@main`; `dev` when it recorded none). Note the binary's full path (`command -v kube-agents-mcp`): your host starts it by that path.
-
-Newer GitHub Releases also attach the bridge prebuilt for macOS and Linux on amd64 and arm64, as `kube-agents-mcp_<version>_<os>_<arch>.tar.gz`, covered by the release's `checksums.txt`. Releases from before those archives began carry none, so build from source when yours has none.
 
 ## Configure your MCP host
 
@@ -195,7 +208,7 @@ agy --print "Call the kube-agents connection_status tool." \
 ```
 
 :::caution
-A bridge built before the `KUBE_AGENTS_MCP_STREAM_STEPS` setting existed ignores it. Check with `kube-agents-mcp --help`; if its usage lists no `stream-steps` flag, rebuild it, or have the agent pass `stream_steps: false` to `send_message` instead, for example "Use the kube-agents send_message tool with stream_steps false to ask: …".
+A bridge built before the `KUBE_AGENTS_MCP_STREAM_STEPS` setting existed ignores it. Check with `kube-agents-mcp --help`, which ends with a `flag: help requested` line after the usage. If the usage lists no `stream-steps` flag, replace it with a release from 0.36.0 on or a build from source. Or have the agent pass `stream_steps: false` to `send_message` instead, for example "Use the kube-agents send_message tool with stream_steps false to ask: …".
 :::
 
 ### Antigravity editor
@@ -242,7 +255,7 @@ On its first call the bridge connects by itself. It scans every context in your 
 
 To connect, it reads the token from `<name>-a2a-mcp-token` (key `token`) and holds it in memory; the state file never stores it. It then opens a port-forward to the pod behind the `<name>-a2a-mcp` Service, inside its own process, through the Kubernetes API server. Nothing listens on a local port, so you do not run `kubectl port-forward`, and no other process on the machine can reach the server through the bridge. When the pod is replaced, the bridge finds the new one on the next call.
 
-What stays with you: the RBAC above, the server turned on, a working kubeconfig context, and picking an install when there are several.
+What stays with you: the RBAC above, a working kubeconfig context, and picking an install when there are several.
 
 ## A first session
 
@@ -292,7 +305,7 @@ Without the `sleep`, a call against a real cluster fails with `context canceled`
 
 ### Connected to the install, but the server is missing
 
-`fetching MCP token Secret <namespace>/<name>-a2a-mcp-token: ... not found` means the MCP server is not turned on for that install, or the operator has not rendered it yet. `... forbidden` means your account lacks `get` on the Secret. The bridge connects to any install it finds, including ones without the server, so with several installs make sure the one it picked is the one you turned on.
+`fetching MCP token Secret <namespace>/<name>-a2a-mcp-token: ... not found` means the MCP server is turned off on that install (`operator.mcpServer.enabled: false`, an install on a release before [the default changed](/kube-agents/install/upgrade/), or a hand-run `helm upgrade --reuse-values` from one), or the operator has not rendered it yet. `... forbidden` means your account lacks `get` on the Secret. The bridge connects to any install it finds, including ones without the server, so with several installs make sure the one it picked runs the server.
 
 ### Port-forward errors
 

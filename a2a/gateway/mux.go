@@ -244,7 +244,7 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 
 // OpenDirect opens a direct message with a backend-qualified user id
 // (<backend>:<id>) on that backend, with the bare id. A prefix that names a
-// chat backend the mux knows (gchat, slack, discord, console) but does not
+// chat backend the mux knows (gchat, slack, teams, discord, console) but does not
 // run (slack:U1 on a gateway without Slack) is refused by name, on any mux.
 // On a mux with several real backends a caller must qualify the id: a bare
 // id, or one whose prefix names no backend the mux runs, is refused. A mux
@@ -346,6 +346,26 @@ func (m *MultiAdapter) AnswersOnLine(conversation string) bool {
 	}
 	answerer, ok := a.(LineAnswerer)
 	return ok && answerer.AnswersOnLine(conversation)
+}
+
+// AnswersWholeOnLine answers for the backend that owns the conversation
+// (WholeLineAnswerer).
+func (m *MultiAdapter) AnswersWholeOnLine(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	answerer, ok := a.(WholeLineAnswerer)
+	return ok && answerer.AnswersWholeOnLine(conversation)
+}
+
+// PieceSize is the owning backend's (PieceSizer), discordChunk otherwise.
+func (m *MultiAdapter) PieceSize(conversation string) int {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return discordChunk
+	}
+	return pieceSizeOf(a, conversation)
 }
 
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {

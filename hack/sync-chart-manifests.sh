@@ -17,6 +17,9 @@
 #     A2A_GATEWAY_POD_POLICY env is set from too.
 #   - templates/web-console-cr-admission-policy.yaml is config/admission/web-console-cr-policy.yaml,
 #     verbatim, wrapped in the kube-agents.webConsoleCRPolicyEnabled helper.
+#   - templates/agentschedule-builtin-admission-policy.yaml is config/admission/agentschedule-builtin-policy.yaml
+#     under the admission values gate, with the chart's operator identity substituted for the
+#     second of its operator usernames, as for the agent RBAC policy.
 #   - templates/a2a-dispatcher-job-admission-policy.yaml is config/admission/a2a-dispatcher-job-policy.yaml,
 #     likewise, under kube-agents.a2aDispatcherJobPolicyEnabled and A2A_DISPATCHER_JOB_POLICY.
 #   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
@@ -48,6 +51,8 @@ readonly WEB_CONSOLE_CR_VAP_SRC=k8s-operator/config/admission/web-console-cr-pol
 readonly WEB_CONSOLE_CR_VAP_TPL=charts/kube-agents/templates/web-console-cr-admission-policy.yaml
 readonly DISPATCHER_JOB_VAP_SRC=k8s-operator/config/admission/a2a-dispatcher-job-policy.yaml
 readonly DISPATCHER_JOB_VAP_TPL=charts/kube-agents/templates/a2a-dispatcher-job-admission-policy.yaml
+readonly SCHEDULE_BUILTIN_VAP_SRC=k8s-operator/config/admission/agentschedule-builtin-policy.yaml
+readonly SCHEDULE_BUILTIN_VAP_TPL=charts/kube-agents/templates/agentschedule-builtin-admission-policy.yaml
 readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
 readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
 readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
@@ -193,6 +198,26 @@ if $check; then
   rm -f "$tmp"
 else
   mv "$tmp" "$VAP_TPL"
+fi
+
+# The AgentSchedule builtin policy: the agent RBAC policy's gate, and its one
+# substitution, since it exempts the operator by name.
+[[ -f "$SCHEDULE_BUILTIN_VAP_SRC" ]] || fail "admission policy source missing: $SCHEDULE_BUILTIN_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}'
+  echo "# GENERATED from $SCHEDULE_BUILTIN_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# See values.yaml (admissionPolicy) for the gate. The semverCompare half keeps a 1.29 cluster,'
+  echo '# where ValidatingAdmissionPolicy is not v1 yet, installable.'
+  sed "s|'system:serviceaccount:kubeagents-system:kube-agents-operator-sa'|'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'|" "$SCHEDULE_BUILTIN_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$SCHEDULE_BUILTIN_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $SCHEDULE_BUILTIN_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$SCHEDULE_BUILTIN_VAP_TPL"
 fi
 
 # The gateway's pod policy: the same shape, under the helper rather than an inline gate,
