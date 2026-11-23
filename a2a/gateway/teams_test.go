@@ -450,6 +450,15 @@ func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no turn handed over")
 	}
+	// Every pull after the one that carried the activity comes back empty,
+	// and each is counted: the series an idle install shows rising.
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEmpty)) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("no empty pull counted")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	cancel()
 	if err := <-done; err == nil {
 		t.Fatal("Run returned nil after cancel")
@@ -465,8 +474,7 @@ func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
 		}
 	}
 	// The pull that carried the activity is counted under events, and the
-	// turn's lag from the activity's own timestamp is observed once. Whether
-	// an empty long poll followed before the cancel is timing, not asserted.
+	// turn's lag from the activity's own timestamp is observed once.
 	if got := counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEvents)); got != 1 {
 		t.Errorf("events pulls %v, want 1", got)
 	}

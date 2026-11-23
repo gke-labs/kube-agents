@@ -486,6 +486,9 @@ func (a *TeamsAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			}
 			continue
 		}
+		// The receipt time, before the ack's round trip, so the ingress lag
+		// holds only what happened before the gateway had the activity.
+		arrived := time.Now()
 		received++
 		a.metrics.teamsPull(teamsPullEvents)
 		var act teamsActivity
@@ -500,7 +503,7 @@ func (a *TeamsAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			a.log.Info("teams activity is not a turn; acked", "activity", act.ID, "reason", reason)
 			continue
 		}
-		a.metrics.teamsIngress(time.Now(), act.Timestamp)
+		a.metrics.teamsIngress(arrived, act.Timestamp)
 		handler(msg)
 	}
 }
