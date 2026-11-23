@@ -337,7 +337,8 @@ class RemediationCasesTest(unittest.TestCase):
     def test_both_cases_name_the_stream_their_run_writes(self):
         """Neither case has a ledger check, so this line is where the runner
         learns which stream's lock and in-flight note the unit owns. It gives
-        no ledger reset: the runner resets a ledger for a ledger check only."""
+        no ledger reset before a unit: the runner does that for a ledger check
+        only."""
         for case in self._CASES:
             with self.subTest(case=case):
                 self.assertEqual(self._load(case)["audit_streams"], [self._STREAM])

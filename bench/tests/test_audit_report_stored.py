@@ -617,7 +617,8 @@ STORE = "/opt/data/fleet-audit/reports"
     ("command", "status"),
     [
         (f"ls {STORE}/", "fail"),
-        (f"cat {STORE}/acme/infra/fleet-consistency-drift/latest.json", "fail"),
+        # No store path here, so only the pattern on the file name can answer.
+        ("cd /tmp/copy && cat fleet-consistency-drift/latest.json", "fail"),
         ("python3 /opt/data/skills/fleet-audit-reports/scripts/report_query.py --audit fleet-consistency-drift", "fail"),
         (f"python3 {SCRIPTS}/audit_report.py start --audit fleet-consistency-drift", "pass"),
         (f"python3 {SCRIPTS}/audit_report.py finish --audit fleet-consistency-drift --findings-file {DRAFT}", "pass"),
