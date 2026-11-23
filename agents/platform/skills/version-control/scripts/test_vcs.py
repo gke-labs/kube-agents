@@ -1329,13 +1329,14 @@ class BrokerCallTest(unittest.TestCase):
         self.assertEqual(printed["baseBranch"], "main")
 
     def test_a_refusal_part_that_is_a_number_is_kept_beside_a_detail_that_is_left_out(self):
-        error = vcs.VcsError("the forge refused the change", code=422, detail=self.nested_lists(vcs.MAX_PRINT_DEPTH))
+        # The number is a `revision`: a `code` that is not a text is no code (`vcs_client.VcsError`).
+        error = vcs.VcsError("the forge refused the change", revision=422, detail=self.nested_lists(vcs.MAX_PRINT_DEPTH))
         with mock.patch.object(vcs_client, "call", side_effect=error):
             code, printed = self.main_with_the_broker_answer(return_value={})
         self.assertEqual(code, 1)
         self.assertEqual(
             printed,
-            {"error": "the forge refused the change", "code": 422, "detail": "left out: nested too deep to print"},
+            {"error": "the forge refused the change", "revision": 422, "detail": "left out: nested too deep to print"},
         )
 
     def test_an_encoder_that_gives_up_before_the_bound_gives_the_same_two_answers(self):
@@ -1357,6 +1358,17 @@ class BrokerCallTest(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(printed["code"], "FORGE_REJECTED")
             self.assertEqual(printed["detail"], "left out: nested too deep to print")
+
+    def test_an_encoder_error_that_is_not_a_recursion_error_gets_out_of_the_print_step(self):
+        """The clause behind the bound takes RecursionError only: another error of the encoder
+        is not printed as an answer that is nested too deep."""
+        with self.assertRaises(TypeError):
+            vcs._as_text({"entries": {1, 2}})
+        # RecursionError is a RuntimeError; the parent type is not taken either.
+        fault = RuntimeError("another fault of the encoder")
+        with mock.patch.object(vcs.json, "dumps", side_effect=fault), self.assertRaises(RuntimeError) as caught:
+            vcs._as_text({"baseBranch": "main"})
+        self.assertIs(caught.exception, fault)
 
     def test_an_answer_and_a_refusal_that_can_be_printed_are_printed_as_before(self):
         code, printed = self.main_with_the_broker_answer(return_value={"baseBranch": "main", "entries": [[1], {"a": 2}]})

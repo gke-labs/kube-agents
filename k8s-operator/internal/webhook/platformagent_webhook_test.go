@@ -565,6 +565,29 @@ func TestPlatformAgentValidation(t *testing.T) {
 			{"sidecar volume shadowing the name", &agentv1alpha1.DeploymentSpec{
 				SidecarVolumes: []corev1.Volume{{Name: "watcher-credential-proxy-token"}},
 			}, "spec.deployment.sidecarVolumes[0].name"},
+			{"extra volume shadowing the name", &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{Name: "watcher-credential-proxy-token"}},
+			}, "spec.deployment.extraVolumes[0].name"},
+			{"sidecar volume projecting the watcher audience under another name", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{
+					Name: "sneaky-sidecar",
+					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+						Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Audience: "kubeagents-credential-proxy-watcher", Path: "token",
+						}}},
+					}},
+				}},
+			}, "spec.deployment.sidecarVolumes[0].projected.sources[0].serviceAccountToken.audience"},
+			{"extra volume projecting the watcher audience under another name", &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{
+					Name: "sneaky-extra",
+					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+						Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Audience: "kubeagents-credential-proxy-watcher", Path: "token",
+						}}},
+					}},
+				}},
+			}, "spec.deployment.extraVolumes[0].projected.sources[0].serviceAccountToken.audience"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				agent := &agentv1alpha1.PlatformAgent{

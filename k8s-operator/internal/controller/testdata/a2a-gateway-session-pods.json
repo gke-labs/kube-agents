@@ -694,6 +694,10 @@
               "value": "in-cluster"
             },
             {
+              "name": "KUBEAGENTS_KUBECTL_COST_TIER",
+              "value": "default"
+            },
+            {
               "name": "KUBE_PROXY_CA_FILE",
               "value": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
             }

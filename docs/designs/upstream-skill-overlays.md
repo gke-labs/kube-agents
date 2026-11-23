@@ -424,7 +424,6 @@ PR 3 rewrites the `AGENTS.md` Skills Guidelines line for the overlay. PR 4 also 
 - The `skill_sync` source in `tests/conformance/_harness.py` and its C4 test, repointed at the new script; the test stops being a known violation.
 - The Cluster Agent's `gke-workload-security` check, moved from the old script's tests to `tests/test_skill_content.py`.
 - The `Makefile` shellcheck comment and `.prettierignore`.
-- The message in `deploy/docker/check_skill_commands.py`.
 - Comments in two bench tasks, `agents/platform/scripts/gke_endpoint.py` and `scripts/skill_overlay.py`, and the `edit-mirrored-skill` skill.
 - The marker line in the five footers names the old script. Migration keeps it verbatim in `append.md` so the generated tree stays byte-identical; a follow-up rewords it.
 

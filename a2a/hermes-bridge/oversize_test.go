@@ -61,15 +61,22 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 	}
 }
 
-// atCapAnswerBytes is the cap the at-cap test runs the bridge at, two result
-// chunks. The boundary is the same comparison at any cap, and the chat fold
-// and the result publish scale with the answer: at apiResponseCap's 8 MiB the
-// answer took about 10 s to its terminal under the race detector on an idle
-// machine, and on a loaded runner it outran finalizePublishTimeout, so the
-// task ended with no terminal at all. TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed
-// keeps the default cap, which reads and refuses but never folds or
-// publishes.
-const atCapAnswerBytes = 512 << 10
+// atCapAnswerBytes is the cap the at-cap tests run the bridge at, and
+// atCapChunkBytes the result chunk size they run it with, so the answer is
+// two result chunks. The boundary is the same comparison at any cap, and the
+// answer's scrub (scrubAnswer), the chat fold and the result publish scale
+// with the answer: at apiResponseCap's 8 MiB the answer took about 10 s to
+// its terminal under the race detector on an idle machine, and on a loaded
+// runner it outran finalizePublishTimeout, so the task ended with no terminal
+// at all. At 512 KiB the scrub alone, which runs before the publish window
+// opens, took the terminal to 37 s to 42 s of the tests' 60 s wait with
+// twelve busy loops on four cores, and past it in 1 run of 10.
+// TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed keeps the default cap,
+// which reads and refuses but never scrubs, folds or publishes.
+const (
+	atCapAnswerBytes = 64 << 10
+	atCapChunkBytes  = atCapAnswerBytes / 2
+)
 
 // fullCapEnv opts in to TestAPI_AnswerAtTheProductionCapReachesATerminal,
 // and fullCapTerminalWait is its terminal budget. An answer of apiResponseCap
@@ -133,6 +140,7 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	published := make(chan resultPublishCall, 1)
 	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, atCapAnswerBytes)), nil, func(b *Bridge) {
 		b.responseCap = atCapAnswerBytes
+		b.cfg.ResultChunkSize = atCapChunkBytes
 		var foldedAt time.Time
 		fold := b.chatPart
 		b.chatPart = func(answer string) (lib.Part, bool) {
@@ -188,10 +196,13 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 // with the cause only in the bridge log.
 //
 // The limit is the server's, not the bus default of 1 MiB: an answer past
-// 1 MiB spent 40 s in the chat fold before its first publish on a loaded
-// runner, and the refusal is the same comparison at any limit.
+// 1 MiB took 40 s to reach its first publish on a loaded runner, and the
+// refusal is the same comparison at any limit. At 64 KiB the
+// 128 KiB answer's scrub (scrubAnswer) still took the terminal to 9 s to 19 s
+// of the 20 s wait with twelve busy loops on four cores, and past it in 3
+// runs of 10.
 func TestResultPublishFailureCarriesTheCause(t *testing.T) {
-	const pubFailMaxPayload = 64 << 10
+	const pubFailMaxPayload = 8 << 10
 	const chunk = 2 * pubFailMaxPayload
 	_, url := startServerOpt(t, true, func(o *natsserver.Options) { o.MaxPayload = pubFailMaxPayload })
 	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {

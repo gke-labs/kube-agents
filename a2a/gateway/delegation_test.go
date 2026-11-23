@@ -891,6 +891,7 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	waitParentTerminalRelayed(t, r, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "child detached", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
@@ -925,6 +926,7 @@ func TestAStoppedChildBlocksUntilItEnds(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	waitParentTerminalRelayed(t, r, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "child detached", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
@@ -1018,6 +1020,34 @@ func completeTask(t *testing.T, exec *lib.TaskExecution, text string) {
 	}
 }
 
+// waitParentTerminalRelayed waits for the delegating turn's own terminal to
+// be relayed: its line closed at completed, or, on a backend that shows task
+// status itself (no lines), its answer posted alone (answer, when it had
+// one). Not any post containing the answer's words: the child's line note
+// "(delegated to platform)" matches "delegated to platform" the moment the
+// child is minted, before the turn ends. Since one stop cancels the whole
+// tree (#5682), a stop sent before the turn's terminal also cancels the
+// still-running turn (#6782).
+func waitParentTerminalRelayed(t *testing.T, r *rig, answer string) {
+	t.Helper()
+	waitFor(t, "parent terminal relayed", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, terminalLine(lib.StateCompleted, "")) {
+				return true
+			}
+		}
+		if answer == "" {
+			return false
+		}
+		for _, p := range r.adapter.postTexts() {
+			if strings.TrimSpace(p) == answer {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 // delegated runs a session turn that delegates, stamped as arriving through
 // backend ("" is the rig's own; sessionTurnVia), waits for the chain on the
 // record, and ends the delegating turn as the adapter does, waiting for its
@@ -1036,7 +1066,7 @@ func delegated(t *testing.T, r *rig, spawn *fakeSpawner, conv, backend string) (
 		return len(pref.Children) == 1
 	})
 	completeTask(t, exec, "delegated to platform")
-	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	waitParentTerminalRelayed(t, r, "delegated to platform")
 	return origin, session, child
 }
 

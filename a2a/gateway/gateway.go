@@ -1897,7 +1897,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// switch's default branch, which only a nil or detached active task
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
-	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID)
+	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID, g.profileRead(rec, active.TaskID, addressee))
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
@@ -2355,7 +2355,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			}
 		}
 	}
-	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read)
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read, g.profileRead(rec, read, addressee))
 	// What the fold shows about a delegate request, for the hand-off rule
 	// below; nil when the read found nothing to fold.
 	var foldEvidence *delegateEvidence
@@ -2482,7 +2482,7 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 	for i, link := range links {
 		folded := readTask
 		if link.ID != read {
-			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID, g.profileRead(rec, link.ID, link.Addressee))
 			switch {
 			case err == nil:
 				folded = t
@@ -3244,6 +3244,8 @@ type taskStart struct {
 	// the waiting profile tasks above it, set only by a profile parent's
 	// child mint.
 	ProfileChain []string
+	// Scheduled goes onto a profile task's history entry (TaskRef.Scheduled).
+	Scheduled bool
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
 	Role         string
@@ -3447,14 +3449,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
 	// A chat thread's kept reports are forgotten once this turn is on the
 	// bus (below), not here: a publish that fails leaves them for the retry.
-	threadReportsRead := 0
+	var threadReportRead uint64
 	if ts.Role == "" {
-		if report, n, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+		if report, seq, ok := g.relayedReport(rec, ts.ReplyTo); ok {
 			if part, err := lib.PushedReportPart(report); err != nil {
 				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
 			} else {
 				extra = append(extra, part)
-				threadReportsRead = n
+				threadReportRead = seq
 			}
 		}
 	}
@@ -3559,6 +3561,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.Tier = string(ts.Route.Tier)
 		ref.Scope = string(ts.Route.Scope)
 		ref.ProfileChain = ts.ProfileChain
+		ref.Scheduled = ts.Scheduled
 	}
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
@@ -3626,11 +3629,12 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 		return "", false
 	}
-	if threadReportsRead > 0 {
+	if threadReportRead > 0 {
 		// The turn under the thread's newest report is on the bus: the
-		// reports it read are forgotten, so the next turn there is not under
-		// a report it was not about; one kept during the publish stays.
-		g.reports.forgetUpTo(rec.Key, threadReportsRead)
+		// reports through the one it read are forgotten, so the next turn
+		// there is not under a report it was not about; one kept during the
+		// publish stays, at the cap too.
+		g.reports.forgetThrough(rec.Key, threadReportRead)
 	}
 
 	// The submission is on the subject now, which is the first moment
@@ -3712,6 +3716,14 @@ var steerRefusalWhy = map[string]string{
 	lib.SteerReasonNoResume:   "this agent's executor can't continue a session, so follow-ups run on the api executor only",
 }
 
+// ruleSteerChangeRequested names the refusal of a steer into a task that
+// holds ChangeRequested (steerTask), and noticeSteerChangeRequested is what
+// its conversation is told.
+const (
+	ruleSteerChangeRequested   = "steer-change-requested"
+	noticeSteerChangeRequested = "⚠️ not sent: the running task is making a confirmed change, and what it's asked to do can't change while it runs. Stop it, then send what you want as a new confirm."
+)
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
@@ -3739,6 +3751,20 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
 			return
 		}
+	}
+	// A task that holds ChangeRequested was started by a person's
+	// structured confirm and may write. A steer would change what it is
+	// asked to do while it runs, and the gateway can't tell who on a door
+	// sent it (the console's human and its MCP server share one author), so
+	// no steer reaches it from any door: the requester stops the task and
+	// confirms again (#5884). A confirm is already refused while a task
+	// runs (noticeConfirmWhileRunning). Before the author is recorded, as
+	// for the checks below.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.ChangeRequested {
+		g.log.Warn("steer refused", "rule", ruleSteerChangeRequested, "taskId", active.TaskID, "conversation", rec.Key,
+			"steerBackend", author.Backend, "steerAuthor", author.Subject)
+		g.post(rec.Key, noticeSteerChangeRequested)
+		return
 	}
 	// A profile task's grant was minted once, at its authors' tier: a steer
 	// from someone at another tier is refused, before the author is
@@ -3808,7 +3834,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// is promised. A read that fails keeps the route's line. The read is
 	// direct gets (taskStreamEmpty), not a replay, so a steer opens no
 	// consumer.
-	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	empty, emptyErr := g.taskStreamEmpty(ctx, rec, active.TaskID)
 	noFirstEvent := emptyErr == nil && empty
 	if noFirstEvent {
 		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
@@ -3958,7 +3984,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 // payoff the payload spec's replay rule promises.
 func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) {
 	active := rec.ActiveTask
-	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
+	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID, g.profileRead(rec, active.TaskID, rec.Addressee))
 	if err != nil {
 		if _, ok := err.(*lib.A2AError); ok {
 			g.post(rec.Key, "📭 no events on the stream for this task yet")
