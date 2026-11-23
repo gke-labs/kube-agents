@@ -32019,52 +32019,46 @@ class TestReportStore(HarnessTestCase):
     def test_a_root_run_hands_what_it_creates_to_the_stores_owner(self):
         """Mode cannot let uid 1000 write into a root-owned directory; root
         hands every directory and file it creates to the nearest existing
-        directory's owner, so the next scheduled run can write."""
+        directory's owner, so the next scheduled run can write. Always
+        through a descriptor: a chown by name could follow a swapped link."""
         self.reports_dir.parent.mkdir(parents=True, exist_ok=True)
         owner = self.reports_dir.parent.stat()
         chowned = []
-        fchowned = []
         with (
             patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(audit_report.os, "chown", side_effect=AssertionError("chown by name")),
             patch.object(
-                audit_report.os, "chown", side_effect=lambda path, uid, gid, **kw: chowned.append(
-                    (Path(path), uid, gid, kw.get("follow_symlinks", True))
+                audit_report.os, "fchown", side_effect=lambda fd, uid, gid: chowned.append(
+                    (os.fstat(fd).st_ino, stat.S_ISDIR(os.fstat(fd).st_mode), uid, gid)
                 )
-            ),
-            patch.object(
-                audit_report.os, "fchown", side_effect=lambda fd, uid, gid: fchowned.append((fd, uid, gid))
             ),
         ):
             audit_report.write_report(AUDIT, self.envelope(), NOW)
-        ids = {(uid, gid) for _, uid, gid, _ in chowned} | {(uid, gid) for _, uid, gid in fchowned}
-        self.assertEqual(ids, {(owner.st_uid, owner.st_gid)})
+        self.assertEqual({(uid, gid) for _, _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
         directory = self.store_dir()
-        paths = {path for path, _, _, _ in chowned}
+        inodes = {ino for ino, _, _, _ in chowned}
         for created in (self.reports_dir, directory, directory / "runs"):
             with self.subTest(created=created):
-                self.assertIn(created, paths)
-        # One temp file per write, the ring entry and latest.json, each
-        # chowned through its descriptor, never by name.
-        self.assertEqual(len(fchowned), 2)
-        self.assertEqual([path for path in paths if path.suffix == ".tmp"], [])
+                self.assertIn(created.stat().st_ino, inodes)
+        # One temp file per write: the ring entry and latest.json.
+        self.assertEqual(len([1 for _, is_dir, _, _ in chowned if not is_dir]), 2)
 
-    def test_a_root_run_never_chowns_through_a_link(self):
-        """The store's directories are its owner's, so an entry root just made
-        can be swapped for a link before the chown; the chown must land on
-        the link itself, never on what it points at."""
+    def test_a_new_directory_swapped_for_a_link_is_left_alone(self):
+        """The store's directories are its owner's, so a directory root just
+        made can be swapped for a link before its mode and owner are set;
+        neither may land on what the link points at."""
         target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "elsewhere"
-        target.write_text("not the store's", encoding="utf-8")
+        target.mkdir(mode=0o700)
         link = Path(self.enterContext(tempfile.TemporaryDirectory())) / "swapped"
         link.symlink_to(target)
-        calls = []
         with (
             patch.object(audit_report.os, "geteuid", return_value=0),
-            patch.object(
-                audit_report.os, "chown", side_effect=lambda path, uid, gid, **kw: calls.append((Path(path), kw))
-            ),
+            patch.object(audit_report.os, "fchown") as fchown,
+            self.assertRaises(OSError),
         ):
-            audit_report._adopt_owner(link, link.parent.stat())
-        self.assertEqual(calls, [(link, {"follow_symlinks": False})])
+            audit_report._settle_new_dir(link, link.parent.stat())
+        fchown.assert_not_called()
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
 
     def test_another_uids_store_is_named_when_it_is_denied(self):
         """What a root hand-run from before the handover left behind: the
