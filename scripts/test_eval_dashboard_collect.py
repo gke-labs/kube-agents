@@ -1550,6 +1550,30 @@ class TestNightlySource(_MergeBase):
                 calls = log.read_text().splitlines()
                 self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}"])
 
+    def test_a_part_flag_naming_the_main_prefix_under_another_job_is_listed_once(self):
+        """--nightly-job renames the main flag's job, so the job names differ
+        while the prefix is one (#3564): the prefix is listed once, under the
+        main flag, and its runs keep the job that flag gives them."""
+        gcloud, log = self.fake_gcloud([])
+        main_b_prefix = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
+        self.place_nightly_build(BUILD_101_TRUNCATED, periodic=main_b_prefix)
+        for main, part in (
+            (main_b_prefix, main_b_prefix),
+            (main_b_prefix, main_b_prefix.rstrip("/")),
+            (main_b_prefix.rstrip("/"), main_b_prefix),
+        ):
+            with self.subTest(main=main, part=part):
+                log.unlink(missing_ok=True)
+                data, stderr = self.quiet_collect(
+                    nightly_prefix=main, nightly_job=FAKE_NIGHTLY_JOB, nightly_main_b_prefix=part,
+                    gcloud=gcloud, since_days=10000,
+                )
+                self.assertIn(f"warning: --nightly-main-b-prefix names prefix {part}, as --nightly-prefix does; listing it once", stderr)
+                calls = log.read_text().splitlines()
+                self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {main_b_prefix}"])
+                self.assertEqual({r["build_id"]: r["job"] for r in data["runs"]}, {BUILD_101_TRUNCATED: FAKE_NIGHTLY_JOB})
+                self.assertEqual(nightly.night_part(data["runs"][0]), nightly.PART_MAIN)
+
     def test_the_main_flag_naming_the_main_b_job_keeps_its_own_watermark(self):
         """--nightly-prefix pointed at the main-b periodic: its runs are the
         main source of this scan, so they set the main watermark rather than

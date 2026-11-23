@@ -335,6 +335,10 @@ INDEX_POINTER_SUFFIX = ".txt"
 GS_SCHEME = links.GS_SCHEME
 POINTER_EXCERPT_CHARS = 80
 
+# What separates the segments of a gs:// path. A prefix names one place in the
+# bucket with or without a trailing one.
+GS_PATH_SEPARATOR = "/"
+
 # Every bucket read is `gcloud storage ls` or `gcloud storage cat` through
 # this binary (--gcloud overrides it; the tests point it at a fake).
 DEFAULT_GCLOUD = "gcloud"
@@ -2011,6 +2015,11 @@ def _periodic_job(prefix: str) -> str:
     return prefix.rstrip("/").rsplit("/", 1)[-1]
 
 
+def _prefix_key(prefix: str) -> str:
+    """What two spellings of one log prefix share: it without a trailing separator."""
+    return prefix.rstrip(GS_PATH_SEPARATOR)
+
+
 def runs_from_periodic(
     prefix: str,
     gcloud: str = DEFAULT_GCLOUD,
@@ -2594,8 +2603,12 @@ def collect(
     # job, or the writers job under --nightly-main-b-prefix) would list it
     # twice and take that job's runs out of its own watermark: list each
     # job once, under the first flag that names it, and drop the later one.
+    # --nightly-job renames the main flag's job, so a part flag can name the
+    # main flag's prefix under another job: list each prefix once as well,
+    # or its runs are read twice and filed under the later flag's job.
     main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
     listed_by: dict[str, str] = {main_job: "--nightly-prefix"} if main_job is not None else {}
+    prefix_listed_by: dict[str, str] = {_prefix_key(nightly_prefix): "--nightly-prefix"} if nightly_prefix else {}
     for source in part_sources:
         flag, prefix, job, default = source
         if not prefix:
@@ -2603,8 +2616,12 @@ def collect(
         if job in listed_by:
             print(f"warning: {flag} names job {job}, as {listed_by[job]} does; listing it once", file=sys.stderr)
             source[1], source[2] = None, default
+        elif _prefix_key(prefix) in prefix_listed_by:
+            print(f"warning: {flag} names prefix {prefix}, as {prefix_listed_by[_prefix_key(prefix)]} does; listing it once", file=sys.stderr)
+            source[1], source[2] = None, default
         else:
             listed_by[job] = flag
+            prefix_listed_by[_prefix_key(prefix)] = flag
     (_, nightly_writers_prefix, writers_job, _), (_, nightly_main_b_prefix, main_b_job, _), (_, nightly_main_c_prefix, main_c_job, _), (_, nightly_main_d_prefix, main_d_job, _), (_, nightly_main_e_prefix, main_e_job, _), (_, nightly_writers_b_prefix, writers_b_job, _), (_, nightly_writers_c_prefix, writers_c_job, _) = part_sources
     # The mirror case: --nightly-prefix itself naming a part's job. Its runs
     # are the main source here, so only the part jobs it does not name are
