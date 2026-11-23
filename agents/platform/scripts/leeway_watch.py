@@ -125,8 +125,9 @@ CR's `spec.deployment.env`, which the operator's allowlist carries.
 not carried; they are overrides for runs started by hand in the pod. Pass
 `--dry-run` when probing narrower or wider thresholds by hand: it previews the
 exact `due_message` and `resolved_message` blocks a scheduled run would post,
-prefixed with `dry run (nothing posted):`, without mutating `ledger.json`,
-`reports/latest.*`, `last-failure.txt`, or `logs/leeway_watch.log`.
+prefixed with `dry run (nothing posted):` (and prints a failing tick's raw
+detail to stderr), without mutating `ledger.json`, `reports/latest.*`,
+`last-failure.txt`, or `logs/leeway_watch.log`.
 
 State ledger, blackboard topic, and 7-day reminder gate. Under
 `<profile home>/leeway/`:
@@ -2025,6 +2026,7 @@ def record_tick_failure(home: Path, exc: Exception, *, dry_run: bool) -> list[st
         next=next_attempt(needs_admin(reason)),
     )
     if dry_run:
+        print(log_line, file=sys.stderr)
         return [chat_line]
     script_log.append(WATCH_LOG_FILE, [log_line])
     marker = home / FAILURE_MARKER_FILE_NAME

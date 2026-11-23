@@ -522,8 +522,9 @@ alerts once per refresh window. `LEEWAY_WATCH_MIN_SEVERITY`,
 scheduled sweep's alert thresholds and re-post interval from the `PlatformAgent` CR's
 `spec.deployment.env` (the operator's allowlist carries them), and also work
 on runs started by hand in the pod with `--dry-run`, which previews the exact
-due and cleared chat messages prefixed with `dry run (nothing posted):` without
-touching the ledger, reports, failure marker or log. `LEEWAY_WATCH_CLUSTERS`,
+due and cleared chat messages prefixed with `dry run (nothing posted):` (and
+prints a failing tick's raw detail to stderr) without touching the ledger,
+reports, failure marker or log. `LEEWAY_WATCH_CLUSTERS`,
 `LEEWAY_WATCH_PROJECTS` and `LEEWAY_WATCH_HOME` are not carried, so they apply
 only to runs started by hand. The report's
 topology findings (`leeway.contract_violated`, `leeway.placement_drift`,

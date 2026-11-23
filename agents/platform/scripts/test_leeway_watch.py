@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -2462,7 +2462,7 @@ class BatchTests(unittest.TestCase):
     def test_a_dry_run_writes_no_stamps_even_when_the_tick_fails(self) -> None:
         self.roster = {"p1": triples("p1", 2)}
         self.clock = 0.0
-        with self.sandbox(hangs(*self.roster["p1"])), redirect_stdout(io.StringIO()):
+        with self.sandbox(hangs(*self.roster["p1"])), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             watch.tick(now=T0, dry_run=True)
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
@@ -3994,6 +3994,39 @@ class PlainStatusAndDryRunTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(buf_single.getvalue().strip(), expected)
         self.assertIn("SandboxTimedOut: p1: the sandbox run timed out after", self.log_text())
+
+    def test_dry_run_failing_tick_prints_detail_to_stderr_without_touching_log(self) -> None:
+        self.write_roster("30 8 * * *")
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}, clear=False
+        ), mock.patch.object(watch, "declared_scope", return_value=None), mock.patch.object(
+            watch, "roster_projects", return_value=set()
+        ), mock.patch.object(
+            watch, "roster_clusters_by_project", return_value={}
+        ), mock.patch.object(
+            watch.sandbox_exec,
+            "run",
+            return_value=subprocess.CompletedProcess(args=list(watch.CONFIG_PROJECT_ARGV), returncode=1, stdout="", stderr=""),
+        ), redirect_stdout(
+            stdout_buf
+        ), redirect_stderr(
+            stderr_buf
+        ):
+            code = watch.main(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stdout_buf.getvalue().strip(),
+            "**The topology skew check didn't run today.** It has no GCP project to read. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+        self.assertEqual(
+            stderr_buf.getvalue().strip(),
+            f"leeway watch: the tick failed: NoProject: {watch.NO_PROJECT_DETAIL}",
+        )
+        self.assertEqual(self.log_text(), "")
+        self.assertFalse((self.home / watch.FAILURE_MARKER_FILE_NAME).exists())
 
 
 if __name__ == "__main__":
