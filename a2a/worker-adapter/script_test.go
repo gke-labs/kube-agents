@@ -887,6 +887,9 @@ func TestASessionsMembersAreReadFromProcStat(t *testing.T) {
 		"416 sleep S 1 2 3":                      {0, false, false},
 		"417 (sleep) S 1 2":                      {0, false, false},
 		"418 (sleep) S 1 2 three":                {0, false, false},
+
+		// Read from the first ")", this name's fields would be "Z 1 2) S", a zombie with no session.
+		"419 (a) Z 1 2) S 400 419 77 0": {77, true, true},
 	} {
 		sid, live, ok := statSession(line)
 		if sid != want.sid || live != want.live || ok != want.ok {
@@ -920,6 +923,34 @@ func TestASessionsMembersAreReadFromProcStat(t *testing.T) {
 	}
 	if got := sessionMembers(filepath.Join(proc, "missing"), 412); got != nil {
 		t.Errorf("no proc tree: %v; want nothing", got)
+	}
+}
+
+// killSessionSelfEnv tells a re-run of this test binary to be the process killSession must spare.
+const killSessionSelfEnv = "WORKER_ADAPTER_TEST_KILL_SESSION_SELF"
+
+// killSession never signals the worker, even when procRoot lists it in the target session. The
+// sweep runs in a child copy of the test binary, so a sweep that kills itself fails the test
+// rather than ending the run.
+func TestKillSessionSparesTheWorkerListedInTheSession(t *testing.T) {
+	const sid = 4242
+	if proc := os.Getenv(killSessionSelfEnv); proc != "" {
+		self := fmt.Sprint(os.Getpid())
+		if err := os.Mkdir(filepath.Join(proc, self), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stat := fmt.Sprintf("%s (worker) S 1 %d %d 0 -1\n", self, sid, sid)
+		if err := os.WriteFile(filepath.Join(proc, self, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		killSession(proc, sid)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestKillSessionSparesTheWorkerListedInTheSession$") // #nosec G204 -- the test binary itself
+	cmd.Env = append(os.Environ(), killSessionSelfEnv+"="+t.TempDir())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the sweep over a session listing the worker ended it: %v\n%s", err, out)
 	}
 }
 
