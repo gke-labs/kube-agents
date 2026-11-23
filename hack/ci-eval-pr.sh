@@ -240,6 +240,17 @@ readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The agent's own Secret and the key of its API token.
+readonly EVAL_AGENT_TOKEN_SECRET="platform-agent-secrets"
+readonly EVAL_AGENT_TOKEN_SECRET_KEY="API_SERVER_KEY"
+# How many times section 4 tries the read of a Secret, and the wait between two
+# tries. A connection error to the API server is a failure of the read, not a
+# state of the install, and the run has built and deployed the install by then.
+# Four tries with five seconds between them outlast an API server that does not
+# answer for fifteen seconds and the time of the failed calls; a longer loss
+# is not a blip, and the run ends.
+readonly EVAL_SECRET_READ_ATTEMPTS=4
+readonly EVAL_SECRET_READ_RETRY_SECONDS=5
 # The A2A door's token Secret (k8s-operator platformagent_a2a_manifests.go),
 # rendered because hack/ci-deploy.sh turns the door on for every eval install. Only
 # the card-wait stopped ask (#5407) goes through the door.
@@ -3107,7 +3118,41 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down the agent model
-PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+
+# read_secret_data SECRET KEY [KUBECTL_FLAG...]: the encoded .data.KEY of SECRET
+# in TARGET_NAMESPACE, on stdout. A read that fails is tried again, with the
+# error of kubectl on stderr each time. Returns 1 when each try failed.
+read_secret_data() {
+  local secret="$1" key="$2" attempt data
+  shift 2
+  for attempt in $(seq 1 "${EVAL_SECRET_READ_ATTEMPTS}"); do
+    # Captured for each try, so that output of a failed try is not joined to a later one.
+    if data="$(kubectl get secret "${secret}" -n "${TARGET_NAMESPACE}" "$@" -o jsonpath="{.data.${key}}")"; then
+      printf '%s' "${data}"
+      return 0
+    fi
+    echo "WARNING: the read of Secret ${secret} in ${TARGET_NAMESPACE} failed (try ${attempt} of ${EVAL_SECRET_READ_ATTEMPTS})." >&2
+    if [ "${attempt}" -lt "${EVAL_SECRET_READ_ATTEMPTS}" ]; then
+      sleep "${EVAL_SECRET_READ_RETRY_SECONDS}"
+    fi
+  done
+  return 1
+}
+
+# secret_read_failed SECRET KEY: ends the run when each try of a read failed. The
+# message names no cause of its own: the error of kubectl has it.
+secret_read_failed() {
+  echo "ERROR: the read of Secret $1 (key $2) in ${TARGET_NAMESPACE} failed ${EVAL_SECRET_READ_ATTEMPTS} times." >&2
+  echo "       The error of kubectl above gives the cause." >&2
+  exit 1
+}
+
+# No --ignore-not-found here: an absent Secret must stay the end of the run, and
+# with the flag it is a read with no value, which goes on with an empty token.
+
+PLATFORM_AGENT_TOKEN_DATA="$(read_secret_data "${EVAL_AGENT_TOKEN_SECRET}" "${EVAL_AGENT_TOKEN_SECRET_KEY}")" \
+  || secret_read_failed "${EVAL_AGENT_TOKEN_SECRET}" "${EVAL_AGENT_TOKEN_SECRET_KEY}"
+PLATFORM_AGENT_TOKEN="$(printf '%s' "${PLATFORM_AGENT_TOKEN_DATA}" | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
 # The deploy armed the inject door and declared the bridge; the matrix goes
 # through the door. The agent token above is still fetched: the transport
@@ -3115,7 +3160,11 @@ export PLATFORM_AGENT_TOKEN
 # the install. Everything about the door the harness needs beyond these two
 # it derives from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
 EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
-if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
+# --ignore-not-found: an absent Secret is then a read that succeeded with no
+# value, so "missing or empty" below is never the message for a failed read.
+AGENT_INJECT_TOKEN_DATA="$(read_secret_data "${EVAL_INJECT_TOKEN_SECRET}" "${EVAL_INJECT_TOKEN_SECRET_KEY}" --ignore-not-found)" \
+  || secret_read_failed "${EVAL_INJECT_TOKEN_SECRET}" "${EVAL_INJECT_TOKEN_SECRET_KEY}"
+if ! AGENT_INJECT_TOKEN="$(printf '%s' "${AGENT_INJECT_TOKEN_DATA}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
   echo "ERROR: the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
   echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does on every install." >&2
   exit 1

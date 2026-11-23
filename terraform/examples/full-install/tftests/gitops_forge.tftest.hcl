@@ -356,9 +356,9 @@ run "the_host_is_bare" {
   expect_failures = [var.gitops_host]
 }
 
-# The release values a GitHub install renders, byte for byte as the composition
-# rendered them before GitLab support (testdata/*.values.golden, rendered by
-# these same runs at that commit).
+# The default GitHub release values, byte for byte as the composition renders
+# them (updated when new defaults, such as sizingProfile = "auto", enter every
+# install).
 run "github_values_are_unchanged" {
   command = apply
   variables {
