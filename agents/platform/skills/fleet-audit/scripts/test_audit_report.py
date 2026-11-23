@@ -35161,6 +35161,151 @@ GITHUB_LIKE = {
 GITLAB_LIKE = {**GITHUB_LIKE, "forge": "gitlab"}
 
 
+class TestShadowRun(BaseTestCase):
+    """A shadow run (#5623): the report goes to the store's shadow stream and nowhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        # Any git or forge call is recorded: a shadow run makes none, even with
+        # a repository registered.
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        no_remote = type(sys)("github_token_refresh")
+        no_remote.get_current_git_repo = lambda cwd=None: None
+        for patcher in (
+            patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]),
+            patch("gitops_workspace._read_state_text", lambda key: "acme/gitops"),
+            patch("gitops_workspace.get_context_github_repo_entries", return_value=[]),
+            patch.dict(sys.modules, {"github_token_refresh": no_remote}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("open_chat_report", "append_chat_report", "save_chat_verdict"):
+            stub = mock.MagicMock(name=name)
+            self.patch_attr(name, stub)
+            setattr(self, name, stub)
+        self.env = {audit_report.SHADOW_TASK_ENV: "true"}
+        patcher = patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(audit_report.SHADOW_TRIGGER_STREAM_ENV, None)
+
+    def shadow_store(self, stream=None):
+        return self.reports_dir / (stream or AUDIT + audit_report.SHADOW_STREAM_SUFFIX) / "no_forge" / "local"
+
+    def start(self, *extra):
+        code = self.run_main(["start", "--audit", AUDIT, *extra])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def finish(self, doc, scheduled=True, extra=(audit_report.STORE_ONLY_FLAG,)):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, *extra]
+            + (["--scheduled"] if scheduled else [])
+        )
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def test_it_writes_the_shadow_stream_alone_and_asks_nothing_of_forge_or_chat(self):
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+        self.assertEqual(out[audit_report.SHADOW_STREAM_KEY], AUDIT + audit_report.SHADOW_STREAM_SUFFIX)
+        latest = json.loads((self.shadow_store() / "latest.json").read_text())
+        self.assertTrue(latest[audit_report.SHADOW_KEY])
+        self.assertEqual(latest["audit_id"], AUDIT)
+        self.assertIn("summary", out)
+        self.assertEqual(latest[audit_report.SHADOW_SUMMARY_KEY].splitlines()[0], out["summary"].splitlines()[0])
+        # The live stream is untouched: no store, no chat, no forge.
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.recorder.calls, [])
+        self.open_chat_report.assert_not_called()
+        self.append_chat_report.assert_not_called()
+        self.save_chat_verdict.assert_not_called()
+
+    def test_its_delta_is_against_its_own_previous_run(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+        self.finish(doc)
+        unchanged = self.finish(doc)
+        self.assertEqual((unchanged["new"], unchanged["resolved"]), (0, 0))
+        fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
+        self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+
+    def test_the_schedule_the_runtime_names_is_the_stream(self):
+        with patch.dict(os.environ, {audit_report.SHADOW_TRIGGER_STREAM_ENV: "compliance-audit-canary"}):
+            out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertEqual(out[audit_report.SHADOW_STREAM_KEY], "compliance-audit-canary")
+        self.assertTrue((self.shadow_store("compliance-audit-canary") / "latest.json").exists())
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_a_schedule_name_that_is_a_live_stream_or_ill_formed_is_refused(self):
+        for bad in (AUDIT, "Not_A_Label"):
+            with self.subTest(bad=bad), patch.dict(os.environ, {audit_report.SHADOW_TRIGGER_STREAM_ENV: bad}):
+                code = self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG])
+                self.assertNotEqual(code, 0)
+                self.assertIn(audit_report.SHADOW_TRIGGER_STREAM_ENV, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_the_runtime_and_the_flag_must_agree(self):
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        # A shadow task that leaves the flag out is refused, on start and finish.
+        self.assertNotEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        # A live task that passes it is refused.
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "false"}):
+            self.assertNotEqual(self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG]), 0)
+        # The flag with --dry-run is refused.
+        self.assertNotEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run", audit_report.STORE_ONLY_FLAG]),
+            0,
+        )
+        # --repo means nothing to a shadow run.
+        self.assertNotEqual(self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG, "--repo", "acme/gitops"]), 0)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_a_dry_run_preview_passes_in_a_shadow_task(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run"]), 0, self.err)
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_a_flag_without_the_runtime_is_a_shadow_run_started_by_hand(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+        self.assertTrue((self.shadow_store() / "latest.json").exists())
+
+    def test_remediate_refuses(self):
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        args = ["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", "x", "--dry-run"]
+        self.assertNotEqual(self.run_main(args), 0)
+        self.assertIn("shadow run", self.err)
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.assertNotEqual(self.run_main(args + [audit_report.STORE_ONLY_FLAG]), 0)
+        self.assertIn("shadow run", self.err)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_a_store_write_that_fails_fails_the_run(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        with patch.object(audit_report, "write_report", return_value=False):
+            code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, audit_report.STORE_ONLY_FLAG])
+        self.assertNotEqual(code, 0)
+        self.assertIn("shadow run", self.err)
+
+
 class TestForgeWithoutIssuesOrLabels(HarnessTestCase):
     """A forge with proposals and no issue tracker and no labels: Bitbucket's shape.
 

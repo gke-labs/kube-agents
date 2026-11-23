@@ -16,8 +16,8 @@ produced here, deterministically.
 
 Two-command lifecycle, plus three on-demand commands:
 
-    audit_report.py start     --audit <audit-id>
-    audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
+    audit_report.py start     --audit <audit-id> [--store-only]
+    audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run | --store-only]
                           [--scheduled]
                           [--manifest-file <path> | --no-collector-manifest <why>]
                           [--decline-fix <id> <why> ...]
@@ -25,6 +25,10 @@ Two-command lifecycle, plus three on-demand commands:
                           --finding <id> [--finding <id>...] [--dry-run]
     audit_report.py fetch     --audit <audit-id> --path <repo-path> [--path ...]
     audit_report.py list      --audit <audit-id> [--prefix <repo-path>]
+
+A shadow run (`--store-only`, which the runtime's PROFILE_TASK_DRY_RUN=true
+requires) keeps its report in the report store's shadow stream and does
+nothing else: see `shadow_mode` and `shadow_stream`.
 
 There are two ways a fix reaches GitHub, and which one runs depends on whether
 a broker is configured.
@@ -3823,6 +3827,105 @@ def validate_audit_id(audit_id: str) -> str:
             + ", ".join(sorted(AUDITS))
         )
     return audit_id
+
+
+# Shadow runs (#5623): a run beside the job it may replace, which writes its
+# report to the report store and nothing else: no ledger, no forge or git
+# write, no remediation, no chat. The runtime decides it, never the model:
+# the fleet-audit profile's worker exports the task's `dry_run` parameter as
+# SHADOW_TASK_ENV, which a scheduled canary's AgentSchedule sets. `--store-only`
+# on `start` and `finish` names it on the command line, and the two must agree
+# (`shadow_mode`). A run on a terminal with neither is not a shadow run.
+STORE_ONLY_FLAG = "--store-only"
+SHADOW_TASK_ENV = "PROFILE_TASK_DRY_RUN"
+# The schedule a dispatched task came from, which the worker exports when the
+# task carries a trigger: runtime-owned, never a task parameter
+# (a2a/worker-adapter). It names the shadow stream (`shadow_stream`).
+SHADOW_TRIGGER_STREAM_ENV = "PROFILE_TASK_TRIGGER_STREAM"
+# A shadow run with no schedule identity (one started by hand) writes to
+# `<audit>` plus this.
+SHADOW_STREAM_SUFFIX = "-shadow"
+# The report store's stream-name shape (audit_report_store.AUDIT_ID_RE).
+SHADOW_STREAM_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+# The envelope keys a shadow run adds: that it is one, the stream it went to,
+# and the summary a live run would have sent to chat, kept instead of posted.
+SHADOW_KEY = "shadow"
+SHADOW_STREAM_KEY = "shadow_stream"
+SHADOW_SUMMARY_KEY = "shadow_summary"
+
+
+def task_is_shadow() -> bool | None:
+    """What the runtime says: True or False when SHADOW_TASK_ENV is set, None when it isn't."""
+    raw = os.environ.get(SHADOW_TASK_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() == "true"
+
+
+def shadow_mode(args: argparse.Namespace, command: str) -> bool:
+    """Whether this `start` or `finish` is a shadow run; ValidationError when the flag and the runtime disagree.
+
+    The runtime decides (`task_is_shadow`). A task that is a shadow run must
+    say `--store-only` on the publishing calls, so no step can write a live
+    ledger by leaving the flag out; a `finish --dry-run` preview writes
+    nothing and passes. A task the runtime says is live refuses
+    `--store-only`. With no runtime word (a run started by hand) the flag
+    decides, and `--store-only` with `--dry-run` is refused: a preview of a
+    shadow run is the dry run itself.
+    """
+    flag = bool(getattr(args, "store_only", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    runtime = task_is_shadow()
+    if flag and dry_run:
+        raise ValidationError(
+            f"{STORE_ONLY_FLAG} and --dry-run: pass one. --dry-run writes nothing; "
+            f"{STORE_ONLY_FLAG} writes the report to the store and nothing else."
+        )
+    if runtime is True and not flag and not dry_run:
+        raise ValidationError(
+            f"this task is a shadow run ({SHADOW_TASK_ENV}=true): `{command}` must pass "
+            f"{STORE_ONLY_FLAG}, which writes the report to the store and nothing else."
+        )
+    if runtime is False and flag:
+        raise ValidationError(
+            f"{STORE_ONLY_FLAG}: this task is not a shadow run ({SHADOW_TASK_ENV} is not "
+            "true), so it publishes as a live run; leave the flag out."
+        )
+    return flag
+
+
+def shadow_stream(audit_id: str) -> str:
+    """The report-store stream a shadow run of `audit_id` writes to.
+
+    The schedule's own name when the runtime gives one
+    (SHADOW_TRIGGER_STREAM_ENV), so two canaries of one audit keep separate
+    baselines; it must be a store stream name and must not be a real audit's
+    stream. Otherwise `<audit>-shadow`. Never a command-line argument: the
+    model doesn't choose where its run's report goes.
+    """
+    raw = (os.environ.get(SHADOW_TRIGGER_STREAM_ENV) or "").strip()
+    if not raw:
+        return audit_id + SHADOW_STREAM_SUFFIX
+    if not SHADOW_STREAM_RE.match(raw):
+        raise ValidationError(
+            f"{SHADOW_TRIGGER_STREAM_ENV}={raw!r} is not a report-store stream name "
+            "(a DNS-1123 label); the shadow run has nowhere to write."
+        )
+    if raw in AUDITS:
+        raise ValidationError(
+            f"{SHADOW_TRIGGER_STREAM_ENV}={raw!r} is a live audit's stream; a shadow "
+            "run never writes there."
+        )
+    return raw
+
+
+def refuse_remediate_in_shadow(args: argparse.Namespace) -> None:
+    """`remediate` drafts nothing in a shadow run: ValidationError when the flag or the runtime says it is one."""
+    if getattr(args, "store_only", False) or task_is_shadow():
+        raise ValidationError(
+            f"remediate: this is a shadow run ({STORE_ONLY_FLAG}, or {SHADOW_TASK_ENV}=true), "
+            "which writes its report to the store and nothing else; it opens no remediation."
+        )
 
 
 def audit_name(audit_id: str) -> str:
@@ -22546,9 +22649,12 @@ def _open_store_ledger(repo: str, audit_id: str) -> tuple[Path, list[dict[str, s
 
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    shadow = shadow_mode(args, "start")
+    if shadow and getattr(args, "repo", None):
+        raise ValidationError(f"--repo: a shadow run ({STORE_ONLY_FLAG}) publishes to no repository.")
     claim_in_flight(audit_id)
     try:
-        _start(args, audit_id)
+        _start(args, audit_id, shadow=shadow)
     except BaseException:
         # A `start` that raised left no run in flight, so the retry must not
         # be refused for its own failure. The refusal above sits outside this
@@ -22558,7 +22664,7 @@ def handle_start(args: argparse.Namespace) -> None:
         raise
 
 
-def _start(args: argparse.Namespace, audit_id: str) -> None:
+def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> None:
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
@@ -22575,12 +22681,19 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
             stale.unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
-    decision = resolve_reachable_repo(audit_id, opt_repo)
+    if shadow:
+        # A shadow run asks the forge nothing: it runs the checks with no
+        # repository, as an install with no forge does, and keeps no chat report.
+        decision = LedgerDecision(NO_FORGE_REPO, LEDGER_STORE, False, None)
+        log(f"SHADOW RUN: this run's report goes to the report store alone ({shadow_stream(audit_id)}).")
+    else:
+        decision = resolve_reachable_repo(audit_id, opt_repo)
     repo, unreachable = decision.publish_repo, decision.unreachable
     # The relay posts what this file holds instead of the run's final message,
     # so a run that dies before its `finish` must not leave the previous run's
     # report there.
-    open_chat_report(audit_id, repo, datetime.now(timezone.utc))
+    if not shadow:
+        open_chat_report(audit_id, repo, datetime.now(timezone.utc))
     no_forge = repo == NO_FORGE_REPO
     if no_forge:
         # The checks still run; only the ledger and the fixes have nowhere to go.
@@ -23583,6 +23696,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     findings a run on its own, but a human who asked for one by name gets it.
     """
     audit_id = validate_audit_id(args.audit)
+    refuse_remediate_in_shadow(args)
     data = load_findings(args.findings_file, audit_id)
     opt_repo = getattr(args, "repo", None)
     # The same withhold `finish` applies, against the same record. A direct
@@ -24424,6 +24538,7 @@ def _finish_without_forge(
     scheduled: bool = False,
     unreachable: tuple[str, str] | None = None,
     probe: str = REACHABILITY_PROBE_VERB,
+    shadow_to: str | None = None,
 ) -> dict | None:
     """Keep a run on an install with no forge in the report store, and print its line.
 
@@ -24454,7 +24569,15 @@ def _finish_without_forge(
     the not-re-checked entries stay in the record that run reads. A document
     `finish` would refuse is refused the same way, since validation runs
     before this.
+
+    `shadow_to` is a shadow run's stream (`shadow_stream`): the delta and the
+    baselines come from that stream's previous record and the envelope goes
+    there, marked `shadow` with the summary a live run would post, and
+    nothing goes to chat. The store is a shadow run's only output, so a write
+    that fails raises instead of returning None.
     """
+    shadow = shadow_to is not None
+    stream = shadow_to or audit_id
     findings = list(data["findings"])
     declared = [entry for entry in data.get("declared") or [] if isinstance(entry, dict)]
     gaps = coverage_gaps(data) + ([waiver_gap(waiver)] if waiver else [])
@@ -24472,7 +24595,7 @@ def _finish_without_forge(
     # includes the not-re-checked entries: with no record, none are kept. It also
     # reads no scheduled baseline, so a scheduled diverted run says that the
     # change since the last scheduled run is unknown.
-    record = None if unreachable is not None else previous_no_forge_record(audit_id)
+    record = None if unreachable is not None else previous_no_forge_record(stream)
     previous_ids = (
         None if record is None else [str(fid) for fid in record.get("current_ids") or []]
     )
@@ -24587,14 +24710,15 @@ def _finish_without_forge(
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
-    save_chat_verdict(
-        audit_id,
-        NO_FORGE_REPO,
-        payload["silent_ok"],
-        [],
-        now,
-        news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
-    )
+    if not shadow:
+        save_chat_verdict(
+            audit_id,
+            NO_FORGE_REPO,
+            payload["silent_ok"],
+            [],
+            now,
+            news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
+        )
     envelope = report_envelope(
         audit_id,
         payload,
@@ -24615,9 +24739,33 @@ def _finish_without_forge(
         started_at=run_started,
     )
     envelope.update(marker)
+    if shadow:
+        # What a live run would have sent to chat, kept rather than posted, so
+        # the shadow can be compared with the job it may replace.
+        envelope[SHADOW_KEY] = True
+        envelope[SHADOW_STREAM_KEY] = stream
+        envelope[SHADOW_SUMMARY_KEY] = render_no_forge_summary(
+            audit_id,
+            data,
+            gaps,
+            new_ids,
+            resolved_ids,
+            delta_known,
+            held,
+            unreachable_note(unreachable, stored=True, probe=probe),
+            len(unpublished),
+            since_scheduled=since_scheduled_line(payload, delta_known),
+            unread=unread,
+            stored=True,
+        )
     # A diverted run wrote nothing to the ledger, so when its write fails the
     # stored record of the last published run is still correct.
-    stored = write_report(audit_id, envelope, now, ledger_unchanged=unreachable is not None)
+    stored = write_report(stream, envelope, now, ledger_unchanged=unreachable is not None)
+    if shadow and not stored:
+        raise RuntimeError(
+            f"the report store did not keep this shadow run's report ({stream}); the "
+            "store is its only output, so the run fails."
+        )
     # The store is the only record on this install, so the note says whether
     # it holds this run rather than promising it.
     note = unreachable_note(unreachable, stored=stored, probe=probe)
@@ -24642,9 +24790,14 @@ def _finish_without_forge(
         unread=unread,
         stored=stored,
     )
-    append_chat_report(
-        audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
-    )
+    if shadow:
+        payload[SHADOW_KEY] = True
+        payload[SHADOW_STREAM_KEY] = stream
+        payload["silent_ok"] = True
+    else:
+        append_chat_report(
+            audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
+        )
     print(json.dumps(payload))
     return envelope if stored else None
 
@@ -25387,6 +25540,8 @@ def _finish_store_ledger(
 
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    if shadow_mode(args, "finish") and getattr(args, "repo", None):
+        raise ValidationError(f"--repo: a shadow run ({STORE_ONLY_FLAG}) publishes to no repository.")
     if getattr(args, "dry_run", False):
         # A preview taken mid-run: the run is still in flight and keeps its note.
         _finish(args, audit_id)
@@ -25417,6 +25572,9 @@ def handle_finish(args: argparse.Namespace) -> None:
         release_in_flight(audit_id)
         raise
     release_in_flight(audit_id)
+    if getattr(args, "store_only", False):
+        # The gate's record is the live stream's; a shadow run leaves it alone.
+        return
     _record_scheduled_digest(args, audit_id, stored)
 
 
@@ -25984,7 +26142,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # when `--repo` was given.
     unreachable: tuple[str, str] | None = None
     decision: LedgerDecision | None = None
-    if args.dry_run:
+    store_only = bool(getattr(args, "store_only", False))
+    if args.dry_run or store_only:
+        # A shadow run, like a dry run, asks the forge nothing.
         repo_hint = opt_repo
     else:
         decision = finish_target(audit_id, opt_repo)
@@ -25999,7 +26159,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # issue, and a dry run does not ask the forge for it. `_dry_run_repo`
     # gives the real run its resolved repository, and a dry run the same
     # repository on a best-effort basis.
-    previous_document = previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
+    # A shadow run reads its own stream, with no repository, so its wording
+    # never comes from the live stream's record or a forge lookup.
+    previous_document = (
+        previous_run_document(shadow_stream(audit_id), NO_FORGE_REPO)
+        if store_only
+        else previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
+    )
     for fid in carry_unchanged_findings(data["findings"], previous_document):
         log(f"{fid}: unchanged since the previous run; its wording is carried forward.")
     # After the carry: an impact sentence that tells which arm of a check
@@ -26067,6 +26233,19 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver, record=record
         )
         return
+
+    if store_only:
+        return _finish_without_forge(
+            audit_id,
+            data,
+            now,
+            run_started=run_started,
+            manifest=manifest,
+            waiver=waiver,
+            timers=timer_payload,
+            scheduled=scheduled,
+            shadow_to=shadow_stream(audit_id),
+        )
 
     repo = repo_hint
     if repo == NO_FORGE_REPO:
@@ -27856,6 +28035,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo",
         help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
     )
+    start_parser.add_argument(
+        STORE_ONLY_FLAG,
+        dest="store_only",
+        action="store_true",
+        help=(
+            "A shadow run: no forge, ledger or chat; finish keeps the report in the "
+            f"store alone. Required when {SHADOW_TASK_ENV}=true, refused when it is false."
+        ),
+    )
 
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
@@ -27873,6 +28061,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate and render to stdout; perform zero git or forge side effects.",
+    )
+    finish_parser.add_argument(
+        STORE_ONLY_FLAG,
+        dest="store_only",
+        action="store_true",
+        help=(
+            "A shadow run: write the report to the report store (the shadow stream) "
+            "and nothing else: no ledger, no forge or git write, no remediation, no "
+            f"chat. Required when {SHADOW_TASK_ENV}=true, refused when it is false. "
+            "A store write that fails fails the run."
+        ),
     )
     finish_parser.add_argument(
         "--scheduled",
@@ -28078,6 +28277,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Render the pull-request bodies to stdout; zero git or forge side effects.",
+    )
+    remediate_parser.add_argument(
+        STORE_ONLY_FLAG,
+        dest="store_only",
+        action="store_true",
+        help="Refused: a shadow run opens no remediation.",
     )
     remediate_parser.add_argument(
         "--manifest-file",
