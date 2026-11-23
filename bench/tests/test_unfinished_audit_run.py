@@ -202,6 +202,23 @@ def test_the_seed_refuses_a_full_set_of_run_start_records(store):
     assert snapshot(store) == before
 
 
+def test_a_root_seed_hands_what_it_creates_to_the_store_owner(store, monkeypatch):
+    # The seed runs as root in the sandbox. Every directory and file it creates
+    # goes to the owner of the nearest existing directory, as audit_report
+    # does for a root run, so nothing it plants is left root-owned.
+    store.mkdir(parents=True)
+    chowned = []
+    monkeypatch.setattr(audit_report.os, "geteuid", lambda: audit_report.ROOT_UID)
+    monkeypatch.setattr(audit_report.os, "chown", lambda path, uid, gid: chowned.append((str(path), uid, gid)))
+    owner = store.stat()
+    plant.seed(audit_report, AUDIT, GITOPS, NOW)
+    stream = audit_report.reports_dir_for(AUDIT, GITOPS)
+    paths = {p for p, _, _ in chowned}
+    for made in (stream, stream / "runs", stream / plant.RUN_STARTS_DIR, stream / plant.PLANT_NOTE):
+        assert str(made) in paths, f"{made} was not handed to the store owner"
+    assert all((uid, gid) == (owner.st_uid, owner.st_gid) for _, uid, gid in chowned)
+
+
 def test_a_failed_seed_in_the_provisioner_runs_teardown():
     main_tf = (STACK / "main.tf").read_text(encoding="utf-8")
     seed_at = main_tf.index("- seed ")

@@ -711,6 +711,17 @@ def run_start_record(
     return record
 
 
+def _adopt_store_owner(path: str, owner: os.stat_result) -> None:
+    """Give `path` to the store owner's uid and gid when this run is root.
+
+    As audit_report._adopt_owner: a root hand-run in the sandbox would
+    otherwise leave a root-owned `run-starts/` that the sandbox user, the
+    store's owner, can no longer write a record into.
+    """
+    if os.geteuid() == 0:
+        os.chown(path, owner.st_uid, owner.st_gid)
+
+
 def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
     """Write one run-start record, replacing its run's. Raises OSError or ValueError.
 
@@ -737,7 +748,14 @@ def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
         # that exists is one a run published to.
         raise FileNotFoundError(f"no report store for {audit_id} in {repo} yet")
     directory = os.path.join(store, RUN_STARTS_DIR)
-    os.makedirs(directory, exist_ok=True)
+    owner = os.stat(store)
+    if not os.path.isdir(directory):
+        try:
+            os.mkdir(directory)
+        except FileExistsError:
+            pass  # a rival run made it, and chose its ownership then
+        else:
+            _adopt_store_owner(directory, owner)
     target = os.path.join(directory, f"{run_id}.json")
     # As the listener: the run's first record's receipt, else now.
     received = None
@@ -757,6 +775,7 @@ def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
     try:
         with open(staged, "wb") as handle:
             handle.write(data)
+        _adopt_store_owner(staged, owner)
         os.replace(staged, target)
     except BaseException:
         try:
