@@ -167,12 +167,9 @@ const callerKubectlFlagRule = "caller.kubectl-flag"
 // writeRefusedReason is the terminal message of a task stopped at a write
 // refusal, in the `reason: <token> - <detail>` shape.
 func writeRefusedReason(r *writeRefusal) string {
-	if r.rule == kubernetesReadOnlyRule {
-		return "reason: write-refused" + reasonDetailSeparator +
-			"the task stopped after a write refusal: the command policy's " + r.rule + " rule refused the verb " + r.verb +
-			". The change was not made and was not retried another way; it can be proposed as a pull request."
-	}
+	// Facts only: the rule, the verb, and that the change was not made. The
+	// reason reaches a delegating parent model, so it carries no advice.
 	return "reason: write-refused" + reasonDetailSeparator +
 		"the task stopped after a write refusal: the credential broker's " + r.rule + " rule refused the verb " + r.verb +
-		". The change was not made and was not retried another way."
+		"; the change was not made."
 }
