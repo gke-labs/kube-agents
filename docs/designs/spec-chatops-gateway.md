@@ -317,7 +317,11 @@ after the restart. Each earlier turn's answer posts as it completes; the result 
 last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
 child is checked against the target's list first (rule `delegation.child-steer`);
 refused, it is not published, its author is not recorded, and the room is told the
-target is not reachable from here.
+target is not reachable from here. A steer into a running task that holds `ChangeRequested` (one a
+structured confirm started, or its child or wake) is refused from every door (rule
+`steer-change-requested`): it is not published, its author is not recorded, and the room is
+told to stop the task and confirm again. That covers an `input-required` answer and a choice
+click too, since both arrive as steers.
 
 **The busy notice.** The gateway tells a person when their turn is going to wait, on the
 turn's own status line. Once a fixed-route turn's task is on the bus, the gateway counts the
@@ -3135,7 +3139,10 @@ submission as a `replyTo` part, `spec-a2a-payloads.md`, and the relayed report a
 `chat.console.<token>.in`, or to `chat.console.<token>.confirm` for a click on a confirm button
 (added 10/30): the same frame, which the adapter delivers with the confirm intent, so its task is
 submitted with `TaskParameters.ChangeRequested`. The subject is the only route to the confirm: a
-frame on `.in` with `kind` `confirm` is dropped as an unknown kind. The adapter posts the gateway's
+frame on `.in` with `kind` `confirm` is dropped as an unknown kind. A frame on `.in` while such a
+task runs is not steered into it: the console's human and its MCP server publish there as the same
+author, so the gateway refuses every steer into a change-requested task and tells the tab to stop
+it and confirm again. The adapter posts the gateway's
 own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
 protocol, and the payload spec's agreement rules do not apply to it. Each task's end goes out

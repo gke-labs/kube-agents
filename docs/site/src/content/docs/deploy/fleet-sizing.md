@@ -34,10 +34,13 @@ need the raises below.
 (`charts/kube-agents/values.yaml` defaults an omitted `sizingProfile` to `small`; `install.sh` and `upgrade.sh` default `PLATFORM_AGENT_SIZING_PROFILE`, and Terraform defaults `platform_agent_sizing_profile`, to `auto`, which begins at `small` below 10 clusters and steps up automatically at the 10- and 25-cluster thresholds above.)
 
 The host-cluster row is the one that sizes the operator. The manager caches every Deployment,
-StatefulSet, Service and PersistentVolumeClaim in the cluster it runs in, so a shared host
-cluster with thousands of them needs the operator memory raise even at a small fleet. The other
-rows size the credential proxy, the event watcher and the data volumes, which grow with what the
-agent reads.
+StatefulSet, Service, ConfigMap, ServiceAccount, PersistentVolumeClaim, NetworkPolicy,
+PodDisruptionBudget and RBAC object in the cluster it runs in. Those informers take about 3.7 MiB
+of live heap per 1,000 objects across a balanced mix, and 7.9 to 8.5 MiB per 1,000 StatefulSets or
+Deployments; see [Manager cache and memory sizing](/kube-agents/operator/#manager-cache-and-memory-sizing).
+A shared host cluster with tens of thousands of them therefore needs the operator memory raise even
+at a small fleet. The other rows size the credential proxy, the event watcher and the data volumes,
+which grow with what the agent reads.
 
 ## What each pod needs
 
@@ -241,7 +244,9 @@ sets what the chart exposes for the `fleet` tier, each key with its reason and i
 caveat beside it:
 
 - `operator.resources`: 1 GiB memory, request and limit alike, for a host cluster at or past
-  50,000 objects. The chart's floor on the limit is 512 MiB.
+  50,000 watched objects (or 180 MiB of cached live heap under the per-kind formula in
+  [Manager cache and memory sizing](/kube-agents/operator/#manager-cache-and-memory-sizing)). The
+  chart's floor on the limit is 512 MiB.
 - `platformAgent.storage.size: 100Gi`: both data claims. A claim cannot shrink, and each GiB
   counts twice against a namespace `requests.storage` quota. For a fleet of more than about 230
   clusters, also set `platformAgent.storage.expectedClusterProfiles`
