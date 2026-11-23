@@ -9,9 +9,10 @@
 # HOW. The prompt's first line is the harness's session-cap directive
 # (bench/kube_agents_bench/session_cap.py). The harness reads the install's
 # session cap off the gateway Deployment (A2A_MAX_SESSIONS), opens that many
-# `/session` conversations through the inject door, each running `sleep 240`
-# so its worker stays busy, then sends the ask below on one conversation
-# more. The door answers that POST with the `queued` refusal and the notice;
+# `/session` conversations through the inject door, each holding its worker
+# busy for the directive's hold (by default the fillers' wait plus a margin,
+# session_cap.DEFAULT_HOLD_SECONDS), checks every filler is still running,
+# then sends the ask below on one conversation more. The door answers that POST with the `queued` refusal and the notice;
 # the harness then cancels the fillers, so a worker frees, and follows the
 # queued turn's task to its answer. The fillers are cancelled whatever
 # happens. A literal block (|-) keeps the directive on its own line.
@@ -23,7 +24,8 @@
 # 6) it is not evaluable and the harness reports it as infrastructure, naming
 # the cap, before it sends anything: the bench has no "not applicable" class
 # for a case precondition. The same goes for a run where the cap never filled
-# (a filler's task ended before the ask went, so the ask started at once).
+# or emptied early (a filler queued, or no longer running before the ask, or
+# the ask started at once).
 # Its evidence runs come from twins whose twin-only commit sets the cap to 2
 # (hack/ci-deploy.sh: MODE_NEXT_MAX_SESSIONS=2 just before
 # MAX_SESSIONS_HELM_SETS is built, which renders
@@ -31,9 +33,12 @@
 # install's cap only make the line longer: the queued turn may wait behind
 # theirs, inside the gateway's five-minute bound.
 #
-# Red without the line: the ask gets the cap's "not started" refusal and no
-# task, so harness_session_cap_queued fails (with the refusal as the output)
-# and the answer check finds no PINEAPPLE. Green: the queued notice, then the
+# Red without the line: the ask's POST is answered with the cap's own refusal
+# ("not started: N session workers are already running (cap N)") and no task,
+# so harness_session_cap_queued fails, with the refusal as the output, and the
+# answer check finds no PINEAPPLE. Any other refusal, and anything that happens
+# after the ask was queued (a refusal, a gateway restart, a wait that ran out),
+# is infrastructure, not the red. Green: the queued notice, then the
 # task the queued turn started, then its answer, which says PINEAPPLE.
 #
 # Isolation class: read-only; it writes nothing to any cluster or repository.
