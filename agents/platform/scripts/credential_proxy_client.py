@@ -2004,7 +2004,7 @@ def record_kubectl_write_attempt(argv: list[str], exit_code: int) -> None:
     if exit_code == 0 or not os.environ.get(REFUSAL_FILE_ENV, "").strip():
         return
     try:
-        import command_policy  # shipped beside this module on session pods only
+        import command_policy  # shipped beside this module in the worker image
     except ImportError:
         return
     verb = command_policy.kubectl_write_attempt(argv, os.environ.get(KUBE_PROXY_MODE_ENV, "").strip())

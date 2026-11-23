@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -150,13 +151,15 @@ type Config struct {
 
 	// StopOnWriteRefusal stops the harness at the first definitive write
 	// refusal the broker client recorded in WriteRefusalFile (refusal.go)
-	// and ends the task rejected with the refused rule and verb. No tool
-	// output is read for it. applyDefaults sets it for a profile pod
-	// (ProfileExecutor); a test sets it directly.
+	// and ends the task rejected with the refused verb, and the rule where
+	// the reason names one. No tool output is read for it. applyDefaults sets
+	// it for a profile pod (ProfileExecutor) and for a session pod with a
+	// WriteRefusalDir; a test sets it directly.
 	StopOnWriteRefusal bool
 	// WriteRefusalFile is the task's record file (EnvWriteRefusalFile),
-	// which the profile worker makes beside the task token. Empty reads
-	// nothing, and the task is never stopped at a refusal.
+	// which the profile worker makes beside the task token, or the adapter
+	// makes per turn in WriteRefusalDir. Empty reads nothing, and the task
+	// is never stopped at a refusal.
 	WriteRefusalFile string
 	// WriteRefusalDir is a session pod's directory for each turn's record
 	// file: the adapter makes the file empty there before every turn's
@@ -881,7 +884,13 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			log.Warn("could not make the turn's write-refusal record; the turn won't stop at a write refusal", "task", a.taskID, "err", err)
 		} else {
 			a.cfg.WriteRefusalFile = path
-			env = append(slices.Clone(env), EnvWriteRefusalFile+"="+path, EnvWriteRefusalTask+"="+a.taskID)
+			base := env
+			if base == nil {
+				// A nil HarnessEnv means the harness inherits this process's
+				// environment; adding to it must not replace that.
+				base = os.Environ()
+			}
+			env = append(slices.Clone(base), EnvWriteRefusalFile+"="+path, EnvWriteRefusalTask+"="+a.taskID)
 		}
 	}
 
@@ -1043,7 +1052,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
 					continue
 				}
-				r, err := readWriteRefusal(a.cfg.WriteRefusalFile, a.taskID)
+				r, err := readWriteRefusalFor(a.cfg.WriteRefusalFile, a.taskID, a.cfg.WriteRefusalDir != "")
 				if err != nil && !refusalReadFailed {
 					refusalReadFailed = true
 					log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
@@ -1260,7 +1269,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 
 // endRefused publishes the terminal of a task stopped at a definitive write
 // refusal: rejected, the state no supervisor retries and the gateway renders
-// with its reason, carrying the refused rule and verb and no other output.
+// with its reason, carrying the refused verb, and the rule where the reason
+// names one, and no other output.
 func (a *adapter) endRefused(r *writeRefusal) (Result, error) {
 	state := lib.StateRejected
 	return Result{State: state}, a.finalize(state, writeRefusedReason(r), "")
