@@ -3,8 +3,9 @@
 a2a/Dockerfile.worker copies deploy/sandbox/session-kubectl.sh to /usr/local/bin/kubectl. This test
 takes that script, points its absolute paths at stubs, and runs it: with KUBE_PROXY_URL set
 (a session pod under the cluster view) it must exec deploy/sandbox/kubectl-admit.py with the
-session pod's settings; without it (an AgentProfile worker) it must exec the broker's
-credential-proxy-exec, as before, and never the admission.
+session pod's settings for an argv the admission may charge, and kubectl directly for one it never
+charges (tests/test_session_kubectl_fast_path.py checks that split); without it (an AgentProfile
+worker) it must exec the broker's credential-proxy-exec, as before, and never the admission.
 """
 
 from __future__ import annotations
@@ -96,27 +97,40 @@ class WorkerWrapperTest(unittest.TestCase):
                                               "KUBECTL_ADMIT_GUARD_PATH": f"{self.libexec}/shell-memory-guard",
                                               "KUBECTL_ADMIT_ON_BUSY": "run"})
 
-    def test_the_wrapper_exits_with_the_admissions_code_and_passes_stdin(self):
+    def test_an_argv_the_admission_never_charges_runs_kubectl_directly(self):
+        for argv in (("get", "pods", "-n", "x"), ("--context", "gke_p_l_c", "get", "pod/p1"), ("logs", "-f", "x"),
+                     ("apply", "-f", "-")):
+            with self.subTest(argv=argv):
+                got = self.run_wrapper({"KUBE_PROXY_URL": PROXY, "CREDENTIAL_PROXY_URL": "http://broker"}, *argv)
+                self.assertEqual(got["ran"], "kubectl")
+                self.assertEqual(got["argv"], list(argv))
+                self.assertEqual(got["env"], dict.fromkeys(SETTINGS))  # as before the admission
+
+    def test_the_wrapper_exits_with_kubectls_code_and_passes_stdin_on_both_paths(self):
         # The admission's exit code is kubectl's, and steps after it read it here.
         base = {"PATH": self.path, "HOME": str(self.home), "KUBE_PROXY_URL": PROXY}
-        for rc in (0, 1, 3, 75):
-            with self.subTest(rc=rc):
-                out = subprocess.run(["/bin/sh", str(self.wrapper), "apply", "-f", "-"],
-                                     env={**base, "STUB_RC": str(rc)}, input="kind: x\n",
-                                     capture_output=True, text=True, timeout=30)
-                self.assertEqual(out.returncode, rc)
-                self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["ran"], "admit")
+        for argv, ran in ((("apply", "-f", "-"), "kubectl"), (("get", "nodes", "-f", "-o", "json"), "kubectl"),
+                          (("get", "nodes", "-o", "json"), "admit")):
+            for rc in (0, 1, 3, 75):
+                with self.subTest(argv=argv, rc=rc):
+                    out = subprocess.run(["/bin/sh", str(self.wrapper), *argv],
+                                         env={**base, "STUB_RC": str(rc)}, input="kind: x\n",
+                                         capture_output=True, text=True, timeout=30)
+                    self.assertEqual(out.returncode, rc)
+                    self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["ran"], ran)
 
-    def test_the_admission_runs_in_the_wrappers_own_process(self):
+    def test_kubectl_or_the_admission_runs_in_the_wrappers_own_process(self):
         # exec'd, not a child: a signal sent only to the wrapper's pid (a backgrounded
-        # port-forward or `logs -f`) reaches the admission, and through it kubectl.
+        # port-forward or `logs -f`) reaches kubectl, directly or through the admission.
         base = {"PATH": self.path, "HOME": str(self.home), "KUBE_PROXY_URL": PROXY}
-        proc = subprocess.Popen(["/bin/sh", str(self.wrapper), "get", "ns"], env=base,
-                                stdout=subprocess.PIPE, text=True)
-        out, _ = proc.communicate(timeout=30)
-        got = json.loads(out.strip().splitlines()[-1])
-        self.assertEqual(got["ran"], "admit")
-        self.assertEqual(got["pid"], proc.pid)
+        for argv, ran in ((("get", "ns"), "admit"), (("logs", "-f", "x"), "kubectl")):
+            with self.subTest(argv=argv):
+                proc = subprocess.Popen(["/bin/sh", str(self.wrapper), *argv], env=base,
+                                        stdout=subprocess.PIPE, text=True)
+                out, _ = proc.communicate(timeout=30)
+                got = json.loads(out.strip().splitlines()[-1])
+                self.assertEqual(got["ran"], ran)
+                self.assertEqual(got["pid"], proc.pid)
 
     def test_without_a_kube_proxy_the_broker_runs_kubectl_and_the_admission_never_does(self):
         got = self.run_wrapper({"CREDENTIAL_PROXY_URL": "http://broker"}, "get", "pods", "-A")
