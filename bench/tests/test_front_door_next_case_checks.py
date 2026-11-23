@@ -165,7 +165,9 @@ LIST = "gcloud container clusters list"
 
 def _bash(command: str) -> dict:
     # The session route's trajectory entry for its own call: no result recorded.
-    return {"name": "Bash", "args": {"command": command, "description": "List GKE clusters"}, "result": None, "status": "completed"}
+    # The shape the inject transport records for a session's own call
+    # (run 2124644200342360064): no result, status "called".
+    return {"name": "Bash", "args": {"command": command, "description": "List GKE clusters"}, "result": None, "status": "called"}
 
 
 def _smoke_passes(delivered: str, trajectory: list[dict] | None = None) -> bool:
@@ -191,7 +193,16 @@ def _smoke_passes(delivered: str, trajectory: list[dict] | None = None) -> bool:
         pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST)], True, id="the session's own live read"),
         pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST + " --format=value(name)")], True, id="the read with a flag"),
         pytest.param("seeded-a, seeded-b and seeded-c.", [_bash("kubectl get nodes")], False, id="a read that isn't the fleet list"),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST + " 2>&1")], True, id="the read with stderr folded in"),
         pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST + "; echo seeded-a")], False, id="a chained command"),
+        pytest.param(
+            "seeded-a, seeded-b and seeded-c.",
+            [_bash(LIST + "\nprintf 'seeded-a seeded-b seeded-c'")],
+            False,
+            id="a second line",
+        ),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST + " | head")], False, id="a pipe"),
+        pytest.param("seeded-a, seeded-b and seeded-c.", [_bash(LIST + " > out.txt")], False, id="a redirect to a file"),
         pytest.param("platform-agent-host only.", [_bash(LIST)], False, id="the read without the planted names"),
     ],
 )
