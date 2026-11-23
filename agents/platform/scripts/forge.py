@@ -79,6 +79,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Protocol
 
 import repo_ref
@@ -204,6 +205,11 @@ TRANSIENT_CODES = frozenset({"FORGE_UNAVAILABLE", "FORGE_CALL_FAILED"})
 #: into a Chat card, and a forge that answers a rejected write with a page of
 #: JSON would otherwise push everything else in the card out of sight.
 MAX_DETAIL_CHARS = 200
+
+_MEMORY_BRANCH_PREFIX = "platform-agent/memory/"
+_MEMORY_RECORD_ID_RE = re.compile(r"^(?:DEC|LES)-\d{4}-\d{3,}$")
+_MEMORY_SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+_MEMORY_REL_DIRS = frozenset({"decisions", "lessons", "decision", "lesson"})
 
 
 class ForgeError(Exception):
@@ -557,6 +563,68 @@ def call(
     raise AssertionError("unreachable")  # pragma: no cover -- the loop returns or raises
 
 
+def _run_sandbox_forge(
+    cmd_args: list[str], label: str, repo: str, payload: dict, ceiling: float
+) -> dict:
+    """Run ``SANDBOX_FORGE`` inside the sandbox and unwrap its JSON envelope."""
+    try:
+        completed = sandbox_exec.run(
+            ["python3", SANDBOX_FORGE, *cmd_args],
+            timeout=ceiling,
+            stdin=json.dumps(payload),
+        )
+    except sandbox_exec.SandboxUnavailable as unreachable:
+        # The verb never ran. Reported as its own code rather than as a forge
+        # refusal, because a sweep that reads "the repository is quiet" out of a
+        # transport that was down is the one answer this path must not produce.
+        raise vcs_client.VcsError(
+            str(unreachable), code=REASON_SANDBOX_UNREACHABLE
+        ) from unreachable
+    except subprocess.TimeoutExpired as expired:
+        raise vcs_client.VcsError(
+            f"{label} on {repo} did not answer within {ceiling}s",
+            code=REASON_SANDBOX_UNREACHABLE,
+        ) from expired
+    if completed.returncode != 0:
+        # `main` answers a refusal with exit 0 and a `refusal` key, so a
+        # non-zero exit is the far side itself failing: no interpreter, no file,
+        # an unhandled fault. stderr is where that is legible.
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        raise vcs_client.VcsError(
+            f"{SANDBOX_FORGE} exited {completed.returncode}: "
+            f"{detail[-1] if detail else 'no output'}",
+            code=REASON_SANDBOX_UNREACHABLE,
+        )
+    try:
+        answer = json.loads(completed.stdout or "")
+    except ValueError as exc:
+        # The sandbox's, not the broker's. Left codeless these two fell through
+        # to the fallback above, which names the broker, and would send an
+        # operator to a component that answered fine.
+        raise vcs_client.VcsError(
+            f"{label} on {repo} answered with something that is not JSON: {exc}",
+            code=REASON_SANDBOX_UNREACHABLE,
+        ) from exc
+    # `null`, a list, a number and a bare string are all valid JSON and none of
+    # them is the envelope. Without this the next two lines raise
+    # `AttributeError` out of a module whose callers catch `VcsError`, so a far
+    # side printing the wrong shape crashes the sweep instead of naming it.
+    if not isinstance(answer, dict):
+        raise vcs_client.VcsError(
+            f"{label} on {repo} answered with {type(answer).__name__}, not an "
+            "envelope",
+            code=REASON_SANDBOX_UNREACHABLE,
+        )
+    refusal = answer.get("refusal")
+    if refusal:
+        raise vcs_client.VcsError(
+            str(refusal.get("message") or f"{label} was refused"),
+            code=refusal.get("code"),
+            detail=refusal.get("detail"),
+        )
+    return answer.get("answer") or {}
+
+
 def _forward(
     verb: str, payload: dict, repo: str, timeout_s: Optional[float] = None
 ) -> dict:
@@ -579,66 +647,153 @@ def _forward(
     `timeout_s` is the caller's ceiling on the hop; `None` is `FORWARD_TIMEOUT_S`.
     """
     ceiling = FORWARD_TIMEOUT_S if timeout_s is None else timeout_s
+    return _run_sandbox_forge(
+        ["call", verb, "--repository", repo], verb, repo, payload, ceiling
+    )
+
+
+def validate_memory_proposal_target(
+    rec_id: str, branch: str, rel_path: str, pr_markdown: str
+) -> bool:
+    """Return True when ``rec_id``, ``branch``, ``rel_path``, and ``pr_markdown`` are safe OKF PR inputs."""
+    if not _MEMORY_RECORD_ID_RE.fullmatch(rec_id):
+        return False
+    if branch != f"{_MEMORY_BRANCH_PREFIX}{rec_id}":
+        return False
+    if not str(pr_markdown or "").strip():
+        return False
+    rel = str(rel_path or "")
+    if "\\" in rel or rel.startswith("/"):
+        return False
+    parts = rel.split("/")
+    if len(parts) != 3 or parts[0] != "knowledge" or parts[1] not in _MEMORY_REL_DIRS:
+        return False
+    filename = parts[2]
+    if filename != f"{rec_id}.md":
+        prefix = f"{rec_id}-"
+        if not (filename.startswith(prefix) and filename.endswith(".md")):
+            return False
+        if not _MEMORY_SLUG_RE.fullmatch(filename[len(prefix) : -3]):
+            return False
+    return True
+
+
+def open_memory_proposal_pr_local(
+    *,
+    repo: str,
+    branch: str,
+    rel_path: str,
+    pr_markdown: str,
+    title: str,
+    body: str,
+) -> dict:
+    """Clone ``repo``, write ``rel_path`` on ``branch``, commit, publish, and open the PR via ``vcs_client``."""
+    if not branch.startswith(_MEMORY_BRANCH_PREFIX):
+        raise vcs_client.VcsError(f"invalid memory proposal branch: {branch!r}")
+    rec_id = branch[len(_MEMORY_BRANCH_PREFIX) :]
+    if not validate_memory_proposal_target(rec_id, branch, rel_path, pr_markdown):
+        raise vcs_client.VcsError(
+            f"invalid memory proposal target ({rec_id!r}, {branch!r}, {rel_path!r})"
+        )
+    if not str(title or "").strip():
+        raise vcs_client.VcsError("memory proposal PR title must not be empty")
+
     try:
-        completed = sandbox_exec.run(
-            ["python3", SANDBOX_FORGE, "call", verb, "--repository", repo],
-            timeout=ceiling,
-            stdin=json.dumps(payload),
-        )
-    except sandbox_exec.SandboxUnavailable as unreachable:
-        # The verb never ran. Reported as its own code rather than as a forge
-        # refusal, because a sweep that reads "the repository is quiet" out of a
-        # transport that was down is the one answer this path must not produce.
-        raise vcs_client.VcsError(
-            str(unreachable), code=REASON_SANDBOX_UNREACHABLE
-        ) from unreachable
-    except subprocess.TimeoutExpired as expired:
-        raise vcs_client.VcsError(
-            f"{verb} on {repo} did not answer within {ceiling}s",
-            code=REASON_SANDBOX_UNREACHABLE,
-        ) from expired
-    if completed.returncode != 0:
-        # `main` answers a refusal with exit 0 and a `refusal` key, so a
-        # non-zero exit is the far side itself failing: no interpreter, no file,
-        # an unhandled fault. stderr is where that is legible.
-        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        raise vcs_client.VcsError(
-            f"{SANDBOX_FORGE} exited {completed.returncode}: "
-            f"{detail[-1] if detail else 'no output'}",
-            code=REASON_SANDBOX_UNREACHABLE,
-        )
+        vcs_client.discard(repo, key=branch)
+    except Exception:  # noqa: BLE001 — ignore absent scratch copy before clone
+        pass
+
+    cloned = vcs_client.clone(repo, key=branch)
     try:
-        answer = json.loads(completed.stdout or "")
-    except ValueError as exc:
-        # The sandbox's, not the broker's. Left codeless these two fell through
-        # to the fallback above, which names the broker, and would send an
-        # operator to a component that answered fine.
-        raise vcs_client.VcsError(
-            f"{verb} on {repo} answered with something that is not JSON: {exc}",
-            code=REASON_SANDBOX_UNREACHABLE,
-        ) from exc
-    # `null`, a list, a number and a bare string are all valid JSON and none of
-    # them is the envelope. Without this the next two lines raise
-    # `AttributeError` out of a module whose callers catch `VcsError`, so a far
-    # side printing the wrong shape crashes the sweep instead of naming it.
-    if not isinstance(answer, dict):
-        raise vcs_client.VcsError(
-            f"{verb} on {repo} answered with {type(answer).__name__}, not an "
-            "envelope",
-            code=REASON_SANDBOX_UNREACHABLE,
+        ws_path = Path(cloned["path"])
+        ws_real = ws_path.resolve()
+        base_branch = cloned.get("baseBranch") or cloned.get("branch")
+        branch_res = vcs_client.branch(repo, name=branch, key=branch)
+        if isinstance(branch_res, dict) and branch_res.get("exitCode", 0) != 0:
+            raise vcs_client.VcsError(
+                f"could not create branch {branch}: {branch_res.get('stderr') or ''}"
+            )
+
+        cur = ws_path
+        parts = rel_path.split("/")
+        for part in parts[:-1]:
+            cur = cur / part
+            if cur.is_symlink():
+                raise vcs_client.VcsError(f"refusing symlink directory in path: {cur}")
+        target = ws_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink() or not target.resolve().is_relative_to(ws_real):
+            raise vcs_client.VcsError(f"memory proposal path escapes workspace: {rel_path}")
+        target.write_text(pr_markdown.rstrip() + "\n", encoding="utf-8")
+
+        vcs_client.commit(title, paths=[rel_path], spec=repo, key=branch)
+        pub = vcs_client.publish(repo, target=base_branch, key=branch)
+
+        final_body = str(body or "").strip()
+        dm_md = str((pub or {}).get("decisionMemoryMarkdown") or "").strip()
+        if dm_md and vcs_client.DECISION_MEMORY_HEADING not in final_body:
+            final_body = f"{final_body}\n\n{dm_md}".strip() if final_body else dm_md
+
+        create_payload = {
+            "repository": repo,
+            "source": branch,
+            "title": title,
+            "body": final_body,
+        }
+        if base_branch:
+            create_payload["target"] = base_branch
+        created = vcs_client.call("proposal-create", create_payload)
+        proposal = (created or {}).get("proposal") or {}
+        return {
+            "url": str(proposal.get("url") or ""),
+            "number": int(proposal.get("number") or 0),
+            "revision": str((pub or {}).get("revision") or ""),
+        }
+    finally:
+        try:
+            vcs_client.discard(repo, key=branch)
+        except Exception:  # noqa: BLE001 — best-effort scratch cleanup
+            pass
+
+
+def open_memory_proposal_pr(
+    *,
+    repo: str,
+    branch: str,
+    rel_path: str,
+    pr_markdown: str,
+    title: str,
+    body: str,
+    timeout_s: Optional[float] = None,
+) -> dict:
+    """Open a deterministic ``knowledge/`` PR locally or inside the shell sandbox."""
+    if sandbox_exec.sandbox_enabled():
+        ceiling = FORWARD_TIMEOUT_S if timeout_s is None else timeout_s
+        return _run_sandbox_forge(
+            ["open-memory-pr", "--repository", repo],
+            "open-memory-pr",
+            repo,
+            {
+                "branch": branch,
+                "rel_path": rel_path,
+                "pr_markdown": pr_markdown,
+                "title": title,
+                "body": body,
+            },
+            ceiling,
         )
-    refusal = answer.get("refusal")
-    if refusal:
-        raise vcs_client.VcsError(
-            str(refusal.get("message") or f"{verb} was refused"),
-            code=refusal.get("code"),
-            detail=refusal.get("detail"),
-        )
-    return answer.get("answer") or {}
+    return open_memory_proposal_pr_local(
+        repo=repo,
+        branch=branch,
+        rel_path=rel_path,
+        pr_markdown=pr_markdown,
+        title=title,
+        body=body,
+    )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Answer one forwarded verb. This is the far side of `_forward`.
+    """Answer one forwarded verb or deterministic memory PR publication.
 
     Reached only as a subprocess inside the sandbox; nothing a person or a
     model runs comes through here. It exists so the forwarding hop needs no
@@ -649,9 +804,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     payload; making it an exit status would leave the code nowhere to go.
     """
     parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("command", choices=["call"])
-    parser.add_argument("verb", help="the version-control verb to send")
-    parser.add_argument("--repository", required=True)
+    sub = parser.add_subparsers(dest="command", required=True)
+    call_parser = sub.add_parser("call")
+    call_parser.add_argument("verb", help="the version-control verb to send")
+    call_parser.add_argument("--repository", required=True)
+    mem_parser = sub.add_parser("open-memory-pr")
+    mem_parser.add_argument("--repository", required=True)
     args = parser.parse_args(argv)
 
     try:
@@ -663,7 +821,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     try:
-        answer = vcs_client.forge(args.verb, payload, repository=args.repository)
+        if args.command == "open-memory-pr":
+            answer = open_memory_proposal_pr_local(
+                repo=args.repository,
+                branch=str(payload.get("branch") or ""),
+                rel_path=str(payload.get("rel_path") or ""),
+                pr_markdown=str(payload.get("pr_markdown") or ""),
+                title=str(payload.get("title") or ""),
+                body=str(payload.get("body") or ""),
+            )
+        else:
+            answer = vcs_client.forge(args.verb, payload, repository=args.repository)
     except vcs_client.VcsError as refusal:
         print(json.dumps({"refusal": {
             "message": str(refusal), "code": refusal.code, "detail": refusal.detail,

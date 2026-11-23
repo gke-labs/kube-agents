@@ -2,13 +2,12 @@
 
     python3 -m unittest tests/test_skill_inline_commands.py
 
-A kanban worker runs as `hermes chat -q`, where the command scanner refuses a
-command whose program is a shell variable (`$G add`) and the refusal is final.
-The image build's deploy/docker/check_skill_commands.py runs the fenced shell
-blocks through that scanner but not inline code, most of which is JSON, report
-templates or fragments the scanner cannot rate. This reads the inline code of
-every shipped skill document, as deploy/docker/skill_documents.py defines it,
-for the variable forms the skills used to teach: a
+The skills call a program by its name or path, never through a shell variable
+(`$G add`). The convention dates from a command scanner that refused the
+variable form; the image no longer runs that scanner and the convention stays.
+This reads the inline code of every shipped skill document, as
+deploy/docker/skill_documents.py defines it, for the variable forms the skills
+used to teach: a
 variable as the program, a script run by a path that starts with one, or the
 path of git or `submit_suggestion.py` put in a variable.
 """

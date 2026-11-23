@@ -184,6 +184,9 @@ func TestTheBuiltinPolicyLeavesBuiltinToTheOperator(t *testing.T) {
 	}), "a writer changing the PlatformAgent controller")
 	refused(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "Run something else." }),
 		"a writer changing a built-in schedule's spec")
+	refused(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) {
+		s.Spec.Prompt, s.Spec.Script = "", "stall-watch"
+	}), "a writer swapping a built-in schedule's prompt for a script")
 	// Suspending is the exception: the one way to pause a built-in audit
 	// until PlatformAgent.spec.schedules.overrides exists.
 	allowed(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Suspend = true }),

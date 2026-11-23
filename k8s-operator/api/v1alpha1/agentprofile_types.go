@@ -275,7 +275,23 @@ type AgentProfileHarness struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MaxTurns int32 `json:"maxTurns,omitempty"`
+
+	// Type is the harness the worker image runs. Absent is claude-code. The
+	// operator passes it to the worker as A2A_HARNESS, which the worker
+	// adapter's harness selector reads to pick its stream driver, argv and
+	// env, and persona adapter. It is passed only when set, so a profile that
+	// leaves it out renders as it did before the field existed. It is pod
+	// configuration only: it is not on the profile's card, and no bus
+	// subject or permission depends on it. claude-code is the only value
+	// accepted today.
+	// +kubebuilder:validation:Enum=claude-code
+	// +optional
+	Type string `json:"type,omitempty"`
 }
+
+// AgentProfileHarnessClaudeCode is the AgentProfile harness type for Claude
+// Code, and what an absent type means.
+const AgentProfileHarnessClaudeCode = "claude-code"
 
 // AgentProfileBus holds the profile's blackboard grants, written without the
 // a2a.topics. prefix.

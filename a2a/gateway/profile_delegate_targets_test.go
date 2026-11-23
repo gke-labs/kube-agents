@@ -164,16 +164,15 @@ func TestADelegatingProfileRootListsWhatTheDelegationAccepts(t *testing.T) {
 	}
 }
 
-// TestAProfileParentTheDelegationRefusesOutrightListsNobody: an unattended
-// parent is refused every child on this gateway (profileParentRefusal), so
-// its list is empty, never a profile it can't reach.
+// TestAProfileParentTheDelegationRefusesOutrightListsNobody: a parent with
+// no scope on its record (profileParentRefusal) or at the depth cap is
+// refused every child, so its list is empty, never a profile it can't reach.
 func TestAProfileParentTheDelegationRefusesOutrightListsNobody(t *testing.T) {
 	t.Parallel()
 	r := startDelegateTargetsRig(t)
 	rec := &SessionRecord{Key: "console:tab-unattended"}
 	requester := TaskRequester{Backend: consoleBackend, Subject: "hmac:00"}
 	for _, parent := range []TaskRef{
-		{Addressee: "chat", Tier: string(capability.TierUnattended), Scope: installScope, Requester: &requester},
 		{Addressee: "chat", Tier: string(capability.TierRead), Scope: "", Requester: &requester},
 		{Addressee: "chat", Tier: string(capability.TierRead), Scope: installScope, Requester: &requester, Depth: r.g.cfg.DelegationDepthMax},
 	} {
@@ -244,4 +243,90 @@ func TestAProfileSubmissionWithoutAListIsAsBefore(t *testing.T) {
 	rec, _ = r.g.reg.Get(context.Background(), conv)
 	parentRef, _ := rec.TaskRefFor(parentID)
 	asBefore("a child", submissionFor(t, r, "prod-east", childID), nil, capability.Tier(parentRef.Tier), lib.SubmitKindChild)
+}
+
+// TestAScheduledRunListsWhatItsDelegationAccepts is the one source of truth
+// for a scheduled run (#6744, #6789): the list a parent below a schedule is
+// offered and the delegation it makes run the same check
+// (delegateEntryCheck), so the list holds exactly the profiles that run at
+// read and list unattended, each of them is accepted, and each profile left
+// off is refused.
+func TestAScheduledRunListsWhatItsDelegationAccepts(t *testing.T) {
+	t.Parallel()
+	type entry struct {
+		name   string
+		params map[string]string
+	}
+	// The trigger rig's fleet-audit (read, unattended; delegates), cluster
+	// (read, unattended; takes a target) and readonly (read), and these.
+	cards := []*lib.AgentCard{
+		{Name: "reader", Tiers: []string{"read", "unattended"}},
+		{Name: "writer", Tiers: []string{"oncall", "unattended"}},
+		{Name: "legacy"},
+	}
+	listed := []entry{
+		{"cluster", targetParams("p1", "us-east1", "prod")},
+		{"fleet-audit", nil},
+		{"reader", nil},
+	}
+	unlisted := []entry{{"legacy", nil}, {"readonly", nil}, {"writer", nil}, {targetPlatform, nil}}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	start := func(t *testing.T) (*triggerRig, lib.Envelope, *lib.TaskExecution) {
+		t.Helper()
+		tr := startTriggerRig(t, nil)
+		for _, c := range cards {
+			tr.g.profiles.put(c.Name, c)
+		}
+		origin, parent := startScheduledParent(t, tr)
+		return tr, origin, parent
+	}
+
+	t.Run("list", func(t *testing.T) {
+		t.Parallel()
+		tr, origin, _ := start(t)
+		rec, err := tr.g.reg.Get(context.Background(), key)
+		if err != nil || rec == nil {
+			t.Fatalf("the run's record: %v", err)
+		}
+		parent, ok := rec.TaskRefFor(origin.TaskID)
+		if !ok || !parent.belowSchedule() {
+			t.Fatalf("the run's entry = %+v, want one below a schedule", parent)
+		}
+		var want []string
+		for _, e := range listed {
+			want = append(want, e.name)
+		}
+		if got := targetNames(tr.g.profileDelegateTargets(rec, parent)); !slices.Equal(got, want) {
+			t.Fatalf("the scheduled run's targets = %v, want %v", got, want)
+		}
+	})
+	for _, tc := range []struct {
+		entries []entry
+		minted  bool
+	}{{listed, true}, {unlisted, false}} {
+		for _, e := range tc.entries {
+			t.Run(e.name, func(t *testing.T) {
+				t.Parallel()
+				tr, origin, parent := start(t)
+				ctx := context.Background()
+				if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, e.name, "look", e.params)); err != nil {
+					t.Fatal(err)
+				}
+				var end string
+				var children int
+				waitFor(t, "the delegation's outcome", func() bool {
+					rec, _ := tr.g.reg.Get(ctx, key)
+					if rec == nil {
+						return false
+					}
+					ref, ok := rec.TaskRefFor(origin.TaskID)
+					end, children = ref.DelegationEnd, len(ref.Children)
+					return ok && (children > 0 || end != "")
+				})
+				if minted := children > 0; minted != tc.minted {
+					t.Fatalf("delegating to %s: minted %v (end %q), want minted %v", e.name, minted, end, tc.minted)
+				}
+			})
+		}
+	}
 }

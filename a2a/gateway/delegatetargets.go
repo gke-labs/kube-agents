@@ -166,8 +166,10 @@ const probeTargetToken = "probe_target"
 // (profileParentRefusal, the depth cap) and each profile's
 // (delegateEntryCheck) are the delegation's own, run on a probe entry
 // addressed to the profile. Platform is never listed: a profile parent's
-// platform child is refused. A parent the delegation refuses outright, such
-// as an unattended one, gets an empty list, which its tool reads as nobody.
+// platform child is refused. A parent below a scheduled run is offered only
+// profiles that run at read and list unattended, as delegateEntryCheck holds
+// its children to (#6744). A parent the delegation refuses outright, such as
+// one at the depth cap, gets an empty list, which its tool reads as nobody.
 //
 // The probe gives the profile what a delegation that can be accepted would:
 // each required parameter, and a target. Under a parent scoped to a cluster

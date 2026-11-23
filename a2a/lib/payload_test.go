@@ -441,6 +441,10 @@ func TestWholeConversationKey(t *testing.T) {
 		"gchat:space/spaces/AAA/threads/BBB": true,
 		"slack:C0HOME/1712.0001":             false, "slack:dm/D123/1712.0001": false, "gchat:spaces/AAA/threads/BBB": false,
 		"gchat:dm/spaces/DDD/threads/TTT": false, "console:abc": false, "inject:bench-7": false, "": false,
+		// Teams: a personal chat, a group chat and a channel's own id are
+		// shared; a channel thread's id, with its token in either spelling, is not.
+		"teams:a:1UxxASmI": true, "teams:19:group@thread.v2": true, "teams:19:chan@thread.tacv2": true,
+		"teams:19:chan@thread.tacv2;messageid=1794603936403": false, "teams:19:chan@thread.tacv2;messageId=1794603936403": false,
 	} {
 		if got := WholeConversationKey(key); got != want {
 			t.Errorf("WholeConversationKey(%q) = %v, want %v", key, got, want)
@@ -454,6 +458,7 @@ func TestThreadKeyedConversation(t *testing.T) {
 		"slack:dm/D123/1712.0001": true,
 		"slack:dm/D123":           false, "gchat:space/spaces/AAA": false, "gchat:dm/spaces/DDD": false,
 		"console:abc": false, "inject:bench-7": false, "a2a:x": false, "discord:g1/t1": false, "": false,
+		"teams:19:chan@thread.tacv2;messageid=1794603936403": true, "teams:a:1UxxASmI": false, "teams:19:chan@thread.tacv2": false,
 	} {
 		if got := ThreadKeyedConversation(key); got != want {
 			t.Errorf("ThreadKeyedConversation(%q) = %v, want %v", key, got, want)

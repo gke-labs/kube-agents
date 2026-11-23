@@ -16,8 +16,10 @@ const clusterScopeSegments = 6
 // "Scale rules" and "Replacing kanban's plumbing" item 3; 09, "Profile
 // tasks"). A profile task's child is minted a fresh root, not a hop, so the
 // verifier never compares parent with child: the gateway's mint is where
-// these hold. A child is never wider than its parent on tier (minted at the
-// parent's, by profileRouteFor), scope or targets, and no profile appears
+// these hold. A child is minted at its parent's tier (by profileRouteFor), or at
+// read below an unattended parent, which runs work only through profile tasks
+// and whose children may never write (#6744). It is never wider than its
+// parent on scope or targets, and no profile appears
 // twice on a chain except the chain head's one self-nest.
 
 // childProfileChain is the chain a child of parent carries: the parent's
@@ -35,11 +37,6 @@ func childProfileChain(parent TaskRef, profileParent bool) []string {
 // after the card check (delegation.profile-not-delegating), which needs the
 // directory and so sits in handleDelegateRequest.
 func profileParentRefusal(parent TaskRef) (rule, notice string) {
-	// An unattended grant is bound to its trigger (09), and the child mint
-	// carries no trigger: refused until the child's inheritance is designed.
-	if capability.Tier(parent.Tier) == capability.TierUnattended {
-		return ruleDelegationUnattendedParent, noticeUnattendedParent
-	}
 	// A profile task this gateway minted always has a scope, so an empty one
 	// is a record from before #5686 or a path that didn't record it: its
 	// chain is unknown too. Refused, never read as "no chain".
@@ -141,4 +138,10 @@ func scopeCluster(s capability.Scope) (clusterTarget, bool) {
 		return clusterTarget{Project: segs[1], Location: segs[3], Cluster: segs[5]}, true
 	}
 	return clusterTarget{}, false
+}
+
+// belowSchedule reports whether a task is a scheduled run (the unattended
+// tier) or a profile task below one (#6744).
+func (t TaskRef) belowSchedule() bool {
+	return t.Tier == string(capability.TierUnattended) || t.Scheduled
 }
