@@ -27648,6 +27648,38 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         return self.stdout_json()
 
+    def test_an_invented_finding_on_a_noted_object_is_uncorroborated(self):
+        """The noted exemption covers only ids the previous ledger carried
+        (`uncorroborated_findings`). A new finding the model wrote about an
+        object the collector read but could not see is a verdict nothing
+        observed, so it reads as uncorroborated like any other; the sweep's
+        own exclusion (`not_visible` in `promotion_candidates`) still keeps
+        every noted finding out of the promotion blocks, so nothing opens
+        either way."""
+        manifest = self.noted_manifest()
+        finding = make_finding(fid="a", title="Alpha finding")
+        # Invented: no previous ledger carries the id.
+        self.assertEqual(
+            audit_report.uncorroborated_findings([finding], manifest),
+            {str(finding["id"])},
+        )
+        # Carried: the previous ledger lists it, so the exemption holds.
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [finding], manifest, [audit_report.published_id(finding)]
+            ),
+            set(),
+        )
+        # The exemption is the noted object's, not every carried id's: a
+        # carried finding on an object no note names stays uncorroborated.
+        other = make_finding(fid="z", title="Zulu finding", obj="Namespace/z")
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [other], manifest, [audit_report.published_id(other)]
+            ),
+            {str(other["id"])},
+        )
+
     def test_a_carried_noted_finding_is_not_uncorroborated_and_not_swept(self):
         """The collector read the object but could not see it, so it did not
         pass it: the finding is not uncorroborated. Nothing this run backs an
@@ -27863,6 +27895,10 @@ class TestNotedSetSpeaksOnce(HarnessTestCase):
     def test_an_on_demand_run_does_not_take_the_news_from_the_channel(self):
         on_demand = self.finish(noted=True, scheduled=False)
         self.assertFalse(on_demand["silent_ok"])
+        # `noted_changed` is the scheduled verdict's term, like `ids_moved`:
+        # an on-demand run reports everything anyway, so its line does not
+        # carry the key.
+        self.assertNotIn(audit_report.NOTED_CHANGED_KEY, on_demand)
         # The on-demand run copied the baseline forward, so the channel still
         # hears the change on the next scheduled run, and only once.
         first = self.finish(noted=True)
@@ -29252,7 +29288,12 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertFalse([b for b in posted if "no longer reproduces" in b])
 
     def test_remediate_refuses_a_noted_id_with_its_own_reason(self):
+        # The ledger carries `a` (the store is its record), so the noted
+        # hold protects a previous finding from being resolved unseen.
         a_id = derived_id(fid="a")
+        self.seed_report(
+            published_body(make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW)
+        )
         findings_file = self.write_findings(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]))
         manifest = _full_manifest()
         manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
@@ -29265,6 +29306,25 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 2, self.err)
         self.assertIn("could not see the result", self.err)
         self.assertNotIn("still emits", self.err)
+
+    def test_remediate_gives_the_plain_error_for_a_noted_id_never_filed(self):
+        """A noted object no previous finding covers holds nothing
+        (`noted_ids`): a `/remediate` on an id never filed is a typo, and
+        the answer lists the known ids rather than telling the caller to
+        carry forward a finding that does not exist."""
+        a_id = derived_id(fid="a")
+        findings_file = self.write_findings(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]))
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", findings_file,
+             "--finding", a_id, "--manifest-file", self.manifest_file(manifest)]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("known ids are", self.err)
+        self.assertNotIn("could not see the result", self.err)
 
     def test_remediate_refuses_a_held_id_as_held_not_as_unknown(self):
         """The CLI path: with the manifest it names the hold; without it the

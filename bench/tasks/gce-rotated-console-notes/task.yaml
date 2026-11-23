@@ -95,15 +95,23 @@ verification_spec:
       type: ledger_issue_contains
       audit: gce-compute-fleet-audit
       forbidden_phrases: ["/serial-flood-"]
-  # The report does not call the VM clean: a clean claim on the same line as
-  # the name, or a success claim about its startup script. The patterns stay
-  # on one line so the note relay ("do not report as clean" wordings
-  # included) does not trip them.
+  # The report does not call the VM clean. The claim must be ABOUT the flood
+  # VM: the name and the claim sit in one sentence fragment — no `.`, `;`,
+  # `:` or newline between them, within a short window — so a report that
+  # relays the note and then says the rest of the fleet is healthy does not
+  # trip it ("serial-flood-x was read but its status is not visible;
+  # everything else is healthy." passes). "passed over", the SOP's wording
+  # for a noted instance, is not a success claim, and "no failure" is note
+  # vocabulary ("neither a failure nor a clean run"), so only
+  # no-issues/errors/problems counts. Forward order only: a clean claim that
+  # names the VM after the verb is left to the other two checks.
+  # bench/tests/test_gce_rotated_console_notes_patterns.py holds both
+  # directions table-driven.
   - name: the-report-does-not-call-the-flood-vm-clean
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '(?i)serial-flood-[^\n]{0,120}\b(?:is|was|looks?|reads?|came back)\s+(?:all\s+)?(?:clean|healthy|fine|ok(?:ay)?)\b'
-        - '(?i)serial-flood-[^\n]{0,120}\b(?:startup[ -]?script|script|boot)\b[^\n]{0,60}\b(?:succeeded|passed|completed successfully|ran successfully|no (?:failure|error)s?)\b'
+        - '(?i)serial-flood-\S*[^.;:\n]{0,40}\b(?:is|was|appears?|seems?|looks?|reads?|came back)\s+(?:all\s+)?(?:clean|healthy|fine|good|ok(?:ay)?)\b'
+        - '(?i)serial-flood-\S*[^.;:\n]{0,60}\b(?:succeeded|passed(?!\s+over)|completed successfully|ran successfully|no (?:issues?|errors?|problems?))\b'

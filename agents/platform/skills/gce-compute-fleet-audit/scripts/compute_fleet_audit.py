@@ -862,6 +862,11 @@ def startup_run_visible(serial_text: str) -> bool:
     return bool(_run_starts(serial_text.splitlines()))
 
 
+def _raw_run_starts(lines: list[str]) -> list[int]:
+    """The indices of every line that opens a startup-script run."""
+    return [index for index, line in enumerate(lines) if STARTUP_RUN_PATTERN.search(line)]
+
+
 def _run_starts(lines: list[str]) -> list[int]:
     """The indices of the lines that open a startup-script run.
 
@@ -870,7 +875,7 @@ def _run_starts(lines: list[str]) -> list[int]:
     runner prints, holds no run yet, so it is not the visible run. The
     previous run counts instead.
     """
-    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_PATTERN.search(line)]
+    starts = _raw_run_starts(lines)
     if (
         starts
         and SYSTEMD_START_MARKER in lines[starts[-1]]
@@ -878,6 +883,24 @@ def _run_starts(lines: list[str]) -> list[int]:
     ):
         starts.pop()
     return starts
+
+
+def startup_boot_window(serial_text: str) -> bool:
+    """Is the console inside a boot window with no previous run to read?
+
+    systemd has started the unit, the runner has not printed, and no earlier
+    run is left in the buffer — a new VM read seconds after boot. The run
+    has not started, so the console is evidence of nothing: not a clean run,
+    not a failure, and not a rotated buffer. The caller files no candidate
+    and writes no note, as on a console whose run is visible; the next read,
+    after the runner prints, grades the run. Without this, a healthy new VM
+    was noted "rotated out" at first read and woke the channel twice: once
+    for the note, once more when it cleared. A console whose earlier run is
+    still in the buffer is not this shape (`_run_starts` keeps the earlier
+    start), and a buffer with no start marker at all is the rotated one.
+    """
+    lines = serial_text.splitlines()
+    return bool(_raw_run_starts(lines)) and not _run_starts(lines)
 
 
 def _metadata_keys(payload: dict, field: str) -> set[str]:
@@ -1355,6 +1378,9 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 (common_script or (instance_name, zone) in scripted)
                 and not instance_name.startswith(GKE_INSTANCE_PREFIXES)
                 and not startup_run_visible(result.stdout)
+                # A first boot read in its boot window is not a rotated
+                # console: the run has not started (`startup_boot_window`).
+                and not startup_boot_window(result.stdout)
             ):
                 # The console was read, but the boot that ran the script is
                 # no longer in it. No failure line here proves nothing, so the

@@ -62,7 +62,9 @@ repository's store. With no public body to check it against, the next no-forge r
 `current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
 that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
 envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
-counted as resolved, as the ledger holds it. Over a gap, so is a previous id on a target the run did
+counted as resolved, as the ledger holds it; so is a previous id on an object a target's note
+names (`noted_objects`) — the collector read it but could not see the result, so the run did not
+see the finding go away. Over a gap, so is a previous id on a target the run did
 not check ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
 
 Two runs have a repository setting but take the no-forge path, and they store marked envelopes. A run
@@ -113,7 +115,8 @@ in the run record, read as `finish` begins, else the in-flight note's, else null
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
 dropped under a gap, or with no forge the ids that left under a gap, until a run with full coverage clears them (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
-run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
+run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), the ids of
+its noted objects (`scheduled_noted_ids`), and the
 ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)).
 The `scheduled_*` keys are the record of the last scheduled run, not this run's own answer: an
 on-demand run copies them from the record before it. A run that `precheck` closed from the stored

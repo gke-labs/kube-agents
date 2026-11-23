@@ -1970,9 +1970,11 @@ SCHEDULED_PUBLISHED_IDS_KEY = "scheduled_published_ids"
 # None when no record shows the set; a scheduled run with a noted object
 # then speaks (`scheduled_noted_baseline`).
 SCHEDULED_NOTED_IDS_KEY = "scheduled_noted_ids"
-# On the JSON line only when True: the run is not silent because its set of
-# noted objects is not the set the last scheduled run stored. The notes
-# themselves are under `notes` (`NOTES_RESULT_KEY`) as on every run.
+# On the JSON line of a scheduled run only, like `SINCE_SCHEDULED_KEY`: the
+# run is not silent because its set of noted objects is not the set the last
+# scheduled run stored. An on-demand run reports everything anyway, so its
+# line never carries the key. The notes themselves are under `notes`
+# (`NOTES_RESULT_KEY`) on every run.
 NOTED_CHANGED_KEY = "noted_changed"
 # On the stored envelope only: the ids under `REPORTED_UNDER_GAP_KEY` that a
 # scheduled run reported. A scheduled run does not report these again; an id
@@ -9086,8 +9088,14 @@ def cap_held_entries(entries: list[dict]) -> tuple[list[dict], list[dict]]:
     return entries[:MAX_HELD_IDS], entries[MAX_HELD_IDS:]
 
 
-def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[str]:
+def uncorroborated_findings(
+    findings: list[dict], manifest: dict | None, carried: Iterable[str] = ()
+) -> set[str]:
     """Findings published under a slug the collector ran and did not flag them for.
+
+    `carried` is the ids the previous ledger carried (`published_id`
+    spelling): a noted object's finding is exempt only when it is one of
+    them — see the note at the bottom.
 
     The inverse of `unpublished_candidates`, and the direction nothing was
     watching. That one asks what the collector saw and the document did not
@@ -9134,8 +9142,19 @@ def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[
         )
     flagged = _flagged_identities(manifest)
     # A noted object was read but not seen, so its check did not pass it: a
-    # finding carried on one is not uncorroborated (`noted_ids`).
-    noted = {derive_finding_id(identity) for _entry, identity, _command in _noted_objects(manifest)}
+    # finding CARRIED on one is not uncorroborated (`noted_ids`). Only a
+    # carried one — the previous ledger's ids, as the caller read them. A
+    # new finding the model wrote about a noted object is a verdict nothing
+    # observed, and it is disclosed as uncorroborated like any other; the
+    # sweep already passes over it through `not_visible`, so this changes
+    # what is said, not what is opened. With no carried ids (a dry run reads
+    # no ledger), no noted id is exempt.
+    carried_ids = {str(fid) for fid in carried}
+    noted = {
+        derive_finding_id(identity)
+        for _entry, identity, _command in _noted_objects(manifest)
+        if published_id(identity) in carried_ids
+    }
     return {
         str(finding.get("id") or "")
         for finding in findings
@@ -23632,6 +23651,8 @@ def _handle_finish_dry_run(
         findings,
         {},
         sweep_off=not sweep_on,
+        # The dry run reads no ledger, so it cannot know that a noted
+        # object is carried; a finding on one previews as uncorroborated.
         uncorroborated=uncorroborated_findings(findings, manifest),
         not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
@@ -24046,7 +24067,21 @@ def handle_remediate(args: argparse.Namespace) -> None:
     by_id = {str(f.get("id", "")): f for f in findings}
     still_flagged = still_flagged_ids(manifest, data) if manifest is not None else set()
     noted = noted_ids(manifest)
-    collector_noted = [fid for fid in args.finding if fid not in by_id and fid in noted]
+    # The noted hold protects a previous finding from being resolved unseen,
+    # so it applies only to an id the ledger carries (`noted_ids`: a noted
+    # id that no previous finding carries holds nothing). This command reads
+    # no ledger body; the store's newest record of it says what it carries.
+    # An id never filed falls through to the plain not-in-document error:
+    # "carry it forward" would tell the caller to carry a finding that does
+    # not exist.
+    store_repo = repo_hint or refusal_repo
+    carried_record = (
+        newest_stored_record(audit_id, store_repo) if noted and store_repo else {}
+    )
+    carried_ids = {str(fid) for fid in (carried_record or {}).get("current_ids") or []}
+    collector_noted = [
+        fid for fid in args.finding if fid not in by_id and fid in noted and fid in carried_ids
+    ]
     if collector_noted:
         raise ValidationError(
             f"--finding: {', '.join(collector_noted)} not in {args.findings_file}: "
@@ -25007,7 +25042,9 @@ def _finish_without_forge(
             {
                 UNPUBLISHED_CANDIDATES_KEY: unpublished,
                 WHOLLY_UNPUBLISHED_CHECKS_KEY: wholly_dropped,
-                UNCORROBORATED_FINDINGS_KEY: sorted(uncorroborated_findings(findings, manifest)),
+                UNCORROBORATED_FINDINGS_KEY: sorted(
+                    uncorroborated_findings(findings, manifest, previous_ids or [])
+                ),
             }
             if manifest is not None
             else {}
@@ -25015,7 +25052,7 @@ def _finish_without_forge(
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
         **since_scheduled,
-        **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
+        **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
@@ -25570,7 +25607,7 @@ def _finish_store_ledger(
         cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
         requested_at={},
         sweep_off=not sweep_on,
-        uncorroborated=uncorroborated_findings(findings, manifest),
+        uncorroborated=uncorroborated_findings(findings, manifest, previous_ids),
         not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
@@ -25766,7 +25803,7 @@ def _finish_store_ledger(
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **({RETIRED_UNLISTED_KEY: sorted(retired_ids)} if retired else {}),
         **since_scheduled,
-        **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
+        **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
         **collector_payload(plan.uncorroborated),
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
@@ -27584,7 +27621,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             # (`SINCE_SCHEDULED_KEY`).
             **since_scheduled,
             # Only when the run speaks because the noted set changed.
-            **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
+            **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
             **timer_payload(),
@@ -27787,7 +27824,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
         requested_at=requests.requested_at,
         sweep_off=not sweep_on,
-        uncorroborated=uncorroborated_findings(findings, manifest),
+        uncorroborated=uncorroborated_findings(findings, manifest, previous_ids),
         not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
@@ -28220,7 +28257,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # Same key as the CLEAN branch; see the note there.
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **since_scheduled,
-        **({NOTED_CHANGED_KEY: True} if noted_moved else {}),
+        **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }

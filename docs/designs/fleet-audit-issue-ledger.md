@@ -1576,7 +1576,9 @@ applies correctly most of the time is a rule the harness should be applying.
 
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
 moved nothing an operator needs to hear about — nothing new, nothing resolved, nothing retired
-unread (§2), no new or changed coverage gap, no
+unread (§2), no new or changed coverage gap, no change in the set of noted objects (a scheduled
+run whose set differs from the last scheduled run's carries `noted_changed: true` and speaks; an
+unchanged noted object does not wake the channel), no
 held close, no remediation PR opened or closed, and, on a run that passed `--manifest-file`, no
 collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md))
 — and it is computed from the numbers `finish` is
@@ -1620,7 +1622,8 @@ last scheduled run published (`scheduled_published_ids`: with a ledger, its find
 it withheld, the held ids and the ids under _Not re-checked this run_, or for a clean run that left
 the body untouched, the ids that body still lists; with the ledger in the report store, the same ids
 as with a ledger, and no value when it held a ledger it could not read; with no forge, its findings,
-the held ids and the not-re-checked ids, which are the ids it stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
+the held ids and the not-re-checked ids, which are the ids it stores as `current_ids`), its gaps (`scheduled_coverage_gaps`, §7.4), and the ids of its
+noted objects (`scheduled_noted_ids`). A scheduled run writes its own
 values there, and an on-demand run copies them from the record before it. A scheduled run whose
 published ids differ from `scheduled_published_ids` is not silent, also when its delta against
 the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches

@@ -81,6 +81,11 @@ FRESH_FAILED_SERIAL = (TESTDATA / "serial_fresh_boot_failed.txt").read_text(enco
 # The failed boot above, then a reboot read in its boot window: systemd has
 # started the startup-scripts unit, and the runner has printed nothing yet.
 BOOT_WINDOW_SERIAL = (TESTDATA / "serial_boot_window.txt").read_text(encoding="utf-8")
+# A NEW VM read in its first boot window: the head of the fresh boot up to
+# systemd's start of the unit — no runner output and no previous run in the
+# buffer. The run has not started, so the console is not rotated and not
+# evidence of anything (`startup_boot_window`).
+FIRST_BOOT_WINDOW_SERIAL = (TESTDATA / "serial_first_boot_window.txt").read_text(encoding="utf-8")
 # A line the runner prints after its start, whichever agent it is.
 RUNNER_LINE = "google_metadata_script_runner[845]: Found startup-script in metadata\n"
 RECORDED_FAILURE_LINE = (
@@ -274,6 +279,19 @@ class StartupScriptTest(unittest.TestCase):
         self.assertFalse(cf.startup_run_visible(
             'google_metadata_script_runner[845]: Running metadata script runner (version 20260715.00) for "shutdown" event\n'
         ))
+
+    def test_a_first_boot_window_is_the_boot_window_not_a_rotated_buffer(self):
+        """Only start: systemd's line; no runner output; no previous run.
+        The run has not started, so the console is not a rotated one."""
+        self.assertTrue(cf.startup_boot_window(FIRST_BOOT_WINDOW_SERIAL))
+        self.assertFalse(cf.startup_run_visible(FIRST_BOOT_WINDOW_SERIAL))
+        # A wrapped buffer has no start marker at all: rotated, not booting.
+        self.assertFalse(cf.startup_boot_window(WRAPPED_SERIAL))
+        # A reboot read in the window still shows the previous run: visible,
+        # not the boot window.
+        self.assertFalse(cf.startup_boot_window(BOOT_WINDOW_SERIAL))
+        self.assertFalse(cf.startup_boot_window(FRESH_CLEAN_SERIAL))
+        self.assertFalse(cf.startup_boot_window(FRESH_FAILED_SERIAL))
 
     def test_a_recorded_wrapped_buffer_shows_no_run(self):
         """The red: the console the 2026-11-09 nightly read. No failure line
@@ -1157,6 +1175,27 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual([c["excerpt"] for c in entry["candidates"]], [RECORDED_FAILURE_LINE])
         self.assertNotIn("limitations", entry)
         self.assertNotIn("notes", entry)
+
+    def test_a_first_boot_read_in_the_boot_window_is_not_noted(self):
+        """A new VM read seconds after systemd starts the unit: the run has
+        not started and no previous run is in the buffer. Not a rotated
+        console — no candidate and no note, as on a console whose run is
+        visible; the next read, after the runner prints, grades the run.
+        Without this, a healthy new VM woke the channel twice: once noted
+        "rotated out" at first read, once more when the note cleared."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, one_running_instance("fresh-vm")),
+                "get-serial-port-output": run_of(0, FIRST_BOOT_WINDOW_SERIAL),
+            })),
+        )
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("notes", entry)
+        self.assertNotIn(cf.NOTED_OBJECTS_KEY, entry)
+        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
+        self.assertNotIn("limitations", entry)
 
     def test_a_read_in_the_boot_window_still_shows_the_earlier_failure(self):
         """The new boot's run has not started, so the last run that printed
