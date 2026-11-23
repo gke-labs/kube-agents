@@ -447,7 +447,12 @@ func TestBuildHandlerRejectsConflictingOrInvalidFlags(t *testing.T) {
 		{
 			name:    "upstream-url with exclude-host-cluster-id",
 			mutate:  func(c *proxyConfig) { c.excludeHostCluster = "gke_proj_us-central1_c" },
-			wantMsg: "--upstream-url cannot be combined with --scope-file or --exclude-host-cluster-id",
+			wantMsg: "--upstream-url cannot be combined with --scope-file, --hold-file or --exclude-host-cluster-id",
+		},
+		{
+			name:    "upstream-url with hold-file",
+			mutate:  func(c *proxyConfig) { c.holdFile = "/etc/hold.json" },
+			wantMsg: "--upstream-url cannot be combined with --scope-file, --hold-file",
 		},
 		{
 			name:    "invalid upstream-url",

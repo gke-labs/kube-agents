@@ -1138,6 +1138,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.handleDeletion(ctx, instance)
 	}
 
+	// 1a. spec.hold, for kube-proxy and the broker, before any step that can
+	// fail or park the reconcile: an operator's kill switch must not wait on an
+	// unrelated fault. In no pod-template hash: both re-read the mounted file,
+	// so a hold rolls nothing.
+	if err := r.reconcileHoldConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 1b. Move a stored spec.mode "today" to "next" (mode_migration.go). The
 	// render below does not read the field; this keeps the object truthful.
 	if migrated, err := r.migrateRetiredMode(ctx, instance); err != nil || migrated {

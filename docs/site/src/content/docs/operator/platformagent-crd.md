@@ -29,11 +29,12 @@ spec:
   networkPolicy: { ... } # generated egress NetworkPolicy (optional)
   integration: { ... } # Google Chat, Slack, Teams, git forge
   scope: { ... } # projects beyond the management project, and exclusions (optional)
+  hold: { ... } # clusters an operator has paused the agents' access to (optional)
   storage: { size: 80Gi } # data volume size (optional; absent means 50Gi)
   mode: next # deprecated and ignored; every install runs the A2A stack (optional; absent reads next)
 ```
 
-`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, `spec.networkPolicy`, and `spec.scope` are optional.
+`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, `spec.networkPolicy`, `spec.scope`, and `spec.hold` are optional.
 
 `spec.mode` is deprecated and ignored: every install runs the A2A stack. The enum still accepts `today` and `next`, so a stored object that carries `today` stays valid, and the schema defaults an absent field to `next`. The mutating webhook rewrites `today` to `next` on create and update. The operator patches a stored `today` to `next` once and records an Event with reason `ModeMigrated`. A later release removes the field.
 
@@ -1440,6 +1441,49 @@ One that reads a CR without a scope block keeps the exclusions of the last decla
 **The management project.** A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) marks the old project `retiring` on the run the change is seen, once the new project has listed its own clusters, and the next clean run prunes, unless `projects` names the old project and no `exclude.projects` entry matches it. An answer from the gcloud config fallback that disagrees with the previous run is treated as unresolved instead. Nothing is created or retired under the management project until an authoritative source, or a fallback answer that matches the previous run, names it.
 
 **The onboarding sweep** names any folder, organisation, Shared VPC host or Metrics Scope the reconcile could not resolve and, on an install whose scope resolved more than one project, any project it could not list, so a partial roster reads as partial; an install with one project and no container renders the sweep prompt it rendered before scopes existed.
+
+## `spec.hold`
+
+Optional. An operator's pause for one cluster, several, or all of them. The credential broker and
+`kube-proxy` refuse a held cluster's Kubernetes API to every caller, on the same routes as
+[`spec.scope.exclude.clusters`](#specscope), usually within a minute or two of the edit and without
+restarting any pod. Unlike an exclusion, a held cluster keeps its Cluster Agent profile and its
+place in fleet answers and audits; those runs meet the same refusal.
+
+- `clusters` — single clusters by `projectId`, `location` and `clusterName`, matched as
+  `exclude.clusters` entries are.
+- `all` — `true` holds every cluster, the one the harness runs in included.
+- `reason` — up to 256 characters, quoted in every refusal.
+
+A held cluster is refused as `scope.held-cluster` (a rule of the `scope.*` family it shares with
+[exclusions](#specscope)), with a message that names the hold and its reason
+and tells the agent to report it and stop. A Cluster Agent task that targets a held cluster is
+refused for every command, metadata reads included. The Platform Agent's own reads of the GKE
+control plane for it (the project's cluster list, a cluster's describe) stay allowed. A broker or
+`kube-proxy` that can't read the hold file it was given reaches no cluster until it can
+(`scope.hold-unreadable`).
+
+A hold, like an exclusion, is checked when a request starts. A watch, a followed `kubectl logs -f`,
+an exec, attach, port-forward or proxy stream, or a watcher stream the broker relays that was opened before
+the hold reached the component keeps running until it ends.
+
+The operator renders the hold into the `<agent>-hold` ConfigMap (`hold.json`), which no pod
+template hashes, so the edit rolls nothing: the kubelet updates the mounted file and both components
+read it again on their next request. `install.env` has no key for it, the chart never renders it,
+and an upgrade leaves it on the CR. Set it with a patch, and lift it by removing it:
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p \
+  '{"spec":{"hold":{"clusters":[{"projectId":"payments-prod","location":"us-central1","clusterName":"prod-1"}],"reason":"INC-1234: rollback in progress"}}}'
+
+# Every cluster:
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p \
+  '{"spec":{"hold":{"all":true,"reason":"change freeze"}}}'
+
+# Lift:
+kubectl patch platformagent platform-agent -n kubeagents-system --type json -p \
+  '[{"op":"remove","path":"/spec/hold"}]'
+```
 
 ## `spec.storage`
 

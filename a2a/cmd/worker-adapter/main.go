@@ -261,6 +261,15 @@ func run() int {
 		return 0
 	}
 
+	// The session's shipped persona and skills, checked against their
+	// build-time manifest before the harness first runs.
+	if dir := harnessConfigDir(); dir != "" {
+		if err := workeradapter.CheckSessionHome(dir, log); err != nil {
+			log.Error("session worker failed", "err", err)
+			return 1
+		}
+	}
+
 	res, err := workeradapter.Run(ctx, cfg)
 	if err != nil {
 		log.Error("adapter run failed", "task", cfg.TaskID, "state", string(res.State), "err", err)
@@ -578,18 +587,26 @@ func harnessCommandWithoutDelegate() []string {
 }
 
 // harnessUserSettings is the settings file the harness reads for its user
-// source: settings.json in $CLAUDE_CONFIG_DIR, else in ~/.claude. "" when
-// neither is known.
+// source: settings.json in harnessConfigDir. "" when that isn't known.
 func harnessUserSettings() string {
-	dir := os.Getenv(claudeConfigDirEnv)
+	dir := harnessConfigDir()
 	if dir == "" {
-		home := os.Getenv("HOME")
-		if home == "" {
-			return ""
-		}
-		dir = filepath.Join(home, claudeDefaultConfigDir)
+		return ""
 	}
 	return filepath.Join(dir, claudeUserSettingsFile)
+}
+
+// harnessConfigDir is the harness's config directory: $CLAUDE_CONFIG_DIR,
+// else ~/.claude. "" when neither is known.
+func harnessConfigDir() string {
+	if dir := os.Getenv(claudeConfigDirEnv); dir != "" {
+		return dir
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, claudeDefaultConfigDir)
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare

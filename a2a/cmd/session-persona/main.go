@@ -3,11 +3,13 @@
 // skills/<name>/SKILL.md, adapted for a session (transform.go). It runs at
 // image build time (a2a/Dockerfile.worker), so agents/cluster/skills stays
 // the one source of those skills and a2a/persona/session/persona.md the one
-// source of the persona.
+// source of the persona. It also writes the tree's content manifest
+// (persona.IntegrityManifestFile) over CLAUDE.md and skills/, which the
+// session worker checks the shipped tree against at start.
 //
 //	session-persona -skills agents/cluster/skills -persona a2a/persona/session/persona.md -out /out/claude
 //
-// Only SKILL.md is shipped. The skills' scripts and assets are not: the
+// Of each skill, only SKILL.md is shipped. The skills' scripts and assets are not: the
 // session pod has no shell beyond the cluster view's kubectl and gcloud, and
 // a file the model can see but not use is an invitation to go looking.
 package main
@@ -18,7 +20,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+	personafmt "github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 const (
@@ -26,9 +32,11 @@ const (
 	skillFile = "SKILL.md"
 	// personaFile is the user-level memory file Claude Code reads from its
 	// config directory ($CLAUDE_CONFIG_DIR, else ~/.claude) on every run.
-	personaFile = "CLAUDE.md"
+	// It and skillsDir are lib's names, which the worker's start-up check of
+	// the shipped tree (lib.SessionHomeCovers) uses too.
+	personaFile = lib.SessionHomePersonaFile
 	// skillsDir is the user-level skills directory under that same root.
-	skillsDir = "skills"
+	skillsDir = lib.SessionHomeSkillsDir
 	// dirMode and fileMode leave the shipped tree readable, and the
 	// Dockerfile copies it in owned by root, so the harness (uid 1000)
 	// cannot edit a shipped file or the skills directory in place. It owns
@@ -71,8 +79,11 @@ func main() {
 	}
 }
 
-// build writes the persona and every session skill under out.
+// build writes the persona and every session skill under out, then the
+// tree's content manifest (personafmt.IntegrityManifestFile), which the worker
+// checks the shipped tree against at start.
 func build(skillsSrc, personaSrc, out string) error {
+	written := map[string][]byte{}
 	persona, err := os.ReadFile(personaSrc) // #nosec G304 -- the -persona flag of a build-time tool
 	if err != nil {
 		return err
@@ -83,6 +94,7 @@ func build(skillsSrc, personaSrc, out string) error {
 	if err := writeFile(filepath.Join(out, personaFile), persona); err != nil {
 		return err
 	}
+	written[personaFile] = persona
 	for _, name := range sessionSkills {
 		src, err := os.ReadFile(filepath.Join(skillsSrc, name, skillFile)) // #nosec G304 -- the -skills flag of a build-time tool
 		if err != nil {
@@ -102,8 +114,9 @@ func build(skillsSrc, personaSrc, out string) error {
 		if err := writeFile(filepath.Join(dir, skillFile), adapted); err != nil {
 			return err
 		}
+		written[path.Join(skillsDir, name, skillFile)] = adapted
 	}
-	return nil
+	return writeFile(filepath.Join(out, personafmt.IntegrityManifestFile), personafmt.FormatIntegrityManifest(written))
 }
 
 // mkdirOut creates out if it is missing and sets its mode only then: a

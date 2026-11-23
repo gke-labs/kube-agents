@@ -108,8 +108,9 @@ spec:
               value: http://inference-gateway/v1
             - name: HINDSIGHT_API_LLM_MODEL
               value: model-default
-            # LiteLLM runs with no master key; the client library insists on a
-            # non-empty value, so this is a placeholder rather than a credential.
+            # A placeholder rather than a credential: the client library insists
+            # on a non-empty value, and the gateway admits "none" as a keyless
+            # caller (charts/kube-agents/files/litellm_caller_auth.py).
             - name: HINDSIGHT_API_LLM_API_KEY
               value: none
             # Omit `temperature` rather than send a value: a model that refuses

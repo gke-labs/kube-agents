@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 CHAT_PATH = "/v1/chat/completions"
-# The in-cluster gateway takes any bearer; the header only satisfies the client.
+# The gateway admits the placeholder "none" as a keyless caller; the header only satisfies the client.
 AUTH_HEADER = "Bearer none"
 TIMEOUT_S = 300
 DEFAULT_GATEWAY = "http://127.0.0.1:8080"  # a port-forward of svc/inference-gateway
