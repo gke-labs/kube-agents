@@ -1435,6 +1435,12 @@
 # up to 15 minutes of ticks, about 45 minutes a night across three.
 ./tasks/post-merge-verified-fixed/task.yaml
 
+# #6814: a profile task that tries a direct cluster write stops at the broker's
+# refusal and ends failed with the write-refused reason, which the chat shows.
+# Red on main, where the task ran on after the refusal. deployer: noop; the
+# write is refused either way.
+./tasks/profile-stops-at-write-refusal/task.yaml
+
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
 # into the platform charts context repository, names the chart template

@@ -1655,6 +1655,22 @@ KUBECTL_MUTATING_SUBVERBS: dict[str, frozenset[str]] = {
 }
 
 
+def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
+    """The verb words of a kubectl ``argv`` that tries a change, or None.
+
+    A mutating verb as the policy resolves it, that is not a local render.
+    The verb words alone (one, or two for a verb whose second word decides),
+    never the object they name. A policy rule that refuses such an argv has
+    refused a write outright, whichever rule it is.
+    """
+    if not argv or argv[0] != "kubectl" or local_render(argv):
+        return None
+    verb, _ = _kubectl_verb_and_flag(argv)
+    if not kubectl_verb_is_mutating(verb):
+        return None
+    return verb[:2] if verb[0] in KUBECTL_MUTATING_SUBVERBS else verb[:1]
+
+
 def kubectl_verb_is_mutating(verb_words) -> bool:
     """Whether the kubectl verb the policy resolved (``Decision.verb_tuple``) changes state."""
     if not verb_words:

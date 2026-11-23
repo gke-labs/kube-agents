@@ -2719,14 +2719,6 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
     return None
 
 
-def profile_vcs_write_refused(principal: Any, verb: str) -> bool:
-    """Whether ``profile_vcs_refusal`` refused a write: a permit-gated verb from a
-    task whose credential carries no permit. A caller with no task credential at
-    all is refused every verb, reads included, so that refusal is not a write's.
-    """
-    return getattr(principal, "task", None) is not None and verb in PROFILE_PERMIT_GATED_VCS_VERBS
-
-
 # What a profile caller's issue-list `query` may not hold, because each can
 # change what a forge's search grammar reads after it (#6247): a colon starts a
 # qualifier; a quote, a backslash or a parenthesis can open a phrase or a group
@@ -15856,6 +15848,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         refused_flag = session_kubectl_flag_refusal(principal.role, argv)
         if refused_flag is not None:
+            # A profile caller's write the flag rule refused is refused outright:
+            # marked for the worker's stop like a read-only refusal, with the
+            # verb words the record names. Only this policy refusal and the
+            # read-only rule's are marked, never a busy, rate or timeout answer.
+            flag_write = command_policy.kubectl_definitive_write(argv) if principal.role == CALLER_ROLE_PROFILE else None
             LOGGER.warning(
                 "flag refused for role request_id=%s role=%s executable=%s flag=%s",
                 request_id,
@@ -15876,6 +15873,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "is not one of them (file inputs, file-backed output formats, streaming flags and the "
                         "API server's own endpoints under --raw are not available to a session)."
                     ),
+                    "verb": list(flag_write) if flag_write else None,
+                    WRITE_REFUSAL_KEY: flag_write is not None,
                 },
             )
             return
@@ -17784,7 +17783,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "error": refusal,
                         "code": CALLER_PERMIT_REQUIRED_CODE,
                         "rule": RULE_CALLER_VCS_PERMIT,
-                        WRITE_REFUSAL_KEY: profile_vcs_write_refused(principal, verb),
                     },
                 )
                 return TOOL_STATUS_BLOCKED

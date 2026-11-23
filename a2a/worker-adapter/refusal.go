@@ -18,10 +18,12 @@ import (
 // values, events), and text planted there must not be able to end a task.
 //
 // The broker marks a definitive write refusal in its 403 body
-// (credential_proxy.WRITE_REFUSAL_KEY): the kubernetes.read-only rule
-// refusing a mutating kubectl verb that is not a local render, or a profile
-// task's permit-gated version-control write (publish, proposal-create,
-// proposal-update) refused for want of the permit. The client
+// (credential_proxy.WRITE_REFUSAL_KEY): a policy rule refusing a mutating
+// kubectl verb that is not a local render, either the kubernetes.read-only
+// rule or the profile caller's flag rule (caller.kubectl-flag), which reads a
+// profile write's flags first. A busy, rate or timeout answer is never
+// marked. Nor is a version-control refusal: the version-control skill's
+// answer to a missing permit is the patch, which the task still gives. The client
 // (agents/platform/scripts/credential_proxy_client.py, record_write_refusal)
 // appends one JSON line per such refusal to the file named by
 // EnvWriteRefusalFile:
@@ -31,7 +33,9 @@ import (
 // The profile worker makes that file empty on the task's tmpfs, beside the
 // task token, before the harness starts, and removes it after. The adapter
 // reads it after each tool-result line the harness prints, which comes after
-// the call that wrote it has exited, and stops at the first valid record.
+// the call that wrote it has exited, and stops at the first valid record: one
+// naming this task, one of those two rules (stopRules), and a verb of one or
+// two lowercase words.
 //
 // Every route by which a definitive write refusal can reach the model runs
 // through that client:
@@ -40,10 +44,11 @@ import (
 //     itself (a2a/Dockerfile.worker; the operator's profile PATH puts
 //     /opt/credential-proxy/bin first). A persona script that runs either
 //     goes the same way.
-//   - The version-control skill's vcs.py calls the broker through
-//     credential_proxy_client.vcs_call.
 //
 // The paths that do not go through it carry no definitive write refusal:
+//   - The version-control skill's vcs.py goes through the client
+//     (credential_proxy_client.vcs_call), but its refusals are never recorded:
+//     a missing permit is answered with the patch.
 //   - The MCP relay (mcprelay.go) carries mcp_policy's refusals. A
 //     gcp.mcp.read-only refusal answers a write tool and a tool the table
 //     does not list alike, so it is not a definitive write refusal.
@@ -77,6 +82,15 @@ const (
 var (
 	// The rule ids and verbs a record may carry: the broker's own vocabulary.
 	refusalRuleShape = regexp.MustCompile(`\A[a-z0-9][a-z0-9.-]{0,63}\z`)
+	// stopRules are the broker's rules whose refusal of a write stops a task:
+	// the read-only rule and the profile caller's flag rule. The record file
+	// is the harness's to write, and the reason reaches a delegating parent,
+	// so a record naming any other rule, or a verb no kubectl write has, is
+	// skipped.
+	stopRules = map[string]bool{kubernetesReadOnlyRule: true, callerKubectlFlagRule: true}
+	// stopVerbShape is a kubectl write's verb as the broker names it: one
+	// word, or two for the verbs whose second word decides.
+	stopVerbShape    = regexp.MustCompile(`\A[a-z]+(?: [a-z]+)?\z`)
 	refusalVerbShape = regexp.MustCompile(`\A[A-Za-z0-9_.:@/-]{1,64}(?: [A-Za-z0-9_.:@/-]{1,64}){0,2}\z`)
 )
 
@@ -133,6 +147,9 @@ func readWriteRefusal(path, taskID string) (*writeRefusal, error) {
 		if taskID == "" || rec.Task != taskID {
 			continue
 		}
+		if !stopRules[rec.Rule] || !stopVerbShape.MatchString(rec.Verb) {
+			continue
+		}
 		return &writeRefusal{rule: rec.Rule, verb: rec.Verb}, nil
 	}
 	return nil, sc.Err()
@@ -141,6 +158,11 @@ func readWriteRefusal(path, taskID string) (*writeRefusal, error) {
 // kubernetesReadOnlyRule is the command policy's read-only rule, whose
 // refused write can be proposed as a pull request instead.
 const kubernetesReadOnlyRule = "kubernetes.read-only"
+
+// callerKubectlFlagRule is the broker's flag rule (credential_proxy
+// RULE_CALLER_KUBECTL_FLAG), which refuses most profile writes that carry a
+// flag before the read-only rule reads them.
+const callerKubectlFlagRule = "caller.kubectl-flag"
 
 // writeRefusedReason is the terminal message of a task stopped at a write
 // refusal, in the `reason: <token> - <detail>` shape.

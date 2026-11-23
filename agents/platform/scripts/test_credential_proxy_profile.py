@@ -885,6 +885,53 @@ class ProfileRouteTest(unittest.TestCase):
         status, body = self.post({"argv": ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"]})
         self.assert_refused(status, body, credential_proxy.RULE_CALLER_KUBECTL_FLAG)
 
+    def test_a_profile_write_the_flag_rule_refuses_is_a_write_refusal(self):
+        # The flag rule runs before the read-only rule, so most profile writes
+        # with a flag meet it first. A refused write is refused outright, so
+        # it carries the mark and the verb words the record names.
+        for argv, verb in (
+            (["kubectl", "scale", "deploy/kube-dns", "-n", "kube-system", "--replicas=3"], ["scale"]),
+            (["kubectl", "apply", "-f", "/tmp/manifest.yaml"], ["apply"]),
+        ):
+            with self.subTest(argv=argv):
+                self.executor.calls.clear()
+                status, body = self.post({"argv": argv})
+                self.assert_refused(status, body, credential_proxy.RULE_CALLER_KUBECTL_FLAG)
+                self.assertIs(True, body[credential_proxy.WRITE_REFUSAL_KEY], body)
+                self.assertEqual(verb, body["verb"])
+
+    def test_a_profile_read_the_flag_rule_refuses_is_not_a_write_refusal(self):
+        for argv in (
+            ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"],
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml", "--output-watch-events"],
+        ):
+            with self.subTest(argv=argv):
+                self.executor.calls.clear()
+                status, body = self.post({"argv": argv})
+                self.assert_refused(status, body, credential_proxy.RULE_CALLER_KUBECTL_FLAG)
+                self.assertIs(False, body[credential_proxy.WRITE_REFUSAL_KEY], body)
+
+    def test_a_busy_or_pressure_answer_is_never_a_write_refusal(self):
+        # Only a policy rule's refusal of a write is marked. A write never
+        # reaches the slot (the policy refuses it first, marked); a call that
+        # does reach it and meets a capacity answer (no free command slot,
+        # resource pressure) gets no mark.
+        status, body = self.post({"argv": ["kubectl", "annotate", "deploy/x", "a=b"]})
+        self.assertEqual(403, status, body)
+        self.assertIs(True, body[credential_proxy.WRITE_REFUSAL_KEY])
+        write = {"argv": ["kubectl", "get", "pods"]}
+        for refusal in (
+            credential_proxy.CommandSlotUnavailable("at the profile share", bound="profile"),
+            credential_proxy.ResourcePressure("memory pressure; retry in 5 s", 5),
+        ):
+            def refusing_slot(handler, role, refusal=refusal):
+                raise refusal
+
+            with self.subTest(refusal=type(refusal).__name__), mock.patch.object(CredentialProxyHandler, "_session_slot", refusing_slot):
+                status, body = self.post(write)
+                self.assertIn(status, (429, 503), body)
+                self.assertNotIn(credential_proxy.WRITE_REFUSAL_KEY, body)
+
     def test_git_is_not_a_profile_executable(self):
         routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
         with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
@@ -1998,8 +2045,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 status, body = self.vcs_post(verb, None)
                 self.assert_permit_refused(verb, status, body)
                 self.assertIn("needs a task credential", body["error"])
-                # Every verb is refused without a credential, reads too: not a write's refusal.
-                self.assertIs(False, body[credential_proxy.WRITE_REFUSAL_KEY])
+                # A version-control refusal never carries the write-refusal mark.
+                self.assertNotIn(credential_proxy.WRITE_REFUSAL_KEY, body)
 
     def test_a_refused_credential_is_refused_whole(self):
         status, body = self.vcs_post("publish", CASES["permits on the nats audience"]["token"])
@@ -2017,8 +2064,9 @@ class ProfileVcsRouteTest(unittest.TestCase):
                     status, body = self.vcs_post(spelling, VALID["token"])
                     self.assert_permit_refused(verb, status, body)
                     self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, body["error"])
-                    # A definitive write refusal, which the in-pod client records.
-                    self.assertIs(True, body[credential_proxy.WRITE_REFUSAL_KEY])
+                    # Not marked: the permit refusal's answer is the patch the
+                    # version-control skill gives, so it must not stop the task.
+                    self.assertNotIn(credential_proxy.WRITE_REFUSAL_KEY, body)
 
     def test_a_refused_write_with_a_large_body_still_reads_its_403(self):
         """The refusal comes before the body is read; the broker drains it first,

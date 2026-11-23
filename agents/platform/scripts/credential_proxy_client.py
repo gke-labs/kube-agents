@@ -2670,7 +2670,9 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
             # every other refusal because it is the one a caller cannot fix by
             # asking differently.
             raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
-        record_write_refusal(exc.code, answer, route, [verb])
+        # No write-refusal record: a version-control refusal never stops the
+        # task. The permit refusal's answer is the patch the version-control
+        # skill tells the agent to give.
         raise _vcs_refusal(exc, answer, answer) from exc
     except urllib.error.URLError:
         # Out untouched: the send never landed, and `vcs_client.call` has an

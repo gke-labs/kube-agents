@@ -598,9 +598,12 @@ it, and never on a tool's output. The client appends a record to the task's
 when the broker's 403 carries `write_refusal: true`;
 [the dispatch design](spec-profiles-dispatch.md) states which refusals those are. The
 adapter reads the file after each tool result, stops the harness as a cancel does, and
-publishes terminal `rejected` with `reason: write-refused`, naming the record's rule and
-verb and nothing of the output. Nothing the harness prints after the refusal is published.
-`rejected` is the state no supervisor retries, and a delegating parent reads its reason. The broker
+publishes terminal `failed` with `reason: write-refused`, naming the record's rule and
+verb and nothing of the output, which the chat shows after the failed notice. Nothing the
+harness prints after the refusal is published. It is `failed`, not `rejected`, because work
+ran before the refusal; a delegating parent reads its reason, and the eval harness grades it.
+A version-control refusal (a write without the task's permit) never stops the task: the
+version-control skill's answer to it is the patch, which the task still gives. The broker
 refuses the write either way: a record that is lost leaves the task running, and every
 further write is refused too.
 
