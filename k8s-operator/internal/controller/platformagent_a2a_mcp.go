@@ -196,7 +196,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 		}
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, a2aMCPComponent)},
 		Spec: appsv1.DeploymentSpec{
@@ -251,8 +251,8 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						Command: []string{a2aMCPCommand},
 						// Distroless, run as 1000: see buildA2AConsoleDeployment.
 						WorkingDir: "/",
-						// The profile supervisor cutoff rides last, and only
-						// once the install has latched (#5301).
+						// The profile supervisor gate's env rides last, and
+						// only once the install has latched (#5301).
 						Env: append([]corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							a2aNATSCAFileEnvVar(),
@@ -301,6 +301,8 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 			},
 		},
 	}
+	withA2AProfileNamesFile(agent, &dep.Spec.Template.Spec, a2aMCPContainer)
+	return dep
 }
 
 // buildA2AMCPService is what `kubectl port-forward svc/...` names.

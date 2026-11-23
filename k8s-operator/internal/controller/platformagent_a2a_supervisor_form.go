@@ -2,6 +2,11 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -10,6 +15,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -42,13 +49,22 @@ const (
 	a2aProfileSupervisorFormValue     = "profile"
 )
 
-// The cutoff the readers take from the latch (#5301 PR 4). Past it, a
+// The gate the readers take from the latch (#5301 PR 4). Past the cutoff, a
 // five-token supervisor terminal on a profile task is not that task's
 // terminal: the dispatcher writes the six-token form from the latch on, and
 // the margin covers its pick-up of the switched dispatch config and a
 // terminal already in flight. One stored before the cutoff still counts, so
 // history and heals keep every terminal the dispatcher wrote before it
 // switched.
+//
+// The gate holds against the gateway, whose grant still reaches the
+// five-token form, so its two inputs are this operator's alone: the cutoff
+// env on the reader's Deployment, and the profile names file, a ConfigMap
+// the readers mount. Which addressees are profiles comes from that file and
+// nothing else. The gateway's Role reaches no ConfigMap but its home-channel
+// record (get, patch) and, under mode next, the resolved scope (get); it can
+// get, not patch, its own Deployment; and its bus grants publish nothing on
+// DIRECTORY. The MCP server mounts no ServiceAccount token at all.
 const (
 	// a2aProfileSupervisorCutoffEnvVar is lib.EnvProfileSupervisorCutoff in
 	// a2a/lib/supervisor_cutoff.go; the gateway and the MCP server read it.
@@ -56,25 +72,129 @@ const (
 	// a2aProfileSupervisorCutoffMargin is how long after the latch the
 	// cutoff falls.
 	a2aProfileSupervisorCutoffMargin = 10 * time.Minute
+	// a2aProfileNamesEnvVar is lib.EnvProfileNamesFile: the path of the
+	// profile names file in the reader's container.
+	a2aProfileNamesEnvVar = "A2A_PROFILE_NAMES_FILE"
+	// The profile names ConfigMap's key, volume and mount. The mount is the
+	// whole directory (no subPath), so the kubelet refreshes the file in
+	// place and a profile bound or unbound reaches the readers without a
+	// roll; they re-read it every 30 seconds.
+	a2aProfileNamesKey       = "profiles.json"
+	a2aProfileNamesVolume    = "a2a-profile-names"
+	a2aProfileNamesMountPath = "/etc/a2a-profile-names"
 )
 
-// a2aProfileSupervisorCutoffEnv is the cutoff env for the gateway and the MCP
-// server: the persisted ProfileSupervisorForm latch's LastTransitionTime plus
-// the margin, in RFC3339 UTC. It reads the condition as the API server holds
-// it, so it appears one pass after the pass that latches, and the latch never
-// moves once True, so the value is stable and the readers roll once.
-//
-// Not latched (absent, held, or a latch with no transition time to anchor
-// on), it is nil and the pod templates are exactly what they were: the
-// readers take both forms, as every install did before the cutoff, and
-// nothing rolls.
-func a2aProfileSupervisorCutoffEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+// a2aProfileNamesName is the profile names ConfigMap.
+func a2aProfileNamesName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-profile-names"
+}
+
+// a2aProfileSupervisorLatchedAt is the persisted ProfileSupervisorForm
+// latch's LastTransitionTime, and whether the install has latched: the
+// condition as the API server holds it, so it reads latched one pass after
+// the pass that latches. The latch never moves once True, so the time is
+// stable. Not latched (absent, held, or a latch with no transition time to
+// anchor on), the readers get no gate and their pod templates are exactly
+// what they were.
+func a2aProfileSupervisorLatchedAt(agent *agentv1alpha1.PlatformAgent) (time.Time, bool) {
 	c := meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
 	if c == nil || c.Status != metav1.ConditionTrue || c.LastTransitionTime.IsZero() {
+		return time.Time{}, false
+	}
+	return c.LastTransitionTime.Time, true
+}
+
+// a2aProfileSupervisorCutoffEnv is the gate's env for the gateway and the MCP
+// server once latched: the cutoff, the latch's time plus the margin in
+// RFC3339 UTC, and the profile names file's path. Nil when not latched, so
+// nothing rolls.
+func a2aProfileSupervisorCutoffEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	at, ok := a2aProfileSupervisorLatchedAt(agent)
+	if !ok {
 		return nil
 	}
-	cutoff := c.LastTransitionTime.Add(a2aProfileSupervisorCutoffMargin).UTC().Format(time.RFC3339)
-	return []corev1.EnvVar{{Name: a2aProfileSupervisorCutoffEnvVar, Value: cutoff}}
+	cutoff := at.Add(a2aProfileSupervisorCutoffMargin).UTC().Format(time.RFC3339)
+	return []corev1.EnvVar{
+		{Name: a2aProfileSupervisorCutoffEnvVar, Value: cutoff},
+		{Name: a2aProfileNamesEnvVar, Value: a2aProfileNamesMountPath + "/" + a2aProfileNamesKey},
+	}
+}
+
+// withA2AProfileNamesFile mounts the profile names file into the named
+// container of spec once latched. The volume is optional: a pod that starts
+// before the ConfigMap exists reads every addressee as a profile (lib's
+// ProfileNames fails closed) until the kubelet puts the file there.
+func withA2AProfileNamesFile(agent *agentv1alpha1.PlatformAgent, spec *corev1.PodSpec, container string) {
+	if _, ok := a2aProfileSupervisorLatchedAt(agent); !ok {
+		return
+	}
+	for i := range spec.Containers {
+		if spec.Containers[i].Name != container {
+			continue
+		}
+		spec.Containers[i].VolumeMounts = append(spec.Containers[i].VolumeMounts,
+			corev1.VolumeMount{Name: a2aProfileNamesVolume, MountPath: a2aProfileNamesMountPath, ReadOnly: true})
+		spec.Volumes = append(spec.Volumes, corev1.Volume{
+			Name: a2aProfileNamesVolume,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aProfileNamesName(agent)},
+				Optional:             ptr.To(true),
+			}},
+		})
+		return
+	}
+}
+
+// a2aProfileNamesFile is the file's shape, which lib.ParseProfileNames reads.
+type a2aProfileNamesFile struct {
+	Profiles []string `json:"profiles"`
+}
+
+// buildA2AProfileNamesConfigMap renders names, sorted and without repeats,
+// into the profile names ConfigMap. The caller passes the names nats.conf
+// denies the gateway the supervisor subjects of (dispatcherGrantNames: the
+// admitted profiles and the ones still draining), so a reader's profile and
+// the bus's deny are one set. A name that isn't one subject token addresses
+// no task and is left out, as the deny leaves it out.
+func buildA2AProfileNamesConfigMap(agent *agentv1alpha1.PlatformAgent, names []string) (*corev1.ConfigMap, error) {
+	f := a2aProfileNamesFile{Profiles: []string{}}
+	for _, n := range names {
+		if n == "" || strings.ContainsAny(n, ".*> \t\r\n") {
+			continue
+		}
+		f.Profiles = append(f.Profiles, n)
+	}
+	sort.Strings(f.Profiles)
+	f.Profiles = slices.Compact(f.Profiles)
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return nil, err
+	}
+	return &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aProfileNamesName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "profile-names")},
+		Data:       map[string]string{a2aProfileNamesKey: string(raw) + "\n"},
+	}, nil
+}
+
+// applyA2AProfileNames renders the profile names ConfigMap once the install
+// has latched, and nothing before: an unlatched install's readers mount
+// nothing and read nothing. Once rendered it is kept current every pass.
+func (r *PlatformAgentReconciler) applyA2AProfileNames(ctx context.Context, agent *agentv1alpha1.PlatformAgent, names []string) error {
+	if _, ok := a2aProfileSupervisorLatchedAt(agent); !ok {
+		return nil
+	}
+	cm, err := buildA2AProfileNamesConfigMap(agent, names)
+	if err != nil {
+		return err
+	}
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, cm); err != nil {
+		return fmt.Errorf("failed to apply the profile names ConfigMap: %w", err)
+	}
+	return nil
 }
 
 // a2aDeploymentFullyOnTemplate reports whether dep has finished rolling out its
