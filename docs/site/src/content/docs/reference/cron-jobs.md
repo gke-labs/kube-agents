@@ -46,7 +46,7 @@ One check failing on several objects in one cluster counts as one finding. A dec
 
 The critical findings the [first inventory report](/kube-agents/concepts/chatops/#first-run-onboarding) names count as added on the UTC day it is delivered, against that day's allowance, and are repeated from the next day. It adds nothing until the first inventory report's delivery is claimed, or until 24 hours after onboarding filed its sweep if the report has still not been delivered by then. A run that cannot read the queue fails, which is reported in chat, at most once a UTC day.
 
-These environment variables, set through the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`), change the limits:
+These environment variables change the limits. Set them through the chart value `platformAgent.deployment.env`, the same way as the two `FEEDBACK_PROMPT_*` variables below:
 
 | Variable                          | Default | Meaning                                                            |
 | --------------------------------- | ------- | ------------------------------------------------------------------ |
@@ -59,7 +59,7 @@ These environment variables, set through the `PlatformAgent` CR's `spec.deployme
 
 A value that is not a whole number, is negative, or (for the hour) is outside 0–23 is ignored and the default applies. The warning goes to the run's stderr, which the scheduler keeps nowhere for a run that succeeds.
 
-On an install managed by `install.sh`, the installer regenerates `terraform.tfvars` from `install.env` on every `install.sh` and `upgrade.sh` run, and `install.env` has no key for these. A value added to the generated file (in `extra_helm_values`) is removed by the next run, and a value set only on the Helm release may be reverted with it: set it again after each upgrade. `enabled: false` on the roster entry turns the nudge off.
+`enabled: false` on the roster entry turns the nudge off.
 
 `feedback-prompt` is the one entry that asks the operator something instead of reporting on the fleet. A week after its first tick it posts one message in the install's home chat channel: how kube-agents has been working out, the public feedback form's short link, and the form's disclosure that a submission becomes a public issue. The message also says that a reply in the thread reaches the agent.
 

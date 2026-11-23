@@ -78,6 +78,8 @@ Wiring the managed endpoint on a cluster that does not have it is what the `None
 
 Nothing here overrides configuration: an operator who sets rung 1 or 2 gets that endpoint on a collector-less cluster. Setting `OTEL_SDK_DISABLED=false` in `spec.deployment.env` re-enables the SDK, but on its own it does not give the exporter anywhere to send — pair it with rung 1 or 2 if you want a working exporter rather than a localhost one.
 
+The chart renders `spec.deployment.env` from its value `platformAgent.deployment.env`, so set `OTEL_SDK_DISABLED`, `HERMES_OTEL_ENABLED` or a rung 1 endpoint there. On an `install.sh` install that is a `TF_VAR_extra_helm_values` line in `install.env`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows; on a hand-driven Terraform apply, `extra_helm_values` in `terraform.tfvars`. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply.
+
 ### Helm
 
 Discovery only covers the agents. LiteLLM's exporter is rendered by Helm, while its NetworkPolicy is managed by the operator on default installs (or rendered by Helm when either `platformAgent.enabled` or `operator.enabled` is false), so one chart value drives all three:
