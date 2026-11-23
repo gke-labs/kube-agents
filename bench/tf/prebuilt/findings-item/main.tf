@@ -22,6 +22,8 @@
 # In findings.json, three rows share check, project and cluster, so they are one
 # gathered line of the nudge's message; findings-decision-covers-item's prompt names
 # the id of only one of them, and findings-decision-reply-names-no-id's names none.
+# findings-twin.json is those five rows and one more: the gathered line's first row
+# again under another project, which no message of the case names.
 # The other two share the project and differ in cluster or in check, so they are
 # lines of their own, and a decision on the first line must leave them alone.
 # findings-unnamed.json has the same shape under its own project, with a fourth

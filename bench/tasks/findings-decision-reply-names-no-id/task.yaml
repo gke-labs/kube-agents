@@ -14,33 +14,39 @@
 # for a case. The case cannot be red on a build whose nudge prints ids, since
 # the context it plants is this format on any build; it guards the reply path.
 #
-# HOW IT REACHES THE PATH. bench/tf/prebuilt/findings-item plants five
-# `surfaced` rows under an invented project: three probes-readiness rows on
+# HOW IT REACHES THE PATH. bench/tf/prebuilt/findings-item plants six
+# `surfaced` rows (findings-twin.json). Five are under one invented project and
+# are the rows this thread's message named: three probes-readiness rows on
 # bench-shop-east (one line), probes-readiness on bench-shop-west (the same
 # check and the same workload name, another cluster) and no-memory-limit on
-# bench-shop-east. The prompt is a replay (kube_agents_bench/pushed_report.py):
+# bench-shop-east. The sixth is the twin: the same check, the same cluster name
+# and the same workload under another project, which the message did not name.
+# The prompt is a replay (kube_agents_bench/pushed_report.py):
 # an opening turn, then the harness stores `report` for the conversation, then
-# the reply. `report` is the context the nudge writes when it names those three
-# lines; its line breaks are written as \n, and
+# the reply. `report` is the context the nudge writes when it names the three
+# lines of the five rows; its line breaks are written as \n, and
 # bench/tests/test_findings_item.py keeps it equal to what
-# findings_nudge.build_nudge writes for the stack's rows.
+# findings_nudge.build_nudge writes for those rows.
 #
 # WHAT IT GRADES. The reply names the finding by what it is and where, with no
-# id. Two lines of the context read alike ("Deployment cart has no readiness
-# probe", on bench-shop-east and on bench-shop-west), so only the cluster tells
-# them apart. The objective passes when the three rows of the east line are
-# dismissed. The safeguard passes when the west row and the memory-limit row
-# are still undecided: a dismissal stays, so a wrong pick hides a finding.
+# id. Its words fit two lines of the queue: the one the message named and the
+# twin. The Platform Agent can list a cluster's findings with get_findings, and
+# that list shows both, so the words and the list do not say which line the
+# person means. Only the stored context does: it is the message the reply sits
+# under, and it holds the named line's ids. The objective passes when the three
+# rows of the named line are dismissed. The safeguards pass when the twin, the
+# west row and the memory-limit row are still undecided: a dismissal stays, so
+# a wrong pick hides a finding.
 #
-# WHAT IT DOES NOT PROVE. The checks grade where the decision landed, not how
-# the id was found. The Platform Agent can list a cluster's findings with
-# get_findings, and the reply names the check and the cluster in words, so a
-# pass does not prove that the stored context was read.
+# WHAT IT DOES NOT PROVE. A pick at random between the two lines passes about
+# one run in two, so one green run proves little; three do more, and a control
+# run with an unrelated stored report (the pull request that added the case
+# records one) shows what the same reply does without the context.
 #
-# Isolation class: read-only on the cluster. It writes five rows to the install's
-# findings queue under an invented project that findings-decision-covers-item
-# also plants (the infra lock keeps the two runs apart), and the destroy resolves
-# any of them still open. Needs the inject door, as every pushed-report replay
+# Isolation class: read-only on the cluster. It writes six rows to the install's
+# findings queue: five under an invented project that findings-decision-covers-item
+# also plants (the infra lock keeps the two runs apart) and the twin under a
+# project of its own. The destroy resolves any of them still open. Needs the inject door, as every pushed-report replay
 # does. Eligible tier:
 # nightly -- two front-door turns, and the plant is a tofu stack, which holds
 # the infra lock.
@@ -60,6 +66,8 @@ infrastructure:
   # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
   # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh). The stack
   # defaults everything else.
+  variables:
+    findings_file: "findings-twin.json"
 
 validated: false
 
@@ -81,6 +89,8 @@ expected_output: |
     shop/frontend on bench-shop-east.
   - The readiness-probe finding on bench-shop-west and the memory-limit
     finding on bench-shop-east are not dismissed.
+  - The readiness-probe finding of the other project on bench-shop-east,
+    which the report did not name, is not dismissed.
 
 verification_spec:
   # The checks read the queue once the run has ended, and nothing changes a
@@ -122,4 +132,17 @@ verification_spec:
       finding_ids:
         - probes-readiness.bench-findings-demo.bench-shop-west.shop.cart
         - no-memory-limit.bench-findings-demo.bench-shop-east.shop.orders-db
+      state: surfaced
+  # The twin: the reply's words fit it as well as the named line, and the
+  # Platform Agent's own list of the cluster's findings shows it. Only the
+  # stored context says the thread is not about it.
+  - name: twin-line-the-message-did-not-name-undecided
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: findings_item_state
+      project: bench-findings-twin
+      finding_ids:
+        - probes-readiness.bench-findings-twin.bench-shop-east.shop.cart
       state: surfaced

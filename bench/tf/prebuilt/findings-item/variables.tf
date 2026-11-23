@@ -52,10 +52,11 @@ variable "agent_container" {
   default     = "platform-agent"
 }
 
-# Which rows to plant: findings.json for findings-decision-covers-item and
-# findings-decision-reply-names-no-id, and
-# findings-unnamed.json for findings-decision-leaves-unnamed-open, which adds
-# a row no message has named (`plant_state: queued`) under its own project.
+# Which rows to plant: findings.json for findings-decision-covers-item;
+# findings-twin.json for findings-decision-reply-names-no-id, which adds a twin
+# of the gathered line under another project; and findings-unnamed.json for
+# findings-decision-leaves-unnamed-open, which adds a row no message has named
+# (`plant_state: queued`) under its own project.
 variable "findings_file" {
   type    = string
   default = "findings.json"
