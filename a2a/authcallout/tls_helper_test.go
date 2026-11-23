@@ -40,8 +40,10 @@ const renderedTLSDir = "/etc/nats-tls/"
 // server (serverConnectBudget); the rendered conf is untouched. The callout
 // holds a fifth bound, authDecisionBudget, measured from the request's
 // receipt and so spent queueing behind its worker slots: a burst of
-// connections whose handshakes a loaded runner spreads past it is refused
-// as "authorization timed out". serveCallout lifts that one too. Three
+// connections whose handshakes a loaded runner spreads past it is refused,
+// as "authorization timed out" while it waits for a slot or as a rejected
+// token when the bound ends a review under way. serveCallout lifts that one
+// too, and the token review's own bound with it. Three
 // clients stay at their own budgets: lib.Connect's callers keep its 10 s
 // dial timeout; the worker adapter the session tests run opens a second,
 // raw connection in dialBus with the library's 2 s; and the nats CLI

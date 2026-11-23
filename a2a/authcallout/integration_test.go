@@ -302,7 +302,8 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	// the shipped shape while nothing fixed is bound. Everything the test is
 	// actually asserting about — accounts, users, grants, the callout block's
 	// keys and policy — is untouched; its two-second timeout is the one
-	// value serverConnectBudget lifts, and why.
+	// value serverConnectBudget lifts, and why. The callout's own two budgets
+	// are not the server's: serveCallout lifts those.
 	opts.Port = -1
 	opts.Websocket.Port = -1
 	opts.HTTPPort = -1
