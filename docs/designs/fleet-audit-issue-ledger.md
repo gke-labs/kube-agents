@@ -766,7 +766,9 @@ Exit contract — the keys below on every line:
 
 `postures_withheld` is the ids of the posture findings `finish` took out of the document because it
 recorded no complete declared-intent search (§7.4); empty on every other run. `notes` is on the line,
-on every status, only when a target carries a note: a list of `{target, note}` (§7.2).
+on every status, only when a target carries a note: a list of `{target, note}` (§7.2), with
+`report_notes` beside it — the same entries as ready-made lines, one per noted target, which the
+worker ends its report with, copied verbatim.
 
 When `--manifest-file` was given, `unpublished_candidates`, `wholly_unpublished_checks` and
 `uncorroborated_findings` join the line; they are absent on every other run
@@ -1231,7 +1233,9 @@ at least one cluster has one, so the common case stays two columns wide.
 not see, such as a GCE serial console that rotated past the last startup-script run. It is not a
 coverage gap. The scope table carries a Notes column only when at least one target has a note, and
 clips each cell as it clips `limitations`. The clean comment and the held comment list each note in
-full, and the JSON line of `finish` carries them under `notes`
+full, and the body carries its own capped "Read but not visible" list of the full notes, because
+the clipped cell ends before a rotated-serial note reaches its instance names. The JSON line of
+`finish` carries them under `notes`, and as ready-made report lines under `report_notes`
 ([collector design](fleet-audit-collector-manifest.md)).
 
 `limitations` closed the false all-clear that came from mis-filing a cluster. It did not close the

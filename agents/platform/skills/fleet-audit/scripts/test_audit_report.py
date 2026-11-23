@@ -27552,6 +27552,61 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
         self.assertNotIn("notes", self.stdout_json())
+        self.assertNotIn(audit_report.REPORT_NOTES_KEY, self.stdout_json())
+        self.assertNotIn("NOTES: the report must carry report_notes", self.err)
+
+    def test_the_line_carries_ready_made_report_lines(self):
+        """`report_notes` beside `notes`: the worker ends its report with
+        these lines, copied verbatim, so the relay is a copy rather than a
+        rule to remember — on the forge path, where the report is
+        model-composed, two runs in five dropped the relay. stderr carries
+        the reminder in the NOT VISIBLE style."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(
+            payload[audit_report.REPORT_NOTES_KEY],
+            [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
+        )
+        self.assertIn("NOTES: the report must carry report_notes verbatim", self.err)
+        # The findings run carries the same lines.
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(
+            self.stdout_json()[audit_report.REPORT_NOTES_KEY],
+            [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
+        )
+
+    def test_the_ledger_body_names_the_noted_objects_in_full(self):
+        """The scope table's Notes cell is clipped at MAX_CELL_CHARS, which
+        ends before the rotated-serial note reaches the instance names. The
+        body's own notes list carries the whole note, so the ledger names
+        the noted objects too."""
+        long_note = (
+            "gce-startup-script-status: the startup-script status of 1 RUNNING "
+            "instance that runs a startup script is not visible. The serial "
+            "console was read, but the boot that ran the script has rotated out "
+            "of the serial buffer: serial-flood-eval (us-central1-a)."
+        )
+        self.assertGreater(len(long_note), audit_report.MAX_CELL_CHARS)
+        manifest = self.noted_manifest()
+        manifest["clusters"][0]["notes"] = long_note
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue-create")[-1]
+        self.assertIn(audit_report.NOTES_LEAD, body)
+        self.assertIn("serial-flood-eval (us-central1-a)", body)
 
     def test_the_held_comment_does_not_call_a_noted_object_flagged(self):
         self.previous_a()
@@ -27802,8 +27857,10 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
 
 class TestScopeNotesFitTheBody(unittest.TestCase):
     def test_sixty_projects_with_long_notes_fit_the_body(self):
-        """The Notes cell is clipped as the Limitations cell is. A cell of
-        the full note on every row of a large fleet is over the body limit."""
+        """The Notes cell is clipped as the Limitations cell is, and the
+        body's own notes list (`_render_body_notes`) is capped at
+        NOTES_SECTION_CAP, so sixty full notes of MAX_NOTE_CHARS still fit
+        the body with room for the findings."""
         clusters = [
             {"name": f"project/p-{i:02d}", "notes": f"n{i:02d} " + "x" * audit_report.MAX_NOTE_CHARS}
             for i in range(audit_report.MAX_SCOPE_ROWS)
@@ -27812,7 +27869,10 @@ class TestScopeNotesFitTheBody(unittest.TestCase):
         body = audit_report.render_issue_body(doc, generated_at=NOW, audit_id="gce-compute-fleet-audit").body
         self.assertIn("| Notes |", body)
         self.assertIn("n59 x", body)
-        self.assertNotIn("x" * (audit_report.MAX_CELL_CHARS + 1), body)
+        # The un-clipped list is present, capped, and says where the rest is.
+        self.assertIn(audit_report.NOTES_LEAD, body)
+        self.assertIn("more; the stored report carries every full note", body)
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
 
 
 class TestNotedSetSpeaksOnce(HarnessTestCase):

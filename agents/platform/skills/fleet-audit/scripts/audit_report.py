@@ -1839,8 +1839,24 @@ SCOPE_NOTES_KEY = "notes"
 NOTES_RESULT_KEY = "notes"
 NOTE_TARGET_FIELD = "target"
 NOTE_TEXT_FIELD = "note"
+# Beside `notes` on the JSON line: the same entries as ready-made report
+# lines, one per noted target. The worker ends its report with these lines,
+# copied verbatim — the SOP told it to "relay each entry of `notes`" and on
+# the forge path, where the report is model-composed rather than `summary`
+# verbatim, two runs in five dropped the relay. A line the worker copies is
+# a rule it cannot misremember. A `[SILENT]` run posts no report, so it
+# copies nothing; `notes` stays the structured field.
+REPORT_NOTES_KEY = "report_notes"
+# The lead of each `report_notes` line: what the note means for the reader.
+REPORT_NOTE_PREFIX = "Not visible, not clean:"
 # The lead of the notes list in a comment and in the no-forge summary.
 NOTES_LEAD = "Read but not visible, which is not a coverage gap"
+# Ceiling on the un-clipped notes list in the ledger body (`_render_body_notes`).
+# The scope table's Notes cell is clipped at MAX_CELL_CHARS, which ends
+# before ROTATED_SERIAL_NOTE reaches the instance names, so the body carries
+# the full notes in a list of its own — bounded, so sixty projects of
+# MAX_NOTE_CHARS notes cannot squeeze the findings out of the budget.
+NOTES_SECTION_CAP = 6_000
 # A collected target's manifest entry may list the objects its `notes` names
 # as `{check, object}` (and `namespace` where the check has one, and an
 # optional `command`, the object's own read): each one an object a check read
@@ -8439,9 +8455,22 @@ def scope_note_entries(data: dict) -> list[dict]:
 
 
 def notes_payload(data: dict) -> dict:
-    """`{NOTES_RESULT_KEY: [...]}` for the JSON line, or nothing when no target has a note."""
+    """`notes` and `report_notes` for the JSON line, or nothing when no target has a note.
+
+    `notes` is the structured field. `report_notes` is the same entries as
+    ready-made lines the worker ends its report with, verbatim
+    (`REPORT_NOTES_KEY`): the relay is a copy, not a rule to remember.
+    """
     entries = scope_note_entries(data)
-    return {NOTES_RESULT_KEY: entries} if entries else {}
+    if not entries:
+        return {}
+    return {
+        NOTES_RESULT_KEY: entries,
+        REPORT_NOTES_KEY: [
+            f"{REPORT_NOTE_PREFIX} {e[NOTE_TARGET_FIELD]}: {e[NOTE_TEXT_FIELD]}"
+            for e in entries
+        ],
+    }
 
 
 def scope_notes(data: dict) -> list[str]:
@@ -8464,6 +8493,37 @@ def _comment_scope_notes(data: dict) -> list[str]:
     out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in notes[:MAX_SCOPE_ROWS]]
     if len(notes) > MAX_SCOPE_ROWS:
         out.append(f"- _…and {len(notes) - MAX_SCOPE_ROWS} more_")
+    return out
+
+
+def _render_body_notes(data: dict) -> list[str]:
+    """The un-clipped notes list for the ledger body, under the scope table.
+
+    The table's Notes cell is clipped at MAX_CELL_CHARS, which ends before
+    ROTATED_SERIAL_NOTE reaches the instance names, so without this list a
+    findings run's ledger never names the noted objects; the clean and held
+    comments already carry the same list (`_comment_scope_notes`). Bounded
+    at NOTES_SECTION_CAP, so a fleet of MAX_NOTE_CHARS notes cannot squeeze
+    the findings out of the budget: the rows past the cap are counted, and
+    every full note stays in the stored report and on the JSON line.
+    """
+    notes = scope_notes(data)
+    if not notes:
+        return []
+    out = ["", f"{NOTES_LEAD} ({len(notes)}):", ""]
+    total = 0
+    shown = 0
+    for note in notes[:MAX_SCOPE_ROWS]:
+        row = f"- {_cell(note, limit=MAX_NOTE_CHARS)}"
+        if total + len(row) > NOTES_SECTION_CAP:
+            break
+        out.append(row)
+        total += len(row) + len(LINE_JOINER)
+        shown += 1
+    if shown < len(notes):
+        out.append(
+            f"- _…and {len(notes) - shown} more; the stored report carries every full note_"
+        )
     return out
 
 
@@ -14956,6 +15016,9 @@ def render_issue_body(
 
     fixed: list[str] = _render_header(audit_id, noun)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id, extra_gaps=extra_gaps)
+    # The full notes, which the scope table's clipped Notes cell cannot
+    # carry; measured with the fixed sections and bounded by its own cap.
+    fixed += _render_body_notes(data)
     fixed += _render_declared_intent_search(data)
     withheld_section = _render_withheld(
         list(withheld or []),
@@ -26424,6 +26487,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # Before the join: a hand-written `declared[]` entry for a pool the
         # collector reports at its ceiling is a declared fault, and exits 2.
         reject_declared_ceiling_pools(data, manifest)
+    if scope_note_entries(data):
+        # The worker-facing reminder, in the style of the NOT VISIBLE and
+        # HELD lines: the JSON line carries ready-made `report_notes` lines,
+        # and the report ends with them, copied verbatim (`REPORT_NOTES_KEY`).
+        log("NOTES: the report must carry report_notes verbatim, as its last lines.")
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.

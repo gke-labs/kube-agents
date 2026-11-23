@@ -138,10 +138,15 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    different: what it already published stands, so re-run `finish` once the broker answers. Output
    fields, exit codes, partial coverage and no forge: `references/finish.md`.
 
-5. **Report.** On a scheduled run with `silent_ok: true`, the final response is exactly
-   `[SILENT]`; a run `precheck` closed is reported from its line the same way. Otherwise report `issue_url` in full and every URL in `prs_opened` and
-   `prs_still_open`; on `status: "NO_FORGE"` or `"STORE_LEDGER"` the report is `summary` verbatim.
-   Relay each entry of `notes` on the JSON line, except on a `[SILENT]` run.
+5. **Report.** From the JSON line, in this order:
+
+   1. On a scheduled run with `silent_ok: true`, the final response is exactly `[SILENT]` and
+      nothing else; a run `precheck` closed is reported from its line the same way.
+   2. On `status: "NO_FORGE"` or `"STORE_LEDGER"`, the report is `summary` verbatim.
+   3. Otherwise report `issue_url` in full and every URL in `prs_opened` and `prs_still_open`.
+   4. End the report with each line of `report_notes`, copied verbatim. Each line names an
+      object a check read but could not see; a report without them calls those objects clean.
+
    An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
 
 ## Reference files
