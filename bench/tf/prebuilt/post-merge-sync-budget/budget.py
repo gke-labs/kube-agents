@@ -49,6 +49,7 @@ runs. The token is never on argv and never printed.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import subprocess
@@ -129,7 +130,8 @@ def _github_once(method: str, path: str, body: dict | None) -> tuple[int, object
             return response.status, json.loads(text) if text else None
     except urllib.error.HTTPError as exc:
         return exc.code, None
-    except OSError:
+    except (OSError, http.client.HTTPException):
+        # A response cut short (IncompleteRead) or malformed is no answer, and is tried again.
         return NO_ANSWER, None
 
 
@@ -156,7 +158,8 @@ def read_file() -> tuple[str | None, str | None]:
         return None, None
     if status != HTTP_OK or not isinstance(body, dict):
         raise GitHubError(f"GET {contents_path()} answered {status or 'nothing'}")
-    return str(body.get("sha") or ""), base64.b64decode(str(body.get("content") or "")).decode("utf-8")
+    # Bytes that are not UTF-8 read as a changed file, which restore replaces.
+    return str(body.get("sha") or ""), base64.b64decode(str(body.get("content") or "")).decode("utf-8", errors="replace")
 
 
 def budget_state() -> dict | None | bool:

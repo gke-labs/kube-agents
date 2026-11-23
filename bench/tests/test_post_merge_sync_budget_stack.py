@@ -159,6 +159,34 @@ def test_restore_waits_for_the_seeded_shape_not_only_the_name(world):
     assert budget.restore() == 1
 
 
+def test_a_response_cut_short_is_tried_again(monkeypatch, tmp_path):
+    import http.client
+
+    calls = []
+
+    def urlopen(request, timeout=None):
+        calls.append(request)
+        if len(calls) == 1:
+            raise http.client.IncompleteRead(b"")
+        raise budget.urllib.error.HTTPError(request.full_url, 404, "gone", {}, None)
+
+    monkeypatch.setattr(budget.urllib.request, "urlopen", urlopen)
+    monkeypatch.setenv(budget.REPO_ENV, "o/r")
+    token = tmp_path / "token"
+    token.write_text("t")
+    monkeypatch.setenv(budget.TOKEN_FILE_ENV, str(token))
+    assert budget.github("GET", "contents/x", sleep=lambda s: None) == (404, None)
+    assert len(calls) == 2
+
+
+def test_a_budget_that_is_not_utf8_is_replaced(monkeypatch):
+    raw = base64.b64encode(b"\xff\xfe not utf-8").decode()
+    monkeypatch.setattr(budget, "github", lambda method, path, body=None: (200, {"sha": "s1", "content": raw}))
+    monkeypatch.setenv(budget.DIRECTORY_ENV, DIRECTORY)
+    sha, text = budget.read_file()
+    assert sha == "s1" and text != budget.BUDGET_CONTENT
+
+
 def test_a_5xx_is_tried_again(monkeypatch):
     answers = iter([(502, None), (0, None), (200, {"ok": True})])
     monkeypatch.setattr(budget, "_github_once", lambda method, path, body: next(answers))
@@ -206,8 +234,15 @@ def test_the_destroy_provisioner_does_not_continue_on_failure():
     assert "on_failure" not in re.sub(r"#[^\n]*", "", main)
 
 
-def test_the_default_directory_is_the_one_config_sync_syncs():
-    default = re.search(r'variable "cluster_directory" \{.*?default\s+= "([^"]+)"', (STACK / "variables.tf").read_text(), re.DOTALL).group(1)
+def test_the_directory_follows_the_fleets_slot_a_name():
+    # On a pool project kcc_cluster_name is seeded-a; on a dev fleet with a
+    # prefix it is <prefix>-a, the name hack/ci-eval-pr.sh exports.
+    main = (STACK / "main.tf").read_text()
+    variables = (STACK / "variables.tf").read_text()
+    assert 'coalesce(var.cluster_directory, "clusters/${var.kcc_cluster_name}/seeded-post-merge")' in main
+    default = re.search(r'variable "kcc_cluster_name" \{.*?default\s+= "([^"]+)"', variables, re.DOTALL).group(1)
+    assert f"clusters/{default}/seeded-post-merge" == DIRECTORY
+    runner = (REPO / "hack" / "ci-eval-pr.sh").read_text()
+    assert 'export TF_VAR_kcc_cluster_name="${cluster}"' in runner
     fleet = (REPO / "bench" / "tf" / "fleet" / "post-merge-sync.tf").read_text()
-    assert default == DIRECTORY
     assert 'dir       = "clusters/${google_container_cluster.seeded_a.name}/${local.post_merge_namespace}"' in fleet

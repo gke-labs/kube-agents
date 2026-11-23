@@ -379,10 +379,11 @@ def _file_text(repo: str, path: str, branch: str, token: str) -> tuple[dict | No
         raise
     if not isinstance(entry, dict) or not entry.get("sha"):
         raise ResetError(f"GitHub answered the contents read of {path} in {repo} without a file")
+    # Bytes that are not UTF-8 read as a changed file, which the restore replaces.
     try:
-        return entry, base64.b64decode(str(entry.get("content") or "")).decode("utf-8")
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise ResetError(f"GitHub answered the contents read of {path} in {repo} with content that does not decode: {exc}") from exc
+        return entry, base64.b64decode(str(entry.get("content") or "")).decode("utf-8", errors="replace")
+    except ValueError as exc:
+        raise ResetError(f"GitHub answered the contents read of {path} in {repo} with content that is not base64: {exc}") from exc
 
 
 def restore_post_merge_budget(

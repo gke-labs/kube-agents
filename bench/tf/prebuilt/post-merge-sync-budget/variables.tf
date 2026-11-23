@@ -42,11 +42,20 @@ variable "bench_gitops_write_token_file" {
   default     = ""
 }
 
-# The pool repositories' layout: scripts/provision_ci_pool_post_merge_sync.sh
-# seeds order-ledger-pdb.yaml here. A dev fleet applied with a cluster prefix
-# sets clusters/<prefix>-seeded-a/seeded-post-merge.
+# seeded-a's real name, which hack/ci-eval-pr.sh exports to every writing
+# stack's unit from the fleet context (export_writing_stack_inputs, KCC_FLEET_SLOT
+# "a"): `<cluster_prefix>-a`, `seeded-a` on every pool project. Config Sync
+# syncs clusters/<it>/seeded-post-merge (bench/tf/fleet/post-merge-sync.tf).
+variable "kcc_cluster_name" {
+  type        = string
+  description = "Name of the seeded fleet's slot-a cluster, whose directory Config Sync syncs into seeded-post-merge"
+  default     = "seeded-a"
+}
+
+# An explicit directory, for a run outside the runner; empty derives it from
+# kcc_cluster_name.
 variable "cluster_directory" {
   type        = string
-  description = "Directory Config Sync syncs into seeded-post-merge, which holds order-ledger's budget at steady state"
-  default     = "clusters/seeded-a/seeded-post-merge"
+  description = "Directory Config Sync syncs into seeded-post-merge, which holds order-ledger's budget at steady state; empty is clusters/<kcc_cluster_name>/seeded-post-merge"
+  default     = ""
 }

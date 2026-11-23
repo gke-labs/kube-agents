@@ -56,7 +56,7 @@ locals {
   # Destroy-time provisioners may read only `self`, so the triggers carry them.
   settings = {
     POST_MERGE_GITOPS_REPO       = var.gitops_repo
-    POST_MERGE_DIRECTORY         = var.cluster_directory
+    POST_MERGE_DIRECTORY         = coalesce(var.cluster_directory, "clusters/${var.kcc_cluster_name}/seeded-post-merge")
     POST_MERGE_GITOPS_TOKEN_FILE = var.bench_gitops_write_token_file
   }
 }

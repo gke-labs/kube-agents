@@ -115,6 +115,6 @@ verification_spec:
           outcome: verified_fixed
           report: silent
           apply_fixture_role: post-merge-sync-workload
-          synced_directory: clusters/*seeded-a/seeded-post-merge
+          synced_directory: clusters/*-a/seeded-post-merge
           synced_namespace: seeded-post-merge
           recipe: no-pdb

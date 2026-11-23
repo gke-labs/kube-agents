@@ -998,8 +998,23 @@ class PostMergeSteadyStateTest(unittest.TestCase):
         self.assertFalse(record["clean"])
 
     def test_the_directory_is_the_one_the_setup_stack_restores(self):
-        variables = (helper.POST_MERGE_BUDGET_MODULE.parent / "variables.tf").read_text()
-        self.assertIn(f'default     = "{helper.POST_MERGE_DIRECTORY.format(cluster=helper.DEFAULT_KCC_CLUSTER)}"', variables)
+        main = (helper.POST_MERGE_BUDGET_MODULE.parent / "main.tf").read_text()
+        self.assertEqual(helper.POST_MERGE_DIRECTORY, "clusters/{cluster}/seeded-post-merge")
+        self.assertIn('"clusters/${var.kcc_cluster_name}/seeded-post-merge"', main)
+
+    def test_a_budget_that_is_not_utf8_is_replaced(self):
+        github = _WritableGitHub(files={self.DECLARATION: "x"})
+        github.files[self.BUDGET] = "x"
+        real = github.__call__
+
+        def call(method, path, token, body=None):
+            if method == "GET" and path.split("?")[0].endswith("order-ledger-pdb.yaml") and github.files.get(self.BUDGET) == "x":
+                github.calls.append((method, path, body))
+                return {"sha": "sha-1", "content": base64.b64encode(b"\xff\xfe").decode()}
+            return real(method, path, token, body)
+
+        record, _, _ = run_reset(call)
+        self.assertEqual(record["steady_files_restored"], [self.BUDGET])
 
 
 if __name__ == "__main__":
