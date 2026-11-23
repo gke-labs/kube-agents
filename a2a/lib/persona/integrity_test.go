@@ -330,3 +330,53 @@ func TestIntegrityAcceptsATabSeparatedLine(t *testing.T) {
 		t.Fatalf("Load = %v, %v; want verified", p, err)
 	}
 }
+
+// A manifest that lists itself is named as the fault, not reported as a
+// missing file.
+func TestIntegrityRefusesAManifestListingItself(t *testing.T) {
+	dir := copyExample(t)
+	writeIntegrityManifest(t, dir)
+	appendTo(t, dir, IntegrityManifestFile, strings.Repeat("0", 64)+"  ./"+IntegrityManifestFile+"\n")
+	ps := problems(t, dir, Options{})
+	if !hasProblem(ps, IntegrityManifestFile, "lists the manifest itself") {
+		t.Errorf("problems = %v, want the self-listing named", ps)
+	}
+	if hasProblem(ps, IntegrityManifestFile, "but missing") {
+		t.Errorf("problems = %v: the manifest reported missing", ps)
+	}
+}
+
+// A listed file that has become a symlink is reported once, as a symlink,
+// not also as missing.
+func TestIntegrityDoesNotCallAListedSymlinkMissing(t *testing.T) {
+	dir := copyExample(t)
+	writeIntegrityManifest(t, dir)
+	script := filepath.Join(dir, "skills/triage/scripts/events.sh")
+	if err := os.Remove(script); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../SKILL.md", script); err != nil {
+		t.Fatal(err)
+	}
+	ps := problems(t, dir, Options{})
+	if !hasProblem(ps, "skills/triage/scripts/events.sh", "symlink") {
+		t.Errorf("problems = %v, want the symlink named", ps)
+	}
+	if hasProblem(ps, "skills/triage/scripts/events.sh", "but missing") {
+		t.Errorf("problems = %v: the symlink reported missing too", ps)
+	}
+}
+
+// An unlisted symlink is the only fault: the integrity outcome is still
+// unverified, not just the load refused.
+func TestIntegrityAnExtraSymlinkLeavesItUnverified(t *testing.T) {
+	dir := copyExample(t)
+	writeIntegrityManifest(t, dir)
+	if err := os.Symlink("SKILL.md", filepath.Join(dir, "skills/notes/extra.md")); err != nil {
+		t.Fatal(err)
+	}
+	l := &loader{dir: dir}
+	if integrity, _ := l.checkIntegrity(false); integrity != IntegrityUnverified {
+		t.Errorf("checkIntegrity = %v with an extra symlink, want unverified", integrity)
+	}
+}

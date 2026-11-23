@@ -92,11 +92,13 @@ func (l *loader) checkIntegrity(require bool) (Integrity, int) {
 	if !parsed {
 		return IntegrityUnverified, 0
 	}
-	found, ok := l.scanForIntegrity()
+	// Taken before the scan, so a symlink or other non-regular entry the
+	// scan reports leaves the persona unverified too.
+	before := len(l.problems)
+	found, refused, ok := l.scanForIntegrity()
 	if !ok {
 		return IntegrityUnverified, 0
 	}
-	before := len(l.problems)
 	for _, rel := range sortedKeys(found) {
 		want, listed := expected[rel]
 		switch {
@@ -107,7 +109,9 @@ func (l *loader) checkIntegrity(require bool) (Integrity, int) {
 		}
 	}
 	for _, rel := range sortedKeys(expected) {
-		if _, present := found[rel]; !present {
+		// A listed path the scan refused is there, just not a regular
+		// file, and the scan has said so.
+		if _, present := found[rel]; !present && !refused[rel] {
 			l.add(rel, "", "is recorded in %s but missing", IntegrityManifestFile)
 		}
 	}
@@ -150,6 +154,8 @@ func (l *loader) parseIntegrityManifest(data []byte) (map[string]string, bool) {
 			l.add(IntegrityManifestFile, field, "%q is not a lowercase hex SHA-256 digest", digest)
 		case !LocalPath(name) || path.Clean(name) != name:
 			l.add(IntegrityManifestFile, field, "%q is not a plain path inside the persona", name)
+		case name == IntegrityManifestFile:
+			l.add(IntegrityManifestFile, field, "lists the manifest itself, which can't carry its own digest (build it with ! -path ./%s)", IntegrityManifestFile)
 		case entries[name] != "":
 			l.add(IntegrityManifestFile, field, "%q is listed twice", name)
 		default:
@@ -170,8 +176,9 @@ func (l *loader) parseIntegrityManifest(data []byte) (map[string]string, bool) {
 // regular files only, so one is always something it did not produce. A file
 // named like the manifest below the root is an ordinary file here, and is
 // reported unless the manifest lists it.
-func (l *loader) scanForIntegrity() (map[string]string, bool) {
-	found := map[string]string{}
+func (l *loader) scanForIntegrity() (found map[string]string, refused map[string]bool, ok bool) {
+	found = map[string]string{}
+	refused = map[string]bool{}
 	// The trailing separator makes WalkDir descend into a persona directory
 	// that is itself a symlink (a mount path pointing at the payload), as
 	// os.ReadDir does for the format reader.
@@ -187,6 +194,7 @@ func (l *loader) scanForIntegrity() (map[string]string, bool) {
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			l.add(rel, "", "is a symlink; %s covers regular files only", IntegrityManifestFile)
+			refused[rel] = true
 			return nil
 		}
 		if d.IsDir() {
@@ -197,6 +205,7 @@ func (l *loader) scanForIntegrity() (map[string]string, bool) {
 		}
 		if !d.Type().IsRegular() {
 			l.add(rel, "", "is not a regular file; %s covers regular files only", IntegrityManifestFile)
+			refused[rel] = true
 			return nil
 		}
 		if sum, read := l.readSums[rel]; read {
@@ -206,6 +215,7 @@ func (l *loader) scanForIntegrity() (map[string]string, bool) {
 		sum, err := hashNoFollow(full)
 		if errors.Is(err, errSymlink) || errors.Is(err, errNotRegular) {
 			l.add(rel, "", "is not a regular file; %s covers regular files only", IntegrityManifestFile)
+			refused[rel] = true
 			return nil
 		}
 		if err != nil {
@@ -216,9 +226,9 @@ func (l *loader) scanForIntegrity() (map[string]string, bool) {
 	})
 	if err != nil {
 		l.err = err
-		return nil, false
+		return nil, nil, false
 	}
-	return found, true
+	return found, refused, true
 }
 
 // errNotRegular is what hashNoFollow returns for an open file that is not a

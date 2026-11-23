@@ -33,19 +33,33 @@ func TestLoadRefusesANamedPipe(t *testing.T) {
 	}
 }
 
-// A named pipe in a skill is refused when the persona carries a manifest,
-// and the integrity walk doesn't block on it either.
+// A named pipe is refused by the integrity walk itself: README.md is never
+// read by the format reader, which checks it only for a symlink, so a pipe
+// there passes without a manifest and is caught only because the persona
+// carries one. The walk doesn't block on it either.
 func TestIntegrityRefusesANamedPipe(t *testing.T) {
 	dir := copyExample(t)
 	writeIntegrityManifest(t, dir)
-	if err := syscall.Mkfifo(filepath.Join(dir, "skills/notes/pipe"), 0o644); err != nil {
+	_ = os.Remove(filepath.Join(dir, ReadmeFile))
+	if err := syscall.Mkfifo(filepath.Join(dir, ReadmeFile), 0o644); err != nil {
 		t.Skip(err)
+	}
+	manifest := filepath.Join(dir, IntegrityManifestFile)
+	aside := filepath.Join(t.TempDir(), "aside")
+	if err := os.Rename(manifest, aside); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err != nil {
+		t.Fatalf("without a manifest the pipe passes the format reader, got %v", err)
+	}
+	if err := os.Rename(aside, manifest); err != nil {
+		t.Fatal(err)
 	}
 	done := make(chan error, 1)
 	go func() { _, err := Load(dir); done <- err }()
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "skills/notes/pipe: is not a regular file") {
+		if err == nil || !strings.Contains(err.Error(), ReadmeFile+": is not a regular file") {
 			t.Fatalf("want the pipe refused, got %v", err)
 		}
 	case <-time.After(5 * time.Second):
