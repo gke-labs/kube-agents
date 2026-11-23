@@ -522,7 +522,10 @@ leave open:
   subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
   the dispatch config's `profileSupervisorForm` is `profile`; readers read both, until a reader
   given `A2A_PROFILE_SUPERVISOR_CUTOFF` stops taking the five-token form as a profile task's
-  terminal when the server stored it after that time; contract addendum 6, #5301), never its `.events`, which stays
+  terminal when the server stored it after that time; contract addendum 6, #5301). The operator
+  renders that env on the gateway and the MCP server once the `ProfileSupervisorForm` condition
+  has latched True, as the condition's `lastTransitionTime` plus ten minutes, in RFC3339 UTC; an
+  unlatched install renders none, so its readers take both forms and nothing rolls. The terminal never goes on `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
@@ -542,6 +545,24 @@ leave open:
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
   task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as
   an error (#5074).
+  On a latched install (`profileSupervisorForm: profile`) a refused six-token terminal is never
+  written on the five-token form instead: readers past the cutoff don't take that form as a
+  profile task's terminal, so it would free the slot while the requester never saw the end. The
+  terminal is retried, a refusal at admission as well as a held task's, for
+  `DroppedTerminalGiveUp`, and then the task is settled without one: tombstoned, its slot freed,
+  its submission settled, an error logged under the reason `terminal-unpublished`, and the
+  dispatcher health line's `supervisorGiveUps` counted. The requester sees no terminal: the
+  gateway ends a task with no events as never started, and holds one with executor events until
+  the user's stop. A refusal needs a grant that never reached the dispatcher's connection; the
+  regrant normally clears that in seconds, well inside the bound. An unlatched install keeps
+  retrying, as before.
+  A terminal's envelope id is fixed per task, so a retry after a lost ack is a duplicate the stream
+  drops. The duplicate window is keyed on the id alone, whatever the subject, so on the six-token
+  form a duplicate ack is checked: a direct get of the task's six-token subject must find the
+  dispatcher's final status. With none there, the terminal is published once more under a fresh
+  id, and if that fails or is a duplicate too, the task takes the `terminal-unpublished` settle
+  at once. A direct get the dispatcher can't make takes the duplicate as landed, as every terminal
+  did before the check.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for
