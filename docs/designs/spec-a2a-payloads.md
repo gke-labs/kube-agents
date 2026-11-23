@@ -483,8 +483,9 @@ model read for the turn, cached reads included, and `outputTokens` every token i
 own estimate for that turn alone and is carried only when the producer had a figure it did not
 invent: a harness that prices its own turns, never Hermes behind the inference gateway, which
 records no price for a turn (`docs/site/src/content/docs/deploy/telemetry.md`), so the
-hermes-bridge omits it and a cost reader turns to the gateway's `litellm_spend_metric_total`. The
-worker adapter's harness reports a running total (`total_cost_usd`) across every result line of
+hermes-bridge omits it and a cost reader turns to the gateway's `litellm_spend_metric_total`. An
+Antigravity (`agy`) worker reports no cost either, until #6808: its driver publishes tokens and duration alone.
+The Claude Code harness reports a running total (`total_cost_usd`) across every result line of
 the process, a resumed session's earlier spend included, so the adapter publishes the difference
 between consecutive lines. A reused pod carries the total its previous run last read into the
 next run, so a resumed session's first line prices its own turn; only a resumed session the pod
