@@ -1121,12 +1121,20 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   serves nothing else, vertex_ai serves Claude under claude-* names, sap (SAP
   AI Core) under anthropic--* names and forwards temperature and top_p into
   its orchestration request, and a Gemini or OpenAI render stays
-  byte-identical. $claudeDrop is that set; $claude, which also gates prompt
-  caching below, leaves sap out, because the cache_control markers have not
-  been shown to pass SAP's orchestration API.
+  byte-identical. $claudeDrop is that set: $claude plus sap.
+
+  $claudeCache, which gates prompt caching below, is $claude plus a Claude
+  model behind openrouter, named anthropic/claude-* there (a literal,
+  case-sensitive prefix). It leaves sap out, because the cache_control markers
+  have not been shown to pass SAP's orchestration API. Through OpenRouter a
+  marked prefix is billed as a cache write and then as cache reads, and an
+  unmarked one in full on every call. The openrouter model is not in
+  $claudeDrop: OpenRouter answered temperature, top_p and top_k for Claude
+  Opus 5 without the 400 Anthropic gives, so there is nothing to drop.
 */}}
 {{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
 {{- $claudeDrop := or $claude (and (eq .provider "sap") (hasPrefix "anthropic--" .model)) -}}
+{{- $claudeCache := or $claude (and (eq .provider "openrouter") (hasPrefix "anthropic/claude-" .model)) -}}
 {{- /*
   openai_compatible goes through LiteLLM's hosted_vllm handler, which speaks the
   same OpenAI chat-completions API, rather than through openai/. Read from
@@ -1274,8 +1282,9 @@ litellm_settings:
   {{- end }}
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching, for Anthropic-family models only: the $claude gate, which
-  leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
+  Prompt caching, for Anthropic-family models only: the $claudeCache gate, which
+  leaves sap out and takes in a Claude model behind openrouter, where
+  additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
   Vertex explicit context caching: a cachedContents list before every call,
   and a create whenever the cached prefix is new. A create that Vertex holds
   past its request credential's life fails the whole turn (a 401 after a
@@ -1284,7 +1293,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) $budgetShare }}
+{{- if or $claudeCache $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) $budgetShare }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -1319,7 +1328,7 @@ router_settings:
       budget_limit: {{ $budgetShare }}
       time_period: {{ $budgetPeriod | quote }}
   {{- end }}
-  {{- if $claude }}
+  {{- if $claudeCache }}
   default_litellm_params:
     cache_control_injection_points:
       - location: message

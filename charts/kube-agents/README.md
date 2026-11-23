@@ -304,7 +304,7 @@ for the model's provider split evenly across `litellm.replicaCount`; a replica
 whose share is spent refuses model calls until the window ends, and exports the
 remaining share as `litellm_provider_remaining_budget_metric`
 ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)).
-On a Claude model the gateway
+On a Claude model behind `anthropic`, `vertex_ai` or `sap` the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
 and only a Claude model gets the prompt-caching breakpoints
@@ -530,7 +530,9 @@ in the credentials Secret, or custom environment variables for `vertex_ai`:
 - **Any other LiteLLM provider** (`azure`, `bedrock`, `databricks`, ...): set
   `litellm.modelProvider` to the slug, `litellm.modelDefaultName` to the model
   (required; the chart has no default for it), and the driver's variables in
-  the Secret.
+  the Secret. For `openrouter` that is `OPENROUTER_API_KEY`, with the model
+  in OpenRouter's `<vendor>/<model>` form
+  ([what the chart derives for it](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#other-litellm-providers)).
 - **An OpenAI-compatible gateway behind OAuth2 client credentials.** With
   `openai_compatible` and `OPENAI_COMPATIBLE_OAUTH_TOKEN_URL`,
   `OPENAI_COMPATIBLE_OAUTH_CLIENT_ID` and `OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET`

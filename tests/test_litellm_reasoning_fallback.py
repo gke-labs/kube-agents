@@ -257,7 +257,7 @@ litellm:
                     self.assertNotIn("thinking", params[name])
                 router = config["router_settings"]
                 self.assertIn({"model-default": ["slow-lane"]}, router["fallbacks"])
-                # Prompt-caching breakpoints stay Claude-direct only: sap is left out.
+                # Of these three, sap alone gets no prompt-caching breakpoints.
                 self.assertEqual("default_litellm_params" in router, provider != "sap")
 
     def test_fallback_alias_colliding_with_a_primary_fails(self) -> None:
