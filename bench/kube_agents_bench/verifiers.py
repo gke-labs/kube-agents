@@ -1929,6 +1929,8 @@ def _read_clipped_closed_top_level(text: str, target: str) -> str | None:
             colon = _JSON_KEY_COLON.match(text, literal.end())
             if colon is not None:
                 key = string if depth == 1 else None
+                if key == target:
+                    last_val = None
                 i = colon.end()
                 continue
             if key == target and depth == 1:

@@ -377,6 +377,15 @@ _GENERIC_WRAPPER_VAL_OPTS = {
     "flock": frozenset(("-w", "--timeout", "-E", "--conflict-exit-code")),
     "time": frozenset(("-f", "--format", "-o", "--output")),
 }
+_NUMERIC_WRAPPER_VAL_OPTS = {
+    "nice": frozenset(("-n", "--adjustment")),
+    "watch": frozenset(("-n", "--interval")),
+    "flock": frozenset(("-w", "--timeout", "-E", "--conflict-exit-code")),
+    "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata", "--pid")),
+    "timeout": frozenset(("-k", "--kill-after")),
+    "xargs": frozenset(("-P", "-n", "-s", "-L", "--max-procs")),
+    "sudo": frozenset(("-C", "-R", "--close-from", "--command-timeout")),
+}
 
 
 def _next_shell_arg(argv: list[str], idx: int) -> tuple[str | None, int]:
@@ -543,14 +552,21 @@ def _scan_command_prefix(
                 redirect_target = False
                 idx += 1
                 continue
-            if _is_redirect(argv[idx]) or (
-                not duration_needed
-                and positionals == 0
-                and argv[idx].isdigit()
-                and idx + 1 < len(argv)
-                and _is_redirect(argv[idx + 1])
-            ):
-                redirect_target = not argv[idx].isdigit()
+            if _is_redirect(argv[idx]):
+                redirect_target = True
+                idx += 1
+                continue
+            if argv[idx].isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1]):
+                if duration_needed:
+                    val_after, _ = _next_shell_arg(argv, idx + 1)
+                    if val_after is None or not (
+                        _SHELL_COUNT_RE.match(val_after)
+                        or (val_after.startswith(_SHELL_EXPANSION_PREFIX) and "/" not in val_after and not val_after.endswith((".py", ".sh")))
+                    ):
+                        duration_needed = False
+                        idx += 1
+                        continue
+                redirect_target = False
                 idx += 1
                 continue
 
@@ -686,6 +702,10 @@ def _scan_command_prefix(
                 idx += 1
                 if takes_val:
                     # Consume next non-redirect argument as value
+                    opt_needs_numeric = (
+                        wrapper_name in _NUMERIC_WRAPPER_VAL_OPTS
+                        and any(w == opt or w.endswith(opt.lstrip("-")) for opt in _NUMERIC_WRAPPER_VAL_OPTS[wrapper_name])
+                    )
                     while idx < len(argv):
                         if redirect_target:
                             redirect_target = False
@@ -693,6 +713,22 @@ def _scan_command_prefix(
                             continue
                         if _is_redirect(argv[idx]):
                             redirect_target = True
+                            idx += 1
+                            continue
+                        if (
+                            argv[idx].isdigit()
+                            and idx + 1 < len(argv)
+                            and _is_redirect(argv[idx + 1])
+                        ):
+                            if opt_needs_numeric:
+                                val_after, _ = _next_shell_arg(argv, idx + 1)
+                                if val_after is None or not (
+                                    _SHELL_COUNT_RE.match(val_after)
+                                    or val_after.startswith(_SHELL_EXPANSION_PREFIX)
+                                ):
+                                    idx += 1
+                                    break
+                            redirect_target = not argv[idx].isdigit()
                             idx += 1
                             continue
                         # Found option value

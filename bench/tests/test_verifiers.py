@@ -11230,6 +11230,114 @@ def test_scan_command_prefix_numeric_wrapper_option_and_duration_with_redirects(
     assert _argv_runs(argv6, run_collect)
 
 
+def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
+    from kube_agents_bench.shell_words import _command_word_index, _scan_command_prefix, _shell_argvs
+    from kube_agents_bench.verifiers import WorkerRun, _argv_runs, _has_detaching_wrapper
+
+    run_collect = WorkerRun(script="collect.py")
+
+    # 1. timeout 2>/dev/null 30 python3 collect.py
+    # 2>/dev/null is skipped as redirect with descriptor; 30 is duration; python3 is command
+    argv1 = _shell_argvs("timeout 2>/dev/null 30 python3 collect.py")[0]
+    wrappers1, idx1 = _scan_command_prefix(argv1)
+    assert wrappers1 == [("timeout", 0, False)]
+    assert idx1 == 5 and argv1[idx1] == "python3"
+    assert _command_word_index(argv1, script="collect.py") == 5
+    assert _argv_runs(argv1, run_collect)
+
+    # 2. sudo -u 2>/dev/null hermes python3 collect.py
+    # 2>/dev/null is skipped in takes_val; hermes is consumed as -u value; python3 is command
+    argv2 = _shell_argvs("sudo -u 2>/dev/null hermes python3 collect.py")[0]
+    wrappers2, idx2 = _scan_command_prefix(argv2)
+    assert wrappers2 == [("sudo", 0, False)]
+    assert idx2 == 6 and argv2[idx2] == "python3"
+    assert _command_word_index(argv2, script="collect.py") == 6
+    assert _argv_runs(argv2, run_collect)
+
+    # 3. chroot 2>/dev/null /mnt python3 collect.py
+    # 2>/dev/null is skipped; /mnt is positional; python3 is command
+    argv3 = _shell_argvs("chroot 2>/dev/null /mnt python3 collect.py")[0]
+    wrappers3, idx3 = _scan_command_prefix(argv3)
+    assert wrappers3 == [("chroot", 0, False)]
+    assert idx3 == 5 and argv3[idx3] == "python3"
+    assert _command_word_index(argv3, script="collect.py") == 5
+    assert _argv_runs(argv3, run_collect)
+
+    # 4. flock 2>/dev/null /tmp/lock python3 collect.py
+    # 2>/dev/null is skipped; /tmp/lock is positional; flock detaches; python3 is command
+    argv4 = _shell_argvs("flock 2>/dev/null /tmp/lock python3 collect.py")[0]
+    wrappers4, idx4 = _scan_command_prefix(argv4)
+    assert wrappers4 == [("flock", 0, True)]
+    assert idx4 == 5 and argv4[idx4] == "python3"
+    assert _command_word_index(argv4, script="collect.py") == 5
+    assert _has_detaching_wrapper(argv4)
+
+    # 5. nice -n 2>/dev/null 10 python3 collect.py
+    # 2>/dev/null is skipped in takes_val; 10 is consumed as -n value; python3 is command
+    argv5 = _shell_argvs("nice -n 2>/dev/null 10 python3 collect.py")[0]
+    wrappers5, idx5 = _scan_command_prefix(argv5)
+    assert wrappers5 == [("nice", 0, False)]
+    assert idx5 == 6 and argv5[idx5] == "python3"
+    assert _command_word_index(argv5, script="collect.py") == 6
+    assert _argv_runs(argv5, run_collect)
+
+
+def test_read_clipped_closed_top_level_duplicate_key_cut():
+    from kube_agents_bench.verifiers import (
+        WorkerCommandsVerifier,
+        _code_call_text_and_clip,
+        _read_clipped_closed_top_level,
+    )
+
+    # Direct helper checks:
+    # Later duplicate target key with colon cut drops earlier closed value
+    assert _read_clipped_closed_top_level('{"command": "echo safe", "command": ', "command") is None
+    assert (
+        _read_clipped_closed_top_level('{"command": "echo safe", "command": {"nested": "decoy"}', "command")
+        is None
+    )
+    # Closed later replacement wins
+    assert (
+        _read_clipped_closed_top_level('{"command": "echo safe", "command": "echo replaced"}', "command")
+        == "echo replaced"
+    )
+    # Different cut key preserves closed target
+    assert _read_clipped_closed_top_level('{"command": "echo safe", "other": ', "command") == "echo safe"
+
+    # Integration via _code_call_text_and_clip:
+    entry_duplicate_cut = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"command": "echo safe", "command": ...[clipped 10 chars]',
+        },
+    }
+    cmd, is_clipped = _code_call_text_and_clip(entry_duplicate_cut)
+    assert cmd is None
+    assert is_clipped is True
+
+    # Verifier does not match forbidden patterns against replaced stale command
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        forbidden_patterns=[r"echo safe"],
+    )
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {
+                "raw": '{"command": "echo safe", "command": ...[clipped 10 chars]',
+            },
+            "result": "ok",
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj, worker_commands=[])
+    res = v.verify(5.0)
+    assert res.success
+
+
 def test_extract_shell_command_string_clustered_options():
     from kube_agents_bench.shell_words import _extract_shell_command_string
 
