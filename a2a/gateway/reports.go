@@ -45,6 +45,18 @@ import (
 // lookup serves it to every reply there. A Slack DM thread has no thread
 // address, so its reports stay in memory alone, as before.
 //
+// A thread on the session-pod route (SessionRecord.SessionRouted) is the
+// exception to the once: every opening human turn there carries the
+// thread's newest report kept within reportRetention (current), memory
+// first and then the bucket, and neither the turn nor a steer forgets it,
+// which is what the hermes-bridge does for every reply on the platform
+// route (attachPushedReport, from the thread's incident row). A session pod
+// keeps its own context across turns and frames a report it was already
+// shown only once (a2a/worker-adapter), so a warm pod is not shown it
+// twice and a fresh incarnation is shown it again. A row read for such a
+// thread is cached for reportHitTTL (hits), so a turn does not pay a bucket
+// read each time; put drops the cached row at every address it writes.
+//
 // Any bucket error is logged and the turn or the post goes on with memory
 // alone: the relay is a help, not a condition.
 const (
@@ -82,6 +94,17 @@ const (
 	// reportMissesMax bounds the cached misses, the oldest dropped first
 	// (notifyUpdates' conversation bound).
 	reportMissesMax = pushedReportsConversationsMax
+	// reportHitTTL is how long a row a bucket read found stands before the
+	// address is read again: short, so another writer's newer row (or the
+	// prune's delete) is seen within a minute, and long enough that a
+	// session-routed thread's every-turn attach (current) reads the bucket
+	// at most once a minute. put drops the cached row for every address it
+	// writes, so this gateway's own newer report is seen at once.
+	reportHitTTL = time.Minute
+	// reportHitsMax bounds the cached rows, the oldest dropped first. Each
+	// holds up to lib.PushedReportTextCap of text, so the bound is smaller
+	// than the misses': 256 × 64 KiB is 16 MiB at the worst.
+	reportHitsMax = 256
 )
 
 // pushedReports is the cache: per conversation, its last reports in order,
@@ -108,6 +131,11 @@ type pushedReports struct {
 	// put writes there. missOrder bounds it (reportMissesMax).
 	misses    map[string]time.Time
 	missOrder []string
+	// hits is, per row key a bucket read found a row at, the row and when
+	// it was read: the key is not read again until reportHitTTL has passed
+	// or put writes there. hitOrder bounds it (reportHitsMax).
+	hits     map[string]reportHit
+	hitOrder []string
 
 	// durable is the bucket side (gatewayReports); nil keeps reports in
 	// memory alone. log logs its failures; nil is slog.Default.
@@ -123,6 +151,12 @@ type pushedReports struct {
 type reportBackend interface {
 	PutReport(ctx context.Context, rec *lib.ReportRecord) error
 	GetReport(ctx context.Context, addr lib.ReportAddress) (*lib.ReportRecord, error)
+}
+
+// reportHit is a row a bucket read found, cached (pushedReports.hits).
+type reportHit struct {
+	rec    lib.ReportRecord
+	readAt time.Time
 }
 
 type pushedReport struct {
@@ -185,6 +219,7 @@ func (p *pushedReports) put(conversation, root, text string) {
 	}
 	p.mu.Lock()
 	p.dropMissLocked(addr.Key())
+	p.dropHitLocked(addr.Key())
 	p.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), reportStoreTimeout)
 	defer cancel()
@@ -254,7 +289,7 @@ func (p *pushedReports) latestOrStored(conversation string) (string, uint64, boo
 	if text, seq, ok := p.latest(conversation); ok || p.durable == nil {
 		return text, seq, ok
 	}
-	rec, ok := p.stored(conversation, "", func(*lib.ReportRecord) bool { return true })
+	rec, ok := p.stored(conversation, "", func(*lib.ReportRecord) bool { return true }, true)
 	if !ok {
 		return "", 0, false
 	}
@@ -268,11 +303,44 @@ func (p *pushedReports) latestOrStored(conversation string) (string, uint64, boo
 	return rec.Text, p.keepLocked(conversation, rec.Root, rec.Text, rec.PostedAt), true
 }
 
+// current is the newest report kept for a session-routed thread posted
+// within reportRetention: memory's, else the thread's stored row, read
+// whatever this process forgot for the thread (a thread that was on the
+// platform route before may have a consumed note). Nothing is forgotten and
+// nothing read back is kept in memory, so every turn reads it again; the
+// bucket read is cached (hits).
+func (p *pushedReports) current(conversation string) (string, bool) {
+	horizon := p.clock().Add(-reportRetention)
+	p.mu.Lock()
+	posts := p.byConversation[conversation]
+	if len(posts) > 0 {
+		newest := posts[len(posts)-1]
+		p.mu.Unlock()
+		// A newer row than memory's newest can only be another writer's,
+		// which a session-routed thread doesn't have today; memory stands,
+		// as it does in latestOrStored.
+		if !newest.postedAt.After(horizon) {
+			return "", false
+		}
+		return newest.text, true
+	}
+	p.mu.Unlock()
+	if p.durable == nil {
+		return "", false
+	}
+	rec, ok := p.stored(conversation, "", func(rec *lib.ReportRecord) bool { return rec.PostedAt.After(horizon) }, false)
+	if !ok {
+		return "", false
+	}
+	return rec.Text, true
+}
+
 // stored is the first row at lib.ReportAddresses(conversation, "", root)
-// that want accepts and that was posted after the newest report this
-// process forgot for conversation. A failed read is logged and read as
-// none.
-func (p *pushedReports) stored(conversation, root string, want func(*lib.ReportRecord) bool) (*lib.ReportRecord, bool) {
+// that want accepts and, when honorConsumed is set, that was posted after
+// the newest report this process forgot for conversation. A row read within
+// reportHitTTL, or a miss within reportMissTTL, is answered from the cache.
+// A failed read is logged and read as none.
+func (p *pushedReports) stored(conversation, root string, want func(*lib.ReportRecord) bool, honorConsumed bool) (*lib.ReportRecord, bool) {
 	addrs := lib.ReportAddresses(conversation, "", root)
 	if len(addrs) == 0 {
 		return nil, false
@@ -282,20 +350,26 @@ func (p *pushedReports) stored(conversation, root string, want func(*lib.ReportR
 	p.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), reportStoreTimeout)
 	defer cancel()
+	consumed = consumed && honorConsumed
 	for _, addr := range addrs {
 		key := addr.Key()
-		if p.missCached(key) {
-			continue
-		}
-		rec, err := p.durable.GetReport(ctx, addr)
-		if err != nil {
-			p.logger().Warn("stored pushed report not read; the turn runs on what memory holds",
-				"conversation", conversation, "root", root, "key", key, "err", err)
-			return nil, false
-		}
-		if rec == nil {
-			p.noteMiss(key)
-			continue
+		rec, cached := p.hitCached(key)
+		if !cached {
+			if p.missCached(key) {
+				continue
+			}
+			var err error
+			rec, err = p.durable.GetReport(ctx, addr)
+			if err != nil {
+				p.logger().Warn("stored pushed report not read; the turn runs on what memory holds",
+					"conversation", conversation, "root", root, "key", key, "err", err)
+				return nil, false
+			}
+			if rec == nil {
+				p.noteMiss(key)
+				continue
+			}
+			p.noteHit(key, rec)
 		}
 		if !want(rec) || (consumed && !rec.PostedAt.After(through)) {
 			continue
@@ -349,6 +423,53 @@ func (p *pushedReports) dropMissLocked(key string) {
 	}
 	delete(p.misses, key)
 	p.missOrder = slices.DeleteFunc(p.missOrder, func(k string) bool { return k == key })
+}
+
+// hitCached is the row a read of key found within the last reportHitTTL,
+// a copy, dropping a cached row that has expired.
+func (p *pushedReports) hitCached(key string) (*lib.ReportRecord, bool) {
+	now := p.clock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	hit, ok := p.hits[key]
+	if !ok {
+		return nil, false
+	}
+	if now.Sub(hit.readAt) < reportHitTTL {
+		rec := hit.rec
+		return &rec, true
+	}
+	p.dropHitLocked(key)
+	return nil, false
+}
+
+// noteHit caches the row a read of key found.
+func (p *pushedReports) noteHit(key string, rec *lib.ReportRecord) {
+	now := p.clock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.hits == nil {
+		p.hits = map[string]reportHit{}
+	}
+	if _, known := p.hits[key]; known {
+		p.hitOrder = moveToEnd(p.hitOrder, key)
+	} else {
+		p.hitOrder = append(p.hitOrder, key)
+	}
+	p.hits[key] = reportHit{rec: *rec, readAt: now}
+	for len(p.hitOrder) > reportHitsMax {
+		delete(p.hits, p.hitOrder[0])
+		p.hitOrder = p.hitOrder[1:]
+	}
+}
+
+// dropHitLocked forgets a cached row for key. Under p.mu.
+func (p *pushedReports) dropHitLocked(key string) {
+	if _, ok := p.hits[key]; !ok {
+		return
+	}
+	delete(p.hits, key)
+	p.hitOrder = slices.DeleteFunc(p.hitOrder, func(k string) bool { return k == key })
 }
 
 // noteConsumedLocked notes that this process forgot conversation's reports
@@ -460,7 +581,7 @@ func (p *pushedReports) byRootOrStored(conversation, root string) (string, bool)
 	if text, ok := p.byRoot(conversation, root); ok || p.durable == nil {
 		return text, ok
 	}
-	rec, ok := p.stored(conversation, root, func(rec *lib.ReportRecord) bool { return rec.Root == root })
+	rec, ok := p.stored(conversation, root, func(rec *lib.ReportRecord) bool { return rec.Root == root }, true)
 	if !ok {
 		return "", false
 	}
@@ -481,10 +602,18 @@ func (p *pushedReports) byRootOrStored(conversation, root string) (string, bool)
 // read first, and the bucket for what it lacks (latestOrStored,
 // byRootOrStored): by the chain's root for a turn naming a task, the root a
 // console report is stored under.
+//
+// A thread on the session-pod route (rec.SessionRouted) is under its newest
+// report within reportRetention on every turn (current), and the number is
+// 0, so the turn forgets nothing: the pod frames a report once per context.
 func (g *Gateway) relayedReport(rec *SessionRecord, replyTo string) (lib.PushedReport, uint64, bool) {
 	if replyTo == "" {
 		if !lib.ThreadKeyedConversation(rec.Key) {
 			return lib.PushedReport{}, 0, false
+		}
+		if rec.SessionRouted {
+			text, ok := g.reports.current(rec.Key)
+			return lib.PushedReport{Text: text}, 0, ok
 		}
 		text, seq, ok := g.reports.latestOrStored(rec.Key)
 		return lib.PushedReport{Text: text}, seq, ok

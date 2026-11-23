@@ -582,3 +582,189 @@ func TestABucketMissIsCachedUntilAWriteOrTheTTL(t *testing.T) {
 		t.Fatal("a recent miss was read again")
 	}
 }
+
+// A thread on the session-pod route carries its newest report on every
+// opening turn, not once: no turn forgets it, a steer doesn't, a new
+// process reads it back from the bucket on every turn too, and a consumed
+// note left by the platform route doesn't hide it. A report past
+// reportRetention is not carried. A platform-routed thread in the same
+// process still carries its report once.
+func TestASessionRoutedThreadCarriesItsReportOnEveryTurn(t *testing.T) {
+	store := &fakeReports{}
+	clock := time.Date(2026, 11, 23, 9, 0, 0, 0, time.UTC)
+	tick := func() time.Time { clock = clock.Add(time.Second); return clock }
+	g := &Gateway{reports: pushedReports{durable: store, now: tick}}
+	const thread = "slack:C8/1950.1"
+	session := &SessionRecord{Key: thread, SessionRouted: true}
+	g.reports.put(thread, "task-x", "card report: np-quartz-7 is at 92%")
+	// turn plays one opening turn as startTaskWith does: read, then forget
+	// through the number once the turn is on the bus.
+	turn := func(g *Gateway, rec *SessionRecord) (lib.PushedReport, bool) {
+		report, seq, ok := g.relayedReport(rec, "")
+		if seq > 0 {
+			g.reports.forgetThrough(rec.Key, seq)
+		}
+		return report, ok
+	}
+	want := lib.PushedReport{Text: "card report: np-quartz-7 is at 92%"}
+	for i := 1; i <= 3; i++ {
+		if got, ok := turn(g, session); !ok || got != want {
+			t.Fatalf("turn %d: %+v %v, want the thread's report", i, got, ok)
+		}
+	}
+	if n := store.reads.Load(); n != 0 {
+		t.Fatalf("memory hits read the bucket %d times", n)
+	}
+
+	// A new process: the report comes from the bucket on every turn, read
+	// once while the cached row stands, and a steer forgets nothing.
+	restarted := &Gateway{reports: pushedReports{durable: store, now: tick}}
+	restarted.reports.forget(thread) // a consumed note, as a platform-route steer leaves
+	for i := 1; i <= 3; i++ {
+		if got, ok := turn(restarted, session); !ok || got != want {
+			t.Fatalf("turn %d after the restart: %+v %v, want the stored report", i, got, ok)
+		}
+	}
+	if n := store.reads.Load(); n != 1 {
+		t.Fatalf("three turns after the restart read the bucket %d times, want 1", n)
+	}
+	if _, _, ok := restarted.reports.latest(thread); ok {
+		t.Fatal("a session thread's read kept the stored row in memory")
+	}
+
+	// Past the retention neither memory's nor the bucket's is carried.
+	clock = clock.Add(reportRetention)
+	if got, ok := turn(g, session); ok {
+		t.Fatalf("memory's report past the retention: %+v", got)
+	}
+	if got, ok := turn(restarted, session); ok {
+		t.Fatalf("the stored report past the retention: %+v", got)
+	}
+
+	// A platform-routed thread keeps the once.
+	const other = "slack:C8/1951.1"
+	g.reports.put(other, "", "the platform thread's report")
+	platform := &SessionRecord{Key: other}
+	if got, ok := turn(g, platform); !ok || got.Text != "the platform thread's report" {
+		t.Fatalf("platform thread, first turn: %+v %v", got, ok)
+	}
+	if got, ok := turn(g, platform); ok {
+		t.Fatalf("platform thread, second turn carried %+v", got)
+	}
+}
+
+// The cached row: a second read within reportHitTTL is answered without a
+// bucket read; past the TTL the row is read again; this process's own put
+// to the address drops it, so its newer report is read at once; the cache
+// stays within its bound.
+func TestAFoundReportRowIsCachedUntilAPutOrTheTTL(t *testing.T) {
+	store := &fakeReports{}
+	clock := time.Date(2026, 11, 23, 9, 0, 0, 0, time.UTC)
+	writer := &pushedReports{durable: store, now: func() time.Time { return clock }}
+	const thread = "gchat:spaces/A/threads/C"
+	writer.put(thread, "", "v1")
+
+	p := &pushedReports{durable: store, now: func() time.Time { return clock }}
+	read := func(want string, reads int32) {
+		t.Helper()
+		if text, ok := p.current(thread); !ok || text != want {
+			t.Fatalf("current = %q %v, want %q", text, ok, want)
+		}
+		if n := store.reads.Load(); n != reads {
+			t.Fatalf("bucket reads = %d, want %d", n, reads)
+		}
+	}
+	read("v1", 1)
+	clock = clock.Add(reportHitTTL - time.Second)
+	read("v1", 1)
+	clock = clock.Add(2 * time.Second)
+	read("v1", 2)
+
+	// Another writer's newer row is not seen until the TTL ...
+	writer.put(thread, "", "v2")
+	read("v1", 2)
+	// ... but this process's own put drops its cached row at once.
+	p.put(thread, "", "v3")
+	p.mu.Lock()
+	p.forgetLocked(thread) // as the bounds evict it
+	p.mu.Unlock()
+	read("v3", 3)
+	read("v3", 3)
+
+	for i := 0; i < reportHitsMax+10; i++ {
+		key := fmt.Sprintf("slack:C9/%d.1", i)
+		writer.put(key, "", "r")
+		p.current(key)
+	}
+	p.mu.Lock()
+	size, order := len(p.hits), len(p.hitOrder)
+	p.mu.Unlock()
+	if size != reportHitsMax || order != reportHitsMax {
+		t.Fatalf("rows cached: %d (order %d), want %d", size, order, reportHitsMax)
+	}
+}
+
+// Through the gateway: a thread on the session-pod route carries its
+// report on its first, second and third opening turns, and on the next
+// one after a restart.
+func TestASessionRoutedThreadsEveryTurnCarriesTheRelayedReport(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	const thread = "slack:C8/1960.1"
+	const report = "card report: np-quartz-7 is at 92%"
+	r.g.reports.put(thread, "task-x", report)
+	seen := map[string]bool{}
+	// turn runs one opening turn and returns its submission, then ends the
+	// task so the next turn opens a task of its own.
+	turn := func(r *rig, spawn *fakeSpawner, name string) *lib.Envelope {
+		t.Helper()
+		busyTurn(r, thread, "slack", name)
+		var env *lib.Envelope
+		var addressee string
+		waitFor(t, name, func() bool {
+			for _, call := range spawn.calls() {
+				for _, e := range inSubjectEnvelopes(t, r.url, call.Session) {
+					if e.Kind == lib.KindMessage && !seen[e.TaskID] {
+						env, addressee = e, call.Session
+						return true
+					}
+				}
+			}
+			rec, _ := r.g.reg.Get(context.Background(), thread)
+			if rec != nil && rec.Addressee != "" {
+				for _, e := range inSubjectEnvelopes(t, r.url, rec.Addressee) {
+					if e.Kind == lib.KindMessage && !seen[e.TaskID] {
+						env, addressee = e, rec.Addressee
+						return true
+					}
+				}
+			}
+			return false
+		})
+		seen[env.TaskID] = true
+		if err := r.execFor(t, env, addressee).PublishStatus(context.Background(), lib.StateCompleted, true); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, name+" released", func() bool {
+			rec, _ := r.g.reg.Get(context.Background(), thread)
+			return rec != nil && rec.ActiveTask == nil
+		})
+		return env
+	}
+	for i := 1; i <= 3; i++ {
+		env := turn(r, spawn, fmt.Sprintf("turn %d", i))
+		got, found, err := lib.PushedReportOf(messageParts(t, env))
+		if err != nil || !found || got != (lib.PushedReport{Text: report}) {
+			t.Fatalf("turn %d: pushedReport part = %+v found=%v err=%v", i, got, found, err)
+		}
+	}
+	if rec, _ := r.g.reg.Get(context.Background(), thread); rec == nil || !rec.SessionRouted {
+		t.Fatalf("the thread is not on the session route: %+v", rec)
+	}
+	r2, spawn2 := restartRig(t, r)
+	env := turn(r2, spawn2, "after the restart")
+	got, found, err := lib.PushedReportOf(messageParts(t, env))
+	if err != nil || !found || got != (lib.PushedReport{Text: report}) {
+		t.Fatalf("after the restart: pushedReport part = %+v found=%v err=%v", got, found, err)
+	}
+}
