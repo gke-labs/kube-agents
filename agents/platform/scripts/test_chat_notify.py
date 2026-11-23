@@ -316,6 +316,30 @@ class CommandTest(unittest.TestCase):
                 ["a2a", "notify", "--platform", "google_chat", "--", "x"],
             )
 
+    def test_a_teams_thread_target_keeps_its_colon(self):
+        # Every Teams conversation id carries a ":" ("19:…", "a:…"), and the
+        # relay names a Teams thread's chat by the thread itself, so the
+        # target is "teams:<id>:<id>"; the thread must come out whole.
+        home = "19:abc@thread.tacv2"
+        thread = home + ";messageid=1794603936403"
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "teams"}):
+            self.assertEqual(
+                chat_notify.command(f"teams:{thread}:{thread}", "follow-up", json_output=False),
+                ["a2a", "notify", "--platform", "teams", "--thread", thread, "--", "follow-up"],
+            )
+            self.assertEqual(
+                chat_notify.command(f"teams:{home}:{thread}", "follow-up"),
+                ["a2a", "notify", "--platform", "teams", "--thread", thread, "--", "follow-up"],
+            )
+            # A personal chat threads nothing: the chat is the thread.
+            self.assertEqual(
+                chat_notify.command("teams:a:1Uxx:a:1Uxx", "x")[4:6], ["--thread", "a:1Uxx"])
+            # A bare conversation, and no conversation, are home posts.
+            self.assertEqual(
+                chat_notify.command(f"teams:{home}", "x"), ["a2a", "notify", "--platform", "teams", "--", "x"])
+            self.assertEqual(
+                chat_notify.command("teams", "x"), ["a2a", "notify", "--platform", "teams", "--", "x"])
+
     def test_text_that_looks_like_a_flag_stays_text(self):
         # "--" ends the CLI's flags, so a bullet, a rule, a negative number, or
         # a message that is exactly a valid flag cannot redirect the post or

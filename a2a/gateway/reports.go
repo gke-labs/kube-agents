@@ -49,10 +49,16 @@ type pushedReports struct {
 	byConversation map[string][]pushedReport
 	order          []string
 	bytes          int
+	// seq numbers every report kept, in order of keeping, so a caller can
+	// forget what it read (forgetThrough) by the newest report's number and
+	// not by a count, which an eviction at the per-conversation cap would
+	// shift onto a report kept since the read.
+	seq uint64
 }
 
 type pushedReport struct {
 	root, text string
+	seq        uint64
 }
 
 // put keeps text as a report posted into conversation on root's behalf,
@@ -69,7 +75,8 @@ func (p *pushedReports) put(conversation, root, text string) {
 		p.byConversation = map[string][]pushedReport{}
 	}
 	posts, known := p.byConversation[conversation]
-	posts = append(posts, pushedReport{root: root, text: text})
+	p.seq++
+	posts = append(posts, pushedReport{root: root, text: text, seq: p.seq})
 	p.bytes += len(text)
 	if len(posts) > pushedReportsPerConversation {
 		p.bytes -= len(posts[0].text)
@@ -94,33 +101,43 @@ func (p *pushedReports) forgetOldest() {
 
 // latest is the newest report kept for conversation, whatever task it was
 // on (what the next human turn that opens in a chat thread is under), and
-// how many reports the conversation holds, for forgetUpTo once that turn is
-// on the bus.
-func (p *pushedReports) latest(conversation string) (string, int, bool) {
+// that report's number, for forgetThrough once that turn is on the bus.
+func (p *pushedReports) latest(conversation string) (string, uint64, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	posts := p.byConversation[conversation]
 	if len(posts) == 0 {
 		return "", 0, false
 	}
-	return posts[len(posts)-1].text, len(posts), true
+	newest := posts[len(posts)-1]
+	return newest.text, newest.seq, true
 }
 
-// forgetUpTo drops the oldest n reports kept for conversation: the ones a
-// turn read (latest), once that turn is on the bus. A report kept since the
-// read stays for the next turn.
-func (p *pushedReports) forgetUpTo(conversation string, n int) {
+// forgetThrough drops the reports kept for conversation up to and including
+// the one numbered seq: the ones a turn read (latest), once that turn is on
+// the bus. A report kept since the read has a higher number and stays for
+// the next turn, whether or not the cap evicted older reports in between.
+func (p *pushedReports) forgetThrough(conversation string, seq uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Reports are kept in order of number (appended in order, evicted from
+	// the front), so the first one numbered past seq starts what stays.
 	posts := p.byConversation[conversation]
-	if n >= len(posts) {
+	first := len(posts)
+	for i, post := range posts {
+		if post.seq > seq {
+			first = i
+			break
+		}
+	}
+	if first == len(posts) {
 		p.forgetLocked(conversation)
 		return
 	}
-	for _, post := range posts[:n] {
+	for _, post := range posts[:first] {
 		p.bytes -= len(post.text)
 	}
-	p.byConversation[conversation] = posts[n:]
+	p.byConversation[conversation] = posts[first:]
 }
 
 // forget drops every report kept for conversation: a chat thread's, once a
@@ -158,19 +175,19 @@ func (p *pushedReports) byRoot(conversation, root string) (string, bool) {
 // and MCP doors) is under the report on that task, read as the root of its
 // chain (observedAs), which is what a console report is kept under. A turn
 // in a chat thread names no task: it is under the newest report kept for
-// the thread's key, and the count returned is how many of the thread's
-// reports the caller forgets once the turn is on the bus (forgetUpTo), so
-// the turn after it is not under a report it was not about while one kept
-// during the publish stays. A turn naming no task anywhere else (a console
-// turn with no reply, a whole-space or DM key) carries none; the count is 0
-// for every turn but a thread's.
-func (g *Gateway) relayedReport(rec *SessionRecord, replyTo string) (lib.PushedReport, int, bool) {
+// the thread's key, and the number returned is that report's, through
+// which the caller forgets the thread's reports once the turn is on the bus
+// (forgetThrough), so the turn after it is not under a report it was not
+// about while one kept during the publish stays. A turn naming no task
+// anywhere else (a console turn with no reply, a whole-space or DM key)
+// carries none; the number is 0 for every turn but a thread's.
+func (g *Gateway) relayedReport(rec *SessionRecord, replyTo string) (lib.PushedReport, uint64, bool) {
 	if replyTo == "" {
 		if !lib.ThreadKeyedConversation(rec.Key) {
 			return lib.PushedReport{}, 0, false
 		}
-		text, n, ok := g.reports.latest(rec.Key)
-		return lib.PushedReport{Text: text}, n, ok
+		text, seq, ok := g.reports.latest(rec.Key)
+		return lib.PushedReport{Text: text}, seq, ok
 	}
 	root, _ := rec.observedAs(replyTo)
 	text, ok := g.reports.byRoot(rec.Key, root)

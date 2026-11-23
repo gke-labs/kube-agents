@@ -340,6 +340,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     ],
     "Meta": [
         "alert-history",
+        "chat-delivery",
         "decision-memory",
         "first-run-report",
         "fleet-audit",

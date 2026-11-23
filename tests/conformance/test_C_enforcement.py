@@ -1871,9 +1871,9 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.
 
-        The operator renders the CR's integration.{googleChat,slack}.allowedUsers
-        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK}; the gateway
-        reads the same two names and checks a session's request to delegate to
+        The operator renders the CR's integration.{googleChat,slack,teams}.allowedUsers
+        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK,TEAMS}; the gateway
+        reads the same three names and checks a session's request to delegate to
         the platform agent against them. The gateway reads an absent variable
         as "all authenticated users", by design (an absent CR list means the
         same), so a rename on either side is not a refusal anyone sees: every
@@ -1887,6 +1887,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         for const, env in (
             ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
             ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
+            ("a2aTargetAllowedUsersTeamsEnvVar", "EnvTargetAllowedUsersTeams"),
         ):
             with self.subTest(pair=const):
                 rendered = self._one_match(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)

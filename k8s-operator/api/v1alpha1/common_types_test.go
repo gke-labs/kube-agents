@@ -267,6 +267,12 @@ func TestBusCredentialRoutes(t *testing.T) {
 	if A2ABusTokenAudience != "a2a-bus" {
 		t.Fatalf("A2ABusTokenAudience = %q, want a2a-bus (what the callout's TokenReview asks for)", A2ABusTokenAudience)
 	}
+	if WatcherTokenAudience != "kubeagents-credential-proxy-watcher" {
+		t.Fatalf("WatcherTokenAudience = %q, want kubeagents-credential-proxy-watcher", WatcherTokenAudience)
+	}
+	if WatcherTokenVolumeName != "watcher-credential-proxy-token" {
+		t.Fatalf("WatcherTokenVolumeName = %q, want watcher-credential-proxy-token", WatcherTokenVolumeName)
+	}
 	tokenFor := func(aud string) corev1.VolumeProjection {
 		return corev1.VolumeProjection{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: aud, Path: "token"}}
 	}
@@ -283,10 +289,16 @@ func TestBusCredentialRoutes(t *testing.T) {
 	}{
 		{"bus audience under another name", corev1.Volume{Name: "innocuous-cache", VolumeSource: projected(tokenFor("a2a-bus"))},
 			[]BusCredentialRoute{{Kind: BusCredentialRouteAudience, Source: 0}}},
+		{"watcher audience under another name", corev1.Volume{Name: "innocuous-watcher", VolumeSource: projected(tokenFor("kubeagents-credential-proxy-watcher"))},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteWatcherAudience, Source: 0}}},
 		{"bus audience behind a configMap source", corev1.Volume{Name: "bundle", VolumeSource: projected(
 			corev1.VolumeProjection{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "ca"}}},
 			tokenFor("a2a-bus"))},
 			[]BusCredentialRoute{{Kind: BusCredentialRouteAudience, Source: 1}}},
+		{"watcher audience behind a configMap source", corev1.Volume{Name: "bundle", VolumeSource: projected(
+			corev1.VolumeProjection{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "ca"}}},
+			tokenFor("kubeagents-credential-proxy-watcher"))},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteWatcherAudience, Source: 1}}},
 		{"another audience", corev1.Volume{Name: "vault-token", VolumeSource: projected(tokenFor("vault"))}, nil},
 		{"the API server's default audience", corev1.Volume{Name: "sa-token", VolumeSource: projected(tokenFor(""))}, nil},
 		{"the creds Secret as a secret volume", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{
