@@ -1794,7 +1794,9 @@ func submissionWithCorrelation(m *nats.Msg) (ref TaskRef, a submissionAuthority,
 	if json.Unmarshal(env.Payload, &msg) != nil {
 		return
 	}
-	return TaskRef{Addressee: parts[submissionAddressee], TaskID: env.TaskID}, a, strings.TrimSpace(partsText(msg.Parts)), env.CorrelationID, true
+	// A new task on .in is a session's or the platform agent's: a profile
+	// takes its new tasks on a2a.submit.
+	return TaskRef{Addressee: parts[submissionAddressee], TaskID: env.TaskID, Kind: TaskKindSession}, a, strings.TrimSpace(partsText(msg.Parts)), env.CorrelationID, true
 }
 
 // ownSubmission reports whether m carries this turn: a message in this
@@ -1820,7 +1822,7 @@ func (w *turnWatch) noticedTask(m *nats.Msg) (TaskRef, bool) {
 	w.mu.Lock()
 	w.known[f.TaskID] = true
 	w.mu.Unlock()
-	return TaskRef{Addressee: f.Addressee, TaskID: f.TaskID}, true
+	return TaskRef{Addressee: f.Addressee, TaskID: f.TaskID, Kind: TaskKindProfile}, true
 }
 
 func (w *turnWatch) ownSubmission(m *nats.Msg) (TaskRef, bool) {

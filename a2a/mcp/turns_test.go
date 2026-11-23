@@ -3039,7 +3039,7 @@ func TestAPlainTurnTakesNoTaskFromANotice(t *testing.T) {
 		t.Error("an unaddressed turn took the task a notice named")
 	}
 	w.addressed = true
-	if ref, ok := w.noticedTask(m); !ok || ref != (TaskRef{Addressee: "cluster", TaskID: "task-x"}) {
+	if ref, ok := w.noticedTask(m); !ok || ref != (TaskRef{Addressee: "cluster", TaskID: "task-x", Kind: TaskKindProfile}) {
 		t.Errorf("an addressed turn's noticed task = %v, %v; want cluster/task-x", ref, ok)
 	}
 	for name, f := range map[string]ConsoleOutFrame{

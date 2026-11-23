@@ -228,13 +228,16 @@ func TaskReplaySubjects(addressee, taskID string) []string {
 
 // TasksGet replays the task's events and supervisor subjects from sequence 1
 // on an ephemeral ordered consumer and folds the result — the durability
-// payoff: no live executor required. The two subjects share the TASKS stream
+// payoff: no live executor required. ProfileTask among opts reads it as a
+// profile task: on a client with a cutoff (WithProfileSupervisorCutoff), a
+// five-token supervisor message stored after it is left out of the fold
+// (AcceptsSupervisorEvent), and a task with nothing else is TaskNotFound. The two subjects share the TASKS stream
 // sequence, so the ordered consumer supplies their total order and the fold
 // needs no merge: a supervisor terminal that raced an executor's own lands
 // wherever the stream put it, and whichever came second is the post-final
 // drop.
-func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task, error) {
-	task, _, _, err := c.tasksGet(ctx, addressee, taskID)
+func (c *Client) TasksGet(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, error) {
+	task, _, _, err := c.tasksGet(ctx, addressee, taskID, opts)
 	return task, err
 }
 
@@ -244,8 +247,8 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 // whether the failure came before the consumer existed (a creation refusal,
 // such as the stream's consumer cap, which clears) or after (a consumer is
 // now live for the inactive threshold, and a retry would open another).
-func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string) (*Task, bool, error) {
-	task, _, opened, err := c.tasksGet(ctx, addressee, taskID)
+func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, bool, error) {
+	task, _, opened, err := c.tasksGet(ctx, addressee, taskID, opts)
 	return task, opened, err
 }
 
@@ -255,8 +258,8 @@ func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string) (
 // rides beside the Task rather than in it, because a Task is the fold of
 // bare envelopes and the live fold and the replay must stay equal (assertion
 // 11); which subject carried the terminal is a fact about the replay.
-func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID string) (*Task, string, error) {
-	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID)
+func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, string, error) {
+	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID, opts)
 	return task, terminal.subject, err
 }
 
@@ -266,8 +269,8 @@ func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID strin
 // is the publisher's word and can say anything; a caller timing a window
 // from the terminal needs a clock the publisher does not control. Beside
 // the Task for the same reason as the subject (assertion 11).
-func (c *Client) TasksGetTerminal(ctx context.Context, addressee, taskID string) (*Task, string, time.Time, error) {
-	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID)
+func (c *Client) TasksGetTerminal(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, string, time.Time, error) {
+	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID, opts)
 	return task, terminal.subject, terminal.storedAt, err
 }
 
@@ -282,16 +285,25 @@ type replayTerminal struct {
 // tasksGet's third result is replay's found: true from the moment the
 // ordered consumer was created, which is also when a later error leaves a
 // consumer live for the inactive threshold.
-func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, replayTerminal, bool, error) {
+func (c *Client) tasksGet(ctx context.Context, addressee, taskID string, opts []ReadOption) (*Task, replayTerminal, bool, error) {
 	events, eventMeta, found, err := c.replay(ctx, TaskReplaySubjects(addressee, taskID), taskID)
 	if err != nil {
 		return nil, replayTerminal{}, found, err
 	}
-	if !found {
+	// The cutoff, before the fold: a refused message is not the task's,
+	// so it neither ends the fold nor counts as its post-final drop, and a
+	// task with nothing else on its subjects has no events.
+	empty := !found
+	if found {
+		var dropped bool
+		events, eventMeta, dropped = c.screenSupervisorEvents(taskID, events, eventMeta, readOptionsOf(opts).profileTask)
+		empty = dropped && len(events) == 0
+	}
+	if empty {
 		// No events in the retention window: the A2A answer is
 		// TaskNotFound, not an empty Task indistinguishable from a broken
-		// one.
-		return nil, replayTerminal{}, false, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
+		// one. found still says whether the replay opened its consumer.
+		return nil, replayTerminal{}, found, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
 	}
 	task, err := FoldTask(taskID, events)
 	if err != nil {
@@ -319,6 +331,31 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			"task", taskID, "events", len(events), "opensAt", opensAt)
 	}
 	return task, terminal, true, nil
+}
+
+// screenSupervisorEvents drops from a replay what AcceptSupervisorEvent
+// refuses, in step with its metadata, and reports whether it dropped any.
+// The common case refuses nothing and returns its arguments as they are.
+func (c *Client) screenSupervisorEvents(taskID string, events []*Envelope, meta []replayTerminal, profileTask bool) ([]*Envelope, []replayTerminal, bool) {
+	keep := -1
+	for i := range events {
+		if c.AcceptSupervisorEvent(meta[i].subject, meta[i].storedAt, profileTask) {
+			if keep >= 0 {
+				events[keep], meta[keep] = events[i], meta[i]
+				keep++
+			}
+			continue
+		}
+		c.log.Warn("a2a five-token supervisor message on a profile task, stored after the cutoff, left out of the fold",
+			"task", taskID, "subject", meta[i].subject, "storedAt", meta[i].storedAt, "cutoff", c.opts.profileSupervisorCutoff)
+		if keep < 0 {
+			keep = i
+		}
+	}
+	if keep < 0 {
+		return events, meta, false
+	}
+	return events[:keep], meta[:keep], true
 }
 
 // TaskInReplay replays a task's `…in` subject in stream order — the

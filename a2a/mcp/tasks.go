@@ -58,7 +58,31 @@ var errReadersBusy = fmt.Errorf("this server already holds its %d bus readers; t
 type TaskRef struct {
 	Addressee string
 	TaskID    string
+	// Kind is what this server learned of the task's supervisor, which
+	// decides how a read takes a five-token supervisor terminal once the
+	// install has a cutoff (gke-labs/kube-agents#5301). It is how the task
+	// was learned, never the addressee's name, which a session and a
+	// profile can share.
+	Kind TaskKind
 }
+
+// TaskKind says whether a task is a profile task, whose supervisor is the
+// dispatcher, or a session or platform task, whose supervisor is the gateway.
+type TaskKind uint8
+
+const (
+	// TaskKindUnknown is a reference a caller typed, or one read off the
+	// stream: an addressee with a live agent card on DIRECTORY is read as a
+	// profile (refIsProfile).
+	TaskKindUnknown TaskKind = iota
+	// TaskKindProfile is a task the gateway's status line named, which it
+	// does only for a profile task (noticedTask).
+	TaskKindProfile
+	// TaskKindSession is a task whose submission this server saw on .in,
+	// where only a session or the platform agent takes a new task
+	// (submission).
+	TaskKindSession
+)
 
 func (r TaskRef) String() string { return r.Addressee + taskRefSep + r.TaskID }
 
@@ -126,6 +150,11 @@ func (b *NATSBus) ReadTask(ctx context.Context, ref TaskRef) (*lib.Task, error) 
 			return nil, err
 		}
 	}
+	if len(w.events) == 0 && w.dropped > 0 {
+		// Nothing on the task but what the cutoff refused: no events, as
+		// lib's replay answers it.
+		return nil, ErrTaskNotFound
+	}
 	return w.fold()
 }
 
@@ -183,6 +212,10 @@ type taskWatch struct {
 	seen    int
 	pending uint64
 	release func(created bool)
+	// accept is the cutoff screen (supervisorScreen); dropped counts what it
+	// refused.
+	accept  func(subject string, storedAt time.Time) bool
+	dropped int
 }
 
 func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error) {
@@ -214,7 +247,71 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 		release(true)
 		return nil, err
 	}
-	return &taskWatch{ref: ref, r: r, pending: pending, release: release}, nil
+	return &taskWatch{ref: ref, r: r, pending: pending, release: release, accept: b.supervisorScreen(ctx, ref)}, nil
+}
+
+// supervisorScreen is the cutoff filter for one task's read
+// (lib.AcceptsSupervisorEvent): on an unlatched install, every message passes.
+// With a cutoff, only a five-token supervisor message stored after it is in
+// question, and only then is the task's kind settled (refIsProfile), so an
+// ordinary read costs no DIRECTORY read. Safe for concurrent use.
+func (b *NATSBus) supervisorScreen(ctx context.Context, ref TaskRef) func(subject string, storedAt time.Time) bool {
+	cutoff := b.client.ProfileSupervisorCutoff()
+	if cutoff.IsZero() {
+		return func(string, time.Time) bool { return true }
+	}
+	var (
+		once    sync.Once
+		profile bool
+	)
+	return func(subject string, storedAt time.Time) bool {
+		if lib.AcceptsSupervisorEvent(cutoff, subject, storedAt, true) {
+			return true
+		}
+		once.Do(func() { profile = b.refIsProfile(ctx, ref) })
+		return b.client.AcceptSupervisorEvent(subject, storedAt, profile)
+	}
+}
+
+// refIsProfile settles whether ref is a profile task: by how it was learned
+// (TaskRef.Kind), and for a reference that says nothing, by the directory: an
+// addressee with a live agent card is a profile. That rule reads an old
+// session task whose name a profile has since taken as a profile task, so a
+// gateway terminal on it stored after the cutoff is not read. A directory
+// that can't be read leaves the addressee a profile too: a task wrongly shown
+// unfinished is seen and corrected by a later read, while one wrongly shown
+// final on a terminal its supervisor never wrote is the read the cutoff
+// exists to refuse.
+func (b *NATSBus) refIsProfile(ctx context.Context, ref TaskRef) bool {
+	switch ref.Kind {
+	case TaskKindProfile:
+		return true
+	case TaskKindSession:
+		return false
+	}
+	return b.directoryProfiles(ctx)(ref.Addressee)
+}
+
+// directoryProfiles reads DIRECTORY once, on the first call of what it
+// returns, and answers whether an addressee has a live agent card there. A
+// read that failed counts every addressee it did not return as a profile
+// (refIsProfile). Not safe for concurrent use.
+func (b *NATSBus) directoryProfiles(ctx context.Context) func(addressee string) bool {
+	var (
+		read  bool
+		cards map[string]AgentCard
+		err   error
+	)
+	return func(addressee string) bool {
+		if !read {
+			read = true
+			if cards, err = b.agentCards(ctx); err != nil {
+				b.logger().Warn("agent directory read failed; reading tasks as profile tasks for the supervisor cutoff", "err", err)
+			}
+		}
+		_, ok := cards[addressee]
+		return ok || err != nil
+	}
 }
 
 // errTooManyEvents is a task with more than maxTaskEvents events.
@@ -260,10 +357,19 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 		if w.seen > maxTaskEvents {
 			return fmt.Errorf("task %s has more than %d events: %w", w.ref, maxTaskEvents, errTooManyEvents)
 		}
-		if env := agreedEnvelope(msg.Subject(), msg.Data()); env != nil {
-			w.events = append(w.events, env)
+		md, mdErr := msg.Metadata()
+		var storedAt time.Time
+		if mdErr == nil {
+			storedAt = md.Timestamp
 		}
-		if md, err := msg.Metadata(); err == nil {
+		if env := agreedEnvelope(msg.Subject(), msg.Data()); env != nil {
+			if w.accept == nil || w.accept(msg.Subject(), storedAt) {
+				w.events = append(w.events, env)
+			} else {
+				w.dropped++
+			}
+		}
+		if mdErr == nil {
 			w.pending = md.NumPending
 		}
 		if w.pending == 0 {

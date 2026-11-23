@@ -258,6 +258,9 @@ type Client struct {
 	// disagreements count here too: they are the one protocol error this
 	// client sees and does not refuse.
 	protocolViolations atomic.Int64
+	// profileSupervisorDrops counts the five-token supervisor messages reads
+	// refused as a profile task's terminal (AcceptSupervisorEvent).
+	profileSupervisorDrops atomic.Int64
 }
 
 // ProtocolViolations reports how many protocol errors this client has
@@ -277,6 +280,9 @@ type clientOptions struct {
 	// (WithFirstDialNATSOptions).
 	firstDialOpts []nats.Option
 	agreement     AgreementPolicy
+	// profileSupervisorCutoff is WithProfileSupervisorCutoff's, zero when
+	// unlatched.
+	profileSupervisorCutoff time.Time
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come

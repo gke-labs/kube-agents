@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -351,7 +350,7 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		if ref.Role == "" && strings.TrimSpace(ref.Request) != "" {
 			said = ref.Request
 		}
-		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
+		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID, g.profileRead(rec, ref.ID, ref.Addressee))
 		if err != nil && !isTaskNotFound(err) {
 			// The stream didn't answer (a transport error, a consumer
 			// refusal, the turn's budget running out): leave the turn out
@@ -514,23 +513,17 @@ func noFirstEventPastGrace(active *ActiveTask, streamEmpty bool, grace time.Dura
 // it opens a consumer (TasksGet answers TaskNotFound exactly when this
 // answers true), made with direct gets and no consumer, so a caller that
 // only needs to know whether the task has a first event does not spend one
-// of the TASKS stream's consumer slots on a five-second ephemeral. An error
-// is the read failing, not the subjects being empty.
-func (g *Gateway) taskStreamEmpty(ctx context.Context, addressee, taskID string) (bool, error) {
-	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
+// of the TASKS stream's consumer slots on a five-second ephemeral. The task is
+// read as the replay reads it (taskIsProfile), so a five-token supervisor
+// message the cutoff refuses on a profile task is not a first event here
+// either. An error is the read failing, not the subjects being empty.
+func (g *Gateway) taskStreamEmpty(ctx context.Context, rec *SessionRecord, taskID string) (bool, error) {
+	addressee := rec.AddresseeFor(taskID)
+	heads, err := g.client.TaskReplayHeads(ctx, nil, addressee, taskID, g.profileRead(rec, taskID, addressee))
 	if err != nil {
-		return false, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
+		return false, err
 	}
-	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
-		_, err := stream.GetLastMsgForSubject(ctx, subject)
-		if err == nil {
-			return false, nil
-		}
-		if !errors.Is(err, jetstream.ErrMsgNotFound) {
-			return false, fmt.Errorf("newest message on %s: %w", subject, err)
-		}
-	}
-	return true, nil
+	return len(heads) == 0, nil
 }
 
 // noticeCeilingGraces bounds the no-first-event notice from above, in
@@ -592,7 +585,7 @@ func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) boo
 	if g.noticeStreamReadHook != nil {
 		g.noticeStreamReadHook(active.TaskID)
 	}
-	empty, err := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	empty, err := g.taskStreamEmpty(ctx, rec, active.TaskID)
 	return err == nil && noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, now)
 }
 
