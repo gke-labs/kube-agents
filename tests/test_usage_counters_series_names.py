@@ -235,6 +235,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
 
+    def test_the_watchers_watch_set_ready_gauge_is_the_one_the_poller_reads(self):
+        self.assertEqual(_go_const(_WATCHER_METRICS_GO, "watchSetReadyMetric"), _go_const(_SCRAPE_GO, "watchSetReadySeries"))
+
     def test_the_cluster_gauges_labels_are_the_ones_the_poller_reads_into_the_scope_condition(self):
         # The watcher's GaugeVec declares its label names in order; the poller reads
         # three of them by name for the ScopeUndeclared condition's cluster triples.
