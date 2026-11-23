@@ -649,14 +649,17 @@ deploy key: one repository, read-only, the narrowest credential Config Sync acce
 token or a GitHub App would reach every repository its owner or installation does.
 
 `scripts/provision_ci_pool_post_merge_sync.sh <project-id>` makes the repository side: it seeds
-`order-ledger`'s declaration in that directory when the file is absent, adds the deploy key without
+`order-ledger`'s declaration in that directory, and its budget `order-ledger-pdb.yaml` beside it (the
+fixture's steady state is the fix merged and applied, so no audit finds the workload unbudgeted),
+each when the file is absent, adds the deploy key without
 write access, keeps its private half and GitHub's SSH host keys as the current version of the
 Secret Manager secret `kube-agents-eval-gitops-deploy-key` in the project, and grants
 `roles/secretmanager.secretAccessor` on that secret alone to the fleet reconciler, which reads it
 on every apply. It prints no key. `scripts/provision_ci_pool_project.sh` runs it in step 1.4,
 before the fleet apply needs the secret. For a registered project run it by hand, as the repair;
 it is idempotent and replaces the key only when the stored one no longer matches the repository's
-read-only key or GitHub's host keys changed. Whoever runs it holds `roles/secretmanager.admin` on
+read-only key or GitHub's host keys changed. It is also the repair for a budget a stopped
+`post-merge-verified-fixed` run left off the default branch. Whoever runs it holds `roles/secretmanager.admin` on
 the project and admin on the repository. To rotate the key, delete it from the repository's deploy
 keys and run the script again.
 

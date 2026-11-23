@@ -4,9 +4,11 @@ Each fake logs its calls as JSON lines and answers from the state the case
 sets, so these assertions are against the script that ships.
 """
 
+import importlib.util
 import json
 import os
 import pathlib
+import re
 import stat
 import subprocess
 import tempfile
@@ -25,6 +27,7 @@ _REPO = "gke-agentic/kube-agents-evals-99-infra"
 _SECRET = "kube-agents-eval-gitops-deploy-key"
 _TITLE = "seeded-fleet config-sync (read-only)"
 _DECLARATION = "clusters/seeded-a/seeded-post-merge/order-ledger.yaml"
+_BUDGET = "clusters/seeded-a/seeded-post-merge/order-ledger-pdb.yaml"
 _RECONCILER = "serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 _HOST_KEYS = ["ssh-ed25519 HOSTKEY-A", "ecdsa-sha2-nistp256 HOSTKEY-B"]
 _KNOWN_HOSTS = "\n".join(sorted(f"github.com {k}" for k in _HOST_KEYS)) + "\n"
@@ -46,7 +49,7 @@ if argv[:2] == ["api", "meta"]:
 if argv[:3] == ["api", "--paginate", "repos/%s/keys" % os.environ["FAKE_REPO"]]:
     rows = json.loads(os.environ["FAKE_DEPLOY_KEYS"])
     done("".join("%s\t%s\t%s\n" % (r["id"], r["key"], str(r["read_only"]).lower()) for r in rows))
-if argv[:1] == ["api"] and argv[1].endswith("/contents/" + os.environ["FAKE_DECLARATION"]):
+if argv[:1] == ["api"] and "/contents/clusters/" in argv[1]:
     if os.environ.get("FAKE_DECLARATION_ABSENT") == "1":
         done(code=1, err="gh: Not Found (HTTP 404)\n")
     done("{}")
@@ -140,8 +143,8 @@ class ProvisionPostMergeSyncTest(unittest.TestCase):
     def test_a_fresh_project_gets_the_declaration_a_read_only_key_the_secret_and_the_grant(self):
         proc, calls = self._run(declaration_absent=True)
         self.assertEqual(0, proc.returncode, proc.stderr)
-        put = self._calls(calls, "gh", "api", "-X", "PUT", f"repos/{_REPO}/contents/{_DECLARATION}")
-        self.assertEqual(1, len(put))
+        for path in (_DECLARATION, _BUDGET):
+            self.assertEqual(1, len(self._calls(calls, "gh", "api", "-X", "PUT", f"repos/{_REPO}/contents/{path}")), path)
         self.assertEqual(1, len(self._calls(calls, "gcloud", "secrets", "create", _SECRET)))
         added = self._calls(calls, "gh", "repo", "deploy-key", "add")
         self.assertEqual(1, len(added))
@@ -194,6 +197,16 @@ class ProvisionPostMergeSyncTest(unittest.TestCase):
         if "post_merge" not in stack:
             self.skipTest("bench/tf/fleet does not read the deploy key yet")
         self.assertIn(f'"{_SECRET}"', stack)
+
+    def test_the_seeded_budget_is_the_one_the_case_stack_restores(self):
+        budget = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "post-merge-sync-budget" / "budget.py"
+        if not budget.is_file():
+            self.skipTest("the case's setup stack is not on this branch yet")
+        content = re.search(r"^readonly BUDGET_CONTENT='(.*?)'$", _SCRIPT.read_text(), re.MULTILINE | re.DOTALL).group(1)
+        spec = importlib.util.spec_from_file_location("budget", budget)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(content + "\n", module.BUDGET_CONTENT)
 
     def test_provisioning_runs_it_before_the_fleet_apply(self):
         script = _PROVISION_SCRIPT.read_text()

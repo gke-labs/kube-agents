@@ -11,13 +11,19 @@
 #      configmanagement.gke.io/managed: disabled, so Config Sync leaves the
 #      Deployment to the fleet stack and applies only what else the directory
 #      holds;
-#   2. a read-only deploy key on that one repository, its private half and
+#   2. that budget, at the path the audit's `remediate` writes it: the fixture's
+#      steady state is the fix merged and applied, so no audit of the fleet
+#      finds order-ledger unbudgeted. post-merge-verified-fixed removes it for
+#      its own run and puts it back afterwards
+#      (bench/tf/prebuilt/post-merge-sync-budget);
+#   3. a read-only deploy key on that one repository, its private half and
 #      GitHub's SSH host keys kept as the current version of a Secret Manager
 #      secret in the project, which the fleet stack reads into the namespace's
 #      git-creds Secret;
-#   3. secretAccessor on that secret alone for the fleet reconciler.
+#   4. secretAccessor on that secret alone for the fleet reconciler.
 #
-# Re-runs converge: a file already there is left as it is, and a new key is
+# Re-runs converge: a file already there is left as it is (so a re-run is also
+# the repair for a budget a stopped run left off the branch), and a new key is
 # made only when the stored one is missing, is not the key GitHub holds under
 # KEY_TITLE, is not read-only, or the stored host keys differ from GitHub's.
 # The new key is added before the old one is deleted, so a sync running on the
@@ -93,6 +99,22 @@ spec:
               memory: 16Mi
             limits:
               memory: 32Mi'
+# The budget the audit writes for order-ledger (fix_recipes/no-pdb/fix.py's
+# shape, without the run's finding comment), plus the app label the fixture's
+# state assertion selects it by (bench/tf/fleet/fixtures.json). bench/tf/prebuilt/
+# post-merge-sync-budget/budget.py restores exactly this; a test pins the two.
+readonly BUDGET_PATH="clusters/seeded-a/seeded-post-merge/order-ledger-pdb.yaml"
+readonly BUDGET_MESSAGE="Merge order-ledger's PodDisruptionBudget, the post-merge fixture's steady state"
+readonly BUDGET_CONTENT='apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-ledger-pdb
+  namespace: seeded-post-merge
+  labels:
+    app: order-ledger
+spec:
+  maxUnavailable: 1
+  selector: {"matchLabels": {"app": "order-ledger"}}'
 
 die() {
   echo "ERROR: [${PROJECT_ID:-?}] $*" >&2
@@ -111,18 +133,24 @@ readonly WORK_DIR
 trap 'rm -rf "${WORK_DIR}"' EXIT
 readonly ERR_FILE="${WORK_DIR}/err"
 
-# ─── Declaration ───────────────────────────────────────────────────────────────
-if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${DECLARATION_PATH}" 2>&1 >/dev/null)"; then
-  echo "[${PROJECT_ID}] ${GITOPS_REPO} already carries ${DECLARATION_PATH}"
-elif grep -q "${GH_NOT_FOUND}" <<<"${read_error}"; then
-  echo "[${PROJECT_ID}] Seeding ${GITOPS_REPO} with ${DECLARATION_PATH}"
-  gh api -X PUT "repos/${GITOPS_REPO}/contents/${DECLARATION_PATH}" \
-    -f message="${DECLARATION_MESSAGE}" \
-    -f content="$(printf '%s\n' "${DECLARATION_CONTENT}" | base64 | tr -d '\n')" >/dev/null ||
-    die "could not seed ${DECLARATION_PATH} in ${GITOPS_REPO}"
-else
-  die "could not read ${DECLARATION_PATH} in ${GITOPS_REPO} (${read_error}); not seeding it blind"
-fi
+# ─── Declaration and budget ────────────────────────────────────────────────────
+# Only a 404 means absent: any other failure stops rather than writing blind.
+seed_file() {
+  local path="$1" message="$2" content="$3" read_error
+  if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
+    echo "[${PROJECT_ID}] ${GITOPS_REPO} already carries ${path}"
+  elif grep -q "${GH_NOT_FOUND}" <<<"${read_error}"; then
+    echo "[${PROJECT_ID}] Seeding ${GITOPS_REPO} with ${path}"
+    gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
+      -f message="${message}" \
+      -f content="$(printf '%s\n' "${content}" | base64 | tr -d '\n')" >/dev/null ||
+      die "could not seed ${path} in ${GITOPS_REPO}"
+  else
+    die "could not read ${path} in ${GITOPS_REPO} (${read_error}); not seeding it blind"
+  fi
+}
+seed_file "${DECLARATION_PATH}" "${DECLARATION_MESSAGE}" "${DECLARATION_CONTENT}"
+seed_file "${BUDGET_PATH}" "${BUDGET_MESSAGE}" "${BUDGET_CONTENT}"
 
 # ─── Current state ─────────────────────────────────────────────────────────────
 KNOWN_HOSTS="$(gh api meta --jq ".ssh_keys[] | \"${KNOWN_HOSTS_HOST} \" + ." | sort)" ||
