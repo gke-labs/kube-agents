@@ -49,6 +49,8 @@ permissions: {}
 # one shared group those arrivals kept cancelling the pending scheduled sweep,
 # the run the header calls the guarantee. Keyed by event, only a later
 # scheduled sweep can displace a scheduled sweep, and it does the same work.
+# A skipped label event can still displace a pending `lgtm` or `approved` run
+# in the label group; the schedule covers that, as the job comment says.
 #
 # Runs of different triggers can overlap. Each run reads a pull request's
 # threads immediately before it writes to that pull request, and every write

@@ -29,12 +29,6 @@ _CONCURRENCY = "concurrency"
 _CONCURRENCY_GROUP = "${{ github.workflow }}-${{ github.event_name }}"
 _SCHEDULE = "schedule"
 _LABEL_EVENT = "pull_request_target"
-_EVENT_NAME_EXPRESSION = "${{ github.event_name }}"
-
-
-def _group_for(group: str, event: str) -> str:
-    """The group name GitHub derives for a run of `event`, the workflow name left as written."""
-    return group.replace(_EVENT_NAME_EXPRESSION, event)
 
 
 class HoldUnresolvedThreadsConcurrencyTest(unittest.TestCase):
@@ -46,16 +40,14 @@ class HoldUnresolvedThreadsConcurrencyTest(unittest.TestCase):
         self.assertLessEqual({_SCHEDULE, _LABEL_EVENT}, _triggers(self.workflow))
 
     def test_a_label_event_cannot_displace_the_pending_scheduled_sweep(self) -> None:
-        group = self.workflow[_CONCURRENCY]["group"]
         self.assertEqual(
             _CONCURRENCY_GROUP,
-            group,
+            self.workflow[_CONCURRENCY]["group"],
             f"{_WORKFLOW.name}: the concurrency group is not keyed on the event "
             "name alone, so either label events share the scheduled sweep's "
             "group and cancel it while it is pending, or the key lets more "
             "runs overlap than the workflow's comment argues is safe",
         )
-        self.assertNotEqual(_group_for(group, _SCHEDULE), _group_for(group, _LABEL_EVENT))
 
     def test_no_job_overrides_the_group(self) -> None:
         for name, job in _jobs(self.workflow).items():
