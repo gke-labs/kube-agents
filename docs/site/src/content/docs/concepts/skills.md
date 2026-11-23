@@ -100,7 +100,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
 3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
 
-   The image build passes each `bash`, `sh`, `shell` and `zsh` block in the skill's `SKILL.md`, whole, to the Tirith command scanner the agent itself runs under. It fails on any block holding a command the scanner would refuse: call a program by its literal path, never through a shell variable. A block too long for the scanner to finish analysing fails the same way, so split a long block. It also fails on a shell block whose Markdown does not parse as one, such as a fence left unclosed inside a list item, since it cannot read that block. It reads every other Markdown file in the skill directory the same way, except under `scripts/`.
+   Call a program by its literal name or path, never through a shell variable.
 
    Keep each of those files, `SKILL.md` included, at most 40,000 characters: the agent opens them with `skill_view`, which returns a result over its own cap as a short preview and a file path instead. The 40,000 limit sits below that cap so each file comes back whole, and `make skills-check` fails a longer one. Put a long procedure's detail in `references/`, one file per step, and say in `SKILL.md` when to open each.
 
@@ -132,8 +132,6 @@ Reproducible and immutable: the skill ships inside the container.
      -t my-registry/kube-agents/platform-agent:v1.1.0 .
    docker push my-registry/kube-agents/platform-agent:v1.1.0
    ```
-
-   The build fails if a shell command in any Markdown file of the copied skill, outside `scripts/`, is one the agent's command scanner would refuse, as in step 3 of [Adding a new skill](#adding-a-new-skill).
 
 3. Point the `PlatformAgent` CR at the new image and apply it:
 

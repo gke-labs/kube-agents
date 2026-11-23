@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The interactive channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled. An experimental **Microsoft Teams** Bot Framework outbound relay (`spec.integration.teams`, [below](#microsoft-teams)) also ships for outbound activity delivery and in-pod event queue scaffolding, but does not yet include external webhook ingress or proactive alert delivery.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The interactive channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled. An experimental **Microsoft Teams** Bot Framework outbound relay (`spec.integration.teams`, [below](#microsoft-teams)) also ships for outbound activity delivery and in-pod event queue scaffolding, but does not yet include external webhook ingress. Proactive alerts and reports reach a Teams home only with the gateway's Teams backend armed.
 
 Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand). It files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails.
 
@@ -297,7 +297,7 @@ Through the gateway, a message sent while the Planning Agent is still answering 
 
 ## Conversations through the A2A gateway
 
-The A2A gateway takes chat in place of the Planning Agent's chat platforms. It holds Google Chat and Slack, either or both, in one process. On a backend the gateway holds, nothing above about the Planning Agent's Slack or Google Chat platform applies. The gateway holds no model. It decides which messages are turns, keeps one status line per task, and answers a few fixed commands itself.
+The A2A gateway takes chat in place of the Planning Agent's chat platforms. It holds Google Chat, Slack and, under the operator's `A2A_TEAMS_BACKEND` switch, Microsoft Teams, in any combination, in one process. On a backend the gateway holds, nothing above about the Planning Agent's Slack or Google Chat platform applies. The gateway holds no model. It decides which messages are turns, keeps one status line per task, and answers a few fixed commands itself.
 
 Every other message goes as a task, by default to the `platform` route. The Hermes bridge in the agent's pod runs it as a Planning Agent turn in that conversation's own Hermes session, and the Planning Agent answers it or files board cards. How the agent then answers the question is in [How a chat question is answered](#how-a-chat-question-is-answered); this section covers what you see in the conversation.
 
@@ -544,9 +544,9 @@ A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons 
 
 ### People seen
 
-The gateway keeps a record of the people who write to it, so an install can count them. Each person who writes on Google Chat, Slack or Discord, once the gateway has verified them, has one hashed key and the time of their last turn, within an hour. A person is the identity the gateway attributes the turn to, so a principal map that folds two member IDs into one identity makes them one person. The key is derived for this record alone and matches no other pseudonym the install keeps.
+The gateway keeps a record of the people who write to it, so an install can count them. Each person who writes on Google Chat, Slack, Discord or, with the gateway's Teams backend armed, Microsoft Teams, once the gateway has verified them, has one hashed key and the time of their last turn, within an hour. A person is the identity the gateway attributes the turn to, so a principal map that folds two member IDs into one identity makes them one person. The key is derived for this record alone and matches no other pseudonym the install keeps.
 
-The doors and the A2A console are not people and get no key. A platform the install still serves through Hermes, such as Microsoft Teams, is outside the record.
+The doors and the A2A console are not people and get no key. A platform the install still serves through Hermes, Microsoft Teams without that switch, is outside the record.
 
 The record is the `people` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which are the hashes alone. Whoever holds the gateway's attribution salt and a directory of addresses can re-identify a Google Chat sender's key by hashing the directory, as they can the other pseudonyms the gateway stamps on each turn today. The bucket drops each key 30 days after the person's last turn. Nothing is sent anywhere else.
 
@@ -605,11 +605,15 @@ The session pods that [Security and IAM](/kube-agents/reference/security-and-iam
 
 ## Microsoft Teams
 
-An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) connects the gateway (`agents/platform/scripts/teams_relay_patch.py` and `agents/chat/plugins/platforms/teams/`) to `/v1/chat/teams/*` on the credential broker (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`). The broker holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, mints and caches Microsoft Entra OAuth 2.0 `client_credentials` tokens, and enforces optional single-tenant isolation (`TEAMS_TENANT_ID`). Outbound calls on `/v1/chat/teams/api` are restricted to `POST v3/conversations/<id>/activities` (excluding `/activities/history`) on official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`, with query strings, fragments, and HTTP redirects refused).
+An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) connects the gateway (`agents/platform/scripts/teams_relay_patch.py` and `agents/chat/plugins/platforms/teams/`) to `/v1/chat/teams/*` on the credential broker (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`). The broker holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, mints and caches Microsoft Entra OAuth 2.0 `client_credentials` tokens, and enforces optional single-tenant isolation (`TEAMS_TENANT_ID`). Outbound calls on `/v1/chat/teams/api` are restricted to `POST v3/conversations/<id>/activities`, plus `PUT` on one `activities/<id>` for the gateway's status line (excluding `/activities/history`), on official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`, with query strings, fragments, and HTTP redirects refused).
 
-The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched. External inbound Bot Framework webhook ingress is not yet shipped in the operator: `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods.
+The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the Hermes gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched.
 
-Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`). See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
+External inbound Bot Framework webhook ingress is not yet shipped in the operator. `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods, and from the A2A gateway pod when a relay backend is armed on it. With the gateway backend armed and `homeChannel` set, proactive alerts and cron reports reach that Teams conversation through the gateway's `chat.notify` route. See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
+
+Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`).
+
+When the operator runs with `A2A_TEAMS_BACKEND=true`, the A2A chat gateway consumes that queue instead of the Hermes adapter (`a2a/gateway/teams.go`, the `A2A_TEAMS_*` env), the broker admits the gateway pod as a caller, and the Hermes Teams platform is not rendered.
 
 What this means for an evaluator: enabling `spec.integration.teams` gives you the outbound half only. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams does not reach the agent: Microsoft delivers it to the bot's messaging endpoint, and the install provides none. The broker's event queue that the gateway reads admits only the gateway pod, so nothing outside the install can feed a message in either.
 
@@ -625,10 +629,11 @@ When no card can be built, the report is posted as text, reshaped with a headlin
 
 - **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL` or learned from the first mention.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
+- **Microsoft Teams**, with the gateway's Teams backend armed: to the conversation `spec.integration.teams.homeChannel` names.
 
 An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. The agent picks one platform for the alert among the platforms that have a home channel: one whose home channel is configured before one whose home the gateway learned, and Google Chat before Slack when both are alike. With none, the gateway keeps it for the digest on the first platform.
 
-A scheduled report has no such constraint. The default jobs' `deliver: chat` relays it to every enabled platform among Google Chat and Slack; a job whose `deliver` names `teams` posts to the Teams home channel instead. [The relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
+A scheduled report has no such constraint. The default jobs' `deliver: chat` relays it to every enabled platform among Google Chat and Slack, and to Microsoft Teams while the gateway's Teams backend is armed. On the Hermes path a job whose `deliver` names `teams` posts to the Teams home channel instead. [The relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
 
 A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
@@ -830,7 +835,7 @@ This reaches the Platform Agent directly, bypassing the front door: a request ty
 
 The [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine, is one more. Its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be. [User interfaces](/kube-agents/reference/user-interfaces/) compares the browser pages.
 
-Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither reaches a person as it happens. The audit reports stay in the report store on the data volume, the triage shows on the board, and other scheduled reports are not kept.
+Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms (Google Chat, Slack, and Microsoft Teams while the gateway's Teams backend is armed), so neither reaches a person as it happens. The audit reports stay in the report store on the data volume, the triage shows on the board, and other scheduled reports are not kept.
 
 What the alert path did is still readable. Ask the agent through any of these doors `what alerts fired overnight?` and it answers from its event ledger: the alerts it posted, and the events it held back from chat and why.
 

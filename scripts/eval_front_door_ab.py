@@ -32,6 +32,11 @@ This reads both and puts every case in one class:
 - ``a-only`` / ``b-only``: the case ran on one side.
 
 It prints a Markdown table and exits 1 when any case regressed, 0 otherwise.
+When both runs carry their grading log (``eval-grading.log``), it also compares
+each case's median answer words, infrastructure repetitions left out, and
+flags a case whose answer runs over A's by more than ``LENGTH_MARGIN``; ``--length-gate`` makes such a case exit 1 too, since
+answer length is part of front-door parity, and exits 2 when a run has no
+shapes to compare.
 It exits 2 when the two runs can't be compared: a directory it can't read, a
 run with no case hand-offs (often a path one level too high), every case of B
 unscored or missing (the session route broke before any case could be graded,
@@ -47,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -57,6 +63,19 @@ CASE_GLOB = "case-*.json"
 # The deploy writes the front door it chose here (hack/ci-deploy.sh); a run
 # without it predates the switch and is taken as platform.
 FRONT_DOOR_FILE = "front-door.txt"
+# The grading log the eval script writes beside the hand-offs: each graded
+# repetition's delivered reply shape, `rep N shape: ... answer_words=W`, under
+# its case's `Task <case> Result:` line (bench-gate case).
+GRADING_LOG = "eval-grading.log"
+TASK_LINE = re.compile(r"^Task (\S+) Result:")
+REP_LINE = re.compile(r"^\s+rep (\d+): (\S+) --")
+ANSWER_WORDS = re.compile(r"^\s+rep (\d+) shape: .*\banswer_words=(\d+)")
+INFRA_OUTCOME = "infra"
+# A case is wordier on B when its median answer runs longer than A's by more
+# than this share: 3 repetitions carry noise, so small differences aren't
+# flagged, nor a difference under MIN_EXTRA_WORDS.
+LENGTH_MARGIN = 0.25
+MIN_EXTRA_WORDS = 10
 
 
 class UnreadableRun(Exception):
@@ -158,6 +177,42 @@ def check_comparable(
         )
 
 
+def read_answer_words(directory: Path) -> dict[str, float]:
+    """Each case's answer words in a run, from its grading log: the
+    nearest-rank median over its repetitions that weren't infrastructure, as
+    the dashboard's shape rollup takes it. Empty when the run has no log (an
+    older run, or one that delivered nothing)."""
+    path = directory / GRADING_LOG
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise UnreadableRun(f"{path}: {err}") from err
+    words: dict[str, list[int]] = {}
+    case, infra = None, set()
+    for line in lines:
+        if m := TASK_LINE.match(line):
+            case, infra = m.group(1), set()
+        elif case and (m := REP_LINE.match(line)):
+            if m.group(2) == INFRA_OUTCOME:
+                infra.add(m.group(1))
+        elif case and (m := ANSWER_WORDS.match(line)) and m.group(1) not in infra:
+            words.setdefault(case, []).append(int(m.group(2)))
+    return {c: sorted(w)[(len(w) - 1) // 2] for c, w in words.items() if w}
+
+
+def wordier(a_words: float | None, b_words: float | None) -> bool:
+    """Whether B's answer is longer than A's by more than LENGTH_MARGIN and
+    by at least MIN_EXTRA_WORDS."""
+    return (
+        a_words is not None
+        and b_words is not None
+        and b_words > a_words * (1 + LENGTH_MARGIN)
+        and b_words - a_words >= MIN_EXTRA_WORDS
+    )
+
+
 def classify(a: Side | None, b: Side | None) -> str:
     if a is None:
         return B_ONLY
@@ -189,21 +244,42 @@ def compare(
     return sorted(rows, key=lambda row: (ORDER.index(row[1]), row[0]))
 
 
-def markdown(rows: list[tuple[str, str, Side | None, Side | None]]) -> str:
+def markdown(
+    rows: list[tuple[str, str, Side | None, Side | None]],
+    a_words: dict[str, float] | None = None,
+    b_words: dict[str, float] | None = None,
+) -> str:
     counts = {kind: sum(1 for row in rows if row[1] == kind) for kind in ORDER}
     summary = ", ".join(f"{counts[kind]} {kind}" for kind in ORDER if counts[kind])
+    lengths = bool(a_words) and bool(b_words)
     lines = [
         "Front-door A/B: platform (A) vs the default session (B)",
         "",
         f"{len(rows)} cases: {summary or 'none'}",
+    ]
+    if lengths:
+        flagged = sum(
+            1 for case, *_ in rows if wordier(a_words.get(case), b_words.get(case))
+        )
+        lines.append(
+            f"Answer length: {flagged} {'case' if flagged == 1 else 'cases'} wordier on B "
+            f"(median answer words over A's by more than {LENGTH_MARGIN:.0%} and {MIN_EXTRA_WORDS} words)"
+        )
+    lines += [
         "",
-        "| Case | Class | A passes | B passes |",
-        "|---|---|---|---|",
+        "| Case | Class | A passes | B passes |"
+        + (" A words | B words | |" if lengths else ""),
+        "|---|---|---|---|" + ("---|---|---|" if lengths else ""),
     ]
     for case, kind, a, b in rows:
-        lines.append(
-            f"| `{case}` | {kind} | {a.cell() if a else '-'} | {b.cell() if b else '-'} |"
-        )
+        row = f"| `{case}` | {kind} | {a.cell() if a else '-'} | {b.cell() if b else '-'} |"
+        if lengths:
+            aw, bw = a_words.get(case), b_words.get(case)
+            cell = lambda w: "-" if w is None else str(round(w))
+            row += (
+                f" {cell(aw)} | {cell(bw)} | {'wordier' if wordier(aw, bw) else ''} |"
+            )
+        lines.append(row)
     return "\n".join(lines) + "\n"
 
 
@@ -215,16 +291,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "run_b", type=Path, help="run B's artifact directory (EVAL_FRONT_DOOR=session)"
     )
+    parser.add_argument(
+        "--length-gate",
+        action="store_true",
+        help="also exit 1 when a case is wordier on B (answer length is part of front-door parity)",
+    )
     args = parser.parse_args(argv)
     try:
         a_run, b_run = read_run(args.run_a), read_run(args.run_b)
         check_comparable(args.run_a, args.run_b, a_run, b_run)
         rows = compare(a_run, b_run)
+        a_words, b_words = read_answer_words(args.run_a), read_answer_words(args.run_b)
     except UnreadableRun as err:
         print(f"ERROR: {err}", file=sys.stderr)
         return 2
-    sys.stdout.write(markdown(rows))
-    return 1 if any(kind == REGRESSION for _, kind, _, _ in rows) else 0
+    sys.stdout.write(markdown(rows, a_words, b_words))
+    if any(kind == REGRESSION for _, kind, _, _ in rows):
+        return 1
+    if args.length_gate:
+        if not any(c in a_words and c in b_words for c, *_ in rows):
+            print(
+                f"ERROR: --length-gate needs answer shapes for at least one case on both runs ({GRADING_LOG}); none overlap",
+                file=sys.stderr,
+            )
+            return 2
+        if any(wordier(a_words.get(c), b_words.get(c)) for c, *_ in rows):
+            return 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -151,6 +151,12 @@ type ScheduleTaskTracker interface {
 	State(ctx context.Context, sched *agentv1alpha1.AgentSchedule, taskID string) (ScheduleTaskState, error)
 }
 
+// ScheduleTaskStopper stops a run in flight through the gateway, and returns
+// the gateway's outcome: stopped, already_final or unknown_run.
+type ScheduleTaskStopper interface {
+	Stop(ctx context.Context, sched *agentv1alpha1.AgentSchedule, taskID string) (string, error)
+}
+
 // The skip reasons and run outcomes the metrics carry.
 const (
 	agentScheduleSkipSuspended          = "suspended"
@@ -199,6 +205,7 @@ type AgentScheduleReconciler struct {
 	Scheme    *runtime.Scheme
 	Submitter ScheduleSubmitter
 	Tracker   ScheduleTaskTracker
+	Stopper   ScheduleTaskStopper
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	// BuiltinNames, when set, replaces the built-in set the PlatformAgent
@@ -436,6 +443,13 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 		r.trackActive(ctx, sched, now, pass)
 	}
 
+	// 1c. Stop: a token not handled yet ends the run in flight. A gateway
+	// that doesn't answer leaves the token for the next pass.
+	stopRetry, err := r.handleStop(ctx, sched, pass)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 2. A claimed slot the gateway has not taken yet (a retry, or a
 	// restart between the claim and the status write after it).
 	if st.PendingSlot != nil {
@@ -451,9 +465,13 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 	// 3. Run now: a token not handled yet starts a run, or adopts the one
 	// in flight. It leaves the cadence alone.
 	if token := sched.Annotations[agentv1alpha1.AgentScheduleRunNowAnnotation]; token != "" && token != st.LastHandledRunNow && st.PendingSlot == nil {
-		if st.ActiveTaskID != "" {
+		// A run in flight that is being stopped isn't adopted: a run-now
+		// asked for after a stop is a new run, started once the stopped one
+		// has settled.
+		stopping := st.ActiveTaskID != "" && st.ActiveTaskID == st.StoppedTaskID
+		if st.ActiveTaskID != "" && !stopping {
 			st.LastHandledRunNow = token
-		} else {
+		} else if !stopping {
 			st.PendingSlot = &agentv1alpha1.AgentSchedulePendingSlot{
 				SlotTime: metav1.NewTime(now), IdempotencyKey: runNowKey(sched, token), RunNow: token, ClaimedAt: metav1.NewTime(now),
 			}
@@ -519,7 +537,11 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 	if err := r.writeStatus(ctx, sched, pass); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: r.requeueAfter(sched, now)}, nil
+	requeue := r.requeueAfter(sched, now)
+	if stopRetry && agentScheduleRetry < requeue {
+		requeue = agentScheduleRetry
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 // trackActive settles a run in flight that ended, vanished or outlived its
@@ -635,6 +657,70 @@ func (r *AgentScheduleReconciler) settle(pass *schedulePass, sched *agentv1alpha
 	pass.count(agentScheduleRunsTotal.WithLabelValues(sched.Name, strings.ToLower(outcome)))
 	st.ActiveTaskID = ""
 	st.ActiveTaskStartedAt = nil
+	st.StoppedTaskID = ""
+}
+
+// handleStop acts on a stop token the status hasn't handled yet. It reports
+// retry when the gateway didn't answer, so the token waits for the next pass.
+func (r *AgentScheduleReconciler) handleStop(ctx context.Context, sched *agentv1alpha1.AgentSchedule, pass *schedulePass) (bool, error) {
+	st := &sched.Status
+	token := sched.Annotations[agentv1alpha1.AgentScheduleStopAnnotation]
+	if token == "" || token == st.LastHandledStop {
+		return false, nil
+	}
+	if st.PendingSlot != nil {
+		// A claim in flight may already be a run the gateway took (a submit
+		// that timed out after the publish). Dropping it would leave that run
+		// untracked, so the token waits until the claim resolves: into a run,
+		// which the next pass stops, or into a dropped slot.
+		return false, nil
+	}
+	if st.ActiveTaskID == "" {
+		st.LastHandledStop = token
+		return false, nil
+	}
+	if r.Stopper == nil {
+		return false, nil
+	}
+	// Two phases. First the run being stopped (stoppedTaskID) is written and
+	// checked kept: an API server still serving a CRD from before these
+	// fields (helm upgrade never applies crds/) prunes it, and there a token
+	// could never be recorded, would read as new on every pass, and would
+	// stop every later run. The token itself is recorded only once the
+	// gateway has answered, so a stop lost to a crash, a lost leadership or a
+	// failed write before it is sent again on the next pass (the gateway
+	// answers a repeat for a run it already stopped as stopped).
+	st.StoppedTaskID = st.ActiveTaskID
+	if err := r.writeStatus(ctx, sched, pass); err != nil {
+		return false, err
+	}
+	if st.StoppedTaskID != st.ActiveTaskID {
+		logf.FromContext(ctx).Error(nil, "not stopping a scheduled run: the AgentSchedule CRD drops status.stoppedTaskID and lastHandledStop; apply this release's CRDs",
+			"schedule", sched.Name, "taskId", st.ActiveTaskID)
+		return false, nil
+	}
+	result, err := r.Stopper.Stop(ctx, sched, st.ActiveTaskID)
+	switch {
+	case errors.Is(err, errTriggerStopRefused):
+		// The gateway refused this stop for good (the run predates the
+		// record of its trigger, say): the token is handled, and the run
+		// ends at its deadline.
+		logf.FromContext(ctx).Error(err, "the gateway refused a scheduled run's stop", "schedule", sched.Name, "taskId", st.ActiveTaskID)
+		st.LastHandledStop, st.StoppedTaskID = token, ""
+		return false, nil
+	case err != nil:
+		// Kept while the stop is retried, as a claimed slot is
+		// (PendingSlot): a run-now meanwhile doesn't adopt the run being
+		// stopped, and a retry pass has nothing new to write.
+		logf.FromContext(ctx).Error(err, "stopping a scheduled run", "schedule", sched.Name, "taskId", st.ActiveTaskID)
+		return true, nil
+	}
+	st.LastHandledStop = token
+	// Stopped: the run's terminal (canceled) arrives through the tracker,
+	// which records it as Cancelled. Already final or unknown: the tracker
+	// settles it as it ends or goes missing.
+	logf.FromContext(ctx).Info("scheduled run stop", "schedule", sched.Name, "taskId", st.ActiveTaskID, "result", result)
+	return false, nil
 }
 
 // submitPending sends the claimed slot. It reports retry when the gateway
@@ -832,16 +918,19 @@ func (r *AgentScheduleReconciler) schedulesInNamespace(ctx context.Context, obj 
 }
 
 func (r *AgentScheduleReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// The bus side, unless a test injected its own: submissions and status
-	// queries to the gateway's trigger ingress on the operator's own bus
-	// connection (agentschedule_submitter.go).
-	if r.Submitter == nil || r.Tracker == nil {
+	// The bus side, unless a test injected its own: submissions, status
+	// queries and stops to the gateway's trigger ingress on the operator's
+	// own bus connection (agentschedule_submitter.go).
+	if r.Submitter == nil || r.Tracker == nil || r.Stopper == nil {
 		bus := newNATSScheduleSubmitter(newNATSCardPublisher(mgr.GetClient()), mgr.GetClient())
 		if r.Submitter == nil {
 			r.Submitter = bus
 		}
 		if r.Tracker == nil {
 			r.Tracker = bus
+		}
+		if r.Stopper == nil {
+			r.Stopper = bus
 		}
 	}
 	return ctrl.NewControllerManagedBy(mgr).

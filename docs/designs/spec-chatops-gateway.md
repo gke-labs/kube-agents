@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat, Slack and Teams adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod, the same four widened when the Teams backend is armed, `a2aRelayCaller`); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
 
 ## Purpose
 
@@ -349,7 +349,7 @@ notice as a post. Nothing is refused, held back, or dropped; the notice is infor
 a count that fails sends none. The operator renders the threshold as the bridge's worker
 count, 10 by default, so the turn told it waits is the first one that finds every worker
 taken; the operator's own `A2A_BUSY_NOTICE_AT` overrides it. It goes to every chat backend
-(Google Chat, Slack and Discord all edit the line in place) and the console. The inject and
+(Google Chat, Slack, Discord and Teams all edit the line in place) and the console. The inject and
 A2A doors get none, because their callers read the status line as data: the A2A door takes
 the line's first edit as the task going to `working`, so a queued edit would report a task
 no worker has as running, and the inject door hands every edit to the eval harness. The
@@ -1335,7 +1335,7 @@ that's a bug in the interface, and better to learn it on the throwaway backend.
 
 ### The inject backend (added 9/17)
 
-A backend beside Discord, Google Chat and Slack, and the one with no human on the other end:
+A backend beside Discord, Google Chat, Slack and Teams, and the one with no human on the other end:
 an HTTP door into `handleInbound` for a program. It is the next-stack analogue of the door
 the eval harness uses today, which posts to the agent's own `/v1/responses` and bypasses chat
 entirely - a path identical under both modes, so a run through it says nothing about the stack
@@ -1618,8 +1618,8 @@ changing it causes, and Chat or Slack with the CR edit. An eval install with thi
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat or Slack has a backend
 by that fact alone: the render asks the CR before it reads any Secret. It renders every
-backend the CR enables, Chat and Slack together when both are, and the `discord-bot` reference
-only when the CR enables neither, so a `discord-bot` Secret left in the namespace does not
+backend the CR enables, Chat, Slack and the armed Teams backend together when more than one
+is, and the `discord-bot` reference only when the CR enables none, so a `discord-bot` Secret left in the namespace does not
 start a third backend beside a Chat or Slack gateway. The Slack refs are rendered on the
 gateway as required references, whatever the CR's own copy says, because the gateway refuses
 half a pair at boot: a missing Secret or key holds the pod at container creation, named in its
@@ -1891,8 +1891,9 @@ rather than lost. The agent-side callers
 other platform through `hermes send` as before (a day on with no conversation to take onboarding's
 first report, that report is a ledger issue on GitHub, and a home line on each routed platform links it the same way).
 `A2A_NOTIFY_PLATFORM` holds a comma-separated list of platform names, and a single name is a list of one;
-these are the agent's platform names (`google_chat`, `slack`), not the gateway's backend names its boot log prints (`gchat`, `slack`). A platform's route is armed for `google_chat` exactly when `a2aChatArmed` holds and `homeChannel` is a space
-name or unset (`a2aGchatNotifyArmed`), and for `slack` by the Slack rule below. The operator
+these are the agent's platform names (`google_chat`, `slack`, `teams`), not the gateway's backend names its boot log prints (`gchat`, `slack`, `teams`). A platform's route is armed for `google_chat` exactly when `a2aChatArmed` holds and `homeChannel` is a space
+name or unset (`a2aGchatNotifyArmed`), for `slack` by the Slack rule below, and for `teams` when the
+backend is armed and `homeChannel` is a Teams conversation id or unset (`a2aTeamsNotifyArmed`, "The Teams adapter"). The operator
 renders in `A2A_NOTIFY_PLATFORM` every armed platform whose home channel the CR sets, a space name
 or a channel id, Chat first (`a2aNotifyHomePlatforms`), and renders no variable when none is. It
 reads CR fields only, so a learn replaces no pod. `routed_platforms()` adds Slack or Chat to that
@@ -1907,7 +1908,7 @@ conversation (below), and onboarding's first report into the conversation the us
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, a comma-separated list of the
 platforms the gateway serves (read by `chat_notify.gateway_platforms()` on the agent side and by the kanban patches' own copies), which names every armed route, home channel or not (`a2aNotifyPlatforms`); on Chat
 the gateway arms the route with `homeChannel` unset (the route then
-serves conversation requests only) or a space name; the Slack render is below. The Hermes kanban notifier, which posts a card's events into the thread the card
+serves conversation requests only), a space name, or, for Teams, a conversation id; the Slack and Teams renders are below. The Hermes kanban notifier, which posts a card's events into the thread the card
 subscribes to and wakes its creator when a card blocks or fails, reaches the same route
 through a send-only stand-in adapter that exists only inside the notifier
 (`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
@@ -1931,7 +1932,7 @@ events that are already more than six hours old are advanced past without postin
 the backlog nothing could deliver before.
 
 A request may name a conversation instead of the home channel: `conversation` (the gateway's
-session-record key, such as `gchat:spaces/A/threads/B`, or `slack:C1/1712.0001`) and `context_id`, on either backend's
+session-record key, such as `gchat:spaces/A/threads/B`, or `slack:C1/1712.0001`) and `context_id`, on the backend's
 subject. This
 is how a kanban card filed in a gateway conversation reports back to it. The hermes-bridge's
 `api` executor records, before each turn, the conversation its Hermes session answers: the
@@ -1964,9 +1965,9 @@ them there only when no platform has a home channel (the gateway keeps what it r
 channel is set or learned). Conversation posts are armed whenever the gateway holds
 Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` then names `slack`
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
-route off, as on Chat. With both backends armed `A2A_NOTIFY_CONVERSATIONS` reads
-`google_chat,slack`, and `A2A_NOTIFY_PLATFORM` names the ones with a home channel on the CR; the
-agent adds a learned Slack channel or Chat space, and sends home posts to both when neither has one.
+route off, as on Chat. With every backend armed `A2A_NOTIFY_CONVERSATIONS` reads
+`google_chat,slack,teams`, and `A2A_NOTIFY_PLATFORM` names the ones with a home channel on the CR; the
+agent adds a learned Slack channel or Chat space, and sends home posts to every armed route when none has one.
 
 **The home-channel record.** The operator owns a ConfigMap
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
@@ -2151,9 +2152,9 @@ requested it. What bounds it is where it may land and who may send it. Where: th
 or a conversation the gateway holds a session record for carrying the request's context id; a
 thread of another space, or a conversation without that record and context, is refused before
 any post (on Slack, a home post lands in the home channel only, which the gateway sets on every
-post). Who: the agent principal alone publishes `chat.notify.gchat`, `chat.notify.slack` and
-`chat.notify.console`, and reads `chat.notify.reply.agent.>`; the gateway alone reads the first
-three and publishes the fourth. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
+post). Who: the agent principal alone publishes `chat.notify.gchat`, `chat.notify.slack`,
+`chat.notify.teams` and `chat.notify.console`, and reads `chat.notify.reply.agent.>`; the gateway alone reads those four
+and publishes the reply. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
 the agent reads its JetStream replies there, and a gateway able to publish into it could
 forge them; a request whose reply subject is outside the namespace is dropped unanswered.
 The agent could already post the same text to the same channel or conversation through
@@ -2650,10 +2651,10 @@ memory too, so after a restart the next verified ask in a thread may title it ag
 three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
 **Every armed backend in one gateway process.** Config lists the armed backends
-(`Backends()`: gchat, slack and discord, in that order) and refuses only half a Slack
+(`Backends()`: gchat, slack, teams and discord, in that order) and refuses only half a Slack
 pair or no ingress at all. Several backends in one process split nothing. Each backend is
 its own transport: Chat a Pub/Sub pull through the broker, Slack a Socket Mode connection,
-Discord its gateway websocket. None shares a durable with another. The task-event relay
+Teams a long poll on the broker's Teams queue, Discord its gateway websocket. None shares a durable with another. The task-event relay
 durable is the gateway process's own, bound once per process, and the election keeps one
 leader per Deployment. The mux stamps each inbound message
 with the backend that delivered it, and a direct message names its backend as
@@ -2661,7 +2662,7 @@ with the backend that delivered it, and a direct message names its backend as
 restarts, while a chat backend that stops is run again after a backoff and the rest
 keep going. The inject and A2A doors sit beside the backends, for the reason the inject
 section gives. The operator renders every backend the CR enables into the one gateway,
-Chat and Slack together when both are. Decided 2026-11-12. Home posts go to every armed route
+Chat, Slack and the armed Teams backend together when more than one is. Decided 2026-11-12. Home posts go to every armed route
 with a home channel set on the CR, plus any whose channel the gateway learned; with none,
 every armed route keeps them for its digest. Revised 2026-11-13, because an alert picks one
 platform and stops when the gateway keeps it. The operator renders the CR half and the agent adds
@@ -3030,6 +3031,94 @@ turns it off with `spec.integration.googleChat.answerFeedback: false` (default `
 operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. Either name is
 one switch for every backend the gateway holds (`AnswerFeedbackOff`); a tap or note
 click on a Google Chat message already posted is logged and acked and changes nothing.
+
+## The Teams adapter (added 11/16)
+
+The second relay-backed backend (Slack is Socket Mode and Discord a websocket), built on the Google Chat adapter's shape rather than
+Slack's: Microsoft Teams delivers by calling a public HTTPS endpoint, which no gateway
+backend serves and the operator renders no Ingress for, and the Hermes Teams path
+(`agents/platform/scripts/teams_relay_patch.py`) already answered that by putting the
+receiver in front of the credential broker. The broker holds the bot's app id and password,
+queues each activity from the install's tenant (`TeamsRelay`, `/v1/chat/teams/events`), and
+relays replies to Bot Framework (`/v1/chat/teams/api`), so the gateway's `teams` backend
+(`a2a/gateway/teams.go`) long-polls that queue with the projected a2a-chat token, acks each
+receipt before the turn is handed over (at-most-once, as the Chat adapter argues; the relay's
+nack route has no caller here), and posts through the passthrough. The gateway opens no port
+for Teams; the question of an inbound endpoint on the gateway does not arise, and the public
+receiver stays a separate piece of work outside this repository, so the authority block names
+what is checked here (`teams-relay+allowlist`), not a JWT nothing in this tree verified.
+
+Identity is Chat's rule with one allowance: the Entra object id Bot Framework asserts
+(`from.aadObjectId`, immutable; never the display name or UPN) is the principal, gated by
+`allowedUsers` alone (`A2A_TEAMS_ALLOWED_USERS`, compared lowercased), and
+`A2A_TEAMS_ALLOW_ALL_USERS` is the CRD's explicit `allowAllUsers` (default false: an empty list
+admits nobody, unlike Chat's raw-list rule). The CRD lets a list name a sender by the Bot
+Framework user id too, so the adapter is handed the same list and attributes a sender by
+whichever of the two ids it names (`SetAllowedUsers`); the gateway's own check on the author
+then sees the listed identity, and an unlisted sender arrives under the object id and is refused
+with the usual notice. The tenant is checked twice, at the broker's intake and again in the
+adapter (`A2A_TEAMS_TENANT_ID`). The conversation key is `teams:` and the conversation id Teams
+gives, whole: a channel message's id already names its thread (`…@thread.tacv2;messageid=…`), a
+personal chat's names the chat, so a thread reply reaches the same session as the post that
+started it and a personal chat is `dm`. A channel message reaches the bot only when it mentions
+it; the adapter strips the bot's own `<at>` mention before the words reach the agent and keeps
+anyone else's.
+
+Replies render as Adaptive Cards 1.5 (`adaptiveCards`, on by default), asked for at the full
+pane width: headings, bullets, fenced code as a monospace block, a pipe table as a `Table`, a
+plain `summary` for the chat list; a card over the 28 KB activity budget posts as text, text
+over it is cut with a marker. A long reply reaches the adapter already split: the gateway cuts
+a backend's text at its piece size before it posts (`chatChunks`, which carries an open fence
+and a table's header into the next piece); the size is the backend's own where it names one
+(`PieceSizer`: Teams says 10,000 bytes, so a report's table is one card rather than two with
+the header repeated) and Discord's 1,900 elsewhere, so one activity is one piece and the
+adapter only fits it under the budget. The chat.notify route (`chat.notify.teams`, `NewTeamsNotifier`)
+posts a kanban card's report back into the Teams conversation it came from (the bridge records
+`teams:` routes beside `gchat:` and `slack:`; the bus grants, exports and imports carry the
+subject beside the other three) and a proactive post into `homeChannel`, a Teams conversation
+id (`19:…` or `a:…`, the rule `teamsIsHomeConversationID` and the operator's
+`a2aTeamsHomeConversation` share); a top-level post into a channel home lands in the thread it starts, a post into a group
+chat or a personal chat lands where it was sent, and a thread-shaped home is refused on both
+sides (every message in a thread shares one key, so the relay would store every report under it
+and the bridge splice the last one into every turn there). The agent's delivery
+resolvers (`chat_platforms.py`, `session_kv_server.py`) name Teams only while the gateway routes
+it (`ROUTE_ONLY_PLATFORMS`), so alerts and cron reports reach the Teams home on this path and
+the Hermes path is unchanged. A Teams personal or group chat, whose key every message shares,
+is a whole conversation to the bridge's incident lookup (never spliced), as a Slack or Chat DM is. A Teams channel
+thread is looked up by the `(thread, thread)` row the relay stores for it, so a reply under a Teams home
+alert or report finds the stored report, as on Slack and Chat. The rolling
+status line edits its own activity through the one PUT the passthrough admits, an update of an
+activity at its id (Bot Framework's updateActivity), never the activities collection; the update
+carries the card and no `summary`, because Teams renders an updated activity that has one as
+that text in a plain bubble and drops the card (the 11-17 live test, settled by two PUTs of the
+same card with and without the field). The
+adapter answers `LineAnswerer` and `WholeLineAnswerer` for every Teams conversation: a
+completed task's direct answer that fits one piece is edited onto that line, so the ask gets
+one card rather than a card holding ✅ alone above a second (the 11-17 live test showed the
+pair on every direct answer); a longer answer posts in pieces and the line ends as the bare
+mark, and a task handed to cards ends it as the acknowledgement, as on Chat. An edit raises no
+Teams notification where a post does; the trade is taken for a reply that lands within the
+ask's own minute. What the
+passthrough does not serve the adapter says so about rather than guess: `OpenDirect` is refused
+(creating a conversation is outside the allowed paths), `Roster` is incomplete and empty,
+reactions are a nil no-op.
+
+The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
+Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
+(the webhook rewrites the rest), so an arm on the mode would move every Teams install off the
+Hermes consumer, which is what customers run, on the upgrade that brings the backend. With the
+switch on and Teams enabled, the gateway gets `A2A_TEAMS_RELAY_URL` (the broker), the gates, the
+tenant and the home channel, and the relay token volume the Chat backend shares. The broker
+admits the gateway as a caller, on its ingress NetworkPolicy and by the a2a-chat audience
+(`a2aRelayCaller`, which Chat alone used to decide), and its `/v1/chat/teams/` routes admit the
+a2a-chat role beside the chat role only while the operator renders
+`CREDENTIAL_PROXY_TEAMS_A2A_CALLER=true` on the broker beside the switch (`_teams_route_roles`),
+so a Chat-armed gateway on an install whose Teams stays on Hermes cannot reach that queue. The
+agent side lists `teams` among the platforms it reports
+cards back to and posts home to (`A2A_NOTIFY_CONVERSATIONS`, `A2A_NOTIFY_PLATFORM`). The Hermes
+`TEAMS_RELAY_URL`, its platform env and its `platforms.teams` config are not rendered
+(`teamsOnHermes`); the broker keeps its app credential either way. The people reading opens
+whenever Teams is not on Hermes.
 
 ## The console adapter (added 9/23)
 
@@ -3436,9 +3525,9 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_gchat_api_rate_limited_total`       | `method`: as above                                                                                                                                                                                       | Each Chat API call the Chat API answered 429, which the relay carries under `chat` in a 502 after its own retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_a2a_gateway_chat_messages_total`                | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                                                                                 | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`         | none                                                                                                                                                                                                     | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `kubeagents_a2a_gateway_messages_inbound_total`             | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                                                                         | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google, a2a-entra) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                        |
-| `kubeagents_a2a_gateway_answer_feedback_total`              | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`                                                                    | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
-| `kubeagents_a2a_gateway_post_feedback_total`                | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `kind`: `alert`, `report`, `other`                                                                    | Each rating change a verified sender made on a home post the agent made on its own, counted as `answer_feedback_total` counts and apart from it: `alert` for a keyed home post (the event watcher's alert, rewritten in place by its triage), `report` for any other (a scheduled or audit report, a digest).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `kubeagents_a2a_gateway_messages_inbound_total`             | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`                                                                                                                                | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google, a2a-entra) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                        |
+| `kubeagents_a2a_gateway_answer_feedback_total`              | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`                                                           | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
+| `kubeagents_a2a_gateway_post_feedback_total`                | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `kind`: `alert`, `report`, `other`                                                           | Each rating change a verified sender made on a home post the agent made on its own, counted as `answer_feedback_total` counts and apart from it: `alert` for a keyed home post (the event watcher's alert, rewritten in place by its triage), `report` for any other (a scheduled or audit report, a digest).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter
@@ -3508,7 +3597,7 @@ list to draw one from, and an open one is the cardinality the labels exist to av
 
 ## What stage 2 builds from this doc
 
-- The gateway: Discord, Google Chat and Slack adapters, session manager (spawn / stream
+- The gateway: Discord, Google Chat, Slack and Teams adapters, session manager (spawn / stream
   / reap / rehydrate / sweep), bus client, KV session registry.
 - The session pod shim: bus-to-stream-json bridge, event mapping.
 - The `authority` block, populated at ingress: `requester` and `audience` advisory,

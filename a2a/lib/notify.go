@@ -14,6 +14,8 @@ const (
 	NotifySubjectGchat = "chat.notify.gchat"
 	// NotifySubjectSlack is the subject a Slack notify is published on.
 	NotifySubjectSlack = "chat.notify.slack"
+	// NotifySubjectTeams is the subject a Microsoft Teams notify is published on.
+	NotifySubjectTeams = "chat.notify.teams"
 	// NotifySubjectConsole is the subject a console notify is published on.
 	// The console has no home channel, so it serves conversation requests
 	// only.
@@ -28,6 +30,8 @@ const (
 	NotifyPlatformGchat = "google_chat"
 	// NotifyPlatformSlack is Slack's, as Hermes spells it (`--to slack`).
 	NotifyPlatformSlack = "slack"
+	// NotifyPlatformTeams is Microsoft Teams', as Hermes spells it (`--to teams`).
+	NotifyPlatformTeams = "teams"
 	// NotifyPlatformConsole is the console door's. Hermes has no console
 	// platform of its own; this is the name the agent side records on a
 	// console conversation's route.
@@ -38,6 +42,7 @@ const (
 var NotifySubjects = map[string]string{
 	NotifyPlatformGchat:   NotifySubjectGchat,
 	NotifyPlatformSlack:   NotifySubjectSlack,
+	NotifyPlatformTeams:   NotifySubjectTeams,
 	NotifyPlatformConsole: NotifySubjectConsole,
 }
 
@@ -145,6 +150,12 @@ const (
 	GchatDMKeyPrefix = "gchat:dm/"
 	GchatThreadsSep  = "/threads/"
 	SlackDMKeyPrefix = "slack:dm/"
+	// TeamsKeyPrefix begins a Microsoft Teams conversation key, whose rest is
+	// the conversation id; only a channel thread's id carries
+	// TeamsThreadToken, so a key without it (a personal chat, a group chat,
+	// a channel's own id) is shared by every message in that conversation.
+	TeamsKeyPrefix   = "teams:"
+	TeamsThreadToken = ";messageid="
 )
 
 // WholeConversationKey reports whether key names a conversation every
@@ -157,16 +168,18 @@ func WholeConversationKey(key string) bool {
 		return !strings.Contains(key[len(GchatDMKeyPrefix):], GchatThreadsSep)
 	case strings.HasPrefix(key, SlackDMKeyPrefix):
 		return !strings.Contains(key[len(SlackDMKeyPrefix):], "/")
+	case strings.HasPrefix(key, TeamsKeyPrefix):
+		return !strings.Contains(strings.ToLower(key[len(TeamsKeyPrefix):]), TeamsThreadToken)
 	}
 	return false
 }
 
 // The conversation key prefixes of the chat backends whose key names the
 // thread a message is typed in, so the key alone says which posts a reply
-// is under. A backend whose keys are threads (Teams, when it lands)
-// registers its prefix here; a console or door key is one long conversation
-// and names a report by task instead.
-var threadKeyedPrefixes = []string{"slack:", "gchat:"}
+// is under. A Teams channel thread's key is its own conversation id with
+// the thread token; a console or door key is one long conversation and
+// names a report by task instead.
+var threadKeyedPrefixes = []string{"slack:", "gchat:", TeamsKeyPrefix}
 
 // ThreadKeyedConversation reports whether key names one thread of a chat
 // backend: a thread-keyed prefix, and not a key every top-level message
