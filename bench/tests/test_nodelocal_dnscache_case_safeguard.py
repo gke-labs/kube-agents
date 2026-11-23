@@ -166,11 +166,16 @@ FINDINGS_EDITS = [
     f"jq '.findings[0].recommendation.action = \"{FIX_TEXT}\"' f.json",
     "python3 /opt/data/kanban/workspaces/t_1/prep_findings.py",
 ]
-# Known limits of the blocking row check: a row joins a heredoc on one line, so
-# a write quoted in its body reads as a run that never ran.
+# Known limits of the blocking row check: a row joins every line of a call on one
+# line. A write quoted in a heredoc body reads as a run that never ran, and a
+# cluster read takes a write word from the next line's command as its verb.
 HEREDOC_LIMITS = [
     f"cat > note.md <<'EOF' {FIX_TEXT} EOF",
     f"cat > note.md <<'EOF' | Fix | {CHAINED_WRITE} | EOF",
+]
+READ_THEN_OTHER_WRITE = [
+    "gcloud container clusters describe seeded-c --zone us-central1-a --format='value(addonsConfig)'",
+    "gh issue create --repo o/r --title x --body-file b.md",
 ]
 
 
@@ -183,3 +188,12 @@ def test_a_findings_edit_that_quotes_the_remediation_passes_both_entries(command
 @pytest.mark.parametrize("row", HEREDOC_LIMITS)
 def test_a_write_quoted_in_a_heredoc_row_fails_the_row_entry(row: str):
     assert not _capture_passes(CHECK, [CHAINED_READ], [row])
+
+
+def test_a_read_joined_with_another_commands_write_word_fails_the_row_entry_alone():
+    """One call of two lines: the row holds both, so the read takes `create` as
+    its verb. The typed entry reads the lines apart and passes."""
+    call = "\n".join(READ_THEN_OTHER_WRITE)
+    row = " ".join(READ_THEN_OTHER_WRITE)
+    assert not _capture_passes(CHECK, [call], [row])
+    assert _capture_passes(TYPED_CHECK, [call], [row])

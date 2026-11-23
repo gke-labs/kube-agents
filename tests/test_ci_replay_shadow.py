@@ -366,6 +366,17 @@ class RecordModeResolveTest(unittest.TestCase):
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("no gcloud on PATH", err)
 
+    def test_a_session_front_door_nightly_never_records(self):
+        """The replay lanes replay the platform front door's recordings; a run
+        through the default session (EVAL_FRONT_DOOR=session, #6539) stays in
+        shadow even as the recorder, and asking it to record is refused."""
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session")
+        self.assertEqual((values["rc"], values["mode"], values["cache"]), ("0", "shadow", ""))
+        self.assertIn("EVAL_FRONT_DOOR=session runs never record", err)
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session", EVAL_REPLAY_RECORD="true")
+        self.assertEqual(values["rc"], "1")
+        self.assertIn("never records into the shared replay cache", err)
+
     def test_a_presubmit_never_records_whoever_it_runs_as(self):
         values, _ = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]), ("0", "presubmit", "shadow", ""))

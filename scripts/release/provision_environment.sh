@@ -330,6 +330,10 @@ if [ -n "${GOOGLE_CHAT_HOME_CHANNEL:-}" ]; then
   INSTALL_ARGS+=(--google-chat-home-channel="${GOOGLE_CHAT_HOME_CHANNEL}")
 fi
 
+if [ -n "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}" ]; then
+  INSTALL_ARGS+=(--google-chat-home-channel-policy="${GOOGLE_CHAT_HOME_CHANNEL_POLICY}")
+fi
+
 if [ -n "${CHAT_TOPIC_NAME:-}" ]; then
   INSTALL_ARGS+=(--chat-topic-name="${CHAT_TOPIC_NAME}")
 fi

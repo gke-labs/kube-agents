@@ -2105,7 +2105,7 @@ func TestResponseCacheEvictKeyDeletesForAGoneCallerAndKeepsARefusedKey(t *testin
 		if err := store.Set(context.Background(), key, []byte("v"), time.Minute); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
-		c.recordScopeKey(InClusterID, info, key, c.now(), time.Minute)
+		c.recordScopeKey(InClusterID, "", info, key, c.now(), time.Minute)
 	}
 
 	put()

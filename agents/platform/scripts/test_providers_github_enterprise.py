@@ -734,7 +734,7 @@ class ConsumerLinksTest(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}), \
                 mock.patch.object(gitops_workspace, "github_host", return_value=HOST), \
-                mock.patch.object(github_token_refresh.urllib.request, "urlopen", side_effect=urlopen):
+                mock.patch.object(github_token_refresh.urllib.request.OpenerDirector, "open", side_effect=urlopen):
             github_token_refresh.refresh_git_credentials("acme/infra")
         self.assertEqual([{"provider": "github", "repository": f"https://{HOST}/acme/infra"}], seen)
 

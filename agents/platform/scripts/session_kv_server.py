@@ -39,6 +39,7 @@ import board_snapshot
 import chat_notify
 import clean_merges
 import dial_state
+from fix_recipes import registry as fix_recipes_registry
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -93,9 +94,9 @@ PROPOSAL_OPENED_AT_MAX_CHARS = 64
 # claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
 # fix the check knows, by the fleet audit's check id, which is the first segment
 # of its finding id (`<check>.<cluster>.<namespace>.<object>`); the kind is
-# derived from that id here, never taken from the caller. The pr_opened plugin
-# holds a copy (POST_MERGE_KINDS), which a test pins to this one.
-POST_MERGE_KINDS = ("no-pdb",)
+# derived from that id here, never taken from the caller. Both this and the
+# pr_opened plugin read the kinds from fix_recipes/registry.py.
+POST_MERGE_KINDS = tuple(sorted(fix_recipes_registry.kinds()))
 POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
@@ -542,8 +543,9 @@ CONVERSATION_HASHED_PREFIX = "h-"
 CONVERSATION_HASHED_HEX_CHARS = 32
 # The conversation key's prefix for each platform the A2A gateway can hold, as
 # the gateway spells its session-record keys (gchatConversationID,
-# slackConversationID); a key for another backend is refused.
-CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "console": "console:"}
+# slackConversationID, teamsConversationID); a key for another backend is
+# refused.
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "teams": "teams:", "console": "console:"}
 # The metadata key the route is kept under. Its own key, not the row's
 # platform/chat_id/thread_id: those are a chat thread's address, which other
 # readers (send_notification, the delegation headers) use as one, and a
@@ -2834,7 +2836,9 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
 
 # The chat platforms this harness ships an egress path for, in the order a
 # message is posted to them and in the order a single-destination caller picks
-# one. Google Chat leads, and the ordering is the whole of #1094.
+# one. Google Chat leads, and the ordering is the whole of #1094. On an install
+# the A2A gateway serves, chat_notify.in_routed_order then puts a configured
+# home ahead of a learned one.
 #
 # #855 put Slack first, on the reasoning that a dual-platform install "resolves
 # the same way whichever branch answers". It does — and the answer it resolves
@@ -2847,7 +2851,16 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
 # This does not undo #855. That defect was a Slack-*only* install calling itself
 # google_chat, and resolution below is per platform: with Google Chat off,
 # nothing puts it in the list whatever the order says.
-CHAT_PLATFORMS = ("google_chat", "slack")
+CHAT_PLATFORMS = ("google_chat", "slack", "teams")
+
+# The platforms this resolver names only when the A2A gateway routes them
+# (`chat_notify.routes`); no config file or environment signal enables them
+# here. Teams on the Hermes path has its own cron delivery (`deliver: teams`)
+# and was never a destination of these callers; the gateway's Teams backend
+# (the operator's A2A_TEAMS_BACKEND switch) is, through its chat.notify route,
+# so an install moves to it only with that switch, never on an upgrade. The
+# twin in chat_platforms.py carries the same tuple.
+ROUTE_ONLY_PLATFORMS = ("teams",)
 
 # Per-platform environment signals, consulted only when no config file settles
 # the question. The relay URL leads each list because the operator sets it on
@@ -2879,10 +2892,11 @@ DEFAULT_CHAT_PLATFORM = "google_chat"
 HOME_CHANNEL_SETTINGS: Dict[str, str] = {
     "google_chat": "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
     "slack": "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",
+    "teams": "spec.integration.teams.homeChannel",
 }
 # The refusal when no platform can be named: no chat at all, a malformed home
 # channel the gateway refuses, or a backend this file has no route for.
-NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
+NO_CHAT_ROUTE_ERROR = "no Google Chat, Slack or Microsoft Teams route to post to; check the chat integration and homeChannel"
 
 
 def _mapping(value: object) -> dict:
@@ -2978,7 +2992,7 @@ def _slack_home_channel() -> str:
 
 
 def enabled_chat_platforms() -> list[str]:
-    """Every chat platform this install posts to, in CHAT_PLATFORMS order.
+    """Every chat platform this install posts to, in CHAT_PLATFORMS order, the routed ones in routing order.
 
     Three sources, most specific first, resolved **per platform** rather than
     per source — so a file that names one platform cannot silence another that
@@ -3009,9 +3023,11 @@ def enabled_chat_platforms() -> list[str]:
     A2A gateway holds its backend, and posts to it go through the gateway
     instead, so each is still a platform this install posts to. The operator
     lists the armed routes with a CR home channel; ``routed_platforms()`` adds
-    Slack when the file names a channel, and takes every armed route when no
+    a platform whose projected file names a learned home, after those, and takes every armed route when no
     platform has a home, the gateway keeping the refused posts for a digest.
-    The alert takes the first of them. The variables are the operator's, and
+    The routed platforms come back in that order (``chat_notify.in_routed_order``),
+    and the alert takes the first of them, so a configured home is picked
+    ahead of a learned one. The variables are the operator's, and
     they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
@@ -3075,6 +3091,8 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
         if chat_notify.routes(name):
             enabled = True
             explicit[name] = True
+        elif name in ROUTE_ONLY_PLATFORMS:
+            enabled = False
         elif name in from_managed:
             enabled = from_managed[name]
             explicit[name] = enabled
@@ -3088,7 +3106,9 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
             )
         if enabled:
             resolved.append(name)
-    return resolved, explicit
+    # The routed platforms in the routing rule's order, so every caller that
+    # takes one destination takes a configured home ahead of a learned one.
+    return chat_notify.in_routed_order(resolved), explicit
 
 
 def _chat_platforms_disabled() -> bool:

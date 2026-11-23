@@ -70,8 +70,9 @@ const (
 	stderrTailHeading = "\nstderr tail:\n"
 	// containerInitPID is the adapter's pid when it is the worker
 	// container's entrypoint (Dockerfile.worker's ENTRYPOINT, and the
-	// spawner sets no shareProcessNamespace), which is when killLeftovers
-	// may signal every other process in the pid namespace.
+	// spawner sets no shareProcessNamespace), which is when killLeftovers,
+	// and a script's kill (script.go), may signal every other process in
+	// the pid namespace.
 	containerInitPID = 1
 	// leftoverReapBound caps how long killLeftovers polls for the processes
 	// it killed to exit, so it reaps them rather than leaving zombies.
@@ -80,9 +81,9 @@ const (
 	leftoverReapPoll = 10 * time.Millisecond
 )
 
-// The namespace-wide half of killLeftovers, as variables so a test can stand
-// in for being the container's init without signalling every process the
-// test's user owns.
+// The namespace-wide half of killLeftovers and of a script's kill, as
+// variables so a test can stand in for being the container's init without
+// signalling every process the test's user owns.
 var (
 	adapterPID         = os.Getpid
 	killEveryoneButMe  = func() { _ = syscall.Kill(-1, syscall.SIGKILL) }
@@ -589,10 +590,11 @@ func (p *harnessProc) killLeftovers() {
 }
 
 // reapChildren waits, for at most bound, for this process's exited children:
-// as pid 1 the adapter inherits every orphan killLeftovers kills, and an
-// unreaped one stays a zombie. It runs only between turns, after the
-// harness's own Wait, when the adapter has no child of its own that os/exec
-// is waiting on, so waiting on any child takes nothing from os/exec.
+// as pid 1 the adapter inherits every orphan killLeftovers or a script's
+// kill leaves, and an unreaped one stays a zombie. It runs only after the
+// harness's or the script's own Wait, when the adapter has no child of its
+// own that os/exec is waiting on, so waiting on any child takes nothing from
+// os/exec.
 func reapChildren(bound time.Duration) {
 	deadline := time.Now().Add(bound)
 	for {

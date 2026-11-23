@@ -49,8 +49,8 @@ The operator renders a message bus and its clients in front of the agent on ever
 - **The A2A gateway** (`<name>-a2a-gateway`), which holds the chat backends: Google Chat and Slack, either or both. It publishes each message as a task on the bus and posts the answer back into the thread. With no chat platform enabled it runs on its console door alone ([Conversations through the A2A gateway](/kube-agents/concepts/chatops/#conversations-through-the-a2a-gateway)).
 - **The Hermes bridge**, a `hermes-bridge` container the operator adds to the agent pod. It takes tasks off the bus and runs each as a Planning Agent turn on the agent's API server.
 - **The A2A console** (`<name>-a2a-console`), a browser page over the bus with a chat pane, reached through `kubectl port-forward` ([User interfaces](/kube-agents/reference/user-interfaces/#a2a-console)).
-- **Session pods**, one per conversation moved onto the `/session` route, started by the gateway and deleted when idle. The [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) resource describes further kinds of agent pod on the bus.
-- Opt-in, behind an operator setting: the [MCP server](/kube-agents/reference/a2a-mcp/) (`<name>-a2a-mcp`), a door for an external coding agent.
+- **Session pods**, one per conversation moved onto the `/session` route, started by the gateway and deleted when idle. The [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) resource describes further kinds of agent pod on the bus, dispatched by `<name>-a2a-dispatcher` (`operator.profileDispatcher.enabled: false` switches it off).
+- **The MCP server** (`<name>-a2a-mcp`), a [Model Context Protocol](/kube-agents/reference/a2a-mcp/) door for an external coding agent, rendered by default (`operator.mcpServer.enabled: false` switches it off).
 
 ## What actually runs after installation
 
@@ -59,7 +59,7 @@ Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 - A GKE cluster with Workload Identity.
 - The operator controller manager Deployment.
 - One `PlatformAgent` custom resource and the three agent pods it reconciles into: the gateway running Hermes, the shell sandbox and the credential broker ([Credential isolation](/kube-agents/reference/credential-isolation/#pod-anatomy)).
-- The A2A stack: the bus, two auth callout and two verifier replicas, the A2A gateway and the A2A console, with the `hermes-bridge` container added to the gateway pod. [Verify the A2A stack](/kube-agents/install/quickstart-gke/#verify-the-a2a-stack) lists the pods.
+- The A2A stack: the bus, two auth callout and two verifier replicas, the A2A gateway, the A2A console, the MCP server and the profile dispatcher, with the `hermes-bridge` container added to the gateway pod. [Verify the A2A stack](/kube-agents/install/quickstart-gke/#verify-the-a2a-stack) lists the pods.
 - A LiteLLM Deployment (or vLLM if you opted in).
 - A Minty Deployment plus a GCP KMS keyring and key.
 - A Google Chat Pub/Sub topic + subscription and a Kubernetes `Secret` holding your model provider API key.

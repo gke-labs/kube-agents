@@ -14,6 +14,8 @@ const (
 	NotifySubjectGchat = "chat.notify.gchat"
 	// NotifySubjectSlack is the subject a Slack notify is published on.
 	NotifySubjectSlack = "chat.notify.slack"
+	// NotifySubjectTeams is the subject a Microsoft Teams notify is published on.
+	NotifySubjectTeams = "chat.notify.teams"
 	// NotifySubjectConsole is the subject a console notify is published on.
 	// The console has no home channel, so it serves conversation requests
 	// only.
@@ -28,6 +30,8 @@ const (
 	NotifyPlatformGchat = "google_chat"
 	// NotifyPlatformSlack is Slack's, as Hermes spells it (`--to slack`).
 	NotifyPlatformSlack = "slack"
+	// NotifyPlatformTeams is Microsoft Teams', as Hermes spells it (`--to teams`).
+	NotifyPlatformTeams = "teams"
 	// NotifyPlatformConsole is the console door's. Hermes has no console
 	// platform of its own; this is the name the agent side records on a
 	// console conversation's route.
@@ -38,6 +42,7 @@ const (
 var NotifySubjects = map[string]string{
 	NotifyPlatformGchat:   NotifySubjectGchat,
 	NotifyPlatformSlack:   NotifySubjectSlack,
+	NotifyPlatformTeams:   NotifySubjectTeams,
 	NotifyPlatformConsole: NotifySubjectConsole,
 }
 
@@ -97,14 +102,17 @@ type NotifyRequest struct {
 	// ReplyTo, on a request aimed at a conversation, is the id of the
 	// gateway task whose turn filed the work this reports on, when the
 	// sender knows it. Only the console passes it on (its frame's replyTo),
-	// so a console client can join a report to the turn it answers, and
+	// so a console client can join a post to the turn it reports on, and
 	// the gateway keeps the post under its root for the reply that names
 	// it (a2a/gateway/reports.go).
 	ReplyTo string `json:"reply_to,omitempty"`
 	// Report marks a conversation post as a card's report: the kanban
 	// notifier sets it on the settled card's report post alone (never on a
 	// progress note, heartbeat, queued or plan line), and the gateway keeps
-	// a post for the reply under it only when it is set and names its task.
+	// a post for the reply under it only when it is set: under its task for
+	// a console post, under the thread for a post into a chat thread; the
+	// console frame carries it (report), so a console client offers a
+	// reply under that post alone.
 	Report bool `json:"report,omitempty"`
 }
 
@@ -142,6 +150,12 @@ const (
 	GchatDMKeyPrefix = "gchat:dm/"
 	GchatThreadsSep  = "/threads/"
 	SlackDMKeyPrefix = "slack:dm/"
+	// TeamsKeyPrefix begins a Microsoft Teams conversation key, whose rest is
+	// the conversation id; only a channel thread's id carries
+	// TeamsThreadToken, so a key without it (a personal chat, a group chat,
+	// a channel's own id) is shared by every message in that conversation.
+	TeamsKeyPrefix   = "teams:"
+	TeamsThreadToken = ";messageid="
 )
 
 // WholeConversationKey reports whether key names a conversation every
@@ -154,16 +168,18 @@ func WholeConversationKey(key string) bool {
 		return !strings.Contains(key[len(GchatDMKeyPrefix):], GchatThreadsSep)
 	case strings.HasPrefix(key, SlackDMKeyPrefix):
 		return !strings.Contains(key[len(SlackDMKeyPrefix):], "/")
+	case strings.HasPrefix(key, TeamsKeyPrefix):
+		return !strings.Contains(strings.ToLower(key[len(TeamsKeyPrefix):]), TeamsThreadToken)
 	}
 	return false
 }
 
 // The conversation key prefixes of the chat backends whose key names the
 // thread a message is typed in, so the key alone says which posts a reply
-// is under. A backend whose keys are threads (Teams, when it lands)
-// registers its prefix here; a console or door key is one long conversation
-// and names a report by task instead.
-var threadKeyedPrefixes = []string{"slack:", "gchat:"}
+// is under. A Teams channel thread's key is its own conversation id with
+// the thread token; a console or door key is one long conversation and
+// names a report by task instead.
+var threadKeyedPrefixes = []string{"slack:", "gchat:", TeamsKeyPrefix}
 
 // ThreadKeyedConversation reports whether key names one thread of a chat
 // backend: a thread-keyed prefix, and not a key every top-level message

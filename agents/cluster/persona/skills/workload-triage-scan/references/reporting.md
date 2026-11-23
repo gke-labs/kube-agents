@@ -4,7 +4,7 @@ Shared by `workload-triage-scan`, `pod-crashloop-oom`, `pod-pending-scheduling`,
 
 ## Boundary
 
-You work under a strict read-only boundary. Do not apply patches to the cluster and do not open pull requests: whoever asked for the investigation owns the GitOps write path. Report in your final answer.
+You work under a strict read-only boundary on the cluster: do not apply patches to it. Open a pull request only when the task asks for that change, as `instructions.md` §2 and the `version-control` skill say; otherwise whoever asked for the investigation owns the GitOps write path. Report in your final answer.
 
 ## Finding
 

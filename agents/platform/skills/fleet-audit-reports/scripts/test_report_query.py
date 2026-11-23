@@ -1265,5 +1265,50 @@ class TestTheWriterIsWhatIsRead(StoreTestCase):
         self.assertEqual(diff["added_total"], 0)
 
 
+class TestThroughTheBroker(TestTheWriterIsWhatIsRead):
+    """The same written runs, read and written through the broker store
+    (FLEET_AUDIT_REPORT_STORE=broker): every subcommand answers as over the
+    file store, and nothing is written to the local root."""
+
+    def setUp(self):
+        super().setUp()
+        import test_report_store_broker  # noqa: PLC0415 — on the path report_query put there
+
+        self.broker = test_report_store_broker.FakeBroker()
+        self.addCleanup(self.broker.close)
+        env = patch.dict(os.environ, {
+            "FLEET_AUDIT_REPORT_STORE": "broker",
+            "CREDENTIAL_PROXY_URL": self.broker.url,
+            "CREDENTIAL_PROXY_TOKEN_FILE": "",
+            "CREDENTIAL_PROXY_TASK_TOKEN_FILE": "",
+            "FLEET_AUDIT_REPORTS_DIR": os.path.join(self.root, "absent"),
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        self.audit_report._BROKER_CLIENTS.clear()
+        self.addCleanup(self.audit_report._BROKER_CLIENTS.clear)
+
+    def query(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = report_query.main(list(argv))
+        self.assertEqual(
+            f"report store: broker {self.broker.url} (FLEET_AUDIT_REPORT_STORE=broker)\n", err.getvalue()
+        )
+        return code, json.loads(out.getvalue())
+
+    def test_a_written_run_answers_every_subcommand(self):
+        super().test_a_written_run_answers_every_subcommand()
+        self.assertEqual(os.listdir(self.root), [])
+        self.assertEqual(f"broker {self.broker.url}", self.ok("streams")["root"])
+
+    def test_an_absent_stream_is_absent(self):
+        payload = self.refused("show", AUDIT)
+        self.assertIn("no reports for stream", payload["error"])
+        self.broker.down = 503
+        payload = self.refused("show", AUDIT)
+        self.assertIn("not readable", payload["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

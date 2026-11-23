@@ -1274,6 +1274,9 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
         self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
         self.assertLess(policy_at, call_at)
+        chat_policy_at = text.find('export GOOGLE_CHAT_HOME_CHANNEL_POLICY=""')
+        self.assertNotEqual(chat_policy_at, -1, "uninstall.sh must blank GOOGLE_CHAT_HOME_CHANNEL_POLICY")
+        self.assertLess(chat_policy_at, call_at)
         # The data volume size likewise: the generator refuses a malformed size.
         storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
         self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")

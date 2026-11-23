@@ -156,8 +156,8 @@ class FootprintSummaryTest(unittest.TestCase):
         self._assert_summary_matches(notes, req)
         # The stock install's figures, the ones the prerequisites page quotes, in the
         # words the notes use, so a wording change is a deliberate one here too.
-        self.assertIn("CPU requests:        4.436 cores", notes)
-        self.assertIn("Memory requests:     14.77 GiB", notes)
+        self.assertIn("CPU requests:        4.536 cores", notes)
+        self.assertIn("Memory requests:     14.89 GiB", notes)
         self.assertIn("Persistent storage:  228 GiB over 7 claims", notes)
         self.assertIn("$0.0445/vCPU-hour", notes)
         self.assertIn("$0.0049225/GiB-hour", notes)

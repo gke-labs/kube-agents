@@ -45,6 +45,7 @@ func TestMain(m *testing.M) {
 		"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL",
 		"A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP",
 		"A2A_SPAWN_SESSIONS", "A2A_SESSION_SERVICE_ACCOUNT", "A2A_DEFAULT_ADDRESSEE",
+		"A2A_TEAMS_RELAY_URL",
 	} {
 		os.Unsetenv(k)
 	}
@@ -707,6 +708,52 @@ func TestNoHomeChannelIsLoggedAsAWarning(t *testing.T) {
 	}
 }
 
+// TestARouteArmedToLearnIsLoggedAsWaiting: with no home channel and the learn
+// armed, the startup line says the route waits for a mention, at Info, and
+// the "not armed" warning is absent: the gateway will get a home without a
+// configuration change.
+func TestARouteArmedToLearnIsLoggedAsWaiting(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		cfg     *gateway.Config
+	}{
+		{"chat", gchat, &gateway.Config{GchatRelayURL: "http://relay.invalid", HomeChannelRecord: "agent-home-channel", HomeChannelLearn: true}},
+		{"slack", slackBackend, &gateway.Config{SlackBotToken: "xoxb-stub", HomeChannelRecord: "agent-home-channel", HomeChannelLearn: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged syncBuffer
+			chatNotifier(tc.cfg, tc.backend, conversations, slog.New(slog.NewJSONHandler(&logged, nil)))
+			waiting := false
+			for _, line := range strings.Split(strings.TrimSpace(logged.buf.String()), "\n") {
+				var rec map[string]any
+				if json.Unmarshal([]byte(line), &rec) != nil {
+					continue
+				}
+				msg := fmt.Sprint(rec["msg"])
+				if strings.HasPrefix(msg, "chat.notify home posts not armed") {
+					t.Fatalf("logged %v for a route armed to learn", rec)
+				}
+				if strings.HasPrefix(msg, "chat.notify home posts use a learned home channel") {
+					waiting = rec["level"] == "INFO"
+				}
+			}
+			if !waiting {
+				t.Fatalf("no Info \"home posts wait\" line; log: %s", logged.buf.String())
+			}
+		})
+	}
+}
+
 // The chat.notify route arms for a Google Chat or Slack backend with or without a home
 // channel, always with the gateway's conversations behind it (a kanban
 // card's report back to its conversation needs them, and with no home channel
@@ -840,5 +887,30 @@ func TestServeExplainsABusLostExit(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("another failure wrote a termination message: %v", err)
+	}
+}
+
+// TestA2ADoorOptionsCarryEverySignInClass: the door is armed from what the
+// config read, class by class. A class the config reads but the options do
+// not carry is a door that refuses every one of that class's tokens on a
+// real install while every test, which builds the options directly, passes.
+func TestA2ADoorOptionsCarryEverySignInClass(t *testing.T) {
+	cfg := &gateway.Config{
+		A2ADoorPublicURL: "https://x/a2a", DefaultAddressee: "platform", TaskDeadline: time.Minute,
+		A2ADoorGoogleClientID: "client", A2ADoorAllowedUsers: []string{"dev@example.com"},
+		A2ADoorEntraTenantID: "tenant", A2ADoorEntraClientID: "app", A2ADoorEntraAllowedUsers: []string{"oid"},
+	}
+	o := a2aDoorOptions(cfg, slog.Default())
+	if o.PublicURL != cfg.A2ADoorPublicURL || o.DefaultAddressee != cfg.DefaultAddressee || o.TaskDeadline != cfg.TaskDeadline {
+		t.Errorf("door options = %+v", o)
+	}
+	if o.GoogleClientID != cfg.A2ADoorGoogleClientID || len(o.GoogleAllowedUsers) != 1 {
+		t.Errorf("the Google class is not carried: %+v", o)
+	}
+	if o.EntraTenantID != cfg.A2ADoorEntraTenantID || o.EntraClientID != cfg.A2ADoorEntraClientID || len(o.EntraAllowedUsers) != 1 {
+		t.Errorf("the Entra class is not carried: %+v", o)
+	}
+	if o.Logger == nil {
+		t.Error("no logger")
 	}
 }

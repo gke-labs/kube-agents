@@ -276,11 +276,9 @@ fixtures:
     defect: >-
       A custom-mode VPC at MTU 8896 with no subnet, peered both ways with
       `default` (MTU 1460), so the networking SOP's 2.4 reads the ACTIVE
-      peering as an MTU mismatch. Not a defect: the one check of that stream
-      proposed as declarable on purpose. Inert for the audit until the
-      stream's declared-intent slice lands and the pool project's GitOps
-      knowledge/ note declares the peering; until then the finding publishes
-      and no case grades it.
+      peering as an MTU mismatch. Not a defect: the pool project's GitOps
+      knowledge/ note declares the peering on purpose, and the networking
+      audit lists it under Declared intent rather than as a finding.
 
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
@@ -403,8 +401,11 @@ fixtures:
     defect: >-
       A Deployment targeted through the nodeSelector with a hand-written
       toleration for the class taint that names key, value and effect and no
-      operator. The pool it targets carries no taint, so the pod runs; the
-      toleration's shape is the fixture.
+      operator. GKE adds its own toleration with operator Equal to a Pod
+      that selects a class, and a live test ran this shape on a tainted class
+      pool, hand-made and GKE-created (Standard 1.35.8, Autopilot 1.36.4;
+      older versions not tested): no defect, and no case reads the role. The
+      pool it targets carries no taint, so the pod runs.
 
   - role: no-ephemeral-limit-workload
     slot: c
@@ -413,7 +414,7 @@ fixtures:
       - deployment/batch-worker-a
     namespace: seeded-compute-class
     defect: >-
-      The same batch-worker-a Deployment, read for a second defect: its
+      The same batch-worker-a Deployment, read for its defect: its
       container sets no ephemeral-storage request or limit, so its writable
       layer and logs can fill the node's boot disk until the kubelet evicts
       pods under DiskPressure. GKE Standard admission adds none, where
@@ -710,8 +711,10 @@ fixtures:
       - statefulset/zone-bound-store
     namespace: seeded-topology
     defect: >-
-      One replica on a zonal standard-rwo claim, so the pod cannot change zone
-      without leaving its data. The fix is a migration, not an edit.
+      Two replicas whose claims use seeded-zonal-pd, a class whose
+      allowedTopologies names only the first zone, so both bind there and
+      neither pod can change zone without leaving its data. The fix is a
+      migration, not an edit.
 
   - role: zonal-skew-capacity
     slot: d
@@ -721,6 +724,8 @@ fixtures:
       - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
-      Four replicas at 120m CPU against two e2-small nodes, so those that do
-      not fit stay Pending on insufficient CPU. Its distribution looks like
+      Four replicas at 500m CPU against the first zone's e2-small, which
+      first-zone-sponge keeps below one replica's worth of free CPU, and the
+      second zone's e2-standard-2, so every replica that runs is in the second
+      zone and the rest stay Pending on insufficient CPU. Its distribution looks like
       the scheduling case; only the Pending pods' events say otherwise.

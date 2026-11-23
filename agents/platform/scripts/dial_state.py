@@ -45,8 +45,13 @@ from typing import Any
 
 import clean_merges
 import kubeagents_switches
+from fix_recipes import registry
 
 logger = logging.getLogger(__name__)
+# The credential broker is an in-cluster Service: a proxy from the environment
+# must not get the level report and its bearer token, and urllib does not leave
+# out a cluster host by itself.
+_BROKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 STATE_NAME = "kube-agents/dial.json"
 #: The managed .env key (``KUBEAGENTS_DIAL_ADMINS``), which the operator pins.
@@ -61,8 +66,8 @@ LEVELS = (LEVEL_EXPLAIN, LEVEL_PROPOSE, LEVEL_AUTOMERGE)
 LEVEL_TITLES = {LEVEL_EXPLAIN: "Explain", LEVEL_PROPOSE: "Propose fixes", LEVEL_AUTOMERGE: "Auto-merge proven fixes"}
 DEFAULT_LEVEL = LEVEL_PROPOSE
 
-#: ``(kind, title, environment)`` for each kind of fix the dial lists.
-FIX_KINDS = (("no-pdb", "Disruption budgets", "dev"),)
+#: ``(kind, title, environment)`` for each kind of fix the dial lists (``fix_recipes/registry.py``).
+FIX_KINDS = tuple((recipe.kind, recipe.title, recipe.dial_environment) for recipe in registry.recipes())
 
 ACTION_LEVEL = "dial.level"
 ACTION_REQUEST = "dial.request"
@@ -314,7 +319,7 @@ def report_level(level: str) -> bool:
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=BROKER_TIMEOUT_SECONDS) as response:
+        with _BROKER_OPENER.open(request, timeout=BROKER_TIMEOUT_SECONDS) as response:
             answer = json.loads(response.read() or b"{}")
     except Exception as exc:  # noqa: BLE001 — reported again on the next pick
         logger.warning("dial: could not report the level %s to the broker: %s", level, exc)

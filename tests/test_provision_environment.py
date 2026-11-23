@@ -1018,6 +1018,15 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("--slack-home-channel-policy", (tmp_dir / MOCK_CALLS_LOG).read_text())
 
+    def test_the_google_chat_home_channel_policy_flag_follows_the_variable(self):
+        """As Slack's: set, it reaches install.sh as the flag; unset, no flag."""
+        proc, tmp_dir = self._run_recording({"GOOGLE_CHAT_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--google-chat-home-channel-policy=manual", (tmp_dir / MOCK_CALLS_LOG).read_text())
+        proc, tmp_dir = self._run_recording({})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--google-chat-home-channel-policy", (tmp_dir / MOCK_CALLS_LOG).read_text())
+
     def test_an_environment_without_slack_is_never_asked_for_tokens(self):
         """Which is every environment but the ones that opt in."""
         for overrides in ({}, {"SLACK_ENABLED": "false"}):

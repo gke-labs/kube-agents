@@ -1011,3 +1011,16 @@ def test_a_scoped_store_answers_the_same_as_a_whole_one_in_scope(tmp_path):
     assert scoped.admission("planted-pdb", KEY, bar=bar) == whole.admission(
         "planted-pdb", KEY, bar=bar
     )
+
+
+def test_the_run_mode_follows_the_front_door(monkeypatch):
+    """``next`` unless the deploy chose the default session as the front door
+    (EVAL_FRONT_DOOR=session, #6539), whose records stay apart."""
+    from kube_agents_bench.baselines import MODE_NEXT_SESSION, run_mode
+
+    for value, want in ((None, MODE_NEXT), ("platform", MODE_NEXT), ("session", MODE_NEXT_SESSION)):
+        if value is None:
+            monkeypatch.delenv("EVAL_FRONT_DOOR", raising=False)
+        else:
+            monkeypatch.setenv("EVAL_FRONT_DOOR", value)
+        assert run_mode() == want

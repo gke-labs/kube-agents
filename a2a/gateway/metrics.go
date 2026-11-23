@@ -150,10 +150,11 @@ const (
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
-	// ingress. The doors (inject, a2a, a2a-google) carry programs' turns, not
+	// ingress. The doors (inject, a2a, a2a-google, a2a-entra) carry programs' turns, not
 	// chat, and are not counted.
 	platformGoogleChat = "googlechat"
 	platformSlack      = "slack"
+	platformTeams      = "teams"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
 	// The answer label's values: what the rated message answered with, the
@@ -234,7 +235,7 @@ var (
 	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor, TerminalFromGateway, TerminalNeverStarted}
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
-	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
+	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformTeams, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
 	metricsAnswers         = []string{answerReply, answerCard}
 	metricsPostKinds       = []string{postKindAlert, postKindReport}
@@ -246,6 +247,7 @@ var (
 	metricsBackendPlatforms = map[string]string{
 		gchatBackend:   platformGoogleChat,
 		slackBackend:   platformSlack,
+		teamsBackend:   platformTeams,
 		discordBackend: platformDiscord,
 		consoleBackend: platformConsole,
 	}
@@ -439,25 +441,25 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      messagesInboundName,
-			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
+			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, teams, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
 		}, []string{labelPlatform}),
 		answerFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      answerFeedbackName,
-			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, teams, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
 		}, []string{labelPlatform, labelRating, labelAnswer}),
 		postFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      postFeedbackName,
-			Help:      "Ratings verified chat users gave the posts the agent made on its own, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and kind (alert, a keyed home post its triage edits; report, any other home post; other); counted once per rating change, apart from answer_feedback_total.",
+			Help:      "Ratings verified chat users gave the posts the agent made on its own, by platform (googlechat, slack, teams, discord, console, other), rating (up, down, other) and kind (alert, a keyed home post its triage edits; report, any other home post; other); counted once per rating change, apart from answer_feedback_total.",
 		}, []string{labelPlatform, labelRating, labelKind}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      sessionsName,
-			Help:      "Conversations the gateway minted a session for, by the platform of the first message (googlechat, slack, discord, console, other); a conversation is counted once, and a door's are not chat and are not counted.",
+			Help:      "Conversations the gateway minted a session for, by the platform of the first message (googlechat, slack, teams, discord, console, other); a conversation is counted once, and a door's are not chat and are not counted.",
 		}, []string{labelPlatform}),
 		slackIngressLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
@@ -659,7 +661,7 @@ func metricsPlatformLabel(backend string) (string, bool) {
 		return platform, true
 	}
 	switch backend {
-	case injectBackend, a2aBackend, a2aGoogleBackend:
+	case injectBackend, a2aBackend, a2aGoogleBackend, a2aEntraBackend:
 		return "", false
 	}
 	return metricsLabelOther, true
