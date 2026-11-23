@@ -77,6 +77,9 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.google_requests = []
         self.k8s_requests = []
         self.pod_status, self.pod_body = 200, json.dumps(POD_METADATA_UPSTREAM).encode()
+        self.events_body = b'{"kind":"EventList","items":[]}'
+        self.truncate_content_length = False
+        self.slow_chunk_delay_s = 0.0
         self.stream_unread = False
         # The fake API server takes the request and closes with no status line.
         self.close_before_status = False
@@ -140,11 +143,31 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
                         time.sleep(EVENT_GAP_S)
                     self.wfile.write(b"0\r\n\r\n")
                     return
-                status, body = 200, b'{"kind":"EventList","items":[]}'
+                status, body = 200, owner.events_body
                 if "/pods/" in self.path:
                     status, body = owner.pod_status, owner.pod_body
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                if owner.truncate_content_length:
+                    self.send_header("Content-Length", str(len(body) + 32))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
+                if owner.slow_chunk_delay_s > 0:
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    half = max(1, len(body) // 2)
+                    self.wfile.write(body[:half])
+                    self.wfile.flush()
+                    time.sleep(owner.slow_chunk_delay_s)
+                    try:
+                        self.wfile.write(body[half:])
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    return
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -587,16 +610,16 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertIn(key, CredentialProxyHandler.watcher_endpoints)
         describes = sum("/clusters/" in p for _, p, _, _ in self.google_requests)
         # The status line comes over the socket; the broker's bounded body
-        # read then resets. The test's own client reads unbounded and is
+        # read then resets. The test's own client reads with read() and is
         # left alone.
-        real_read = http.client.HTTPResponse.read
+        real_read1 = http.client.HTTPResponse.read1
 
         def reset_mid_body(response, amt=None):
-            if amt == credential_proxy.WATCHER_POD_METADATA_MAX_BYTES + 1:
+            if amt == credential_proxy.API_RELAY_READ_CHUNK_BYTES:
                 raise ConnectionResetError("reset mid-body")
-            return real_read(response, amt)
+            return real_read1(response, amt)
 
-        with mock.patch.object(http.client.HTTPResponse, "read", reset_mid_body):
+        with mock.patch.object(http.client.HTTPResponse, "read1", reset_mid_body):
             status, body = self._pod_metadata()
         self.assertEqual(status, 502, body)
         self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNAVAILABLE")
@@ -604,6 +627,35 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         status, _ = self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events")
         self.assertEqual(status, 200)
         self.assertEqual(sum("/clusters/" in p for _, p, _, _ in self.google_requests), describes)
+
+    def test_a_non_watch_k8s_read_over_the_size_cap_is_refused_502(self):
+        small_cap = 1024
+        self.events_body = b'{"kind":"EventList","pad":"' + (b"x" * small_cap) + b'"}'
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", small_cap):
+            status, body = self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?limit=500")
+        self.assertEqual(status, 502, body)
+        self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNRELAYABLE")
+
+    def test_a_non_watch_k8s_read_past_the_total_deadline_is_refused_504(self):
+        self.slow_chunk_delay_s = 0.4
+        with mock.patch.object(credential_proxy, "API_RELAY_DEADLINE_S", 0.15):
+            status, body = self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?limit=500")
+        self.assertEqual(status, 504, body)
+        self.assertEqual(json.loads(body)["code"], "UPSTREAM_TIMEOUT")
+
+    def test_a_truncated_content_length_k8s_response_is_refused_502(self):
+        self.truncate_content_length = True
+        for path, headers in (
+            ("/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?limit=500", None),
+            (
+                "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/pods/web-0",
+                {"Accept": "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"},
+            ),
+        ):
+            with self.subTest(path=path):
+                status, body = self._request("GET", path, headers=headers)
+                self.assertEqual(status, 502, body)
+                self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNAVAILABLE")
 
     def test_an_api_server_that_closes_before_its_status_line_is_forgotten(self):
         # The lower edge of the rule above: with no status line, nothing

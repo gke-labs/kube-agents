@@ -76,7 +76,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NamedTuple
 
-# The shared scripts dir holds github_token_refresh and gitops_workspace (see
+# The shared scripts dir holds github_token_refresh, gitops_workspace and the
+# fix_recipes package (the no-pdb generator) (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
 # copied per-profile). The import itself is lazy so `--dry-run` works on a dev
 # machine with no sandbox. The third entry is the same directory in a source
@@ -404,6 +405,7 @@ AUDITS: dict[str, AuditSpec] = {
             "reservation-mismatch-risk",
             "autoscaler-out-of-resources",
             "dangling-compute-class",
+            "ccc-unbacked-manual-fallback",
         ),
         # §4's manifest note: the `project/<id>` entry carries the two
         # project-scoped checks. `reservation-mismatch-risk` sits under both
@@ -424,6 +426,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "reservation-mismatch-risk",
                     "autoscaler-out-of-resources",
                     "dangling-compute-class",
+                    "ccc-unbacked-manual-fallback",
                 ),
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
@@ -436,7 +439,7 @@ AUDITS: dict[str, AuditSpec] = {
         # finding; the join tells the arms apart by the collector's excerpt
         # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
         # validator cannot, and the SOP's step carries that distinction. The
-        # other eleven are capacity faults no
+        # other twelve are capacity faults no
         # declaration excuses: a quota near its limit, a ComputeClass with no
         # fallback, a Spot shape that gets preempted, an autoscaler that
         # already failed to add a node.
@@ -1348,6 +1351,7 @@ CHECK_PHRASES = {
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
+    "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists machine options that it cannot use",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -2222,11 +2226,9 @@ RUN_RECORD_STARTED_KEY = "started_at"
 # cleared finding of it `manual`: a PodDisruptionBudget is fully determined by
 # the workload's selector (obtainability SOP §3.3), which the collector reads.
 GENERATED_FIX_CHECK = "no-pdb"
-# The new file `finish` writes beside the workload's declaration.
-GENERATED_PDB_SUFFIX = "-pdb"
+# The extension of the new file `finish` writes beside the workload's
+# declaration; its name is the recipe's (`fix_recipes/no-pdb/fix.py`).
 GENERATED_PDB_EXTENSION = ".yaml"
-# A DNS-1123 subdomain, what Kubernetes requires of a PDB's name and namespace.
-KUBERNETES_NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 # A clone's own directory, which no search of the repository's files enters.
 GIT_DIR_NAME = ".git"
 # What marks a directory as a Kustomize root, as the collector reads it: a
@@ -2300,8 +2302,6 @@ HTTP_TOO_MANY_REQUESTS = 429
 MANUAL_NOTE_MANIFEST_LINES = 60
 # The last line of a copied file that went past either cap.
 MANUAL_NOTE_TRUNCATED = "# (truncated)"
-# The selector keys `policy/v1` takes, and nothing else.
-LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
 GENERATED_FIX_NOTE = (
     "_(The audit wrote this PodDisruptionBudget from the workload's own selector, "
@@ -2899,7 +2899,7 @@ def _manifest_delta():
 # The install's auto-merge switch (`KUBEAGENTS_AUTOMERGE`, read by
 # kubeagents_switches.py in the shared scripts directory). Anything but "off"
 # has every disruption-budget fix checked against its cluster before its pull
-# request opens, and the answer written into the body (pdb_safety.py).
+# request opens, and the answer written into the body (fix_preflight.py).
 AUTOMERGE_SWITCH = "AUTOMERGE"
 SWITCH_OFF = "off"
 AUTOMERGE_PRACTICE = "practice"
@@ -2920,7 +2920,7 @@ def automerge_switch() -> str:
         return SWITCH_OFF
 
 
-def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
+def safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
     """The safety-check section for a group's disruption-budget fixes, or "".
 
     "" while the auto-merge switch is off, and for a group with no `no-pdb`
@@ -2942,7 +2942,7 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:
         sys.path.insert(0, here)
-    import pdb_safety  # lazy, as manifest_delta is
+    import fix_preflight as preflight  # lazy, as manifest_delta is
 
     read = {
         str(entry.get("name") or "")
@@ -2960,13 +2960,14 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(
+                "checks": preflight.unanswered(
+                    GENERATED_FIX_CHECK,
                     "the audit did not write this file on this run at the path it chooses for the budget, so it was not read again"
                 ),
             })
             continue
         try:
-            answer = pdb_safety.check_fix(
+            answer = preflight.check_fix(
                 finding,
                 raw.decode("utf-8", errors="replace") if raw is not None else None,
                 in_manifest=str(finding.get("cluster") or "") in read,
@@ -2976,12 +2977,12 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(f"the check failed ({type(exc).__name__}: {exc})"),
+                "checks": preflight.unanswered(GENERATED_FIX_CHECK, f"the check failed ({type(exc).__name__}: {exc})"),
             }
         answers.append(answer)
     eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
     log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
-    return pdb_safety.render_section(
+    return preflight.render_section(
         answers, eligible=eligible, noun=noun, clean=publishable_text, practice=automerge_switch() == AUTOMERGE_PRACTICE
     )
 
@@ -3193,7 +3194,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Twelve markers. A cost collector sets `service-fronted` on an idle
+# Thirteen markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -3244,6 +3245,11 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # other three are set by `collect.py` for the same reason, on §2.7,
 # §3.16 and §3.19; `collect.py`'s `TRIAGE_BY_SLUG` says what each fix risks.
 #
+# The stockout collector sets `manual-pool-fallback` on every §3.13 finding:
+# the fix adds a node pool for each rule that has none, or lets GKE create
+# node pools for the class, and the collector cannot tell which the owners
+# want.
+#
 # The text beside each marker is what the ledger prints after the finding's
 # title in the "fix needs a decision" block, so a reader sees why the sweep
 # passed over that one without opening it. Keep it a clause about the fix.
@@ -3260,6 +3266,7 @@ TRIAGE_REASONS = {
     "service-selector": "rewrites or deletes a Service on a judgement about its backend",
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
     "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
+    "manual-pool-fallback": "creates node pools or turns on automatic node pool creation, and which of the two is the owners' call",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
@@ -15291,7 +15298,7 @@ def render_remediation_pr_body(
     `unlabelled` is a forge with no labels: the body then also carries the
     stream marker, which is how the next run finds this pull request.
 
-    `safety` is `pdb_safety_section`'s answer, placed after the files.
+    `safety` is `safety_section`'s answer, placed after the files.
     """
     ordered = sort_findings(group)
     ids = sorted(str(f.get("id", "")) for f in ordered if f.get("id"))
@@ -18134,7 +18141,7 @@ def open_remediation_pr(
     # known is taken to have labels, and the label write below corrects it.
     labelled = _LABELS.get(repo, True)
     # Read once: the label fallback below re-renders the same body.
-    safety = pdb_safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
+    safety = safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
     body = render_remediation_pr_body(
         audit_id,
         group,
@@ -18234,7 +18241,7 @@ def carries_practice_label(pr: dict | None) -> bool:
 def request_practice_label(repo: str, number: int | str) -> None:
     """Ask the broker to judge pull request `number` for the auto-merge label.
 
-    Called where `pdb_safety_section` wrote a section (the switch on, a group
+    Called where `safety_section` wrote a section (the switch on, a group
     holding a disruption-budget fix), and on a refresh of a pull request that
     already carries the label. The broker reads everything itself and decides;
     this sends the number and logs the answer. A refusal is logged and nothing
@@ -18946,53 +18953,27 @@ def unwritten_refusal_message(
     return " ".join(parts)
 
 
+def _no_pdb_fix():
+    """The `no-pdb` recipe's generator (`fix_recipes/no-pdb/fix.py`).
+
+    Lazy, as `gitops_workspace` is (the module comment on `sys.path`)."""
+    from fix_recipes import registry
+
+    return registry.generator(GENERATED_FIX_CHECK)
+
+
 def _pdb_unbuildable_reason(candidate: dict) -> str:
     """Why `_pdb_manifest` builds nothing for `candidate`, in the refusal's words,
-    or "" where it builds one. The one place those refusals are decided, so the
-    note the worker reads names the refusal `_pdb_manifest` made."""
-    selector = candidate.get("pod_selector")
-    if not isinstance(selector, dict) or not selector:
-        return "the collector attached no selector to write it from"
-    if set(selector) - LABEL_SELECTOR_KEYS:
-        return "the collector's selector has keys `policy/v1` does not take"
-    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
-        return "the collector's selector is empty, and would select every pod in the namespace"
-    workload = str(candidate.get("object") or "").partition("/")[2]
-    if not KUBERNETES_NAME_PATTERN.match(f"{workload}{GENERATED_PDB_SUFFIX}"):
-        return "its name would not be a valid Kubernetes name"
-    if not KUBERNETES_NAME_PATTERN.match(str(candidate.get("namespace") or "")):
-        return "the collector named no valid namespace for it"
-    return ""
+    or "" where it builds one: the recipe's `unbuildable_reason`, so the note the
+    worker reads names the refusal `_pdb_manifest` made."""
+    return _no_pdb_fix().unbuildable_reason(candidate)
 
 
 def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
-    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None.
-
-    `maxUnavailable: 1` and the workload's `spec.selector` verbatim, which the
-    collector carries as `pod_selector`. None where that cannot be written
-    safely (`_pdb_unbuildable_reason`): no selector, an empty one (which would
-    select every pod in the namespace), keys `policy/v1` does not take, or a
-    name or namespace Kubernetes refuses.
-    """
-    if _pdb_unbuildable_reason(candidate):
-        return None
-    selector = candidate["pod_selector"]
-    name = f"{str(candidate.get('object') or '').partition('/')[2]}{GENERATED_PDB_SUFFIX}"
-    namespace = str(candidate.get("namespace") or "")
-    # JSON is YAML, so the selector is written exactly as it was read.
-    text = (
-        f"# {candidate.get('cluster', '')}: {GENERATED_FIX_CHECK} on {candidate.get('object')} "
-        f"({finding_id})\n"
-        "apiVersion: policy/v1\n"
-        "kind: PodDisruptionBudget\n"
-        "metadata:\n"
-        f"  name: {name}\n"
-        f"  namespace: {namespace}\n"
-        "spec:\n"
-        "  maxUnavailable: 1\n"
-        f"  selector: {json.dumps(selector, sort_keys=True)}\n"
-    )
-    return name, text
+    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None: the
+    `no-pdb` recipe's `generate` (`fix_recipes/no-pdb/fix.py`), which says when
+    it refuses and pins the text byte for byte."""
+    return _no_pdb_fix().generate(candidate, finding_id)
 
 
 def _broker_outage(exc: BaseException) -> bool:
@@ -23369,7 +23350,7 @@ def _open_promoted_prs(
     """Open (or refresh) one pull request per group holding a promoted finding.
 
     `on_open` runs after each one, before the next is tried. `manifest` is the
-    run's collector manifest, which `pdb_safety_section` needs.
+    run's collector manifest, which `safety_section` needs.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,

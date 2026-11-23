@@ -195,6 +195,39 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "PROTECTED_BRANCH")
         self.assertEqual(caught.exception.as_json(), {"error": "no", "code": "PROTECTED_BRANCH", "detail": "d"})
 
+    def _refused_with(self, status, payload, verb="publish"):
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(status, payload)
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call(verb, {})
+        return caught.exception
+
+    def test_a_refusal_code_that_is_not_a_text_is_no_code(self):
+        """The callers look the code up in a set, and a list cannot enter one: the lookup
+        raised TypeError. The rest of the refusal stays."""
+        known = frozenset({"PROTECTED_BRANCH"})
+        for code in (["PROTECTED_BRANCH"], {"name": "PROTECTED_BRANCH"}, 7, True, ""):
+            with self.subTest(code=code):
+                refused = self._refused_with(409, {"error": "no", "code": code, "detail": "d"})
+                self.assertIsNone(refused.code)
+                self.assertNotIn(refused.code, known)
+                self.assertEqual({"error": "no", "detail": "d"}, refused.as_json())
+
+    def test_a_404_with_a_code_that_is_not_a_text_reads_as_a_404_with_no_code(self):
+        """A 404 with no code is a broker that does not serve the verb."""
+        for code in (["FORGE_NOT_FOUND"], {"name": "FORGE_NOT_FOUND"}, 7, ""):
+            with self.subTest(code=code):
+                refused = self._refused_with(404, {"status": "not_found", "code": code}, verb="issue-update")
+                self.assertEqual(vcs_client.BROKER_ROUTE_UNSUPPORTED, refused.code)
+
+    def test_the_error_keeps_a_code_that_is_a_text_and_drops_each_other_value(self):
+        self.assertEqual("BASE_MOVED", vcs_client.VcsError("moved", code="BASE_MOVED").code)
+        for code in (["BASE_MOVED"], ("BASE_MOVED",), {"BASE_MOVED": 1}, 7, True, "", None):
+            with self.subTest(code=code):
+                self.assertIsNone(vcs_client.VcsError("moved", code=code).code)
+
     def test_a_path_refusal_keeps_the_revision_the_broker_read(self):
         error = vcs_client.credential_proxy_client.WorkspaceRequestError(
             "refused", payload={"error": "no", "code": "PATH_NOT_FOUND", "revision": "a" * 40}
@@ -766,6 +799,42 @@ class WorkingCopyTest(unittest.TestCase):
 
     def _record(self) -> dict:
         return json.loads((vcs_client.SESSIONS / "local__acme__infra__main.json").read_text())
+
+    def test_a_publish_answer_with_a_branch_or_revision_that_is_not_a_text_is_an_error_and_the_record_stays(self):
+        """The broker did the publish. The record has the branch as a key, which a list cannot
+        be, and a made-up name there is worse than the error. An absent value (None here) and an
+        empty text are no name either."""
+        cloned = vcs_client.clone("acme/infra")
+        vcs_client.branch("acme/infra", "fix/one")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("change a", spec="acme/infra")
+        record_files = sorted(vcs_client.SESSIONS.iterdir())
+        before = {path: path.read_bytes() for path in record_files}
+        good_call = self.call
+        for field in ("branch", "revision"):
+            for value in (["fix/one"], {"name": "fix/one"}, 7, None, ""):
+                with self.subTest(field=field, value=value):
+                    self.published.clear()
+
+                    def call(verb, payload, field=field, value=value):
+                        answer = good_call(verb, payload)
+                        if verb == "publish":
+                            answer[field] = value
+                        return answer
+
+                    with mock.patch.object(vcs_client, "call", call), self.assertRaises(vcs_client.VcsError) as caught:
+                        vcs_client.publish("acme/infra")
+                    self.assertEqual(
+                        f"the broker's answer has no usable `{field}`; the request reached the broker and may have taken effect",
+                        str(caught.exception),
+                    )
+                    self.assertIsNone(caught.exception.code)
+                    self.assertEqual(1, len(self.published), "the publish went to the broker one time")
+                    self.assertEqual(before, {path: path.read_bytes() for path in sorted(vcs_client.SESSIONS.iterdir())})
+                    self.assertEqual(list(vcs_client.ROOT.glob("*.bundle")), [])
+        # The control: with the answer as the broker sends it, the same publish goes into the record.
+        vcs_client.publish("acme/infra")
+        self.assertNotEqual(before, {path: path.read_bytes() for path in sorted(vcs_client.SESSIONS.iterdir())})
 
     def test_clone_carries_the_pinned_base_into_the_record_and_the_answer(self):
         self.clone_extra = {"baseBranch": "release"}
