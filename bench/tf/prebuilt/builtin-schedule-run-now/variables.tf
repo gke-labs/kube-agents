@@ -36,18 +36,33 @@ variable "agent_namespace" {
   type        = string
   description = "Namespace of the kube-agents install on host_cluster_name, where its AgentSchedules are"
   default     = "kubeagents-system"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.agent_namespace))
+    error_message = "agent_namespace must be a namespace name: a DNS-1123 label."
+  }
 }
 
 variable "agent_deployment" {
   type        = string
   description = "Deployment running the gateway pod, whose agent container holds the state file"
   default     = "platform-agent-gateway"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.agent_deployment))
+    error_message = "agent_deployment must be a Deployment name: a DNS-1123 label."
+  }
 }
 
 variable "agent_container" {
   type        = string
   description = "Container inside agent_deployment that mounts the agent's data volume"
   default     = "platform-agent"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.agent_container))
+    error_message = "agent_container must be a container name: a DNS-1123 label."
+  }
 }
 
 variable "schedule" {

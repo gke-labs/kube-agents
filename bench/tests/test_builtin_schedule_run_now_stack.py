@@ -63,6 +63,7 @@ class FakeKubectl:
         self.files: dict[str, str] = {}
         self.log: list[tuple] = []
         self.unreadable = False
+        self.snapshot = {"rows": {"f1": {"source": "audit", "check_slug": "c", "hash": "h"}}, "count": 1, "error": None}
 
     def schedule(self, name):
         assert name == NAME
@@ -73,13 +74,18 @@ class FakeKubectl:
             step(self.object)
         return json.loads(json.dumps(self.object))
 
-    def annotate(self, name, value):
-        self.log.append(("annotate", value))
+    def annotate(self, name, value, key=None):
+        key = key or run_now.RUN_NOW_ANNOTATION
+        self.log.append(("annotate", value) if key == run_now.RUN_NOW_ANNOTATION else ("annotate", key, value))
         annotations = self.object["metadata"]["annotations"]
         if value is None:
-            annotations.pop(run_now.RUN_NOW_ANNOTATION, None)
+            annotations.pop(key, None)
         else:
-            annotations[run_now.RUN_NOW_ANNOTATION] = value
+            annotations[key] = value
+
+    def findings_snapshot(self):
+        self.log.append(("findings_snapshot",))
+        return dict(self.snapshot)
 
     def pod_now(self):
         self.log.append(("pod_now",))
@@ -151,7 +157,8 @@ def test_idle_gives_up_on_a_run_that_does_not_settle():
 def test_fire_records_the_pods_clock_before_it_sets_a_fresh_token():
     fake = FakeKubectl(status={"lastTaskID": "t1", "recentRuns": [{"taskID": "t1"}, {"taskID": "t0"}], "lastHandledRunNow": "old"})
     state = _fired(fake)
-    assert [entry[0] for entry in fake.log] == ["pod_now", "write_state", "annotate"]
+    assert [entry[0] for entry in fake.log] == ["findings_snapshot", "pod_now", "write_state", "annotate"]
+    assert state["findings_snapshot"] == fake.snapshot
     assert state["fired_at"] == POD_NOW
     assert datetime.fromisoformat(state["fired_at"]).tzinfo is not None
     assert state["schedule"] == NAME
@@ -159,6 +166,29 @@ def test_fire_records_the_pods_clock_before_it_sets_a_fresh_token():
     assert state["token"] == _token(fake)
     assert state["token"].startswith(run_now.TOKEN_PREFIX)
     assert state["token"] != "old"
+
+
+def test_a_snapshot_that_failed_stops_the_fire():
+    fake = FakeKubectl()
+    fake.snapshot = {"rows": None, "count": 0, "error": "SESSION_KV_API_KEY is not set in the agent container"}
+    with pytest.raises(SystemExit, match="could not be read before the fire"):
+        run_now.fire(fake, NAME, STATE)
+    assert ("annotate", ) not in [entry[:1] for entry in fake.log if entry[0] == "annotate"]
+    assert run_now.RUN_NOW_ANNOTATION not in fake.object["metadata"]["annotations"]
+
+
+@pytest.mark.parametrize("bad", ["Compliance", "a_b", "-x", "x" * 64, "--all", "a b", ""])
+def test_a_schedule_that_is_not_a_name_never_reaches_kubectl(bad):
+    fake = FakeKubectl()
+    for step in (
+        lambda: run_now.idle(fake, bad, 60),
+        lambda: run_now.fire(fake, bad, STATE),
+        lambda: run_now.wait(fake, bad, STATE, 60, 60),
+        lambda: run_now.clean(fake, bad, STATE),
+    ):
+        with pytest.raises(SystemExit, match="not an AgentSchedule name"):
+            step()
+    assert fake.log == []
 
 
 def test_two_fires_set_two_tokens():
@@ -307,6 +337,36 @@ def test_a_run_of_another_token_in_flight_is_not_the_fired_one():
     assert json.loads(fake.files[STATE])["task_id"] == "t-cadence"
 
 
+def test_a_new_ring_entry_before_the_token_is_handled_is_not_the_fired_run():
+    """A cadence run that ended before the schedule handled the token is not the fire's."""
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [
+        _settle("t-cadence", delivery="posted"),
+        _accept("t-fired"),
+        _settle("t-fired", delivery="local"),
+    ]
+    run_now.wait(fake, NAME, STATE, 3600, 660)
+    assert json.loads(fake.files[STATE])["task_id"] == "t-fired"
+
+
+def test_an_active_slot_answering_another_token_is_not_the_fired_run():
+    fake = FakeKubectl()
+    _fired(fake)
+
+    def other_slot(obj):
+        _status(obj, lastHandledRunNow=_token(fake), activeTaskID="t-other", activeSlot={"runNow": "someone-else"})
+
+    def ours(obj):
+        _status(obj, activeTaskID="t-ours", activeSlot={"runNow": _token(fake)})
+
+    fake.script = [other_slot, ours, _settle("t-ours", delivery="local")]
+    run_now.wait(fake, NAME, STATE, 3600, 660)
+    state = json.loads(fake.files[STATE])
+    assert state["task_id"] == "t-ours"
+    assert state["active_run_now"] == state["token"]
+
+
 # ---------------------------------------------------------------- clean
 
 
@@ -323,6 +383,54 @@ def test_clean_leaves_a_token_someone_else_set():
     run_now.clean(fake, NAME, STATE)
     assert fake.object["metadata"]["annotations"][run_now.RUN_NOW_ANNOTATION] == "1732380000"
     assert ("annotate", None) not in fake.log
+
+
+def test_a_failed_apply_stops_the_fired_run_in_flight():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [_accept("t-slow")]
+    with pytest.raises(SystemExit):
+        run_now.wait(fake, NAME, STATE, 60, 660)
+    run_now.clean(fake, NAME, STATE, stop_run=True)
+    stops = [entry for entry in fake.log if entry[:2] == ("annotate", run_now.STOP_ANNOTATION)]
+    assert len(stops) == 1 and stops[0][2].startswith(run_now.TOKEN_PREFIX)
+    assert fake.object["metadata"]["annotations"][run_now.STOP_ANNOTATION] == stops[0][2]
+    assert STATE not in fake.files
+
+
+def test_a_failed_apply_before_the_task_was_seen_still_stops_it():
+    """A SIGTERM between the fire and the first poll that named the task."""
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [_accept("t-new")]
+    run_now.clean(fake, NAME, STATE, stop_run=True)
+    assert run_now.STOP_ANNOTATION in fake.object["metadata"]["annotations"]
+
+
+def test_a_run_that_already_ended_is_not_stopped():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [_accept("t-done"), _settle("t-done", delivery="local")]
+    run_now.wait(fake, NAME, STATE, 3600, 660)
+    run_now.clean(fake, NAME, STATE, stop_run=True)
+    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
+
+
+def test_another_run_in_flight_is_not_stopped():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.files[STATE] = json.dumps(json.loads(fake.files[STATE]) | {"task_id": "t-fired"})
+    fake.script = [lambda o: _status(o, activeTaskID="t-cadence", lastHandledRunNow="x")]
+    run_now.clean(fake, NAME, STATE, stop_run=True)
+    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
+
+
+def test_the_destroys_clean_stops_nothing():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [_accept("t-slow")]
+    run_now.clean(fake, NAME, STATE)
+    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
 
 
 def test_clean_with_an_unreadable_schedule_still_removes_the_state_file():
@@ -358,6 +466,7 @@ def test_the_kubectl_calls_are_the_schedule_and_the_gateway_container(monkeypatc
     assert kubectl.pod_now() == POD_NOW
     kubectl.write_state(STATE, {"fired_at": POD_NOW})
     kubectl.remove_state(STATE)
+    kubectl.annotate(NAME, "bench-run-now-2-cd", key=run_now.STOP_ANNOTATION)
     ns = ["kubectl", "-n", "kubeagents-system"]
     exec_prefix = ["exec", "deployment/platform-agent-gateway", "-c", "platform-agent", "--"]
     assert calls[0][0] == [*ns, "get", run_now.RESOURCE, NAME, "-o", "json"]
@@ -368,6 +477,38 @@ def test_the_kubectl_calls_are_the_schedule_and_the_gateway_container(monkeypatc
     assert calls[4][0][-1] == STATE
     assert json.loads(calls[4][1]) == {"fired_at": POD_NOW}
     assert calls[5][0] == [*ns, *exec_prefix, "rm", "-f", STATE]
+    assert calls[6][0] == [*ns, "annotate", run_now.RESOURCE, NAME, f"{run_now.STOP_ANNOTATION}=bench-run-now-2-cd", "--overwrite"]
+
+
+def test_the_snapshot_runs_the_script_in_the_agent_container(monkeypatch):
+    calls: list[list[str]] = []
+    payload = {"rows": {}, "count": 0, "error": None}
+
+    def run(cmd, input=None, **kwargs):
+        calls.append(cmd)
+        return Done("noise\n" + run_now.SNAPSHOT_READ + json.dumps(payload) + "\n")
+
+    monkeypatch.setattr(run_now.subprocess, "run", run)
+    snap = run_now.Kubectl("ns", "dep", "ctr").findings_snapshot()
+    assert snap == payload
+    cmd = calls[0]
+    assert cmd[:8] == ["kubectl", "-n", "ns", "exec", "deployment/dep", "-c", "ctr", "--"]
+    assert cmd[8:10] == ["sh", "-c"]
+    assert cmd[11] == run_now.SNAPSHOT_SCRIPT
+    assert cmd[12:] == [run_now.SESSION_KV_URL, str(run_now.FINDINGS_ROW_LIMIT), str(run_now.FINDINGS_TIMEOUT_SEC), run_now.SNAPSHOT_READ]
+
+
+def test_the_snapshot_script_is_the_checks():
+    """The stack's copy and the check's are the same script, with the same arguments, so the two snapshots compare."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO / "bench"))
+    from kube_agents_bench import findings, worker_trajectory
+
+    assert run_now.SNAPSHOT_SCRIPT == findings.SNAPSHOT_SCRIPT
+    assert run_now.SNAPSHOT_READ == findings.SNAPSHOT_READ
+    assert [run_now.SESSION_KV_URL, str(run_now.FINDINGS_ROW_LIMIT), str(run_now.FINDINGS_TIMEOUT_SEC), run_now.SNAPSHOT_READ] == findings.snapshot_argv()
+    assert (run_now.POD_PYTHON, run_now.POD_PYTHON_FALLBACK) == (worker_trajectory.HERMES_PYTHON, worker_trajectory.FALLBACK_PYTHON)
 
 
 def test_a_kubectl_failure_stops_the_step(monkeypatch):
@@ -378,19 +519,23 @@ def test_a_kubectl_failure_stops_the_step(monkeypatch):
 
 def test_the_command_line_routes_each_step(monkeypatch):
     seen: list[tuple] = []
+    stops: list[bool] = []
     for verb in ("idle", "fire", "wait", "clean"):
-        monkeypatch.setattr(run_now, verb, lambda kubectl, *args, verb=verb: seen.append((verb, kubectl.namespace, kubectl.deployment, kubectl.container, args)))
+        monkeypatch.setattr(run_now, verb, lambda kubectl, *args, verb=verb, **kw: (seen.append((verb, kubectl.namespace, kubectl.deployment, kubectl.container, args)), stops.append(kw.get("stop_run"))))
     flags = ["--namespace", "ns", "--deployment", "dep", "--container", "ctr"]
     run_now.main([*flags, "idle", NAME, "1800"])
     run_now.main([*flags, "fire", NAME, STATE])
     run_now.main([*flags, "wait", NAME, STATE, "2700", "660"])
     run_now.main([*flags, "clean", NAME, STATE])
+    run_now.main([*flags, "clean", "--stop-run", NAME, STATE])
     assert seen == [
         ("idle", "ns", "dep", "ctr", (NAME, "1800")),
         ("fire", "ns", "dep", "ctr", (NAME, STATE)),
         ("wait", "ns", "dep", "ctr", (NAME, STATE, "2700", "660")),
         ("clean", "ns", "dep", "ctr", (NAME, STATE)),
+        ("clean", "ns", "dep", "ctr", (NAME, STATE)),
     ]
+    assert stops[-2:] == [False, True]
 
 
 # ---------------------------------------------------------------- the stack's parameters
@@ -424,7 +569,7 @@ def test_main_runs_every_step_with_the_schedule_and_the_waits():
         'run_now idle "${var.schedule}" "${var.idle_wait}"',
         'run_now fire "${var.schedule}" "${local.state_file}"',
         'run_now wait "${var.schedule}" "${local.state_file}" "${var.run_wait}" "${var.delivery_wait}"',
-        'run_now clean "${var.schedule}" "${local.state_file}"',
+        'run_now clean --stop-run "${var.schedule}" "${local.state_file}"',
         'clean "${self.triggers.schedule}" "${self.triggers.state_file}"',
     ):
         assert step in main, step
@@ -444,3 +589,23 @@ def test_the_annotation_and_the_label_are_the_operators():
     assert re.search(r'AgentScheduleOriginLabel = "([^"]+)"', types).group(1) == run_now.ORIGIN_LABEL
     assert re.search(r'AgentScheduleOriginBuiltin = "([^"]+)"', types).group(1) == run_now.ORIGIN_BUILTIN
     assert re.search(r'AgentScheduleOutcomeLost\s+= "([^"]+)"', types).group(1) == run_now.OUTCOME_LOST
+
+
+def test_the_script_is_inlined_so_the_destroy_runs_the_applied_copy():
+    main = (STACK / "main.tf").read_text()
+    assert 'run_now_b64 = base64encode(file("${path.module}/run_now.py"))' in main
+    assert "run_now_b64   = local.run_now_b64" in main
+    assert "printf '%s' '${local.run_now_b64}' | base64 -d" in main
+    assert "printf '%s' '${self.triggers.run_now_b64}' | base64 -d" in main
+    # No path to the module's file survives into a provisioner.
+    assert 'python3 "${path.module}' not in main
+    assert "self.triggers.script" not in main
+
+
+@pytest.mark.parametrize("name", ["agent_namespace", "agent_deployment", "agent_container"])
+def test_the_install_names_are_checked(name):
+    block = _variables()[name]
+    pattern = re.search(rf'regex\("([^"]+)", var\.{name}\)', block).group(1)
+    assert re.fullmatch(pattern, "platform-agent-gateway")
+    for bad in ("Has-Caps", "a b", "-x", "x;rm", "x" * 64):
+        assert not re.fullmatch(pattern, bad), bad

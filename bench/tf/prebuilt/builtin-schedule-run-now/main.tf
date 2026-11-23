@@ -30,14 +30,17 @@
 # turn is graded.
 #
 # Access: kubectl get and annotate on the schedule, and kubectl exec into the
-# gateway's agent container for the clock and the state file, with the
-# runner's credentials for the host cluster. No Secret is read.
+# gateway's agent container for the clock, the state file and the findings
+# queue snapshot (the Session KV route, with the container's own key, as the
+# findings checks read it), with the runner's credentials for the host
+# cluster. No Secret is read.
 #
-# Teardown: a failed apply removes the state file and the annotation before it
-# exits (Terraform taints the resource and skips its destroy provisioner); the
-# destroy removes both on the success path. The annotation is removed only
-# while it holds a token run_now.py set. A run still going when an apply fails
-# is left to finish.
+# Teardown: a failed apply (a wait that timed out, a SIGTERM) first stops the
+# fired run if it is still in flight, with the schedule's
+# `kubeagents.x-k8s.io/stop` annotation, then removes the state file and the
+# run-now annotation before it exits (Terraform taints the resource and skips
+# its destroy provisioner); the destroy removes both on the success path. The
+# run-now annotation is removed only while it holds a token run_now.py set.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -52,6 +55,9 @@ terraform {
 locals {
   # Read by the store and side-effect checks as `since_state_file`.
   state_file = "/opt/data/.bench-builtin-schedule-run-now.json"
+  # The script inlined, so the destroy runs the copy the apply ran, as
+  # audit-chat-report carries arm.py.
+  run_now_b64 = base64encode(file("${path.module}/run_now.py"))
 }
 
 resource "null_resource" "run_now" {
@@ -64,8 +70,7 @@ resource "null_resource" "run_now" {
     container     = var.agent_container
     schedule      = var.schedule
     state_file    = local.state_file
-    script        = "${path.module}/run_now.py"
-    digest        = filesha256("${path.module}/run_now.py")
+    run_now_b64   = local.run_now_b64
   }
 
   provisioner "local-exec" {
@@ -73,8 +78,9 @@ resource "null_resource" "run_now" {
     command     = <<-EOT
       set -euo pipefail
       kubeconfig_dir="$(mktemp -d)"
+      printf '%s' '${local.run_now_b64}' | base64 -d > "$kubeconfig_dir/run_now.py"
       run_now() {
-        python3 "${path.module}/run_now.py" --namespace "${var.agent_namespace}" \
+        python3 "$kubeconfig_dir/run_now.py" --namespace "${var.agent_namespace}" \
           --deployment "${var.agent_deployment}" --container "${var.agent_container}" "$@"
       }
       on_exit() {
@@ -83,7 +89,7 @@ resource "null_resource" "run_now" {
         set +e
         if [ "$status" -ne 0 ]; then
           echo "Apply failed (exit $status); undoing what it did." >&2
-          run_now clean "${var.schedule}" "${local.state_file}" >&2 \
+          run_now clean --stop-run "${var.schedule}" "${local.state_file}" >&2 \
             || echo "Could not clean up; the next apply's fire overwrites the state file and the annotation." >&2
         fi
         rm -rf "$kubeconfig_dir"
@@ -120,6 +126,7 @@ resource "null_resource" "run_now" {
       trap 'rm -rf "$kubeconfig_dir"' EXIT
       KUBECONFIG="$kubeconfig_dir/config"
       export KUBECONFIG
+      printf '%s' '${self.triggers.run_now_b64}' | base64 -d > "$kubeconfig_dir/run_now.py"
 
       project="${self.triggers.host_project}"
       if [ -z "$project" ]; then
@@ -129,7 +136,7 @@ resource "null_resource" "run_now" {
         --location "${self.triggers.host_location}" --project "$project" --quiet \
         || echo "WARNING: could not fetch credentials for ${self.triggers.host_cluster}." >&2
 
-      python3 "${self.triggers.script}" --namespace "${self.triggers.namespace}" \
+      python3 "$kubeconfig_dir/run_now.py" --namespace "${self.triggers.namespace}" \
         --deployment "${self.triggers.deployment}" --container "${self.triggers.container}" \
         clean "${self.triggers.schedule}" "${self.triggers.state_file}" \
         || echo "WARNING: could not remove the state file or the annotation; the next apply overwrites both." >&2

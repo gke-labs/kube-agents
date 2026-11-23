@@ -21,15 +21,20 @@ fetches the credentials). Four commands, each after the global flags
   idle <schedule> <seconds>    refuse a schedule that is not built-in, then wait until
                                it has no run in flight or claimed, so the run-now
                                starts a run rather than adopting one
-  fire <schedule> <state>      record when, in the state file <state> in the gateway's
-                               agent container, then set the run-now annotation to a
-                               token the schedule has not handled
+  fire <schedule> <state>      record when, and a snapshot of the findings queue (each
+                               row's id, source, check and hash), in the state file
+                               <state> in the gateway's agent container, then set the
+                               run-now annotation to a token the schedule has not
+                               handled
   wait <schedule> <state> <run-seconds> <delivery-seconds>
                                wait until the fired run has ended, then until the
                                gateway has said how its report was delivered, and
                                record both in the state file
-  clean <schedule> <state>     remove the state file, and the annotation when it still
-                               holds a token this script set
+  clean [--stop-run] <schedule> <state>
+                               remove the state file, and the annotation when it still
+                               holds a token this script set; with --stop-run (a failed
+                               apply), first stop the fired run if it is still in flight,
+                               with the schedule's stop annotation
 
 The annotation (``kubeagents.x-k8s.io/run-now``, AgentScheduleRunNowAnnotation)
 asks for one run: a value that differs from ``status.lastHandledRunNow`` claims a
@@ -44,10 +49,12 @@ The fire time is the gateway pod's clock, read before the annotation is set, so
 it is a lower bound for anything the run writes. The store and side-effect
 checks read it from the state file as ``fired_at`` (the shape the
 audit-chat-report and unchanged-manifest-digest stacks write).
+``findings_queue_untouched`` diffs the queue against the snapshot.
 """
 
 import argparse
 import json
+import re
 import secrets
 import subprocess
 import sys
@@ -55,6 +62,7 @@ import time
 
 # k8s-operator/api/v1alpha1/agentschedule_types.go.
 RUN_NOW_ANNOTATION = "kubeagents.x-k8s.io/run-now"
+STOP_ANNOTATION = "kubeagents.x-k8s.io/stop"
 ORIGIN_LABEL = "kubeagents.x-k8s.io/origin"
 ORIGIN_BUILTIN = "builtin"
 # AgentScheduleOutcomeLost: a run the gateway lost has no delivery to wait for.
@@ -66,6 +74,50 @@ TOKEN_PREFIX = "bench-run-now-"
 TOKEN_RANDOM_BYTES = 4
 POLL_S = 15
 KUBECTL_TIMEOUT_S = 60
+# An AgentSchedule name, checked before it reaches kubectl's argv.
+SCHEDULE_NAME_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?\Z")
+
+# kube_agents_bench/findings.py: SESSION_KV_URL, ROW_LIMIT, REQUEST_TIMEOUT_SEC,
+# SNAPSHOT_READ and SNAPSHOT_SCRIPT, copied because this file runs on its own
+# (main.tf inlines it); the stack's tests hold the copies equal.
+SESSION_KV_URL = "http://127.0.0.1:8699"  # sanitizer: allow the Session KV server on the pod's loopback, not an address of anyone's
+FINDINGS_ROW_LIMIT = 1000
+FINDINGS_TIMEOUT_SEC = 20.0
+SNAPSHOT_READ = "__FINDINGS_QUEUE_SNAPSHOT__"
+SNAPSHOT_SCRIPT = r"""
+import hashlib, json, os, sys, urllib.error, urllib.parse, urllib.request
+base, limit, timeout, sentinel = sys.argv[1:5]
+out = {"rows": None, "count": 0, "error": None}
+token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+if not token:
+    out["error"] = "SESSION_KV_API_KEY is not set in the agent container"
+else:
+    query = urllib.parse.urlencode({"limit": limit})
+    request = urllib.request.Request(base + "/v1/findings?" + query, headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(request, timeout=float(timeout)) as response:
+            rows = json.loads(response.read().decode("utf-8")).get("findings")
+        if not isinstance(rows, list):
+            out["error"] = "GET /v1/findings returned no list of findings"
+        else:
+            out["count"] = len(rows)
+            out["rows"] = {
+                str(row.get("id")): {
+                    "source": row.get("source"),
+                    "check_slug": row.get("check_slug"),
+                    "hash": hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
+                }
+                for row in rows
+                if isinstance(row, dict)
+            }
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        out["error"] = "GET /v1/findings: %s" % exc
+print(sentinel + json.dumps(out))
+"""
+# The agent container's Python, as the bench's reads pick it.
+POD_PYTHON = '/opt/hermes/.venv/bin/python3'
+POD_PYTHON_FALLBACK = 'python3'
+
 # The pod's own clock, in the ISO-8601 form verifiers.read_fired_at parses.
 POD_CLOCK = ["date", "-u", "+%Y-%m-%dT%H:%M:%S+00:00"]
 
@@ -97,10 +149,23 @@ class Kubectl:
     def schedule(self, name):
         return json.loads(self.run(["get", RESOURCE, name, "-o", "json"]))
 
-    def annotate(self, name, value):
-        """Set the run-now annotation to ``value``, or remove it when ``value`` is None."""
-        pair = f"{RUN_NOW_ANNOTATION}-" if value is None else f"{RUN_NOW_ANNOTATION}={value}"
+    def annotate(self, name, value, key=RUN_NOW_ANNOTATION):
+        """Set the annotation ``key`` to ``value``, or remove it when ``value`` is None."""
+        pair = f"{key}-" if value is None else f"{key}={value}"
         self.run(["annotate", RESOURCE, name, pair, "--overwrite"])
+
+    def findings_snapshot(self):
+        """The findings queue's snapshot from the agent container (SNAPSHOT_SCRIPT's object)."""
+        command = (
+            f'PY={POD_PYTHON}; [ -x "$PY" ] || PY={POD_PYTHON_FALLBACK}; "$PY" -c "$0" "$@"'
+        )
+        reply = self.exec(
+            ["sh", "-c", command, SNAPSHOT_SCRIPT, SESSION_KV_URL, str(FINDINGS_ROW_LIMIT), str(FINDINGS_TIMEOUT_SEC), SNAPSHOT_READ]
+        )
+        marker = reply.find(SNAPSHOT_READ)
+        if marker < 0:
+            raise SystemExit("the findings queue snapshot printed nothing")
+        return json.loads(reply[marker + len(SNAPSHOT_READ):].strip().splitlines()[0])
 
     def pod_now(self):
         return self.exec(POD_CLOCK).strip()
@@ -129,6 +194,11 @@ def _busy(status):
     return None
 
 
+def _require_name(name):
+    if not SCHEDULE_NAME_RE.match(name or ""):
+        raise SystemExit(f"{name!r} is not an AgentSchedule name (a DNS-1123 label)")
+
+
 def _require_builtin(schedule, name):
     labels = (schedule.get("metadata") or {}).get("labels") or {}
     if labels.get(ORIGIN_LABEL) != ORIGIN_BUILTIN:
@@ -154,6 +224,7 @@ def _sleep(seconds):
 
 
 def idle(kubectl, name, seconds):
+    _require_name(name)
     deadline = _clock() + float(seconds)
     while True:
         schedule = kubectl.schedule(name)
@@ -172,6 +243,7 @@ def new_token():
 
 
 def fire(kubectl, name, state_path):
+    _require_name(name)
     schedule = kubectl.schedule(name)
     _require_builtin(schedule, name)
     status = _status(schedule)
@@ -181,19 +253,44 @@ def fire(kubectl, name, state_path):
     if reason is not None:
         raise SystemExit(f"AgentSchedule {name}: {reason}; not firing over it")
     token = new_token()
+    # Before the clock and the fire: every row the run could write is in it.
+    snapshot = kubectl.findings_snapshot()
+    if snapshot.get("error"):
+        raise SystemExit(f"the findings queue could not be read before the fire: {snapshot['error']}")
     fired_at = kubectl.pod_now()
     kubectl.write_state(
-        state_path, {"schedule": name, "token": token, "fired_at": fired_at, "known_tasks": _known_tasks(status)}
+        state_path,
+        {
+            "schedule": name,
+            "token": token,
+            "fired_at": fired_at,
+            "known_tasks": _known_tasks(status),
+            "findings_snapshot": snapshot,
+        },
     )
     kubectl.annotate(name, token)
     print(f"set {RUN_NOW_ANNOTATION}={token} on AgentSchedule {name} at {fired_at}")
 
 
+def _active_run_now(status):
+    """The run-now token the run in flight answers, when the status says (status.activeSlot.runNow)."""
+    slot = status.get("activeSlot")
+    return slot.get("runNow") if isinstance(slot, dict) else None
+
+
 def _fired_task(status, state):
-    """The fired run's task, once the status names one the schedule did not have before the fire."""
+    """The fired run's task, once the status names one the schedule did not have before the fire.
+
+    Only once the schedule has handled this token: before then a new task is
+    the cadence's, not the fire's. A status that names the token the run in
+    flight answers (``activeSlot.runNow``) must name this one.
+    """
+    if status.get("lastHandledRunNow") != state["token"]:
+        return None
     known = set(state.get("known_tasks") or [])
     active = status.get("activeTaskID")
-    if active and active not in known and status.get("lastHandledRunNow") == state["token"]:
+    answers = _active_run_now(status)
+    if active and active not in known and answers in (None, state["token"]):
         return active
     # A run that ended between two polls is in the ring, newest first.
     for run in status.get("recentRuns") or []:
@@ -217,6 +314,7 @@ def _run(status, task):
 
 
 def wait(kubectl, name, state_path, run_seconds, delivery_seconds):
+    _require_name(name)
     state = kubectl.read_state(state_path)
     deadline = _clock() + float(run_seconds)
     task = state.get("task_id")
@@ -227,6 +325,8 @@ def wait(kubectl, name, state_path, run_seconds, delivery_seconds):
             task = _fired_task(status, state)
             if task is not None:
                 state["task_id"] = task
+                if _active_run_now(status) is not None:
+                    state["active_run_now"] = _active_run_now(status)
                 kubectl.write_state(state_path, state)
                 print(f"AgentSchedule {name}: the fired run is task {task}")
         if task is not None and status.get("activeTaskID") != task:
@@ -254,13 +354,36 @@ def wait(kubectl, name, state_path, run_seconds, delivery_seconds):
     print(f"AgentSchedule {name}: task {task} ended {state['outcome']}, delivery {state['delivery'] or 'not reported'}")
 
 
-def clean(kubectl, name, state_path):
-    kubectl.remove_state(state_path)
+def _stop_fired_run(kubectl, name, state, schedule):
+    """Ask the schedule to stop the fired run when it is still the one in flight."""
+    status = _status(schedule)
+    task = state.get("task_id") or _fired_task(status, state)
+    if not task or status.get("activeTaskID") != task:
+        return
+    token = new_token()
+    kubectl.annotate(name, token, key=STOP_ANNOTATION)
+    print(f"set {STOP_ANNOTATION}={token} on AgentSchedule {name}: stopping run {task}", file=sys.stderr)
+
+
+def clean(kubectl, name, state_path, stop_run=False):
+    _require_name(name)
+    state = None
+    if stop_run:
+        try:
+            state = kubectl.read_state(state_path)
+        except (SystemExit, ValueError) as exc:
+            print(f"could not read the state file; no run to stop: {exc}", file=sys.stderr)
     try:
         schedule = kubectl.schedule(name)
     except SystemExit as exc:
+        kubectl.remove_state(state_path)
         print(f"could not read AgentSchedule {name}; its annotation stays: {exc}", file=sys.stderr)
         return
+    if isinstance(state, dict) and state.get("token"):
+        # Left set: a stop token removed before it is handled is a stop lost,
+        # and a handled one is inert.
+        _stop_fired_run(kubectl, name, state, schedule)
+    kubectl.remove_state(state_path)
     value = ((schedule.get("metadata") or {}).get("annotations") or {}).get(RUN_NOW_ANNOTATION, "")
     # A handled token is inert; it goes only so the schedule is left as found,
     # and only when it is this script's.
@@ -277,10 +400,13 @@ def main(argv=None):
     command = commands.add_parser("idle")
     command.add_argument("schedule")
     command.add_argument("seconds")
-    for verb in ("fire", "clean"):
-        command = commands.add_parser(verb)
-        command.add_argument("schedule")
-        command.add_argument("state")
+    command = commands.add_parser("fire")
+    command.add_argument("schedule")
+    command.add_argument("state")
+    command = commands.add_parser("clean")
+    command.add_argument("--stop-run", action="store_true")
+    command.add_argument("schedule")
+    command.add_argument("state")
     command = commands.add_parser("wait")
     command.add_argument("schedule")
     command.add_argument("state")
@@ -295,7 +421,7 @@ def main(argv=None):
     elif args.command == "wait":
         wait(kubectl, args.schedule, args.state, args.run_seconds, args.delivery_seconds)
     else:
-        clean(kubectl, args.schedule, args.state)
+        clean(kubectl, args.schedule, args.state, stop_run=args.stop_run)
 
 
 if __name__ == "__main__":
