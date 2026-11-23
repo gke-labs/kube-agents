@@ -14,7 +14,7 @@ func TestTeamsAPIMethodLabelNamesTheOperationFromTheVerbAndEndpoint(t *testing.T
 	}{
 		{http.MethodPost, conv, teamsAPIMethodCreate},
 		{http.MethodPut, conv + "/1794603936403", teamsAPIMethodUpdate},
-		{http.MethodDelete, conv + "/1794603936403", teamsAPIMethodDelete},
+		{http.MethodDelete, conv + "/1794603936403", metricsLabelOther},
 		{http.MethodPost, conv + "/1794603936403", metricsLabelOther}, // a POST under an activity is not a create
 		{http.MethodPut, conv, metricsLabelOther},                     // a PUT on the collection is nothing
 		{http.MethodGet, conv, metricsLabelOther},

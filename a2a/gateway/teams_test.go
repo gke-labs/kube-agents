@@ -373,16 +373,20 @@ func TestTeamsRelayError(t *testing.T) {
 
 // fakeTeamsRelay speaks the credential proxy's Teams relay: one event is
 // handed out on the first pull, every later pull is empty, and every ack,
-// nack and api call is recorded.
+// nack and api call is recorded. A test that sets pullStatus or apiStatus
+// has that route refuse instead, with apiBody as the refusal's body.
 type fakeTeamsRelay struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 
-	event   map[string]any
-	pulled  bool
-	acks    []string
-	apiCall []map[string]any
-	tokens  []string
+	event      map[string]any
+	pulled     bool
+	acks       []string
+	apiCall    []map[string]any
+	tokens     []string
+	pullStatus int
+	apiStatus  int
+	apiBody    map[string]any
 }
 
 func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
@@ -398,6 +402,10 @@ func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case teamsRelayEventsPath:
+			if f.pullStatus != 0 {
+				w.WriteHeader(f.pullStatus)
+				return
+			}
 			if f.pulled || f.event == nil {
 				_ = json.NewEncoder(w).Encode(map[string]any{"event": nil})
 				return
@@ -409,6 +417,11 @@ func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
 			_ = json.NewEncoder(w).Encode(map[string]any{"settled": true})
 		case teamsRelayAPIPath:
 			f.apiCall = append(f.apiCall, body)
+			if f.apiStatus != 0 {
+				w.WriteHeader(f.apiStatus)
+				_ = json.NewEncoder(w).Encode(f.apiBody)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"response": map[string]any{"id": "1794603936403-reply"}})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -481,6 +494,67 @@ func TestTeamsPostIsTimedUnderTheCreateOperation(t *testing.T) {
 	}
 	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodUpdate, teamsCallOK)); got != 1 {
 		t.Errorf("update ok observations %d, want 1", got)
+	}
+}
+
+// A 429 Microsoft answered reaches the gateway as the broker's 502 with the
+// status under teams.status; through Post it reads rate_limited and counts,
+// while a 429 the broker answered itself is an error and does not.
+func TestTeamsPostReadsMicrosofts429ThroughTheBroker(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	relay.apiStatus = http.StatusBadGateway
+	relay.apiBody = map[string]any{"error": "upstream", "teams": map[string]any{"status": 429}}
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
+	if _, err := a.Post("teams:"+testTeamsChannel, "hello"); err == nil {
+		t.Fatal("a post Microsoft refused 429 succeeded")
+	}
+	if got := counterValue(t, m.teamsRateLimited.WithLabelValues(teamsAPIMethodCreate)); got != 1 {
+		t.Errorf("rate-limited creates = %v, want 1", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodCreate, teamsCallRateLimited)); got != 1 {
+		t.Errorf("create/rate_limited observations = %d, want 1", got)
+	}
+
+	relay.mu.Lock()
+	relay.apiStatus = http.StatusTooManyRequests
+	relay.apiBody = map[string]any{"error": "slow down"}
+	relay.mu.Unlock()
+	if err := a.Edit("teams:"+testTeamsChannel, "1794603936403-reply", "hello again"); err == nil {
+		t.Fatal("an edit the broker refused 429 succeeded")
+	}
+	if got := counterValue(t, m.teamsRateLimited.WithLabelValues(teamsAPIMethodUpdate)); got != 0 {
+		t.Errorf("rate-limited updates = %v, want 0", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodUpdate, teamsCallError)); got != 1 {
+		t.Errorf("update/error observations = %d, want 1", got)
+	}
+}
+
+// A pull the broker refuses counts under failed and the loop keeps going.
+func TestTeamsRunCountsARefusedPullAsFailed(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	relay.pullStatus = http.StatusInternalServerError
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) { t.Error("a refused pull handed over a turn") }) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(t, m.teamsPulls.WithLabelValues(teamsPullFailed)) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("no failed pull counted")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("Run returned nil after cancel")
+	}
+	if got := counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEvents)); got != 0 {
+		t.Errorf("events pulls %v, want 0", got)
 	}
 }
 

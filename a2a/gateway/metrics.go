@@ -57,8 +57,8 @@ const (
 	// gchatRateLimitedName counts the ones answered 429. The event pull and
 	// its ack are relay routes, not Chat API calls, and are not timed; the
 	// pull is a long poll gchatPullsName already counts.
-	gchatAPIDurationName   = "gchat_api_request_duration_seconds"
-	gchatRateLimitedName   = "gchat_api_rate_limited_total"
+	gchatAPIDurationName = "gchat_api_request_duration_seconds"
+	gchatRateLimitedName = "gchat_api_rate_limited_total"
 	// The Teams backend's equivalents: each pull of the broker's Teams queue
 	// by outcome and the events it carried; each Bot Framework call the
 	// adapter makes through the broker's passthrough, by operation and
@@ -69,8 +69,8 @@ const (
 	teamsAPIDurationName    = "teams_api_request_duration_seconds"
 	teamsRateLimitedName    = "teams_api_rate_limited_total"
 	teamsIngressLagName     = "teams_ingress_lag_seconds"
-	chatMessagesName       = "chat_messages_total"
-	notifyMarksDroppedName = "notify_marks_dropped_total"
+	chatMessagesName        = "chat_messages_total"
+	notifyMarksDroppedName  = "notify_marks_dropped_total"
 	// messagesInboundName counts the chat messages the gateway accepted as
 	// turns, by platform: the next-mode half of status.usage's
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
@@ -157,10 +157,11 @@ const (
 	gchatCallOK          = "ok"
 	gchatCallRateLimited = "rate_limited"
 	gchatCallError       = "error"
-	// The Teams passthrough's call outcomes, the same three words.
-	teamsCallOK          = gchatCallOK
-	teamsCallRateLimited = gchatCallRateLimited
-	teamsCallError       = gchatCallError
+	// The Teams passthrough's call outcomes: the same three words, spelled
+	// on their own so a change to one backend's cannot move the other's.
+	teamsCallOK          = "ok"
+	teamsCallRateLimited = "rate_limited"
+	teamsCallError       = "error"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -198,10 +199,11 @@ const (
 	gchatPullEvents = "events"
 	gchatPullEmpty  = "empty"
 	gchatPullFailed = "failed"
-	// The Teams queue's pull outcomes, the same three words.
-	teamsPullEvents = gchatPullEvents
-	teamsPullEmpty  = gchatPullEmpty
-	teamsPullFailed = gchatPullFailed
+	// The Teams queue's pull outcomes, the same three words spelled on
+	// their own.
+	teamsPullEvents = "events"
+	teamsPullEmpty  = "empty"
+	teamsPullFailed = "failed"
 
 	// The chat-message outcomes (spec-a2a-payloads.md, "Chat messages"):
 	// rendered, laid out by the backend; text-only, a backend that renders
@@ -290,14 +292,6 @@ var (
 	metricsGchatAPIMethods = []string{
 		"spaces.messages.create", "spaces.messages.patch", "spaces.messages.get",
 		"spaces.members.list", "spaces.findDirectMessage", "spaces.setup",
-	}
-	// metricsTeamsAPIMethods are the Bot Framework operations the Teams
-	// adapter makes through the broker's passthrough, named by the REST
-	// resource and verb: a POST to a conversation's activities creates one,
-	// a PUT to an activity updates it, a DELETE removes it. Anything else
-	// the passthrough is asked for reads other.
-	metricsTeamsAPIMethods = []string{
-		teamsAPIMethodCreate, teamsAPIMethodUpdate, teamsAPIMethodDelete,
 	}
 	// metricsSlackIngressBuckets reach from a Socket Mode delivery that is
 	// near instant to one a minute late; metricsSlackAPIBuckets from a fast
@@ -473,14 +467,14 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      teamsAPIDurationName,
-			Help:      "Seconds each Bot Framework call the Teams adapter made through the credential broker's passthrough took, by method (conversations.activities.create, conversations.activities.update, conversations.activities.delete, other) and outcome (ok, the broker returned Microsoft's response; rate_limited, a 429 from Microsoft; error, any other status or no response).",
+			Help:      "Seconds each Bot Framework call the Teams adapter made through the credential broker's passthrough took, by method (conversations.activities.create, conversations.activities.update, other) and outcome (ok, the broker returned Microsoft's response; rate_limited, a 429 from Microsoft; error, any other status or no response).",
 			Buckets:   metricsGchatAPIBuckets,
 		}, []string{labelMethod, labelOutcome}),
 		teamsRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      teamsRateLimitedName,
-			Help:      "Bot Framework calls Microsoft answered 429 (rate limited), as the credential broker carries its status, by method (conversations.activities.create, conversations.activities.update, conversations.activities.delete, other).",
+			Help:      "Bot Framework calls Microsoft answered 429 (rate limited), as the credential broker carries its status, by method (conversations.activities.create, conversations.activities.update, other).",
 		}, []string{labelMethod}),
 		teamsIngressLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,

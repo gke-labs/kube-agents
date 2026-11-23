@@ -12,14 +12,15 @@ import (
 const (
 	teamsAPIMethodCreate = "conversations.activities.create"
 	teamsAPIMethodUpdate = "conversations.activities.update"
-	teamsAPIMethodDelete = "conversations.activities.delete"
 )
 
 // teamsAPIMethodLabel is the method label for one passthrough call: the
 // Bot Framework operation the HTTP method and endpoint spell (a POST to a
-// conversation's activities creates one, a PUT to an activity updates it, a
-// DELETE removes it), other for anything else. The endpoint is the
-// adapter's own, never a user's text, and the label set is closed either way.
+// conversation's activities creates one, a PUT to an activity updates it),
+// other for anything else, a DELETE included: the broker's passthrough
+// admits only POST and PUT, so the adapter never deletes. The endpoint is
+// the adapter's own, never a user's text, and the label set is closed
+// either way.
 func teamsAPIMethodLabel(httpMethod, endpoint string) string {
 	path := strings.TrimSuffix(endpoint, "/")
 	if !strings.HasPrefix(path, teamsConversationsPath) {
@@ -32,8 +33,6 @@ func teamsAPIMethodLabel(httpMethod, endpoint string) string {
 		return teamsAPIMethodCreate
 	case httpMethod == http.MethodPut && underActivities:
 		return teamsAPIMethodUpdate
-	case httpMethod == http.MethodDelete && underActivities:
-		return teamsAPIMethodDelete
 	}
 	return metricsLabelOther
 }
