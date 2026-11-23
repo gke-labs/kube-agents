@@ -116,15 +116,22 @@ def write_record(audit_report, audit_id, repo, now):
         record = report_status.run_start_record(RUN_ID, started_at, True)
         report_status.write_run_start(audit_report._run_start_store(audit_id, repo), audit_id, repo, record)
         return target
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # audit_report's own directory maker: as root it hands what it creates to
+    # the nearest existing directory's owner, the sandbox user, not root.
+    audit_report._make_store_dirs(target.parent)
     record = {"run_id": RUN_ID, "started_at": started_at, "scheduled": True, RECEIVED_KEY: started_at}
     target.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    audit_report._adopt_owner(target, target.parent.stat())
     return target
 
 
-def write_note(note_path, note):
-    """The plant note, rewritten as each write lands, so teardown always knows what to undo."""
+def write_note(audit_report, note_path, note):
+    """The plant note, rewritten as each write lands, so teardown always knows what to undo.
+
+    Owned like the store it sits in, as audit_report owns what it writes there.
+    """
     note_path.write_text(json.dumps(note, sort_keys=True), encoding="utf-8")
+    audit_report._adopt_owner(note_path, note_path.parent.stat())
 
 
 def seed(audit_report, audit_id, repo, now):
@@ -176,15 +183,18 @@ def seed(audit_report, audit_id, repo, now):
     while not parent.exists():
         created.append(str(parent))
         parent = parent.parent
-    store.mkdir(parents=True, exist_ok=True)
+    # audit_report's own directory maker, not mkdir: the seed runs as root in
+    # the sandbox, and this hands the store to the sandbox user that owns the
+    # volume, as a root run of audit_report itself would.
+    audit_report._make_store_dirs(store)
     ring = runs / f"{reported.astimezone(timezone.utc).strftime(audit_report.REPORT_STAMP_FORMAT)}.json"
     record_path = store / RUN_STARTS_DIR / f"{RUN_ID}.json"
     note = {"record": str(record_path), "ring": str(ring), "latest": str(latest), "backup": None, "created": created}
-    write_note(note_path, note)
+    write_note(audit_report, note_path, note)
     if latest.is_file():
         os.replace(latest, backup)
         note["backup"] = str(backup)
-        write_note(note_path, note)
+        write_note(audit_report, note_path, note)
     payload = {
         "status": CLEAN_STATUS,
         "issue_url": "",
