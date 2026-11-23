@@ -888,7 +888,7 @@ func TestASessionsMembersAreReadFromProcStat(t *testing.T) {
 		"417 (sleep) S 1 2":                      {0, false, false},
 		"418 (sleep) S 1 2 three":                {0, false, false},
 
-		// Read from the first ")", this name's fields would be "Z 1 2) S", a zombie with no session.
+		// Read from the first ")", this name's fields would be "Z 1 2) S", which don't parse.
 		"419 (a) Z 1 2) S 400 419 77 0": {77, true, true},
 	} {
 		sid, live, ok := statSession(line)
@@ -929,6 +929,9 @@ func TestASessionsMembersAreReadFromProcStat(t *testing.T) {
 // killSessionSelfEnv tells a re-run of this test binary to be the process killSession must spare.
 const killSessionSelfEnv = "WORKER_ADAPTER_TEST_KILL_SESSION_SELF"
 
+// killSessionSweptMarker is what the child prints once its sweep returns.
+const killSessionSweptMarker = "kill-session-swept"
+
 // killSession never signals the worker, even when procRoot lists it in the target session. The
 // sweep runs in a child copy of the test binary, so a sweep that kills itself fails the test
 // rather than ending the run.
@@ -943,14 +946,22 @@ func TestKillSessionSparesTheWorkerListedInTheSession(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(proc, self, "stat"), []byte(stat), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		if !slices.Contains(sessionMembers(proc, sid), os.Getpid()) {
+			t.Fatalf("the worker is not a member of session %d, so the sweep would test nothing", sid)
+		}
 		killSession(proc, sid)
+		fmt.Println(killSessionSweptMarker)
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestKillSessionSparesTheWorkerListedInTheSession$") // #nosec G204 -- the test binary itself
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$") // #nosec G204 -- the test binary itself
 	cmd.Env = append(os.Environ(), killSessionSelfEnv+"="+t.TempDir())
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("the sweep over a session listing the worker ended it: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), killSessionSweptMarker) {
+		t.Fatalf("the child never swept the session:\n%s", out)
 	}
 }
 
