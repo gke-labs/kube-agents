@@ -143,6 +143,22 @@ class C1IsolationIsStructural(unittest.TestCase):
                 f"{fixture}: the gateway's ServiceAccount is bound to a Google service account",
             )
 
+    @staticmethod
+    def _tier_of(role_ref: dict) -> str:
+        """The tier in a `kubeagents:<tier>:<namespace>:<agent>` role name, else the whole name.
+
+        The A2A components' Roles (`<agent>-a2a-gateway`, `<agent>-a2a-callout`)
+        and the built-in `system:auth-delegator` carry no tier. A binding of the
+        gateway identity to one of those therefore shows up under its full
+        name and fails the audited-set comparison below, rather than being
+        parsed as a tier or crashing the parse.
+        """
+        name = role_ref["name"]
+        parts = name.split(":")
+        if len(parts) == 4 and parts[0] == "kubeagents":
+            return parts[1]
+        return name
+
     def test_C1_the_gateway_identity_holds_only_the_audited_bindings(self) -> None:
         """The gateway ServiceAccount holds the minimal, local and leader grants, nothing else.
 
@@ -151,12 +167,15 @@ class C1IsolationIsStructural(unittest.TestCase):
         drift detector read the management cluster (minimal), the drift join
         reads the PlatformAgent an audit record names (local), and leader
         election takes a Lease (leader). The broker, which runs no leader
-        election, no longer holds leader.
+        election, no longer holds leader. The A2A components beside the gateway
+        (callout, spawner, verifier, scope publisher) each run as their own
+        ServiceAccount, and none of their bindings names this one: a binding
+        that did would appear here under the role's full name.
         """
         for fixture, documents in h.golden_documents().items():
             name = self._gateway(documents)["spec"]["template"]["spec"]["serviceAccountName"]
             held = sorted(
-                d["roleRef"]["name"].split(":")[1]
+                self._tier_of(d["roleRef"])
                 for d in documents
                 if d.get("kind") in ("ClusterRoleBinding", "RoleBinding")
                 and any(
@@ -168,7 +187,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             leader_subjects = [
                 s.get("name")
                 for d in documents
-                if d.get("kind") == "RoleBinding" and d["roleRef"]["name"].split(":")[1] == "leader"
+                if d.get("kind") == "RoleBinding" and self._tier_of(d["roleRef"]) == "leader"
                 for s in d.get("subjects") or []
             ]
             self.assertEqual(leader_subjects, [name], f"{fixture}: the leader Role is bound to {leader_subjects}")
@@ -855,8 +874,8 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_the_session_fence_selects_the_pods_the_spawner_stamps(self) -> None:
         """The one A2A assertion that has to live here rather than in Go.
 
-        Under `spec.mode: next` the operator renders an egress NetworkPolicy
-        over the pods the A2A gateway spawns per delegated task. That fence is
+        The operator renders an egress NetworkPolicy over the pods the A2A
+        gateway spawns per delegated task. That fence is
         what stops delegation being the way around the agent pod's own egress
         allowlist: a session pod runs the model, holds a bus credential scoped
         to its own task, and without the fence has open egress. The credential
@@ -1020,6 +1039,184 @@ class C1IsolationIsStructural(unittest.TestCase):
                         rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
                         "a peer is admitted to a port other than the metrics listener's",
                     )
+
+    # The audit-report store listener (#5619): its port and the name of it,
+    # which the Service targets.
+    _REPORT_STORE_PORT = 8700
+    _REPORT_STORE_PORT_NAME = "report-store"
+
+    @staticmethod
+    def _rule_reaches(rule: dict, port: int, port_name: str) -> bool:
+        """Whether an ingress rule admits TCP to `port` (or its name) at all.
+
+        No `ports` is every port, a port entry with no `port` is every port of
+        its protocol, an absent protocol is TCP, and `endPort` makes a range.
+        """
+        ports = rule.get("ports")
+        if not ports:
+            return True
+        for entry in ports:
+            if (entry.get("protocol") or "TCP") != "TCP":
+                continue
+            value = entry.get("port")
+            if value is None or value == port_name:
+                return True
+            if isinstance(value, int) and value <= port <= entry.get("endPort", value):
+                return True
+        return False
+
+    def test_C1_only_the_broker_reaches_the_audit_report_store_listener(self) -> None:
+        """The store's port on the gateway pod admits the broker's pods alone.
+
+        The listener reads and writes the fleet-audit report store, which is a
+        profile worker's memory of what the last run found. It checks the
+        broker's token as well, but on the pod network nothing but the broker
+        should reach it: a rule from any other peer that covers the port --
+        a port range that takes 8700 in, or a rule with no ports -- is the
+        store reachable from every pod beside it.
+
+        NetworkPolicies selecting one pod are additive, so this reads every
+        policy that selects the gateway pod and isolates it for ingress, and
+        every rule in them that reaches the port: each must admit exactly the
+        broker's pod selector. And at least one must, or the store is reached
+        by nobody, which is no listener. The rule lives in the gateway policy,
+        and no policy of the store's own is rendered: an operator rollback
+        rewrites the gateway policy without the rule, where a separate policy
+        would be left behind isolating the pod to the broker alone.
+
+        The store renders with the A2A stack, on every install, so this holds
+        on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            with self.subTest(fixture=fixture):
+                self._assert_only_the_broker_reaches_the_store(documents)
+
+    def _assert_only_the_broker_reaches_the_store(self, documents: tuple[dict, ...]) -> None:
+        port, port_name = self._REPORT_STORE_PORT, self._REPORT_STORE_PORT_NAME
+        services = [s for s in h.objects_of_kind(documents, "Service") if s["metadata"]["name"].endswith("-report-store")]
+        self.assertEqual(len(services), 1, "the golden renders no report-store Service")
+        selector = services[0]["spec"]["selector"]
+        self.assertTrue(selector, "the report-store Service selects every pod")
+        # The pod behind the Service: the Hermes gateway, not the A2A gateway.
+        gateways = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if selector == {k: d["spec"]["template"]["metadata"]["labels"].get(k) for k in selector}
+        ]
+        self.assertEqual(
+            [d["metadata"]["name"] for d in gateways], [services[0]["metadata"]["name"].removesuffix("-report-store") + "-gateway"],
+            "the report-store Service does not select the gateway pod alone",
+        )
+        gateway = gateways[0]
+        pod_labels = gateway["spec"]["template"]["metadata"]["labels"]
+        # Every port entry on the store's port or carrying its name: a second name
+        # on 8700 would let a rule admitting that name reach the store unseen.
+        declared = [
+            (c["name"], p.get("name"), p.get("containerPort"))
+            for c in h.containers_of(gateway)
+            for p in c.get("ports") or []
+            if p.get("name") == port_name or p.get("containerPort") == port
+        ]
+        self.assertEqual(
+            declared, [("agent-api-auth", port_name, port)], "the store's port is not agent-api-auth's alone"
+        )
+
+        brokers = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if d["metadata"]["name"].endswith("-credential-proxy")
+        ]
+        self.assertEqual(len(brokers), 1, "the golden no longer renders one broker Deployment")
+        broker_labels = brokers[0]["spec"]["template"]["metadata"]["labels"]
+        broker_selector = {
+            "app": brokers[0]["metadata"]["name"],
+            "kubeagents.x-k8s.io/component": "credential-proxy",
+        }
+        self.assertEqual(broker_selector, {k: broker_labels.get(k) for k in broker_selector})
+
+        def selects_gateway(policy: dict) -> bool:
+            chosen = policy["spec"].get("podSelector") or {}
+            # Not evaluated, so refused outright: a policy selecting the gateway
+            # by matchExpressions could admit any peer to the store unseen.
+            self.assertFalse(
+                chosen.get("matchExpressions"),
+                f"{policy['metadata']['name']} uses matchExpressions, which this check does not evaluate",
+            )
+            labels = chosen.get("matchLabels") or {}
+            return labels == {k: pod_labels.get(k) for k in labels}
+
+        isolating = [
+            p for p in h.objects_of_kind(documents, "NetworkPolicy")
+            if selects_gateway(p) and "Ingress" in (p["spec"].get("policyTypes") or [])
+        ]
+        self.assertTrue(isolating, "nothing isolates the gateway pod for ingress, so every pod reaches the store")
+        reaching = []
+        for policy in isolating:
+            for rule in policy["spec"].get("ingress") or []:
+                if self._rule_reaches(rule, port, port_name):
+                    reaching.append((policy["metadata"]["name"], rule.get("from")))
+        self.assertTrue(reaching, "no rule admits anyone to the store, so the broker cannot reach it")
+        self.assertEqual(
+            {name for name, _ in reaching}, {gateway["metadata"]["name"] + "-netpol"},
+            "the store's rule is not in the gateway policy",
+        )
+        self.assertEqual(
+            [p["metadata"]["name"] for p in h.objects_of_kind(documents, "NetworkPolicy")
+             if p["metadata"]["name"].endswith("-report-store")],
+            [], "a NetworkPolicy of the store's own is rendered, which an operator rollback leaves behind",
+        )
+        for name, peers in reaching:
+            with self.subTest(policy=name):
+                self.assertEqual(
+                    peers, [{"podSelector": {"matchLabels": broker_selector}}],
+                    "a rule reaching the store's port admits a peer other than the broker's pods",
+                )
+
+    def test_C1_the_report_store_listener_reads_only_reserved_env(self) -> None:
+        """Every environment variable the store listener reads is one a CR cannot set.
+
+        agent-api-auth takes spec.deployment.env through
+        mergeCredentialProxyEnv, which drops only reserved names. A name the
+        listener reads that is not reserved is a CR choosing it: its subject
+        check, its root, or the API server it fetches the JWKS from with the
+        pod's own token, which would then vouch for any token the CR signs.
+        So the names the listener reads, each spelled through a module
+        constant, must all be in the operator's auditReportStoreEnvNames, and
+        the API server, the ServiceAccount directory and the root must come
+        from no environment variable at all.
+        """
+        listener = h.text("audit_report_store_listener")
+        tree = ast.parse(listener)
+        constants = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+        }
+        read = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "getenv")
+                and ast.unparse(node.func.value) in ("os.environ", "os") and node.args
+            ):
+                arg = node.args[0]
+                read.add(constants.get(arg.id) if isinstance(arg, ast.Name) else ast.unparse(arg))
+            if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
+                read.add(ast.unparse(node.slice))
+        self.assertTrue(read, "the listener reads no environment at all, so its subject check has no subject")
+        self.assertNotIn(None, read, "the listener reads an environment name not spelled through a module constant")
+
+        operator = h.text("audit_report_store_operator")
+        block = self._one_match(r"(?s)var auditReportStoreEnvNames = \[\]string\{(.*?)\n\}", operator, "auditReportStoreEnvNames")
+        go_constants = dict(re.findall(r"^\s*(auditReportStore\w+Env)\s*=\s*\"([^\"]+)\"", operator, re.MULTILINE))
+        reserved = set()
+        for line in re.sub(r"//[^\n]*", "", block).split(","):
+            item = line.strip()
+            if not item:
+                continue
+            reserved.add(item.strip('"') if item.startswith('"') else go_constants.get(item, item))
+        self.assertLessEqual(read, reserved, "the listener reads a name a CR can set through spec.deployment.env")
+        for name in ("FLEET_AUDIT_REPORTS_DIR", "AUDIT_REPORT_STORE_API_SERVER", "AUDIT_REPORT_STORE_SA_DIR"):
+            self.assertNotIn(name, read, f"the listener takes {name} from the environment")
+            self.assertIn(name, reserved, f"{name} is not reserved, so an image that read it would let a CR set it")
 
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
@@ -1674,9 +1871,9 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.
 
-        The operator renders the CR's integration.{googleChat,slack}.allowedUsers
-        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK}; the gateway
-        reads the same two names and checks a session's request to delegate to
+        The operator renders the CR's integration.{googleChat,slack,teams}.allowedUsers
+        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK,TEAMS}; the gateway
+        reads the same three names and checks a session's request to delegate to
         the platform agent against them. The gateway reads an absent variable
         as "all authenticated users", by design (an absent CR list means the
         same), so a rename on either side is not a refusal anyone sees: every
@@ -1690,6 +1887,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         for const, env in (
             ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
             ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
+            ("a2aTargetAllowedUsersTeamsEnvVar", "EnvTargetAllowedUsersTeams"),
         ):
             with self.subTest(pair=const):
                 rendered = self._one_match(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
@@ -1722,6 +1920,29 @@ class C1IsolationIsStructural(unittest.TestCase):
             "dropped blank-subject guard could admit a requester the "
             "compiled list does not name",
         )
+
+    def test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary(self) -> None:
+        """Tier membership crosses the same boundary (#3659).
+
+        The operator renders spec.tiers.membership onto the gateway as
+        A2A_TIER_MEMBERSHIP, and the gateway reads it to pick the tier a
+        person's profile task runs at. A rename on either side leaves the
+        gateway with no membership, so everyone runs at read and both Go
+        suites stay green: a mapped person silently loses their tier. The two
+        spellings are pinned equal here.
+        """
+        a2a_manifests = h.text("a2a_session_fence")
+        membership = h.text("a2a_gateway_tier_membership")
+        rendered = self._one_match(r'a2aTierMembershipEnvVar\s*=\s*"([^"]+)"', a2a_manifests, "the operator's a2aTierMembershipEnvVar")
+        read = self._one_match(r'EnvTierMembership\s*=\s*"([^"]+)"', membership, "the gateway's EnvTierMembership")
+        self.assertEqual(
+            rendered,
+            read,
+            "the operator renders %r and the gateway reads %r: every person runs at "
+            "read on an install whose Go suites are green" % (rendered, read),
+        )
+        self._one_match(r"Name:\s*a2aTierMembershipEnvVar,", a2a_manifests, "the operator's render of a2aTierMembershipEnvVar")
+        self._one_match(r"os\.(?:Getenv|LookupEnv)\(EnvTierMembership\)", h.text("a2a_gateway_config"), "the gateway's read of EnvTierMembership")
 
     def test_C1_the_delegate_artifact_is_spelled_once(self) -> None:
         """The reserved artifact name crosses a module boundary in two places.
@@ -1765,8 +1986,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         arrives anyway (`handleDelegateRequest`'s own comment: "the adapter
         holds the same cap", because the adapter's check is bypassable by
         anything that can reach the bus directly, so this is a second,
-        independent line of defence rather than a redundant one). Both call
-        `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
+        independent line of defence rather than a redundant one). The
+        gateway's half runs through `lib.ValidateDelegateRequest`, which
+        caps the single task's text and every batch entry's (#5682). Both
+        reach `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
         side compiles, passes every Go suite today, and silently stops
         agreeing with lib.DelegateTextCap's definition the day someone edits
         only that constant.
@@ -1779,16 +2002,67 @@ class C1IsolationIsStructural(unittest.TestCase):
         )
         magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
         # Scoped to the function that makes the check, and to its code
-        # without comments (_go_code): elsewhere in delegation.go the wake's
-        # budget and two comments name the constant too, and a comment inside
-        # the function could name it beside a hand-spelled check.
-        for key, function, what in (
-            ("a2a_worker_adapter_delegate", "validateDelegate", "the worker-adapter's validateDelegate"),
-            ("a2a_gateway_delegation", "handleDelegateRequest", "the gateway's handleDelegateRequest"),
-        ):
-            body = _go_code(h.text(key), function)
-            self.assertIn("lib.DelegateTextCap", body, f"{what} no longer references the shared cap")
-            self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
+        # without comments (_go_code): elsewhere the wake's budget and some
+        # comments name the constant too, and a comment inside a function
+        # could name it beside a hand-spelled check.
+        adapter = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegate")
+        self.assertIn("lib.DelegateTextCap", adapter, "the worker-adapter's validateDelegate no longer references the shared cap")
+        self.assertNotRegex(adapter, magic_number, "the worker-adapter's validateDelegate hand-spells the delegate text cap")
+        # The adapter's entry point takes one task or a batch: a single task
+        # goes to validateDelegate, and so does every batch entry, with that
+        # entry's own text. A batch past this loop is published unchecked.
+        entry = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegateFor")
+        self.assertIn("return validateDelegate(req)", entry, "the worker-adapter no longer caps a single delegate request")
+        self.assertRegex(
+            entry,
+            r"for\s+\w+,\s*(\w+)\s*:=\s*range\s+req\.Tasks\s*\{\s*if\s+why\s*:=\s*validateDelegate\(lib\.DelegateRequest\{[^}]*\bText:\s*\1\.Text\b[^}]*\}\);\s*why\s*!=\s*\"\"\s*\{\s*return\b",
+            "the worker-adapter no longer refuses a batch whose entry's own text fails validateDelegate",
+        )
+        # Read without comments, and pinned to the refusal: a non-empty answer
+        # is sent back to the caller and the request skipped, before publishing.
+        adapter_code = re.sub(r"//[^\n]*", "", h.text("a2a_worker_adapter"))
+        self.assertRegex(
+            adapter_code,
+            r"if\s+why\s*:=\s*validateDelegateFor\(ask\.req,[^)]*\);\s*why\s*!=\s*\"\"\s*\{\s*ask\.reply\s*<-[^\n]*\n\s*continue\b[\s\S]*?a\.publishDelegate\(ctx,\s*ask\.req\)",
+            "the worker-adapter no longer refuses a delegate request validateDelegateFor refuses, before publishing it",
+        )
+
+        # The gateway's half is lib's shared validator, since a request may be
+        # one task or a batch (#5682): handleDelegateRequest ignores any
+        # request lib.ValidateDelegateRequest refuses, and the validator caps
+        # the single task's text and every batch entry's. The call is a
+        # disjunct of the malformed-request guard in its own right, straight
+        # after !parsed and followed only by another || or the block: the
+        # guard has other terms (a resumed batch's size check), and a call
+        # ANDed with one of them would still read "ValidateDelegateRequest(req)
+        # != nil" while checking only the requests that term selects.
+        gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
+        # Followed only by `||` or the block: an `&&` after the call (a
+        # condition on it) would validate only some requests and mint the rest.
+        self.assertRegex(
+            gateway,
+            r"if\s+!parsed\s*\|\|\s*lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil\s*(?:\|\||\{)",
+            "the gateway's handleDelegateRequest no longer refuses every request lib.ValidateDelegateRequest refuses",
+        )
+        self.assertNotRegex(gateway, magic_number, "the gateway's handleDelegateRequest hand-spells the delegate text cap")
+
+        validate = _go_code(payload, "ValidateDelegateRequest")
+        self.assertIn(
+            "validateDelegateText(r.Text)", validate,
+            "lib.ValidateDelegateRequest no longer caps a single task's text",
+        )
+        self.assertRegex(
+            validate,
+            r"for\s+\w+,\s*(\w+)\s*:=\s*range\s+r\.Tasks\s*\{[^}]*validateDelegateText\(\1\.Text\)",
+            "lib.ValidateDelegateRequest no longer caps every batch entry's text",
+        )
+        text_check = _go_code(payload, "validateDelegateText")
+        self.assertRegex(
+            text_check,
+            r"len\(text\)\s*>\s*DelegateTextCap\b",
+            "lib's validateDelegateText no longer compares the text with DelegateTextCap",
+        )
+        self.assertNotRegex(text_check, magic_number, "lib's validateDelegateText hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
         """The MCP tool schema and `lib.DelegateRequest` spell the same fields.
@@ -1811,27 +2085,48 @@ class C1IsolationIsStructural(unittest.TestCase):
         struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
         # A tag's name runs to its first comma or quote: `json:"parameters,omitempty"`.
         all_tags = sorted(re.findall(r'`json:"(\w+)[,"]', struct))
+        # Named in full, so a fifth field fails here rather than slipping past:
+        # one task's three fields, and `tasks`, the batch (#5682).
         self.assertEqual(
-            ["addressee", "parameters", "text"],
+            ["addressee", "parameters", "tasks", "text"],
             all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
+        entry_tags = [t for t in all_tags if t != "tasks"]
+        task = payload.split("type DelegateTask struct {")[1].split("\n}")[0]
+        self.assertEqual(
+            entry_tags,
+            sorted(re.findall(r'`json:"(\w+)[,"]', task)),
+            "lib.DelegateTask's fields no longer match a single request's",
+        )
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("func delegateToolSchema(")[1].split("\n}\n")[0]
-        # A property opens its own line; `additionalProperties` inside one doesn't.
+        # One task's properties are built once (entry) and used both at the
+        # top and as each batch item's. A property opens its own line;
+        # `additionalProperties` inside one doesn't.
         properties = sorted(re.findall(r'^\s*"(\w+)":\s*map\[string\]any\{"type": "(?:string|object)"', schema, re.M))
         self.assertEqual(
-            all_tags,
+            entry_tags,
             properties,
-            "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
+            "the tool schema's task properties no longer match lib.DelegateRequest's json tags",
+        )
+        self.assertRegex(
+            schema,
+            r'props\["tasks"\]\s*=\s*map\[string\]any\{\s*"type":\s*"array"',
+            "the tool schema no longer offers the batch under lib.DelegateRequest's `tasks` tag",
+        )
+        self.assertRegex(
+            schema,
+            r'"items":\s*map\[string\]any\{[^}]*"properties":\s*entry\(\)',
+            "a batch item's properties are no longer one task's",
         )
         # `parameters` is optional on both sides: platform takes none, and the
         # wire struct's tag is omitempty.
-        required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
+        required_block = re.search(r'required\s*:=\s*\[\]string\{([^}]*)\}', schema)
         self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
         required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
         self.assertEqual(
-            [t for t in all_tags if t != "parameters"],
+            [t for t in entry_tags if t != "parameters"],
             required,
             "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
         )
@@ -1984,7 +2279,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         start without the variable. But both Go suites stay green through a
         rename on one side, and the failure lands at the next operator
         upgrade: the new callout pods exit, never go Ready, and the rollout
-        stalls on every `spec.mode: next` install.
+        stalls on every install.
         """
         operator = h.text("operator_a2a_callout")
         callout = h.text("a2a_callout_main")
@@ -2011,7 +2306,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             callout_env[0],
             "the operator renders %r and the callout reads %r: the callout "
             "refuses to start, and the next operator upgrade stalls the callout "
-            "rollout on every spec.mode: next install" % (operator_env[0], callout_env[0]),
+            "rollout on every install" % (operator_env[0], callout_env[0]),
         )
         self.assertEqual(
             operator_env[0],
@@ -2053,7 +2348,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         The same failure shape as the reserved principals above: the callout
         refuses to start without the variable, both Go suites stay green
         through a rename on one side, and the next operator upgrade stalls the
-        callout rollout on every `spec.mode: next` install.
+        callout rollout on every install.
         """
         operator = h.text("operator_a2a_callout")
         callout = h.text("a2a_callout_main")
@@ -2080,7 +2375,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             callout_env[0],
             "the operator renders %r and the callout reads %r: the callout "
             "refuses to start, and the next operator upgrade stalls the callout "
-            "rollout on every spec.mode: next install" % (operator_env[0], callout_env[0]),
+            "rollout on every install" % (operator_env[0], callout_env[0]),
         )
         self.assertEqual(
             operator_env[0],
@@ -2126,7 +2421,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         so there is no password for the operator to render. The container's own
         env is asserted one module over, by
         `TestPluginCannotOverrideBusEnv`, which pins `NATS_PASSWORD` absent
-        from the agent container under `mode: next`.
+        from the agent container.
         """
         operator = h.text("a2a_identities")
 
@@ -2432,6 +2727,128 @@ class C2FailClosed(unittest.TestCase):
                 "the Authorization header is conditional on the token being "
                 "present, so a missing key degrades to an unauthenticated request",
             )
+
+    def test_C2_custom_universe_refuses_commercial_googleapis_relays(self) -> None:
+        """A broker in a custom universe refuses every `*.googleapis.com` relay host.
+
+        A custom-universe bearer token sent to commercial `*.googleapis.com`
+        crosses a sovereign trust boundary. Each relay evaluator must admit
+        `<service>.<universe_domain>` and refuse `<service>.googleapis.com`
+        whenever `universe_domain` is not `googleapis.com`.
+        """
+        custom = "universe.example.test"
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            if not route.host.endswith(".googleapis.com"):
+                continue
+            with self.subTest(api_host=route.host, rule=route.rule_id):
+                decision = api.evaluate(
+                    "GET",
+                    route.host,
+                    "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                    "",
+                    universe_domain=custom,
+                )
+                self.assertFalse(
+                    decision.allowed,
+                    f"api_policy admitted commercial {route.host} under custom universe {custom}",
+                )
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+
+        sub = "projects/sample-project/subscriptions/drift-sub"
+        self.assertFalse(
+            h.watcher_policy.evaluate_gcp(
+                "GET",
+                "container.googleapis.com",
+                "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                b"",
+                sub,
+                universe_domain=custom,
+            ).allowed
+        )
+        self.assertFalse(
+            h.watcher_policy.evaluate_pubsub(
+                "POST",
+                "pubsub.googleapis.com",
+                f"v1/{sub}:pull",
+                b'{"maxMessages":1}',
+                frozenset({sub}),
+                universe_domain=custom,
+            ).allowed
+        )
+        for srv in h.mcp_policy.MCP_SERVERS:
+            resolved = h.mcp_policy.server(srv.name, universe_domain=custom)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertFalse(
+                resolved.host.endswith(".googleapis.com"),
+                f"mcp_policy resolved {srv.name} to commercial {resolved.host} under {custom}",
+            )
+
+    def test_C2_a_universe_domain_under_googleapis_com_is_refused(self) -> None:
+        """A universe domain under `googleapis.com` is refused, and no relay serves its hosts.
+
+        `<service>.mtls.googleapis.com` is a host of the commercial universe.
+        As a universe domain, `mtls.googleapis.com` would pass the rule that a
+        custom universe refuses the commercial hosts while every request stays
+        in the commercial universe under other host names. The value is refused
+        where every reader normalises it, so the broker does not start with it,
+        and the relay evaluators have no host for it.
+        """
+        under = "mtls.googleapis.com"
+        client = h.credential_proxy.credential_proxy_client
+        with self.assertRaises(ValueError):
+            client.normalize_universe_domain(under)
+        with self.assertRaises(ValueError):
+            h.credential_proxy.resolve_universe_domain(environ={client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV: under})
+
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            host = route.host.replace(".googleapis.com", f".{under}")
+            with self.subTest(api_host=host, rule=route.rule_id):
+                decision = api.evaluate("GET", host, "no/such/path", "", universe_domain=under)
+                self.assertFalse(decision.allowed)
+                # gcp.api.path here would mean the policy has a route for this host.
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+        for srv in h.mcp_policy.MCP_SERVERS:
+            self.assertIsNone(
+                h.mcp_policy.server(srv.name, universe_domain=under),
+                f"mcp_policy resolved {srv.name} under {under}",
+            )
+        # The commercial domain itself is still the default universe.
+        self.assertEqual(client.DEFAULT_UNIVERSE_DOMAIN, client.normalize_universe_domain("googleapis.com"))
+
+    def test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts(self) -> None:
+        """A universe domain from the environment is held to the metadata server's answer.
+
+        The environment's value decides which hosts get the broker's credential.
+        A value that the host's metadata server contradicts would send that
+        credential to another universe, or to commercial hosts under other
+        names (`clients6.google.com` is well-formed and is not under
+        `googleapis.com`). The start check refuses it, in both directions; a
+        value the metadata server confirms, and a host with no universe route,
+        start as before.
+        """
+        proxy = h.credential_proxy
+
+        def check(configured, answer):
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answer
+            try:
+                proxy.check_universe_domain_against_metadata(configured, sleep=lambda _s: None)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                with self.assertRaises(RuntimeError):
+                    check(configured, (reported, True))
+        check("universe.example.test", ("universe.example.test", True))
+        check("universe.example.test", (None, True))
 
 
 class C3UntrustedByDefault(unittest.TestCase):
@@ -2807,9 +3224,9 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     # Verbs a read-only ceiling may contain.
     READ_VERBS = frozenset({"get", "list", "watch"})
 
-    # The two roles that legitimately hold a write verb, each exempted by name
-    # prefix and then bounded separately below. Exempting by name rather than by
-    # widening READ_VERBS means a *third* write-capable minted role is a red
+    # The three roles that legitimately hold a write verb, each exempted by
+    # name and then bounded separately below. Exempting by name rather than by
+    # widening READ_VERBS means a *fourth* write-capable minted role is a red
     # test rather than an unnoticed addition to a set.
     #
     # - kubeagents:leader: coordination leases for the replicas > 1 path. Nothing
@@ -2818,13 +3235,215 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     #   broker verifies its caller's token by asking the API server instead of
     #   comparing a secret. Deliberately this rather than binding
     #   system:auth-delegator, which carries subjectaccessreviews too.
+    # - <agent>-a2a-gateway: the spawner's Role. It creates and reaps one
+    #   session pod per delegated task, patches the one home-channel record and
+    #   renews its own election Lease; every write but the pod one is pinned to
+    #   a named object. Bounded by test_C5_the_spawner_role_holds_exactly_its_audited_rules,
+    #   which asserts the whole rule set, so a write rule added beside these is
+    #   red there rather than excused here.
     WRITE_CAPABLE_ROLE_PREFIXES = ("kubeagents:leader:", "kubeagents:tokenreview:")
+    A2A_GATEWAY_ROLE_SUFFIX = "-a2a-gateway"
+
+    # The auth callout's identity, and the one binding allowed to name
+    # system:auth-delegator: the callout TokenReviews the tokens bus clients
+    # present, which is that role's intended use. The binding is cluster-scoped
+    # and qualified by namespace and agent (a2aCalloutClusterRoleBindingName in
+    # platformagent_a2a_callout.go), so the prefix plus the two trailing
+    # segments name exactly one object per agent.
+    A2A_CALLOUT_BINDING_PREFIX = "kubeagents:a2a-callout-tokenreview:"
+    A2A_CALLOUT_ROLE_SUFFIX = "-a2a-callout"
+    AUTH_DELEGATOR_ROLE = "system:auth-delegator"
+
+    # The write half of the operator's Secret grant, the namespaced Role's:
+    # by-name writes in the two namespaces are the whole grant. The reads are
+    # the ClusterRole's (READ_VERBS above): escalation prevention needs the
+    # operator to hold what the agent's `minimal` role grants.
+    OPERATOR_SECRET_WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
+
+    # Every namespaced kind the operator renders, as (apiGroup, resource): the
+    # Secret split applied to all of them. The ClusterRole holds the reads of
+    # each (the informers, escalation prevention) and no write verb; the Role
+    # document names exactly this set, with write verbs only: a read in the
+    # Role is a 403 wherever the Role is not bound, and the teardown reads
+    # the dispatcher's params in a profile namespace a mode-today install
+    # never binds it in. docs/designs/operator-namespaced-write-verbs.md.
+    OPERATOR_NAMESPACED_WRITE_KINDS = frozenset({
+        ("", "configmaps"),
+        ("", "events"),
+        ("", "persistentvolumeclaims"),
+        ("", "pods"),
+        ("", "podtemplates"),
+        ("", "resourcequotas"),
+        ("", "secrets"),
+        ("", "serviceaccounts"),
+        ("", "services"),
+        ("apps", "deployments"),
+        ("apps", "statefulsets"),
+        ("batch", "jobs"),
+        ("coordination.k8s.io", "leases"),
+        ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
+        ("networking.gke.io", "fqdnnetworkpolicies"),
+        ("networking.k8s.io", "networkpolicies"),
+        ("policy", "poddisruptionbudgets"),
+        ("rbac.authorization.k8s.io", "rolebindings"),
+        ("rbac.authorization.k8s.io", "roles"),
+    })
+    OPERATOR_NAMESPACED_READ_KINDS = frozenset()
+    # The two namespaces the chart binds the Role in, in every mode: the
+    # release namespace and its profile namespace.
+    OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
+    HELM_MODE_NEXT = "platformAgent.mode=next"
+
+    def test_C5_the_operators_write_verbs_are_namespaced(self) -> None:
+        """The operator writes in its install namespace and its profile namespace, and nowhere else.
+
+        The operator is the most privileged identity an install puts on a
+        cluster, and the write verbs on its ClusterRole were what made it
+        cluster-admin in effect: `create`, `update`, `patch` and `delete` on
+        every Secret in every namespace is every ServiceAccount token and every
+        credential on the cluster, and `create` on every Pod or ServiceAccount
+        is the same by another route. Every object the operator writes is in
+        the namespace of the PlatformAgent it reconciles or that namespace's
+        profile namespace, so the write verbs are a Role, bound in each. The
+        reads stay cluster-wide, because the informers watch every rendered
+        kind for drift and the agent's `minimal` ClusterRole grants reads the
+        API server will not let the operator grant without holding them.
+
+        Asserted on both delivery paths, as the refusal rather than the
+        presence of the control: no ClusterRole in `role.yaml` or in the
+        rendered chart grants a verb beyond the three reads on any kind in
+        OPERATOR_NAMESPACED_WRITE_KINDS, or a wildcard that reaches one; and
+        the Role that names `secrets` names exactly that set of kinds, with
+        write verbs only. Equality
+        rather than a subset, so a kind dropped from the Role is red here and
+        not first at runtime; the Secret rule's verbs are pinned as before.
+
+        The chart is read rendered (`helm template`, mode next), not as text:
+        the text reader drops template lines, so the `range` that renders the
+        Role once per namespace collapses to one object and rules that came
+        through an `include` would vanish. Rendered, the Role and its
+        RoleBinding must appear in the release namespace and the profile
+        namespace, each binding the operator's ServiceAccount.
+        """
+
+        def rule_kinds(rule: dict) -> set[tuple[str, str]]:
+            return {
+                (group, resource)
+                for group in (rule.get("apiGroups") or [])
+                for resource in (rule.get("resources") or [])
+            }
+
+        def secret_rules(role: dict) -> list[dict]:
+            return [
+                rule
+                for rule in role.get("rules") or []
+                if "secrets" in (rule.get("resources") or [])
+                or "*" in (rule.get("resources") or [])
+            ]
+
+        for source, documents, namespaces in (
+            ("operator_clusterrole", h.yaml_documents("operator_clusterrole"), None),
+            ("chart_rendered_mode_next", h.helm_rendered(self.HELM_MODE_NEXT), self.OPERATOR_ROLE_NAMESPACES),
+        ):
+            with self.subTest(source=source):
+                cluster_roles = [
+                    role for role in h.objects_of_kind(documents, "ClusterRole")
+                    if "operator" in role["metadata"]["name"] or role["metadata"]["name"].endswith("manager-role")
+                ]
+                self.assertTrue(cluster_roles, f"{source} renders no operator ClusterRole")
+                for role in cluster_roles:
+                    for rule in role.get("rules") or []:
+                        # A wildcard counts for the kinds it reaches: `*` as the
+                        # resource reaches every inventory kind in that group,
+                        # `*` as the group reaches the inventory kinds of that
+                        # name in any group. A wildcard that reaches none is A4's
+                        # to judge, not this test's.
+                        reached = {
+                            kind
+                            for kind in self.OPERATOR_NAMESPACED_WRITE_KINDS
+                            for group in (rule.get("apiGroups") or [])
+                            for resource in (rule.get("resources") or [])
+                            if group in ("*", kind[0]) and resource in ("*", kind[1])
+                        }
+                        if not reached:
+                            continue
+                        self.assertTrue(
+                            set(rule.get("verbs") or []) <= self.READ_VERBS,
+                            f"{source}: ClusterRole {role['metadata']['name']} grants "
+                            f"{sorted(set(rule.get('verbs') or []) - self.READ_VERBS)} on {sorted(reached)} "
+                            "cluster-wide; the write verbs belong in the namespaced Role",
+                        )
+                granting = [
+                    (role, secret_rules(role))
+                    for role in h.objects_of_kind(documents, "Role")
+                    if secret_rules(role)
+                ]
+                self.assertTrue(
+                    granting,
+                    f"{source}: no Role names secrets; the Role document is missing or lost its Secret rule",
+                )
+                expected = namespaces or {granting[0][0]["metadata"].get("namespace")}
+                self.assertEqual(
+                    expected,
+                    {role["metadata"].get("namespace") for role, _ in granting},
+                    f"{source}: expected the namespaced Role granting secrets in {sorted(expected)}, "
+                    f"found {[(r['metadata'].get('namespace'), r['metadata']['name']) for r, _ in granting]}",
+                )
+                self.assertEqual(len(expected), len(granting), f"{source}: a namespace carries the Role twice")
+                for role, rules in granting:
+                    self.assertTrue(
+                        role["metadata"].get("namespace"),
+                        f"{source}: the Role granting secrets carries no namespace",
+                    )
+                    self.assertEqual(1, len(rules), f"{source}: secrets appear in more than one rule")
+                    self.assertEqual(self.OPERATOR_SECRET_WRITE_VERBS, set(rules[0].get("verbs") or []))
+                    self.assertEqual(
+                        self.OPERATOR_NAMESPACED_WRITE_KINDS,
+                        {kind for rule in role.get("rules") or [] for kind in rule_kinds(rule)},
+                        f"{source}: the Role document must name exactly the namespaced kinds",
+                    )
+                    for rule in role.get("rules") or []:
+                        kinds = rule_kinds(rule)
+                        allowed = self.OPERATOR_SECRET_WRITE_VERBS | (
+                            self.READ_VERBS if kinds <= self.OPERATOR_NAMESPACED_READ_KINDS else frozenset()
+                        )
+                        self.assertTrue(
+                            set(rule.get("verbs") or []) <= allowed,
+                            f"{source}: the Role document grants {sorted(set(rule.get('verbs') or []) - allowed)} "
+                            f"on {sorted(kinds)}; reads stay in the ClusterRole",
+                        )
+                    if namespaces is None:
+                        continue
+                    bindings = [
+                        b for b in h.objects_of_kind(documents, "RoleBinding")
+                        if b["metadata"].get("namespace") == role["metadata"]["namespace"]
+                        and (b.get("roleRef") or {}).get("kind") == "Role"
+                        and (b.get("roleRef") or {}).get("name") == role["metadata"]["name"]
+                    ]
+                    self.assertEqual(
+                        1, len(bindings),
+                        f"{source}: expected one RoleBinding to {role['metadata']['name']} in "
+                        f"{role['metadata']['namespace']}, found {len(bindings)}",
+                    )
+                    subjects = bindings[0].get("subjects") or []
+                    self.assertTrue(
+                        any(
+                            s.get("kind") == "ServiceAccount" and s.get("namespace") == h.HELM_RENDER_NAMESPACE
+                            and "operator" in s.get("name", "")
+                            for s in subjects
+                        ),
+                        f"{source}: the RoleBinding in {role['metadata']['namespace']} does not bind the "
+                        f"operator's ServiceAccount in {h.HELM_RENDER_NAMESPACE}; subjects={subjects}",
+                    )
 
     def test_C5_no_minted_role_grants_a_write_verb(self) -> None:
         """The agent-side half of A2's intersection, asserted on rendered output.
 
-        Every Role and ClusterRole the controller mints appears in the golden
-        fixtures, so this reads what ships rather than what the builders say.
+        Every Role and ClusterRole the controller mints for the agent and its
+        A2A stack appears in the golden fixtures, so this reads what ships
+        rather than what the builders say. The three write-capable roles are
+        skipped here by the names above and bounded by their own tests; the
+        callout's Role, the scope-read Roles and every tier role are read.
         """
         checked = 0
         for name, documents in h.golden_documents().items():
@@ -2832,6 +3451,8 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
                 for role in h.objects_of_kind(documents, kind):
                     role_name = role["metadata"]["name"]
                     if role_name.startswith(self.WRITE_CAPABLE_ROLE_PREFIXES):
+                        continue
+                    if kind == "Role" and role_name.endswith(self.A2A_GATEWAY_ROLE_SUFFIX):
                         continue
                     checked += 1
                     for rule in role.get("rules") or []:
@@ -2844,6 +3465,86 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         self.assertGreater(
             checked, 0, "no minted role was examined; the fixtures render none"
         )
+
+    @staticmethod
+    def _rule_shape(rule: dict) -> tuple:
+        """A PolicyRule as a comparable value: groups, resources, names, verbs, each sorted."""
+        return (
+            tuple(sorted(rule.get("apiGroups") or [])),
+            tuple(sorted(rule.get("resources") or [])),
+            tuple(sorted(rule.get("resourceNames") or [])),
+            tuple(sorted(rule.get("verbs") or [])),
+        )
+
+    def test_C5_the_spawner_role_holds_exactly_its_audited_rules(self) -> None:
+        """The third named exception, bounded as a whole rule set.
+
+        The A2A gateway's Role is the one minted Role with `create` and
+        `delete` on pods: it spawns one session pod per delegated task and
+        reaps it. `create` on pods is an escalation primitive wherever
+        admission does not hold the PodSpec, so this grant is not read-only
+        and cannot be made so; what keeps it from growing is that every rule
+        is listed here and nothing else may be. A seventh rule, a verb added
+        to any of these, a resourceName dropped from one, or a second Role
+        under the spawner's name is red.
+
+        The six rules, each with its caller (buildA2AGatewayRole): session pods
+        (create/get/list/watch/delete, no patch, no update, no exec); its own
+        Deployment by name (the ownerReference UID); its own PlatformAgent by
+        name (/feedback summary); the home-channel ConfigMap by name
+        (get/patch); its own election Lease by name (get/update, created by
+        the operator); the resolved-scope ConfigMap by name (get). The Role is
+        bound to exactly one subject, the ServiceAccount of the same name in
+        the agent's namespace; the admission policy that holds the pod creates
+        to the session shape is C5's `kube-agents-a2a-gateway-pod` tests.
+        """
+        checked = 0
+        for fixture, documents in h.golden_documents().items():
+            roles = [
+                role for role in h.objects_of_kind(documents, "Role")
+                if role["metadata"]["name"].endswith(self.A2A_GATEWAY_ROLE_SUFFIX)
+            ]
+            self.assertEqual(1, len(roles), f"{fixture}: expected one spawner Role, found {len(roles)}")
+            role = roles[0]
+            name = role["metadata"]["name"]
+            namespace = role["metadata"].get("namespace")
+            agent = name[: -len(self.A2A_GATEWAY_ROLE_SUFFIX)]
+            self.assertTrue(agent and namespace, f"{fixture}: the spawner Role {name!r} is not namespaced under an agent")
+            expected = sorted(
+                self._rule_shape(rule)
+                for rule in (
+                    {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "get", "list", "watch", "delete"]},
+                    {"apiGroups": ["apps"], "resources": ["deployments"], "resourceNames": [name], "verbs": ["get"]},
+                    {"apiGroups": ["kubeagents.x-k8s.io"], "resources": ["platformagents"], "resourceNames": [agent], "verbs": ["get"]},
+                    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": [f"{agent}-home-channel"], "verbs": ["get", "patch"]},
+                    {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": [name], "verbs": ["get", "update"]},
+                    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": [f"{agent}-resolved-scope"], "verbs": ["get"]},
+                )
+            )
+            got = sorted(self._rule_shape(rule) for rule in role.get("rules") or [])
+            self.assertEqual(expected, got, f"{fixture}: the spawner Role's rules moved off the audited set")
+            bindings = [
+                binding
+                for binding in h.objects_of_kind(documents, "RoleBinding")
+                if binding["roleRef"].get("kind") == "Role" and binding["roleRef"].get("name") == name
+            ]
+            self.assertEqual(1, len(bindings), f"{fixture}: {len(bindings)} RoleBindings name the spawner Role")
+            self.assertEqual(
+                [{"kind": "ServiceAccount", "name": name, "namespace": namespace}],
+                bindings[0].get("subjects"),
+                f"{fixture}: the spawner Role is bound to a subject other than its own ServiceAccount",
+            )
+            self.assertNotIn(
+                name,
+                [
+                    s.get("name")
+                    for binding in h.objects_of_kind(documents, "ClusterRoleBinding")
+                    for s in binding.get("subjects") or []
+                ],
+                f"{fixture}: the spawner's ServiceAccount holds a cluster-scoped grant",
+            )
+            checked += 1
+        self.assertGreater(checked, 0, "no spawner Role in any fixture; the exemption above is stale")
 
     def test_C5_the_tokenreview_role_is_the_narrowest_form_of_itself(self) -> None:
         """The second named exception, bounded.
@@ -2871,33 +3572,66 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         )
 
     def test_C5_no_agent_binding_names_the_auth_delegator_role(self) -> None:
-        """The shortcut the test above exists to keep closed.
+        """The shortcut the test above exists to keep closed, with its one exception named.
 
-        Scoped to the agent, and the name says so. The four golden fixtures
-        are all `mode: today`, and under `mode: next` the operator DOES bind
-        system:auth-delegator -- to the auth callout's own ServiceAccount, so
-        it can TokenReview the tokens bus clients present. That is the role's
-        intended use by a component whose whole job is validating tokens, and
-        it is bounded on the Go side instead: the operator's own grant is
-        `bind` restricted by resourceNames to this one role (A4), and in
-        platformagent_a2a_callout_test.go TestA2ACalloutIsGatedByMode asserts
-        the binding's roleRef while
-        TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs asserts
-        it names exactly one subject, the callout's own ServiceAccount in the
-        agent's namespace.
-
-        What no fixture covers is the rendered mode: next object set, so this
-        invariant cannot yet be asserted over it. A golden_a2a_next fixture is
-        the way to close that, and it is owed rather than done.
+        The operator binds system:auth-delegator once per agent: to the auth
+        callout's own ServiceAccount, so the callout can TokenReview the
+        tokens bus clients present. That is the role's intended use by a
+        component whose whole job is validating tokens, and the operator's own
+        grant is `bind` restricted by resourceNames to this one role (A4). The
+        exception is encoded by object and subject, not by fixture: the one
+        binding allowed to name the role is the ClusterRoleBinding
+        `kubeagents:a2a-callout-tokenreview:<namespace>:<agent>`, its subjects
+        are exactly the ServiceAccount `<agent>-a2a-callout` in that
+        namespace, that ServiceAccount is the one the callout Deployment runs
+        as, and no other workload runs as it. Every other binding in the
+        render, the broker's TokenReview binding included, must name some
+        other role: the broker holds the minted one-verb role above, and the
+        agent, gateway and sandbox identities hold no TokenReview at all.
         """
-        for name, documents in h.golden_documents().items():
-            for kind in ("RoleBinding", "ClusterRoleBinding"):
-                for binding in h.objects_of_kind(documents, kind):
-                    with self.subTest(fixture=name, binding=binding["metadata"]["name"]):
-                        self.assertNotEqual(
-                            "system:auth-delegator",
-                            (binding.get("roleRef") or {}).get("name"),
-                        )
+        workload_kinds = ("Deployment", "StatefulSet", "Job", "CronJob")
+        for fixture, documents in h.golden_documents().items():
+            delegator_bindings = [
+                binding
+                for kind in ("RoleBinding", "ClusterRoleBinding")
+                for binding in h.objects_of_kind(documents, kind)
+                if (binding.get("roleRef") or {}).get("name") == self.AUTH_DELEGATOR_ROLE
+            ]
+            self.assertEqual(
+                1,
+                len(delegator_bindings),
+                f"{fixture}: {[b['metadata']['name'] for b in delegator_bindings]} name "
+                f"{self.AUTH_DELEGATOR_ROLE}; only the callout's binding may",
+            )
+            binding = delegator_bindings[0]
+            binding_name = binding["metadata"]["name"]
+            self.assertEqual("ClusterRoleBinding", binding["kind"], fixture)
+            self.assertTrue(
+                binding_name.startswith(self.A2A_CALLOUT_BINDING_PREFIX),
+                f"{fixture}: {binding_name} names {self.AUTH_DELEGATOR_ROLE} and is not the callout's binding",
+            )
+            namespace, _, agent = binding_name[len(self.A2A_CALLOUT_BINDING_PREFIX):].partition(":")
+            self.assertTrue(namespace and agent and ":" not in agent, f"{fixture}: {binding_name} is not namespace- and agent-qualified")
+            callout_account = f"{agent}{self.A2A_CALLOUT_ROLE_SUFFIX}"
+            self.assertEqual(
+                [{"kind": "ServiceAccount", "name": callout_account, "namespace": namespace}],
+                binding.get("subjects"),
+                f"{fixture}: {binding_name} binds {self.AUTH_DELEGATOR_ROLE} to a subject other than the callout",
+            )
+            runs_as_callout = sorted(
+                (workload["kind"], workload["metadata"]["name"])
+                for kind in workload_kinds
+                for workload in h.objects_of_kind(documents, kind)
+                if (workload["spec"].get("template") or workload["spec"].get("jobTemplate", {}).get("spec", {}).get("template") or {})
+                .get("spec", {})
+                .get("serviceAccountName") == callout_account
+                and workload["metadata"].get("namespace") == namespace
+            )
+            self.assertEqual(
+                [("Deployment", callout_account)],
+                runs_as_callout,
+                f"{fixture}: the callout's ServiceAccount is the identity of {runs_as_callout}",
+            )
 
     def test_C5_the_leader_role_stays_confined_to_coordination(self) -> None:
         """The named exception above, bounded so it cannot become a general grant."""

@@ -1,7 +1,7 @@
 # NIGHTLY-TIER: a full audit, the same cost band as the other fleet-audit
 # cases, registered in hack/eval/nightly-cases.txt. The VM below is on every
-# pool project: the fixture-state scan of 2026-11-06 reads the startup-fail-vm
-# role healthy on all 40.
+# pool project. The fixture-state scan checks its failure line on the serial
+# console, and each reconcile's reset of the VM keeps it there.
 #
 # The check this case grades is `gce-startup-script-status`, GCE compute SOP
 # §2.1: a RUNNING instance whose startup script failed. The collector

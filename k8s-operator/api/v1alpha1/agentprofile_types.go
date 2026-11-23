@@ -30,8 +30,8 @@ import (
 // of record, and AgentProfileSpec is its field table, field for field
 // (TestAgentProfileFieldsMatchTheSpecTable).
 //
-// Everything an AgentProfile renders is dark unless the PlatformAgent in its
-// namespace runs `spec.mode: next`.
+// Everything an AgentProfile renders is dark unless a PlatformAgent is bound
+// in its namespace.
 
 // DefaultAgentProfileQueueTimeoutSeconds is the spec's default for
 // AgentProfileSpec.QueueTimeoutSeconds.
@@ -44,6 +44,7 @@ const DefaultAgentProfileQueueTimeoutSeconds = 3600
 const AgentProfileTopicPattern = `^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`
 
 // AgentProfileSpec defines the desired state of AgentProfile.
+// +kubebuilder:validation:XValidation:rule="!has(self.scripts) || self.scripts.all(s, s.timeoutSeconds <= self.lifecycle.activeDeadlineSeconds)",message="each spec.scripts timeoutSeconds must be at most spec.lifecycle.activeDeadlineSeconds"
 // +kubebuilder:validation:XValidation:rule="!has(self.identity) || !has(self.identity.serviceAccountName) || self.identity.serviceAccountName.size() == 0 || !has(self.allowedTiers) || size(self.allowedTiers) <= 1",message="spec.identity.serviceAccountName names one ServiceAccount, so it can serve only one tier: leave it unset (the operator creates one per tier) or allow one tier"
 type AgentProfileSpec struct {
 	// Description is the routing blurb, rendered into the A2A agent card.
@@ -90,6 +91,15 @@ type AgentProfileSpec struct {
 	// +optional
 	ClusterRef *AgentProfileClusterRef `json:"clusterRef,omitempty"`
 
+	// YieldToPinned hands a task addressed to this profile to the profile
+	// pinned to the task's target cluster (clusterRef), when there is one.
+	// Set it on the generic cluster agent, whose pinned profiles are its
+	// per-cluster variants. Leave it unset on a specialist: a task addressed
+	// to one by name keeps its own persona on a pinned cluster. It has no
+	// effect on a pinned profile, or on one that takes no target.
+	// +optional
+	YieldToPinned bool `json:"yieldToPinned,omitempty"`
+
 	// Lifecycle bounds one task's wall clock and how long the finished Job
 	// lingers.
 	// +required
@@ -112,10 +122,23 @@ type AgentProfileSpec struct {
 	// refuses one whose tier is not listed here; a pinned production profile
 	// might allow only read. Tier is authority, so it lives on the CR, never
 	// in the persona. Absent means read alone (AllowedTierList).
+	//
+	// Each is a tier: the built-in read or unattended, or a Tier resource in
+	// the install's namespace (#3659). A name with neither is refused by the
+	// operator, which reports TierUnknown. A tier name listed here is at most
+	// 10 characters, the length of "unattended": it becomes part of the
+	// profile's bus identity, profile-<name>-<tier>, which must fit one
+	// 63-character label beside the profile's name, and of its pools' and
+	// Jobs' names and labels, whose budgets assume no longer tier. It has no
+	// hyphen either: the profile's durables are named
+	// profile-<name>-<tier>-<kind>, and a hyphen would let profile a with tier
+	// b-c and profile a-b with tier c share one. A longer or hyphenated Tier
+	// resource can exist but can't be listed.
 	// +listType=set
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=2
-	// +kubebuilder:validation:items:Enum=read;unattended
+	// +kubebuilder:validation:MaxItems=4
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
 	// +optional
 	AllowedTiers []string `json:"allowedTiers,omitempty"`
 
@@ -130,6 +153,19 @@ type AgentProfileSpec struct {
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
 	Parameters []AgentProfileParameter `json:"parameters,omitempty"`
+
+	// Scripts are the helper scripts this profile may run as a script-run
+	// task (#5622): a built-in schedule's run that execs one of them, with no
+	// model turn. A task names a script, and the dispatcher refuses one this
+	// list doesn't name. The path comes from here, through the operator's
+	// render of the dispatch config, never from the task. Absent means the
+	// profile runs no scripts. Set by an admin or the chart, like the rest
+	// of the spec.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Scripts []AgentProfileScript `json:"scripts,omitempty"`
 
 	// Resources is the pod resource class.
 	// +required
@@ -146,6 +182,39 @@ type AgentProfileParameter struct {
 	// Required means a submission without it is refused.
 	// +optional
 	Required bool `json:"required,omitempty"`
+}
+
+// AgentProfileScriptRoot is the one directory helper scripts ship in: a
+// fixed path in the worker image, whose layers are root-owned. A profile's
+// script path must lie under it.
+const AgentProfileScriptRoot = "/opt/kube-agents/scripts/"
+
+// AgentProfileScript is one helper script a profile allowlists.
+type AgentProfileScript struct {
+	// Name is how a task names the script: a DNS-1123 label, unique in the
+	// list. It is a subject token on the bus, so it can't hold a dot.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`
+	// +required
+	Name string `json:"name"`
+
+	// Path is the script's absolute path in the worker image, under
+	// /opt/kube-agents/scripts/. Each segment starts with a letter, digit or
+	// underscore and holds only those, dots and hyphens, so there is no ".."
+	// or "." segment, no empty segment, and no shell metacharacter. There is
+	// no args field: a script takes its input from the task's parameters.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$`
+	// +required
+	Path string `json:"path"`
+
+	// TimeoutSeconds bounds one run of the script. It may not exceed
+	// spec.lifecycle.activeDeadlineSeconds, which bounds the whole task.
+	// +kubebuilder:validation:Minimum=1
+	// +required
+	TimeoutSeconds int32 `json:"timeoutSeconds"`
 }
 
 // AgentProfilePersona is the persona artifact.
@@ -285,12 +354,17 @@ const (
 	// AgentProfileConditionCardPublished is True when the profile's agent card
 	// is on the directory.
 	AgentProfileConditionCardPublished = "CardPublished"
-	// AgentProfileConditionJobResourcesFit is False when the profile allows
-	// the unattended tier and its resource requests break GKE Autopilot's
-	// cpu-to-memory ratio: Autopilot raises them on the profile's Jobs, which
-	// then no longer equal their template, so the Job admission policy refuses
-	// them there.
+	// AgentProfileConditionJobResourcesFit is False when the profile's
+	// resource requests break GKE Autopilot's cpu-to-memory ratio: Autopilot
+	// raises them on the profile's Jobs (its unattended tasks', and at any tier
+	// its permit-carrying ones'), which then no longer equal their template,
+	// so the Job admission policy refuses them there.
 	AgentProfileConditionJobResourcesFit = "JobResourcesFit"
+	// AgentProfileConditionTiersRendered is False when allowedTiers lists a
+	// name with no tier (reason TierUnknown) or a second unattended-mode tier
+	// beside the one the profile serves (TierModeConflict); those tiers
+	// render nothing, and the rest render as usual (#3659).
+	AgentProfileConditionTiersRendered = "TiersRendered"
 )
 
 // AgentProfileStatus defines the observed state of AgentProfile.
@@ -306,10 +380,41 @@ type AgentProfileStatus struct {
 	AgentRef string `json:"agentRef,omitempty"`
 
 	// ServiceAccountName lists the ServiceAccounts the profile's pods run as,
-	// in the profile namespace: one per allowed tier, comma-separated, or the
+	// in the profile namespace: one per rendered tier, comma-separated, or the
 	// one named in spec.identity.
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// RenderedTiers are the tiers the operator last rendered this profile's
+	// identities, durables and pools for (#3659), kept through a pass whose
+	// identities aren't ready. The operator reads it to tell an incumbent
+	// unattended-mode tier from a newcomer. It is a hint, not authority: a tier here never creates
+	// anything the spec and the Tier catalog don't, cleanup still acts only on
+	// objects carrying this profile's labels, and when it is absent (a
+	// restore that dropped status) the operator derives it once from the
+	// profile's own objects.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=4
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
+	// +optional
+	RenderedTiers []string `json:"renderedTiers,omitempty"`
+
+	// DurableTiers are the tiers whose PROFILE_SUBMITS durables the operator
+	// last made or found, written only after a durable sync succeeds and
+	// left as it was by any other pass (#6283). The operator reads it to
+	// tell a durable that existed, which it re-creates only once it is
+	// still missing a pass later, from one it never made, which it makes at
+	// once. A hint like renderedTiers: absent, every durable counts as new.
+	// It holds at most 32: the rendered tiers first, then the draining ones
+	// by name. A draining tier left out counts as new, re-created on its
+	// first miss as before #6283.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
+	// +optional
+	DurableTiers []string `json:"durableTiers,omitempty"`
 
 	// Conditions represent the latest available observations of the profile.
 	// +listType=map
@@ -331,14 +436,25 @@ type AgentProfileStatus struct {
 // `platform` is the Hermes bridge's addressee: a profile under that name would put a
 // second executor on a2a.tasks.platform.*. The platform persona as a profile is not a goal.
 // +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'",message="AgentProfile name 'platform' is reserved: the Hermes bridge is the executor for that addressee"
+// `session` is the A2A gateway's session route (spec.harness.tuning.defaultRoute
+// on the PlatformAgent): set as the default addressee it opens a session pod,
+// so a profile under that name would hold an addressee the gateway means
+// something else by. The rule refuses a create only. A name is immutable, so
+// oldSelf is present exactly on an update, and a profile created under the name
+// before the rule existed keeps taking writes (status and finalizer removal
+// included) rather than hanging on its next one.
+// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name != 'session'",optionalOldSelf=true,message="AgentProfile name 'session' is reserved: it is the A2A gateway's session route"
 // The name bound ratchets: it refuses a create, or an update that newly breaks
 // it, but not an update to a profile that already broke it. A profile named
 // under 0.19.0's flat 55 would otherwise be refused every write after the
 // upgrade, its status and finalizer removal included, and hang Terminating.
-// The operator still drops such a profile from the identity map. The old
-// object's unattended test reads the set by size and index, not exists():
-// through the optional oldSelf, exists() blows the CEL cost budget.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= (has(self.spec.allowedTiers) && self.spec.allowedTiers.exists(t, t == 'unattended') ? 44 : 50) || (oldSelf.hasValue() && oldSelf.value().metadata.name.size() > ((has(oldSelf.value().spec.allowedTiers) && (size(oldSelf.value().spec.allowedTiers) == 2 || oldSelf.value().spec.allowedTiers[0] == 'unattended')) ? 44 : 50))",optionalOldSelf=true,message="AgentProfile name is too long for its tiers: each tier's bus identity is profile-<name>-<tier>, which must fit one 63-character label, so a name is at most 50 characters, or 44 if allowedTiers includes unattended"
+// The operator still drops such a profile from the identity map. With tiers
+// as data (#3659) the bound is per listed tier: the name plus the tier at most
+// 54, so the map user profile-<name>-<tier> fits 63. allowedTiers' items are
+// at most 10 characters and at most 4. The rule reads each of the four by
+// index rather than iterating: all() or exists() over the list, through the
+// optional oldSelf, is estimated far over the CEL cost budget even at 4.
+// +kubebuilder:validation:XValidation:rule="(!has(self.spec.allowedTiers) ? self.metadata.name.size() <= 50 : (self.metadata.name.size() + self.spec.allowedTiers[0].size() <= 54 && (size(self.spec.allowedTiers) < 2 || self.metadata.name.size() + self.spec.allowedTiers[1].size() <= 54) && (size(self.spec.allowedTiers) < 3 || self.metadata.name.size() + self.spec.allowedTiers[2].size() <= 54) && (size(self.spec.allowedTiers) < 4 || self.metadata.name.size() + self.spec.allowedTiers[3].size() <= 54))) || (oldSelf.hasValue() && !(!has(oldSelf.value().spec.allowedTiers) ? oldSelf.value().metadata.name.size() <= 50 : (oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[0].size() <= 54 && (size(oldSelf.value().spec.allowedTiers) < 2 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[1].size() <= 54) && (size(oldSelf.value().spec.allowedTiers) < 3 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[2].size() <= 54) && (size(oldSelf.value().spec.allowedTiers) < 4 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[3].size() <= 54))))",optionalOldSelf=true,message="AgentProfile name is too long for its tiers: each tier's bus identity is profile-<name>-<tier>, which must fit one 63-character label, so the name plus its longest allowed tier is at most 54 characters (50 with read alone, 44 with a 10-character tier such as unattended)"
 
 // AgentProfile is the Schema for the agentprofiles API.
 type AgentProfile struct {

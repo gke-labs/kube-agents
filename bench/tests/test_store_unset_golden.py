@@ -55,7 +55,7 @@ GOLDEN = Path(__file__).parent / "fixtures" / "golden" / "store-unset"
 #: The version pins the golden was captured under. Written into an empty
 #: directory per test rather than read from the live ``bench/baselines/``.
 SHIPPED_VERSIONS = {"fleet": 1, "verifiers": 1}
-JUDGE = "gemini-3.1-pro-preview"
+JUDGE = "model-x"
 PATH_TOKEN = "<FIXTURE_RUNS>"
 #: Additive since the golden was captured; popped before comparing. The last
 #: two are the suite verdict's: ``outcome`` restates ``green`` as one of three
@@ -90,6 +90,9 @@ def _clean_env(monkeypatch):
         "EVAL_BASELINE_STORE",
         "EVAL_BASELINE_MAX_OBJECTS",
         "EVAL_BASELINE_CAT_WORKERS",
+        # The agent stamp reads these; the golden was captured without them.
+        "MODEL_PROVIDER",
+        "EVAL_REASONING_EFFORT",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)

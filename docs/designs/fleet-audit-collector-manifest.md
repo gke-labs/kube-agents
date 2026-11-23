@@ -280,7 +280,15 @@ previous run's stored report (`ledger_document` when the previous run held the o
 `impact`. It also keeps the previous `recommendation` and `remediation` together, but not when
 either side is `manifest` or names a path, not when the previous one is `manual` and this run's is
 not, and not when `finish` wrote part of either note, other than the route notes, which are stripped
-and written again. A carried note loses the route notes of the previous run, which `finish` writes
+and written again. The previous pair is also not kept when it would not pass validation (an unknown
+`kind`, a `note` that is not a string), or when one of its commands fails a rule in `CARRY_RULES`
+and this run's commands pass: a `gcloud container clusters update` for another cluster than the
+finding's, or a literal range for a flag whose value the SOP leaves to the cluster's owner
+(`OWNER_SUPPLIED_FLAGS`). A rule gives no verdict on a command it cannot read, and when this run's
+pair fails too the previous pair stays. The rules read what a finding publishes, and nothing else
+judges whether a carried remediation is right. On a scheduled close that replays the stored
+document (§3.7), this run's pair is the stored pair, so a stored remediation stays until the next
+full run. A carried note loses the route notes of the previous run, which `finish` writes
 again from this run's manifest (the issue-ledger design, §6). When the previous run cut the worker's
 note to give the route notes room, the stored `uncut_note` comes back as the note. So the check for
 text that `finish` wrote reads `uncut_note` as well as the note.
@@ -352,7 +360,7 @@ helper a finding's heading is — and its id is appended to the hidden marker af
 ones. The marker is what the next run keys on, under every tier; the heading is what gives it a
 title. Only the detail lines (the check and the collector's command) are capped, at
 `MAX_HELD_DETAIL_ROWS`. The section is measured _after_ the document's findings and before the
-evidence appendix, so it can never displace a finding: full rows if they fit, identity lines alone
+evidence appendix, so it can never displace a finding or the dropped check-evidence notice: full rows if they fit, identity lines alone
 if not, and failing that a one-line note — never an oversized body. A held entry is not `new` (its
 id was already in `previous_ids`), the sweep never sees it (it is not in the document), and it stays
 until the collector stops emitting it or a `declared` entry releases it.
@@ -504,8 +512,8 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   named in the ledger's _Awaiting `/remediate`_ section under a paragraph that says to read it
   first, and reported on the JSON line.
 - **Needs triage:** a finding whose candidate carries a `needs_triage` value in `NO_SWEEP_TRIAGE`
-  (`service-fronted`, `new-computeclass`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
-  `default-deny`, `namespace-token`, `service-selector`, `hard-spread`). The collector stands behind the finding; the _fix_ has a consequence
+  (`service-fronted`, `new-computeclass`, `class-status`, `reserved-pool`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
+  `default-deny`, `namespace-token`, `service-selector`, `hard-spread`, `serviceentry-owner`, `manual-pool-fallback`). The collector stands behind the finding; the _fix_ has a consequence
   it could not measure. Named in its own paragraph, worded differently from the one above because
   the two say opposite things about the collector, each row followed by the marker and the
   consequence it stands for (`TRIAGE_REASONS`).
@@ -697,7 +705,7 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
 and stockout streams declare a `cluster` and a `project` kind; the GCE compute stream, whose targets
 are all projects, declares `project` alone; the networking stream declares a `subnet` kind for
-`subnet-ip-exhaustion` and a `project` kind for its other five checks. A fleet that holds no cluster is not
+`subnet-ip-exhaustion` and a `project` kind for its other six checks. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs

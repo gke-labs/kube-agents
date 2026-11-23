@@ -27,6 +27,7 @@ import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
 from kube_agents_bench import board, card_wake, harness, transcript, worker_trajectory
+from kube_agents_bench import inject_transport as inject
 from kube_agents_bench.verifiers import ReplayCardVerifier
 from kube_agents_bench.cases import CaseSpec
 from kube_agents_bench.harness import KubeAgentsHarness
@@ -182,6 +183,7 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         self.server.last_request = json.loads(self.rfile.read(length))
         self.server.requests.append(self.server.last_request)
         self.server.last_auth = self.headers.get("Authorization")
+        self.server.eval_runs.append(self.headers.get("X-Kube-Agents-Eval-Run"))
         if len(self.server.requests) in self.server.drop_on:
             # Kill the socket before any status line goes out: the client
             # sees the connection die in flight, not an HTTP answer.
@@ -287,6 +289,7 @@ def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, N
     server.session_lookups = []
     server.get_auths = []
     server.requests = []
+    server.eval_runs = []
     server.turns = []
     server.fail_headers = {}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1952,25 +1955,6 @@ def instant_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
 
 
-@pytest.fixture(autouse=True)
-def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Keep settling a card off whatever cluster kubectl is pointed at.
-
-    Settling reads the card's artifacts back and then deletes them, both by
-    exec-ing into the agent pod. Left live, the suite would issue a ``kubectl
-    exec`` per delegating test against the developer's current context -- slow,
-    and a delete aimed at a real pod. Returns the scripts that would have run.
-    """
-    scripts: list[str] = []
-
-    def _record(script: str, timeout: float) -> str:
-        scripts.append(script)
-        return ""
-
-    monkeypatch.setattr(harness, "_agent_shell", _record)
-    return scripts
-
-
 def _is_purge(script: str) -> bool:
     return harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script
 
@@ -2001,6 +1985,58 @@ def test_delegated_work_is_awaited_before_the_result_is_returned(
     # The pod read did not complete here, so _settle records the gap.
     assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
+
+
+def test_every_turn_carries_the_eval_run_tag_of_its_conversation(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``X-Kube-Agents-Eval-Run: <run>/<case>/<rep>``, the run being the conversation id.
+
+    The agent records it per session and stamps it on its model requests for
+    the replay proxy's log; the file beside results.json names the run id, so a
+    retried repetition's attempt is told apart from the first.
+    """
+    target = tmp_path / "eval_run.json"
+    monkeypatch.setenv("KUBE_AGENTS_EVAL_RUN_FILE", str(target))
+    monkeypatch.setenv("EVAL_CASE_ID", "some-case")
+    monkeypatch.setenv("EVAL_REPETITION", "2")
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    run_id = stub_agent.requests[0]["conversation"]
+    assert stub_agent.eval_runs == [f"{run_id}/some-case/2"] * 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "eval_run": f"{run_id}/some-case/2", "run_id": run_id, "case_id": "some-case", "repetition": "2",
+    }
+
+
+def test_the_eval_run_record_is_the_inject_conversation_key() -> None:
+    """Both transports write one shape; the inject path's tag is its conversation key."""
+    record = harness._eval_run_record("devops-bench-0123456789ab", "some-case", "2")
+    assert record == {
+        "eval_run": "devops-bench-0123456789ab/some-case/2",
+        "run_id": "devops-bench-0123456789ab",
+        "case_id": "some-case",
+        "repetition": "2",
+    }
+    assert record["eval_run"] == inject.conversation_key("devops-bench-0123456789ab", "some-case", "2")
+
+
+def test_the_eval_run_tag_falls_back_outside_the_presubmit(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("EVAL_CASE_ID", raising=False)
+    monkeypatch.delenv("EVAL_REPETITION", raising=False)
+    monkeypatch.setenv("KUBE_AGENTS_EVAL_RUN_FILE", "")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    monkeypatch.chdir(tmp_path)
+
+    KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    run_id = stub_agent.requests[0]["conversation"]
+    assert stub_agent.eval_runs == [f"{run_id}/adhoc/1"]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_status_turns_continue_the_same_conversation(
@@ -5109,7 +5145,7 @@ def test_a_card_wake_refuses_an_unknown_transport(
 
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
-    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject'], got 'smoke-signal'"]
+    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject', 'slack'], got 'smoke-signal'"]
     # Only the run-start clock read: nothing planted.
     assert scripts == [harness._POD_CLOCK_SCRIPT]
     assert stub_agent.requests == []
@@ -5175,6 +5211,25 @@ def test_a_fresh_session_replay_sends_the_answer_on_a_new_conversation_after_the
     check = ReplayCardVerifier(type="replay_card", status_not_in=["blocked"], decoy_status_in=["blocked"])
     assert check.verify(5.0).success
     assert _archived(scripts)
+
+
+def test_a_fresh_session_answer_keeps_the_wake_turns_eval_run_tag(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, tmp_path: Path
+) -> None:
+    """One repetition, one tag: the answer opens a new conversation, not a new run."""
+    target = tmp_path / "eval_run.json"
+    monkeypatch.setenv("KUBE_AGENTS_EVAL_RUN_FILE", str(target))
+    monkeypatch.setenv("EVAL_CASE_ID", "some-case")
+    monkeypatch.setenv("EVAL_REPETITION", "2")
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell([]))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    wake, answer = stub_agent.requests
+    assert wake["conversation"] != answer["conversation"]
+    assert stub_agent.eval_runs == [f"{wake['conversation']}/some-case/2"] * 2
+    assert json.loads(target.read_text(encoding="utf-8"))["run_id"] == wake["conversation"]
 
 
 def test_a_fresh_session_replay_puts_a_posted_wake_reply_in_the_thread(
@@ -5744,6 +5799,92 @@ def test_settle_records_a_capture_gap_on_the_trajectory(
         assert res.trajectory[-2]["agent"] == "cluster-a"
     assert harness.worker_trajectory.GAP_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "card, entries, commands, summary, expected",
+    [
+        (("done", None), [], [], {}, True),
+        (("blocked", "needs_input"), [], [], {}, True),
+        (("blocked", "dependency"), [], [], {}, True),
+        (("blocked", "capability"), [], [], {}, True),
+        (("blocked", "needs_input", "spawn failed"), [], [], {}, False),
+        (("blocked", "transient"), [], [], {}, False),
+        (("blocked", "capacity"), [], [], {}, False),
+        (("blocked", None), [], [], {}, False),
+        (("archived", None), [], [], {}, False),
+        (("failed", None), [], [], {}, False),
+        (None, [], [], {}, False),
+        (("done", None), [{"name": "kanban_show", "agent": "platform", "task": "t_1"}], [], {}, False),
+        (("done", None), [], [{"task": "t_1", "command": "ls"}], {}, False),
+        (("done", None), [], [], {"clipped": ["calls"], "errors": []}, False),
+    ],
+    ids=[
+        "done", "needs-input", "dependency", "capability", "breaker-after-a-block", "rate-limit-transient", "capacity",
+        "breaker-gave-up", "archived", "failed", "not-on-board", "worker-entry", "worker-command", "capture-gap",
+    ],
+)
+def test_settle_records_cards_closed_with_no_worker_call(
+    card, entries, commands, summary, expected, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5371: ``_settle`` writes ``worker_trajectory.NO_WORKER_CALLS_ENTRY``
+    only when every awaited card was closed by an agent (done, or one of
+    ``kanban_block``'s kinds), the read is clean and the capture holds no
+    worker entry or logged command. The platform's own blocks (breaker,
+    rate-limit guardrail, admission) and a gap never earn it."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": ""})
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: list(commands))
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[dict(e) for e in entries], summary=summary),
+    )
+    on_board = (
+        {}
+        if card is None
+        else {"t_1": harness.board.BoardCard(card[0], block_kind=card[1], error=card[2] if len(card) > 2 else None)}
+    )
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, ids, to: on_board)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    marked = [e for e in res.trajectory if e.get("name") == harness.worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert marked == ([harness.worker_trajectory.no_worker_calls_entry(["t_1"])] if expected else [])
+    assert harness.worker_trajectory.NO_WORKER_CALLS_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
+
+
+@pytest.mark.parametrize(
+    "statuses, logs, expected",
+    [
+        ({"t_1": "done", "t_2": "done"}, {"t_1": "", "t_2": ""}, True),
+        ({"t_1": "done", "t_2": "running"}, {"t_1": "", "t_2": ""}, False),
+        ({"t_1": "done", "t_2": "done"}, {"t_1": "", "t_2": None}, False),
+    ],
+    ids=["both-closed", "one-open", "one-log-unread"],
+)
+def test_settle_records_no_worker_calls_only_when_every_card_closed_and_every_log_read(
+    statuses, logs, expected, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5371: with two awaited cards, one card still open or one worker log
+    unread keeps ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` off the trajectory."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: dict(logs))
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: [])
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[], summary={}),
+    )
+    on_board = {t: harness.board.BoardCard(s) for t, s in statuses.items()}
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, ids, to: on_board)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1", "t_2"])
+
+    marked = [e for e in res.trajectory if e.get("name") == harness.worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert marked == ([harness.worker_trajectory.no_worker_calls_entry(["t_1", "t_2"])] if expected else [])
 
 
 @pytest.mark.parametrize("awaited", [["t_1"], []], ids=["delegated", "no-card"])
@@ -6801,3 +6942,91 @@ def test_a_run_whose_prompt_names_the_agent_cluster_without_a_context_is_a_setup
     assert "AGENT_CLUSTER_CONTEXT" in result.errors[0]
     snap = transcript.get()
     assert snap is not None and snap.output == ""
+
+
+# ------------------------------------------------ the job's GitOps repository in a prompt
+
+
+def test_the_gitops_repo_placeholder_expands_from_bench_gitops_repo(monkeypatch):
+    monkeypatch.setenv("BENCH_GITOPS_REPO", "gke-agentic/evals-3-infra")
+    expanded, problem = harness.expand_gitops_repo_placeholder("open it on {{BENCH_GITOPS_REPO}}, beside the manifest")
+    assert problem is None
+    assert expanded == "open it on gke-agentic/evals-3-infra, beside the manifest"
+
+
+def test_a_prompt_without_the_gitops_repo_placeholder_needs_no_repository(monkeypatch):
+    monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+    assert harness.expand_gitops_repo_placeholder("list the pods") == ("list the pods", None)
+    # The pilot's own placeholder is not this one, and is left for its wrapper.
+    assert harness.expand_gitops_repo_placeholder("in {{GITOPS_REPO}}") == ("in {{GITOPS_REPO}}", None)
+
+
+def test_an_unset_gitops_repo_is_a_setup_problem_not_the_models(monkeypatch):
+    prompt = "open it on {{BENCH_GITOPS_REPO}}"
+    for value in (None, "", "  ", "gke-agentic/evals 3"):
+        if value is None:
+            monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+        else:
+            monkeypatch.setenv("BENCH_GITOPS_REPO", value)
+        expanded, problem = harness.expand_gitops_repo_placeholder(prompt)
+        assert problem is not None and "BENCH_GITOPS_REPO" in problem, value
+        assert expanded == prompt
+
+
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_a_run_whose_prompt_names_the_gitops_repo_without_one_is_a_setup_failure(monkeypatch, value):
+    # Infrastructure naming the variable, and nothing sent: an empty repository
+    # is never rendered into the prompt.
+    if value is None:
+        monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+    else:
+        monkeypatch.setenv("BENCH_GITOPS_REPO", value)
+    sent: list[str] = []
+    monkeypatch.setattr(harness.inject, "_request", lambda url, *a, **k: sent.append(url) or {})
+    result = harness.KubeAgentsHarness().run("open it on {{BENCH_GITOPS_REPO}}")
+    assert result.output == ""
+    assert result.errors and result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "BENCH_GITOPS_REPO" in result.errors[0]
+    assert sent == []
+
+
+# ------------------------------------------------ a fleet fixture's cluster in a prompt
+
+
+def _fleet_context(tmp_path, monkeypatch, text: str):
+    (tmp_path / ".fleet-context").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("BENCH_FLEET_KUBECONFIG_DIR", str(tmp_path))
+
+
+def test_the_fleet_cluster_placeholders_expand_from_the_runners_context(tmp_path, monkeypatch):
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.b=seeded-b\nlocation.b=us-central1-a\n")
+    prompt = ("why does payments-api restart on {{FLEET_CLUSTER_NAME:crashloop-workload}} "
+              "(project {{FLEET_CLUSTER_PROJECT:crashloop-workload}}, location {{FLEET_CLUSTER_LOCATION:crashloop-workload}})")
+    expanded, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is None
+    assert expanded == "why does payments-api restart on seeded-b (project evals-3, location us-central1-a)"
+
+
+def test_a_prompt_without_fleet_placeholders_needs_no_fleet(monkeypatch):
+    monkeypatch.delenv("BENCH_FLEET_KUBECONFIG_DIR", raising=False)
+    assert harness.expand_fleet_cluster_placeholders("list the pods") == ("list the pods", None)
+
+
+def test_an_unresolved_fleet_role_is_a_setup_problem_not_the_models(tmp_path, monkeypatch):
+    prompt = "about {{FLEET_CLUSTER_NAME:crashloop-workload}}"
+    monkeypatch.delenv("BENCH_FLEET_KUBECONFIG_DIR", raising=False)
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "fleet" in problem
+    # A slot for another role only.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.idle-nodepool=a\ncluster.a=seeded-a\nlocation.a=us-east1\n")
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "crashloop-workload" in problem
+    # The role's slot was recorded but never reached.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.a=seeded-a\nlocation.a=us-east1\n")
+    expanded, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "never reached" in problem
+    assert expanded == prompt
+    # A reached slot with no location recorded can't name the target either.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.b=seeded-b\n")
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "never reached" in problem

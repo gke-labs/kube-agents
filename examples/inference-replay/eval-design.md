@@ -56,8 +56,9 @@ flowchart LR
 Three properties make this sound for grading:
 
 - **A hit means the model saw the same input.** The key covers the whole request: system prompt,
-  tool schemas, the model alias, and every message so far, including every tool result, with one
-  exception (the recent-work digest, below). That includes settings like temperature, max tokens,
+  tool schemas, the model alias, and every message so far, including every tool result, except
+  what the [normalization rules](#normalization) drop or fix (the recent-work digest, the sandbox
+  kernel, and the others listed there). That includes settings like temperature, max tokens,
   reasoning settings and tool choice; only fields that change how the answer is delivered
   (`stream`) or who is asking (`user`, `metadata`) are left out. A stored answer is a real sample from the model for
   that exact input. What serving it loses is independence between samples, and under pass-only
@@ -118,8 +119,8 @@ flowchart LR
 
 The rules that keep this safe:
 
-- **Identifiers only, never state.** Counts, statuses, restart numbers, versions, scores and
-  zones stay literal; they are what the agent reasons about. A crashlooping pod's restart count
+- **Identifiers only, never state.** Counts, statuses, restart numbers, versions (bar the sandbox
+  kernel in the system prompt, below), scores and zones stay literal; they are what the agent reasons about. A crashlooping pod's restart count
   rises between runs, so cases with a live defect replay less, and that is correct.
 - **Only real ages are treated as ages, and they keep their unit.** `5m` and `3d` get different
   placeholders, because a pod being minutes old instead of days old can be the whole finding. And
@@ -234,6 +235,41 @@ The rules that keep this safe:
   same small number would refuse about one answer in five after a queued card, and none of the
   64,027 distinct assistant messages stored from the Nov 7 nightlies and presubmits mentions a
   queued event.
+- **The front door's `kanban_create` queue fields are dropped from the key.** When the new card's
+  class has no free worker slot at that moment, the result carries `"queued": true` and
+  `"queue": {"running": N, "limit": M}`, and neither key otherwise; being queued doesn't change
+  the card's status (only a `ready` card can carry the fields), and the thread hears about the wait from the dispatcher's queued event above, not
+  from the model. So in a tool message answering a `kanban_create` call, a result holding
+  `task_id` and `subscribed` keys the same queued or not, also when Hermes has appended a warning
+  after it. Any other tool's result, and any other JSON holding `queued`, keeps it. In 9,780
+  front-door answers after a create in the nightly and presubmit stores kept locally (4,281
+  queued, counted once per distinct answer) none mentioned a queue, so the model does not
+  read the fields. `running` and `limit` count against an answer as a dropped queued event's
+  payload numbers do. And when the dropped `queued` was true, an answer that talks about a queue or
+  a slot at all ("queued", "frees up", "slot", "in use", "board is full", "waiting for a worker")
+  isn't saved, with or without a number: served to a run whose card had a free slot, it would
+  announce a wait that run doesn't have. That is the only direction the drop opens that could
+  mislead: an answer recorded without the fields came from a model never told of a wait, and a
+  queued run's thread hears of its wait from the dispatcher, so nothing more is checked at replay.
+  It would refuse none of the 4,358 answers (counted once per build) that came straight after a queued create in the Nov 6–14
+  nightly and presubmit stores, nor any of the up to twelve answers after each before the next user
+  turn.
+- **A missing file's list of similar names is dropped from the key.** When `read_file` can't find
+  a file, Hermes lists up to five names like it from the same directory (`similar_files`), as the
+  directory stood at that moment, and leaves the list out when nothing is like it. Whether another
+  agent had written `INVENTORY.md` there yet changed the list between otherwise identical runs. So
+  in a tool message answering a `read_file` call, a not-found result keys the same whatever it
+  lists, and the same as one with no list, also when Hermes has appended a warning after it. Any
+  other result, and any other tool's output, keeps its list. About one answer in twenty after such
+  a list names a listed file (63 of 1,370 in the Nov 12 nightlies), so no file named in either
+  run's list crosses runs, matched by its file name in the answer as written: an answer naming one
+  of the recording's isn't saved, since served to a run whose list lacked it, it would read a file
+  that run was never shown; and a saved answer naming one of this run's isn't served, since the
+  recording may have acted on that file not being there (writing `INVENTORY.md` would overwrite
+  what another agent wrote). An answer that acts on a file's absence without naming it ("no
+  inventory file exists yet") is still served across runs. In the Nov 12 nightlies none of the 300
+  answers that came straight after a not-found result talked about a missing file other than by
+  naming it.
 - **The eval pool project is an identifier.** Every Prow build leases its own GCP project,
   `kube-agents-evals` or `kube-agents-evals-<n>`, and its name is in 94% of requests (Nov 7 shadow
   data): the Cluster Agent's profile name (`cluster-kube-agents-evals-31-seeded-a-…`), the front
@@ -254,6 +290,19 @@ The rules that keep this safe:
   literal. An answer that quotes a bound commit anywhere is served with this run's commit. One
   that holds a longer or shorter form of it than the request does (`c99b1ab` for
   `c99b1ab1fee8…`) isn't saved, since nothing binds that form.
+- **An earlier run's proposal in `submit_suggestion`'s notice is bound.** When `prepare` finds that
+  a closed or merged proposal last used the branch name, it says so ("… was the source of
+  `https://github.com/<owner>/<repo>/pull/1399`, which is closed. That proposal's last revision,
+  `3ef98c4e29cf`, is not in 'main' …"; "Deleted the spent branch at `<revision>`" when it deletes
+  the branch; and "The repository held the branch at `<revision>`" or "still holds the branch at
+  `<revision>`" when it can't). A GitLab proposal's URL ends `/-/merge_requests/<n>` instead. Every
+  run opens proposals of its own, so the number and the revision are an earlier run's and differ
+  between otherwise identical runs. In those sentences only, the revision
+  is bound like any commit, and the number gets a placeholder that, like a `pid`, is never put back
+  in an answer: an answer that holds the number with no digit beside it (`proposal view 1399`,
+  `PR #1399`) isn't saved. A proposal number or a run of hex anywhere else stays literal,
+  including the broker's error a refused delete quotes in parentheses, so two runs refused alike
+  still key apart there.
 - **A time of day on its own is left as written.** A bare `13:44` is in 43% of requests, but
   without a date it can't be turned into how far from now it is: it may be yesterday's, another
   time zone's, or a duration (`ps` prints CPU time as `0:47`). Any token for it would give
@@ -262,13 +311,27 @@ The rules that keep this safe:
   and its normal output in whatever order they arrive. So the same `gcloud` command, with the same
   output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
   difference cost the obtainability case the rest of its conversation in the replay lane. When a text is one JSON document with `WARNING: ` lines before or after it (each with any indented lines that continue it), the key puts the warnings after the JSON. Any other text keeps its order, because there the order can mean something: `WARNING: disk pressure` then `Pod evicted` is not the same story told backwards. The text the agent sees isn't touched.
+- **A skill's file listing doesn't change the key by its order.** Hermes' `skill_view` result lists the skill's `linked_files` (and, for a missing file, `available_files`) in directory order, which differs from pod to pod, so in a tool message answering a `skill_view` call the key sorts each of those lists, also when Hermes has appended a notice after the result, and leaves every other field, and every other tool's output, in its order. A result too large to send whole, which Hermes cuts to a preview, keeps its order.
+- **The sandbox's kernel version in the system prompt doesn't change the key.** Hermes ends its
+  system prompt with a runtime environment block whose `OS: Linux 6.12.105+` line is the kernel of
+  the node the sandbox landed on. Nodes of one pool can run different patch versions: on the Nov 18
+  recording night 3 of 8 nightly shards ran on `6.12.110+`, and their requests could never match a
+  lane on `6.12.105+`. So in a system message, on that block's `OS:` line only, the kernel becomes
+  a fixed `⟦KERNEL⟧`. It is the one exception to versions staying literal: a kernel anywhere else,
+  in `uname -r`, a node's `Kernel Version` or a `kubectl get nodes -o wide` column, is about a node
+  the agent may be debugging and stays literal. The token is bound to no value, so no answer is
+  rewritten with it: an answer rarely names a kernel, and then one it read in a tool result the key
+  keeps. The match starts at the block's last heading, as Hermes reads it, so prose quoting the
+  heading earlier in the prompt is left alone. The block's other lines (user, home,
+  working directory) are the same on every node or already keyed.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
 `resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages; the eval pool
 project, repository commits, the declared-intent clone directory and GKE operation IDs came later,
 from the Nov 7 shadow data, and the kanban `comment_id` (a row id counting every comment on the
-install's board) from the Nov 10 replay-lane trial. Epoch seconds
+install's board) from the Nov 10 replay-lane trial, and the spent proposal's number and revision in
+`submit_suggestion`'s notice from the Nov 12 nightlies. Epoch seconds
 become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
 events in one second would otherwise shift every later number. The measurements found two gaps,
 `ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`); the
@@ -277,7 +340,7 @@ they are when a network range is in the request.
 
 ## Measurements
 
-All on one dev install, `spec.mode: next`, Gemini 3.1 Pro via LiteLLM. Each row is one recording
+All on one dev install, `spec.mode: next`, the agent model via LiteLLM. Each row is one recording
 followed by replays of that same recording minutes later; "tokens" is the share of prompt tokens
 served from the cache.
 
@@ -325,7 +388,7 @@ replace it.
 ### Replay lane trials
 
 The table above replays a recording minutes later. To test what the replay lane would do, we ran
-the lane's record and replay modes on the same dev install (2026-11-04 and 05, `gemini-4-argon`, the
+the lane's record and replay modes on the same dev install (2026-11-04 and 05, the
 inject door, as the presubmit runs). Four cases were recorded once, the way the nightly would, and
 then each was replayed three times. "Reused" is the share of prompt tokens served from saved
 answers instead of the model.
@@ -350,7 +413,7 @@ requests of one conversation served through the second key described under "Diff
 same answer". The trial ran that key with the earlier answers' tool calls blanked whole; the key as
 it now stands, with only `kanban_show`'s arguments blanked, serves the same six requests (checked
 offline against the trial's saved requests, with each recorded answer noted and checked the way the
-proxy now does).
+proxy did before it timed that check by the whole prefix rather than its last message).
 
 Every run passed, recordings and replays. And every replayed conversation that was served saved
 answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the
@@ -593,7 +656,10 @@ that misses on the exact key can still be served from the second one, but only i
 
 - every earlier answer in it is one the model really gave to that same point in a recording, and
   that the proxy itself recorded and could have stored: never one the client wrote into the history,
-  and never an answer from a fallback;
+  and never an answer from a fallback. That point is read as of when the proxy first saw it whole
+  (the settings and every message up to it), as the recording read it. When the proxy first saw its
+  last message would not do: a skill's text is the same in every conversation, so that time can be
+  another conversation's, minutes earlier, and this run's timestamps before it would read as future;
 - the agent did the same things: every tool call matches by name, and by arguments unless the tool
   only reads. A different action that happened to get the same output (`{"ok": true}` from
   completing a card rather than commenting on it) is still a miss, and so is any other tool called
@@ -656,23 +722,43 @@ and the merge copy takes only the merged pull request's last passing presubmit.
 
 **Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
 15 cases, three times each) going at the same time on the same install, and a build can pass while
-some of those runs fail. Requests don't say which run they belong to, but we can work it out after
-the run with data we already have. A worker's request names the card it's working on (its first
+some of those runs fail. Most requests can be tied to their run after the fact with data we already
+have, and the rest carry a run tag (below). A worker's request names the card it's working on (its first
 message is "work kanban task t\_…"), and a front door's request names the cards it created (what
 its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
 and whether it passed. So the copy job can match each saved answer to its card, the card to its
 run, and the run to pass or fail, and copy only the passing ones. A front door's first request
 names no card at all, only the case's prompt, and the board reads before its first card name none
-either. Each is matched through the requests that came after it: an answer is copied when a chain
-of requests, each going on from exactly the answer before it, reaches a request naming a passing
-run's card.
+either. Those are matched by the run tag instead: on an eval install the agent stamps every model
+request with its run, case and repetition (`X-Kube-Agents-Eval-Run`), the proxy logs it, and the
+harness writes the same tag beside each run's `results.json`. The run part is new on every
+attempt, so a retried attempt's requests never count for the attempt that was graded. A request
+with a card must also agree with its tag; when they name different runs, its answer isn't copied.
+A request with neither a card nor a tag isn't copied at all.
 
-Each case runs three times. Ideally each of the three would replay its own recording, so we still
-get three different samples instead of one sample three times. That needs the proxy to know the run
-while it's happening, not afterwards. It could follow the same chain live: the harness tells the
-proxy which case and run each front-door task ID is, and every card after that was created by an
-answer the proxy already saw. That's more work, so it comes later. Until then all three runs of a
-case replay the same recording, which is also how our measurements were done.
+**Every passing answer is kept, and handed out in turn.** Each case runs three times, and the runs
+often answer the same request differently. If the cache kept only the first answer to each request,
+a failing run that happened to answer first would cost the request its passing answers, and every
+replayed run of the case would follow that one recording, so three runs would be one sample
+counted three times. So the cache keeps every distinct answer to a request, each under a name made
+of the request's fingerprint and a hash of the answer exactly as it is stored and served, written
+once like every other object; only those a passing run gave are published, decided answer by
+answer, so two runs that gave the same answer share one file and two that differed in any served
+word or action never do. The replay proxy hands a request's answers out in turn, each as often as
+passing runs gave it: a request whose passing runs answered one way nine times and another way once
+is served the second answer one time in ten, in a fixed order, rather than every other time.
+Identical answers share one file, so without the count a rare answer would be served as often as
+the common one. Once a run is served one answer, its next request holds that answer, so it only
+matches what followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
+once can take turns in either order, so this spreads runs across recordings rather than giving each
+run its own. Giving each run exactly one recording would mean serving by the run tag above, which
+the proxy logs but does not serve by yet.
+
+The lane loads only answers that a passing run of a night inside its 30-hour window produced
+(older-layout answers aside). A
+night's record lists the answers its passing runs gave, so an older object that a later night only
+found already in the bucket never comes in on that night's record. The record also counts how many
+requests from passing runs got each answer, and the lane adds the counts of the nights in its window.
 
 ### Prompts change often
 
@@ -787,7 +873,7 @@ before stage 3 of the rollout (turning replay on):
      tool), and the result of that action differs too. Under replay the saved action would run
      and return the same result.
 
-   The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
+   The dev-install dry run (2026-11-04, four phases standing in for a nightly,
    two builds of one pull request and a second pull request) showed how big the gap is: the
    replayed estimate (then called simulated) was 12%, ignoring other agents' kanban text as well
    raised it to 22%, and most of the remaining misses were tool results after a differently chosen
@@ -816,10 +902,12 @@ before stage 3 of the rollout (turning replay on):
 
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
    without changing their results, so it gets its own job: a periodic, non-blocking job that runs a
-   set of cases on `main`'s code with replay on, served from the nightly's recordings. Its results
+   set of cases with replay on, served from the nightly's recordings, on the commit the newest
+   recording night ran. Its results
    don't block anything and aren't written to the evidence store. For this the nightly saves its
-   answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
-   only reads them. For each conversation it records
+   answers, every distinct answer to each fingerprint, as the trusted writer in "Who can write to
+   the cache"; the lane only reads them, and hands a request's answers out in turn ("Only save
+   answers from runs that passed"). For each conversation it records
    how many messages and tokens were replayed before the first miss, what caused that miss (the proxy has the cache, so it logs the closest saved request, which message first differed, and
    short cleaned-up snippets of both sides), and whether the run's verdict matched the live nightly's. Every miss here is real: a
    normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
@@ -833,11 +921,18 @@ before stage 3 of the rollout (turning replay on):
    ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane))
    and the bucket ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)). A nightly running
    as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
-   that account can write. It works out which run each answer came from after the fact, from the
-   cards each request and each run's results name ("Telling the runs in a build apart"). A
-   periodic on `main`, at 06:00 UTC, replays the previous nights' complete recordings plus
-   tonight's partial ones, gating nothing. It reports what was
-   served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
+   that account can write. It works out which run each answer came from using the cards each
+   request and each run's results name, or, for a request with no card, from the run tag the agent
+   stamps on it, and a request whose tag and card name different runs is not published ("Telling
+   the runs in a build apart"). A periodic at 06:00 UTC replays the previous nights' complete
+   recordings plus tonight's partial ones, gating nothing. It checks out the commit the newest recording night ran (each record names
+   it), or `main` when no record does, so what merged between 00:00 and 06:00 doesn't change what
+   it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
+   mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
+   served before each first miss, the miss causes, and each case's verdicts beside the newest recording night's on the same commit.
+   Only passing runs' answers are published, so replay could push a flaky case toward passing; the
+   lane's safety cases (`hack/eval/replay-lane-safety-cases.txt`) therefore run live before the
+   cache is seeded and then replayed, and the report sets the two pass rates side by side.
    The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
    into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM
    behind it, with the Prow runner's `roles/container.admin`, and the nightly then publishes what
@@ -872,7 +967,7 @@ rest live, and compare the two groups.
     needs (the shared cache, who can write to it, and the gate rules).
 
 Our staged plan answers the same questions without touching anyone's pull request until we know:
-shadow mode measures how often pull requests could hit, at no risk; the replay lane replays the nightly's own recordings of the same cases on `main`'s code, which is the like-for-like comparison an A/B test
+shadow mode measures how often pull requests could hit, at no risk; the replay lane replays the nightly's own recordings of the same cases on the code that recorded them, which is the like-for-like comparison an A/B test
 can't give; and only then do presubmits turn on. Its weakness is that the lane isn't real pull
 request traffic, and stage 3 turns replay on for everyone at once. If we want a ramp at stage 3, we
 would turn replay on case by case rather than by coin flip: the same cases replay for every pull
@@ -880,10 +975,10 @@ request, so the gate stays fair, and we add cases as each one's lane results hol
 
 ## Open questions
 
-- **Following runs live, for one recording per run.** Working out which run an answer came from
-  after the fact is covered above. Doing it live, so each of the three runs gets its own recording,
-  means the harness telling the proxy which case and run each front-door task is, and the proxy
-  following the cards from there. Worth doing only if shadow mode shows replay is worth turning on.
+- **Serving by run, for one recording per run.** Every request already carries its run tag, and
+  the proxy logs it. Serving each of the three runs its own recording means choosing among a key's
+  answers by that tag rather than in turn. Worth doing only if shadow mode shows replay is worth
+  turning on.
 - **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We

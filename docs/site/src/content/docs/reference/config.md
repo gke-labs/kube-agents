@@ -44,6 +44,7 @@ mcp_servers:
       GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
+      A2A_NOTIFY_CONVERSATIONS: "${A2A_NOTIFY_CONVERSATIONS}"
       NATS_URL: "${NATS_URL}"
       NATS_CA_FILE: "${NATS_CA_FILE}"
       A2A_BUS_USER: "${A2A_BUS_USER}"
@@ -145,6 +146,10 @@ plugins:
     - tool_call_audit
     - incident_context
     - pr_opened
+    # Off unless KUBEAGENTS_EVAL_RUN_TAGS is on (eval installs only): then it adds
+    # the eval run, case and repetition to each model request's headers for the
+    # replay proxy's log (plugins/eval_run_tag/__init__.py). Off, it registers nothing.
+    - eval_run_tag
 ```
 
 ## Sections
@@ -157,8 +162,9 @@ Every server is `lazy: true`, so none of them is started at boot. Hermes registe
 
 - **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Planning Agent).
   - The `env:` block is an allowlist rather than a pass-through. Hermes gives a stdio MCP server a safe baseline (`PATH`, `HOME`, `TMPDIR`, `XDG_*`) plus exactly the keys named there and drops every other pod variable, so anything a tool needs has to be listed.
-  - Currently listed: the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the project ids, the Google Chat and Slack home channels, the API server key, and the Session KV bearer token and database path. Three more groups are listed. The agent's own cluster (`GKE_PROJECT_ID`, `GKE_LOCATION`, `GKE_CLUSTER_NAME`) lets `gke_endpoint` decide whether a fleet cluster is reachable over its private endpoint. The four bus variables (`A2A_NOTIFY_PLATFORM`, `NATS_URL`, `NATS_CA_FILE`, `A2A_BUS_USER`) are what `send_notification` posts through under `mode: next`. `KUBEAGENTS_SCOPE_FILE`, the operator's render of `spec.scope`, is what `fleet_scope` reads before the first reconcile snapshot answers. The data root (`PLATFORM_AGENT_HOME`) is listed too; the Cluster Agent roster tools read the profiles tree from it.
-  - A home channel is what `send_notification` falls back to when a notification has no thread to reply into, which is every alert-driven investigation. It needs `spec.integration.googleChat.homeChannel` set to carry a value. The bearer token is what lets it read `chat_id` and `thread_id` back in the first place, so an absent one costs the thread and the incident report both. See the comments on those keys in the source file.
+  - Currently listed: the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the project ids, the Google Chat and Slack home channels, the API server key, and the Session KV bearer token and database path. The allowlist also carries the agent's own cluster, the kube-api proxy flag, the scope file and the data root. The agent's own cluster (`GKE_PROJECT_ID`, `GKE_LOCATION`, `GKE_CLUSTER_NAME`) lets `gke_endpoint` decide whether a fleet cluster is reachable over its private endpoint. `KUBE_PROXY_IN_USE_URL` tells it when the kube-api proxy decides instead. `KUBEAGENTS_SCOPE_FILE`, the operator's render of `spec.scope`, is what `fleet_scope` reads before the first reconcile snapshot answers. The data root (`PLATFORM_AGENT_HOME`) is listed too; the Cluster Agent roster tools read the profiles tree from it.
+  - The five bus variables (`A2A_NOTIFY_PLATFORM`, `A2A_NOTIFY_CONVERSATIONS`, `NATS_URL`, `NATS_CA_FILE`, `A2A_BUS_USER`) are what `send_notification` posts through. The two notify variables each hold a comma-separated list of platform names. A single name is a list of one. The operator names every armed route in `A2A_NOTIFY_CONVERSATIONS`, and every armed route with a home channel set on the PlatformAgent in `A2A_NOTIFY_PLATFORM`, Chat first. The agent adds a platform whose home the gateway learned, after the configured ones. When no platform has a home channel, the agent sends home posts to every armed route. An alert goes to the first of those.
+  - A home channel is what `send_notification` falls back to when a notification has no thread to reply into, which is every alert-driven investigation. It carries a value when a home channel is set on the PlatformAgent (`spec.integration.googleChat.homeChannel`, or the Slack field) or the gateway learned one. The bearer token is what lets it read `chat_id` and `thread_id` back in the first place, so an absent one costs the thread and the incident report both. See the comments on those keys in the source file.
 - **`gke`** — Remote GKE MCP server, reached through `mcp-remote` and the credential proxy. `mcp-remote` sends each call to the proxy's MCP relay (the operator sets `KUBE_AGENTS_MCP_RELAY_URL` on the agent container) and presents the agent's projected token from the file `MCP_REMOTE_BEARER_FILE` names. The proxy relays only the server's read-only tools and refuses the rest, and forwards on its own credential, so the agent container needs none. `developer_knowledge` is reached the same way.
   - `tools.include` registers only the server's read tools, the ones it annotates `readOnlyHint`, so its cluster, node-pool and manifest writes are never offered to the model. The proxy enforces the same list (`mcp_policy.GKE_READ_TOOLS`), so a write is refused even if the offer drifts. It is an allowlist on both sides: a tool the server adds later stays hidden and refused until it is named.
   - A cluster profile already on the volume gets the `tools.include` list at the next pod start if it has none, and keeps the list it holds when a later image changes it. The proxy's list is what is enforced either way.
@@ -178,7 +184,7 @@ A variable the block omits arrives unset inside the server, and a read of it sil
 Toolsets group MCP servers into named bundles for different Hermes surfaces:
 
 - **`cli`** — Exposed to the Hermes CLI (interactive terminal usage inside the pod).
-- **`api_server`** — Exposed to the Hermes REST API (Chat integrations, external callers, and under `spec.mode: next` the `hermes-bridge` container, which runs each task it takes off the bus as a turn on this API server).
+- **`api_server`** — Exposed to the Hermes REST API (Chat integrations, external callers, and the `hermes-bridge` container, which runs each task it takes off the bus as a turn on this API server).
 
 Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`), and both list `memory`. That entry is a gate, not a tool grant: Hermes only injects the memory provider's tools into a profile that names it. A specialist reached as a kanban worker resolves its toolsets from `cli` while the API-server path uses `api_server`, so it has to appear on both for the two routes to see the same memory. Which tools it actually yields is decided by the provider — see [`memory`](#memory). `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) is declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at build time.
 
@@ -186,7 +192,7 @@ Note that the two files' toolset lists are **unioned**, not overridden — the b
 
 `agent.disabled_toolsets` then removes `browser`, `computer_use`, `image_gen`, `tts` and `vision` from both surfaces, on the Platform Agent and on every Cluster Agent. Hermes applies it last, so it also narrows the toolsets a kanban worker is spawned with. None of the agents' work uses them, and declaring the full set puts Gemini on Vertex on an intermittent slow path before the first token. In a replay of a captured worker request, the 90th-percentile wait fell from 13.7s (up to 57s) to 2.8s once they were gone.
 
-No MCP server exposes an agent-to-agent call tool; delegation between the profiles is kanban-only. Under `spec.mode: next` the A2A bus carries tasks from the gateway into the agent pod and to session pods, and nothing between the profiles.
+No MCP server exposes an agent-to-agent call tool; delegation between the profiles is kanban-only. The A2A bus carries tasks from the gateway into the agent pod and to session pods, and nothing between the profiles.
 
 ### `toolsets`
 
@@ -246,6 +252,7 @@ Hermes plugins enabled:
 - **`tool_call_audit`** — writes per-tool-call records for audit and debug.
 - **`incident_context`** — injects Kubernetes incident context into known chat threads on reply (`pre_gateway_dispatch` hook), and records an `apply` there so its fix [holds a recurrence](/kube-agents/concepts/chatops/#one-incident-per-workload). The work happens on the Planning Agent, which enables it too: the pod runs a single gateway and it is homed at that profile, so an incident-thread reply is dispatched there and never here. It stands aside for a message that starts with `/`. `legacy_slash_commands` is on the same hook, and prepending the triage report first would move the command off the front of the line, where that plugin's anchored pattern can no longer see it.
 - **`pr_opened`** — claims each pull or merge request the agent opens through the credential broker, which checks it with the forge (`transform_terminal_output` hook). It strips the token from the output and counts the pull request in the proposals ledger by origin ([Hermes chat metrics](/kube-agents/concepts/observability/#hermes-chat-metrics)). In a kanban worker it also records a `pr_opened` event on the card, posted to the card's chat thread with `KAGE_SLACK_UX` on ([ChatOps](/kube-agents/concepts/chatops/)). The Cluster Agent and TSE profiles enable it too. Its `pre_tool_call` hook refuses the `submit-suggestion` skill's `prepare` and `submit` from a worker whose run on its card has ended. With [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) on, the operator's overlay enables it; the back-fill never adds an entry a live file already holds.
+- **`eval_run_tag`** — registers nothing unless the chart's `platformAgent.deployment.evalRunTags` sets `KUBEAGENTS_EVAL_RUN_TAGS`, which only eval installs with the replay proxy do. Then it adds the eval run, case and repetition to the HTTP headers of each model request (an `llm_request` middleware), which the proxy logs and does not forward. The Planning Agent, Cluster Agent and `tse` profiles enable it too.
 
 The chat-ingress plugins run on the Planning Agent profile, which owns chat ingress. `session_store` holds durable session state. `session_otel_bridge` enriches OTel spans with session context (see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)). `chat_metrics` counts inbound messages and failed turns, thumbs-down reactions and the board's cards that gave up for `status.usage`, and reads the proposals ledger by origin from Session KV. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
 

@@ -1,15 +1,15 @@
-"""Today's Slack presentation as ``kube-agents.chat/v1`` messages, for ``spec.mode: next``.
+"""The Slack presentation as ``kube-agents.chat/v1`` messages, for the A2A gateway.
 
 Pure functions only, like the presenters they port: nothing here imports the
-Hermes gateway, the Slack SDK or the network. Under ``next`` the chat gateway
+Hermes gateway, the Slack SDK or the network. The chat gateway
 renders a chat message and composes nothing (``docs/designs/spec-a2a-payloads.md``,
 "Chat messages"), so the composing that ``slack_status``, ``slack_presenter`` and
 ``slack_moments`` do for Block Kit happens here instead, with the same rules and
 caps, and the result is a dict the notify route carries beside its text
-fallback. The Block Kit functions are untouched: ``today`` keeps them, byte for
-byte, and every function here is new.
+fallback. The Block Kit functions are untouched: the Hermes Slack UX the image
+still carries keeps them, byte for byte, and every function here is new.
 
-Each builder returns the chat message, or None when today posts the plain text
+Each builder returns the chat message, or None where Block Kit posts the plain text
 (an answer that opens on a code fence, a rest past the fold's cap). ``*_text``
 builds the fallback where the caller has no text of its own; it is plain, since
 the gateway escapes the fallback itself. Every field carries the raw text: the
@@ -369,11 +369,18 @@ def plan_mark(ask: str, rows: Sequence[Any]) -> dict | None:
 
 
 def plan_text(title: str | None, rows: Sequence[Any]) -> str:
-    """:func:`slack_status.plan_text` unescaped: the gateway escapes a fallback itself."""
+    """:func:`slack_status.plan_text` unescaped: the gateway escapes a fallback itself.
+
+    A plan of one card whose row has nothing to say yet is titled by that
+    card, and its one row line would repeat the title under it; the row
+    line, which carries the status marker, is drawn alone then.
+    """
     rows = _plan_rows(rows)
     several = len(rows) > 1
-    lines = [_status.plan_title(title, rows)]
-    lines += [f"{_status.ROW_MARKERS.get(r.status, _status.STEP_OPEN)} {_status.row_title(r, several)}" for r in rows]
+    head = _status.plan_title(title, rows)
+    lines = [f"{_status.ROW_MARKERS.get(r.status, _status.STEP_OPEN)} {_status.row_title(r, several)}" for r in rows]
+    if not (len(rows) == 1 and _status.row_title(rows[0], several) == head):
+        lines.insert(0, head)
     return "\n".join(lines)
 
 

@@ -9,7 +9,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -33,11 +32,9 @@ import (
 // container, the reason, and the bucket not yet existing.
 
 func bucketWaitAgent() *agentv1alpha1.PlatformAgent {
-	agent := &agentv1alpha1.PlatformAgent{
+	return &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	}
-	agent.Spec.Mode = ptr.To(string(ModeNext))
-	return agent
 }
 
 func verifierPod(agent *agentv1alpha1.PlatformAgent, container, waitingReason string) *corev1.Pod {
@@ -113,9 +110,6 @@ func TestTheVerifiersBucketWaitIsNotReportedAsADegradedInstall(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
 			agent := bucketWaitAgent()
-			if !a2aStackRendering(agent) {
-				t.Fatalf("the fixture does not render the A2A stack, so the verifier selector is never appended and every case below would pass vacuously")
-			}
 			pod := verifierPod(agent, tc.container, tc.reason)
 			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
@@ -270,7 +264,7 @@ func TestAVerifierCrashLoopDuringAProvisionJobReRunIsAFault(t *testing.T) {
 		t.Fatal("precondition: the re-rendered provision Job already reads complete, so this pass is not the re-run window")
 	}
 
-	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +317,7 @@ func TestAVerifierCrashLoopOnAFreshInstallStillReadsProvisioning(t *testing.T) {
 		t.Fatal("precondition: the provision Job reads complete on a fresh install")
 	}
 
-	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +375,7 @@ func TestTheFirstPassThatSeesTheJobCompleteAlreadyTreatsACrashLoopAsAFault(t *te
 		t.Fatal("precondition: reconcileA2A wrote the provisioned-once record, so the two readings agree by the time the scan runs")
 	}
 
-	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
 	if err != nil {
 		t.Fatal(err)
 	}

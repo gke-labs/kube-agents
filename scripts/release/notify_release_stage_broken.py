@@ -19,7 +19,7 @@ completed run that said anything and brings the tracking issue into line:
 
 One open issue per workflow at a time, found by a hidden marker in its body
 rather than by title. The body names the stage (the failing job that
-completed last, leaving aside the compensation and non-gating jobs named in
+completed last, leaving aside the compensation jobs named in
 `COMPENSATION_JOB_MARKERS` unless nothing else failed), the step inside it,
 the candidate the run tested, the step that failed with a pointer at its
 log (the issue is public, so it never quotes the log line itself; the Chat
@@ -207,11 +207,11 @@ JOB_NOT_RUN_CONCLUSIONS = ("skipped", "cancelled")
 STEP_FAILED = "failure"
 # A job without a `completed_at` sorts before every job that has one.
 NO_TIME = ""
-# Substrings of the job names that are compensation or non-gating legs in
-# the watched workflows: the promotion pipeline's rollback leg (`Roll
-# Back`, `continue-on-error`), its withdrawal of an unsettled nomination
+# Substrings of the job names that are compensation legs in the watched
+# workflows: the promotion pipeline's rollback leg (`Roll Back`,
+# `continue-on-error`), its withdrawal of an unsettled nomination
 # (`Withdraw`, `always()`) and its teardown (`Tear Down`, `!cancelled()`),
-# the RC pipeline's teardown and its `(non-gating)` legs. The
+# and the RC pipeline's teardown. The
 # jobs API carries neither `if:` nor `continue-on-error`, so the names are
 # the only handle. Such a job fails after the gating failure (a withdrawal
 # runs because step 5 did not settle) or inside green runs, and is skipped
@@ -220,7 +220,7 @@ NO_TIME = ""
 # the workflow files, so a rename of those jobs reds the test.
 ROLLBACK_LEG_MARKER = "Roll Back"
 WITHDRAWAL_JOB_MARKER = "Withdraw"
-COMPENSATION_JOB_MARKERS = ("(non-gating)", ROLLBACK_LEG_MARKER, WITHDRAWAL_JOB_MARKER, "Tear Down")
+COMPENSATION_JOB_MARKERS = (ROLLBACK_LEG_MARKER, WITHDRAWAL_JOB_MARKER, "Tear Down")
 # The promotion pipeline's (`EVAL_PIPELINE`) eval wait (step 5), by name
 # substring. It fails on a RED verdict and on no verdict alike,
 # and the jobs API carries no job outputs, so the withdrawal is what tells
@@ -414,8 +414,9 @@ NIGHT_LENGTH = len("2026-11-04")
 COMMIT_URL = "https://github.com/{repo}/commit/{sha}"
 ISSUE_URL = "https://github.com/{repo}/issues/{number}"
 # What `poll_rc_eval_verdict.py` prints into the step-5 log once it has a
-# settled RED: the Prow build id and its Spyglass link. An empty build id
-# prints no link, and reads as unavailable.
+# settled RED: the Prow build id and its build link (Spyglass, or the
+# Console's bucket browser for a build in a private bucket). An empty build
+# id prints no link, and reads as unavailable.
 # The pattern is built from the poller's own format, so a change to the line
 # there changes what is read here.
 _LINE_FIELD = "FIELDPLACEHOLDER"
@@ -794,7 +795,8 @@ def stall_stamp_entries(body: str | None) -> list:
 
 
 def extract_red_verdict_build(log_text: str) -> tuple | None:
-    """`(build id, Spyglass link)` from the poller's settled-RED line, or None."""
+    """`(build id, build link)` from the poller's settled-RED line, or None;
+    the link is Spyglass or the Console's bucket browser, as the poller chose."""
     for raw in log_text.splitlines():
         match = _RED_VERDICT_LINE_RE.match(clean_log_line(raw).strip())
         if match:

@@ -280,7 +280,7 @@ WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
 # the list: a check whose result should not depend on the attempt, which is
 # every check that reads the tree and nothing else. Left off on purpose:
 # `Validate PR Title`, which a title edit legitimately turns green without a
-# commit; `Security Scanning`, whose advisory database moves between attempts,
+# commit, and `UX Evidence`, which a body edit does; `Security Scanning`, whose advisory database moves between attempts,
 # so a green re-run there is the database changing rather than the check
 # flaking; and the `pull_request_target` automations (`Risk Classification`,
 # `Hold Unresolved Threads`, `Merge Gate`, `Auto Enqueue`), which are not checks
@@ -302,6 +302,7 @@ WATCHED_WORKFLOWS = (
     "Documentation Freshness Check",
     "GHES Proxy Tests",
     "Installer Cross-OS Validation Matrix",
+    "Installer tests on bash 3.2",
     "Operator Tests",
     "Prettier Check",
     "Python Unit Tests",

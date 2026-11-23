@@ -111,7 +111,23 @@ class Scenario(unittest.TestCase):
         res = subprocess.run([sys.executable, "scripts/skill_overlay.py", *args], cwd=self.repo,
                              env=self.env, capture_output=True, text=True)
         self.assertEqual(res.returncode, expect, res.stdout + res.stderr)
+        if args[0] == "refresh":
+            self.fill_eval_cases()
         return res.stdout + res.stderr
+
+    def add_case(self, *case_ids):
+        """Give the fixture repository an eval case folder, so an Eval-Case: line may name it."""
+        for case_id in case_ids:
+            folder = self.repo / "bench" / "tasks" / case_id
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "task.yaml").write_text(f"id: {case_id}\n")
+
+    def fill_eval_cases(self):
+        """Do what an author does after a refresh, so `check` judges the rest of the overlay."""
+        for patch in (self.repo / "agents" / "platform" / "skill-overlays").glob("*/*.patch"):
+            data = patch.read_bytes()  # bytes: a text-mode rewrite would change a CRLF patch
+            if b"Eval-Case: TODO" in data:
+                patch.write_bytes(data.replace(b"Eval-Case: TODO", b"Eval-Case: none (fixture)"))
 
     def skill(self, name="basics"):
         return self.repo / "agents" / "platform" / "skills" / name / "SKILL.md"
@@ -147,6 +163,67 @@ class Scenario(unittest.TestCase):
         self.assertIn("no change outside append.md", out)
         self.assertEqual(len(list(self.overlay().glob("*.patch"))), 2)
         self.assertIn("ok: 2", self.run_tool("check"))
+
+    def test_check_fails_on_an_unfilled_eval_case(self):
+        self.adopt_with_two_patches()
+        patch = self.overlay() / "0002-fix-typo.patch"
+        filled = patch.read_text()
+        self.assertIn("Local-Issue: TODO\nEval-Case: none (fixture)\nUpstream-Issue: none\n", filled)
+        for value in (" TODO", " TODO: the case", "", "   "):
+            patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case:" + value))
+            out = self.run_tool("check", expect=1)
+            self.assertIn("fill in the Eval-Case: header of 0002-fix-typo.patch", out)
+            self.assertNotIn("0001-use-location.patch", out)
+        # A filled line above the unfilled one does not hide it.
+        patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case: case-one\nEval-Case: TODO"))
+        self.assertIn("fill in the Eval-Case: header of 0002-fix-typo.patch", self.run_tool("check", expect=1))
+        self.add_case("case-one", "case-two")
+        patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case: case-one, case-two"))
+        self.assertIn("ok: 2", self.run_tool("check"))
+
+    def test_check_fails_an_eval_case_that_names_no_case_folder(self):
+        self.adopt_with_two_patches()
+        self.add_case("case-one")
+        (self.repo / "bench" / "tasks" / "no-task-file").mkdir()   # a folder that is not a case
+        patch = self.overlay() / "0002-fix-typo.patch"
+        filled = patch.read_text()
+        for value, named in (("case-on", "'case-on'"), ("case-one, case-two", "'case-two'"), ("todo", "'todo'"),
+                             ("none", "'none'"), ("none ()", "'none ()'"), ("none ( )", "'none ( )'"),
+                             ("../tasks/case-one", "'../tasks/case-one'"), ("case-one,", "''"),
+                             ("no-task-file", "'no-task-file'"), ("Case-One", "'Case-One'"),
+                             ("none (a reason), bogus", "'none (a reason)', 'bogus'")):
+            patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case: " + value))
+            out = self.run_tool("check", expect=1)
+            self.assertIn("names no case folder in bench/tasks for 0002-fix-typo.patch: " + named, out)
+            self.assertNotIn("0001-use-location.patch", out)
+        for value in ("case-one", "none (a lint fix)", "none (exempt: a direct live test (see the pull request))"):
+            patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case: " + value))
+            self.assertIn("ok: 2", self.run_tool("check"))
+
+    def test_check_fails_a_patch_with_no_eval_case_line(self):
+        self.adopt_with_two_patches()
+        patch = self.overlay() / "0001-use-location.patch"
+        filled = patch.read_text()
+        # No line at all, and a key the tool does not read as the line.
+        for header in (filled.replace("Eval-Case: none (fixture)\n", ""),
+                       filled.replace("Eval-Case: none (fixture)", "Eval-case: none (fixture)")):
+            patch.write_text(header)
+            out = self.run_tool("check", expect=1)
+            self.assertIn("fill in the Eval-Case: header of 0001-use-location.patch", out)
+            self.assertNotIn("0002-fix-typo.patch", out)
+        patch.write_text(filled)
+        self.assertIn("ok: 2", self.run_tool("check"))
+
+    def test_eval_case_line_survives_a_sync_and_a_fold(self):
+        self.adopt_with_two_patches()
+        patch = self.overlay() / "0001-use-location.patch"
+        patch.write_text(patch.read_text().replace("Eval-Case: none (fixture)", "Eval-Case: case-one"))
+        self.run_tool("sync", "basics", "--ref", "v2")
+        self.assertIn("Local-Issue: TODO\nEval-Case: case-one\n", patch.read_text())
+        md = self.skill()
+        md.write_text(md.read_text().replace("--location=LOCATION", "--location=LOCATION --project=PROJECT"))
+        self.assertIn("folded the edit", self.run_tool("refresh", "basics", "--patch", "0001"))
+        self.assertIn("Local-Issue: TODO\nEval-Case: case-one\n", patch.read_text())
 
     def test_hand_edit_without_patch_fails_check(self):
         self.adopt_with_two_patches()
@@ -527,6 +604,10 @@ class Helpers(unittest.TestCase):
     """The pure helpers, in process, so coverage sees the module."""
 
     tool = load_tool()
+
+    def test_a_new_patch_header_asks_for_its_eval_case(self):
+        header = self.tool.PATCH_HEADER_TEMPLATE.format(subject="s")
+        self.assertIn("Local-Issue: TODO\nEval-Case: TODO\nUpstream-Issue: none\n", header)
 
     def test_strip_index_lines_keeps_binary_index_lines(self):
         diff = ("diff --git a/a.md b/a.md\nindex 111..222 100644\n--- a/a.md\n+++ b/a.md\n@@ -1 +1 @@\n-x\n+y\n"

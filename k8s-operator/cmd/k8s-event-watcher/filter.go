@@ -318,6 +318,16 @@ const (
 	// still being started. Matched as a prefix so another writer that quotes
 	// the text mid-message does not match.
 	hostIPUnknownMessage = "Error: host IP unknown; known addresses:"
+	// podEtcHostsOpenPrefix and podEtcHostsMissingSuffix bound kubelet's event
+	// when building a container's config writes the pod's managed hosts file
+	// (makeHostsMount, <root-dir>/pods/<uid>/etc-hosts) after the pod's
+	// directory has been removed: os.WriteFile's PathError, "open <path>: no
+	// such file or directory", inside startContainer's "Error: ". A pod deleted
+	// while kubelet is still starting it, as Autopilot's balloon pods are. The
+	// path between is left open because kubelet's --root-dir moves it; the
+	// suffix names the pod's etc-hosts, not a host-network pod's /etc/hosts.
+	podEtcHostsOpenPrefix    = "Error: open "
+	podEtcHostsMissingSuffix = "/etc-hosts: no such file or directory"
 )
 
 // newFilterConfig creates a new filterConfig, applying defaults for missing values.
@@ -926,11 +936,12 @@ func settleApplies(canonicalReason, message string) bool {
 // starts a container with no status whatever the restartPolicy, so kubelet
 // retries such an error on every pod sync while it lasts and stops only when
 // the pod is deleted: a lasting one crosses the settle period, and one whose
-// pod went with its node is never sighted again. A list of known messages
-// rather than "every Failed but the start errors", so a message not on it
-// still fires on its first sighting.
+// pod went with its node, or was deleted before it started, is never sighted
+// again. A list of known messages rather than "every Failed but the start
+// errors", so a message not on it still fires on its first sighting.
 func retriedConfigError(message string) bool {
-	return strings.HasPrefix(message, hostIPUnknownMessage)
+	return strings.HasPrefix(message, hostIPUnknownMessage) ||
+		(strings.HasPrefix(message, podEtcHostsOpenPrefix) && strings.HasSuffix(message, podEtcHostsMissingSuffix))
 }
 
 // settled reports whether the event's own sightings span the settle period.

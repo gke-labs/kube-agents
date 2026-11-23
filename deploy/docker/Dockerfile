@@ -49,21 +49,10 @@
 # The defaults are the upstream references, so an ordinary build is unchanged.
 ARG HERMES_AGENT_TAG
 ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
-ARG ENVOY_VERSION=v1.39.1
+ARG ENVOY_VERSION=v1.39.6
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
-# tirith, the command scanner Hermes runs before a terminal command. Pinned and
-# checksum-verified here, and put on PATH in the image (the a2a-tools stage), so
-# Hermes' tools/tirith_security finds it on PATH and never downloads the "latest"
-# release into each profile's $HERMES_HOME/bin: that was 38 MiB per scaffolded
-# Cluster Agent profile, 6.5 GiB of a 10 GiB data volume at 209 clusters
-# (gke-labs#3325). Bump the version and both sums together, from the release's
-# checksums.txt, and the same three in deploy/docker/check_skill_commands.py:
-# deploy/docker/test_check_skill_commands.py holds the two copies equal.
-ARG TIRITH_VERSION=v0.4.2
-ARG TIRITH_SHA256_AMD64=efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77
-ARG TIRITH_SHA256_ARM64=c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569
 # Declared here as well as in the `platform` stage that consumes it, so the
 # credential-proxy build -- which shares deploy/docker/cloudbuild.yaml and is
 # therefore handed the same --build-arg -- does not warn about an argument no
@@ -108,11 +97,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/drift-detector ./cmd/drift-detector/
 
-# The a2a CLI — the topics reader/writer for the A2A bus (mode: next). Same
-# pattern as the event watcher above. The binary ships UNGATED at
-# /usr/local/bin: it is inert until something invokes it, and the thing that
-# invokes it — the a2a-topics skill — is what ships dark (see the
-# /opt/a2a-template COPY below and docker-entrypoint.sh step 2.6a-bis).
+# The a2a CLI — the topics reader/writer for the A2A bus. Same pattern as
+# the event watcher above. The binary ships at /usr/local/bin and is inert
+# until something invokes it; the thing that invokes it — the a2a-topics
+# skill — ships as its own template (see the /opt/a2a-template COPY below and
+# docker-entrypoint.sh step 2.6a-bis).
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS a2a-builder
 # Repeated for the same reason as watcher-builder above: a substituted
 # GOLANG_IMAGE must not reintroduce GOTOOLCHAIN=auto (#1138).
@@ -123,31 +112,9 @@ WORKDIR /workspace
 COPY a2a/ /workspace/a2a/
 WORKDIR /workspace/a2a
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
-
-# tirith joins a2a in /workspace/bin, so agent-base copies both with the one
-# COPY it already has and the image gains no layer. The download is verified
-# against the pinned sum for the target architecture before anything is kept.
-FROM a2a-builder AS a2a-tools
-ARG TARGETARCH
-ARG TIRITH_VERSION
-ARG TIRITH_SHA256_AMD64
-ARG TIRITH_SHA256_ARM64
-RUN set -eu; \
-    case "${TARGETARCH:-amd64}" in \
-        amd64) triple=x86_64-unknown-linux-gnu; sum="${TIRITH_SHA256_AMD64}" ;; \
-        arm64) triple=aarch64-unknown-linux-gnu; sum="${TIRITH_SHA256_ARM64}" ;; \
-        *) echo "no tirith build pinned for ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    delay=1; \
-    for attempt in 1 2 3 4 5 6 7 8 9; do \
-        wget -qO /tmp/tirith.tar.gz "https://github.com/sheeki03/tirith/releases/download/${TIRITH_VERSION}/tirith-${triple}.tar.gz" && break; \
-        [ "$attempt" -lt 9 ] || exit 1; sleep "$delay"; delay=$((delay * 2)); \
-    done; \
-    echo "${sum}  /tmp/tirith.tar.gz" | sha256sum -c -; \
-    mkdir /tmp/tirith; tar -xzf /tmp/tirith.tar.gz -C /tmp/tirith tirith; \
-    install -m 0755 /tmp/tirith/tirith /workspace/bin/tirith; \
-    rm -rf /tmp/tirith /tmp/tirith.tar.gz
+    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/ && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/bin/curator ./cmd/curator/
 
 FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 
@@ -445,37 +412,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/apply_cron_skip_ledger.p
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/verify_cron_skip_ledger.py && \
     rm -rf /tmp/cron-skip-ledger
 
-# Security: scan the cron commands that skip the approval prompt.
-# approvals.cron_mode: approve is a fleet-wide default here -- a scheduled run
-# has nobody at the keyboard, so it cannot answer an approval prompt. Upstream
-# read that as permission to skip the Tirith content scan as well: the scanner
-# is called only from _unattended_deny, the `deny` arm check_all_command_guards
-# runs for each unattended context, so under `approve` every command in every
-# watchdog run executed unscanned. Measured
-# against the live image, not inferred: the scanner is consulted 0 times.
-# That is the wrong half to drop. github-issue-resolver fires every 30 minutes
-# over issue text written by anyone with a GitHub account, and Tirith's whole
-# subject is the content-level threats that arrive that way -- homograph and
-# lookalike-TLD URLs, pipe-to-interpreter, terminal escape injection, encoded
-# payloads -- none of which DANGEROUS_PATTERNS is looking for. The patch
-# inserts its own scan ahead of that loop, in every mode; the mode goes on
-# deciding only what happens to a pattern-flagged command, which is the part
-# that genuinely needs a human.
-# The applier proves the anchor matched; it cannot prove the gate now refuses
-# anything, and every way this patch fails is silent -- an unscanned run looks
-# exactly like a clean one. verify_cron_tirith_scan.py drives the real patched
-# check_all_command_guards and asserts on its verdict.
-# See the module docstring in deploy/docker/patches/cron_tirith_scan.py.
-COPY --chmod=0644 deploy/docker/patches/cron_tirith_scan.py /opt/hermes/tools/cron_tirith_scan.py
-COPY deploy/docker/patches/apply_cron_tirith_scan.py \
-     deploy/docker/patches/verify_cron_tirith_scan.py \
-     deploy/docker/patches/patchlib.py \
-     /tmp/cron-tirith-scan/
-RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.py /opt/hermes && \
-    grep -q "from tools.cron_tirith_scan import cron_tirith_block" /opt/hermes/tools/approval.py && \
-    grep -q "describe=_format_tirith_description" /opt/hermes/tools/approval.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
-    rm -rf /tmp/cron-tirith-scan
+# Licensing: Hermes' external command scanner is not run, shipped or fetched.
+# Upstream's tools/tirith_security.py spawns a third-party AGPL binary before
+# each terminal command and downloads the latest release into every profile's
+# $HERMES_HOME/bin when PATH holds none. The stand-in replaces that module, so
+# the image has no downloader and every caller gets the verdict upstream gives
+# with the scan off. The cron risk gate's RUN below checks the replacement took.
+# See the module docstring in deploy/docker/patches/no_external_scanner.py.
+COPY --chmod=0644 deploy/docker/patches/no_external_scanner.py /opt/hermes/tools/tirith_security.py
 
 # Cron: a run directory per agent run (gke-labs/kube-agents#2989). A job with
 # no workdir (all of ours) started its terminal in the sandbox's unwritable
@@ -507,8 +451,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.p
     rm -rf /tmp/cron-run-workdir
 
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
-# Must run after cron_tirith_scan: anchors into tools/approval.py at the point
-# introduced by apply_cron_tirith_scan.py.
+# The same RUN proves the scanner stand-in above is the module Hermes imports
+# and that the module holds no download or spawn. The platform stage checks
+# that PATH resolves no scanner binary in the finished image.
 COPY --chmod=0644 agents/platform/scripts/command_policy.py \
      deploy/docker/patches/cron_risk_gate.py \
      /opt/hermes/tools/
@@ -520,6 +465,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-risk-gate/apply_cron_risk_gate.py /o
     grep -q "from tools.cron_risk_gate import" /opt/hermes/tools/approval.py && \
     grep -q "cron_execute_code_block" /opt/hermes/tools/approval.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-risk-gate/verify_cron_risk_gate.py && \
+    /opt/hermes/.venv/bin/python3 -c "from tools import tirith_security as s; assert s.ensure_installed() is None and not s.is_platform_supported() and s.check_command_security('x')['action'] == s.ACTION_ALLOW" && \
+    ! grep -rqE 'releases/(latest/)?download|urlopen|subprocess' /opt/hermes/tools/tirith_security.py && \
     rm -rf /tmp/cron-risk-gate
 
 # Cron delivery: `deliver: "chat"` hands a job's finished report to the Chat
@@ -923,6 +870,7 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
+     deploy/docker/patches/apply_api_platform_hint.py \
      deploy/docker/patches/apply_slack_reactions_scope.py \
      deploy/docker/patches/verify_slack_reactions_scope.py \
      deploy/docker/patches/apply_slack_ux_reactions.py \
@@ -976,6 +924,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_chan
     grep -qF "kube-agents patch: attachment-fallback notice" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -qF "_credential_proxy_relay_patched" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_api_platform_hint.py /opt/hermes && \
+    grep -qF "kube-agents chat gateway" /opt/hermes/agent/prompt_builder.py && \
+    ! grep -qF "assume plain text" /opt/hermes/agent/prompt_builder.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_reactions_scope.py /opt/hermes && \
     grep -qF '"reactions:write"' /opt/hermes/hermes_cli/slack_cli.py && \
     install -m 0644 /tmp/message-surface/slack_ux_reactions.py /opt/hermes/gateway/slack_ux_reactions.py && \
@@ -1459,7 +1410,7 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # google.rpc.RetryInfo.retryDelay, so the three retries fell 2-6s apart. The
 # retryDelay fallback shares the header path's 600s cap and leaves the retry
 # count alone. rate_limit_backoff_floor, applied after it, covers the 429 that
-# names no window at all: gemini-4-argon's dynamic-shared-quota 429 carries no
+# names no window at all: Vertex's dynamic-shared-quota 429 carries no
 # header, no field and no RetryInfo, so the three retries still fell 2-6s apart
 # inside a quota minute that was still closed and the rep was lost as
 # hermes-rate-limited (gke-labs/kube-agents#4238). It waits a jittered 30-60s
@@ -1891,6 +1842,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # wraps. hermes_cli/ is the destination no chmod loop walks, hence install -m.
 # See the module docstring in deploy/docker/patches/kanban_origin.py.
 #
+# eval_run_tag: which eval run, case and repetition a model request serves,
+# for the replay proxy's log. hermes_cli/eval_run_tag.py is installed beside
+# kanban_origin, which calls it from the same two wrappers to stamp a card's
+# tag (side table kanban_task_eval_runs); apply_eval_run_tag.py makes the API
+# server's chat-completions and responses handlers record an incoming
+# X-Kube-Agents-Eval-Run for the turn's session in the Session KV server; the
+# eval_run_tag plugin (agents/platform/plugins) adds it to each model
+# request's headers. All of it is inert unless KUBEAGENTS_EVAL_RUN_TAGS is on.
+# The build counts the two awaited calls; verify_eval_run_tag.py checks each
+# follows every session_id assignment, the import is the real module, and the
+# switch gates the header. See the module docstring in
+# deploy/docker/patches/eval_run_tag.py.
+#
 # kanban_ended_run: a block from outside a card's run stops the run's worker,
 # and a worker whose run is over is told so (#2947). Upstream's block_task ends
 # the run but leaves the process running (archive_task stops it), and a refused
@@ -1983,6 +1947,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_origin.py \
      deploy/docker/patches/apply_kanban_origin.py \
      deploy/docker/patches/verify_kanban_origin.py \
+     deploy/docker/patches/eval_run_tag.py \
+     deploy/docker/patches/apply_eval_run_tag.py \
+     deploy/docker/patches/verify_eval_run_tag.py \
      deploy/docker/patches/kanban_ended_run.py \
      deploy/docker/patches/apply_kanban_ended_run.py \
      deploy/docker/patches/verify_kanban_ended_run.py \
@@ -2088,6 +2055,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'create_task = _kanban_origin_wrap_create_task(create_task)' /opt/hermes/hermes_cli/kanban_db.py && \
     grep -qF '_HANDLERS["create"] = _cmd_create' /opt/hermes/hermes_cli/kanban.py && \
     grep -qF '_HANDLERS["swarm"] = _cmd_swarm' /opt/hermes/hermes_cli/kanban.py && \
+    install -m 0644 /tmp/latency-patches/eval_run_tag.py /opt/hermes/hermes_cli/eval_run_tag.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_eval_run_tag.py /opt/hermes && \
+    test "$(grep -c 'await _kube_agents_eval_run_record(request, session_id)  # kube-agents patch: eval_run_tag' /opt/hermes/gateway/platforms/api_server_openai_routes.py)" = "2" && \
     cp /tmp/latency-patches/kanban_ended_run.py /opt/hermes/tools/kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_ended_run.py /opt/hermes && \
     test "$(grep -c '_kanban_refuse_ended_run(tid, _kanban_ended_run_connect)' /opt/hermes/tools/kanban_tools.py)" = "2" && \
@@ -2128,6 +2098,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_origin.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_eval_run_tag.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_self_copy.py && \
     KUBE_AGENTS_REDACTOR_MODULE=/tmp/latency-patches/redactor.py \
@@ -2335,9 +2306,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of the pod, on a pod that stays Ready while it does.
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
-# The a2a CLI, ungated (see the a2a-builder stage for why that is safe), and the
-# pinned tirith (see the a2a-tools stage).
-COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/tirith /usr/local/bin/
+# The a2a and curator CLIs, ungated (see the a2a-builder stage for why that is
+# safe).
+COPY --from=a2a-builder --chmod=0755 /workspace/bin/a2a /workspace/bin/curator /usr/local/bin/
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
@@ -2360,7 +2331,6 @@ CMD ["hermes", "gateway", "run"]
 #   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
 #                   /opt/cluster-template (see scripts/cluster_agent_profile.py).
 FROM agent-base AS platform
-ARG TIRITH_VERSION
 
 # Base trees this stage never writes to normalize first — including the
 # plugin tree's root-ownership barrier — so the ~150MB copy-up layer caches
@@ -2375,17 +2345,13 @@ ARG TIRITH_VERSION
 # a part of. Cost is not the reason either way: a find/chmod over a tree whose
 # modes are already correct exports a ~4kB layer, since BuildKit diffs the
 # result rather than the syscall.
-#
-# The same layer checks that the pinned tirith is what PATH resolves, so Hermes
-# never installs a per-profile copy (gke-labs#3325).
 RUN set -eu; \
     for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
     chown -R root:root /opt/hermes/plugins; \
-    [ "$(command -v tirith)" = /usr/local/bin/tirith ]; \
-    tirith --version | grep -qx "tirith ${TIRITH_VERSION#v}"
+    ! command -v tirith
 
 # --- Chat Agent (the `default` profile) ---
 # Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
@@ -2417,8 +2383,9 @@ RUN rm -f /opt/defaults/config.yaml && \
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
 # One COPY for the two, for the same destination-sharing reason as the three
-# below.
-COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
+# below. The bench's shell reader rides in it, because worker_transcript.py
+# loads it from its own folder; bench/kube_agents_bench/ stays its one source.
+COPY agents/chat/scripts/ agents/platform/scripts/ bench/kube_agents_bench/shell_words.py /opt/defaults/scripts/
 # One COPY for the three, not three: this is the chain the layer budget is measured
 # against, and it is bounded at 128 — see the layer-budget note at the top of the
 # file. They share a destination anyway.
@@ -2474,14 +2441,12 @@ COPY --chown=hermes:hermes agents/platform/SOUL.md \
      /opt/platform-template/
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
 
-# --- A2A persona content, deliberately OUTSIDE /opt/platform-template ---
-# A skill in the template appears in the agent's skill list on every install,
-# including the ones where the bus does not exist — which breaks the mode
-# switch's promise that a normal install cannot tell this feature exists
-# (a2a/persona/README.md). It lands here instead, and docker-entrypoint.sh
-# step 2.6a-bis overlays it into the platform profile only when
-# runtime_mode.is_next(). Step 2.6a's replace-from-image is also why the PVC
-# is not a place a skill can live: this template is the only route.
+# --- A2A persona content, kept OUTSIDE /opt/platform-template ---
+# The bus persona is maintained in a2a/persona/ (a2a/persona/README.md), so
+# its skill ships as its own template rather than inside the Platform Agent's,
+# and docker-entrypoint.sh step 2.6a-bis overlays it into the platform profile
+# on every boot. Step 2.6a's replace-from-image is also why the PVC is not a
+# place a skill can live: this template is the only route.
 COPY --chown=hermes:hermes a2a/persona/platform/skills/ /opt/a2a-template/skills/
 
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
@@ -2498,8 +2463,9 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
-# scaffolded into the optional `tse` Hermes profile at runtime when enabled.
+# Copy the GKE Support Agent (tse) profile TEMPLATE (SOUL, config, skills),
+# scaffolded into the optional `tse` Hermes profile at runtime when enabled,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 
 # Platform config is self-contained (scaffold does not merge again): build it by
@@ -2544,19 +2510,16 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 # roster as well as the scheduler: each failure line the scheduler writes still
 # carries the words the relay matches, and the roster still reads as daily.
 #
-# check_skill_commands.py rides along the same way, with skill_documents.py,
-# which it imports. It runs every shell block in the skill documents of the
-# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
-# copied above this block rather than below it.
-# It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
+# The inline import of worker_transcript.py rides along for the layer budget
+# too. The module loads the bench's shell reader when it is imported, and the
+# assert fails the build when that reader is not the copy in
+# /opt/defaults/scripts.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
      deploy/docker/patches/verify_card_stop.py \
      deploy/docker/plugins/verify_scheduler_failure_line.py \
-     deploy/docker/check_skill_commands.py \
-     deploy/docker/skill_documents.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
     cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \
@@ -2571,13 +2534,9 @@ assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lo
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_scheduler_failure_line.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
-        --tirith-bin /usr/local/bin/tirith \
-        agents/platform/skills=/opt/platform-template/skills \
-        agents/cluster/skills=/opt/cluster-template/skills \
-        agents/cluster/persona/skills=/opt/cluster-template/persona/skills \
-        agents/tse/skills=/opt/tse-template/skills \
-        a2a/persona/platform/skills=/opt/a2a-template/skills && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 -c "\
+import worker_transcript as w; \
+assert w.SHELL_READER_PATH == '/opt/defaults/scripts/shell_words.py', 'shell reader loaded from %r' % w.SHELL_READER_PATH" && \
     rm -rf /tmp/platform-config
 
 # Plugins land in the shared plugin root regardless of which profile owns them —
@@ -3039,6 +2998,7 @@ RUN chmod 0755 /opt/defaults
 COPY --chown=root:root --chmod=0755 \
      agents/chat/scripts/ \
      agents/platform/scripts/ \
+     bench/kube_agents_bench/shell_words.py \
      deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \

@@ -20,6 +20,11 @@ import (
 // discordChunk leaves headroom under Discord's 2000-char message cap.
 const discordChunk = 1900
 
+// lineDoneMark ends a completed task's live message on a backend that
+// answers on the line (LineAnswerer, doneTerminalLine): the glyph alone,
+// where the terminal edit elsewhere reads "✅ completed".
+const lineDoneMark = "✅"
+
 // progressCap bounds the progress text embedded in rolling lines and status
 // answers, so one artifact can't blow a chat edit past the backend cap.
 const progressCap = 300
@@ -42,7 +47,110 @@ const (
 	reasonPrefix         = "reason: "
 	reasonTokenCap       = 64 // the longest executor token today is 34 bytes
 	reasonTokenMalformed = "(malformed)"
+	// reasonDetailSeparator is what the executors put between the token
+	// and the detail.
+	reasonDetailSeparator = " - "
+	// reasonSessionMarker opens the session id an executor appends to a
+	// reason's detail for the operator; the user's reading stops before it.
+	reasonSessionMarker = "; session: "
 )
+
+// The notices a conversation reads when a task ends other than completed.
+// The user-facing text carries the executor's detail in plain words and
+// never the `reason:` prefix or the token (.agents/rules/chat_ux.md, "No
+// plumbing in user text" and "A failure is one plain line"). A reason in the
+// executors' shape is rendered as `<prefix> — <detail>`; one that is plain
+// text already (a supervisor's note) is rendered as `<prefix>: <text>`, as
+// it always was; an empty one is the bare line.
+const (
+	noticeFailed          = "❌ failed"
+	noticeFailedBare      = "❌ the task failed"
+	noticeCanceled        = "🛑 canceled"
+	noticeRejected        = "🚫 the executor rejected the task"
+	noticeDetailSeparator = " — "
+	noticePlainSeparator  = ": "
+)
+
+// reasonSentences is the person's reading of each failure token the
+// executors, the dispatcher and the gateway write whose detail is written
+// for an operator (an HTTP status, a session id, a body or stderr tail, a
+// Go error, a pod or profile name): one plain line per token, shown in the
+// detail's place. "Ask again" is said only where the fault is transient;
+// a fault that repeats is for the operator. A token in neither this map
+// nor reasonDetailShown reads as the bare notice, so a token added later
+// leaks nothing until someone writes its line.
+var reasonSentences = map[string]string{
+	// The agent did not get to run the request.
+	"bridge-shutdown":                    "the agent was restarted while it worked on this; ask again",
+	"bridge-queue-overflow":              "the agent had too many requests waiting; ask again in a moment",
+	"bus-publish-failed":                 "the agent could not send its update over the message bus",
+	"bus-subscribe-failed":               "the agent could not listen on the message bus",
+	"spawn-failed":                       "the agent could not be started",
+	"bridge-died-without-terminal-event": "the agent stopped without reporting a result; ask again",
+	"worker-evicted":                     "the agent's worker was restarted before it finished; ask again",
+	"session-busy":                       "the agent was still busy with an earlier request when time ran out; ask again",
+	"hermes-rate-limited":                "the agent's server or the model provider is rate-limiting requests; ask again in a few minutes",
+	"hermes-api-unreachable":             "the agent's server did not answer; ask again",
+	"hermes-api-refused":                 "the agent's server refused the request before it ran",
+	"request-encode-failed":              "the request could not be prepared for the agent",
+	"request-build-failed":               "the request could not be prepared for the agent",
+	"harness-config-failed":              "the agent's worker could not be configured",
+	"harness-settings-failed":            "the agent's worker could not be configured",
+	"delegate-socket-failed":             "the agent's worker could not open its delegation channel",
+	"no-worker":                          "no worker on this install can run this request",
+	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
+	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
+	"tier-ended":                         "an administrator stopped this agent running this kind of request, which ended this one; ask again if you still need it",
+	// A confirmed change runs only in a one-pod Job of its own (#4458); the
+	// detail names the profile and tier, which are for an operator.
+	"change-needs-job": "this change has to run in a job of its own, which this agent can't start for this kind of request, so nothing was changed",
+	// The dispatcher's re-check of a profile task's child (#5686). The
+	// gateway refuses the same at mint, so these reach the room only from a
+	// child an older gateway sent, or one that broke a rule anyway.
+	"parent-unchecked":     "this delegated request wasn't checked against the task that asked for it, so it didn't run; ask again",
+	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
+	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
+	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A script-run task's worker (#5622): refused before the script ran,
+	// the script failed, or it ran past its bound.
+	"script-refused": "the worker refused to run this scheduled script, and its log says why",
+	"script-failed":  "the scheduled script ended with an error",
+	"script-timeout": "the scheduled script ran past its time limit and was stopped",
+	// A script-run task naming a script its profile doesn't list (#5622).
+	"script-not-allowed": "this agent isn't set up to run the script this schedule asked for, so it didn't run; whoever manages this agent can allow the script, or change the schedule",
+	// The agent ran and produced no answer.
+	"hermes-exited-nonzero":         "the agent stopped with an error before it answered",
+	"stream-ended-without-result":   "the agent stopped before it produced an answer",
+	"deadline-exceeded":             "the task ran out of time before it finished; ask again with a smaller task",
+	"hermes-api-failed":             "the agent's server reported an error during the turn",
+	"hermes-api-unreadable":         "the agent's server sent an answer that could not be read",
+	"hermes-api-read-failed":        "the agent's answer broke off before it arrived; ask again",
+	"hermes-api-oversize":           "the agent's answer was too large to relay; ask for a shorter answer",
+	"hermes-cli-oversize":           "the agent's output was too large to relay; ask for a shorter answer",
+	"hermes-unstructured-reasoning": "the agent's reply was its thinking, not an answer; whatever it did this turn already happened, so check that before you ask again",
+	"card-stop-unavailable":         "the agent could not reach its board to stop the cards",
+	"card-stop-unsupported":         "this agent runs no cards, so there was nothing to stop",
+	// The worker adapter passes the harness's own result subtype through as the token.
+	"error_max_turns":        "the agent used up its turns before it answered; ask again with a smaller task",
+	"error_during_execution": "the agent hit an error while it worked and produced no answer",
+	// A delegation the gateway could not carry through.
+	"delegation-refused": "the agent could not hand this to another agent",
+	"wake-not-started":   "the agent could not pick the delegated work back up",
+	// The refusals both executors publish before a task runs.
+	"no-text-parts": "the request carried no text",
+}
+
+// reasonDetailShown names the tokens whose detail is written for the
+// person: the verifier's rule (capability.Reason), the dispatcher's
+// admission wording, a delegation's own why. That detail is shown, cut
+// before any session id (reasonSessionMarker).
+var reasonDetailShown = map[string]bool{
+	"capability-refused":     true,
+	"verifier-refused":       true,
+	"parameters-invalid":     true,
+	"queue-timeout":          true,
+	"delegation-not-started": true,
+}
 
 // KV access rides withRetry with these shapes: enough to ride out a
 // connection rebuild window without inventing a second resilience layer,
@@ -351,6 +459,8 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
 	defer l.Unlock()
+	// A wake that took a cap slot ends it here, as a turn does (#6033).
+	defer g.releaseCapHold(sessionKey)
 
 	// A stopping gateway renders nothing new: its run context is done, so
 	// every read would fail, and the batch's deliveries are left for the
@@ -521,6 +631,11 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 		g.retireTaskRoute(ctx, env.TaskID)
 		return
 	}
+	// A task the gateway canceled writes nothing more to the room.
+	if ref, ok := rec.TaskRefFor(env.TaskID); ok && ref.Canceled {
+		g.applyCanceledEvent(ctx, rec, rs, item)
+		return
+	}
 
 	switch env.Kind {
 	case lib.KindStatusUpdate:
@@ -540,6 +655,124 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 	}
 }
 
+// What a canceled task's dropped write was, as the drop's log line names it
+// (dropCanceledWrite).
+const (
+	droppedStatusNote   = "status note"
+	droppedQuestion     = "question"
+	droppedSteerNotice  = "steer notice"
+	droppedRollingLine  = "rolling line"
+	droppedProgress     = "progress"
+	droppedTurnAnswer   = "turn answer"
+	droppedNotice       = "notice"
+	droppedResult       = "result"
+	droppedTerminal     = "terminal notice"
+	droppedSteerSummary = "steer shortfall"
+	droppedGatewayNote  = "deferred notice"
+)
+
+// applyCanceledEvent is applyEvent for a task the gateway canceled (a stop,
+// a withdrawn batch, a fan-out child that asked): nothing it writes reaches
+// the room, so the stop's own notice is the only output
+// (spec-chatops-gateway.md, "Stop"). A status note, a question, a steer
+// notice, a progress line, a turn's answer and a notice are each dropped and
+// logged (dropCanceledWrite); its terminal still ends it (relayTerminal,
+// which closes its line and posts nothing, except one "🛑 canceled" for a
+// task with no line to close: Lineless); and what the
+// gateway keeps as state rather than renders (the result, a handoff, a
+// delegate request, which the stopped-turn guard ignores) is applied as
+// for any task.
+func (g *Gateway) applyCanceledEvent(ctx context.Context, rec *SessionRecord, rs *relayState, item relayItem) {
+	env := item.env
+	switch env.Kind {
+	case lib.KindStatusUpdate:
+		var s lib.StatusUpdate
+		if err := json.Unmarshal(env.Payload, &s); err != nil {
+			g.log.Error("relay: malformed status-update", "taskId", env.TaskID, "err", err)
+			return
+		}
+		rs.state = s.Status.State
+		if s.Final {
+			g.relayTerminal(ctx, rec, rs, env.TaskID, s, terminalSourceOf(item.subject))
+			return
+		}
+		what := droppedRollingLine
+		switch {
+		case s.Status.State == lib.StateInputRequired:
+			what = droppedQuestion
+		case s.Status.Message == nil:
+		case isSteerNotice(s.Status.Message.Parts):
+			what = droppedSteerNotice
+		case joinTextParts(s.Status.Message.Parts) != "":
+			what = droppedStatusNote
+		}
+		g.dropCanceledWrite(rec, env.TaskID, what)
+	case lib.KindArtifactUpdate:
+		var a lib.ArtifactUpdate
+		if err := json.Unmarshal(env.Payload, &a); err != nil {
+			g.log.Error("relay: malformed artifact-update", "taskId", env.TaskID, "err", err)
+			return
+		}
+		switch a.Artifact.Name {
+		case lib.ArtifactProgress:
+			g.dropCanceledWrite(rec, env.TaskID, droppedProgress)
+		case lib.ArtifactTurn:
+			g.dropCanceledWrite(rec, env.TaskID, droppedTurnAnswer)
+		case lib.ArtifactNotice:
+			g.dropCanceledWrite(rec, env.TaskID, droppedNotice)
+		default:
+			g.applyArtifact(ctx, rec, rs, item.subject, env.TaskID, a, false)
+		}
+	}
+}
+
+// dropCanceledNotices is the end of a canceled task for the lines that
+// would follow its deliverable: the gateway's deferred notices for it and
+// the steer shortfall, each dropped and logged rather than posted.
+func (g *Gateway) dropCanceledNotices(rec *SessionRecord, rs *relayState, taskID string) {
+	g.mu.Lock()
+	notices := len(rs.notices)
+	rs.notices = nil
+	// The same test postSteerShortfall posts on: a missed steer counts only
+	// for an addressee seen to speak steer notices.
+	speaks := g.steerNoticesFrom[rec.AddresseeFor(taskID)]
+	shortfall := (speaks && rs.steersSent > len(rs.answered)) || len(rs.ended)+max(0, len(rs.queued)-rs.turnsStarted) > 0
+	g.mu.Unlock()
+	if notices > 0 {
+		g.logCanceledDrop(rec, taskID, droppedGatewayNote)
+	}
+	if shortfall {
+		g.logCanceledDrop(rec, taskID, droppedSteerSummary)
+	}
+}
+
+// logCanceledDrop is the log line for a canceled task's dropped write. At
+// its terminal it is the whole of the drop: the terminal's own edit closes
+// the line.
+func (g *Gateway) logCanceledDrop(rec *SessionRecord, taskID, what string) {
+	g.log.Info("relay: dropped a canceled task's write", "taskId", taskID, "conversation", rec.Key, "what", what)
+}
+
+// isSteerNotice reports a status message that is a steer notice.
+func isSteerNotice(parts []lib.Part) bool {
+	_, ok := lib.SteerNoticeOf(parts)
+	return ok
+}
+
+// dropCanceledWrite logs a canceled task's write the room won't get. The
+// first drop for the task holding the conversation closes its line, so a
+// typed stop's line doesn't keep its Stop control while the task runs on:
+// edited to "cancel sent" with the control gone, and left so
+// (ActiveTask.LineClosed) until the terminal's edit.
+func (g *Gateway) dropCanceledWrite(rec *SessionRecord, taskID, what string) {
+	g.logCanceledDrop(rec, taskID, what)
+	if a := rec.ActiveTask; a != nil && a.TaskID == taskID && a.StatusMsgID != "" && !a.LineClosed {
+		if g.editLine(rec.Key, a.StatusMsgID, withLineNote(cancelSentNotice, a.LineNote), "") {
+			a.LineClosed = true
+		}
+	}
+}
+
 func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource, render bool) {
 	rs.state = s.Status.State
 	switch {
@@ -554,6 +787,14 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		}
 		if ask == "" {
 			ask = "the task needs input to continue"
+		}
+		// A child of a batch of two or more ends on its question, which
+		// goes back to the session with the batch's results, rather than
+		// pausing the conversation (batchChildAsks). Anything else asks the
+		// room.
+		if ref, ok := rec.TaskRefFor(taskID); ok && rec.fanOutChild(ref) {
+			g.batchChildAsks(ctx, rec, ref, ask)
+			return
 		}
 		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: layoutOf(question)})
 		g.markFrom(rec, taskID, question)
@@ -642,24 +883,74 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 const completedNonTextResult = "(completed with a non-text result; see the stream)"
 
 // terminalNotice is the line a conversation is told when a task ends other
-// than completed, with the executor's reason when it gave one: the relay's
-// notice, and the text of a console conversation's terminal frame.
+// than completed, with the executor's reason in plain words when it gave
+// one (reasonInPlainWords): the relay's notice, and the text of a console
+// conversation's terminal frame.
 func terminalNotice(state lib.TaskState, reason string) string {
+	text, shaped := reasonInPlainWords(reason)
 	switch state {
 	case lib.StateFailed:
-		if reason != "" {
-			return "❌ failed: " + reason
-		}
-		return "❌ the task failed"
+		return noticeWithReason(noticeFailed, noticeFailedBare, text, shaped)
 	case lib.StateCanceled:
-		return "🛑 canceled"
-	case lib.StateRejected:
-		if reason != "" {
-			return "🚫 the executor rejected the task: " + reason
+		// A cancel is bare: the requester asked for it. One an
+		// administrator caused says so (canceledReasonShown).
+		if canceledReasonShown[reasonToken(reason)] {
+			return noticeWithReason(noticeCanceled, noticeCanceled, text, shaped)
 		}
-		return "🚫 the executor rejected the task"
+		return noticeCanceled
+	case lib.StateRejected:
+		return noticeWithReason(noticeRejected, noticeRejected, text, shaped)
 	}
 	return string(state)
+}
+
+// canceledReasonShown lists the tokens a canceled terminal names in its
+// notice: cancels the requester didn't ask for. Every other cancel reads as
+// the bare noticeCanceled.
+var canceledReasonShown = map[string]bool{
+	"tier-ended": true, // dispatch.ReasonTierEnded (#5850)
+}
+
+// noticeWithReason joins a notice's prefix to the reason's text: bare when
+// there is none, after a dash when it came out of the executors' shape, and
+// after a colon when it was plain text already.
+func noticeWithReason(prefix, bare, text string, shaped bool) string {
+	switch {
+	case text == "":
+		return bare
+	case shaped:
+		return prefix + noticeDetailSeparator + text
+	}
+	return prefix + noticePlainSeparator + text
+}
+
+// reasonInPlainWords is the user's reading of a terminal reason, and whether
+// the reason was in the executors' `reason: <token>[ - detail]` shape. In
+// that shape a token in reasonSentences reads as its sentence whatever
+// detail follows it; a token in reasonDetailShown reads as its detail, cut
+// before the session id an executor appends (reasonSessionMarker); any
+// other token reads as nothing, so the notice is the bare line and a token
+// nobody has written a line for leaks no plumbing. A reason outside the
+// shape is plain text already and is returned as it is.
+func reasonInPlainWords(reason string) (string, bool) {
+	rest, ok := strings.CutPrefix(reason, reasonPrefix)
+	if !ok {
+		return reason, false
+	}
+	token := reasonToken(reason)
+	if sentence, known := reasonSentences[token]; known {
+		return sentence, true
+	}
+	if !reasonDetailShown[token] {
+		return "", true
+	}
+	if _, detail, found := strings.Cut(rest, reasonDetailSeparator); found {
+		detail, _, _ = strings.Cut(detail, reasonSessionMarker)
+		if detail = strings.TrimSpace(detail); detail != "" {
+			return detail, true
+		}
+	}
+	return "", true
 }
 
 // relayTerminal posts the deliverable (or the failure), releases the
@@ -667,7 +958,35 @@ func terminalNotice(state lib.TaskState, reason string) string {
 // the durable record; the index only exists to route live events. source is
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
+	ref, _ := rec.TaskRefFor(taskID)
+	// A task the gateway canceled posts nothing at its end: no turn answer,
+	// result, notice or steer shortfall (applyCanceledEvent). Its line is
+	// still closed below, once, and its end logged and observed. A task with
+	// no line to close (Lineless) posts its one "🛑 canceled" instead.
+	muted := ref.Canceled
+	// endState is how the task's end reads to the room's line, its marks and
+	// its observers: a canceled task ends canceled whatever its executor
+	// said, so its line keeps reading stopped and no program is handed an
+	// answer the room was not (logTaskTerminal keeps the executor's state).
+	endState := s.Status.State
+	if muted {
+		endState = lib.StateCanceled
+	}
+	// Toward its observers and its mark, a turn whose request minted no child
+	// keeps the hand-off rule (handOffEnd): it ends failed with the reason on
+	// its entry, the turn having been stopped, and delivers nothing. Read
+	// once settleHandOff below has written what the stream shows.
+	observedEnd := func() lib.TaskState {
+		if _, _, handOff := rec.handOffEnd(taskID, s.Status.State); handOff {
+			return s.Status.State
+		}
+		return endState
+	}
 	// A turn answer still assembling posts before the deliverable it led to.
+	if muted && rs.turnPending {
+		rs.turn, rs.turnChunks, rs.turnPending = nil, nil, false
+		g.logCanceledDrop(rec, taskID, droppedTurnAnswer)
+	}
 	g.flushTurn(rec, rs, taskID)
 	result := joinTextParts(rs.result)
 	// The console never posts the deliverable as a notice (see the
@@ -676,7 +995,6 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// stream whatever the conversation, except for a console task whose
 	// terminal the heal already observed: it gets no second frame, so the
 	// replay would buy nothing.
-	ref, _ := rec.TaskRefFor(taskID)
 	needResult := result == "" && s.Status.State == lib.StateCompleted &&
 		!(isConsoleConversation(rec.Key) && ref.TerminalObserved)
 	// A child's turn answers feed its wake too, however it ended. The render
@@ -684,7 +1002,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// otherwise a restart may have lost some, and the stream has them all. A
 	// child its requester stopped wakes nothing, so it needs none.
 	turns := rs.turnAnswers
-	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local
+	// A fan-out child takes no steers (refuseFanOutSteer), so it has no
+	// turns to read.
+	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local && !rec.fanOutChild(ref)
 	turnsUnread := false
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
@@ -766,12 +1086,18 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		rec.markCardsAnswer(taskID)
 	}
 
+	// doneLine is the task's live message on a backend that answers on the
+	// line (LineAnswerer): a hand-off acknowledgement is edited onto it
+	// (answerOnLine), which sets lineAnswered so the terminal edit below
+	// leaves it be, and any other completed task ends it as lineDoneMark.
+	doneLine := g.answerLineFor(rec, taskID)
+	lineAnswered := false
 	switch s.Status.State {
 	case lib.StateCompleted:
 		// Whole, to the adapter whose caller is a program, before the chunked
 		// posts below (DeliverableObserver). A non-text result hands over
 		// nothing: the notice that replaces it is not the deliverable.
-		if result != "" {
+		if result != "" && !muted {
 			g.observeDelivered(rec, taskID, result)
 		}
 		// A chat message needs its text fallback, so a non-text result
@@ -799,15 +1125,39 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// The other terminal arms below are notices, not answers, and go to
 		// every backend. Chat backends have no TASKS view, so for them this
 		// post IS the answer.
-		if !isConsoleConversation(rec.Key) {
+		if muted {
+			g.logCanceledDrop(rec, taskID, droppedResult)
+			answerChat = chatmsg.Reading{}
+		} else if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
+			} else if doneLine != "" && (toCards || (rs.turnsStarted == 0 && rs.steersSent == 0 && g.answersWholeOnLine(rec.Key, answer))) && result != completedNonTextResult {
+				// The task's live message becomes the acknowledgement, or
+				// the whole answer where the backend takes one that fits
+				// (WholeLineAnswerer, answersWholeOnLine) and nothing has
+				// been posted under the line since: once a turn answer or
+				// a queued follow-up sits below it, an edit would put the
+				// last answer above what it answers, so it posts instead;
+				// and takes no terminal edit below (LineAnswerer); an
+				// edit that does not land posts it instead. An answer
+				// posts, so it notifies: a Chat edit raises none, and
+				// the acknowledgement is followed by the plan and the
+				// report, which do. The stand-in for a non-text result is
+				// a notice, not an answer, and posts.
+				lineAnswered = g.answerOnLine(rec.Key, doneLine, answer)
 			} else {
 				g.postMessage(rec.Key, answer)
 			}
 		}
 		g.markFrom(rec, taskID, answerChat)
 	case lib.StateFailed, lib.StateCanceled:
+		if s.Status.State == lib.StateCanceled {
+			// The card-stop result of a cancel that stopped the turn's
+			// cards, to the adapter whose caller is a program, before the
+			// terminal (CardStopObserver); nothing else of a canceled
+			// result is handed over.
+			g.observeCardStop(rec, taskID, rs.result)
+		}
 		reason := ""
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
@@ -815,7 +1165,17 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// A Stop button answers for itself: Slack's with one reply
 		// (slack_stop.go), Google Chat's on the line, as does a stop typed
 		// on Google Chat with a line (chat_stop_press.go).
-		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
+		switch {
+		case muted && ref.Lineless && !ref.QuietCancel:
+			// A canceled task started with no line at all (a backend that
+			// shows task status itself gives a delegated child none) would
+			// otherwise end unseen after the stop's "cancel sent": its one
+			// "🛑 canceled" is the only end the room can read. Every other
+			// late write of it stays dropped.
+			g.post(rec.Key, terminalNotice(lib.StateCanceled, ""))
+		case muted:
+			g.logCanceledDrop(rec, taskID, droppedTerminal)
+		case s.Status.State != lib.StateCanceled || !ref.QuietCancel:
 			g.post(rec.Key, terminalNotice(s.Status.State, reason))
 		}
 	case lib.StateRejected:
@@ -830,24 +1190,49 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		if muted {
+			g.logCanceledDrop(rec, taskID, droppedTerminal)
+		} else {
+			g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		}
 	}
-	g.postSteerShortfall(rec, rs, taskID)
-	g.flushNotices(rec.Key, rs)
-	g.terminalMark(rec, taskID, s.Status.State, terminal)
+	if muted {
+		g.dropCanceledNotices(rec, rs, taskID)
+	} else {
+		g.postSteerShortfall(rec, rs, taskID)
+		g.flushNotices(rec.Key, rs)
+	}
+	if muted {
+		// An executor's own mark is a write like any other.
+		terminal = chatmsg.Reading{}
+	}
+	g.terminalMark(rec, taskID, observedEnd(), terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
-		if active.StatusMsgID != "" {
+		if active.StatusMsgID != "" && !lineAnswered {
 			// The same display gate as the rolling line: under default the
 			// terminal edit carries the state and never the narration.
 			progress := rs.progress
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs, "")
+			// On a backend that shows task status itself, the only line is a
+			// delegated profile child's (childKeepsLine): done, it closes to
+			// the bare mark, as a line that took its answer does, rather than
+			// leaving a "completed" header above the answer for good.
+			onLine := doneLine != "" || g.showsTaskStatus(rec.Key)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
-		rec.ActiveTask = nil
+		if !active.Detached && rec.fanOutPending(taskID) {
+			// A turn whose batch is still running keeps the conversation
+			// until the last child ends (wakeBatch releases it): a stop
+			// reaches it, a steer is refused and a status lists the
+			// children. Its line is closed above.
+			active.StatusMsgID = ""
+		} else {
+			rec.ActiveTask = nil
+		}
 		// An executor's end of a live task is activity. The Slack adapter's
 		// session-thread rule (hasSession, through LastTaskActivity) counts
 		// from here, not from the ask that started the task; the reap does
@@ -872,11 +1257,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// that kept it. Its answer ("delegated to platform") is task
 		// activity for the session-thread rule all the same; LastActivity
 		// stays the active task's business.
-		progress := rs.progress
-		if g.cfg.DisplayMode == displayModeDefault {
-			progress = ""
+		if !lineAnswered {
+			progress := rs.progress
+			if g.cfg.DisplayMode == displayModeDefault {
+				progress = ""
+			}
+			g.renderLine(rec.Key, parent.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, doneLine != ""), parent.LineNote), rs, "")
 		}
-		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
@@ -887,6 +1274,8 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// and the fold; the gateway's job is only to never replay the result at
 	// the room).
 	g.retireTaskRoute(ctx, taskID)
+	rec.setStopPending(taskID, false)
+	rec.setCancelUnsent(taskID, false)
 	// Last, after the deliverable is posted and the rolling line edited, so
 	// an observer that treats this as "the task is over" has already been
 	// handed everything the conversation received for it. See TaskObserver.
@@ -905,7 +1294,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// the worker adapter write `reason: <token>[ - detail]` there, and a
 	// program classifying a failed terminal reads the token. Passed through
 	// rather than parsed here, because the tokens are the executors'
-	// definitions and the gateway has no business knowing them.
+	// definitions and a program grading off the door keys on them; only the
+	// notice the conversation read (terminalNotice) puts the reason in plain
+	// words.
 	reason := ""
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
@@ -929,11 +1320,21 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// wake runs) takes it in consoleFrame.
 		if isConsoleConversation(rec.Key) && handedOff(s.Status.State, rs.handoff) {
 			root, _ := rec.observedAs(taskID)
-			g.consoleCardsPending.put(root, "")
+			rec.markCardsPending(root)
 		}
-		g.observeEnded(rec, taskID, s.Status.State, source, reason)
+		g.observeEnded(rec, taskID, observedEnd(), source, reason)
 	}
 
+	// A fan-out child's end is kept until its last sibling's, which wakes
+	// the session once with all of them (batchChildEnded).
+	if ref, ok := rec.TaskRefFor(taskID); ok && rec.fanOutChild(ref) {
+		text := reason
+		if s.Status.State == lib.StateCompleted {
+			text = result
+		}
+		g.batchChildEnded(ctx, rec, ref, BatchEnd{State: s.Status.State, Text: text, Source: source, Cards: toCards}, reason)
+		return
+	}
 	// A delegated child's end wakes the session that asked, or reaches a
 	// parent addressed to an AgentProfile, which waits open, on its .in.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild && !g.deliverChildResult(ctx, rec, ref, s.Status.State, result, reason) {
@@ -1150,7 +1551,7 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 // the Stop control a backend draws on it (OutMessage.Stop); the terminal
 // edit passes none and takes it off.
 func (g *Gateway) editLine(conversation, messageID, line, stop string) bool {
-	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, discordChunk), Stop: stop}); err != nil {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, pieceSizeOf(g.adapter, conversation)), Stop: stop}); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 		return false
 	}
@@ -1185,6 +1586,17 @@ func statusLine(state lib.TaskState, progress string) string {
 	return line
 }
 
+// doneTerminalLine is terminalLine, or on a backend that answers on the
+// line (onLine) the bare lineDoneMark for a completed task: its answer has
+// posted, and the line ends as the ask's reaction comes off on Slack,
+// rather than reading as a verdict under the question.
+func doneTerminalLine(state lib.TaskState, progress string, onLine bool) string {
+	if onLine && state == lib.StateCompleted {
+		return lineDoneMark
+	}
+	return terminalLine(state, progress)
+}
+
 func terminalLine(state lib.TaskState, progress string) string {
 	icon := map[lib.TaskState]string{
 		lib.StateCompleted: "✅",
@@ -1212,10 +1624,10 @@ func terminalLine(state lib.TaskState, progress string) string {
 // rather than failing the relay — chat delivery is best-effort; the stream
 // is the record.
 func (g *Gateway) post(conversation, text string) {
-	if strings.TrimSpace(text) == "" {
+	if strings.TrimSpace(text) == "" || g.unpostableTrigger(conversation) {
 		return
 	}
-	for _, chunk := range chatChunks(text, discordChunk) {
+	for _, chunk := range chatChunks(text, pieceSizeOf(g.adapter, conversation)) {
 		if _, err := g.adapter.Post(conversation, chunk); err != nil {
 			g.log.Error("post failed", "conversation", conversation, "err", err)
 			return

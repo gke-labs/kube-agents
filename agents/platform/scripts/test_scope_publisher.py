@@ -99,7 +99,9 @@ class FakeBroker:
     holds the arguments whose call times out. Every call is recorded in `calls`.
     """
 
-    def __init__(self, assets=None, xpn=None, scopes=None, names=None, probes=None, fail=None, timeouts=()):
+    def __init__(self, assets=None, xpn=None, scopes=None, names=None, probes=None, fail=None, timeouts=(),
+                 listings=None):
+        self.listings = listings or {}
         self.assets, self.xpn, self.scopes = assets or {}, xpn or {}, scopes or {}
         self.names, self.probes, self.fail = names or {}, probes or {}, fail or {}
         self.timeouts = set(timeouts)
@@ -121,7 +123,7 @@ class FakeBroker:
         if shape == SHAPE_PROBE:
             if argument in self.probes:
                 return self._answer(argv, check, "", self.probes[argument], 1)
-            return self._answer(argv, check, "prod us-central1\n", "", 0)
+            return self._answer(argv, check, self.listings.get(argument, "prod us-central1\n"), "", 0)
         if shape == SHAPE_ASSET_SEARCH:
             projects = self.assets.get(argument, [])
             self.window.update(projects)
@@ -630,6 +632,8 @@ FOLDER_A = "folders/111111111111"
 FOLDER_B = "folders/222222222222"
 ORG = "organizations/333333333333"
 PREVIOUS_TIME = "2026-11-02T14:00:00Z"
+# The time a test gives two builds it compares, later than PREVIOUS_TIME.
+BUILD_TIME = "2026-11-03T09:00:00Z"
 
 
 def _scope(**fields):
@@ -1390,6 +1394,126 @@ class MainTest(unittest.TestCase):
         code, _, written = self._main(env=env)
         self.assertEqual(code, pub.EXIT_NOT_WRITTEN)
         written.assert_not_called()
+
+
+class ClustersMapTest(unittest.TestCase):
+    """The `clusters` map: member projects' clusters, from the probes the run already makes (#5621)."""
+
+    setUp = BuildDocumentTest.setUp
+    _build = BuildDocumentTest._build
+
+    def test_a_probed_member_lists_its_clusters(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"]})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(document["clusters"], {
+            "team-a": {"at": document["resolvedAt"], "clusters": [["us-central1", "prod"]]},
+            "team-b": {"at": document["resolvedAt"], "clusters": [["us-central1", "prod"]]},
+        })
+
+    def test_management_and_explicit_projects_are_not_in_the_map(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "explicit-1", MANAGEMENT]})
+        document = self._build(broker, _scope(projects=["explicit-1"], folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(list(document["clusters"]), ["team-a"])
+
+    def test_a_failed_probe_keeps_the_last_good_list_never_an_empty_one(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}],
+            "clusters": {"team-a": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"], ["us-east1", "b"]]}}}
+        for name, broker in {
+            "denied": FakeBroker(assets={FOLDER_A: ["team-a"]}, probes={"team-a": DENIED_STDERR}),
+            "timed out": FakeBroker(assets={FOLDER_A: ["team-a"]}, timeouts={"team-a"}),
+            "source failed": FakeBroker(fail={FOLDER_A: "connection reset by peer"}),
+        }.items():
+            with self.subTest(name):
+                document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]), previous)
+                self.assertEqual(document["clusters"]["team-a"],
+                                 {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"], ["us-east1", "b"]]})
+
+    def test_a_failed_probe_with_no_earlier_list_has_no_entry(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"]}, probes={"team-b": DENIED_STDERR})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(list(document["clusters"]), ["team-a"])
+
+    def test_a_project_that_left_the_scope_leaves_the_map(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "gone", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}],
+            "clusters": {"gone": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]}}}
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]), previous)
+        self.assertEqual(list(document["clusters"]), ["team-a"])
+
+    def test_the_projects_rows_are_the_same_with_and_without_the_map(self):
+        # The map is for readers that list clusters. It must never change the rows, which
+        # are what the gateway and the operator admit.
+        declared = _scope(projects=["explicit-1"], folders=[FOLDER_A.split("/")[1]])
+        assets = {FOLDER_A: ["team-a", "team-b", "explicit-1", MANAGEMENT]}
+        # One clock for both builds: an `ok` row stamps confirmedAt with its build's
+        # time, so two builds a second apart would differ by the timestamp alone.
+        with mock.patch.object(pub, "_now", return_value=BUILD_TIME):
+            with_map = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
+            with mock.patch.object(pub, "_clusters_map", return_value={}):
+                without = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
+        self.assertNotIn("clusters", without)
+        for key in ("projects", "excludedProjects", "state", "memberHash"):
+            self.assertEqual(json.dumps(with_map[key]), json.dumps(without[key]), key)
+
+    def test_a_previous_documents_map_is_cleaned_on_read(self):
+        raw = json.dumps({"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [], "clusters": {
+            "ok": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]},
+            "no-at": {"clusters": [["us-east1", "a"]]},
+            "bad-pair": {"at": PREVIOUS_TIME, "clusters": [["us-east1"]]},
+            "bad-type": {"at": PREVIOUS_TIME, "clusters": "us-east1/a"},
+            "not-a-dict": ["us-east1", "a"],
+            "bad-at": {"at": "yesterday", "clusters": [["us-east1", "a"]]},
+        }})
+        self.assertEqual(pub.parse_document(raw)["clusters"],
+                         {"ok": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]}})
+        self.assertNotIn("clusters", pub.parse_document(json.dumps(
+            {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": []})))
+
+    def test_the_map_is_dropped_before_the_rows_are(self):
+        # The map is for helper scripts. Past the budget it goes first, so it
+        # can never cost the gateway the rows it admits on.
+        rows = [{"id": f"p{i:029d}", "via": ["folders/111111111111"], "outcome": "ok",
+                 "confirmedAt": PREVIOUS_TIME} for i in range(4000)]
+        clusters = {r["id"]: {"at": PREVIOUS_TIME, "clusters": [["us-central1", f"cluster-{j:02d}"] for j in range(10)]}
+                    for r in rows}
+        doc = {"v": 1, "resolvedAt": PREVIOUS_TIME, "memberHash": MEMBER_HASH_VECTOR_HASH,
+               "state": pub.STATE_OK, "excludedProjects": [], "projects": rows, "clusters": clusters}
+        with mock.patch.object(pub, "log") as log:
+            published = json.loads(pub.encode_document(doc))
+        self.assertEqual(published["state"], pub.STATE_OK)
+        self.assertEqual(len(published["projects"]), 4000)
+        self.assertNotIn("clusters", published)
+        self.assertTrue(any("cluster" in str(c) for c in log.call_args_list), "dropping the map is logged")
+
+    def test_an_ok_probe_with_no_clusters_writes_an_empty_list(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}],
+            "clusters": {"team-a": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "gone"]]}}}
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]}, listings={"team-a": ""})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]), previous)
+        self.assertEqual(document["clusters"]["team-a"], {"at": document["resolvedAt"], "clusters": []})
+
+    def test_the_listing_is_sorted(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]},
+                            listings={"team-a": "zeta us-west1\nalpha us-west1\nbeta asia-east1\n"})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(document["clusters"]["team-a"]["clusters"],
+                         [["asia-east1", "beta"], ["us-west1", "alpha"], ["us-west1", "zeta"]])
+
+    def test_a_thousand_clusters_fit_well_inside_the_budget(self):
+        # The design's target: about 40 bytes a cluster, so 1,000 clusters across 100
+        # member projects cost about 40 KiB of the 900 KiB the ConfigMap allows.
+        base = {"v": 1, "resolvedAt": PREVIOUS_TIME, "memberHash": MEMBER_HASH_VECTOR_HASH,
+                "state": pub.STATE_OK, "excludedProjects": [], "projects": []}
+        clusters = {f"p{i:029d}": {"at": PREVIOUS_TIME,
+                                   "clusters": [["us-central1", f"cluster-{j:02d}"] for j in range(10)]}
+                    for i in range(100)}
+        without = len(pub.encode_document(base).encode())
+        text = pub.encode_document({**base, "clusters": clusters})
+        self.assertEqual(json.loads(text)["state"], pub.STATE_OK)
+        self.assertLess(len(text.encode()) - without, 48 * 1024)
 
 
 if __name__ == "__main__":

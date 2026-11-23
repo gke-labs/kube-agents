@@ -2707,12 +2707,15 @@ func TestReconcileRequeuesForTheHoldsEndWhileAStepBackIsHeld(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 
-	// The finalizer, then the workload and the status, then a settled pass.
+	// The finalizer, then the workload and the status, then the A2A stack
+	// settled (its pending requeue would mask the interval under test), then
+	// a settled pass.
 	for pass := 1; pass <= 2; pass++ {
 		if _, err := r.Reconcile(ctx, req); err != nil {
 			t.Fatalf("Reconcile %d: %v", pass, err)
 		}
 	}
+	settleA2AStack(t, ctx, cl, r, req, agent)
 	settled, err := r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("settled Reconcile: %v", err)

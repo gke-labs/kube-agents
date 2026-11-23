@@ -119,7 +119,7 @@ func TestASettleWaitsForTheConfirmedAck(t *testing.T) {
 	}
 	key := b.putRecord("tse", "read", "tse-0", "task-1", time.Now().Add(time.Hour))
 	rec := b.records()[key]
-	h, _ := d.reserve(testDispatchConfig(6, testProfile("tse", 2)), testProfile("tse", 2), "read", lib.SubmitKindTop, "task-1")
+	h, _ := d.reserve(testDispatchConfig(6, testProfile("tse", 2)), testProfile("tse", 2), "read", lib.SubmitKindTop, "task-1", false)
 	del := &stubDelivery{syncFails: 3}
 	done := make(chan struct{})
 	go func() {

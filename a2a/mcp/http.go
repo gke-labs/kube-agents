@@ -53,7 +53,7 @@ var errEmptyToken = errors.New("empty token")
 // missing or empty is an error: a server with no token authenticates no one,
 // and must say so rather than fall back to anything.
 func ReadToken(path string) (string, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the server's own token mount
 	if err != nil {
 		return "", err
 	}

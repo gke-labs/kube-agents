@@ -19,7 +19,8 @@ Subcommands:
   refresh <skill>            record edits to the generated skill as a patch
   generate <skill>           rebuild the generated skill from the upstream copy and overlay
   check [<skill>...]         verify copies against their locks and generated skills against
-                             copy + overlay, offline
+                             copy + overlay, offline; fail on a missing or unfilled Eval-Case: header,
+                             or one that names no eval case folder
   status                     list skills upstream has moved past, and upstream skills not mirrored
   verify-upstream            compare each copy with google/skills at its locked commit
 
@@ -93,6 +94,17 @@ BINARY_PATCH_MARKER = "GIT binary patch"
 # left out: it is also a Markdown heading underline.
 CONFLICT_MARKER_PREFIXES = ("<<<<<<< ", ">>>>>>> ")
 WHY_PREFIX = "Why:"
+# The header line that names the eval case(s) of the pull request that added the patch, and of a
+# later one that changed what it does. A new patch carries the placeholder until its author
+# fills the line in.
+EVAL_CASE_PREFIX = "Eval-Case:"
+HEADER_PLACEHOLDER = "TODO"
+# What an Eval-Case: value may hold: `none (<reason>)`, or ids that are folders with a task file here.
+EVAL_TASKS_ROOT = REPO_ROOT / "bench" / "tasks"
+EVAL_TASK_FILE = "task.yaml"
+EVAL_CASE_NONE_RE = re.compile(r"none \(.*\S.*\)")
+EVAL_CASE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+EVAL_CASE_SEPARATOR = ","
 STATE_FILE = "sync-state.json"
 SERIES_BRANCH = "patches"
 BASE_TAG = "base"
@@ -112,6 +124,7 @@ PATCH_HEADER_TEMPLATE = (
     "\n"
     "Why: TODO, say why this repository needs the change\n"
     "Local-Issue: TODO\n"
+    f"{EVAL_CASE_PREFIX} {HEADER_PLACEHOLDER}\n"
     "Upstream-Issue: none\n"
     "Retire-When: TODO\n"
     "\n"
@@ -329,6 +342,29 @@ def patch_why(path):
         if line.startswith(WHY_PREFIX):
             return line[len(WHY_PREFIX):].strip()
     return ""
+
+
+def eval_case_unfilled(path):
+    """True when the patch header has no Eval-Case: line, or one that is empty or the placeholder."""
+    values = [line[len(EVAL_CASE_PREFIX):].strip()
+              for line in patch_header(read_exact(path)).splitlines() if line.startswith(EVAL_CASE_PREFIX)]
+    return not values or any(not value or value.startswith(HEADER_PLACEHOLDER) for value in values)
+
+
+def eval_case_unknown_ids(path):
+    """The ids in the patch's Eval-Case: line(s) that name no case folder. `none (<reason>)` names none."""
+    unknown = []
+    for line in patch_header(read_exact(path)).splitlines():
+        if not line.startswith(EVAL_CASE_PREFIX):
+            continue
+        value = line[len(EVAL_CASE_PREFIX):].strip()
+        if EVAL_CASE_NONE_RE.fullmatch(value):
+            continue
+        for case_id in (part.strip() for part in value.split(EVAL_CASE_SEPARATOR)):
+            known = EVAL_CASE_ID_RE.fullmatch(case_id) and (EVAL_TASKS_ROOT / case_id / EVAL_TASK_FILE).is_file()
+            if not known:
+                unknown.append(case_id)
+    return unknown
 
 
 def separator_for(text):
@@ -607,6 +643,20 @@ def cmd_check(skills):
                     + f"\nIf you edited the skill, run `make skills-refresh SKILL={skill}`. If you "
                     f"edited a patch or {APPEND_NAME}, run `make skills-generate SKILL={skill}`."
                 )
+            unfilled = [p.name for p in patches(skill) if eval_case_unfilled(p)]
+            if unfilled:
+                raise OverlayError(
+                    f"{skill}: fill in the {EVAL_CASE_PREFIX} header of {', '.join(unfilled)} (add the line "
+                    f"after Local-Issue: when the patch has none): the eval case id(s) from the pull "
+                    f"request's Live validation, or `none (<reason>)`."
+                )
+            unknown = [f"{p.name}: {', '.join(repr(i) for i in ids)}"
+                       for p in patches(skill) for ids in [eval_case_unknown_ids(p)] if ids]
+            if unknown:
+                raise OverlayError(
+                    f"{skill}: the {EVAL_CASE_PREFIX} header names no case folder in {rel(EVAL_TASKS_ROOT)} for "
+                    f"{'; '.join(unknown)}. Name the folder of an eval case, or write `none (<reason>)`."
+                )
         except OverlayError as e:
             failures.append(str(e))
     for msg in failures:
@@ -740,7 +790,7 @@ def refresh_into_overlay(skill, repo, tmp, target, message):
     header = PATCH_HEADER_TEMPLATE.format(subject=message or DEFAULT_SUBJECT)
     diff = git_diff_text(["show", "--format=", "--no-color", "--binary", "HEAD"], cwd=repo)
     write_exact(overlay_dir(skill) / name, header + strip_index_lines(diff))
-    print(f"wrote {rel(overlay_dir(skill) / name)}; fill in its Why: header")
+    print(f"wrote {rel(overlay_dir(skill) / name)}; fill in its Why: and {EVAL_CASE_PREFIX} headers")
     return edited
 
 

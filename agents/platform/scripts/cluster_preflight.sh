@@ -52,19 +52,21 @@ readonly KUBECONFIG_READ_RC_NO_PARSER=12
 #
 # The Cluster Agent runs this script as `bash cluster_preflight.sh --json` with
 # no `timeout` argument (agents/cluster/SOUL.md §6, agents/cluster/AGENTS.md),
-# so Hermes' terminal tool bounds the run at its own default:
+# so Hermes' terminal tool bounds the run at TERMINAL_TIMEOUT. The operator pins
+# that through terminal.timeout in the managed config to Hermes' own code default,
 # `_parse_env_var("TERMINAL_TIMEOUT", "180")` in tools/terminal_tool.py at the
-# Hermes tags.env pins, with nothing in this repository setting TERMINAL_TIMEOUT
-# or terminal.timeout. One thing can lower it: the dispatcher gives a worker
-# whose card carries max_runtime_seconds a TERMINAL_TIMEOUT of that figure less
-# 30 s (hermes_cli/kanban_db_dispatch.py), and nothing in this repository sets
-# max_runtime_seconds on a card. A script killed there prints no JSON, and a Cluster Agent
+# Hermes tags.env pins (shellSandboxTerminalTimeoutSeconds in
+# platformagent_manifests.go); without the pin, the TERMINAL_TIMEOUT=60 that
+# Hermes' first boot seeds into .env from its .env.example would win. The
+# dispatcher's max_runtime_seconds rule (hermes_cli/kanban_db_dispatch.py) only
+# ever raises it. A script killed there prints no JSON, and a Cluster Agent
 # with no JSON cannot block its card with a reason, which is the silent crash
 # this script exists to prevent. So checks 4 and 5, the two calls that go
 # through the credential proxy, share one budget under that bound: the tool's
 # default less the margin the file read, the python parse and the JSON need.
 # deploy/shared/terminal_env_pin.py --build-check reads the default out of the
-# Hermes the image ships and fails the build if this mirror disagrees with it.
+# Hermes the image ships and fails the build if this mirror disagrees with it,
+# and tests/test_terminal_env_pin.py holds the operator's pin to the same value.
 #
 # Within the budget, one call is capped at what the broker can take to answer
 # it: in the sandbox `kubectl` is the credential-proxy shim, and the broker

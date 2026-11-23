@@ -5,7 +5,7 @@
 # (gke-labs/kube-agents#5415, which proposes `konnectivity-agent-exhaustion`).
 # Nothing is planted, and no honest plant exists: the agent is a GKE-managed
 # add-on whose replica count GKE's autoscaler sets and reconciles, editing it
-# is the host mutation the certification rules forbid, and a bench Deployment
+# is the host mutation the validated-capabilities rules forbid, and a bench Deployment
 # under that name would confuse the compliance audit's add-on suppression.
 # The customer cannot resize it either; the customer action is a support
 # case, so a check reports the ratio rather than a fix. Two flip conditions,
@@ -24,7 +24,8 @@
 id: control-plane-konnectivity-agent-exhaustion
 name: "Konnectivity agent exhaustion (declared gap; nothing planted, a GKE-managed add-on; needs a clean-read objective)"
 domain: fleet-audits
-suite: certification
+suite: validated-capabilities
+suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -34,7 +35,7 @@ prompt: >-
   gce-compute-fleet-audit SOP.
 expected_output: >-
   Nothing planted. Customer failure: control-plane-to-node tunnels saturated.
-  Certified needs a check that reports konnectivity-agent replicas against
+  Validated needs a check that reports konnectivity-agent replicas against
   node count, graded by a clean-read objective type that does not exist yet;
   the ledger issue would then carry the ratio for Deployment
   `konnectivity-agent` in namespace `kube-system`. The closing response is

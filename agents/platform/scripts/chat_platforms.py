@@ -44,7 +44,17 @@ import chat_notify
 # move to it. #1094/#1111 settled the same order for the same reason on the sibling
 # in `session_kv_server`, after #855's Slack-first ordering cost autopush a week of
 # governance reports to a Slack leg with no home channel.
-CHAT_PLATFORMS = ("google_chat", "slack")
+# On an install the A2A gateway serves, chat_notify.in_routed_order then puts a
+# configured home ahead of a learned one.
+CHAT_PLATFORMS = ("google_chat", "slack", "teams")
+
+# The platforms this resolver names only when the A2A gateway routes them
+# (`chat_notify.routes`): no config file or environment signal enables them
+# here. Teams on the Hermes path has its own cron delivery (`deliver: teams`)
+# and was never a destination of these callers; the gateway's Teams backend
+# (the operator's A2A_TEAMS_BACKEND switch) is, through its chat.notify route,
+# so an install moves to it only with that switch, never on an upgrade.
+ROUTE_ONLY_PLATFORMS = ("teams",)
 
 # The managed scope, mounted read-only by the operator and machine-global — one
 # /etc/hermes for every profile in the pod, so a cron child in the platform-agent
@@ -76,10 +86,10 @@ CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yam
 # matching `spec.integration.<platform>.enabled` is true and this pod is the platform's
 # consumer, so it answers the question being asked rather than approximating it
 # (platformagent_manifests.go, the `integration.GoogleChat` / `integration.Slack` blocks
-# in buildPodTemplateSpec). Under `mode: next` Google Chat moves to the A2A gateway and
-# the variable is not set here, so this list does not count it; the platform
-# `chat_notify.routed_platform()` names, from `A2A_NOTIFY_PLATFORM` or the projected
-# home-channel file, is counted through the gateway's notify route.
+# in buildPodTemplateSpec). Google Chat is the A2A gateway's, so the variable is not
+# set here and this list does not count it; the platforms
+# `chat_notify.routed_platforms()` names, from the two notify variables and the
+# projected home-channel file, are counted through the gateway's notify route.
 #
 # In a deployed pod the relay URL is not merely first, it is the only one of these
 # that arrives. A bot token is a credential, so it lives in the credential-proxy
@@ -181,7 +191,7 @@ def _env_enabled(platform: str) -> bool:
 
 
 def enabled_chat_platforms() -> list[str]:
-    """Every chat platform this install posts to, in CHAT_PLATFORMS order.
+    """Every chat platform this install posts to, in CHAT_PLATFORMS order, the routed ones in routing order.
 
     Three sources, most specific first, resolved **per platform** rather than per
     source — so a file that names one platform cannot silence another that only a
@@ -197,12 +207,12 @@ def enabled_chat_platforms() -> list[str]:
     An explicit `enabled: false` therefore wins over an environment signal, in either
     file: that combination is an operator or an admin turning a platform off on a pod
     that still has the variables rendered on it, and the file is the more specific
-    statement. The one exception is the platform `chat_notify.routed_platform()`
-    names, from `A2A_NOTIFY_PLATFORM` or the projected home-channel file: under
-    `next` the managed scope turns that platform's Hermes consumer off because the
+    statement. The one exception is each platform `chat_notify.routed_platforms()`
+    names, from the two notify variables and the projected home-channel file: the
+    managed scope turns that platform's Hermes consumer off because the
     A2A gateway holds the backend, and posts reach it through the gateway, so it
-    counts as enabled whatever the files say. The operator renders the variable
-    and the file only then, and reserves the variable.
+    counts as enabled whatever the files say. The operator renders the variables
+    and the file only then, and reserves the variables.
 
     Never returns an empty list: an install that resolves to nothing gets
     DEFAULT_PLATFORM, which is what every caller did unconditionally before.
@@ -212,12 +222,14 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        # Under next the managed scope says the Hermes platform is off, because
+        # The managed scope says the Hermes platform is off where
         # the A2A gateway holds the backend; posts to it go through the
         # gateway's chat.notify route instead (chat_notify.py), so it is
         # still a platform this install posts to.
         if chat_notify.routes(name):
             enabled = True
+        elif name in ROUTE_ONLY_PLATFORMS:
+            enabled = False
         elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
@@ -226,7 +238,9 @@ def enabled_chat_platforms() -> list[str]:
             enabled = _env_enabled(name)
         if enabled:
             resolved.append(name)
-    return resolved or [DEFAULT_PLATFORM]
+    # The routed platforms in the routing rule's order, as session_kv_server's
+    # resolver returns them: a configured home ahead of a learned one.
+    return chat_notify.in_routed_order(resolved) or [DEFAULT_PLATFORM]
 
 
-__all__ = ["CHAT_PLATFORMS", "DEFAULT_PLATFORM", "enabled_chat_platforms"]
+__all__ = ["CHAT_PLATFORMS", "DEFAULT_PLATFORM", "ROUTE_ONLY_PLATFORMS", "enabled_chat_platforms"]

@@ -1583,7 +1583,11 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
         start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
         end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
-        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md", "onboarding/report_filed.md")
+        # Every prompt the image ships, so a new one the entrypoint's list does not name fails here.
+        names = sorted(
+            f"onboarding/{p.name}" for p in (_REPO / "agents" / "chat" / "defaults" / "onboarding").glob("*.md")
+        )
+        self.assertIn("onboarding/report_filed.md", names)
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
             pvc = pathlib.Path(tmp) / "data"
@@ -1681,6 +1685,9 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reached-the-next-step", proc.stdout)
         self.assertIn("WARN: could not refresh", proc.stderr)
+        # The volume had a copy, so the warning says that it is kept, not that the plugin is missing.
+        self.assertIn("keeps the previous image's copy", proc.stderr)
+        self.assertNotIn("is missing", proc.stderr)
         self.assertEqual(kept, "stale\n", "a failed copy did not leave the old module whole")
         self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
         self.assertEqual(refreshed, "image\n", "one failed plugin stopped the loop")
@@ -1713,6 +1720,101 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         self.assertIn("WARN: could not refresh", proc.stderr)
         self.assertEqual(kept, "stale\n")
         self.assertEqual(leftovers, [], "a failed rename left its temporary file behind")
+
+    def test_a_copy_that_fails_part_way_on_a_new_volume_names_the_plugin_as_missing_or_incomplete(self):
+        # No earlier copy, and the rename of the first file fails: the folder is made but
+        # holds no module. The warning must not say that a previous copy is kept.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "mv").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            left = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("the chat_metrics plugin is missing or incomplete", proc.stderr)
+        self.assertNotIn("keeps the previous image's copy", proc.stderr)
+        self.assertEqual(left, [], "the failed copy left a file behind")
+
+    def test_a_copy_that_fails_after_its_first_file_on_a_new_volume_is_not_called_an_earlier_copy(self):
+        # The first file lands and the second fails. The folder now holds a file, but it
+        # held none before the copy, so the plugin is incomplete, not kept.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            for module in ("metrics.py", "plugin.py"):
+                (image / "plugins" / "chat_metrics" / module).write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            real_mv = shutil.which("mv")
+            count = pathlib.Path(tmp) / "mv-calls"
+            (shims / "mv").write_text(
+                f'#!/bin/sh\nn=$(cat "{count}" 2>/dev/null || echo 0)\nn=$((n + 1))\necho "$n" > "{count}"\n'
+                f'[ "$n" -le 1 ] && exec "{real_mv}" "$@"\nexit 1\n',
+                encoding="utf-8",
+            )
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            landed = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(landed), 1, f"one file should have landed before the failure: {landed}")
+        self.assertIn("the chat_metrics plugin is missing or incomplete", proc.stderr)
+        self.assertNotIn("keeps the previous image's copy", proc.stderr)
+
+    def test_each_failed_plugin_gets_the_warning_for_its_own_folder(self):
+        # Two plugins fail in one start. The first had a copy; the second has a folder with
+        # no module in it, and a temporary file that an earlier failed copy left. The second
+        # must not take the first one's warning.
+        if os.geteuid() == 0:
+            self.skipTest("root writes into a read-only directory")
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+            (pvc / "plugins" / "agent_roster" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            (pvc / "plugins" / "chat_metrics" / "plugin.py.refresh.pod0").write_text("partial\n", encoding="utf-8")
+            for name in ("agent_roster", "chat_metrics"):
+                (pvc / "plugins" / name).chmod(0o555)
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                    env={**os.environ, "TARGET_DIR": str(pvc)},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            finally:
+                for name in ("agent_roster", "chat_metrics"):
+                    (pvc / "plugins" / name).chmod(0o755)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warnings = {line.split("/plugins/")[1].split(" ")[0]: line for line in proc.stderr.splitlines() if "could not refresh" in line}
+        self.assertEqual(sorted(warnings), ["agent_roster", "chat_metrics"], proc.stderr)
+        self.assertIn("keeps the previous image's copy", warnings["agent_roster"])
+        self.assertIn("the chat_metrics plugin is missing or incomplete", warnings["chat_metrics"])
+        self.assertNotIn("keeps the previous image's copy", warnings["chat_metrics"])
 
     def test_a_symlinked_plugin_destination_is_left_alone(self):
         # A symlink at the destination is not the image's copy to refresh: the loop
@@ -1783,8 +1885,9 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n")
 
     def test_a_plugins_directory_the_entrypoint_cannot_write_does_not_end_the_start(self):
-        # On a fresh volume the kubelet creates $TARGET_DIR/plugins as root when a plugin
-        # is mounted beneath it; under `set -e` an unguarded mkdir there ends the container.
+        # On a fresh volume the container runtime creates $TARGET_DIR/plugins as root when a
+        # plugin is mounted beneath it and the operator did not make the folder first; under
+        # `set -e` an unguarded mkdir there ends the container.
         name = "plugins/bootstrap_onboarding/plugin.py"
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
@@ -1813,6 +1916,37 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             self.assertIn("reached-the-next-step", proc.stdout)
             self.assertIn("WARN: could not refresh", proc.stderr)
             self.assertFalse((pvc / name).exists())
+            # A new volume has no earlier copy to keep: the warning names the plugin as
+            # missing and does not say that a previous copy is kept.
+            self.assertIn("the bootstrap_onboarding plugin is missing", proc.stderr)
+            self.assertNotIn("keeps the previous image's copy", proc.stderr)
+
+    def test_a_file_in_the_place_of_a_plugin_folder_is_no_earlier_copy(self):
+        # A file where the plugin's folder must be fails the copy for each user, root or
+        # not. It is no copy of the plugin: the warning names the plugin as missing, and
+        # the start goes on. Without the `[ -d "$_plugin_dst" ]` test of step 2b, `find`
+        # prints the file itself and the warning says that a previous copy is kept.
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            in_the_way = pvc / "plugins" / "bootstrap_onboarding"
+            in_the_way.parent.mkdir(parents=True)
+            in_the_way.write_text("not a folder\n", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(in_the_way.read_text(encoding="utf-8"), "not a folder\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("the bootstrap_onboarding plugin is missing", proc.stderr)
+        self.assertNotIn("keeps the previous image's copy", proc.stderr)
 
 
 class ManagedScopeAssertionTest(unittest.TestCase):
@@ -2100,7 +2234,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
             self.assertFalse((tmp / "profile" / self.OLD).exists())
 
     def test_no_overlay_leaves_the_template_alone(self):
-        """A today install passes an empty $3 — the flip-back self-clean. The
+        """An image without /opt/a2a-template/skills passes an empty $3. The
         skill is gone because the swap rebuilt skills/ from the template only."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
@@ -3088,9 +3222,7 @@ class TerminalEnvPinGateTest(unittest.TestCase):
         self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
 
 
-_TIRITH_CLEANUP_OPENER = (
-    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then'
-)
+_SCANNER_CLEANUP_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ]; then'
 
 
 def _entrypoint_readonly(name):
@@ -3101,33 +3233,28 @@ def _entrypoint_readonly(name):
     return match.group(1)
 
 
-class TirithCleanupTest(unittest.TestCase):
-    """Step 4.4 removes the tirith copies Hermes downloaded into each home.
+class StaleScannerCleanupTest(unittest.TestCase):
+    """Step 4.4 removes the command scanner copies earlier images left in each home.
 
-    Gated on the image's copy being what PATH resolves, which no host has, so every other
-    entrypoint test skips it. The block runs extracted, with IMAGE_TIRITH pointed at a stub
-    first on PATH. It must never execute a candidate: the files sit on a volume the agent's
-    workers can write.
+    The block runs extracted. It must never execute a candidate: the files sit on a
+    volume the agent's workers can write.
     """
 
     ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 57
 
     @classmethod
     def setUpClass(cls):
-        cls._BLOCK = _extract_shell_block(_TIRITH_CLEANUP_OPENER)
+        cls._BLOCK = _extract_shell_block(_SCANNER_CLEANUP_OPENER)
         cls._ELF_MAGIC_HEX = _entrypoint_readonly("ELF_MAGIC_HEX")
+        cls._NAME = _entrypoint_readonly("STALE_SCANNER_BINARY")
+        cls._DATA_PARENTS = ".local/share .local/state"
 
-    def _run(self, seed, primary="1", image_on_path=True):
+    def _run(self, seed, primary="1"):
         """Seed $TARGET_DIR via `seed(target, tmp)`, run the block, return (proc, target, tmp)."""
         tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         target = tmp / "data"
-        image = tmp / "image" / "tirith"
-        image.parent.mkdir(parents=True)
-        image.write_text("#!/bin/sh\necho tirith 0.4.2\n", encoding="utf-8")
-        image.chmod(0o755)
         seed(target, tmp)
-        path = f"{image.parent}:{os.environ['PATH']}" if image_on_path else os.environ["PATH"]
         proc = subprocess.run(
             ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
             capture_output=True,
@@ -3135,10 +3262,10 @@ class TirithCleanupTest(unittest.TestCase):
             timeout=60,
             env={
                 **os.environ,
-                "PATH": path,
                 "TARGET_DIR": str(target),
                 "IS_BOOTSTRAP_PRIMARY": primary,
-                "IMAGE_TIRITH": str(image),
+                "STALE_SCANNER_BINARY": self._NAME,
+                "STALE_SCANNER_DATA_PARENTS": self._DATA_PARENTS,
                 "ELF_MAGIC_HEX": self._ELF_MAGIC_HEX,
             },
         )
@@ -3153,47 +3280,75 @@ class TirithCleanupTest(unittest.TestCase):
         return path
 
     def _seed_copies(self, target, tmp):
-        self._plant(target / "bin" / "tirith", self.ELF)
-        self._plant(target / "profiles" / "cluster-a" / "bin" / "tirith", self.ELF)
+        self._plant(target / "bin" / self._NAME, self.ELF)
+        self._plant(target / "profiles" / "cluster-a" / "bin" / self._NAME, self.ELF)
 
     def test_the_downloaded_copies_are_removed_and_logged(self):
         proc, target, _ = self._run(self._seed_copies)
-        self.assertFalse((target / "bin" / "tirith").exists())
-        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
-        self.assertEqual(proc.stdout.count("Reclaimed a per-profile tirith copy:"), 2, proc.stdout)
+        self.assertFalse((target / "bin" / self._NAME).exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / self._NAME).exists())
+        self.assertEqual(proc.stdout.count("Removed a per-profile command scanner copy:"), 2, proc.stdout)
+
+    def test_the_entrypoint_names_the_data_parents_this_test_runs_with(self):
+        self.assertIn(
+            f'readonly STALE_SCANNER_DATA_PARENTS="{self._DATA_PARENTS}"',
+            _ENTRYPOINT.read_text(encoding="utf-8"),
+        )
+
+    def test_the_scanner_data_directories_are_removed_and_logged(self):
+        def seed(target, tmp):
+            self._plant(target / "home" / ".local" / "share" / self._NAME / "log.jsonl", b"{}\n", mode=0o600)
+            self._plant(target / "home" / ".local" / "state" / self._NAME / "sessions" / "a.id", b"x", mode=0o600)
+            self._plant(
+                target / "profiles" / "cluster-a" / "home" / ".local" / "share" / self._NAME / "db.dat", b"x"
+            )
+            self._plant(target / "home" / ".local" / "share" / "other" / "keep", b"x")
+
+        proc, target, _ = self._run(seed)
+        self.assertFalse((target / "home" / ".local" / "share" / self._NAME).exists())
+        self.assertFalse((target / "home" / ".local" / "state" / self._NAME).exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "home" / ".local" / "share" / self._NAME).exists())
+        self.assertTrue((target / "home" / ".local" / "share" / "other" / "keep").exists())
+        self.assertEqual(proc.stdout.count("Removed command scanner data:"), 3, proc.stdout)
+
+    def test_a_symlinked_data_directory_and_its_target_stay(self):
+        def seed(target, tmp):
+            self._plant(tmp / "elsewhere" / "data" / "keep", b"x")
+            link = target / "home" / ".local" / "share" / self._NAME
+            link.parent.mkdir(parents=True)
+            link.symlink_to(tmp / "elsewhere" / "data")
+
+        _, target, tmp = self._run(seed)
+        self.assertTrue((target / "home" / ".local" / "share" / self._NAME).is_symlink())
+        self.assertTrue((tmp / "elsewhere" / "data" / "keep").exists())
 
     def test_a_non_primary_replica_leaves_them(self):
         _, target, _ = self._run(self._seed_copies, primary="0")
-        self.assertTrue((target / "bin" / "tirith").exists())
-        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
-
-    def test_without_the_image_copy_on_path_they_stay(self):
-        """Hermes would still need them: with nothing on PATH it falls back to the home copy."""
-        _, target, _ = self._run(self._seed_copies, image_on_path=False)
-        self.assertTrue((target / "bin" / "tirith").exists())
+        self.assertTrue((target / "bin" / self._NAME).exists())
+        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / self._NAME).exists())
 
     def test_a_file_that_is_not_an_elf_binary_stays_and_is_never_run(self):
         def seed(target, tmp):
             marker = tmp / "executed"
             self._plant(
-                target / "profiles" / "cluster-b" / "bin" / "tirith",
-                f'#!/bin/sh\ntouch "{marker}"\necho tirith 0.3.3\n'.encode(),
+                target / "profiles" / "cluster-b" / "bin" / self._NAME,
+                f'#!/bin/sh\ntouch "{marker}"\necho 0.3.3\n'.encode(),
             )
 
         _, target, tmp = self._run(seed)
-        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / self._NAME).exists())
         self.assertFalse((tmp / "executed").exists(), "the cleanup executed a file from the volume")
 
     def test_a_symlink_and_its_target_stay(self):
         def seed(target, tmp):
-            real = self._plant(tmp / "elsewhere" / "tirith", self.ELF)
-            link = target / "profiles" / "cluster-c" / "bin" / "tirith"
+            real = self._plant(tmp / "elsewhere" / self._NAME, self.ELF)
+            link = target / "profiles" / "cluster-c" / "bin" / self._NAME
             link.parent.mkdir(parents=True)
             link.symlink_to(real)
 
         _, target, tmp = self._run(seed)
-        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / "tirith").is_symlink())
-        self.assertTrue((tmp / "elsewhere" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / self._NAME).is_symlink())
+        self.assertTrue((tmp / "elsewhere" / self._NAME).exists())
 
 
 _NPM_CACHE_SHARE_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then'
@@ -3254,132 +3409,91 @@ class NpmCacheShareTest(unittest.TestCase):
         self.assertFalse((target / ".cache").exists())
 
 
-class A2AModeProbeTest(unittest.TestCase):
-    """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
+class A2ASkillOverlayStepTest(unittest.TestCase):
+    """Step 2.6a-bis overlays the A2A topics skill into the platform profile on every boot.
 
-    The probe hands the operator's managed .env to Python and lets runtime_mode —
-    the one agent-side reader the mode spec allows — answer. Exit meanings:
-    0 next (overlay), 1 today or no managed scope (skip silently), 2 no readable
-    managed env (skip with a warning; on an operator-managed install that is a
-    fault the skill's silent absence would otherwise hide).
+    Every install runs the A2A stack, so nothing gates the overlay: no managed
+    .env key, no container environment. The step passes the image's skill tree
+    to sync_profile_skills as $3 whenever the image ships it, and the template
+    alone when it does not.
 
-    The parse is the strict KEY=value renderManagedEnv writes, never `.`-sourced:
-    the entrypoint is pid 1, and sourcing would execute whatever a value that
-    grew a space turned into. That property is asserted here, not just claimed.
+    The shipped block is run as written, with one substitution: the image path
+    of the skill tree (`/opt/a2a-template/skills`) is pointed at a directory
+    under the test's temp root, since the host has no such tree.
     """
 
-    def _probe(self, managed_env, pwned_marker=None, extra_env=None, reader=True):
-        """Run the real probe. `managed_env` is the .env body, or None for no file,
-        or ... (Ellipsis) for HERMES_MANAGED_DIR unset entirely.
+    OPENER = 'if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then'
+    IMAGE_SKILLS = "/opt/a2a-template/skills"
+    OVERLAY_LINE = "Overlaying the A2A topics skill into the platform profile"
 
-        `extra_env` adds process environment the container would have inherited.
-        `reader=False` drops runtime_mode off the path, standing in for a broken
-        image.
+    def _tree(self, root, **files):
+        root = pathlib.Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for name, body in files.items():
+            (root / name).write_text(body, encoding="utf-8")
+        return root
+
+    def _run(self, tmp, ship_skill=True, managed_env=None, extra_env=None):
+        """Run the shipped step against a template and a profile under `tmp`.
+
+        `ship_skill` plants the image's skill tree; `managed_env` writes an
+        operator-managed .env the old gate used to read; `extra_env` adds
+        container environment. Neither of the last two may change the answer.
         """
-        script = f"{_extract_shell_function('a2a_mode_probe')}\na2a_mode_probe\n"
+        tmp = pathlib.Path(tmp)
+        self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+        self._tree(tmp / "data" / "profiles" / "platform" / "skills", **{"stale.md": "x"})
+        a2a_skills = tmp / "a2a" / "skills"
+        if ship_skill:
+            self._tree(a2a_skills, **{"a2a-topics.md": "bus"})
+        block = _extract_shell_block(self.OPENER).replace(self.IMAGE_SKILLS, str(a2a_skills))
+        script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n{block}echo DONE\n"
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOSTNAME": "test-pod-0",
+            "TARGET_DIR": str(tmp / "data"),
+            "PLATFORM_TEMPLATE": str(tmp / "template"),
+        }
+        if managed_env is not None:
+            managed = tmp / "managed"
+            managed.mkdir()
+            (managed / ".env").write_text(managed_env, encoding="utf-8")
+            env["HERMES_MANAGED_DIR"] = str(managed)
+        if extra_env:
+            env.update(extra_env)
+        proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env)
+        installed = sorted(p.name for p in (tmp / "data" / "profiles" / "platform" / "skills").iterdir())
+        return proc, installed
+
+    def test_the_skill_is_overlaid_with_no_mode_anywhere(self):
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = pathlib.Path(tmp)
-            # The image runs the probe on $INSTALL_DIR's venv Python and imports
-            # runtime_mode from /opt/defaults/scripts; neither exists on a host.
-            # The venv is faked with a symlink and the module comes in through
-            # PYTHONPATH — sys.path.insert of an absent directory is harmless, so
-            # the probe under test is byte-identical to the one the image runs.
-            (tmp / ".venv" / "bin").mkdir(parents=True)
-            (tmp / ".venv" / "bin" / "python3").symlink_to(sys.executable)
-            env = {
-                "PATH": "/usr/bin:/bin",
-                "INSTALL_DIR": str(tmp),
-            }
-            if reader:
-                env["PYTHONPATH"] = str(_REPO / "agents" / "platform" / "scripts")
-            if extra_env:
-                env.update(extra_env)
-            if managed_env is not Ellipsis:
-                managed = tmp / "managed"
-                managed.mkdir()
-                env["HERMES_MANAGED_DIR"] = str(managed)
-                if managed_env is not None:
-                    body = managed_env
-                    if pwned_marker:
-                        body = body.replace("{MARKER}", str(pwned_marker))
-                    (managed / ".env").write_text(body, encoding="utf-8")
-            return subprocess.run(
-                ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
-            )
+            proc, installed = self._run(tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+            self.assertIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
 
-    def test_next_answers_overlay(self):
-        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=next\n")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_today_answers_skip(self):
-        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_an_unrecognized_mode_fails_closed(self):
-        """runtime_mode's own rule, exercised through the probe: the dark stack
-        stays dark from both sides of the boundary."""
-        proc = self._probe("KUBEAGENTS_MODE=quantum\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_pin_free_env_reads_as_today(self):
-        proc = self._probe("API_SERVER_KEY=x\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_missing_managed_env_is_reported_not_conflated(self):
-        proc = self._probe(None)
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-
-    def test_no_managed_scope_at_all_skips_silently(self):
-        """Unset HERMES_MANAGED_DIR is a non-operator start (compose, docker run),
-        not a fault — the same marker every other managed-scope step gates on."""
-        proc = self._probe(Ellipsis)
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_the_inherited_container_env_cannot_decide_the_mode(self):
-        """The managed file is the ONLY delivery path, which is the spec's whole
-        point — one answer per agent, computed in one place.
-
-        This is not hypothetical: an AgentPlugin's spec.env is copied into the
-        agent container verbatim with no allowlist, so a plugin can put this key
-        in the process environment. Before os.environ.clear() the probe read it
-        whenever the file was silent, which made the plugin a second writer of a
-        decision the operator owns. Found by adversarial review before this
-        shipped.
-        """
-        # Key absent from the file entirely: the inherited value must not fill in.
-        proc = self._probe("API_SERVER_KEY=x\n", extra_env={"KUBEAGENTS_MODE": "next"})
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        # And the file still wins when the two disagree.
-        proc = self._probe(
-            "KUBEAGENTS_MODE=today\n", extra_env={"KUBEAGENTS_MODE": "next"}
-        )
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_malformed_line_is_skipped_not_called_unreadable(self):
-        """An empty key is not a pin. os.environ refuses one, and letting that
-        raise reported a perfectly readable file as missing."""
-        proc = self._probe("=x\nKUBEAGENTS_MODE=next\n")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_a_missing_reader_is_a_fault_not_a_decision(self):
-        """A broken image must not read as 'today' behind a bare traceback: the
-        skill would be silently absent with nothing saying why."""
-        proc = self._probe("KUBEAGENTS_MODE=next\n", reader=False)
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-
-    def test_a_hostile_value_is_data_not_shell(self):
-        """The reason this is a parse and not a `.`: a value carrying a space and
-        a command must neither break the gate nor run."""
-        with tempfile.TemporaryDirectory() as outside:
-            marker = pathlib.Path(outside) / "pwned"
-            proc = self._probe(
-                "SLACK_HOME_CHANNEL_NAME=general chat; touch {MARKER}\n"
-                "KUBEAGENTS_MODE=next\n",
-                pwned_marker=marker,
+    def test_a_stored_today_pin_no_longer_holds_the_skill_back(self):
+        """The operator still pins the mode into the managed .env until no
+        supported agent image predates the removal; this image no longer reads
+        it, so a `today` pin, in the file or in the environment, overlays too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, installed = self._run(
+                tmp,
+                managed_env="API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n",
+                extra_env={"KUBEAGENTS_MODE": "today"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertFalse(marker.exists(), "a managed .env value was executed")
+            self.assertIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
 
+    def test_an_image_without_the_skill_tree_syncs_the_template_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, installed = self._run(tmp, ship_skill=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+            self.assertNotIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["platform.md"])
 
 
 def _extract_nested_block(opener, indent, closer="fi"):

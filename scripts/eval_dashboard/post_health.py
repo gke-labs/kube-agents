@@ -51,7 +51,8 @@ The digest hour is a Toronto hour too, and "once a day" is a Toronto day.
 One side effect beyond posting: on a new OUTAGE with no tracking issue --
 none in case-notes.yaml, none open under the `presubmit-gate` label naming
 the same cases -- gate_issue.py files one with the workflow's GitHub token
-(`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN", and the
+(`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN" (the full
+URL when the issue is in the issues repository, ghcli.issue_tag), and the
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
 the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
@@ -160,6 +161,7 @@ CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
 CONDITION_POOL_DRIFT = "pool_drift"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_FORGE_OUTAGE = "forge_outage"
 CONDITION_DEADLINE_KILL = "deadline_kill"
 # The presubmit job's timeout in minutes, as health.py owns it.
 DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // SECONDS_PER_MINUTE)
@@ -221,6 +223,10 @@ DAYS_LAST_JOIN = " and "
 # The kinds of message this script sends.
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
+# Appended to a clear decided on a superseding run that failed: its summary
+# may name failures, none of them on the projects this clear is about, and
+# what they need is that run's own message, not this one.
+CLEARED_BY_FAILED_RUN = " (that run failed elsewhere, not on these projects)"
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
 KIND_NEAR_DEADLINE = "near_deadline"  # a near_deadline note with a deadline kill; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
@@ -695,9 +701,9 @@ def describe_cases(cases) -> str:
 
 
 def issue_tag(issue) -> str | None:
-    """"#1278" for an {number, url} the bot filed or found; None otherwise."""
-    number = (issue or {}).get("number") if isinstance(issue, dict) else None
-    return f"#{number}" if number else None
+    """ghcli.issue_tag: "#N" for this repository's issue, the URL for the
+    issues repository's; None for anything else."""
+    return ghcli.issue_tag(issue)
 
 
 def issue_for(issue, condition: str | None) -> dict | None:
@@ -716,15 +722,17 @@ def episode_issues(state: dict) -> list[dict]:
     out: list[dict] = []
     for candidate in [*(state.get("issues") or []), state.get("issue")]:
         tag = issue_tag(candidate)
-        if tag and tag not in {issue_tag(seen) for seen in out}:
+        if tag and not ghcli.has_issue([issue_tag(seen) for seen in out], tag):
             out.append(candidate)
     return out
 
 
 def tracking_text(issues, issue=None) -> str:
+    """The issues as the reader sees them: case-notes.yaml's as written
+    ("#N"), the bot's by URL, each issue once whichever form names it."""
     issues = list(issues or [])
     tag = issue_tag(issue)
-    if tag and tag not in issues:
+    if tag and not ghcli.has_issue(issues, tag):
         issues.append(tag)
     return ", ".join(issues) if issues else NO_ISSUE_TEXT
 
@@ -919,6 +927,12 @@ def cause_sentence(health: dict) -> str:
             f"{incident.get('reps', 0)} repetitions on {prs} PRs ended with the worker still running {window};"
             " nothing was graded and nothing counts against a case."
         )
+    if condition == CONDITION_FORGE_OUTAGE:
+        # No repetition count: gate_comment.py posts this sentence on a public
+        # pull request as it stands.
+        start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        window = clock_range(start, end) if start and end else f"since {since}"
+        return f"grading could not read GitHub on {prs} PRs {window}, so their checks did not run and nothing counts against a case."
     return health.get("cause") or "no single cause"
 
 
@@ -937,6 +951,11 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
         lines = [
             f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Those runs read NOT EVALUATED, not red; retest once workers are"
             " finishing again. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879)."
+        ]
+    elif condition == CONDITION_FORGE_OUTAGE:
+        lines = [
+            f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} The GitHub App's hourly rate limit ran out (the evals"
+            " repositories of a shard share one installation, #6105); retest once it has reset."
         ]
     elif condition == CONDITION_LOST_PODS:
         tag = issue_tag(issue)
@@ -1278,9 +1297,10 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
         return is_token == key.endswith(TOKEN_TOLD_SUFFIX)
 
     def recovered(key):
-        # Its own passed build, or the tick's decision that a later pass of
-        # the job that supersedes it reached its projects. A silence (a
-        # later failed daily) is not a recovery and clears nothing. The token
+        # Its own passed build, or the tick's decision that a later run of
+        # the job that supersedes it reached its projects (a pass, or a run
+        # that failed elsewhere and applied them). A silence (a later failed
+        # daily that owes a hand step) is not a recovery and clears nothing. The token
         # episode is about the credential, so only a passed build whose
         # GitLab report was read and names no token ends it: a build whose
         # report was not read says nothing about the token.
@@ -1423,6 +1443,10 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
             theirs = (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_BY) or runs.get(other) or {}
             when = clock(parse_iso(theirs.get("finished_at"))) if theirs.get("finished_at") else "?"
             did = f": {theirs['summary']}" if theirs.get("summary") else " finished clean"
+            # A run that failed elsewhere still did this build's work; said,
+            # or the ✅ reads as if it carried a failure of its own.
+            if theirs.get("passed") is False:
+                did += CLEARED_BY_FAILED_RUN
             lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")
             continue
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
@@ -1623,6 +1647,8 @@ def short_cause(prev: dict) -> str:
         return "pool projects had drifted"
     if condition == CONDITION_DELEGATION_CEILING:
         return "workers were not finishing"
+    if condition == CONDITION_FORGE_OUTAGE:
+        return "grading could not read GitHub"
     if condition == CONDITION_DEADLINE_KILL:
         return "runs were being killed at the deadline"
     return prev.get("cause") or "unknown cause"
@@ -1635,7 +1661,7 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     issues = list(prev.get("tracking_issues") or [])
     for each in episode_issues(prev):
         tag = issue_tag(each)
-        if tag not in issues:
+        if not ghcli.has_issue(issues, tag):
             issues.append(tag)
     if issues:
         parts.append(", ".join(issues))
@@ -1951,7 +1977,7 @@ def run(
             if tracker.is_open(each) is False:
                 log(f"tracking issue: #{each['number']} is closed; dropped")
                 dropped.append(issue_tag(each))
-                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if tag != issue_tag(each)])
+                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if not ghcli.has_issue([issue_tag(each)], tag)])
                 if issue_for(each, condition) and condition_open(health, condition) is not False and evidence_after(health, condition, tracker.closed_at(each)):
                     reopen = True
                 continue
@@ -1972,7 +1998,7 @@ def run(
     issue = next((candidate for candidate in carried if issue_for(candidate, condition) and not candidate.get(UNSETTLED_KEY)), None)
     # What the readers were told, less the issues this tick found closed:
     # the recovery names the ones still carried.
-    told = prev if prev is None else dict(prev, issues=carried, issue=None if issue_tag(prev.get("issue")) in dropped else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if tag not in dropped])
+    told = prev if prev is None else dict(prev, issues=carried, issue=None if ghcli.has_issue(dropped, issue_tag(prev.get("issue"))) else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if not ghcli.has_issue(dropped, tag)])
     wants_issue = (
         (KIND_CHANGE in kinds or reopen)
         and (health.get("state") == OUTAGE or condition in (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT))

@@ -46,6 +46,16 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `post-merge-check` follows a fix after it merges
+
+`post-merge-check` is a `no_agent` script: the tick prompts no model. Every five minutes it runs
+`post_merge_check.py`, which reads nothing while `KUBEAGENTS_POST_MERGE_CHECK` is `off`. With it on,
+it follows each recorded fix pull request through merge, apply, the health window and the fleet
+audit's re-check to one stored outcome, and then reports and follows up. A run stops starting work after four minutes, so it ends inside its
+schedule. A clean run is silent and keeps its summary in `logs/post_merge_check.log`. A run in which a record or step errored posts
+one line naming them and exits 0, at most once a day per failure. The steps and their columns are in
+[`session_management.md`](../docs/session_management.md).
+
 ## `stall-watch` hands a stall to the AutoOps pipeline
 
 `stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
@@ -54,7 +64,9 @@ Cluster Agent profile's `cluster_identity` names, which is how a project
 `spec.scope` brings in reaches the watch, and, for every namespace of every
 running or reconciling cluster that has a Cluster Agent profile and is not a
 system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
-of controller kinds, keeping a ledger of the rows it has seen. On a new stall
+of controller kinds, once per cluster (each kind read once across the cluster
+and split per namespace, clusters four at a time), keeping a ledger of the rows
+it has seen. On a new stall
 episode it sends the Session KV server a `controller-stall` inject, the route
 `k8s-event-watcher` and the drift detector use
 ([design](../../../docs/designs/stall-watch-inject.md)). The server posts the
@@ -137,9 +149,10 @@ every project's listing fails, when no management project resolves, when
 
 Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
 through `sandbox_exec`, because the agent container carries no kubectl (with the
-sandbox switched off the calls run locally and fail with `No such file or
-directory: 'gcloud'`, the same failure every `sandbox_exec` caller sees in that
-state). The script itself travels on the command's stdin, read from the agent
+sandbox switched off the calls run locally, under the watch's coreutils `timeout`
+wrapper, and fail with its exit 127, `failed to run command 'gcloud'`: no
+management project resolves and the tick reports a sweep failure). The script
+itself travels on the command's stdin, read from the agent
 image's copy in `/opt/defaults/scripts` and run with `python3 -I -`: what the
 `hermes` login executes is never a file under the sandbox's agent-owned
 `/opt/data`, and isolated mode keeps that directory, which is the command's
@@ -147,7 +160,8 @@ working directory, off the module path, so a `json.py` the model dropped there i
 not the code that runs. The per-cluster kubeconfigs stay in
 `/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
 prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
-cluster to what `kubectl api-resources` says it serves. The CR's
+cluster to what `kubectl api-resources` says it serves. A cluster with no
+namespace to watch skips that call and the wildcard discovery. The CR's
 `spec.harness.stallWatch` sets three knobs, which the operator pins in the
 managed `.env` on every install (empty when unset, which is the default):
 `STALL_WATCH_EXCLUDE_NAMESPACES` names namespaces never read,
@@ -435,40 +449,125 @@ is reported like any other grant, and repeated daily like one.
 The `topology-drift` skill reads a `leeway report` on request and attributes
 the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
 "chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
---parallelism 2 --clusters <project>/<location>/<cluster>,…` in `agent-sandbox`
-across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
+--parallelism 2 --timeout <n>s --clusters <project>/<location>/<cluster>,…` in
+`agent-sandbox` across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
 `LEEWAY_WATCH_PROJECTS` or the management project plus every project a Cluster
 Agent profile's identity names; a project with no Cluster Agent profiles is
 enumerated with `gcloud container clusters list` first, since the sandbox
 relays that and not the GKE API route leeway's own `--clusters-from <project>`
 would take) and gates notifications through `<profile home>/leeway/ledger.json`.
+`--timeout` is leeway's per-cluster deadline: each call's sandbox timeout (15
+minutes, less when the tick budget is nearly spent), less 90 seconds for
+start-up and report assembly, split across the call's waves of two clusters,
+at most five minutes so one stuck cluster can't spend the tick, and never below
+leeway's own one-minute default. A project's clusters (or
+`LEEWAY_WATCH_CLUSTERS`) are read in calls of at most 12 clusters, sized so
+each cluster gets at least two minutes, about twice the slowest read measured.
+A call started late in the 45-minute tick holds only the waves of two that fit
+at that read time, and no call starts with less than one wave's worth left;
+the clusters after that point wait for a later run. A call that fails costs
+only its own clusters. Every cluster in a call is stamped in the ledger
+(`cluster_runs`) however the call ended; the least recently stamped go first,
+and clusters stamped together are shuffled by the run's date so batch
+membership changes from run to run. Projects go least recently swept first
+(`project_runs`): a project whose turn starts with a full 15 minutes is
+stamped then and rotates behind the others, so a project too big for one tick
+is covered over the next ticks without starving the rest. A project's turn
+ends at its first sandbox timeout, so a project whose calls hang costs one
+call a tick, and a tick in which no call returned still saves the stamps.
+Each project has at most one scan error. A project whose one call held all
+its clusters and raised keeps that call's message; any other is summarised by
+counts (`p1: 72 of 100 clusters read — 12 failed (<cause>) — 16 not reached
+(out of time this run)`), with error rows folded in: up to three clusters
+that returned one are named (`c00, c01 and c02 returned an error
+(forbidden)`), more are counted, and only ok rows count as read. A row is
+matched to its call's cluster by its `source`, then its context name, then a
+short name no two clusters of the call share; a row whose `source` names a
+cluster the call did not hold, or that matches nothing, is counted (`1 cluster
+returned an error (<cause>)`), never named, and marks its project's episode as
+failed as a whole. Clusters only the budget kept from being read are
+not a failure: they post nothing, keep their findings, and are listed under
+the report's "Not Reached This Run". The partial-scan line posts when a project fails that
+has no open episode, and names the projects that failed in that run, up to
+six and then "+N more". An episode remembers the clusters that failed, and
+whether the project failed as a whole (its cluster list could not be read, or
+an error row matched none of its clusters). It closes once each remembered
+cluster has read cleanly since or left its project's list and, for a project
+that failed as a whole, a call for it has started in a run where nothing
+failed for it. One line says so once every announced project's episode has
+closed, and a project that leaves the sweep drops its episode without a line.
+A ledger from before per-project episodes has its signature of error kinds
+read in the first run after the upgrade and then removed, without a line: a
+project failing in that run with a kind the signature holds opens its episode
+silently, and one failing with another kind posts. A run in which no call
+returned fails the tick with one fixed sentence that names no project and no
+count, only whether the reads timed out, failed, or both; while the tick keeps
+failing it keeps the kinds the last line named, so it does not change with the
+rotation and posts once. A run of one project whose list failed, or whose one
+call held every cluster, keeps that project's message; under
+`LEEWAY_WATCH_CLUSTERS`, one call that held every cluster keeps that call's
+own error. A finding on a cluster its project no longer lists
+retires once that list was read.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
 findings bypass the drift floor so single-zone node-pool confinement still
-alerts once per refresh window; `LEEWAY_WATCH_MIN_SEVERITY`,
+alerts once per refresh window. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
-`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
-runs started by hand in the pod with `--dry-run` (the operator's
-`spec.deployment.env` allowlist does not carry them). The report's
+`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` set the
+scheduled sweep's alert thresholds and re-post interval from the `PlatformAgent` CR's
+`spec.deployment.env` (the operator's allowlist carries them), and also work
+on runs started by hand in the pod with `--dry-run`. `LEEWAY_WATCH_CLUSTERS`,
+`LEEWAY_WATCH_PROJECTS` and `LEEWAY_WATCH_HOME` are not carried, so they apply
+only to runs started by hand. The report's
 topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
 `leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
 key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
 `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
 by cluster, class, judging rule and kind. A finding earns a report under
 `<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
-`latest.md` and `latest.json` symlinks) and a chat summary line naming up to
-six due subjects with their cause and share when it first appears, when its
-`suspectedCause` (a rank finding's `rule`) changes or its `severity` escalates,
-or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
-of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
-clusters are retired with a single resolution line (and a clean `latest.*`
-refresh once all clusters scan cleanly), while clusters whose scan failed
-retain their ledger entries so transient errors do not erase state and re-page
-tomorrow. When `NATS_URL` is set, the watch also writes `latest.json` to the
-`topology-skew` (`a2a.topics.agent.platform.topology-skew`) blackboard topic;
-if that write fails, it warns once in chat and retries on subsequent clean
-ticks until the write recovers.
+`latest.md` and `latest.json` symlinks) and a place in one chat message when
+it first appears, when its `suspectedCause` (a rank finding's `rule`) changes
+or its `severity` escalates, or when its 7-day refresh window
+(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. The
+message opens with a bold headline ("**2 pod placement problems on 2 clusters
+(1 new, 1 still open)**"), names up to three of them, most severe first, by
+workload, zone, compute class or node pool (named as one) and cluster, with
+leeway's cause in plain words (`CAUSE_PHRASES` in the script) and a share
+where there is one (a workload's pods or a node pool's nodes in one zone, a
+compute class's time on its last machine choice), adds "and N more" past that, and ends by pointing at the agent for
+fixes and with the date its findings are next posted if still open.
+The report's path on the pod is left out, since a chat reader cannot open it.
+Resolved findings on cleanly scanned (`status: "ok"`) clusters are retired
+under their own headline in the same post ("**1 pod placement problem has
+cleared**", then up to three names), while clusters whose scan failed or that
+were not reached retain their ledger entries so transient errors do not erase
+state and re-page tomorrow. Lines about the scan itself follow the headlines. A run
+with a finding due writes and publishes its own report, partial or not. The
+JSON report carries a `coverage` block: `clusters_swept`, `clusters_read`, and
+the projects `not_reached` or with `scan_errors` this run (each with its
+summary), since `summary` counts only the clusters read; a cluster missing
+from a partial report is unread, not clean. Every other rewrite of
+`latest.*` waits for a run that reads every project in full without a
+failure: the refresh after findings retire, a refresh deferred from an
+earlier run, and the one after a threshold override changes. A failed project
+or clusters not reached hold it back. So on a fleet too big for one run,
+`latest.*` and the topic change only when a finding comes due, and otherwise
+keep the previous report. When `NATS_URL` is set, the watch also writes the
+JSON report it just saved to the `topology-skew`
+(`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
+fails, it warns once in chat and retries with `latest.json` on a later run
+that reads every project in full without a failure, until the write recovers.
+A report too large for one bus message (NATS's 1 MiB `max_payload`, less 64
+KiB held back for the envelope and encoding slack) is published capped: the
+same document keeping the fleet's most severe findings in order, up to the
+first that does not fit, each in its own cluster, the full report's `summary`,
+and a `truncated` block counting what was left out. Its `full_report` is the
+timestamped report's path on the Platform Agent profile's disk, which
+leeway-watch prunes once ten newer reports exist. When even the clusters
+stripped of findings do not fit, `clusters` is emptied and counted in
+`truncated.clusters_omitted`. The `--text` summary gains a suffix naming the
+cap.
 
 ## `session-retention` gives every profile's history an end
 
@@ -599,7 +698,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack and Google Chat, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in
@@ -611,12 +710,10 @@ them, through session-kv's `POST /v1/board/actions`, which touches only a card
 and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
-press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
-allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
-where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
-is never an agent turn. Google Chat under today, and a run that also reports
-the board's other findings, get the text.
+press: the Home tab's admission rule on Slack, and the allowed-users list (`resolvePrincipal`) on Google Chat, where
+the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap is
+never an agent turn. A run that also reports the board's other findings gets
+the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
@@ -895,7 +992,7 @@ repositories posts each finished repository's report, then a line naming any it
 did not finish. A failed run posts the scheduler's failure line in plain words,
 once until the job runs again ([the relay design](../../../docs/designs/cron-report-relay.md)),
 and a run that finished no repository without failing posts a one-line notice
-that it did not finish. On Slack, and on Google Chat under `spec.mode: next`, the report is then replaced by a headline linking its
+that it did not finish. On Slack and Google Chat, the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
 with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
@@ -984,7 +1081,7 @@ SOP and a roster entry, not a restore.
 ## Adding a watchdog: the repository steps
 
 The site's [Autonomous watchdogs](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md#adding-a-watchdog)
-page lists what an entry needs. Two steps belong to this repository rather than
+page lists what an entry needs. Three steps belong to this repository rather than
 to an install:
 
 - Run `make docs-generate` after editing either roster. The site's cron
@@ -993,6 +1090,10 @@ to an install:
   `compliance-audit` entry is also rendered in full as the job-schema example
   on the watchdogs, skills and cron-jobs pages, so an edit to it changes those
   three pages too.
+- Add, change or remove the job's row in
+  [`scheduling-on-profiles-inventory.md`](../../../docs/designs/scheduling-on-profiles-inventory.md)
+  in the same PR, saying where the job lives once Hermes cron retires (profile,
+  trigger kind, report sink). TBD with a linked open question is an answer.
 - For a dev workspace, `scripts/dev/dev_rebuild_agent.sh` rebuilds and restarts
   the agent image without a release; `./upgrade.sh --upgrade-mode=harness
 --image-tag=<ref>` is the path for an installed cluster.
@@ -1126,7 +1227,7 @@ tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_ga
 
 - `"low"`: Read-only governance watchdogs, audits, and internal scheduler plumbing. Runs under
   the configured `cron_mode` (typically `approve`), protected by the denylist floor (hardline +
-  `approvals.deny` + Tirith POSIX shell content scan), terminal escape rejection, lookalike TLD
+  `approvals.deny`), terminal escape rejection, lookalike TLD
   blocks, and `execute_code` blocks.
 - `"high"`: Workloads with broad operational authority or untrusted input sources (such as
   `github-repo-watcher`), as well as unannotated dispatches. For agentic (prompt-driven) jobs,

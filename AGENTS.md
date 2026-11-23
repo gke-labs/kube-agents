@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent configurations, personas, and skills for managing Kubernetes/GKE operations.
+The Kubernetes Agentic Harness (`kube-agents`): agent configurations, personas and skills for Kubernetes/GKE operations.
 
 ## Repository Layout
 
@@ -13,7 +13,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images: review skills (adversarial, security, docs-drift, chat UX, skill quality) run against pull requests and clusters, `review-preflight` runs the pre-PR set in a context that did not write the change, the `install-`/`uninstall-`/`upgrade-kube-agents` lifecycle skills drive the installer scripts, and `edit-mirrored-skill` edits mirrored `gke-*` skills.
 - `.agents/rules/`: Repository-level rules, one file per family: code (`core_engineering.md`), workflows (`github_actions.md`), pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`), chat UX (`chat_ux.md`), public posts (`public_surfaces.md`).
-- `a2a/`: bus Go module: wire library, `a2a` topics CLI (`docs/designs/spec-a2a-payloads.md`), gateway, auth-callout, `persona/` (bus content), `lib/persona/` (persona format).
+- `a2a/`: bus Go module: wire library, `a2a` topics CLI (`docs/designs/spec-a2a-payloads.md`), gateway, auth-callout, `memory/` (OKF Curator), `persona/` (bus content), `lib/persona/` (persona format).
 - `charts/`: Canonical Helm chart (`kube-agents`) deploying the operator and profiles.
 - `terraform/`: Reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`), plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Dockerfile, Kustomize bases, shared runtime assets.
@@ -25,8 +25,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
 - `scripts/`: Repository tooling: `installer/` (shared by the front doors), `dev/`, `release/`.
 - `examples/`: LiteLLM provider configs, vLLM serving, inference replay.
 - `bench/`: Evaluation harness running [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent.
-- `images.json`: Inventory of every container image an install pulls, with its upstream reference
-  and pin; read by `make mirror-images`, the kustomize deploy targets, and the docs generator.
+- `images.json`: Every container image an install pulls, with its upstream reference and pin;
+  read by `make mirror-images`, the kustomize deploy targets and the docs generator.
 
 ## Where Tests Go
 
@@ -54,7 +54,7 @@ A new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the `Makef
 ## Agent Setup & Integration
 
 Follow [INSTALL.md](INSTALL.md) to set up and register the Platform Agent;
-[docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts, and
+[docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts and
 operational guides.
 
 ## Before Starting a Task
@@ -70,15 +70,14 @@ git fetch upstream main
 git switch -c <branch> --no-track upstream/main
 ```
 
-Already on a branch? Measure whether `main` moved underneath the files you are changing with the
-drift check in
+Already on a branch? Check whether `main` moved under your files with the drift check in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#measure-how-far-a-branch-has-drifted-from-main).
-If it lists a file, rebase onto `upstream/main` and re-read those files before writing more; if it
-lists nothing, being behind is a merge-conflict risk to settle later, not a reason to stop.
+If it lists a file, rebase onto `upstream/main` and re-read those files before writing more; if
+none, being behind is a merge-conflict risk for later, not a reason to stop.
 
 ### Check whether someone is already doing it
 
-Before writing code on a non-trivial task, scan open PRs and issues with the queries in
+Before coding a non-trivial task, scan open PRs and issues with the queries in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#check-whether-someone-is-already-doing-it)
 and report to the user (skip only when the user named the issue/PR or asked for a one-liner):
 
@@ -88,18 +87,18 @@ and report to the user (skip only when the user named the issue/PR or asked for 
 - **An open issue describes the task and is unassigned.** Give the number and title, offer to claim
   it, and say what you would comment. Assign or comment only after the user agrees (the token is a
   person's account).
-- **The issue is assigned to someone else.** Report it and ask before starting.
-- **Nothing matches.** Say so in one line and carry on.
+- **The issue is assigned to someone else.** Report it; ask before starting.
+- **Nothing matches.** Say so in a line and carry on.
 
 Record the result in the PR's **Context** section (`Closes #<number>`, or the related open PR and
-how yours differs) per [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Do
-not apply `status:` labels here; those belong to the runtime claim loop in
-[`agents/platform/skills/github-issue-resolver/SKILL.md`](agents/platform/skills/github-issue-resolver/SKILL.md).
+how yours differs) per [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
+`status:` labels belong to the runtime claim loop in
+[`agents/platform/skills/github-issue-resolver/SKILL.md`](agents/platform/skills/github-issue-resolver/SKILL.md), not here.
 
 ## Skills Guidelines
 
 - Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md`.
-- Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
+- Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent. A profile persona may publish its task's requested change as a proposal through the broker; the broker's permit gate, not the persona, enforces when that's allowed.
 - `agents/platform/skills/gke-*` (a reserved prefix) are copies of `google/skills`, generated from `third_party/google-skills/<skill>/` and the overlay in `agents/platform/skill-overlays/<skill>/`. Edit one in place and record it with `make skills-refresh` (see `edit-mirrored-skill`).
 
 ## Engineering Rules
@@ -116,7 +115,7 @@ Read the matching file in [`.agents/rules/`](.agents/rules/) before writing:
 
 ## Documentation Guidelines
 
-Every fact has one home; check whether the topic has an owner before adding prose:
+Every fact has one home; check for the topic's owner before adding prose:
 
 | Content                                        | Canonical home                       |
 | ---------------------------------------------- | ------------------------------------ |
@@ -153,7 +152,7 @@ Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.m
   lists (`SKILL.md` excepted per `.agents/skills/skill-review/SKILL.md`).
 
 Run `make docs-check` before pushing: generated regions, links/anchors/reachability, terminology,
-site audience, site prose, the context budget, the PR template's sections, and upgrade-table labels.
+site audience and prose, the context budget, PR template sections, upgrade-table labels.
 
 ## Contributing as an agent
 
@@ -170,7 +169,7 @@ user" clauses here. Agents with a user in the loop follow this file.
   `type(optional-scope): description` (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
   `build`, `ci`, `chore`, `revert`; breaking changes marked with `!` before `:` or a
   `BREAKING CHANGE:` footer). Confirm the title prefix with the author before opening a PR.
-- Push PR branches to a fork, not to the upstream repository.
+- Push PR branches to a fork, not upstream.
 - **Pin every third-party GitHub Action to a full commit SHA with a version comment**
   (`uses: actions/checkout@3d3c42e… # v7.0.1`), and **guard automatically-triggered credentialed
   workflows against forks** with `if: github.repository == 'gke-labs/kube-agents'` on every job.
@@ -179,23 +178,23 @@ user" clauses here. Agents with a user in the loop follow this file.
   A bug fix fills in **Bug Fix: Preventing Recurrence**: why it shipped, what catches it now, where
   else it lives ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **AI Agent Attribution:** No AI co-author trailers (`Co-Authored-By:`) on commits; note AI
-  assistance in the PR description instead.
+  assistance in the PR description.
 - **Write PR titles, bodies, commits, and review replies straight:** plain declaratives leading with
-  the outcome, without self-grading (`comprehensive`, `production-ready`).
-- **Adversarial and docs-drift self-review before opening a PR:** run `review-adversarial`
-  (`.agents/skills/review-adversarial/SKILL.md`) and `review-docs-drift`
-  (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff **in a clean context that
-  did not write the change** (`/pr-preflight` spawns one). Fix confirmed findings and record one
-  merged disposition list under **Self-Review**: what you looked for, what was found, the context
-  used. Mechanics: [`pre_pr_review.md`](.agents/rules/pre_pr_review.md).
+  the outcome, without self-grading (`comprehensive`).
+- **Self-review before opening a PR:** run `review-adversarial`, `review-docs-drift` and, when chat
+  output changes, `review-chat-ux` on your diff **in a clean context that did not write it**
+  (`/pr-preflight` spawns them). Fix confirmed findings; under **Self-Review** list every
+  disposition, what you looked for and the context ([mechanics](.agents/rules/pre_pr_review.md)).
+- **Show a user-facing change:** a PR changing what a user sees carries a screenshot under **UX
+  change**; CI checks it ([mechanics](.agents/rules/pre_pr_review.md#ux-change)).
 - **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how it
   ran against a running installation, the eval loop or exemption record for agent
   behaviour changes, or "Not live-tested" and why. Mechanics:
   [`pre_pr_review.md`](.agents/rules/pre_pr_review.md); what the section may carry:
   [`public_surfaces.md`](.agents/rules/public_surfaces.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
-  fixes into the sections rather than appending rounds; round-by-round history belongs in the
-  review threads ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
+  fixes into the sections, not appended rounds; per-round history goes in review threads
+  ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **The install has one engine: Terraform + Helm.** `terraform/examples/full-install` (via
   `lifecycle.sh`) owns every GCP resource and the chart every Kubernetes resource;
   `install.sh` / `uninstall.sh` / `upgrade.sh` only generate `terraform.tfvars` and drive it. Do not
@@ -215,20 +214,19 @@ user" clauses here. Agents with a user in the loop follow this file.
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
 - **Local Validation Checks:** Before committing, run the checks for what you touched:
   `prettier --write` on changed Markdown/YAML, `make shellcheck` on shell scripts, a
-  `--platform linux/amd64` Docker build (plus `scripts/check_image_layers.py` for a new `RUN`/`COPY`
-  in `deploy/docker/Dockerfile`), `go build` in `k8s-operator/` or `a2a/`, `make terraform-test` on
-  Terraform modules. Commands:
+  `--platform linux/amd64` Docker build (and `scripts/check_image_layers.py` for a new `RUN`/`COPY` in
+  `deploy/docker/Dockerfile`), `go build` in `k8s-operator/` or `a2a/`, `make terraform-test` on Terraform
+  modules, `scripts/dev/repeat_under_load.sh` on a new or changed test. Commands:
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#local-validation-before-committing).
 
 ### The behavioural presubmit gate
 
-`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
-install (3 repetitions per active case, 1.5–3.5 hours). Non-inert
+`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` through the A2A
+gateway's inject door (3 repetitions per active case, 1.5–3.5 hours). Non-inert
 pushes restart it, so open the PR early and batch changes; a green on the head stays valid when
 `main` moves. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
 or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
-inconsistent liveness signals; a run-less record is infrastructure unless every case is one). Today
-mode and rollback: optional `pull-kube-agents-smoke-test-today` (round-trip PRs or `/test`).
+inconsistent liveness signals; a run-less record is infrastructure unless every case is one).
 Roster, inject-lane exclusions: `docs/eval-gate-roster.md`; verdict ladder:
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2. On a red, read the
 health bot comment and <https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>:
@@ -289,7 +287,7 @@ reviewer, not another edit.
 with its commit named, or the finding is factually wrong against `main` (not a stale checkout) and
 you have said why. Resolve a `kube-agents-bot` finding you decline or defer once your reply gives
 the reason (and any follow-up issue) and **Self-Review** names it, and the description thread once
-the body is edited: an open thread hides the PR from its reviewer
+the body is edited: an open thread blocks the merge
 ([why](docs/pull-request-workflow.md#who-owns-an-open-pull-request)). Unresolve it if a reviewer
 asks for the fix. A person's thread is different: a judgment call, a declined ask, or an unanswered
 rebuttal stays open with a reply; resolving does not end a disagreement. Reply first:
@@ -306,5 +304,5 @@ another round. Two traps:
   the base branch, and any unresolved review thread means work is still outstanding.
 - **Unanswered Self-Review:** "no findings" counts only alongside what was looked for.
 
-Mechanics, queries, and verdicts live in
+Mechanics, queries and verdicts:
 [`.claude/commands/pr-review-batch.md`](.claude/commands/pr-review-batch.md).

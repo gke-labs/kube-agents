@@ -478,7 +478,7 @@ class CadenceCellTest(unittest.TestCase):
 
 
 class CRDFieldBlocksTest(unittest.TestCase):
-    """The three CRD field pages are registered, rendered as tables, and selectable."""
+    """The CRD field pages are registered, rendered as tables, and selectable."""
 
     def test_each_kind_has_a_block_on_its_own_page(self):
         for kind, page in generate_docs.CRD_KINDS.items():
@@ -639,7 +639,7 @@ class ConditionsBlockTest(unittest.TestCase):
         self.assertIn("`A2AVerifier`", types)
         self.assertEqual(len(types), len(set(types)))
         degraded = next(line for line in lines if line.startswith("| `Degraded`"))
-        self.assertIn("`InvalidCredentialProxyExec` or `RBACIncomplete`", degraded)
+        self.assertIn("`InvalidCredentialProxyExec`, `InvalidKanbanAdmission` or `RBACIncomplete`", degraded)
         self.assertNotIn(generate_docs.CONDITIONS_REASONS_PLACEHOLDER, "\n".join(lines))
 
     @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
@@ -714,7 +714,7 @@ class FootprintBlocksTest(unittest.TestCase):
     @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
     def test_a_hand_edited_figure_fails_the_check(self):
         page_text = generate_docs.FOOTPRINT_PAGE.read_text(encoding="utf-8")
-        row = next(line for line in page_text.splitlines() if line.startswith("| `today`, GKE Standard |"))
+        row = next(line for line in page_text.splitlines() if line.startswith("| GKE Standard |"))
         cells = row.split(" | ")
         cells[1] = str(int(cells[1]) + 1)
         edited = page_text.replace(row, " | ".join(cells), 1)
@@ -732,37 +732,58 @@ class FootprintBlocksTest(unittest.TestCase):
     def test_the_figures_come_from_the_chart_and_the_golden(self):
         footprint = generate_docs.install_footprint
         model = footprint.profiles_model()["profiles"]
-        self.assertIsNone(model["today-standard"]["sessionQuotaPods"])
-        self.assertEqual(model["next-standard"]["sessionQuotaPods"], footprint.golden_session_quota())
+        self.assertEqual(model["standard"]["sessionQuotaPods"], footprint.golden_session_quota())
         # Autopilot counts the credential proxy at its Autopilot requests.
         self.assertGreater(
-            model["today-autopilot"]["requirements"]["requestsCpu"],
-            model["today-standard"]["requirements"]["requestsCpu"],
+            model["autopilot"]["requirements"]["requestsCpu"],
+            model["standard"]["requirements"]["requestsCpu"],
         )
         # Hindsight and the minter add chart pods, which the session quota counts.
-        self.assertGreater(model["next-hindsight-minter"]["sessionQuotaPods"], model["next-standard"]["sessionQuotaPods"])
+        self.assertGreater(model["hindsight-minter"]["sessionQuotaPods"], model["standard"]["sessionQuotaPods"])
+        # One NATS server is two fewer standing pods in the quota.
+        self.assertEqual(model["one-server"]["sessionQuotaPods"], model["standard"]["sessionQuotaPods"] - 2)
         self.assertEqual(footprint.cpu(2000), "2")
         self.assertEqual(footprint.cpu(2756), "2756m")
         self.assertEqual(footprint.memory(2 * 1024**3), "2Gi")
         self.assertEqual(footprint.memory(10048 * 1024**2), "10048Mi")
 
     def test_the_session_pod_reads_every_quantity_form_kubernetes_accepts(self):
-        footprint = generate_docs.install_footprint
-        constants = {
-            "workerCPURequest": "1.5",
-            "workerMemoryRequest": "1.5Gi",
-            "workerCPULimit": "2500m",
-            "workerMemoryLimit": "2G",
-            "workerEphemeralStorageRequest": "1Ti",
+        """The session row comes from footprint.yaml, which the chart footprint generator
+        reads from the A2A gateway's session env; every quantity form parses there."""
+        import generate_chart_footprint as gcf
+
+        env = {
+            "A2A_SESSION_CPU_REQUEST": "1.5",
+            "A2A_SESSION_MEMORY_REQUEST": "1.5Gi",
+            "A2A_SESSION_CPU_LIMIT": "2500m",
+            "A2A_SESSION_MEMORY_LIMIT": "2G",
+            "A2A_MAX_SESSIONS": "10",
         }
-        source = "\n".join(f'\t{name} = "{value}"' for name, value in constants.items())
-        with mock.patch.object(Path, "read_text", return_value=source):
-            pod = footprint._session_pod()
+        kind, name, (container,) = gcf._A2A_WORKLOADS[gcf._A2A_GATEWAY]
+        gateway = {
+            "kind": kind,
+            "metadata": {"name": name},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": container, "env": [{"name": k, "value": v} for k, v in env.items()]},
+            ]}}},
+        }
+        pod = gcf._session_pod_entry([gateway], "1Ti")
         self.assertEqual(pod["cpuMillisRequest"], 1500)
         self.assertEqual(pod["memoryBytesRequest"], 1536 * 1024**2)
         self.assertEqual(pod["cpuMillisLimit"], 2500)
         self.assertEqual(pod["memoryBytesLimit"], 2 * 1000**3)
         self.assertEqual(pod["ephemeralStorageBytesRequest"], 1024**4)
+        self.assertEqual(pod["maxSessionsDefault"], 10)
+
+    def test_the_session_row_is_footprint_yamls_entry(self):
+        footprint = generate_docs.install_footprint
+        entry = {"pods": 1, "cpuMillisRequest": 7}
+        probe = {"footprint": {"operatorRenderedPerReplica": {"sessionPod": entry}}}
+        with mock.patch.object(footprint, "run_probe", return_value=probe):
+            self.assertIs(footprint._session_pod(), entry)
+        with mock.patch.object(footprint, "run_probe", return_value={"footprint": {}}):
+            with self.assertRaises(SystemExit):
+                footprint._session_pod()
 
     def test_a_sum_that_does_not_split_evenly_over_its_pods_is_refused(self):
         footprint = generate_docs.install_footprint
@@ -772,13 +793,13 @@ class FootprintBlocksTest(unittest.TestCase):
         self.assertIn("cpuMillisRequest", str(caught.exception))
 
     @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
-    def test_a_next_mode_workload_the_table_does_not_list_fails_the_render(self):
+    def test_an_a2a_workload_the_table_does_not_list_fails_the_render(self):
         footprint = generate_docs.install_footprint
-        with mock.patch.object(footprint, "NEXT_WORKLOADS", footprint.NEXT_WORKLOADS[1:]):
+        with mock.patch.object(footprint, "A2A_WORKLOADS", footprint.A2A_WORKLOADS[1:]):
             with self.assertRaises(SystemExit) as caught:
                 footprint.workloads_rows()
         self.assertIn("a2aNats", str(caught.exception))
-        self.assertIn("NEXT_WORKLOADS", str(caught.exception))
+        self.assertIn("A2A_WORKLOADS", str(caught.exception))
 
 
 class ReplayBaselineMetricsTest(unittest.TestCase):

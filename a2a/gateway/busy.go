@@ -34,9 +34,10 @@ var errSessionWatchClosed = errors.New("session-state watch closed before its in
 // The busy notice, singular and plural: a state of the turn's status line,
 // rendered the way statusLine renders the relay's states (icon, bold label,
 // a dash, the detail). It replaces the "⏳ submitted…" placeholder rather than
-// following it as a post of its own, so the relay's next edit (working, or
-// the terminal) replaces it in turn and it is never left under a "completed"
-// header, where it read as the output of some earlier command. On a backend
+// following it as a post of its own, so the relay's next edit (working, the
+// terminal, or on Google Chat the acknowledgement) replaces it in turn and it is never
+// left under a "completed" header, where it read as the output of some
+// earlier command. On a backend
 // that keeps no line (StatusShower: Slack with Agent Sessions) there is none
 // to replace, and showBusy posts it as a message of its own. Plain words,
 // no task id: it is for the person who just asked, and what they need is
@@ -121,8 +122,8 @@ func lineStillSubmitted(rs *relayState) bool {
 
 // busyNoticeBackend reports whether a turn that arrived through backend gets
 // the busy notice: the chat backends and the console do. The inject door and
-// both A2A door classes (a2aBackend, and a2aGoogleBackend for Google-verified
-// callers) do not, because their callers are programs that read the status line
+// every A2A door class (a2aBackend, a2aGoogleBackend for Google-verified
+// callers, a2aEntraBackend for Entra-verified ones) do not, because their callers are programs that read the status line
 // as data. The A2A door takes the line's first edit as the task going to
 // working (A2ADoor.Edit), so a queued edit would report a task no worker has
 // as running; the inject door records every edit as an entry the eval
@@ -130,7 +131,7 @@ func lineStillSubmitted(rs *relayState) bool {
 // unedited post of a task as its output, so the notice would be graded or
 // returned as part of the answer.
 func busyNoticeBackend(backend string) bool {
-	return backend != injectBackend && backend != a2aBackend && backend != a2aGoogleBackend
+	return backend != injectBackend && backend != a2aBackend && backend != a2aGoogleBackend && backend != a2aEntraBackend
 }
 
 // busyNoticeAt is the configured threshold, or defaultBusyNoticeAt when the

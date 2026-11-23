@@ -4,6 +4,8 @@ kind: GitRepository
 metadata:
   name: platform-charts
   namespace: flux-system
+  labels:
+    managed-by: kube-agents-bench
 spec:
   interval: 10m
   url: https://github.com/CONTEXT_REPOSITORY_OWNER/CONTEXT_REPOSITORY_NAME

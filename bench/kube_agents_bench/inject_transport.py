@@ -75,6 +75,8 @@ __all__ = [
     "EVENT_ENTRY_TASK",
     "GRACE_MARGIN_SECONDS",
     "INFRASTRUCTURE_REASONS",
+    "INTENTS",
+    "INTENT_CONFIRM",
     "OUTCOME_DEADLINE",
     "OUTCOME_NEVER_STARTED",
     "OUTCOME_NOT_ACCEPTED",
@@ -159,6 +161,14 @@ KEY_SEPARATOR = "/"
 # Appended to the backend message id of a cancel, so the ingress log shows
 # which submission the cancel belongs to and still tells the two apart.
 CANCEL_MESSAGE_ID_SUFFIX = "-cancel"
+
+# The submit body's ``intent`` (``injectRequest.Intent``): absent for a typed
+# message, or ``confirm``, which submits the turn as a confirmed change (the
+# task's ``changeRequested``). A door not armed for it (A2A_INJECT_CONFIRM)
+# answers 400; the gateway refuses every other value, and so does this side.
+INTENT_FIELD = "intent"
+INTENT_CONFIRM = "confirm"
+INTENTS = frozenset({INTENT_CONFIRM})
 
 
 # Transcript entry kinds, as the gateway spells them.
@@ -1460,10 +1470,27 @@ class InjectTask:
         token: str,
         author: str = DEFAULT_AUTHOR,
         message_id: str = "",
+        profile: str = "",
+        parameters: dict[str, str] | None = None,
+        intent: str = "",
     ) -> None:
+        # Refused here, before anything is sent: a typo would otherwise cost a
+        # lease to learn from the door's 400.
+        if intent and intent not in INTENTS:
+            raise ValueError(
+                f"inject intent {intent!r} is not one the door takes: empty or one of {sorted(INTENTS)}"
+            )
         self.base_url = base_url.rstrip("/")
         self.conversation = conversation
         self.prompt = prompt
+        # The submit's intent: empty sends a typed message, as every turn was
+        # sent before; "confirm" submits it as a confirmed change. Only the
+        # opening submit carries it, never a stop or a cancel.
+        self.intent = intent
+        # The AgentProfile the opening turn is addressed to, and its
+        # parameters (profile_hook, #5945); empty sends the turn as any other.
+        self.profile = profile
+        self.parameters = dict(parameters or {})
         self.token = token
         self.author = author
         # The backend message id, which the gateway's ingress log joins to the
@@ -1547,6 +1574,12 @@ class InjectTask:
         }
         if self.message_id:
             payload["messageId"] = self.message_id
+        if self.profile:
+            payload["profile"] = self.profile
+            if self.parameters:
+                payload["parameters"] = self.parameters
+        if self.intent:
+            payload[INTENT_FIELD] = self.intent
         self.unanswered_post = True
         try:
             body = _request(

@@ -100,7 +100,7 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 	// Nobody answers: no verdict, so the dispatcher holds the submission
 	// rather than rejecting it. It ends within the caller's ctx.
 	nctx, ncancel := context.WithTimeout(ctx, 2*time.Second)
-	err = v.CheckProfileRun(nctx, ref, "tse", "read", "namespace/ka")
+	err = v.CheckProfileRun(nctx, ref, "tse", "read", "namespace/ka", nil)
 	ncancel()
 	if !errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Fatalf("with no verifier, got %v, want ErrVerifierUnreachable", err)
@@ -117,7 +117,8 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 		var req capability.Request
 		_ = json.Unmarshal(m.Data, &req)
 		asked.Store(&req)
-		resp := capability.Response{Allowed: req.Ref.Key == "cap-ok"}
+		// Echoes the request id, as the verifier does.
+		resp := capability.Response{Allowed: req.Ref.Key == "cap-ok", RequestID: req.RequestID}
 		if !resp.Allowed {
 			resp.Reason = "not this one"
 		}
@@ -132,19 +133,19 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 	// The client replaced its connection: the old one is closed.
 	current.Load().Close()
 	current.Store(dial())
-	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); err != nil {
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka", nil); err != nil {
 		t.Fatalf("permitted ref: %v", err)
 	}
 	if req := asked.Load(); req == nil || req.Verb != capability.VerbProfileRun || req.Profile != "tse" ||
 		req.Tier != "read" || req.Resource != "namespace/ka" || req.Ref != ref {
 		t.Errorf("the verifier was asked %+v, want profile.run for tse at read on namespace/ka", req)
 	}
-	err = v.CheckProfileRun(ctx, capability.Ref{Key: "cap-bad", Revision: 1}, "tse", "read", "namespace/ka")
+	err = v.CheckProfileRun(ctx, capability.Ref{Key: "cap-bad", Revision: 1}, "tse", "read", "namespace/ka", nil)
 	if !errors.As(err, &r) || capability.Reason(err) != "not this one" || errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Errorf("refused ref: got %v, want the verifier's refusal", err)
 	}
 	current.Store(nil)
-	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); !errors.Is(err, dispatch.ErrVerifierUnreachable) {
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka", nil); !errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Errorf("with no connection, got %v, want ErrVerifierUnreachable", err)
 	}
 }
@@ -408,10 +409,7 @@ func TestAStopBeforeDispatchingIsACleanStop(t *testing.T) {
 	s := settings{natsURL: "nats://127.0.0.1:1", namespace: ns, configMap: name}
 	cfg := lib.DispatchConfig{Version: "test", Namespace: ns, ProfileNamespace: "kube-agents-profiles", Ceiling: 6,
 		InteractiveReserve: 2, ChildReserve: 2, LeaseSeconds: 3, RenewSeconds: 1, RestartGraceSeconds: 2, AcceptTimeoutSeconds: 1,
-		Profiles: []lib.DispatchProfile{{Name: "tse", Tiers: []string{"read"}, Concurrency: 1, QueueTimeoutSeconds: 60, ActiveDeadlineSeconds: 60,
-			Durables: []lib.DispatchDurable{
-				{Tier: "read", Kind: lib.SubmitKindTop, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)},
-				{Tier: "read", Kind: lib.SubmitKindChild, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindChild)}}}}}
+		Profiles: []lib.DispatchProfile{{Name: "tse", Tiers: []string{"read"}, Concurrency: 1, QueueTimeoutSeconds: 60, ActiveDeadlineSeconds: 60}}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -463,5 +461,35 @@ func TestAStopBeforeDispatchingIsACleanStop(t *testing.T) {
 	cancel(errProfileNamespaceMoved)
 	if err := stopped(ctx, fmt.Errorf("bus connect: %w", ctx.Err())); !errors.Is(err, errProfileNamespaceMoved) {
 		t.Errorf("a moved namespace during the connect: %v, want errProfileNamespaceMoved", err)
+	}
+}
+
+// With A2A_DISPATCHER_BUCKETED_GRANTS exactly "true" the process prepares one
+// bucket connection per lib.DispatcherBucket, on the projected token; any
+// other value keeps the one connection. A static NATS_USER has no callout to
+// split its grants, so the switch refuses it.
+func TestReadSettingsPreparesTheBucketConnectionsOnlyWhenBucketed(t *testing.T) {
+	tok := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tok, []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := map[string]string{"NATS_URL": "nats://x", envNamespace: "ka", envConfigMap: "m", lib.EnvBusTokenFile: tok}
+	for v, want := range map[string]int{"true": lib.DispatcherBuckets, " true ": lib.DispatcherBuckets, "": 0, "false": 0, "TRUE": 0, "1": 0} {
+		m := map[string]string{envBucketedGrants: v}
+		for k, val := range base {
+			m[k] = val
+		}
+		s, err := readSettings(env(m))
+		if err != nil {
+			t.Fatalf("%s=%q: %v", envBucketedGrants, v, err)
+		}
+		if len(s.bucketAuth) != want {
+			t.Errorf("%s=%q: %d bucket connections, want %d", envBucketedGrants, v, len(s.bucketAuth), want)
+		}
+	}
+	static := map[string]string{"NATS_URL": "nats://x", envNamespace: "ka", envConfigMap: "m",
+		"NATS_USER": "dispatcher", "NATS_PASSWORD": "pw", envBucketedGrants: "true"}
+	if _, err := readSettings(env(static)); err == nil {
+		t.Error("bucketed grants were accepted on a static NATS_USER")
 	}
 }

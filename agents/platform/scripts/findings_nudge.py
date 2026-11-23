@@ -35,7 +35,7 @@ formatting and bookkeeping. Each run:
    the state file alone while its marks have not landed.
 
 Nothing is added before the first inventory report is out (its delivery
-claimed, or under ``spec.mode: next`` its post's outcome recorded), so that
+claimed, or on the conversation path its post's outcome recorded), so that
 report is the first thing onboarding says about the fleet. The hold ends
 ``FIRST_REPORT_HOLD_HOURS`` (24) after onboarding filed its sweep, delivered or
 not: an undelivered report by then means onboarding stalled, and holding on
@@ -46,11 +46,15 @@ posts as a failure) once a UTC day; later failures that day go to stderr and
 exit 0.
 
 The bookkeeping is best-effort, and what a failed write costs: an addition
-whose mark fails is not offered again the same day (the state file remembers
-it), still counts against that day's limit, and holds additions back as a
-pending item of its class would, though the stop-add notice does not name it.
-Unlike a recorded addition, it counts only while undecided: a decision on it
-the same day refunds its slot. It is offered as new the next day. If the state file cannot be written
+whose marks all fail is not offered again the same day (the state file
+remembers it), still counts against that day's limit, and holds additions back
+as a pending item of its class would, though the stop-add notice does not name
+it. Unlike a recorded addition, it counts only while undecided: a decision on
+it the same day refunds its slot. It is offered as new the next day. When only
+some of an addition's marks fail, the addition is on record: a member left new
+waits for the next day and does not count again; a non-critical one does not
+stop additions, and a critical one holds non-criticals back as a critical
+waiting for the budget does. If the state file cannot be written
 either, the same additions and the daily part are posted again every hour.
 """
 
@@ -95,7 +99,9 @@ FAILURE_KEY = "failure_reported"
 # what was added today and the members it named, so a mark that failed does
 # not announce the same item again an hour later, and the item still counts
 # against the day and holds additions back (`pace`). A row that joins the line
-# later is not one of the ids, so it does not hold anything back. A record an
+# later is not one of the ids, so it does not hold anything back. An item
+# whose additions today are all in the queue's record (some marks succeeded)
+# does not count again; it waits for tomorrow (`pace`). A record an
 # older build wrote today has no "ids"; the key alone decides until the day ends.
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_DAY = "day"
@@ -109,7 +115,7 @@ RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Filed and not yet delivered means a first report is on its way.
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 DELIVERED_MARKER = ".bootstrap_completed"
-# Under spec.mode next a claim on the conversation path is one attempt and can
+# A claim on the conversation path is one attempt and can
 # be released; the report is out only once this outcome marker exists
 # (bootstrap_delivery.py, CONVERSATION_FILE, CONVERSATION_ALIGNED_MARKER and
 # CONVERSATION_DONE_FILE).
@@ -171,7 +177,7 @@ def _filed_at(marker: Path) -> tuple[datetime, str] | None:
 def first_report_markers(gateway_home: Path) -> tuple[Path, Path]:
     """The sweep marker, and the marker that says the first report is out.
 
-    Out is the delivery claim, or on the conversation path (``spec.mode: next``)
+    Out is the delivery claim, or on the conversation path
     the recorded outcome, because a claim there can be released and taken
     again. The board snapshot reads the same pair for the Home tab, and ends
     its state early once delivery has registered the sweep's findings.

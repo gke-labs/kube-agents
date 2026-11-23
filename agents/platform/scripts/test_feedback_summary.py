@@ -29,7 +29,7 @@ CR = {
         "creationTimestamp": "2026-10-01T12:00:00Z",
     },
     "spec": {
-        "mode": "today",
+        "mode": "next",
         "harness": {"clusterName": CLUSTER, "projectId": PROJECT, "location": "us-central1", "memory": {"memoryEnabled": "false", "provider": "multiuser_memory"}},
         "scope": {"projects": ["acme-scope-dev"], "exclude": {"clusters": ["old-cluster"]}},
         "integration": {"gitops": {"repository": "acme/gitops"}},
@@ -70,6 +70,9 @@ CR = {
             "proposalsFromScheduled": 0,
             "proposalsFromIssue": 0,
             "proposalsFromOther": 0,
+            "inputTokensTotal": 98765432,
+            "outputTokensTotal": 1234567,
+            "spendMicrosUSDTotal": 2512345678,
             "lastActiveTime": "2026-10-20T17:34:06Z",
             "lastHumanActiveTime": "2026-10-20T16:10:00Z",
             "activeInterfaces": ["googlechat"],
@@ -88,6 +91,20 @@ LITELLM_CONFIG_YAML = """model_list:
 OTHER_LITELLM_CONFIG_YAML = """model_list:
   - model_name: model-default
     litellm_params:
+      model: openai/gpt-4o
+"""
+
+EFFORT_LITELLM_CONFIG_YAML = """model_list:
+  - model_name: model-default
+    litellm_params:
+      model: openai/gpt-4o
+      reasoning_effort: "medium"
+"""
+
+EFFORT_FIRST_LITELLM_CONFIG_YAML = """model_list:
+  - model_name: model-default
+    litellm_params:
+      reasoning_effort: medium
       model: openai/gpt-4o
 """
 
@@ -202,7 +219,7 @@ class RenderTest(unittest.TestCase):
         # The full fixture fills the block: a new line moves the cap with it.
         self.assertEqual(len(lines), fs.SUMMARY_MAX_LINES)
         self.assertIn("  peopleSeen30d: 11 (as the gateway reports)\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n", text)
-        self.assertIn("mode: today", text)
+        self.assertIn("mode: next", text)
         self.assertIn(f"version: {TAG}", text)
         self.assertIn("model: vertex_ai/claude-opus-5", text)
         self.assertIn("kubernetes: v1.33.4-gke.1234000", text)
@@ -246,7 +263,7 @@ class RenderTest(unittest.TestCase):
 
     def test_audit_matches_whole_tokens_only(self):
         text = fs.render(full_snapshot())
-        self.assertEqual(fs.audit(text, ["kube-agents", "today", "usage", "0.14"]), [])
+        self.assertEqual(fs.audit(text, ["kube-agents", "next", "usage", "0.14"]), [])
         self.assertEqual(fs.audit("version: 0.14.0-rc", ["0.14.0"]), [])
         self.assertEqual(fs.audit("cluster prod-eu-1 here", ["prod-eu-1"]), ["prod-eu-1"])
 
@@ -255,12 +272,12 @@ class RenderTest(unittest.TestCase):
         for expected in (CLUSTER, PROJECT, NAMESPACE, "us-central1", "acme-scope-dev", "old-cluster", "acme/gitops", "platform-agent"):
             self.assertIn(expected, ids)
         self.assertNotIn(TAG, ids)
-        self.assertNotIn("today", ids)
+        self.assertNotIn("next", ids)
 
     def test_a_namespace_named_kube_agents_is_not_a_leak(self):
         cr = json.loads(json.dumps(CR))
         cr["metadata"]["namespace"] = "kube-agents"
-        cr["spec"]["harness"]["clusterName"] = "today"
+        cr["spec"]["harness"]["clusterName"] = "next"
         snapshot = full_snapshot(cr=cr)
         self.assertEqual(fs.audit(fs.render(snapshot), snapshot.identifiers), [])
 
@@ -301,6 +318,21 @@ class RenderTest(unittest.TestCase):
         self.assertIn("spend: 2.91 USD", text)
         self.assertIn("latency p50 2.3s / p95 17.5s", text)
 
+    def test_the_totals_since_install_come_from_the_status_above_the_live_lines(self):
+        text = fs.render(full_snapshot())
+        self.assertIn(
+            "performance:\n  tokens (since install): in 98765432 / out 1234567\n  spend (since install): 2512.35 USD\n  tokens: in 1200100 / out 34000\n",
+            text,
+        )
+
+    def test_a_status_without_the_totals_prints_zeroes_and_the_live_lines_still_degrade(self):
+        cr = json.loads(json.dumps(CR))
+        for field in fs.PERFORMANCE_TOTAL_FIELDS:
+            del cr["status"]["usage"][field]
+        text = fs.render(full_snapshot(cr=cr, litellm_metrics=None, sources={"session-kv": True, "litellm-metrics": False}))
+        self.assertIn("  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n  tokens: unavailable\n  spend: unavailable\n", text)
+        self.assertEqual(fs.audit(text, full_snapshot(cr=cr).identifiers), [])
+
     def test_missing_sources_degrade_to_unavailable_lines(self):
         cr = json.loads(json.dumps(CR))
         del cr["status"]["inference"]
@@ -337,6 +369,72 @@ class RenderTest(unittest.TestCase):
         del cr["status"]["inference"]
         text = fs.render(full_snapshot(cr=cr, litellm_config=OTHER_LITELLM_CONFIG_YAML))
         self.assertIn("\n  model: openai/gpt-4o\n", text)
+
+    def test_the_reasoning_effort_line_reads_status_inference(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"]["reasoningEffort"] = "high"
+        text = fs.render(full_snapshot(cr=cr))
+        self.assertIn("\n  model: vertex_ai/claude-opus-5\n  reasoning effort: high\n", text)
+
+    def test_an_unset_reasoning_effort_prints_unset_beside_a_known_model(self):
+        text = fs.render(full_snapshot())
+        self.assertIn("\n  model: vertex_ai/claude-opus-5\n  reasoning effort: unset\n", text)
+
+    def test_the_reasoning_effort_is_unavailable_when_the_model_is(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"] = {}
+        text = fs.render(full_snapshot(cr=cr))
+        self.assertIn("\n  model: unavailable\n  reasoning effort: unavailable\n", text)
+        cr["status"]["inference"] = {"provider": "vertex_ai", "reasoningEffort": "high"}
+        self.assertIn("\n  reasoning effort: unavailable\n", fs.render(full_snapshot(cr=cr)))
+
+    def test_an_absent_inference_key_reads_the_effort_from_the_model_default_entry(self):
+        cr = json.loads(json.dumps(CR))
+        del cr["status"]["inference"]
+        text = fs.render(full_snapshot(cr=cr, litellm_config=EFFORT_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  model: openai/gpt-4o\n  reasoning effort: medium\n", text)
+        text = fs.render(full_snapshot(cr=cr, litellm_config=EFFORT_FIRST_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  reasoning effort: medium\n", text)
+        text = fs.render(full_snapshot(cr=cr, litellm_config=OTHER_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  reasoning effort: unset\n", text)
+
+    def test_the_effort_is_unavailable_when_the_first_qualified_scan_answered(self):
+        config = "model_list:\n- model_name: x\n  litellm_params:\n    model: gemini/g\n    reasoning_effort: high\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(config), fs.UNAVAILABLE)
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(None), fs.UNAVAILABLE)
+
+    def test_the_fallback_effort_reads_litellm_params_only(self):
+        after = ("model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n"
+                 "  model_info:\n    reasoning_effort: high\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(after), fs.REASONING_EFFORT_UNSET)
+        before = ("model_list:\n- model_name: model-default\n  model_info:\n    reasoning_effort: high\n"
+                  "  litellm_params:\n    model: gemini/g\n    reasoning_effort: low\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(before), "low")
+
+    def test_the_fallback_effort_drops_a_value_with_spaces_or_a_quoted_hash(self):
+        entry = "model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n    reasoning_effort: {}\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(entry.format("very high")), fs.REASONING_EFFORT_UNSET)
+        # Go keeps "high#1"; the regex cannot read a quoted hash, and prints unset rather than a partial value.
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(entry.format('"high#1"')), fs.REASONING_EFFORT_UNSET)
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(entry.format("high # a note")), "high")
+
+    def test_the_fallback_effort_reads_the_direct_key_of_litellm_params_only(self):
+        nested = ("model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n"
+                  "    extra_body:\n      reasoning_effort: high\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(nested), fs.REASONING_EFFORT_UNSET)
+        nested_then_direct = nested + "    reasoning_effort: low\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(nested_then_direct), "low")
+
+    def test_the_fallback_effort_answers_from_the_first_model_default_entry(self):
+        two = ("model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n"
+               "- model_name: model-default\n  litellm_params:\n    model: openai/o\n    reasoning_effort: low\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(two), fs.REASONING_EFFORT_UNSET)
+
+    def test_a_bare_number_effort_on_the_fallback_path_prints_as_typed(self):
+        # The Go reader drops a non-string; the regex cannot tell a bare 1 from a word.
+        # Pinned as a recorded divergence (see the note beside LITELLM_DEFAULT_ENTRY_MODEL).
+        config = "model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n    reasoning_effort: 1\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(config), "1")
 
     def test_the_environment_lines_print_in_the_shared_key_order(self):
         text = fs.render(full_snapshot(scale=None))
@@ -477,13 +575,19 @@ class RenderTest(unittest.TestCase):
             [f"proposalsFrom{origin}" for origin in ("Chat", "Console", "Api", "Event", "Drift", "Audit", "Scheduled", "Issue", "Other")],
         )
 
-    def test_next_mode_and_interfaces_are_printed_as_enums(self):
+    def test_the_mode_and_interfaces_are_printed_as_enums(self):
         cr = json.loads(json.dumps(CR))
-        cr["spec"]["mode"] = "next"
         cr["status"]["usage"]["activeInterfaces"] = ["slack", "googlechat"]
         text = fs.render(full_snapshot(cr=cr))
         self.assertIn("mode: next", text)
         self.assertIn("interfaces: googlechat, slack", text)
+
+    def test_an_absent_mode_prints_next(self):
+        # The deprecated field defaults to `next` in the CRD; a CR read before
+        # the default applied prints the same.
+        cr = json.loads(json.dumps(CR))
+        del cr["spec"]["mode"]
+        self.assertIn("mode: next", fs.render(full_snapshot(cr=cr)))
 
 
 class ParsingTest(unittest.TestCase):
@@ -846,7 +950,7 @@ class MainTest(unittest.TestCase):
         self.assertIn(f"hosted_vllm/{CLUSTER}/llama-8b", out.getvalue())
 
     def test_the_audit_skips_the_model_line_and_nothing_else(self):
-        text = f"```\n  mode: today\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
+        text = f"```\n  mode: next\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
         stripped = fs._without_fixed_lines(text)
         self.assertNotIn("model:", stripped)
         self.assertIn(f"  kubernetes: {CLUSTER}", stripped)
@@ -855,6 +959,21 @@ class MainTest(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.object(fs, "collect", return_value=snapshot), mock.patch.object(fs, "render", return_value=text):
             self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), fs.EXIT_LEAK)
+
+    def test_the_audit_skips_the_reasoning_effort_line_and_nothing_else(self):
+        text = f"```\n  model: x/y\n  reasoning effort: {CLUSTER}\n  kubernetes: {CLUSTER}\n```"
+        stripped = fs._without_fixed_lines(text)
+        self.assertNotIn("reasoning effort:", stripped)
+        self.assertIn(f"  kubernetes: {CLUSTER}", stripped)
+        self.assertEqual(len(stripped.splitlines()), len(text.splitlines()) - 2)
+
+    def test_an_effort_equal_to_the_cluster_name_is_not_refused(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"]["reasoningEffort"] = CLUSTER
+        snapshot = full_snapshot(cr=cr)
+        text = fs.render(snapshot)
+        self.assertIn(f"\n  reasoning effort: {CLUSTER}\n", text)
+        self.assertEqual(fs.audit(fs._without_fixed_lines(text), snapshot.identifiers), [])
 
     def test_the_audit_skips_the_origin_line_and_nothing_else(self):
         text = f"```\n  model: x/y\n  proposals by origin: chat 3 (as the agent reports)\n  kubernetes: {CLUSTER}\n```"
@@ -893,7 +1012,7 @@ class GatewayCopyTest(unittest.TestCase):
         source = self.GO_FILE.read_text()
         start = source.index(f"var {var} = ")
         body = source[start : source.index("}", start)]
-        return re.findall(r'"([A-Za-z0-9]+)"', body)
+        return re.findall(r'"([A-Za-z0-9 ]+)"', body)
 
     def test_the_gateway_prints_the_same_counters_and_readings(self):
         self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))
@@ -904,6 +1023,17 @@ class GatewayCopyTest(unittest.TestCase):
 
     def test_the_gateway_prints_the_same_environment_lines(self):
         self.assertEqual(list(fs.ENVIRONMENT_KEYS), self._go_strings("usageSummaryEnvironmentKeys"))
+
+    def test_the_gateway_prints_the_same_totals_since_install(self):
+        """The fields the gateway's render reads, in the order it reads them, through the
+        constants it names; the test reads the render itself, not a list beside it."""
+        source = self.GO_FILE.read_text()
+        start = source.index("func renderUsageSummary(")
+        body = source[start : source.index("\nfunc ", start + 1)]
+        names = re.findall(r"usage\[(usageSummary\w+Field)\]", body)
+        values = [re.search(rf'{name}\s*=\s*"([A-Za-z0-9]+)"', source).group(1) for name in names]
+        self.assertEqual(list(fs.PERFORMANCE_TOTAL_FIELDS), values)
+        self.assertEqual(fs.MICROS_PER_USD, int(float(re.search(r'usageSummaryMicrosPerUSD\s*=\s*([0-9_.]+)', source).group(1).replace("_", ""))))
 
     def test_the_gateway_names_the_same_source_for_each_reading(self):
         source = self.GO_FILE.read_text()

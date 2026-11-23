@@ -40,7 +40,7 @@ const (
 	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
 	// directories the worker empties after every task.
 	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
-	// profileWorkerUID is the worker image's user (a2a-worker, node:22's
+	// profileWorkerUID is the worker image's user (a2a-worker, the node base image's
 	// node user), and its FSGroup.
 	profileWorkerUID = 1000
 	// profileWorkerStatusPort is lib.ProfileWorkerStatusPort: /readyz and
@@ -51,9 +51,11 @@ const (
 	profileWorkerScratchPath   = "/scratch"
 	// 2Gi: the session worker, the same image and harness, left its 1Gi
 	// scratch at 4 KiB over a week of dev-lane sessions (a2a/gateway/
-	// spawn.go), and the image has no git to clone with. Twice that floor
-	// keeps the worker's whole ephemeral request inside Autopilot's 10Gi
-	// per pod with up to profileWorkerAutopilotToolLimit tools.
+	// spawn.go). A persona's version-control skill keeps its working copies
+	// here too (KUBE_AGENTS_VCS_ROOT in a2a/Dockerfile.worker); the broker
+	// refuses a clone over 256 MiB by default. Twice that floor keeps
+	// the worker's whole ephemeral request inside Autopilot's 10Gi per pod
+	// with up to profileWorkerAutopilotToolLimit tools.
 	profileWorkerScratchSizeLimit = "2Gi"
 	// profileWorkerAutopilotToolLimit is how many tools a profile can carry
 	// before the worker's ephemeral-storage request passes Autopilot's 10Gi
@@ -96,11 +98,6 @@ const (
 	// <agent>-kube-proxy when KUBE_PROXY_URL is set and delegates to
 	// credential-proxy-exec kubectl on AgentProfile workers where it is unset.
 	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-	// profileWorkerModelKey only satisfies the harness's "an API key exists"
-	// check: the install's inference gateway runs keyless (the session
-	// worker's default, a2a/cmd/worker-adapter).
-	profileWorkerModelKey = "a2a-playground" // #nosec G101 -- placeholder, not a credential
 )
 
 // profileWorkerLabels are a worker pod's labels: the agent's, the worker
@@ -137,9 +134,12 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
 		// The install's inference gateway, by its full name: the worker runs
 		// in the profile namespace, where the session worker's short default
-		// doesn't resolve.
+		// doesn't resolve. The gateway runs keyless. Do not set
+		// ANTHROPIC_API_KEY here: the AI workload audit flags a literal model
+		// key in a pod spec (check 3.5, model-credential-plaintext-env), also
+		// a placeholder. worker-adapter adds the placeholder to the harness
+		// env (harnessEnv).
 		{Name: "ANTHROPIC_BASE_URL", Value: fmt.Sprintf("http://%s.%s.svc.cluster.local", inferenceGatewayServiceName, agent.Namespace)},
-		{Name: "ANTHROPIC_API_KEY", Value: profileWorkerModelKey},
 		{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)},
 		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},
 		{Name: "CREDENTIAL_PROXY_TASK_TOKEN_FILE", Value: profileWorkerTaskTokenPath + "/token"},
@@ -148,6 +148,9 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 	// change between 0 and a positive count rolls the warm pools.
 	if credentialProxyExecTierEnabled(agent) {
 		env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
+	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
 	}
 	if m := profile.Spec.Harness.Model; m != "" {
 		env = append(env, corev1.EnvVar{Name: "A2A_MODEL", Value: m})
@@ -213,7 +216,10 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		ServiceAccountName:           serviceAccount,
 		AutomountServiceAccountToken: ptr.To(false),
 		RestartPolicy:                restart,
-		RuntimeClassName:             shellSandboxRuntimeClassName(agent),
+		// ndots:3, see brokerCallerPodDNSConfig: the Job template and the
+		// warm pool both use this pod spec.
+		DNSConfig:        brokerCallerPodDNSConfig(),
+		RuntimeClassName: shellSandboxRuntimeClassName(agent),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot:   ptr.To(true),
 			RunAsUser:      ptr.To(int64(profileWorkerUID)),
@@ -343,10 +349,11 @@ func buildProfilePool(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1
 	}
 }
 
-// interactiveTier reports whether a tier runs on a warm pool. The unattended
-// tier runs as a Job per task (PR 6).
-func interactiveTier(tier string) bool {
-	return tier == agentv1alpha1.AgentProfileTierRead
+// interactiveTier reports whether a profile's tier runs on a warm pool: one
+// whose mode is interactive (read, or a Tier resource of that mode, #3659).
+// An unattended-mode tier runs as a Job per task (PR 6).
+func interactiveTier(p *agentv1alpha1.AgentProfile, tier string) bool {
+	return tierModeOf(p, tier) == tierModeInteractive
 }
 
 // profileCABundleComponent labels the NATS CA bundle's copy in the profile
@@ -387,7 +394,7 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 			continue
 		}
 		for _, id := range res.identities {
-			if !interactiveTier(id.tier) {
+			if !interactiveTier(&profiles[i], id.tier) {
 				continue
 			}
 			pool := buildProfilePool(agent, &profiles[i], id.tier, id.serviceAccount, imageVolumes)
@@ -473,8 +480,8 @@ func (r *PlatformAgentReconciler) deleteProfilePoolsExcept(ctx context.Context, 
 }
 
 // deleteProfilePools removes every warm pool of this agent's, and the CA
-// bundle's copy, from the profile namespace: the gate turned off, the flip to
-// today, and PlatformAgent deletion (through deleteDispatcherPodsRBAC).
+// bundle's copy, from the profile namespace: the gate turned off, and
+// PlatformAgent deletion (through deleteDispatcherPodsRBAC).
 func (r *PlatformAgentReconciler) deleteProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
 }

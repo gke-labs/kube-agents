@@ -147,7 +147,7 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 **Evidence:**
 
 - crashloop-workload drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan
-- certification lane: build 2100000000000000001 failed at 2026-11-07T03:10:00Z (log `ERROR rca-remediation-pr: required phrases absent`)
+- validated-capabilities lane: build 2100000000000000001 failed at 2026-11-07T03:10:00Z (log `ERROR rca-remediation-pr: required phrases absent`)
 
 **Reconcile:** the daily run re-applies the stack.
 """
@@ -290,6 +290,11 @@ class NightlyIssueTest(unittest.TestCase):
         self.assertTrue(clean(action.body), action.body)
         self.assertEqual(scrub_bot_posts.plan_issue(issue(3960, "t", action.body)).verb, "skip")
 
+    def test_a_group_issue_is_skipped_not_rewritten_to_one_case(self):
+        body = nightly_bugs.GROUP_MARKER.format(date="2026-10-06") + "\n" + nightly_bugs.MARKER.format(case="case-red") + "\n" + nightly_bugs.MARKER.format(case="case-maint")
+        action = scrub_bot_posts.plan_issue(issue(3970, "Nightly: cases red together since 2026-10-06 need triage", body))
+        self.assertEqual((action.verb, action.kind), ("skip", scrub_bot_posts.KIND_OTHER))
+
     def test_a_pull_request_and_a_human_issue_are_skipped(self):
         self.assertEqual(scrub_bot_posts.plan_issue(issue(1, "t", OLD_RED_BODY, pull_request=True)).reason, scrub_bot_posts.REASON_PULL_REQUEST)
         action = scrub_bot_posts.plan_issue(issue(2, "case-red fails on main", "see the nightly"))
@@ -366,7 +371,7 @@ class InfrastructureIssueTest(unittest.TestCase):
         action = scrub_bot_posts.plan_issue(issue(1401, FIXTURE_TITLE, FIXTURE_BODY, labels=("presubmit-gate",)))
         self.assertEqual(action.verb, "edit")
         self.assertIn("**Evidence:**\n\n- crashloop-workload drifted on 3 pool project(s)", action.body)
-        self.assertNotIn("certification lane", action.body)
+        self.assertNotIn("validated-capabilities lane", action.body)
         self.assertNotIn("rca-remediation-pr", action.body)
         self.assertTrue(clean(action.body), action.body)
 

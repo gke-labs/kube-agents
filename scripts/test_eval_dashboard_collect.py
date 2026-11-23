@@ -1,13 +1,13 @@
-"""The eval-dashboard collector parses real Prow logs into the data.json contract.
+"""The eval-dashboard collector parses Prow logs into the data.json contract.
 
-The fixtures under scripts/eval_dashboard/testdata/ are REAL
-pull-kube-agents-smoke-test builds (PRs 956 and 998), trimmed to the eval
-section: the lease line, every `Task ... Result:` line, and the final verdict
-where the build reached one. Their started.json/finished.json are the real
-Prow uploads, verbatim. That makes these tests the proof that the parser
-handles what the presubmit actually prints -- including the build where
-resource preparation failed (an INFRA result, which must never count against
-a case) and the build the Prow deadline truncated before a verdict line.
+The fixtures under scripts/eval_dashboard/testdata/ are SYNTHETIC
+pull-kube-agents-smoke-test builds (PRs 101 and 102) in the shape the
+presubmit prints, trimmed to the eval section: the lease line, every
+`Task ... Result:` line, and the final verdict where the build reached one,
+with started.json/finished.json in Prow's shape (SCHEMA.md, Fixtures). They
+cover the build where resource preparation failed (an INFRA result, which
+must never count against a case) and the build the Prow deadline truncated
+before a verdict line.
 
 data.json is a contract two sibling dashboard PRs build against; the
 assertions here pin the exact field names and derivation rules SCHEMA.md
@@ -25,31 +25,33 @@ import shutil
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import collect, nightly, tiers
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata"
+# A synthetic checkout: the task file, roster files and domain list the collector reads for a case's domain and activity, so no real case name is in the fixtures.
+FAKE_REPO = TESTDATA.parent / "testdata_repo"
 
-# The nightly of 2026-09-21 (#1491), the second night the Prow deadline ended
-# with every unit finished and nothing graded. Its driver lines and Prow
-# metadata are real; the four grading blocks are what hack/ci-eval-pr.sh
-# prints since it grades each case inside the fan-out, spliced in at the
-# repetition-3 `finished` lines (SCHEMA.md, Fixtures).
+# A synthetic nightly in the shape of a night the Prow deadline ended with
+# every unit finished (#1491): the four grading blocks are what
+# hack/ci-eval-pr.sh prints since it grades each case inside the fan-out,
+# placed at the repetition-3 `finished` lines (SCHEMA.md, Fixtures).
 NIGHTLY_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly"
-BUILD_NIGHTLY_CUT = "2102186223282950144"
+BUILD_NIGHTLY_CUT = "2090000000000000100"
 
-# Real multi-repetition builds (see SCHEMA.md's fixtures table): the grading
-# blocks the single-rep-era fixtures above predate.
+# Synthetic multi-repetition builds (see SCHEMA.md's fixtures table): the
+# grading blocks the single-rep-era fixtures above predate.
 REPS_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_reps"
-BUILD_1057_PARALLEL = "2094432646640701440"  # PR 1057, parallel fan-out, green
-BUILD_1075_SERIAL = "2094467976156680192"  # PR 1075, serial reps, aborted mid-run
-BUILD_1089_MIXED = "2094714569262895104"  # PR 1089, blocked/infra-heavy reps
+BUILD_103_PARALLEL = "2090000000000000040"  # PR 103, parallel fan-out, green
+BUILD_104_SERIAL = "2090000000000000050"  # PR 104, serial reps, aborted mid-run
+BUILD_105_MIXED = "2090000000000000060"  # PR 105, blocked/infra-heavy reps
 
-# A real post-kube-agents-eval-rc build -- a postsubmit, so no `pull` key in
-# started.json and no PR number anywhere in the log.
+# A synthetic post-kube-agents-eval-rc build -- a postsubmit, so no `pull` key
+# in started.json and no PR number anywhere in the log.
 RC_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_rc"
-BUILD_RC_GREEN = "2097891568546484224"  # staging_2609092307_5b5ad10, GREEN, no baseline
+BUILD_RC_GREEN = "2090000000000000070"  # staging_2609092307_0707070, GREEN, no baseline
 
 # Two real builds of 2026-09-11 (#1478): a pod whose node went NotReady
 # mid-run, and a clone failure -- the two zero-task shapes the health
@@ -58,16 +60,16 @@ LOSTPOD_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / 
 BUILD_1118_LOST = "2098383791838990336"  # PR 1118, NodeNotReady 2h08m in, no build-log.txt
 BUILD_1446_CLONE_FAILED = "2098418565454499840"  # PR 1446, clone failed (merge conflict) in 0s
 
-# The one DERIVED build (SCHEMA.md, Fixtures): the suite's not-evaluated
+# The not-evaluated build (SCHEMA.md, Fixtures): the suite's not-evaluated
 # verdict -- NOT EVALUATED on the final line, artifacts/eval-verdict.json
-# agreeing -- which no real build carried when the fixture was written.
+# agreeing.
 NOTEVAL_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_notevaluated"
-BUILD_1782_NOT_EVALUATED = "2101862036789329920"  # one admitted case lost every repetition
+BUILD_108_NOT_EVALUATED = "2090000000000000090"  # one admitted case lost every repetition
 
-# The three real builds, oldest first (started.json timestamps).
-BUILD_956_TRUNCATED = "2092688354838581248"  # PR 956, deadline hit before verdict
-BUILD_998_INFRA = "2093030474753511424"  # PR 998, compliance canary infra-failed
-BUILD_998_FULL = "2093054394793725952"  # PR 998, all 14 executed tasks graded
+# The three single-repetition builds, oldest first (started.json timestamps).
+BUILD_101_TRUNCATED = "2090000000000000010"  # PR 101, deadline hit before verdict
+BUILD_102_INFRA = "2090000000000000020"  # PR 102, one task infra-failed
+BUILD_102_FULL = "2090000000000000030"  # PR 102, all 14 executed tasks graded
 
 
 def _runs_by_id():
@@ -79,64 +81,64 @@ def _cases_by_name(data):
 
 
 class TestFixtureParsing(unittest.TestCase):
-    def test_full_run_998(self):
-        run = _runs_by_id()[BUILD_998_FULL]
-        self.assertEqual(run["pr"], 998)
-        self.assertEqual(run["head_sha"], "a28f0b3")
+    def test_full_run_102(self):
+        run = _runs_by_id()[BUILD_102_FULL]
+        self.assertEqual(run["pr"], 102)
+        self.assertEqual(run["head_sha"], "0303030")
         self.assertEqual(run["project"], "kube-agents-evals-2")
         self.assertEqual(run["result"], "FAILURE")
         # The verdict line's Total Duration, not the Prow timestamp delta.
-        self.assertEqual(run["duration_s"], 5793)
-        self.assertEqual(run["started"], "2026-08-27T19:13:55+00:00")
-        self.assertEqual(run["finished"], "2026-08-27T21:07:53+00:00")
+        self.assertEqual(run["duration_s"], 4105)
+        self.assertEqual(run["started"], "2025-08-28T19:13:55+00:00")
+        self.assertEqual(run["finished"], "2025-08-28T21:07:53+00:00")
         self.assertEqual(len(run["tasks"]), 14)
         by_name = {t["name"]: t for t in run["tasks"]}
         self.assertEqual(
-            by_name["reliability-pdb-probe"],
+            by_name["case-02"],
             {
-                "name": "reliability-pdb-probe",
+                "name": "case-02",
                 "result": "pass",
-                "duration_s": 182,
+                "duration_s": 177,
                 "outcome_validity": 1.0,
             },
         )
-        self.assertEqual(by_name["capacity-pinned-pool-probe"]["result"], "fail")
-        self.assertEqual(by_name["capacity-pinned-pool-probe"]["duration_s"], 129)
-        self.assertEqual(by_name["capacity-pinned-pool-probe"]["outcome_validity"], 0.0)
-        self.assertEqual(by_name["upgrades-lagging-master-probe"]["outcome_validity"], 0.8)
+        self.assertEqual(by_name["case-16"]["result"], "fail")
+        self.assertEqual(by_name["case-16"]["duration_s"], 140)
+        self.assertEqual(by_name["case-16"]["outcome_validity"], 0.0)
+        self.assertEqual(by_name["case-27"]["outcome_validity"], 0.85)
         results = [t["result"] for t in run["tasks"]]
         self.assertEqual(results.count("pass"), 12)
         self.assertEqual(results.count("fail"), 2)
 
-    def test_infra_run_998(self):
-        run = _runs_by_id()[BUILD_998_INFRA]
-        self.assertEqual(run["pr"], 998)
-        self.assertEqual(run["head_sha"], "b336c6c")
+    def test_infra_run_102(self):
+        run = _runs_by_id()[BUILD_102_INFRA]
+        self.assertEqual(run["pr"], 102)
+        self.assertEqual(run["head_sha"], "0202020")
         self.assertEqual(run["project"], "kube-agents-evals-5")
-        self.assertEqual(run["duration_s"], 2143)
+        self.assertEqual(run["duration_s"], 1550)
         self.assertEqual(run["eval_verdict"], "RED", "the final verdict line, in the release record's words")
         self.assertEqual(len(run["tasks"]), 11)
         by_name = {t["name"]: t for t in run["tasks"]}
-        infra = by_name["compliance-rbac-overgrant"]
+        infra = by_name["case-09"]
         self.assertEqual(infra["result"], "infra")
-        self.assertEqual(infra["duration_s"], 41)
+        self.assertEqual(infra["duration_s"], 78)
         # No grade was recorded for a task the infrastructure never ran.
         self.assertIsNone(infra["outcome_validity"])
         results = [t["result"] for t in run["tasks"]]
         self.assertEqual((results.count("pass"), results.count("fail"), results.count("infra")), (8, 2, 1))
 
-    def test_truncated_run_956_yields_partial_run(self):
+    def test_truncated_run_101_yields_partial_run(self):
         """A log the Prow deadline cut off is a partial run, not an exception."""
-        run = _runs_by_id()[BUILD_956_TRUNCATED]
-        self.assertEqual(run["pr"], 956)
-        self.assertEqual(run["head_sha"], "13b2c71")
+        run = _runs_by_id()[BUILD_101_TRUNCATED]
+        self.assertEqual(run["pr"], 101)
+        self.assertEqual(run["head_sha"], "0101010")
         self.assertEqual(run["project"], "kube-agents-evals-3")
         self.assertEqual(run["result"], "FAILURE")
         # The deadline ended the job before its verdict line: recorded as such,
         # since Prow says FAILURE here, not ABORTED.
         self.assertIsNone(run["eval_verdict"])
         # No verdict line -> fall back to finished-started timestamps.
-        self.assertEqual(run["duration_s"], 1787775335 - 1787770764)
+        self.assertEqual(run["duration_s"], 1756325735 - 1756321164)
         self.assertEqual(len(run["tasks"]), 5)
         results = [t["result"] for t in run["tasks"]]
         self.assertEqual((results.count("pass"), results.count("fail")), (2, 3))
@@ -145,7 +147,7 @@ class TestFixtureParsing(unittest.TestCase):
         data = collect.collect(from_dir=TESTDATA)
         self.assertEqual(
             [run["build_id"] for run in data["runs"]],
-            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL],
+            [BUILD_101_TRUNCATED, BUILD_102_INFRA, BUILD_102_FULL],
         )
 
 
@@ -173,15 +175,15 @@ class TestTruncatedNightlyFixture(unittest.TestCase):
         run = self.run_record()
         self.assertEqual(run["result"], "FAILURE", "Prow records a deadline as FAILURE, not ABORTED")
         self.assertIsNone(run["eval_verdict"], "the cut-off line is not a verdict line")
-        self.assertEqual(run["duration_s"], 1790064220 - 1790035235, "no verdict line: finished - started")
-        self.assertEqual((run["pr"], run["head_sha"], run["project"]), (None, "fefbf06", "kube-agents-evals-27"))
+        self.assertEqual(run["duration_s"], 1758614620 - 1758585635, "no verdict line: finished - started")
+        self.assertEqual((run["pr"], run["head_sha"], run["project"]), (None, "1010101", "kube-agents-evals-27"))
         self.assertEqual(
             [(t["name"], t["result"], [r["result"] for r in t["reps"]]) for t in run["tasks"]],
             [
-                ("rca-remediation-pr", "pass", ["infra", "pass", "pass"]),
-                ("security-overgrant-remediation-proposal", "pass", ["pass", "pass", "pass"]),
-                ("obtainability-pdb-semantics", "pass", ["pass", "pass", "pass"]),
-                ("cost-idle-pool-probe", "fail", ["pass", "pass", "fail"]),
+                ("case-23", "pass", ["infra", "pass", "pass"]),
+                ("case-12", "pass", ["pass", "pass", "pass"]),
+                ("case-22", "pass", ["pass", "pass", "pass"]),
+                ("case-01", "fail", ["pass", "pass", "fail"]),
             ],
         )
 
@@ -193,7 +195,7 @@ class TestTruncatedNightlyFixture(unittest.TestCase):
         like the one before it."""
         log = (NIGHTLY_TESTDATA / BUILD_NIGHTLY_CUT / "build-log.txt").read_text()
         cut = log.index("Eval ended before its verdict")
-        self.assertIn('heartbeat sent for resource "kube-agents-evals-27"', log[log.index("Task rca-remediation-pr Result:"):cut])
+        self.assertIn('heartbeat sent for resource "kube-agents-evals-27"', log[log.index("Task case-23 Result:"):cut])
         self.assertIn("Process did not finish before 8h0m0s timeout", log[:cut])
         self.assertEqual(log[cut:].count("Result: ["), 3)
         run = self.run_record()
@@ -205,15 +207,15 @@ class TestTruncatedNightlyFixture(unittest.TestCase):
         run = self.run_record()
         names = [t["name"] for t in run["tasks"]]
         data = {
-            "cases": [{"name": n, "domain": "x", "active": True, "nightly_active": True} for n in [*names, "agent-kanban-smoke"]],
+            "cases": [{"name": n, "domain": "x", "active": True, "nightly_active": True} for n in [*names, "case-24"]],
             "runs": [run],
         }
         night = nightly.night_document(run, data, None)
         self.assertTrue(night["truncated"])
         self.assertFalse(night["complete"])
         self.assertEqual(night["counts"], {"expected": 5, "recorded": 4, "passed": 3, "partial": 1, "failed": 0, "infra": 0, "missing": 1})
-        self.assertEqual(night["missing"], ["agent-kanban-smoke"])
-        at = datetime(2026, 9, 22, 13, 0, tzinfo=timezone.utc)  # 9 AM ET that morning (the test's hour; the assertion is hour-independent)
+        self.assertEqual(night["missing"], ["case-24"])
+        at = datetime(2025, 9, 23, 13, 0, tzinfo=timezone.utc)  # 9 AM ET that morning (the test's hour; the assertion is hour-independent)
         line = nightly.digest_line(data, at)
         self.assertIn("truncated after 8h 03m", line)
         self.assertIn("4 of 5 cases recorded", line)
@@ -228,43 +230,45 @@ class TestCaseDerivation(unittest.TestCase):
         self.assertEqual(len(self.cases), 18)
 
     def test_infra_never_counts_against_a_case(self):
-        """compliance-rbac-overgrant: pass, infra, fail across the fixtures.
+        """case-09: pass, infra, fail across the fixtures.
 
         The infra run appears in runs_on_record and last3 (it is history) but
         is excluded from the pass_rate denominator and the duration stats.
         """
-        case = self.cases["compliance-rbac-overgrant"]
+        case = self.cases["case-09"]
         self.assertEqual(case["runs_on_record"], 3)
         self.assertEqual(case["pass_rate"], 0.5)  # 1 pass / 2 graded, NOT /3
         self.assertEqual(case["last3"], ["pass", "infra", "fail"])
-        self.assertEqual(case["durations"], {"min": 606, "med": 1238, "max": 1870})
+        self.assertEqual(case["durations"], {"min": 474, "med": 916, "max": 1359})
         self.assertEqual(
             case["ov_history"],
             [
-                {"build_id": BUILD_956_TRUNCATED, "value": 0.1},
-                {"build_id": BUILD_998_FULL, "value": 0.0},
+                {"build_id": BUILD_101_TRUNCATED, "value": 0.25},
+                {"build_id": BUILD_102_FULL, "value": 0.0},
             ],
         )
 
     def test_clean_case(self):
-        case = self.cases["reliability-pdb-probe"]
+        case = _cases_by_name(collect.collect(from_dir=TESTDATA, repo_root=FAKE_REPO))["case-02"]
         self.assertEqual(case["domain"], "reliability")
         self.assertTrue(case["active"])
         self.assertEqual(case["runs_on_record"], 2)
         self.assertEqual(case["pass_rate"], 1.0)
         self.assertEqual(case["last3"], ["pass", "pass"])
-        self.assertEqual(case["durations"], {"min": 168, "med": 175, "max": 182})
+        self.assertEqual(case["durations"], {"min": 167, "med": 172, "max": 177})
         self.assertEqual(
             case["ov_history"],
             [
-                {"build_id": BUILD_998_INFRA, "value": 1.0},
-                {"build_id": BUILD_998_FULL, "value": 1.0},
+                {"build_id": BUILD_102_INFRA, "value": 1.0},
+                {"build_id": BUILD_102_FULL, "value": 1.0},
             ],
         )
 
     def test_retired_task_is_inactive_but_kept(self):
-        """A case only historical runs mention stays on record, active: false."""
-        case = self.cases["obtainability-planted-pdb"]
+        """A case only historical runs mention stays on record, active: false
+        (against the synthetic checkout, whose presubmit roster names case-02 and
+        case-09 and whose nightly roster names case-26)."""
+        case = _cases_by_name(collect.collect(from_dir=TESTDATA, repo_root=FAKE_REPO))["case-26"]
         self.assertFalse(case["active"])
         self.assertEqual(case["runs_on_record"], 1)
 
@@ -298,7 +302,7 @@ class TestCaseDerivation(unittest.TestCase):
 class TestLaneExcluded(unittest.TestCase):
     def test_the_inject_lanes_dropped_cases_are_named_once_each(self):
         log = (
-            "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
+            "running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
             "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
             "AGENT_TRANSPORT=inject: case-d leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
             "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
@@ -383,7 +387,7 @@ sys.exit(2)
 """
 
 FAKE_BUCKET = "gs://fake-prow/"
-FAKE_GLOB = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/*"
+FAKE_GLOB = FAKE_BUCKET + "pull/gke-labs_kube-agents/102/pull-kube-agents-smoke-test/*"
 # Prow's per-job directory index for the fake bucket, laid out like the real
 # one: <prefix>/<build_id>.txt holding the build directory's gs:// path.
 FAKE_INDEX_PREFIX = FAKE_BUCKET + "pr-logs/directory/pull-kube-agents-smoke-test/"
@@ -403,7 +407,7 @@ class _MergeBase(unittest.TestCase):
         path.write_text(json.dumps(data))
         return str(path)
 
-    def fake_gcloud(self, builds, pr=998) -> tuple[str, pathlib.Path]:
+    def fake_gcloud(self, builds, pr=102) -> tuple[str, pathlib.Path]:
         """A gcloud serving `builds` (fixture ids) plus the call log's path.
 
         Each build is placed under PR `pr`'s directory and gets an index
@@ -420,7 +424,7 @@ class _MergeBase(unittest.TestCase):
         return self._install_fake_gcloud(root)
 
     def fake_rc_gcloud(self, build_ids) -> tuple[str, pathlib.Path]:
-        """The same, under the RC job's prefix, serving copies of the one real
+        """The same, under the RC job's prefix, serving copies of the one
         RC fixture under whatever build ids the test needs."""
         root = self.tmp / "bucket"
         prefix = root / RC_FAKE_GLOB[len(FAKE_BUCKET):].rstrip("*")
@@ -445,11 +449,11 @@ class _MergeBase(unittest.TestCase):
         return str(gcloud), log
 
     @staticmethod
-    def build_url(build, pr=998) -> str:
+    def build_url(build, pr=102) -> str:
         """The build directory's gs:// URL under PR `pr`, no trailing slash."""
         return f"{FAKE_BUCKET}pull/gke-labs_kube-agents/{pr}/pull-kube-agents-smoke-test/{build}"
 
-    def place_build(self, root, build, pr=998) -> pathlib.Path:
+    def place_build(self, root, build, pr=102) -> pathlib.Path:
         """Copy fixture `build` under PR `pr` and write its index pointer."""
         url = self.build_url(build, pr)
         dst = root / url[len(FAKE_BUCKET):]
@@ -501,12 +505,12 @@ class TestMergeWithPrior(_MergeBase):
     def test_fresh_parse_wins_over_a_stale_prior_copy(self):
         stale = collect.collect(from_dir=TESTDATA)
         for run in stale["runs"]:
-            if run["build_id"] == BUILD_998_FULL:
+            if run["build_id"] == BUILD_102_FULL:
                 run["tasks"] = []  # plausible shape, wrong content
         prior = self.write_prior(stale)
         merged, _ = self.quiet_collect(from_dir=TESTDATA, merge_with=prior)
         by_id = {run["build_id"]: run for run in merged["runs"]}
-        self.assertEqual(len(by_id[BUILD_998_FULL]["tasks"]), 14)
+        self.assertEqual(len(by_id[BUILD_102_FULL]["tasks"]), 14)
 
     def test_prior_only_runs_are_carried_over_and_aggregated(self):
         baseline = collect.collect(from_dir=TESTDATA)
@@ -515,8 +519,8 @@ class TestMergeWithPrior(_MergeBase):
             "pr": 900,
             "head_sha": "abc1234",
             "project": "kube-agents-evals-1",
-            "started": "2026-08-01T00:00:00+00:00",
-            "finished": "2026-08-01T01:00:00+00:00",
+            "started": "2025-08-02T00:00:00+00:00",
+            "finished": "2025-08-02T01:00:00+00:00",
             "result": "SUCCESS",
             "duration_s": 100,
             "tasks": [
@@ -588,10 +592,10 @@ class TestIncrementalGcsScan(_MergeBase):
 
     def test_scan_skips_every_build_at_or_below_the_watermark(self):
         gcloud, log = self.fake_gcloud(
-            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL]
+            [BUILD_101_TRUNCATED, BUILD_102_INFRA, BUILD_102_FULL]
         )
         with tempfile.TemporaryDirectory() as sub:
-            for build in (BUILD_956_TRUNCATED, BUILD_998_INFRA):
+            for build in (BUILD_101_TRUNCATED, BUILD_102_INFRA):
                 shutil.copytree(TESTDATA / build, pathlib.Path(sub) / build)
             prior = self.write_prior(collect.collect(from_dir=pathlib.Path(sub)))
         merged, stderr = self.quiet_collect(
@@ -599,17 +603,17 @@ class TestIncrementalGcsScan(_MergeBase):
         )
         self.assertEqual(
             [run["build_id"] for run in merged["runs"]],
-            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL],
+            [BUILD_101_TRUNCATED, BUILD_102_INFRA, BUILD_102_FULL],
         )
         calls = log.read_text()
         # One listing, then reads for the ONE new build only.
-        self.assertIn(f"cat gs://fake-prow/pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/{BUILD_998_FULL}/finished.json", calls)
-        self.assertNotIn(BUILD_956_TRUNCATED + "/finished.json", calls)
-        self.assertNotIn(BUILD_998_INFRA + "/finished.json", calls)
+        self.assertIn(f"cat gs://fake-prow/pull/gke-labs_kube-agents/102/pull-kube-agents-smoke-test/{BUILD_102_FULL}/finished.json", calls)
+        self.assertNotIn(BUILD_101_TRUNCATED + "/finished.json", calls)
+        self.assertNotIn(BUILD_102_INFRA + "/finished.json", calls)
         self.assertIn("merged 2 prior runs with 1 newly collected", stderr)
 
     def test_since_days_stops_after_the_started_probe(self):
-        gcloud, log = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, log = self.fake_gcloud([BUILD_102_FULL])
         merged, _ = self.quiet_collect(
             pr_globs=[FAKE_GLOB], since_days=1, gcloud=gcloud
         )
@@ -620,7 +624,7 @@ class TestIncrementalGcsScan(_MergeBase):
         self.assertNotIn("finished.json", calls)
 
     def test_since_days_keeps_recent_builds_without_a_second_started_read(self):
-        gcloud, log = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, log = self.fake_gcloud([BUILD_102_FULL])
         merged, _ = self.quiet_collect(
             pr_globs=[FAKE_GLOB], since_days=365 * 100, gcloud=gcloud
         )
@@ -633,15 +637,15 @@ class TestIncrementalGcsScan(_MergeBase):
         shorter, newer one is already on record. The watermark alone would
         skip it forever; the prior's pending_builds punches it through."""
         gcloud, log = self.fake_gcloud(
-            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL]
+            [BUILD_101_TRUNCATED, BUILD_102_INFRA, BUILD_102_FULL]
         )
         with tempfile.TemporaryDirectory() as sub:
-            shutil.copytree(TESTDATA / BUILD_998_FULL, pathlib.Path(sub) / BUILD_998_FULL)
+            shutil.copytree(TESTDATA / BUILD_102_FULL, pathlib.Path(sub) / BUILD_102_FULL)
             prior_data = collect.collect(from_dir=pathlib.Path(sub))
         # INFRA (a lower id than FULL) was in flight when FULL got recorded.
         prior_data["pending_builds"] = [
             {
-                "build_id": BUILD_998_INFRA,
+                "build_id": BUILD_102_INFRA,
                 "first_seen": datetime.now(timezone.utc).isoformat(),
             }
         ]
@@ -651,32 +655,32 @@ class TestIncrementalGcsScan(_MergeBase):
         )
         self.assertEqual(
             [run["build_id"] for run in merged["runs"]],
-            [BUILD_998_INFRA, BUILD_998_FULL],
+            [BUILD_102_INFRA, BUILD_102_FULL],
         )
         self.assertNotIn("pending_builds", merged)  # recorded -> off the list
         self.assertIn("retrying 1 pending", stderr)
         calls = log.read_text()
-        self.assertIn(BUILD_998_INFRA + "/finished.json", calls)
+        self.assertIn(BUILD_102_INFRA + "/finished.json", calls)
         # A build below the watermark and NOT pending still costs zero reads.
-        self.assertNotIn(BUILD_956_TRUNCATED + "/finished.json", calls)
-        self.assertNotIn(BUILD_956_TRUNCATED + "/started.json", calls)
+        self.assertNotIn(BUILD_101_TRUNCATED + "/finished.json", calls)
+        self.assertNotIn(BUILD_101_TRUNCATED + "/started.json", calls)
 
     def test_unfinished_build_lands_on_pending_and_keeps_first_seen(self):
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
         bucket_build = (
             pathlib.Path(os.environ["FAKE_GCLOUD_ROOT"])
             / FAKE_GLOB[len("gs://fake-prow/"):].rstrip("*")
-            / BUILD_998_FULL
+            / BUILD_102_FULL
         )
         (bucket_build / "finished.json").unlink()  # still in flight
-        first_sweep = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        first_sweep = datetime(2025, 9, 2, 12, 0, tzinfo=timezone.utc)
         first, _ = self.quiet_collect(
             pr_globs=[FAKE_GLOB], gcloud=gcloud, now=first_sweep
         )
         self.assertEqual(first["runs"], [])
         self.assertEqual(
             first["pending_builds"],
-            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
+            [{"build_id": BUILD_102_FULL, "first_seen": first_sweep.isoformat()}],
         )
         # An hour later it is STILL unfinished: the entry is carried with its
         # original first_seen, so the retry clock runs from the first sighting.
@@ -689,11 +693,11 @@ class TestIncrementalGcsScan(_MergeBase):
         )
         self.assertEqual(
             second["pending_builds"],
-            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
+            [{"build_id": BUILD_102_FULL, "first_seen": first_sweep.isoformat()}],
         )
         # Another hour on, finished.json has landed: recorded, list emptied.
         shutil.copy(
-            TESTDATA / BUILD_998_FULL / "finished.json",
+            TESTDATA / BUILD_102_FULL / "finished.json",
             bucket_build / "finished.json",
         )
         prior = self.write_prior(second)
@@ -704,19 +708,19 @@ class TestIncrementalGcsScan(_MergeBase):
             now=first_sweep + timedelta(hours=2),
         )
         self.assertEqual(
-            [run["build_id"] for run in third["runs"]], [BUILD_998_FULL]
+            [run["build_id"] for run in third["runs"]], [BUILD_102_FULL]
         )
         self.assertNotIn("pending_builds", third)
 
     def test_expired_pending_entry_is_dropped_without_paying_a_read(self):
-        gcloud, log = self.fake_gcloud([BUILD_998_INFRA, BUILD_998_FULL])
+        gcloud, log = self.fake_gcloud([BUILD_102_INFRA, BUILD_102_FULL])
         with tempfile.TemporaryDirectory() as sub:
-            shutil.copytree(TESTDATA / BUILD_998_FULL, pathlib.Path(sub) / BUILD_998_FULL)
+            shutil.copytree(TESTDATA / BUILD_102_FULL, pathlib.Path(sub) / BUILD_102_FULL)
             prior_data = collect.collect(from_dir=pathlib.Path(sub))
-        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 2, 12, 0, tzinfo=timezone.utc)
         prior_data["pending_builds"] = [
             {
-                "build_id": BUILD_998_INFRA,
+                "build_id": BUILD_102_INFRA,
                 "first_seen": (
                     now - timedelta(days=collect.PENDING_RETRY_DAYS, hours=1)
                 ).isoformat(),
@@ -727,18 +731,18 @@ class TestIncrementalGcsScan(_MergeBase):
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud, now=now
         )
         self.assertEqual(
-            [run["build_id"] for run in merged["runs"]], [BUILD_998_FULL]
+            [run["build_id"] for run in merged["runs"]], [BUILD_102_FULL]
         )
         self.assertNotIn("pending_builds", merged)
         self.assertIn("giving up", stderr)
-        self.assertNotIn(BUILD_998_INFRA + "/", log.read_text())  # zero reads
+        self.assertNotIn(BUILD_102_INFRA + "/", log.read_text())  # zero reads
 
     def test_malformed_pending_builds_is_ignored_but_runs_are_kept(self):
         prior_data = collect.collect(from_dir=TESTDATA)
         for label, bad in {
             "not a list": {"oops": 1},
             "entry missing first_seen": [{"build_id": "123"}],
-            "non-numeric id": [{"build_id": "abc", "first_seen": "2026-09-01"}],
+            "non-numeric id": [{"build_id": "abc", "first_seen": "2025-09-02"}],
         }.items():
             with self.subTest(label):
                 prior = self.write_prior({**prior_data, "pending_builds": bad})
@@ -784,11 +788,11 @@ class TestIndexDiscovery(_MergeBase):
     refusal line and nothing new.
     """
 
-    ALL = (BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL)
+    ALL = (BUILD_101_TRUNCATED, BUILD_102_INFRA, BUILD_102_FULL)
 
     def test_index_is_listed_instead_of_the_glob_and_only_new_pointers_are_read(self):
         gcloud, log = self.fake_gcloud(self.ALL)
-        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        prior = self.prior_with([BUILD_101_TRUNCATED, BUILD_102_INFRA])
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX
         )
@@ -796,11 +800,11 @@ class TestIndexDiscovery(_MergeBase):
         calls = log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_INDEX_PREFIX}"])
         pointers = [c for c in calls if c.startswith(f"cat {FAKE_INDEX_PREFIX}")]
-        self.assertEqual(pointers, [f"cat {FAKE_INDEX_PREFIX}{BUILD_998_FULL}.txt"])
+        self.assertEqual(pointers, [f"cat {FAKE_INDEX_PREFIX}{BUILD_102_FULL}.txt"])
         self.assertNotIn("latest-build.txt", "\n".join(calls))
         # The one new build was read through the path its pointer named.
-        self.assertIn(f"cat {self.build_url(BUILD_998_FULL)}/finished.json", calls)
-        self.assertNotIn(BUILD_998_INFRA + "/finished.json", "\n".join(calls))
+        self.assertIn(f"cat {self.build_url(BUILD_102_FULL)}/finished.json", calls)
+        self.assertNotIn(BUILD_102_INFRA + "/finished.json", "\n".join(calls))
         self.assertIn("merged 2 prior runs with 1 newly collected", stderr)
         self.assertIn("via the directory index", stderr)
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
@@ -820,57 +824,57 @@ class TestIndexDiscovery(_MergeBase):
         """The glob names one PR; the index names every build the job ran.
         A pointer into a different PR's directory is read where it points,
         and that path is the PR hint when started.json carries none."""
-        gcloud, log = self.fake_gcloud([BUILD_998_INFRA])
-        other = self.place_build(self.bucket_root(), BUILD_998_FULL, pr=1234)
+        gcloud, log = self.fake_gcloud([BUILD_102_INFRA])
+        other = self.place_build(self.bucket_root(), BUILD_102_FULL, pr=1234)
         started = json.loads((other / "started.json").read_text())
         del started["pull"]
         (other / "started.json").write_text(json.dumps(started))
-        prior = self.prior_with([BUILD_998_INFRA])
+        prior = self.prior_with([BUILD_102_INFRA])
         merged, _ = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX
         )
         by_id = {run["build_id"]: run for run in merged["runs"]}
-        self.assertEqual(by_id[BUILD_998_FULL]["pr"], 1234)
-        self.assertEqual(len(by_id[BUILD_998_FULL]["tasks"]), 14)
-        self.assertIn(f"cat {self.build_url(BUILD_998_FULL, 1234)}/build-log.txt", log.read_text())
+        self.assertEqual(by_id[BUILD_102_FULL]["pr"], 1234)
+        self.assertEqual(len(by_id[BUILD_102_FULL]["tasks"]), 14)
+        self.assertIn(f"cat {self.build_url(BUILD_102_FULL, 1234)}/build-log.txt", log.read_text())
 
     def test_pending_build_below_the_watermark_is_reread_through_the_index(self):
         gcloud, log = self.fake_gcloud(self.ALL)
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_FULL])).read_text())
         prior_data["pending_builds"] = [
-            {"build_id": BUILD_998_INFRA, "first_seen": datetime.now(timezone.utc).isoformat()}
+            {"build_id": BUILD_102_INFRA, "first_seen": datetime.now(timezone.utc).isoformat()}
         ]
         prior = self.write_prior(prior_data)
         merged, _ = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX
         )
         self.assertEqual(
-            [run["build_id"] for run in merged["runs"]], [BUILD_998_INFRA, BUILD_998_FULL]
+            [run["build_id"] for run in merged["runs"]], [BUILD_102_INFRA, BUILD_102_FULL]
         )
         self.assertNotIn("pending_builds", merged)
         calls = log.read_text()
-        self.assertIn(f"{FAKE_INDEX_PREFIX}{BUILD_998_INFRA}.txt", calls)
-        self.assertNotIn(f"{FAKE_INDEX_PREFIX}{BUILD_956_TRUNCATED}.txt", calls)  # zero reads
+        self.assertIn(f"{FAKE_INDEX_PREFIX}{BUILD_102_INFRA}.txt", calls)
+        self.assertNotIn(f"{FAKE_INDEX_PREFIX}{BUILD_101_TRUNCATED}.txt", calls)  # zero reads
 
     def test_unfinished_build_found_through_the_index_lands_on_pending(self):
         gcloud, _ = self.fake_gcloud(self.ALL)
-        (self.bucket_root() / self.build_url(BUILD_998_FULL)[len(FAKE_BUCKET):] / "finished.json").unlink()
-        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
-        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        (self.bucket_root() / self.build_url(BUILD_102_FULL)[len(FAKE_BUCKET):] / "finished.json").unlink()
+        prior = self.prior_with([BUILD_101_TRUNCATED, BUILD_102_INFRA])
+        now = datetime(2025, 9, 11, 12, 0, tzinfo=timezone.utc)
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud,
             index_prefix=FAKE_INDEX_PREFIX, now=now,
         )
         self.assertEqual(len(merged["runs"]), 2)
         self.assertEqual(
-            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}]
+            merged["pending_builds"], [{"build_id": BUILD_102_FULL, "first_seen": now.isoformat()}]
         )
         # An in-flight build is the ordinary case, not a stall: publishable.
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
 
     def test_listing_timeout_or_failure_trips_the_refusal_line_and_adds_nothing(self):
         gcloud, log = self.fake_gcloud(self.ALL)
-        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        prior = self.prior_with([BUILD_101_TRUNCATED, BUILD_102_INFRA])
         stages = {
             "timed out": {"FAKE_GCLOUD_SLEEP": json.dumps({f"ls {FAKE_INDEX_PREFIX}": 3})},
             # A denied listing (the grant gone), not an empty prefix: with a
@@ -910,12 +914,12 @@ class TestIndexDiscovery(_MergeBase):
         would not survive running as root); the other builds still read."""
         gcloud, _ = self.fake_gcloud(self.ALL)
         os.environ["FAKE_GCLOUD_SLEEP"] = json.dumps(
-            {f"cat {FAKE_INDEX_PREFIX}{BUILD_998_FULL}.txt": 3}
+            {f"cat {FAKE_INDEX_PREFIX}{BUILD_102_FULL}.txt": 3}
         )
         self.addCleanup(setattr, collect, "GCLOUD_TIMEOUT_S", collect.GCLOUD_TIMEOUT_S)
         collect.GCLOUD_TIMEOUT_S = 1
-        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
-        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        prior = self.prior_with([BUILD_101_TRUNCATED, BUILD_102_INFRA])
+        now = datetime(2025, 9, 11, 12, 0, tzinfo=timezone.utc)
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud,
             index_prefix=FAKE_INDEX_PREFIX, now=now,
@@ -923,14 +927,14 @@ class TestIndexDiscovery(_MergeBase):
         self.assertEqual(len(merged["runs"]), 2)
         self.assertRegex(stderr, WORKFLOW_REFUSAL)
         self.assertEqual(
-            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}]
+            merged["pending_builds"], [{"build_id": BUILD_102_FULL, "first_seen": now.isoformat()}]
         )
 
     def test_pointer_without_a_gs_path_is_skipped_with_a_plain_warning(self):
         gcloud, _ = self.fake_gcloud(self.ALL)
-        pointer = self.bucket_root() / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):] / f"{BUILD_998_FULL}.txt"
+        pointer = self.bucket_root() / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):] / f"{BUILD_102_FULL}.txt"
         pointer.write_text("http://not-a-bucket/somewhere\n")
-        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        prior = self.prior_with([BUILD_101_TRUNCATED, BUILD_102_INFRA])
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX
         )
@@ -942,11 +946,11 @@ class TestIndexDiscovery(_MergeBase):
     def test_without_a_watermark_the_glob_is_listed_not_the_index(self):
         """The cold sweep: no prior (or a prior with no numeric watermark)
         still discovers through --pr-glob, index or no index."""
-        gcloud, log = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, log = self.fake_gcloud([BUILD_102_FULL])
         # A prior with no watermark bounds the sweep to DEGRADED_SINCE_DAYS,
         # so `now` is pinned near the fixture: on the wall clock the build
-        # (started 2026-08-27) aged out of that bound on 2026-09-10.
-        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        # (started 2025-08-28) aged out of that bound on 2025-09-11.
+        now = datetime(2025, 9, 2, tzinfo=timezone.utc)
         for label, kwargs in {
             "no prior": {},
             "prior without a watermark": {
@@ -955,12 +959,12 @@ class TestIndexDiscovery(_MergeBase):
         }.items():
             with self.subTest(label):
                 log.write_text("")
-                # Pinned: the fixture build finished 2026-08-27 and the
+                # Pinned: the fixture build finished 2025-08-28 and the
                 # default --since-days window would age it out.
                 merged, _ = self.quiet_collect(
                     pr_globs=[FAKE_GLOB], gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX, now=now, **kwargs
                 )
-                self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
+                self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_102_FULL])
                 # A Deck-readable bucket: no gcs_base, the Spyglass link stays.
                 self.assertNotIn("gcs_base", merged["runs"][0])
                 listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
@@ -972,12 +976,12 @@ class TestIndexDiscovery(_MergeBase):
         may be purged later. With a watermark that is nothing new, a note,
         never the `warning: gcloud storage ls failed` the refresh workflow
         refuses to publish on (the GitLab lane's rule, applied here)."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
-        prior = self.prior_with([BUILD_998_FULL])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
+        prior = self.prior_with([BUILD_102_FULL])
         old_glob = FAKE_BUCKET + "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*"
         new_glob = FAKE_BUCKET + "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-moved/*"
         merged, err = self.quiet_collect(pr_globs=[new_glob, old_glob], gcloud=gcloud, merge_with=prior)
-        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
+        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_102_FULL])
         self.assertIn("note: directory index " + FAKE_BUCKET + "pr-logs/directory/pull-kube-agents-smoke-test-moved/ did not list", err)
         self.assertNotIn("warning: gcloud storage ls failed", err)
 
@@ -995,8 +999,8 @@ class TestIndexDiscovery(_MergeBase):
         existed and on every build that died before grading; its retry must
         not pay a second process for a definitive 404, while a read that
         failed for another reason keeps its real second attempt."""
-        gcloud, log = self.fake_gcloud([BUILD_998_FULL])
-        base = FAKE_BUCKET + f"pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/{BUILD_998_FULL}/"
+        gcloud, log = self.fake_gcloud([BUILD_102_FULL])
+        base = FAKE_BUCKET + f"pull/gke-labs_kube-agents/102/pull-kube-agents-smoke-test/{BUILD_102_FULL}/"
         reader = collect._gcs_reader(base, gcloud)
         self.assertIsNone(collect.read_retrying(reader, collect.EVAL_GRADING_FILE))
         calls = [c for c in log.read_text().splitlines() if c.startswith("cat ") and c.endswith(collect.EVAL_GRADING_FILE)]
@@ -1012,11 +1016,11 @@ class TestIndexDiscovery(_MergeBase):
         """The hand seed and the in-job publish take the cold path; an empty
         glob under the new bucket must be the same note there, not the
         warning the refresh workflow refuses to publish on."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
-        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
+        now = datetime(2025, 9, 2, tzinfo=timezone.utc)
         empty_glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-moved/*"
         merged, err = self.quiet_collect(pr_globs=[empty_glob, FAKE_GLOB], gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX, now=now)
-        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
+        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_102_FULL])
         self.assertIn(f"note: glob {empty_glob} did not list", err)
         self.assertNotIn("warning: gcloud storage ls failed", err)
 
@@ -1024,7 +1028,7 @@ class TestIndexDiscovery(_MergeBase):
         """--merge-with without --pr-glob recomputes; the index is how a
         glob scan discovers builds, not a scan of its own."""
         gcloud, log = self.fake_gcloud(self.ALL)
-        prior = self.prior_with([BUILD_956_TRUNCATED])
+        prior = self.prior_with([BUILD_101_TRUNCATED])
         merged, _ = self.quiet_collect(merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX)
         self.assertEqual(len(merged["runs"]), 1)
         self.assertEqual(log.read_text(), "")
@@ -1036,7 +1040,7 @@ class TestIndexDiscovery(_MergeBase):
         document."""
         gcloud, _ = self.fake_gcloud(self.ALL)
         os.environ["FAKE_GCLOUD_SLEEP"] = json.dumps(
-            {BUILD_956_TRUNCATED + "/": 0.4, BUILD_998_INFRA + "/": 0.2}
+            {BUILD_101_TRUNCATED + "/": 0.4, BUILD_102_INFRA + "/": 0.2}
         )
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -1045,7 +1049,7 @@ class TestIndexDiscovery(_MergeBase):
 
     def test_cli_flag_reaches_the_scan_and_an_empty_value_disables_it(self):
         gcloud, log = self.fake_gcloud(self.ALL)
-        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        prior = self.prior_with([BUILD_101_TRUNCATED, BUILD_102_INFRA])
         out = self.tmp / "out.json"
         common = ["--pr-glob", FAKE_GLOB, "--merge-with", prior, "--gcloud", gcloud, "--gh", "", "--out", str(out)]
         for label, extra, expected_listing in (
@@ -1114,22 +1118,22 @@ class TestNightlySource(_MergeBase):
 
     def test_nightly_builds_parse_with_tier_job_and_no_pr(self):
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_998_FULL)
+        self.place_nightly_build(BUILD_102_FULL)
         data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, gcloud=gcloud)
         (run,) = data["runs"]
-        self.assertEqual(run["build_id"], BUILD_998_FULL)
+        self.assertEqual(run["build_id"], BUILD_102_FULL)
         self.assertEqual(run["tier"], "nightly")
         self.assertEqual(run["job"], FAKE_NIGHTLY_JOB, "derived from the prefix, not hardcoded")
         # Spyglass's page for the directory the listing named, so the report
         # links follow the bucket rather than one the renderer assumes.
-        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/{FAKE_NIGHTLY_JOB}/{BUILD_998_FULL}")
-        # The real fixture's started.json says pull 998; a periodic runs main
+        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/{FAKE_NIGHTLY_JOB}/{BUILD_102_FULL}")
+        # The fixture's started.json says pull 102; a periodic runs main
         # and its run is nobody's pull request whatever the metadata says.
         self.assertIsNone(run["pr"])
         # The same parser as the presubmit: every task, the verdict duration.
         self.assertEqual(len(run["tasks"]), 14)
-        self.assertEqual(run["duration_s"], 5793)
-        self.assertEqual(run["head_sha"], "a28f0b3")
+        self.assertEqual(run["duration_s"], 4105)
+        self.assertEqual(run["head_sha"], "0303030")
         calls = log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}"])
         self.assertNotIn("latest-build.txt", "\n".join(calls))
@@ -1138,29 +1142,29 @@ class TestNightlySource(_MergeBase):
 
     def test_nightly_job_flag_overrides_the_derived_name(self):
         gcloud, _ = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_998_FULL)
+        self.place_nightly_build(BUILD_102_FULL)
         data, _ = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_job="renamed-job", gcloud=gcloud)
         self.assertEqual(data["runs"][0]["job"], "renamed-job")
 
     def test_presubmit_runs_carry_their_job_from_the_build_path(self):
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
         data, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gcloud=gcloud)
         (run,) = data["runs"]
-        self.assertEqual((run["tier"], run["job"], run["pr"]), ("presubmit", "pull-kube-agents-smoke-test", 998))
+        self.assertEqual((run["tier"], run["job"], run["pr"]), ("presubmit", "pull-kube-agents-smoke-test", 102))
         self.assertNotIn("log_url", run, "the nightly's field; the pages build a presubmit's link themselves")
 
     def test_each_source_resumes_above_its_own_watermark(self):
         """Prow build ids are one global sequence, so the newest presubmit
         id is usually ABOVE every nightly id on record and vice versa. A
         shared watermark would skip whichever source is behind."""
-        gcloud, log = self.fake_gcloud([BUILD_998_INFRA])  # presubmit: the middle id
-        self.place_nightly_build(BUILD_956_TRUNCATED)  # nightly: the lowest id
+        gcloud, log = self.fake_gcloud([BUILD_102_INFRA])  # presubmit: the middle id
+        self.place_nightly_build(BUILD_101_TRUNCATED)  # nightly: the lowest id
         # Prior: the presubmit's HIGHEST id recorded (so the presubmit
         # candidate is genuinely old and must be skipped), and one old
         # nightly run with a tiny id. Under a shared watermark -- the
         # newest id on record -- the nightly candidate would be skipped
         # forever; above the nightly's own watermark it is new.
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_FULL])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
         prior = self.write_prior(prior_data)
         merged, stderr = self.quiet_collect(
@@ -1168,37 +1172,37 @@ class TestNightlySource(_MergeBase):
             index_prefix=FAKE_INDEX_PREFIX,
         )
         by_id = {run["build_id"]: run for run in merged["runs"]}
-        self.assertEqual(by_id[BUILD_956_TRUNCATED]["tier"], "nightly", "below the presubmit watermark, above the nightly's own")
-        self.assertNotIn(BUILD_998_INFRA, by_id, "below the presubmit's own watermark and not pending: skipped, zero reads")
-        self.assertNotIn(BUILD_998_INFRA + "/", log.read_text())
-        self.assertEqual(sorted(by_id), sorted([BUILD_956_TRUNCATED, BUILD_998_FULL, "1"]))
-        self.assertIn(f"GCS scan resumed above build {BUILD_998_FULL}", stderr)
+        self.assertEqual(by_id[BUILD_101_TRUNCATED]["tier"], "nightly", "below the presubmit watermark, above the nightly's own")
+        self.assertNotIn(BUILD_102_INFRA, by_id, "below the presubmit's own watermark and not pending: skipped, zero reads")
+        self.assertNotIn(BUILD_102_INFRA + "/", log.read_text())
+        self.assertEqual(sorted(by_id), sorted([BUILD_101_TRUNCATED, BUILD_102_FULL, "1"]))
+        self.assertIn(f"GCS scan resumed above build {BUILD_102_FULL}", stderr)
         self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
 
     def test_the_presubmit_watermark_ignores_nightly_ids(self):
-        gcloud, log = self.fake_gcloud([BUILD_998_INFRA, BUILD_998_FULL])
+        gcloud, log = self.fake_gcloud([BUILD_102_INFRA, BUILD_102_FULL])
         # Prior: presubmit INFRA on record, plus a nightly run whose id is
         # above FULL. FULL must still be read through the presubmit index.
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
-        prior_data["runs"].append(dict(prior_data["runs"][0], build_id=str(int(BUILD_998_FULL) + 1), tier="nightly", pr=None))
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id=str(int(BUILD_102_FULL) + 1), tier="nightly", pr=None))
         prior = self.write_prior(prior_data)
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX
         )
-        self.assertIn(BUILD_998_FULL, {run["build_id"] for run in merged["runs"]})
-        self.assertIn(f"GCS scan resumed above build {BUILD_998_INFRA}", stderr)
-        self.assertNotIn(f"cat {FAKE_INDEX_PREFIX}{BUILD_998_INFRA}.txt", log.read_text())
+        self.assertIn(BUILD_102_FULL, {run["build_id"] for run in merged["runs"]})
+        self.assertIn(f"GCS scan resumed above build {BUILD_102_INFRA}", stderr)
+        self.assertNotIn(f"cat {FAKE_INDEX_PREFIX}{BUILD_102_INFRA}.txt", log.read_text())
 
     def test_a_prefix_that_does_not_list_is_a_note_never_the_refusal_line(self):
         """Until oss-test-infra's periodic runs, the prefix does not exist;
         the gate's dashboard must keep publishing meanwhile."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
-        prior = self.prior_with([BUILD_998_INFRA])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
+        prior = self.prior_with([BUILD_102_INFRA])
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gcloud=gcloud,
             index_prefix=FAKE_INDEX_PREFIX,
         )
-        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_INFRA, BUILD_998_FULL])
+        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_102_INFRA, BUILD_102_FULL])
         self.assertIn(f"note: nightly prefix {FAKE_NIGHTLY_PREFIX} did not list", stderr)
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         self.assertIn("nightly scan resumed above build None, 0 new", stderr)
@@ -1206,9 +1210,9 @@ class TestNightlySource(_MergeBase):
     def test_a_known_prefix_that_stops_listing_is_the_refusal_line(self):
         """Once a night is on record, a prefix that fails to list is a stall,
         not an absent job: republishing would freeze the nightly record."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
         os.environ["FAKE_GCLOUD_DENY"] = FAKE_NIGHTLY_PREFIX
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_INFRA])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=self.write_prior(prior_data),
@@ -1221,9 +1225,9 @@ class TestNightlySource(_MergeBase):
     def test_a_known_prefix_that_times_out_is_the_refusal_line(self):
         """A hung listing says nothing about objects; with a night on record
         it is the refusal line, as any hung gcloud call is."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
-        self.place_nightly_build(BUILD_998_FULL)
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
+        self.place_nightly_build(BUILD_102_FULL)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_INFRA])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
         self.addCleanup(setattr, collect, "GCLOUD_TIMEOUT_S", collect.GCLOUD_TIMEOUT_S)
         collect.GCLOUD_TIMEOUT_S = 1
@@ -1240,7 +1244,7 @@ class TestNightlySource(_MergeBase):
         retry list with its tier and no link; the Nightly page then links it
         under the legacy bucket, which is where such a build is."""
         gcloud, _ = self.fake_gcloud([])
-        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 11, 12, 0, tzinfo=timezone.utc)
         prior = self.write_prior({
             "schema_version": 1, "generated_at": now.isoformat(), "source": "logs", "runs": [], "cases": [],
             "pending_builds": [{"build_id": "2099649477534027776", "first_seen": now.isoformat(), "tier": "nightly"}],
@@ -1254,8 +1258,8 @@ class TestNightlySource(_MergeBase):
         prefix, `gcloud storage ls` says it matched no objects. That is not the
         bucket or the grant failing, and the gate's dashboard must keep
         publishing through the day."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_INFRA])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=self.write_prior(prior_data),
@@ -1270,13 +1274,13 @@ class TestNightlySource(_MergeBase):
         the build: the Grid's running columns are the presubmit's, and a
         night in flight for hours must not draw one every morning."""
         gcloud, _ = self.fake_gcloud([])
-        built = self.place_nightly_build(BUILD_998_FULL)
+        built = self.place_nightly_build(BUILD_102_FULL)
         (built / "finished.json").unlink()
-        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 11, 12, 0, tzinfo=timezone.utc)
         data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, gcloud=gcloud, now=now)
         self.assertEqual(data["runs"], [])
-        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/{FAKE_NIGHTLY_JOB}/{BUILD_998_FULL}"
-        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
+        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/{FAKE_NIGHTLY_JOB}/{BUILD_102_FULL}"
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_102_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         # The tag and the link survive a scan whose nightly listing does not
         # name the build again (the listing failed, or the build fell off it).
@@ -1284,17 +1288,17 @@ class TestNightlySource(_MergeBase):
         gcloud, _ = self.fake_gcloud([])
         later = now + timedelta(minutes=15)
         merged, _ = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gcloud=gcloud, now=later)
-        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_102_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
 
     def test_cases_keep_the_two_records_apart(self):
         """The per-case fields are the presubmit's; the nightly's sit under
         `nightly`. A case only the nightly ran is still on record."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_INFRA])
-        self.place_nightly_build(BUILD_998_FULL)
+        gcloud, _ = self.fake_gcloud([BUILD_102_INFRA])
+        self.place_nightly_build(BUILD_102_FULL)
         data, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, gcloud=gcloud)
         cases = _cases_by_name(data)
-        # compliance-rbac-overgrant: infra on the presubmit build, fail on the nightly one.
-        case = cases["compliance-rbac-overgrant"]
+        # case-09: infra on the presubmit build, fail on the nightly one.
+        case = cases["case-09"]
         self.assertEqual((case["runs_on_record"], case["pass_rate"], case["last3"]), (1, None, ["infra"]))
         self.assertEqual(case["nightly"], {"runs_on_record": 1, "pass_rate": 0.0, "last3": ["fail"]})
         # A task only the FULL build ran (as the nightly here): empty presubmit side.
@@ -1311,15 +1315,15 @@ class TestNightlySource(_MergeBase):
         """A night split across two jobs: both prefixes are listed, both
         builds are nightly runs, each with its own job and link."""
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_998_INFRA)
-        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        self.place_nightly_build(BUILD_102_INFRA)
+        self.place_nightly_build(BUILD_102_FULL, periodic=FAKE_WRITERS_PREFIX)
         data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX, gcloud=gcloud)
         by_id = {run["build_id"]: run for run in data["runs"]}
         self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
-            BUILD_998_INFRA: ("nightly", FAKE_NIGHTLY_JOB),
-            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers"),
+            BUILD_102_INFRA: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_102_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers"),
         })
-        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}")
+        self.assertEqual(by_id[BUILD_102_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_102_FULL}")
         calls = log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}"])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
@@ -1341,30 +1345,30 @@ class TestNightlySource(_MergeBase):
         its id on record must not lift the main job's watermark over a main
         build the listing names later, nor the other way round."""
         gcloud, _ = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_956_TRUNCATED)  # main: below the writers id on record
-        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)  # writers: above the main id on record
+        self.place_nightly_build(BUILD_101_TRUNCATED)  # main: below the writers id on record
+        self.place_nightly_build(BUILD_102_INFRA, periodic=FAKE_WRITERS_PREFIX)  # writers: above the main id on record
         prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
         prior_data["runs"] = [
             {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
-            {"build_id": "2093040000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers", "pr": None, "tasks": []},
+            {"build_id": "2090000000000000025", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers", "pr": None, "tasks": []},
         ]
         merged, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
             merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
         )
-        self.assertNotIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "below the writers' own watermark")
-        self.assertIn(BUILD_956_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
+        self.assertNotIn(BUILD_102_INFRA, {r["build_id"] for r in merged["runs"]}, "below the writers' own watermark")
+        self.assertIn(BUILD_101_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
         self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
-        self.assertIn("writers scan resumed above build 2093040000000000000, 0 new", stderr)
+        self.assertIn("writers scan resumed above build 2090000000000000025, 0 new", stderr)
 
     def test_a_writers_prefix_with_no_writers_on_record_is_a_note(self):
         """Until a writers build is on record, its prefix failing to list is
         the job not existing yet, whatever the main job has on record: a
         note, never the refusal line."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
         os.environ["FAKE_GCLOUD_DENY"] = FAKE_WRITERS_PREFIX
-        self.place_nightly_build(BUILD_998_INFRA)
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        self.place_nightly_build(BUILD_102_INFRA)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_INFRA])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
@@ -1385,21 +1389,21 @@ class TestNightlySource(_MergeBase):
         listed after the writers one, and its build is a nightly run with
         its own job and link."""
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_956_TRUNCATED)
-        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)
-        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_MAIN_B_PREFIX)
+        self.place_nightly_build(BUILD_101_TRUNCATED)
+        self.place_nightly_build(BUILD_102_INFRA, periodic=FAKE_WRITERS_PREFIX)
+        self.place_nightly_build(BUILD_102_FULL, periodic=FAKE_MAIN_B_PREFIX)
         data, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
             nightly_main_b_prefix=FAKE_MAIN_B_PREFIX, gcloud=gcloud, since_days=10000,
         )
         by_id = {run["build_id"]: run for run in data["runs"]}
         self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
-            BUILD_956_TRUNCATED: ("nightly", FAKE_NIGHTLY_JOB),
-            BUILD_998_INFRA: ("nightly", "ci-kube-agents-eval-nightly-writers"),
-            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-main-b"),
+            BUILD_101_TRUNCATED: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_102_INFRA: ("nightly", "ci-kube-agents-eval-nightly-writers"),
+            BUILD_102_FULL: ("nightly", "ci-kube-agents-eval-nightly-main-b"),
         })
-        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-main-b/{BUILD_998_FULL}")
-        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_MAIN_B)
+        self.assertEqual(by_id[BUILD_102_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-main-b/{BUILD_102_FULL}")
+        self.assertEqual(nightly.night_part(by_id[BUILD_102_FULL]), nightly.PART_MAIN_B)
         calls = log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}", f"ls {FAKE_MAIN_B_PREFIX}"])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
@@ -1412,15 +1416,15 @@ class TestNightlySource(_MergeBase):
         after the main-b one, its build files as the main-c part, and the
         main-c, main-d and main-e constants agree with the report's."""
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_956_TRUNCATED)
-        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_MAIN_C_PREFIX)
+        self.place_nightly_build(BUILD_101_TRUNCATED)
+        self.place_nightly_build(BUILD_102_FULL, periodic=FAKE_MAIN_C_PREFIX)
         data, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
             nightly_main_c_prefix=FAKE_MAIN_C_PREFIX, gcloud=gcloud, since_days=10000,
         )
         by_id = {run["build_id"]: run for run in data["runs"]}
-        self.assertEqual(by_id[BUILD_998_FULL]["job"], "ci-kube-agents-eval-nightly-main-c")
-        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_MAIN_C)
+        self.assertEqual(by_id[BUILD_102_FULL]["job"], "ci-kube-agents-eval-nightly-main-c")
+        self.assertEqual(nightly.night_part(by_id[BUILD_102_FULL]), nightly.PART_MAIN_C)
         calls = log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {p}" for p in (FAKE_NIGHTLY_PREFIX, FAKE_MAIN_B_PREFIX, FAKE_MAIN_C_PREFIX)])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
@@ -1433,7 +1437,7 @@ class TestNightlySource(_MergeBase):
             self.assertIn(f"main-{letter}", nightly.MAIN_PARTS)
         # Each shard resumes above its own watermark, and its note says so.
         prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
-        prior_data["runs"] = [{"build_id": "2093050000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-d", "pr": None, "tasks": []}]
+        prior_data["runs"] = [{"build_id": "2090000000000000025", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-d", "pr": None, "tasks": []}]
         _, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_c_prefix=FAKE_MAIN_C_PREFIX,
             nightly_main_d_prefix=f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_D_JOB}/",
@@ -1441,7 +1445,7 @@ class TestNightlySource(_MergeBase):
             merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
         )
         self.assertIn("main-c scan resumed above build None, 1 new", stderr)
-        self.assertIn("main-d scan resumed above build 2093050000000000000, 0 new", stderr)
+        self.assertIn("main-d scan resumed above build 2090000000000000025, 0 new", stderr)
         self.assertIn("main-e scan resumed above build None, 0 new", stderr)
 
     def test_the_writers_thirds_prefixes_are_collected_beside_the_others(self):
@@ -1450,9 +1454,9 @@ class TestNightlySource(_MergeBase):
         each build is a nightly run with its own job and link, each files as
         its own part, and each resumes above its own watermark."""
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_956_TRUNCATED)
-        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_B_PREFIX)
-        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_C_PREFIX)
+        self.place_nightly_build(BUILD_101_TRUNCATED)
+        self.place_nightly_build(BUILD_102_INFRA, periodic=FAKE_WRITERS_B_PREFIX)
+        self.place_nightly_build(BUILD_102_FULL, periodic=FAKE_WRITERS_C_PREFIX)
         data, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
             nightly_main_b_prefix=FAKE_MAIN_B_PREFIX, nightly_writers_b_prefix=FAKE_WRITERS_B_PREFIX,
@@ -1460,13 +1464,13 @@ class TestNightlySource(_MergeBase):
         )
         by_id = {run["build_id"]: run for run in data["runs"]}
         self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
-            BUILD_956_TRUNCATED: ("nightly", FAKE_NIGHTLY_JOB),
-            BUILD_998_INFRA: ("nightly", "ci-kube-agents-eval-nightly-writers-b"),
-            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers-c"),
+            BUILD_101_TRUNCATED: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_102_INFRA: ("nightly", "ci-kube-agents-eval-nightly-writers-b"),
+            BUILD_102_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers-c"),
         })
-        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers-c/{BUILD_998_FULL}")
-        self.assertEqual(nightly.night_part(by_id[BUILD_998_INFRA]), nightly.PART_WRITERS_B)
-        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_WRITERS_C)
+        self.assertEqual(by_id[BUILD_102_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers-c/{BUILD_102_FULL}")
+        self.assertEqual(nightly.night_part(by_id[BUILD_102_INFRA]), nightly.PART_WRITERS_B)
+        self.assertEqual(nightly.night_part(by_id[BUILD_102_FULL]), nightly.PART_WRITERS_C)
         calls = log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {p}" for p in (FAKE_NIGHTLY_PREFIX, FAKE_WRITERS_PREFIX, FAKE_MAIN_B_PREFIX, FAKE_WRITERS_B_PREFIX, FAKE_WRITERS_C_PREFIX)])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
@@ -1482,19 +1486,19 @@ class TestNightlySource(_MergeBase):
         prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
         prior_data["runs"] = [
             {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
-            {"build_id": "2093050000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers-c", "pr": None, "tasks": []},
+            {"build_id": "2090000000000000025", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers-c", "pr": None, "tasks": []},
         ]
         merged, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_b_prefix=FAKE_WRITERS_B_PREFIX,
             nightly_writers_c_prefix=FAKE_WRITERS_C_PREFIX, merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
         )
-        self.assertIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "above the writers-b watermark, which the writers-c id does not set")
+        self.assertIn(BUILD_102_INFRA, {r["build_id"] for r in merged["runs"]}, "above the writers-b watermark, which the writers-c id does not set")
         self.assertIn("writers-b scan resumed above build None, 1 new", stderr)
-        self.assertIn("writers-c scan resumed above build 2093050000000000000, 1 new", stderr)
+        self.assertIn("writers-c scan resumed above build 2090000000000000025, 1 new", stderr)
 
     def test_a_writers_third_prefix_naming_a_listed_job_is_listed_once(self):
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_MAIN_B_PREFIX)
+        self.place_nightly_build(BUILD_102_INFRA, periodic=FAKE_MAIN_B_PREFIX)
         _, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
             nightly_writers_b_prefix=FAKE_MAIN_B_PREFIX, gcloud=gcloud,
@@ -1515,7 +1519,7 @@ class TestNightlySource(_MergeBase):
         """The warning names the part the runs really file as, and one job
         named by both flags is listed once, not twice above one watermark."""
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)
+        self.place_nightly_build(BUILD_102_INFRA, periodic=FAKE_WRITERS_PREFIX)
         _, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX,
             nightly_writers_prefix=FAKE_WRITERS_PREFIX,
@@ -1532,17 +1536,17 @@ class TestNightlySource(_MergeBase):
         main job's runs still set its watermark: the scan resumes above the
         main build on record rather than re-reading every main build."""
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_956_TRUNCATED)
+        self.place_nightly_build(BUILD_101_TRUNCATED)
         for flag in ("nightly_writers_prefix", "nightly_main_b_prefix"):
             with self.subTest(flag=flag):
                 log.unlink(missing_ok=True)
                 prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
-                prior_data["runs"] = [{"build_id": BUILD_956_TRUNCATED, "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []}]
+                prior_data["runs"] = [{"build_id": BUILD_101_TRUNCATED, "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []}]
                 prior = self.tmp / "prior-main-collision.json"
                 prior.write_text(json.dumps(prior_data))
                 _, stderr = self.quiet_collect(merge_with=str(prior), nightly_prefix=FAKE_NIGHTLY_PREFIX, gcloud=gcloud, **{flag: FAKE_NIGHTLY_PREFIX})
                 self.assertIn("as --nightly-prefix does; listing it once", stderr)
-                self.assertIn(f"nightly scan resumed above build {BUILD_956_TRUNCATED}", stderr)
+                self.assertIn(f"nightly scan resumed above build {BUILD_101_TRUNCATED}", stderr)
                 calls = log.read_text().splitlines()
                 self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}"])
 
@@ -1552,43 +1556,43 @@ class TestNightlySource(_MergeBase):
         being excluded from it as another flag's part."""
         gcloud, log = self.fake_gcloud([])
         main_b_prefix = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
-        self.place_nightly_build(BUILD_956_TRUNCATED, periodic=main_b_prefix)
+        self.place_nightly_build(BUILD_101_TRUNCATED, periodic=main_b_prefix)
         prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
-        prior_data["runs"] = [{"build_id": BUILD_956_TRUNCATED, "tier": "nightly", "job": collect.DEFAULT_NIGHTLY_MAIN_B_JOB, "pr": None, "tasks": []}]
+        prior_data["runs"] = [{"build_id": BUILD_101_TRUNCATED, "tier": "nightly", "job": collect.DEFAULT_NIGHTLY_MAIN_B_JOB, "pr": None, "tasks": []}]
         prior = self.tmp / "prior-main-is-main-b.json"
         prior.write_text(json.dumps(prior_data))
         _, stderr = self.quiet_collect(merge_with=str(prior), nightly_prefix=main_b_prefix, gcloud=gcloud)
         self.assertIn(f"--nightly-prefix names job {collect.DEFAULT_NIGHTLY_MAIN_B_JOB}, a part's job", stderr)
-        self.assertIn(f"nightly scan resumed above build {BUILD_956_TRUNCATED}", stderr)
+        self.assertIn(f"nightly scan resumed above build {BUILD_101_TRUNCATED}", stderr)
 
     def test_the_main_b_job_resumes_above_its_own_watermark(self):
         """main-a and main-b start together and either may finish first: a
         main-b id on record must not lift the main job's watermark, nor the
         main job's the main-b one's."""
         gcloud, _ = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_956_TRUNCATED)  # main: below the main-b id on record
-        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_MAIN_B_PREFIX)  # main-b: above the main id on record
+        self.place_nightly_build(BUILD_101_TRUNCATED)  # main: below the main-b id on record
+        self.place_nightly_build(BUILD_102_INFRA, periodic=FAKE_MAIN_B_PREFIX)  # main-b: above the main id on record
         prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
         prior_data["runs"] = [
             {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
-            {"build_id": "2093040000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-b", "pr": None, "tasks": []},
+            {"build_id": "2090000000000000025", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-b", "pr": None, "tasks": []},
         ]
         merged, stderr = self.quiet_collect(
             nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
             merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
         )
-        self.assertNotIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "below main-b's own watermark")
-        self.assertIn(BUILD_956_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
+        self.assertNotIn(BUILD_102_INFRA, {r["build_id"] for r in merged["runs"]}, "below main-b's own watermark")
+        self.assertIn(BUILD_101_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
         self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
-        self.assertIn("main-b scan resumed above build 2093040000000000000, 0 new", stderr)
+        self.assertIn("main-b scan resumed above build 2090000000000000025, 0 new", stderr)
 
     def test_a_main_b_prefix_with_no_main_b_on_record_is_a_note(self):
         """Dormant until its first build: the prefix failing to list is a
         note while no main-b build is on record, the refusal line after."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
         os.environ["FAKE_GCLOUD_DENY"] = FAKE_MAIN_B_PREFIX
-        self.place_nightly_build(BUILD_998_INFRA)
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        self.place_nightly_build(BUILD_102_INFRA)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_INFRA])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
         _, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
@@ -1605,24 +1609,24 @@ class TestNightlySource(_MergeBase):
 
     def test_an_unfinished_writers_build_rides_pending_with_its_link(self):
         gcloud, _ = self.fake_gcloud([])
-        built = self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        built = self.place_nightly_build(BUILD_102_FULL, periodic=FAKE_WRITERS_PREFIX)
         (built / "finished.json").unlink()
-        now = datetime(2026, 9, 10, 0, 5, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 11, 0, 5, tzinfo=timezone.utc)
         data, _ = self.quiet_collect(nightly_writers_prefix=FAKE_WRITERS_PREFIX, gcloud=gcloud, now=now)
-        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}"
-        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
+        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_102_FULL}"
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_102_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
 
     def test_nightly_active_is_the_superset_matrix(self):
-        data = collect.collect(from_dir=TESTDATA)
+        data = collect.collect(from_dir=TESTDATA, repo_root=FAKE_REPO)
         cases = _cases_by_name(data)
-        self.assertTrue(cases["reliability-pdb-probe"]["active"])
-        self.assertTrue(cases["reliability-pdb-probe"]["nightly_active"], "TASKS is in the nightly too")
-        self.assertFalse(cases["obtainability-planted-pdb"]["active"])
-        self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "a nightly-cases.txt entry")
-        # Seated held out in the presubmit 2026-09-29 to 2026-11-02 (#2013 step 2) and on the
-        # roster since (step 4): it runs on every pull request, and the nightly runs the presubmit file.
-        self.assertTrue(cases["compliance-rbac-overgrant"]["active"])
-        self.assertTrue(cases["compliance-rbac-overgrant"]["nightly_active"], "a presubmit case is a nightly case too")
+        self.assertTrue(cases["case-02"]["active"])
+        self.assertTrue(cases["case-02"]["nightly_active"], "TASKS is in the nightly too")
+        self.assertFalse(cases["case-26"]["active"])
+        self.assertTrue(cases["case-26"]["nightly_active"], "a nightly-cases.txt entry")
+        # Listed in the synthetic presubmit file (testdata_repo/hack/eval/presubmit-cases.txt):
+        # it runs on every pull request, and the nightly runs the presubmit file too.
+        self.assertTrue(cases["case-09"]["active"])
+        self.assertTrue(cases["case-09"]["nightly_active"], "a presubmit case is a nightly case too")
 
     def test_base_sha_is_the_base_segment_of_started_repos(self):
         self.assertEqual(collect.parse_base_sha({"gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43,1118:7db690bc3322921efc793056e9d1760b2ef3e75c"}), "147b063")
@@ -1650,7 +1654,7 @@ class TestNightlySource(_MergeBase):
 
     def test_cli_flags_bare_and_explicit(self):
         gcloud, log = self.fake_gcloud([])
-        self.place_nightly_build(BUILD_998_FULL)
+        self.place_nightly_build(BUILD_102_FULL)
         out = self.tmp / "out.json"
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(
@@ -1678,7 +1682,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
 
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
-        self.assertEqual(cov["domains_total"], 13)
+        self.assertEqual(cov["domains_total"], 14)
         # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
         # probe, took a roster seat, closing the gap open since the tofu case
         # moved to the nightly tier on 2026-09-03 (#1202); the same day the
@@ -1706,9 +1710,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # The canary took its roster line on 2026-11-02 (#2013 step 4, #4094),
         # covering fleet-audits, and monitoring-alert-policy-read took one the
         # same day (#4095), covering observability.
+        # harness-scale is a new row whose only case is parked until its
+        # fixture exists (#4896), so it starts on the allowlist.
         self.assertEqual(
             cov["uncovered"],
-            [],
+            ["harness-scale"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
@@ -1844,13 +1850,13 @@ class TestHowTheBuildEnded(unittest.TestCase):
 
     def test_a_build_that_ran_costs_no_extra_read(self):
         asked = []
-        inner = collect._dir_reader(TESTDATA / BUILD_998_FULL)
+        inner = collect._dir_reader(TESTDATA / BUILD_102_FULL)
 
         def reader(name):
             asked.append(name)
             return inner(name)
 
-        run = collect.build_run(BUILD_998_FULL, reader)
+        run = collect.build_run(BUILD_102_FULL, reader)
         self.assertNotIn("podinfo.json", asked)
         self.assertNotIn("clone-records.json", asked)
         self.assertIs(run["has_build_log"], True)
@@ -1896,11 +1902,11 @@ class TestHowTheBuildEnded(unittest.TestCase):
         self.assertIsNone(collect.parse_clone_records('{"refs": {}}'), "a document that is not a list")
 
     def test_a_failed_log_read_on_a_pod_that_uploaded_is_not_a_lost_pod(self):
-        # PR 998's real red run, with only the build-log read failing: the
+        # PR 102's red run, with only the build-log read failing: the
         # podinfo of a completed pod (sidecar terminated) says the log was
         # uploaded, so `has_build_log` stays unknown rather than False.
-        podinfo = json.dumps({"pod": {"spec": {"nodeName": "n1"}, "status": {"phase": "Failed", "containerStatuses": [{"name": "test", "state": {"terminated": {"exitCode": 1}}}, {"name": "sidecar", "state": {"terminated": {"exitCode": 0}}}]}}, "events": [{"reason": "Started", "lastTimestamp": "2026-08-27T19:14:00Z"}]})
-        inner = collect._dir_reader(TESTDATA / BUILD_998_INFRA)
+        podinfo = json.dumps({"pod": {"spec": {"nodeName": "n1"}, "status": {"phase": "Failed", "containerStatuses": [{"name": "test", "state": {"terminated": {"exitCode": 1}}}, {"name": "sidecar", "state": {"terminated": {"exitCode": 0}}}]}}, "events": [{"reason": "Started", "lastTimestamp": "2025-08-28T19:14:00Z"}]})
+        inner = collect._dir_reader(TESTDATA / BUILD_102_INFRA)
         asked = []
 
         def reader(name):
@@ -1913,7 +1919,7 @@ class TestHowTheBuildEnded(unittest.TestCase):
 
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            run = collect.build_run(BUILD_998_INFRA, reader)
+            run = collect.build_run(BUILD_102_INFRA, reader)
         self.assertEqual(asked.count("build-log.txt"), 2, "the log is read twice before it is given up on")
         self.assertNotIn("has_build_log", run)
         self.assertEqual((run["pod_phase"], run["pod_node"], run["pod_last_event"]), ("Failed", "n1", "Started"))
@@ -2003,40 +2009,40 @@ class TestHowTheBuildEnded(unittest.TestCase):
             with contextlib.redirect_stderr(err):
                 merged = collect.collect(from_dir=LOSTPOD_TESTDATA, merge_with=str(prior))
         by_id = {run["build_id"]: run for run in merged["runs"]}
-        self.assertNotIn("has_build_log", by_id[BUILD_998_FULL], "a prior run is carried verbatim")
+        self.assertNotIn("has_build_log", by_id[BUILD_102_FULL], "a prior run is carried verbatim")
         self.assertIs(by_id[BUILD_1118_LOST]["has_build_log"], False)
 
 
 class TestReleaseCandidateParsing(unittest.TestCase):
-    """releases[] from a REAL post-kube-agents-eval-rc build.
+    """releases[] from a post-kube-agents-eval-rc build.
 
-    The fixture is the first RC to go through the release-gate lane end to
-    end: staging_2609092307_5b5ad10, four hours, 26 tasks, GREEN with no
-    baseline at its version key. It keeps both banners the driver prints --
+    The fixture is shaped like the first RC to go through the release-gate
+    lane end to end: staging_2609092307_0707070, 10554 s, 26 tasks, GREEN
+    with no baseline at its version key. It keeps both banners the driver prints --
     resolve-rc-target.sh's "RELEASE CANDIDATE EVAL TARGET" near the top and
     ci-eval-rc.sh's "RELEASE CANDIDATE EVAL" at the bottom -- because a
     substring match opens the parse block on the wrong one.
     """
 
-    def test_real_rc_build_parses(self):
+    def test_rc_build_parses(self):
         releases = collect.releases_from_dir(RC_TESTDATA)
         self.assertEqual(len(releases), 1)
         release = releases[0]
         self.assertEqual(release["build_id"], BUILD_RC_GREEN)
-        self.assertEqual(release["rc_tag"], "staging_2609092307_5b5ad10")
-        self.assertEqual(release["commit"], "5b5ad10")  # abbreviated from the banner's full sha
+        self.assertEqual(release["rc_tag"], "staging_2609092307_0707070")
+        self.assertEqual(release["commit"], "0707070")  # abbreviated from the banner's full sha
         self.assertEqual(release["tier"], "nightly")
         self.assertEqual(release["verdict"], "GREEN")
         self.assertEqual(release["result"], "SUCCESS")
         self.assertEqual(release["project"], "kube-agents-evals-10")
-        self.assertEqual(release["started"], "2026-09-10T03:35:01+00:00")
-        self.assertEqual(release["duration_s"], 15006)  # the verdict line, not the Prow delta
+        self.assertEqual(release["started"], "2025-09-11T03:35:01+00:00")
+        self.assertEqual(release["duration_s"], 10554)  # the verdict line, not the Prow delta
         self.assertEqual(
             release["artifacts_url"],
             "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/"
             "post-kube-agents-eval-rc/" + BUILD_RC_GREEN,
         )
-        self.assertEqual(release["pass_rate"], 0.9)
+        self.assertEqual(release["pass_rate"], 0.88)
         # "(no baseline at the current version key -- advisory)" carries no
         # numbers, so the comparison stays unset rather than defaulting to 0.
         self.assertIsNone(release["baseline_rate"])
@@ -2084,8 +2090,8 @@ class TestReleaseCandidateParsing(unittest.TestCase):
             build = pathlib.Path(tmp) / "999"
             build.mkdir()
             (build / "build-log.txt").write_text("=== boom ===\n")
-            (build / "started.json").write_text('{"timestamp": 1789011301}')
-            (build / "finished.json").write_text('{"timestamp": 1789011401, "result": "FAILURE"}')
+            (build / "started.json").write_text('{"timestamp": 1757561701}')
+            (build / "finished.json").write_text('{"timestamp": 1757561801, "result": "FAILURE"}')
             release = collect.releases_from_dir(pathlib.Path(tmp))[0]
         self.assertEqual(release["result"], "FAILURE")
         self.assertIsNone(release["verdict"])
@@ -2097,7 +2103,7 @@ class TestReleaseCollection(_MergeBase):
     """releases[] through collect(): the trim, the carry-forward, the skip."""
 
     def _rc_dir(self, build_ids) -> pathlib.Path:
-        """A local RC archive holding copies of the real fixture, renamed."""
+        """A local RC archive holding copies of the fixture, renamed."""
         root = self.tmp / "rc"
         root.mkdir(exist_ok=True)
         for build_id in build_ids:
@@ -2125,7 +2131,7 @@ class TestReleaseCollection(_MergeBase):
 
     def test_prior_releases_are_carried_forward(self):
         prior = self.write_release_prior(
-            [{"build_id": "5", "verdict": "RED", "started": "2020-01-01T00:00:00+00:00"}]
+            [{"build_id": "5", "verdict": "RED", "started": "2020-12-30T00:00:00+00:00"}]
         )
         data, _ = self.quiet_collect(
             from_dir=TESTDATA, rc_from_dir=self._rc_dir(["10"]), merge_with=prior
@@ -2160,7 +2166,7 @@ class TestReleaseCollection(_MergeBase):
         """A recorded release is final, so the sweep must not pay for it again."""
         gcloud, log = self.fake_rc_gcloud(["10", "20"])
         prior = self.write_release_prior(
-            [{"build_id": "20", "started": "2026-09-10T03:35:01+00:00"}]
+            [{"build_id": "20", "started": "2025-09-11T03:35:01+00:00"}]
         )
         data, _ = self.quiet_collect(rc_globs=[RC_FAKE_GLOB], merge_with=prior, gcloud=gcloud)
         self.assertEqual({r["build_id"] for r in data["releases"]}, {"10", "20"})
@@ -2177,8 +2183,68 @@ class TestReleaseCollection(_MergeBase):
         self.assertNotIn("/10/build-log.txt", calls)
         self.assertNotIn("/20/build-log.txt", calls)
 
+    def test_a_release_read_from_a_private_bucket_records_where_it_lives(self):
+        """The lane moves from the Prow cluster's default bucket to the
+        presubmit lanes' private one, and the collector reads both across the
+        move. A release read from the private one carries `gcs_base`, by the
+        rule runs[] use (records_location), so the Brief's row can link the
+        Console; one read from the old bucket keeps its Spyglass
+        artifacts_url and no `gcs_base`."""
+        old_prefix = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+        new_prefix = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
+        files = {}
+        for prefix, build_id in ((old_prefix, "10"), (new_prefix, "20")):
+            for path in (RC_TESTDATA / BUILD_RC_GREEN).rglob("*"):
+                if path.is_file():
+                    files[f"{prefix}{build_id}/{path.relative_to(RC_TESTDATA / BUILD_RC_GREEN).as_posix()}"] = path.read_text()
+
+        def fake_call(args, gcloud=collect.DEFAULT_GCLOUD, runner=None):
+            if args[0] == "ls":
+                prefix = args[1].rstrip("*")
+                dirs = sorted({url[len(prefix):].split("/", 1)[0] for url in files if url.startswith(prefix)})
+                return "".join(f"{prefix}{d}/\n" for d in dirs), ""
+            text = files.get(args[1])
+            return (text, "") if text is not None else (None, "matched no objects")
+
+        with mock.patch.object(collect, "_gcloud_storage_call", fake_call):
+            releases = collect.releases_from_gcs([old_prefix + "*", new_prefix + "*"])
+        by_id = {r["build_id"]: r for r in releases}
+        self.assertEqual(set(by_id), {"10", "20"})
+        self.assertNotIn("gcs_base", by_id["10"])
+        self.assertEqual(by_id["20"]["gcs_base"], new_prefix + "20/")
+
+    def test_the_rc_limit_is_taken_across_the_globs_not_per_glob(self):
+        """collect trims releases[] to rc_limit across every glob, so the reads
+        must be trimmed the same way: with the limit applied per glob, the old
+        bucket's builds that the new bucket's had pushed out of releases[]
+        would be read again on every tick and thrown away again."""
+        old_prefix = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+        new_prefix = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
+        files = {}
+        for prefix, build_id in ((old_prefix, "10"), (old_prefix, "20"), (old_prefix, "30"), (new_prefix, "40")):
+            for path in (RC_TESTDATA / BUILD_RC_GREEN).rglob("*"):
+                if path.is_file():
+                    files[f"{prefix}{build_id}/{path.relative_to(RC_TESTDATA / BUILD_RC_GREEN).as_posix()}"] = path.read_text()
+        reads = []
+
+        def fake_call(args, gcloud=collect.DEFAULT_GCLOUD, runner=None):
+            if args[0] == "ls":
+                prefix = args[1].rstrip("*")
+                dirs = sorted({url[len(prefix):].split("/", 1)[0] for url in files if url.startswith(prefix)})
+                return "".join(f"{prefix}{d}/\n" for d in dirs), ""
+            reads.append(args[1])
+            text = files.get(args[1])
+            return (text, "") if text is not None else (None, "matched no objects")
+
+        with mock.patch.object(collect, "_gcloud_storage_call", fake_call), contextlib.redirect_stderr(io.StringIO()) as err:
+            releases = collect.releases_from_gcs([old_prefix + "*", new_prefix + "*"], limit=2)
+        self.assertEqual([r["build_id"] for r in releases], ["40", "30"], "the newest two across both prefixes")
+        self.assertFalse([r for r in reads if "/10/" in r or "/20/" in r], "the builds the caller would trim are never read")
+        self.assertIn("4 release-candidate builds listed under 2 prefix(es), reading the newest 2", err.getvalue())
+
     def test_a_failed_listing_warns_and_keeps_the_rest_of_the_collect(self):
         gcloud, _ = self.fake_rc_gcloud([])
+        os.environ["FAKE_GCLOUD_DENY"] = "nowhere"
         data, err = self.quiet_collect(
             from_dir=TESTDATA, rc_globs=["gs://fake-prow/nowhere/*"], gcloud=gcloud
         )
@@ -2186,12 +2252,23 @@ class TestReleaseCollection(_MergeBase):
         self.assertIn("gcloud storage ls failed", err)
         self.assertEqual(len(data["runs"]), 3)
 
+    def test_an_empty_prefix_is_a_note_not_a_failed_listing(self):
+        """One of the two RC globs lists nothing for the whole transition
+        (the new one before its first build, the old one once reaped)."""
+        gcloud, _ = self.fake_rc_gcloud([])
+        data, err = self.quiet_collect(
+            from_dir=TESTDATA, rc_globs=["gs://fake-prow/nowhere/*"], gcloud=gcloud
+        )
+        self.assertNotIn("releases", data)
+        self.assertIn("note: gs://fake-prow/nowhere/*: no release-candidate builds listed", err)
+        self.assertNotIn("warning", err)
+
 
 class TestRepParsing(unittest.TestCase):
     """tasks[].reps from the multi-repetition grading blocks, both formats.
 
-    The fixtures are REAL builds: PR 1075's serial run (`--- <task>
-    repetition N/3` launch markers), and PR 1057's / PR 1089's parallel
+    The fixtures are synthetic: PR 104's serial run (`--- <task>
+    repetition N/3` launch markers), and PR 103's / PR 105's parallel
     fan-out runs (`>>> launching <task> rep N/3` / `<<< finished ...`). The
     verdicts come from the `rep N:` grading lines in every format, so both
     fixtures must parse identically apart from which tasks they reached.
@@ -2205,7 +2282,7 @@ class TestRepParsing(unittest.TestCase):
         return {t["name"]: t for t in self.runs[build_id]["tasks"]}
 
     def test_parallel_green_reps_all_pass_with_null_reason(self):
-        task = self.tasks(BUILD_1057_PARALLEL)["reliability-pdb-probe"]
+        task = self.tasks(BUILD_103_PARALLEL)["case-02"]
         self.assertEqual(task["result"], "pass")
         self.assertEqual(
             task["reps"],
@@ -2218,19 +2295,19 @@ class TestRepParsing(unittest.TestCase):
 
     def test_unstable_task_grades_as_fail_and_keeps_the_rep_split(self):
         """[UNSTABLE] (passed some but not all reps) is not a clean pass."""
-        task = self.tasks(BUILD_1057_PARALLEL)["upgrades-lagging-master-probe"]
+        task = self.tasks(BUILD_103_PARALLEL)["case-27"]
         self.assertEqual(task["result"], "fail")
         self.assertEqual([r["result"] for r in task["reps"]], ["pass", "fail", "pass"])
 
     def test_reason_survives_its_own_delimiter_and_drops_the_scores_tail(self):
         """Fail reasons contain ` -- ` themselves; only the first one splits."""
-        rep = self.tasks(BUILD_1057_PARALLEL)["upgrades-lagging-master-probe"]["reps"][1]
-        self.assertTrue(rep["reason"].startswith("VerificationCorrectness=0.5 (floor 1.0) --"))
-        self.assertIn("the-probe-identifies-the-version-lag", rep["reason"])
+        rep = self.tasks(BUILD_103_PARALLEL)["case-27"]["reps"][1]
+        self.assertTrue(rep["reason"].startswith("VerificationCorrectness=0.4 (floor 1.0) --"))
+        self.assertIn("check-1", rep["reason"])
         self.assertNotIn("OutcomeScore", rep["reason"])  # metrics, not reason
 
     def test_infra_verdict_rep_with_marker(self):
-        task = self.tasks(BUILD_1057_PARALLEL)["compliance-rbac-overgrant"]
+        task = self.tasks(BUILD_103_PARALLEL)["case-09"]
         self.assertEqual([r["result"] for r in task["reps"]], ["pass", "infra", "fail"])
         self.assertEqual(
             task["reps"][1]["reason"],
@@ -2242,7 +2319,7 @@ class TestRepParsing(unittest.TestCase):
     def test_infra_verdict_rep_without_the_marker(self):
         """The `infra` verdict token alone is enough; not every infra rep
         carries the KUBE_AGENTS_INFRA_FAILURE literal."""
-        task = self.tasks(BUILD_1089_MIXED)["autoops-warning-event-triage"]
+        task = self.tasks(BUILD_105_MIXED)["case-25"]
         rep = task["reps"][0]
         self.assertEqual(rep["result"], "infra")
         self.assertNotIn("KUBE_AGENTS_INFRA_FAILURE", rep["reason"])
@@ -2251,31 +2328,31 @@ class TestRepParsing(unittest.TestCase):
     def test_blocked_rep_grades_as_fail(self):
         """`blocked` (inadmissible record, e.g. an empty trajectory) is a
         fail: the case did not pass, and the schema vocabulary is closed."""
-        rep = self.tasks(BUILD_1089_MIXED)["security-overgrant-probe"]["reps"][2]
+        rep = self.tasks(BUILD_105_MIXED)["case-29"]["reps"][2]
         self.assertEqual(rep["result"], "fail")
         self.assertTrue(rep["reason"].startswith("the record is not evidence of a real agent run"))
 
     def test_reason_is_truncated_to_the_cap(self):
-        rep = self.tasks(BUILD_1089_MIXED)["compliance-rbac-overgrant"]["reps"][1]
+        rep = self.tasks(BUILD_105_MIXED)["case-09"]["reps"][1]
         self.assertEqual(len(rep["reason"]), collect.REP_REASON_MAX_CHARS)
 
     def test_serial_format_parses_like_the_parallel_one(self):
-        tasks = self.tasks(BUILD_1075_SERIAL)
+        tasks = self.tasks(BUILD_104_SERIAL)
         self.assertEqual(
-            [r["result"] for r in tasks["capacity-pinned-pool-probe"]["reps"]],
+            [r["result"] for r in tasks["case-16"]["reps"]],
             ["fail", "fail", "pass"],
         )
-        # The abort cut the run mid-task: security-overgrant-probe launched
+        # The abort cut the run mid-task: case-29 launched
         # (its repetition markers are in the log) but was never graded, so it
         # yields no task entry at all -- launch markers alone carry no verdict.
         self.assertEqual(
-            sorted(tasks), ["capacity-pinned-pool-probe", "reliability-pdb-probe"]
+            sorted(tasks), ["case-02", "case-16"]
         )
 
     def test_rep_entry_field_names_and_order(self):
-        rep = self.tasks(BUILD_1057_PARALLEL)["reliability-pdb-probe"]["reps"][0]
+        rep = self.tasks(BUILD_103_PARALLEL)["case-02"]["reps"][0]
         self.assertEqual(list(rep), ["n", "result", "reason"])
-        task = self.tasks(BUILD_1057_PARALLEL)["reliability-pdb-probe"]
+        task = self.tasks(BUILD_103_PARALLEL)["case-02"]
         self.assertEqual(
             list(task), ["name", "result", "duration_s", "outcome_validity", "reps"]
         )
@@ -2291,7 +2368,7 @@ class TestRepParsing(unittest.TestCase):
         log = (
             "Task some-case Result: [PASSED] passed all 3 repetitions\n"
             "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
-            ">>> [2026-08-31T17:17:00Z] Grading Task: other-case (./tasks/other-case/task.yaml) x3 <<<\n"
+            ">>> [2025-09-01T17:17:00Z] Grading Task: other-case (./tasks/other-case/task.yaml) x3 <<<\n"
             "  rep 2: fail -- looks like a grading line, belongs to nothing\n"
         )
         (task,) = collect.parse_build_log(log)["tasks"]
@@ -2305,10 +2382,10 @@ class TestRepParsing(unittest.TestCase):
         """`bench-gate case` prints the agent's own words under a failing
         rep's grading line; the collector keeps them as that rep's `excerpt`
         and never makes a rep out of a report line alone."""
-        words = "I looked for a pool named pinned-inference-pool and found nothing by that name…"
+        words = "I looked for the named object and found nothing by that name…"
         log = (
-            "Task capacity-pinned-pool-probe Result: [FAILED] repetition 1: VerificationCorrectness=0.0 (floor 1.0)\n"
-            "  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- the-probe-names-the-planted-pool: required phrases absent [OutcomeScore=0.0]\n"
+            "Task case-16 Result: [FAILED] repetition 1: VerificationCorrectness=0.0 (floor 1.0)\n"
+            "  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.0]\n"
             f"  rep 1 report: {words}\n"
             "  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
             "  rep 3 report: a report for a repetition the log never graded\n"
@@ -2317,7 +2394,7 @@ class TestRepParsing(unittest.TestCase):
         (task,) = collect.parse_build_log(log)["tasks"]
         self.assertEqual([r["n"] for r in task["reps"]], [1, 2], "a report line never fabricates a rep")
         self.assertEqual(task["reps"][0]["excerpt"], words)
-        self.assertEqual(task["reps"][0]["reason"], "VerificationCorrectness=0.0 (floor 1.0) -- the-probe-names-the-planted-pool: required phrases absent",
+        self.assertEqual(task["reps"][0]["reason"], "VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent",
                          "the grading line parses exactly as before")
         self.assertEqual(list(task["reps"][0]), ["n", "result", "reason", "excerpt"])
         self.assertNotIn("excerpt", task["reps"][1], "absent, not null, when the log carried none")
@@ -2359,10 +2436,10 @@ class TestRepParsing(unittest.TestCase):
         self.assertIsNone(parsed["project"])
         self.assertEqual(parsed["tasks"], [])
 
-    def test_the_real_fixtures_predate_the_report_line(self):
-        """Absence means the log carried none: no fixture build printed the
-        line, so no rep may carry the key."""
-        for build in (BUILD_1057_PARALLEL, BUILD_1075_SERIAL, BUILD_1089_MIXED):
+    def test_logs_without_a_report_line_give_no_rep_the_key(self):
+        """Absence means the log carried none: none of the fixture logs prints
+        the line, so no rep may carry the key."""
+        for build in (BUILD_103_PARALLEL, BUILD_104_SERIAL, BUILD_105_MIXED):
             for task in self.tasks(build).values():
                 for rep in task.get("reps") or []:
                     self.assertNotIn("excerpt", rep, f"{build}/{task['name']}")
@@ -2525,8 +2602,8 @@ class TestRepParsing(unittest.TestCase):
         self.assertEqual(parsed["tasks"], [])
         self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
 
-    def test_the_real_fixtures_predate_the_tokens_line(self):
-        for build in (BUILD_1057_PARALLEL, BUILD_1075_SERIAL, BUILD_1089_MIXED):
+    def test_logs_without_a_tokens_line_give_no_rep_the_key(self):
+        for build in (BUILD_103_PARALLEL, BUILD_104_SERIAL, BUILD_105_MIXED):
             for task in self.tasks(build).values():
                 for rep in task.get("reps") or []:
                     self.assertNotIn("tokens", rep, f"{build}/{task['name']}")
@@ -2570,7 +2647,7 @@ pr = sys.argv[3]  # ["pr", "view", "<pr>", "--repo", ...]
 state = states.get(pr)
 if state is None:
     sys.exit(1)
-merged_at = "2026-08-31T18:47:42Z" if state == "MERGED" else None
+merged_at = "2025-09-01T18:47:42Z" if state == "MERGED" else None
 print(json.dumps({"state": state, "mergedAt": merged_at}))
 """
 
@@ -2606,25 +2683,25 @@ class TestPrMerged(unittest.TestCase):
             self.assertNotIn("pr_merged", run)
 
     def test_true_false_and_null_from_gh_answers(self):
-        gh, _ = self.fake_gh({"1057": "MERGED", "1075": "OPEN", "1089": "CLOSED"})
-        now = datetime(2026, 9, 2, tzinfo=timezone.utc)  # fixtures start 08-31/09-01
+        gh, _ = self.fake_gh({"103": "MERGED", "104": "OPEN", "105": "CLOSED"})
+        now = datetime(2025, 9, 3, tzinfo=timezone.utc)  # fixtures start 09-01/02
         data, stderr = self.collect_quietly(from_dir=REPS_TESTDATA, gh=gh, now=now)
         by_pr = {run["pr"]: run["pr_merged"] for run in data["runs"]}
         # MERGED -> true; OPEN and CLOSED-unmerged -> false.
-        self.assertEqual(by_pr, {1057: True, 1075: False, 1089: False})
+        self.assertEqual(by_pr, {103: True, 104: False, 105: False})
         self.assertNotIn("warning", stderr)
 
     def test_one_gh_call_per_distinct_pr(self):
-        gh, log = self.fake_gh({"956": "MERGED", "998": "MERGED"})
-        now = datetime(2026, 9, 1, tzinfo=timezone.utc)  # fixtures start 08-26/27
+        gh, log = self.fake_gh({"101": "MERGED", "102": "MERGED"})
+        now = datetime(2025, 9, 2, tzinfo=timezone.utc)  # fixtures start 08-27/28
         data, _ = self.collect_quietly(from_dir=TESTDATA, gh=gh, now=now)
-        self.assertEqual(len(data["runs"]), 3)  # two of them share PR 998
+        self.assertEqual(len(data["runs"]), 3)  # two of them share PR 102
         self.assertTrue(all(run["pr_merged"] is True for run in data["runs"]))
         self.assertEqual(len(log.read_text().splitlines()), 2)
 
     def test_gh_failure_degrades_to_null_with_one_warning(self):
         gh, log = self.fake_gh({})  # every pr view exits 1
-        now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 3, tzinfo=timezone.utc)
         data, stderr = self.collect_quietly(from_dir=REPS_TESTDATA, gh=gh, now=now)
         self.assertTrue(all(run["pr_merged"] is None for run in data["runs"]))
         warnings = [l for l in stderr.splitlines() if "pr_merged unresolved" in l]
@@ -2634,10 +2711,10 @@ class TestPrMerged(unittest.TestCase):
     def test_missing_gh_binary_degrades_to_null_with_one_warning(self):
         """The OSError path (no binary at all) trips the circuit breaker:
         everything degrades to null with the single summary warning."""
-        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 2, tzinfo=timezone.utc)
         runs = [
-            {"build_id": "1", "pr": 10, "started": "2026-08-30T00:00:00+00:00"},
-            {"build_id": "2", "pr": 20, "started": "2026-08-30T00:00:00+00:00"},
+            {"build_id": "1", "pr": 10, "started": "2025-08-31T00:00:00+00:00"},
+            {"build_id": "2", "pr": 20, "started": "2025-08-31T00:00:00+00:00"},
         ]
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -2651,14 +2728,14 @@ class TestPrMerged(unittest.TestCase):
         """true is terminal at any age; anything else resolves (or
         re-resolves) only while the run started within the 14-day window --
         an older run keeps its carried value, or gets null without a call."""
-        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 2, tzinfo=timezone.utc)
         runs = [
-            {"build_id": "1", "pr": 10, "started": "2026-08-30T00:00:00+00:00", "pr_merged": True},
-            {"build_id": "2", "pr": 20, "started": "2026-06-01T00:00:00+00:00", "pr_merged": False},
-            {"build_id": "3", "pr": 30, "started": "2026-08-30T00:00:00+00:00", "pr_merged": False},
-            {"build_id": "4", "pr": 40, "started": "2026-06-01T00:00:00+00:00"},
-            {"build_id": "5", "pr": None, "started": "2026-08-30T00:00:00+00:00"},
-            {"build_id": "6", "pr": 60, "started": "2026-08-30T00:00:00+00:00"},
+            {"build_id": "1", "pr": 10, "started": "2025-08-31T00:00:00+00:00", "pr_merged": True},
+            {"build_id": "2", "pr": 20, "started": "2025-06-02T00:00:00+00:00", "pr_merged": False},
+            {"build_id": "3", "pr": 30, "started": "2025-08-31T00:00:00+00:00", "pr_merged": False},
+            {"build_id": "4", "pr": 40, "started": "2025-06-02T00:00:00+00:00"},
+            {"build_id": "5", "pr": None, "started": "2025-08-31T00:00:00+00:00"},
+            {"build_id": "6", "pr": 60, "started": "2025-08-31T00:00:00+00:00"},
         ]
         gh, log = self.fake_gh({"30": "MERGED", "60": "OPEN"})
         collect.annotate_pr_merged(runs, gh, now=now)
@@ -2680,14 +2757,14 @@ class TestGradingArtifact(unittest.TestCase):
     parses as it always did."""
 
     LOG = (
-        "=== [2026-11-02T01:00:00Z] Running PR Smoke Test Evaluation for PR #4500 in Namespace: kubeagents-system ===\n"
+        "=== [2025-11-03T01:00:00Z] Running PR Smoke Test Evaluation for PR #4500 in Namespace: kubeagents-system ===\n"
         "Successfully leased project: kube-agents-evals-8\n"
-        ">>> [2026-11-02T01:30:00Z] some-case: graded; its block is in eval-grading.log <<<\n"
-        "=== [2026-11-02T02:00:00Z] Verdict table written to /logs/artifacts/eval-verdict.md ===\n"
-        "=== [2026-11-02T02:00:01Z] PR Smoke Test Evaluation Succeeded (Total Duration: 3600s) ===\n"
+        ">>> [2025-11-03T01:30:00Z] some-case: graded; its block is in eval-grading.log <<<\n"
+        "=== [2025-11-03T02:00:00Z] Verdict table written to /logs/artifacts/eval-verdict.md ===\n"
+        "=== [2025-11-03T02:00:01Z] PR Smoke Test Evaluation Succeeded (Total Duration: 3600s) ===\n"
     )
     GRADING = (
-        ">>> [2026-11-02T01:29:00Z] Grading Task: some-case (./tasks/some-case/task.yaml) x3 <<<\n"
+        ">>> [2025-11-03T01:29:00Z] Grading Task: some-case (./tasks/some-case/task.yaml) x3 <<<\n"
         "Task some-case Result: [UNSTABLE] passed 2 of 3 repetitions\n"
         "  deployer: noop\n"
         "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
@@ -2730,7 +2807,7 @@ class TestGradingArtifact(unittest.TestCase):
             "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
         )
         log = (
-            "--- [PROFILE 2026-11-02T01:00:00Z] step: bootstrap ---\n"
+            "--- [PROFILE 2025-11-03T01:00:00Z] step: bootstrap ---\n"
             "  rep 2: fail -- a stray line in the job log\n"
         ) + self.LOG
         with tempfile.TemporaryDirectory() as tmp:
@@ -2762,8 +2839,7 @@ class TestGradingArtifact(unittest.TestCase):
 
 class TestNotEvaluatedRun(unittest.TestCase):
     """runs[].eval_outcome and runs[].not_evaluated (SCHEMA.md), from the
-    DERIVED build under testdata_notevaluated/ -- no real run had ended with
-    the verdict when it was written; SCHEMA.md's fixtures table says so. Its
+    build under testdata_notevaluated/ (SCHEMA.md, Fixtures). Its
     final line carries NOT EVALUATED between the anchors and its
     artifacts/eval-verdict.json says `outcome: not_evaluated`, the two facts
     the collector requires together."""
@@ -2773,15 +2849,15 @@ class TestNotEvaluatedRun(unittest.TestCase):
 
     def test_the_suites_verdict_rides_beside_a_red_eval_verdict(self):
         run = self.fixture()
-        self.assertEqual(run["build_id"], BUILD_1782_NOT_EVALUATED)
+        self.assertEqual(run["build_id"], BUILD_108_NOT_EVALUATED)
         self.assertEqual((run["result"], run["eval_verdict"]), ("FAILURE", "RED"), "the line's Failed word still reads RED")
         self.assertEqual(run["eval_outcome"], "not_evaluated")
-        self.assertEqual(run["not_evaluated"], ["security-overgrant-probe"])
-        self.assertEqual(run["duration_s"], 1631, "the anchors survive the words between them")
+        self.assertEqual(run["not_evaluated"], ["case-29"])
+        self.assertEqual(run["duration_s"], 1191, "the anchors survive the words between them")
         by_name = {t["name"]: t for t in run["tasks"]}
-        self.assertEqual(by_name["security-overgrant-probe"]["result"], "infra")
-        self.assertEqual([r["result"] for r in by_name["security-overgrant-probe"]["reps"]], ["infra", "infra", "infra"])
-        self.assertEqual(by_name["reliability-pdb-probe"]["result"], "pass")
+        self.assertEqual(by_name["case-29"]["result"], "infra")
+        self.assertEqual([r["result"] for r in by_name["case-29"]["reps"]], ["infra", "infra", "infra"])
+        self.assertEqual(by_name["case-02"]["result"], "pass")
         self.assertEqual(
             list(run),
             ["build_id", "tier", "job", "pr", "head_sha", "base_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "eval_outcome", "not_evaluated", "has_build_log"],
@@ -2789,28 +2865,28 @@ class TestNotEvaluatedRun(unittest.TestCase):
 
     def test_the_verdict_file_is_read_once_and_only_when_the_line_says_so(self):
         asked = []
-        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_108_NOT_EVALUATED)
 
         def reader(name):
             asked.append(name)
             return inner(name)
 
-        run = collect.build_run(BUILD_1782_NOT_EVALUATED, reader)
+        run = collect.build_run(BUILD_108_NOT_EVALUATED, reader)
         self.assertEqual(asked.count("artifacts/eval-verdict.json"), 1)
         self.assertEqual(run["eval_outcome"], "not_evaluated")
         asked.clear()
-        plain = collect._dir_reader(TESTDATA / BUILD_998_FULL)
+        plain = collect._dir_reader(TESTDATA / BUILD_102_FULL)
 
         def plain_reader(name):
             asked.append(name)
             return plain(name)
 
-        run = collect.build_run(BUILD_998_FULL, plain_reader)
+        run = collect.build_run(BUILD_102_FULL, plain_reader)
         self.assertNotIn("artifacts/eval-verdict.json", asked, "a plain Failed line costs no extra read")
         self.assertFalse({"eval_outcome", "not_evaluated"} & set(run))
 
     def test_a_line_without_an_agreeing_file_is_a_plain_red_with_a_warning(self):
-        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_108_NOT_EVALUATED)
         for label, verdict_text in (
             ("missing", None),
             ("malformed", "{"),
@@ -2824,7 +2900,7 @@ class TestNotEvaluatedRun(unittest.TestCase):
             with self.subTest(label):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: verdict_text if name == "artifacts/eval-verdict.json" else inner(name))
+                    run = collect.build_run(BUILD_108_NOT_EVALUATED, lambda name: verdict_text if name == "artifacts/eval-verdict.json" else inner(name))
                 self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
                 self.assertEqual(run["eval_verdict"], "RED")
                 self.assertIn("the final line says NOT EVALUATED but artifacts/eval-verdict.json is missing or does not agree", err.getvalue())
@@ -2832,7 +2908,7 @@ class TestNotEvaluatedRun(unittest.TestCase):
     def test_a_transient_miss_on_the_artifact_gets_a_second_read(self):
         # A recorded build is never re-read, so one failed object read must
         # not record a not-evaluated run as the hard red for good.
-        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_108_NOT_EVALUATED)
         misses = []
 
         def reader(name):
@@ -2841,9 +2917,9 @@ class TestNotEvaluatedRun(unittest.TestCase):
                 return None
             return inner(name)
 
-        run = collect.build_run(BUILD_1782_NOT_EVALUATED, reader)
+        run = collect.build_run(BUILD_108_NOT_EVALUATED, reader)
         self.assertEqual(misses, ["artifacts/eval-verdict.json"])
-        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["case-29"]))
 
     def test_the_transport_shape_stays_a_plain_red_with_a_note(self):
         # Two writers share the outcome word (hack/ci-eval-pr.sh,
@@ -2855,36 +2931,36 @@ class TestNotEvaluatedRun(unittest.TestCase):
         # environment is healthy" would be the opposite of the gate's own
         # banner ("the lane's roster is what to fix"), so it is not recorded
         # as an infrastructure loss.
-        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_108_NOT_EVALUATED)
         transport_line = (
-            "❌ [2026-09-21T15:38:13Z] PR Smoke Test Evaluation Failed -- NOT EVALUATED: every case in the matrix was not graded"
+            "❌ [2025-09-22T15:38:13Z] PR Smoke Test Evaluation Failed -- NOT EVALUATED: every case in the matrix was not graded"
             " on this transport (every objective check not applicable), so this run graded nothing and cannot certify green."
             " Not a finding against the change and not an environment failure: the lane's roster is what to fix."
-            " See /logs/artifacts/eval-verdict.md (Total Duration: 1631s)"
+            " See /logs/artifacts/eval-verdict.md (Total Duration: 1191s)"
         )
         log = inner("build-log.txt")
         infra_line = next(l for l in log.splitlines() if "NOT EVALUATED" in l)
         transport_log = log.replace(infra_line, transport_line)
         self.assertNotEqual(log, transport_log)
-        artifact = json.dumps({"green": False, "outcome": "not_evaluated", "not_evaluated": [], "not_graded": ["agent-kanban-smoke", "reliability-pdb-probe"]})
+        artifact = json.dumps({"green": False, "outcome": "not_evaluated", "not_evaluated": [], "not_graded": ["case-24", "case-02"]})
         for label, log_text in (("the transport line", transport_log), ("the infrastructure line", log)):
             with self.subTest(label):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
                     run = collect.build_run(
-                        BUILD_1782_NOT_EVALUATED,
+                        BUILD_108_NOT_EVALUATED,
                         lambda name: artifact if name == "artifacts/eval-verdict.json" else log_text if name == "build-log.txt" else inner(name),
                     )
                 self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
-                self.assertEqual((run["eval_verdict"], run["duration_s"]), ("RED", 1631))
+                self.assertEqual((run["eval_verdict"], run["duration_s"]), ("RED", 1191))
                 self.assertIn("says every case was not graded on its transport", err.getvalue())
                 self.assertIn("recorded as a plain RED, which is not an infrastructure loss", err.getvalue())
                 self.assertNotIn("warning:", err.getvalue(), "a designed fallback, not a disagreeing artifact")
         # The artifact decides, not the words on the line: the infra shape
         # under the transport line is still the infra shape.
         with contextlib.redirect_stderr(io.StringIO()):
-            run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: transport_log if name == "build-log.txt" else inner(name))
-        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+            run = collect.build_run(BUILD_108_NOT_EVALUATED, lambda name: transport_log if name == "build-log.txt" else inner(name))
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["case-29"]))
 
     def test_an_infrastructure_artifact_naming_no_case_id_is_a_plain_red_with_a_warning(self):
         # scoring.py names every gradable case, or the admitted ones lost,
@@ -2895,11 +2971,11 @@ class TestNotEvaluatedRun(unittest.TestCase):
         # lost" and the comment "An admitted case lost", and told the author
         # to retest. It stays the plain RED the line's Failed word says,
         # with a warning that says why, distinct from the transport note.
-        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_108_NOT_EVALUATED)
         for label, artifact in (
             ("no list at all", {"green": False, "outcome": "not_evaluated"}),
             ("an empty list", {"green": False, "outcome": "not_evaluated", "not_evaluated": []}),
-            ("not a list", {"green": False, "outcome": "not_evaluated", "not_evaluated": "security-overgrant-probe"}),
+            ("not a list", {"green": False, "outcome": "not_evaluated", "not_evaluated": "case-29"}),
             ("no id-shaped entry", {"green": False, "outcome": "not_evaluated", "not_evaluated": ["with space", "a`b", 3, None]}),
             ("empty under both keys", {"green": False, "outcome": "not_evaluated", "not_evaluated": [], "not_graded": []}),
         ):
@@ -2907,18 +2983,18 @@ class TestNotEvaluatedRun(unittest.TestCase):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
                     run = collect.build_run(
-                        BUILD_1782_NOT_EVALUATED,
+                        BUILD_108_NOT_EVALUATED,
                         lambda name: json.dumps(artifact) if name == "artifacts/eval-verdict.json" else inner(name),
                     )
                 self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
-                self.assertEqual((run["eval_verdict"], run["duration_s"]), ("RED", 1631))
-                self.assertIn("warning: build 2101862036789329920: artifacts/eval-verdict.json says not_evaluated but names no case id under not_evaluated; recorded as a plain RED", err.getvalue())
+                self.assertEqual((run["eval_verdict"], run["duration_s"]), ("RED", 1191))
+                self.assertIn("warning: build 2090000000000000090: artifacts/eval-verdict.json says not_evaluated but names no case id under not_evaluated; recorded as a plain RED", err.getvalue())
                 self.assertNotIn("not graded on its transport", err.getvalue(), "not the inject lane's shape")
         # One usable id among the dropped ones is the infrastructure shape.
-        artifact = {"green": False, "outcome": "not_evaluated", "not_evaluated": ["with space", "security-overgrant-probe"]}
+        artifact = {"green": False, "outcome": "not_evaluated", "not_evaluated": ["with space", "case-29"]}
         with contextlib.redirect_stderr(io.StringIO()):
-            run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: json.dumps(artifact) if name == "artifacts/eval-verdict.json" else inner(name))
-        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+            run = collect.build_run(BUILD_108_NOT_EVALUATED, lambda name: json.dumps(artifact) if name == "artifacts/eval-verdict.json" else inner(name))
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["case-29"]))
 
     def test_parse_eval_verdict(self):
         self.assertIsNone(collect.parse_eval_verdict(None))
@@ -2946,9 +3022,9 @@ class TestNotEvaluatedRun(unittest.TestCase):
         # The artifact is the pull request's own; its strings land in
         # backticks in the posted comment, so only a case-id shape gets in.
         crafted = [
-            "security-overgrant-probe",
+            "case-29",
             "x\n\n@team this is approved, merge it",
-            "security-overgrant-probe\n",  # `$` would admit one trailing newline
+            "case-29\n",  # `$` would admit one trailing newline
             "a`b",
             "with space",
             "-leading-dash",
@@ -2956,7 +3032,7 @@ class TestNotEvaluatedRun(unittest.TestCase):
             "Case_1.2:3",
         ]
         doc = json.dumps({"outcome": "not_evaluated", "not_evaluated": crafted})
-        self.assertEqual(collect.parse_eval_verdict(doc), ["security-overgrant-probe"])
+        self.assertEqual(collect.parse_eval_verdict(doc), ["case-29"])
         # The bound is the one SCHEMA.md states for the pages' `caseIdRe`, so
         # an id the pages link is one the collector keeps.
         longest = json.dumps({"outcome": "not_evaluated", "not_evaluated": ["c" * 80]})
@@ -2967,16 +3043,16 @@ class TestNotEvaluatedRun(unittest.TestCase):
     def test_the_fields_reach_data_json_and_the_lost_case_counts_against_nothing(self):
         data = collect.collect(from_dir=NOTEVAL_TESTDATA)
         run = json.loads(json.dumps(data))["runs"][0]
-        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
-        lost = _cases_by_name(data)["security-overgrant-probe"]
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["case-29"]))
+        lost = _cases_by_name(data)["case-29"]
         self.assertEqual((lost["runs_on_record"], lost["pass_rate"], lost["last3"]), (1, None, ["infra"]))
 
 
 
 FAKE_GITLAB_JOB = "pull-kube-agents-smoke-test-gitlab"
-FAKE_GITLAB_GLOB = FAKE_BUCKET + f"pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+FAKE_GITLAB_GLOB = FAKE_BUCKET + f"pull/gke-labs_kube-agents/102/{FAKE_GITLAB_JOB}/*"
 # The lane's glob in the shape its index derives from, and that index.
-FAKE_GITLAB_INDEXED_GLOB = FAKE_BUCKET + f"pr-logs/pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+FAKE_GITLAB_INDEXED_GLOB = FAKE_BUCKET + f"pr-logs/pull/gke-labs_kube-agents/102/{FAKE_GITLAB_JOB}/*"
 FAKE_GITLAB_INDEX_PREFIX = FAKE_BUCKET + f"pr-logs/directory/{FAKE_GITLAB_JOB}/"
 
 
@@ -2985,7 +3061,7 @@ class TestGitLabLane(_MergeBase):
     builds, tagged tier gitlab, with a watermark of its own, listed on the
     Brief by itself and counted in no gate verdict."""
 
-    def place_gitlab_build(self, build, pr=998) -> pathlib.Path:
+    def place_gitlab_build(self, build, pr=102) -> pathlib.Path:
         root = self.bucket_root()
         dst = root / f"pull/gke-labs_kube-agents/{pr}/{FAKE_GITLAB_JOB}/{build}"
         shutil.copytree(TESTDATA / build, dst)
@@ -2993,10 +3069,10 @@ class TestGitLabLane(_MergeBase):
 
     def test_gitlab_builds_parse_with_their_tier_and_job_and_feed_no_case_history(self):
         gcloud, _ = self.fake_gcloud([])
-        self.place_gitlab_build(BUILD_998_FULL)
-        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        self.place_gitlab_build(BUILD_102_FULL)
+        now = datetime(2025, 9, 2, tzinfo=timezone.utc)
         data, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gcloud=gcloud, now=now)
-        self.assertEqual([(r["build_id"], r["tier"], r["job"], r["pr"]) for r in data["runs"]], [(BUILD_998_FULL, "gitlab", FAKE_GITLAB_JOB, 998)])
+        self.assertEqual([(r["build_id"], r["tier"], r["job"], r["pr"]) for r in data["runs"]], [(BUILD_102_FULL, "gitlab", FAKE_GITLAB_JOB, 102)])
         self.assertEqual(tiers.gitlab_runs(data["runs"]), data["runs"])
         self.assertEqual(tiers.presubmit_runs(data["runs"]), [], "the gate's filters never see it")
         # The per-case record is the presubmit's and the nightly's; a GitLab
@@ -3006,29 +3082,29 @@ class TestGitLabLane(_MergeBase):
     def test_each_source_resumes_above_its_own_watermark_gitlab_included(self):
         """The newest presubmit id sits far above every GitLab id (the lane
         runs rarely), so a shared watermark would skip every GitLab build."""
-        gcloud, log = self.fake_gcloud([BUILD_998_INFRA])  # presubmit candidate, old
-        self.place_gitlab_build(BUILD_956_TRUNCATED)  # the lowest id, under the GitLab job
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        gcloud, log = self.fake_gcloud([BUILD_102_INFRA])  # presubmit candidate, old
+        self.place_gitlab_build(BUILD_101_TRUNCATED)  # the lowest id, under the GitLab job
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_FULL])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
         prior = self.write_prior(prior_data)
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gcloud=gcloud, index_prefix="",
         )
         by_id = {run["build_id"]: run for run in merged["runs"]}
-        self.assertEqual(by_id[BUILD_956_TRUNCATED]["tier"], "gitlab", "below the presubmit watermark, above the lane's own")
-        self.assertNotIn(BUILD_998_INFRA, by_id, "below the presubmit's own watermark: skipped")
-        self.assertIn(f"GCS scan resumed above build {BUILD_998_FULL}", stderr)
+        self.assertEqual(by_id[BUILD_101_TRUNCATED]["tier"], "gitlab", "below the presubmit watermark, above the lane's own")
+        self.assertNotIn(BUILD_102_INFRA, by_id, "below the presubmit's own watermark: skipped")
+        self.assertIn(f"GCS scan resumed above build {BUILD_102_FULL}", stderr)
         self.assertIn("gitlab scan resumed above build 1, 1 new", stderr)
         # And the presubmit watermark ignores the lane's ids, as it ignores the nightly's.
-        self.assertEqual(collect.newest_build_id(tiers.presubmit_runs(merged["runs"])), int(BUILD_998_FULL))
+        self.assertEqual(collect.newest_build_id(tiers.presubmit_runs(merged["runs"])), int(BUILD_102_FULL))
 
     def test_a_lane_that_has_not_run_yet_is_a_note_not_the_refusal_line(self):
         """`gcloud storage ls` exits non-zero on a glob matching no objects, and the
         refresh workflow refuses to publish on `warning: gcloud storage ls ... failed`;
         until the lane's first build that must be a note, or every tick is red."""
-        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, _ = self.fake_gcloud([BUILD_102_FULL])
         data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], gcloud=gcloud)
-        self.assertEqual([r["build_id"] for r in data["runs"]], [BUILD_998_FULL])
+        self.assertEqual([r["build_id"] for r in data["runs"]], [BUILD_102_FULL])
         self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         # The presubmit's own glob keeps the warning when the listing fails (a
@@ -3050,7 +3126,7 @@ class TestGitLabLane(_MergeBase):
         the listing timeout that is the refusal line, indefinitely for an
         on-demand lane. The index answers "nothing yet" as a note, and lists
         the first build when it lands."""
-        gcloud, log = self.fake_gcloud([BUILD_998_FULL])
+        gcloud, log = self.fake_gcloud([BUILD_102_FULL])
         _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX)
         self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the lane's index, cold")
         self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "never the archive-wide glob")
@@ -3058,13 +3134,13 @@ class TestGitLabLane(_MergeBase):
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         # The first lane build lands: read through the index, no watermark yet.
         root = self.bucket_root()
-        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
-        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_101_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_101_TRUNCATED, root / url[len(FAKE_BUCKET):])
         index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
         index.mkdir(parents=True)
-        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        (index / f"{BUILD_101_TRUNCATED}.txt").write_text(url + "\n")
         data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX)
-        self.assertEqual({r["build_id"]: r["tier"] for r in data["runs"]}, {BUILD_998_FULL: "presubmit", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertEqual({r["build_id"]: r["tier"] for r in data["runs"]}, {BUILD_102_FULL: "presubmit", BUILD_101_TRUNCATED: "gitlab"})
         self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text())
 
     def test_a_known_but_empty_lane_index_is_a_note_and_a_denied_one_the_warning(self):
@@ -3073,8 +3149,8 @@ class TestGitLabLane(_MergeBase):
         the on-demand lane sat idle) must not stop the gate's dashboard
         publishing for the weeks until the lane next builds; a listing that
         fails any other way is the bucket or the grant, the refusal line."""
-        gcloud, log = self.fake_gcloud([BUILD_998_FULL])
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        gcloud, log = self.fake_gcloud([BUILD_102_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_FULL])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
         prior = self.write_prior(prior_data)
         merged, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX)
@@ -3096,37 +3172,37 @@ class TestGitLabLane(_MergeBase):
         """`--index-prefix` names the presubmit's index; handed to the lane it
         would list every presubmit build above the lane's low watermark and
         re-tag them gitlab, emptying the gate's history."""
-        gcloud, log = self.fake_gcloud([BUILD_998_FULL])  # in the presubmit's index
+        gcloud, log = self.fake_gcloud([BUILD_102_FULL])  # in the presubmit's index
         root = self.bucket_root()
-        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
-        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_101_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_101_TRUNCATED, root / url[len(FAKE_BUCKET):])
         index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
         index.mkdir(parents=True)
-        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        (index / f"{BUILD_101_TRUNCATED}.txt").write_text(url + "\n")
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_102_FULL])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
         prior = self.write_prior(prior_data)
         merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX,
         )
-        self.assertEqual({r["build_id"]: r["tier"] for r in merged["runs"]}, {BUILD_998_FULL: "presubmit", "1": "gitlab", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertEqual({r["build_id"]: r["tier"] for r in merged["runs"]}, {BUILD_102_FULL: "presubmit", "1": "gitlab", BUILD_101_TRUNCATED: "gitlab"})
         self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text())
         self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "with a watermark the lane reads its index, not the glob")
 
     def test_an_unfinished_gitlab_build_rides_pending_with_its_tier(self):
         gcloud, _ = self.fake_gcloud([])
-        built = self.place_gitlab_build(BUILD_998_FULL)
+        built = self.place_gitlab_build(BUILD_102_FULL)
         (built / "finished.json").unlink()
-        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 11, 12, 0, tzinfo=timezone.utc)
         data, _ = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gcloud=gcloud, now=now)
         self.assertEqual(data["runs"], [])
-        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_102_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
         # The tag survives a scan that lists nothing new, and the presubmit
         # source never retries it: its retry set is the presubmit's own.
         prior = self.write_prior(data)
         gcloud, log = self.fake_gcloud([])
         merged, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gcloud=gcloud, now=now + timedelta(minutes=15), index_prefix="")
-        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_102_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
 
     def test_a_gitlab_night_is_a_periodic_of_the_gitlab_tier_with_its_own_watermark(self):
         """The lane's nightly (kube-agents#2832) archives as a periodic: its
@@ -3139,21 +3215,21 @@ class TestGitLabLane(_MergeBase):
         root = self.bucket_root()
         prefix = root / night_prefix[len(FAKE_BUCKET):]
         prefix.mkdir(parents=True)
-        shutil.copytree(TESTDATA / BUILD_998_FULL, prefix / BUILD_998_FULL)
-        (prefix / "latest-build.txt").write_text(BUILD_998_FULL + "\n")
-        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)  # inside 14 days of the fixtures (2026-08-26/27): the fresh sweep is bounded to that without a watermark
+        shutil.copytree(TESTDATA / BUILD_102_FULL, prefix / BUILD_102_FULL)
+        (prefix / "latest-build.txt").write_text(BUILD_102_FULL + "\n")
+        now = datetime(2025, 9, 2, 12, 0, tzinfo=timezone.utc)  # inside 14 days of the fixtures (2025-08-27/28): the fresh sweep is bounded to that without a watermark
         data, stderr = self.quiet_collect(gitlab_nightly_prefix=night_prefix, gcloud=gcloud, now=now)
         (run,) = data["runs"]
         self.assertEqual((run["tier"], run["pr"], run["job"]), ("gitlab", None, "ci-fake-eval-nightly-gitlab"))
-        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-fake-eval-nightly-gitlab/{BUILD_998_FULL}")
+        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-fake-eval-nightly-gitlab/{BUILD_102_FULL}")
         self.assertEqual(tiers.presubmit_runs(data["runs"]), [])
         # A lane pull-request build with a LOWER id than the night is still read: the lane's watermark is its own.
         prior = self.write_prior(data)
-        self.place_gitlab_build(BUILD_956_TRUNCATED)
+        self.place_gitlab_build(BUILD_101_TRUNCATED)
         merged, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gitlab_nightly_prefix=night_prefix, merge_with=prior, gcloud=gcloud, index_prefix="", now=now)
-        self.assertEqual({r["build_id"]: r["pr"] for r in merged["runs"]}, {BUILD_998_FULL: None, BUILD_956_TRUNCATED: 956}, "the night keeps no pull request; the lane build keeps the one its started.json names")
+        self.assertEqual({r["build_id"]: r["pr"] for r in merged["runs"]}, {BUILD_102_FULL: None, BUILD_101_TRUNCATED: 101}, "the night keeps no pull request; the lane build keeps the one its started.json names")
         self.assertIn("gitlab scan resumed above build None", stderr)
-        self.assertIn(f"gitlab nights resumed above build {BUILD_998_FULL}, 0 new", stderr)
+        self.assertIn(f"gitlab nights resumed above build {BUILD_102_FULL}, 0 new", stderr)
 
     def test_a_ghes_lane_glob_is_a_tier_and_a_section_of_its_own(self):
         """A self-managed forge lane (kube-agents#3682) is collected the GitLab
@@ -3161,11 +3237,11 @@ class TestGitLabLane(_MergeBase):
         GitLab one's, and counted in no gate verdict."""
         gcloud, _ = self.fake_gcloud([])
         root = self.bucket_root()
-        shutil.copytree(TESTDATA / BUILD_998_FULL, root / f"pull/gke-labs_kube-agents/998/pull-fake-smoke-ghes/{BUILD_998_FULL}")
-        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-fake-smoke-ghes/*"
-        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        shutil.copytree(TESTDATA / BUILD_102_FULL, root / f"pull/gke-labs_kube-agents/102/pull-fake-smoke-ghes/{BUILD_102_FULL}")
+        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/102/pull-fake-smoke-ghes/*"
+        now = datetime(2025, 9, 2, tzinfo=timezone.utc)
         data, stderr = self.quiet_collect(lane_globs={"ghes": [glob]}, gcloud=gcloud, now=now)
-        self.assertEqual([(r["build_id"], r["tier"], r["job"]) for r in data["runs"]], [(BUILD_998_FULL, "ghes", "pull-fake-smoke-ghes")])
+        self.assertEqual([(r["build_id"], r["tier"], r["job"]) for r in data["runs"]], [(BUILD_102_FULL, "ghes", "pull-fake-smoke-ghes")])
         self.assertEqual(tiers.forge_runs(data["runs"], "ghes"), data["runs"])
         self.assertEqual(tiers.gitlab_runs(data["runs"]), [], "not the GitLab lane's")
         self.assertEqual(tiers.presubmit_runs(data["runs"]), [])
@@ -3179,20 +3255,20 @@ class TestGitLabLane(_MergeBase):
         nxt = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab-next/"
         gcloud, _ = self.fake_gcloud([])
         root = self.bucket_root()
-        for prefix, build in ((today, BUILD_998_FULL), (nxt, BUILD_956_TRUNCATED)):
+        for prefix, build in ((today, BUILD_102_FULL), (nxt, BUILD_101_TRUNCATED)):
             where = root / prefix[len(FAKE_BUCKET):]
             where.mkdir(parents=True)
             shutil.copytree(TESTDATA / build, where / build)
             (where / "latest-build.txt").write_text(build + "\n")
-        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 9, 2, 12, 0, tzinfo=timezone.utc)
         data, _ = self.quiet_collect(gitlab_nightly_prefix=today, gcloud=gcloud, now=now)
         prior = self.write_prior(data)
         merged, stderr = self.quiet_collect(
             gitlab_nightly_prefix=today, lane_nightly_prefixes={"gitlab": [nxt]}, merge_with=prior, gcloud=gcloud, now=now,
         )
         by_id = {r["build_id"]: r for r in merged["runs"]}
-        self.assertEqual((by_id[BUILD_956_TRUNCATED]["tier"], by_id[BUILD_956_TRUNCATED]["job"]), ("gitlab", "ci-fake-eval-nightly-gitlab-next"), "below the today night, above its own job's watermark")
-        self.assertIn(f"gitlab nights ci-fake-eval-nightly-gitlab resumed above build {BUILD_998_FULL}, 0 new", stderr)
+        self.assertEqual((by_id[BUILD_101_TRUNCATED]["tier"], by_id[BUILD_101_TRUNCATED]["job"]), ("gitlab", "ci-fake-eval-nightly-gitlab-next"), "below the today night, above its own job's watermark")
+        self.assertIn(f"gitlab nights ci-fake-eval-nightly-gitlab resumed above build {BUILD_102_FULL}, 0 new", stderr)
         self.assertIn("gitlab nights ci-fake-eval-nightly-gitlab-next resumed above build None, 1 new", stderr)
 
     def test_a_lane_tier_that_is_not_a_forge_lanes_is_refused(self):
@@ -3205,8 +3281,8 @@ class TestGitLabLane(_MergeBase):
     def test_the_cli_takes_a_forge_lane_glob_and_refuses_a_malformed_one(self):
         gcloud, _ = self.fake_gcloud([])
         root = self.bucket_root()
-        shutil.copytree(TESTDATA / BUILD_998_FULL, root / f"pull/gke-labs_kube-agents/998/pull-fake-smoke-gitlab-ce/{BUILD_998_FULL}")
-        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-fake-smoke-gitlab-ce/*"
+        shutil.copytree(TESTDATA / BUILD_102_FULL, root / f"pull/gke-labs_kube-agents/102/pull-fake-smoke-gitlab-ce/{BUILD_102_FULL}")
+        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/102/pull-fake-smoke-gitlab-ce/*"
         out = self.tmp / "out.json"
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -3219,7 +3295,7 @@ class TestGitLabLane(_MergeBase):
 
     def test_the_cli_takes_the_lane_glob_and_counts_it(self):
         gcloud, _ = self.fake_gcloud([])
-        self.place_gitlab_build(BUILD_998_FULL)
+        self.place_gitlab_build(BUILD_102_FULL)
         out = self.tmp / "out.json"
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

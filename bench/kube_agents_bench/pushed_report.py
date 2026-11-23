@@ -30,13 +30,16 @@ What it grades is the hermes-bridge's read of that row before the turn
 (``a2a/hermes-bridge/incident.go``): under ``spec.mode: next`` a reply under
 a report the relay or the notifier pushed reaches the bridge with no link to
 the report, and the bridge attaches the stored report ahead of the user's
-words, as the Hermes gateway's ``incident_context`` hook does under today.
+words, as the Hermes gateway's ``incident_context`` hook did before the bus.
+On a live install the gateway relays a card's report it posted into the
+thread ahead of the row (``a2a/docs/hermes-bridge.md``); the row is the
+fallback, and the one reached here, since nothing posts into an inject
+conversation.
 A case asks about a detail only the report carries; an agent that has the
 report answers it, and one that does not cannot.
 
-It runs on the inject transport only: the API server has no conversation
-the bridge keys the row to. A case that uses it lists itself in
-``hack/eval/api-lane-exclusions.txt``.
+It runs on the inject transport only, which every CI lane uses: the API
+server has no conversation the bridge keys the row to.
 
 The plant records :data:`PLANT_ENTRY` on the run's trajectory with status
 ``completed``, so a case's ``tool_called`` objective with
@@ -247,7 +250,11 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
     record's tokens are the chain's usage as the door reported it, null
     where it reported none, and a null bucket adds nothing).
     """
+    from kube_agents_bench import worker_trajectory  # devops_bench-bound, like the import below
     from kube_agents_bench.card_wake import _add_tokens  # devops_bench-bound; imported where a result exists
+
+    def _no_worker_calls(trajectory: list) -> bool:
+        return any(isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY for e in trajectory)
 
     tokens = dict(reply.tokens)
     _add_tokens(tokens, opening.tokens)
@@ -257,10 +264,15 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
         "opening_task_id": opening.metadata.get("task_id"),
         "plant": entry["args"],
     }
+    # A no-worker-calls entry speaks for the cards of the turn that wrote it;
+    # beside a turn without one it would grade that turn's cards too.
+    trajectory = [*opening.trajectory, entry, *reply.trajectory]
+    if not (_no_worker_calls(opening.trajectory) and _no_worker_calls(reply.trajectory)):
+        trajectory = [e for e in trajectory if not (isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY)]
     # The result's own class, so this module never imports devops_bench.
     return type(reply)(
         output=reply.output,
-        trajectory=[*opening.trajectory, entry, *reply.trajectory],
+        trajectory=trajectory,
         tokens=tokens,
         errors=[*opening.errors, *reply.errors],
         metadata=metadata,

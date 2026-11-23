@@ -178,7 +178,7 @@ func (b *NATSBus) Status(ctx context.Context) BusStatus {
 	if sr == nil {
 		sr = &statusRead{done: make(chan struct{})}
 		b.inflight = sr
-		go b.refresh(sr)
+		go b.refresh(sr) // #nosec G118 -- the read is shared: a caller that gives up must not cancel the read the next caller waits on
 	}
 	b.mu.Unlock()
 	select {
@@ -385,7 +385,7 @@ func passwordFromFile(user, path, initial string) func() (string, string) {
 	return func() (string, string) {
 		mu.Lock()
 		defer mu.Unlock()
-		if raw, err := os.ReadFile(path); err == nil {
+		if raw, err := os.ReadFile(path); err == nil { // #nosec G304 -- the server's own password mount
 			if pw := strings.TrimRight(string(raw), "\r\n"); pw != "" {
 				last = pw
 			}

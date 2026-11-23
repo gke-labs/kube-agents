@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -27,7 +28,7 @@ import (
 // Secret, the StatefulSet on hash "h1", and its pod.
 func a2aReloadFixture(t *testing.T, liveConf string, annotations map[string]string) (*PlatformAgentReconciler, *agentv1alpha1.PlatformAgent, *appsv1.StatefulSet, *record.FakeRecorder) {
 	t.Helper()
-	agent := a2aTestAgent()
+	agent := a2aSingleServerTestAgent()
 	sts := buildA2ANATSStatefulSet(agent, "h1")
 	sts.UID = "sts-uid"
 	secret := &corev1.Secret{
@@ -41,6 +42,14 @@ func a2aReloadFixture(t *testing.T, liveConf string, annotations map[string]stri
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts, secret, pod).Build()
 	rec := record.NewFakeRecorder(10)
 	return &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: rec}, agent, sts, rec
+}
+
+// singleServerRecord is the per-server reload record for the fixture's one
+// pod (UID "pod-uid", on the fixed start the busConfigLoadTime stub answers)
+// with the load time loaded.
+func singleServerRecord(loaded string) string {
+	name := a2aNATSName(a2aSingleServerTestAgent()) + a2aNATSPodOrdinalSuffix
+	return `{"` + name + `":{"uid":"pod-uid","start":"s","loaded":"` + loaded + `"}}`
 }
 
 func a2aDesiredConfig(agent *agentv1alpha1.PlatformAgent, conf string) *corev1.Secret {
@@ -63,17 +72,18 @@ func a2aBusPodExists(t *testing.T, r *PlatformAgentReconciler, sts *appsv1.State
 // records when it was asked for and the load time it has to move off.
 func TestANewConfigUnderTheSameHashIsAReload(t *testing.T) {
 	r, agent, sts, _ := a2aReloadFixture(t, "old", nil)
-	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t0", nil }
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t0", nil }
 	config := a2aDesiredConfig(agent, "new")
 	now := time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC)
 	plan, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.restartPod || plan.reloaded || plan.requeue != a2aBusReloadRecheck {
+	if plan.restart != "" || plan.reloaded || plan.requeue != a2aBusReloadRecheck {
 		t.Fatalf("plan = %+v, want a pending reload rechecked in %s", plan, a2aBusReloadRecheck)
 	}
-	if config.Annotations[a2aBusReloadBaselineAnnotation] != "t0" || config.Annotations[a2aBusReloadRequestedAnnotation] != now.Format(time.RFC3339Nano) {
+	state, _ := readA2ABusReloadState(config.Annotations, sts.Name)
+	if state.servers[sts.Name+a2aNATSPodOrdinalSuffix].Loaded != "t0" || config.Annotations[a2aBusReloadBaselineAnnotation] != "t0" || config.Annotations[a2aBusReloadRequestedAnnotation] != now.Format(time.RFC3339Nano) {
 		t.Fatalf("pending reload not stamped: %v", config.Annotations)
 	}
 }
@@ -87,7 +97,7 @@ func TestAChangedHashIsARollNotAReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan != (a2aBusReload{}) || len(config.Annotations) != 0 {
+	if !reflect.DeepEqual(plan, a2aBusReload{}) || len(config.Annotations) != 0 {
 		t.Fatalf("plan = %+v, annotations %v; want nothing tracked", plan, config.Annotations)
 	}
 }
@@ -102,7 +112,7 @@ func TestAReloadThatDoesntLandRestartsTheBusPod(t *testing.T) {
 		a2aBusReloadBaselineAnnotation:  "t0",
 	}
 	r, agent, sts, rec := a2aReloadFixture(t, "new", pending)
-	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t0", nil }
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t0", nil }
 	ctx := context.Background()
 
 	config := a2aDesiredConfig(agent, "new")
@@ -110,7 +120,7 @@ func TestAReloadThatDoesntLandRestartsTheBusPod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.restartPod || plan.requeue <= 0 || config.Annotations[a2aBusReloadRequestedAnnotation] != pending[a2aBusReloadRequestedAnnotation] {
+	if plan.restart != "" || plan.requeue <= 0 || config.Annotations[a2aBusReloadRequestedAnnotation] != pending[a2aBusReloadRequestedAnnotation] {
 		t.Fatalf("inside the bound: plan = %+v, annotations %v; want still pending", plan, config.Annotations)
 	}
 
@@ -119,10 +129,12 @@ func TestAReloadThatDoesntLandRestartsTheBusPod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !plan.restartPod || len(config.Annotations) != 0 {
-		t.Fatalf("at the bound: plan = %+v, annotations %v; want a restart and no pending record", plan, config.Annotations)
+	// The record stays until the restarted server is read on the new
+	// config: the profile hold rides it (fail closed).
+	if plan.restart != sts.Name+a2aNATSPodOrdinalSuffix || config.Annotations[a2aBusReloadRequestedAnnotation] != pending[a2aBusReloadRequestedAnnotation] {
+		t.Fatalf("at the bound: plan = %+v, annotations %v; want a restart and the pending record kept", plan, config.Annotations)
 	}
-	if err := r.actOnA2ABusReload(ctx, agent, sts.Name, plan); err != nil {
+	if err := r.actOnA2ABusReload(ctx, agent, plan); err != nil {
 		t.Fatal(err)
 	}
 	if a2aBusPodExists(t, r, sts) {
@@ -143,7 +155,7 @@ func TestAReloadThatDoesntLandRestartsTheBusPod(t *testing.T) {
 func TestAnUnreadableLoadTimeEndsInARestart(t *testing.T) {
 	r, agent, sts, _ := a2aReloadFixture(t, "old", nil)
 	readable := false
-	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) {
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) {
 		if !readable {
 			return "", errors.New("connection refused")
 		}
@@ -176,7 +188,7 @@ func TestAnUnreadableLoadTimeEndsInARestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !plan.restartPod {
+	if plan.restart == "" {
 		t.Fatalf("plan = %+v, want a restart at the bound", plan)
 	}
 }

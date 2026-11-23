@@ -45,6 +45,7 @@ func TestMain(m *testing.M) {
 		"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL",
 		"A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP",
 		"A2A_SPAWN_SESSIONS", "A2A_SESSION_SERVICE_ACCOUNT", "A2A_DEFAULT_ADDRESSEE",
+		"A2A_TEAMS_RELAY_URL",
 	} {
 		os.Unsetenv(k)
 	}
@@ -55,8 +56,8 @@ func TestMain(m *testing.M) {
 // there, so none of them dials NATS. Each case pins A2A_CHAT_DISPLAY_MODE to
 // empty because FromEnv validates it before NATS_URL: a CI environment with
 // a stray value there would otherwise change which error fires. The Slack
-// pair is cleared for the same reason — it arms a third backend, so a stray
-// SLACK_BOT_TOKEN turns a one-backend case into a two-backend refusal.
+// pair is cleared for the same reason: a stray SLACK_BOT_TOKEN arms Slack,
+// and half a pair turns any case into the half-pair refusal.
 func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 	cases := []struct {
 		name string
@@ -69,47 +70,12 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			want: "NATS_URL",
 		},
 		{
-			name: "two backends set",
-			env: map[string]string{
-				"NATS_URL":            "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":       "tok",
-				"A2A_GCHAT_RELAY_URL": "http://relay",
-			},
-			// The refusal names what is armed, so an operator reading it
-			// knows which variable to unset.
-			want: "more than one chat backend is configured",
-		},
-		{
-			name: "slack and discord set",
-			env: map[string]string{
-				"NATS_URL":        "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":   "tok",
-				"SLACK_BOT_TOKEN": "xoxb-tok",
-				"SLACK_APP_TOKEN": "xapp-tok",
-			},
-			want: "more than one chat backend is configured (the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair, DISCORD_TOKEN)",
-		},
-		{
 			name: "half a slack pair",
 			env: map[string]string{
 				"NATS_URL":        "nats://127.0.0.1:1",
 				"SLACK_BOT_TOKEN": "xoxb-tok",
 			},
 			want: "SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together",
-		},
-		{
-			// The door is a side door: beside one real backend it is
-			// accepted, so the refusal here is the two BACKENDS, and the
-			// message must not send the reader to unset the door.
-			name: "two backends with the door open as well",
-			env: map[string]string{
-				"NATS_URL":            "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":       "tok",
-				"A2A_GCHAT_RELAY_URL": "http://relay",
-				"A2A_INJECT_LISTEN":   ":8099",
-				"A2A_INJECT_TOKEN":    "s3cret",
-			},
-			want: "more than one chat backend is configured",
 		},
 		{
 			// A door with no token never arms. The fence in front of it does
@@ -278,7 +244,7 @@ func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
 	s := startTestServer(t)
 	cfg := &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x"}
 	primary := newFakePrimary()
-	m, err := buildAdapters(cfg, primary, nil, slog.Default())
+	m, err := buildAdapters(cfg, map[string]gateway.Adapter{"discord": primary}, nil, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +253,58 @@ func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
 	}
 	if _, err := m.Post("discord:g/c", "hi"); err != nil {
 		t.Errorf("primary not wired: %v", err)
+	}
+}
+
+// TestBuildAdaptersCarriesEveryRealBackend proves two armed backends both sit
+// behind the mux beside the console: a post to each prefix reaches its own
+// adapter.
+func TestBuildAdaptersCarriesEveryRealBackend(t *testing.T) {
+	s := startTestServer(t)
+	cfg := &gateway.Config{NATSURL: s.ClientURL(), GchatRelayURL: "http://relay", SlackBotToken: "xoxb-1", SlackAppToken: "xapp-1"}
+	gchat, slack := newFakePrimary(), newFakePrimary()
+	m, err := buildAdapters(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, conv := range []string{"console:tab-1", "gchat:spaces/A", "slack:C1/1.1"} {
+		if _, err := m.Post(conv, "hi"); err != nil {
+			t.Errorf("%s not wired: %v", conv, err)
+		}
+	}
+	if len(gchat.posts) != 1 || len(slack.posts) != 1 {
+		t.Fatalf("posts reached gchat=%d slack=%d, want one each", len(gchat.posts), len(slack.posts))
+	}
+}
+
+// TestChatNotifiersArmOnePerBackend proves each real backend gets its own
+// chat.notify route, in cfg.Backends() order, and that one backend's
+// malformed home channel leaves the other's route armed.
+func TestChatNotifiersArmOnePerBackend(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slack, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	// The malformed-home case below logs its refusal by design; keep it out of the test output.
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := &gateway.Config{GchatRelayURL: "http://relay.invalid", SlackBotToken: "xoxb-stub", SlackAppToken: "xapp-stub",
+		GchatHomeChannel: "spaces/AAAA", SlackHomeChannel: "C0HOME"}
+	ns := chatNotifiers(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, conversations, quiet)
+	if len(ns) != 2 {
+		t.Fatalf("%d routes armed, want 2", len(ns))
+	}
+	if ns[0].Backend() != lib.NotifyPlatformGchat || ns[1].Backend() != lib.NotifyPlatformSlack {
+		t.Fatalf("routes = %s, %s; want %s then %s", ns[0].Backend(), ns[1].Backend(), lib.NotifyPlatformGchat, lib.NotifyPlatformSlack)
+	}
+	// A malformed Slack home arms Chat's route alone.
+	cfg.SlackHomeChannel = "#ops"
+	if ns := chatNotifiers(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, conversations, quiet); len(ns) != 1 || ns[0].Backend() != lib.NotifyPlatformGchat {
+		t.Fatalf("with a malformed Slack home: %d routes, want Chat's alone", len(ns))
 	}
 }
 
@@ -313,9 +331,9 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var primary gateway.Adapter
+			var backends map[string]gateway.Adapter
 			if tc.primary != nil {
-				primary = tc.primary
+				backends = map[string]gateway.Adapter{"discord": tc.primary}
 			}
 			doors := []gateway.DoorSpec{gateway.InjectDoorSpec(door)}
 			if tc.cfg.A2ADoorArmed() {
@@ -325,7 +343,7 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 				}
 				doors = append(doors, gateway.A2ADoorSpec(a2a))
 			}
-			a, err := composeAdapters(tc.cfg, primary, doors, nil, slog.Default())
+			a, err := composeAdapters(tc.cfg, backends, doors, nil, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -690,6 +708,52 @@ func TestNoHomeChannelIsLoggedAsAWarning(t *testing.T) {
 	}
 }
 
+// TestARouteArmedToLearnIsLoggedAsWaiting: with no home channel and the learn
+// armed, the startup line says the route waits for a mention, at Info, and
+// the "not armed" warning is absent: the gateway will get a home without a
+// configuration change.
+func TestARouteArmedToLearnIsLoggedAsWaiting(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		cfg     *gateway.Config
+	}{
+		{"chat", gchat, &gateway.Config{GchatRelayURL: "http://relay.invalid", HomeChannelRecord: "agent-home-channel", HomeChannelLearn: true}},
+		{"slack", slackBackend, &gateway.Config{SlackBotToken: "xoxb-stub", HomeChannelRecord: "agent-home-channel", HomeChannelLearn: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged syncBuffer
+			chatNotifier(tc.cfg, tc.backend, conversations, slog.New(slog.NewJSONHandler(&logged, nil)))
+			waiting := false
+			for _, line := range strings.Split(strings.TrimSpace(logged.buf.String()), "\n") {
+				var rec map[string]any
+				if json.Unmarshal([]byte(line), &rec) != nil {
+					continue
+				}
+				msg := fmt.Sprint(rec["msg"])
+				if strings.HasPrefix(msg, "chat.notify home posts not armed") {
+					t.Fatalf("logged %v for a route armed to learn", rec)
+				}
+				if strings.HasPrefix(msg, "chat.notify home posts use a learned home channel") {
+					waiting = rec["level"] == "INFO"
+				}
+			}
+			if !waiting {
+				t.Fatalf("no Info \"home posts wait\" line; log: %s", logged.buf.String())
+			}
+		})
+	}
+}
+
 // The chat.notify route arms for a Google Chat or Slack backend with or without a home
 // channel, always with the gateway's conversations behind it (a kanban
 // card's report back to its conversation needs them, and with no home channel
@@ -774,5 +838,79 @@ func TestTheStandbyAnswersOnEveryArmedDoor(t *testing.T) {
 	got := standbyListens(&gateway.Config{InjectListen: "127.0.0.1:8099", InjectToken: "t", A2ADoorListen: "127.0.0.1:8100", A2ADoorToken: "u"})
 	if strings.Join(got, ",") != "127.0.0.1:8099,127.0.0.1:8100" {
 		t.Fatalf("standby listens %v", got)
+	}
+}
+
+// The inject door takes intent "confirm" exactly when the config says so:
+// realMain builds it through newInjectDoor, which must arm AllowConfirm for
+// A2A_INJECT_CONFIRM=true and leave it off otherwise.
+func TestNewInjectDoorArmsConfirmOnlyUnderItsFlag(t *testing.T) {
+	for _, confirm := range []bool{false, true} {
+		cfg := &gateway.Config{InjectListen: "127.0.0.1:0", InjectToken: "tok", InjectConfirm: confirm}
+		door, err := newInjectDoor(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("InjectConfirm=%v: %v", confirm, err)
+		}
+		if got := door.ConfirmAllowed(); got != confirm {
+			t.Errorf("InjectConfirm=%v: door ConfirmAllowed = %v, want %v", confirm, got, confirm)
+		}
+	}
+}
+
+// A gateway that gave its term up because the bus was down mid-term exits
+// with a termination message naming ErrTermBusLost and how long the bus was
+// down, so the restart reads as that in kubectl describe; another failure
+// writes none.
+func TestServeExplainsABusLostExit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "termination-log")
+	old := terminationLogPath
+	terminationLogPath = path
+	t.Cleanup(func() { terminationLogPath = old })
+	cfg := &gateway.Config{}
+	log := slog.New(slog.DiscardHandler)
+
+	lost := fmt.Errorf("%w for 1m0s, so the lease goes to a replica whose bus may", gateway.ErrTermBusLost)
+	if err := serve(context.Background(), cfg, gateway.NewMetrics(), nil, log, func(context.Context) error { return lost }); !errors.Is(err, gateway.ErrTermBusLost) {
+		t.Fatalf("serve = %v, want the bus-lost error back", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("termination message: %v", err)
+	}
+	if msg := string(b); !strings.HasPrefix(msg, "ErrTermBusLost: ") || !strings.Contains(msg, "1m0s") {
+		t.Fatalf("termination message = %q, want ErrTermBusLost and the duration", msg)
+	}
+
+	_ = os.Remove(path)
+	if err := serve(context.Background(), cfg, gateway.NewMetrics(), nil, log, func(context.Context) error { return errors.New("something else") }); err == nil {
+		t.Fatal("serve swallowed the error")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("another failure wrote a termination message: %v", err)
+	}
+}
+
+// TestA2ADoorOptionsCarryEverySignInClass: the door is armed from what the
+// config read, class by class. A class the config reads but the options do
+// not carry is a door that refuses every one of that class's tokens on a
+// real install while every test, which builds the options directly, passes.
+func TestA2ADoorOptionsCarryEverySignInClass(t *testing.T) {
+	cfg := &gateway.Config{
+		A2ADoorPublicURL: "https://x/a2a", DefaultAddressee: "platform", TaskDeadline: time.Minute,
+		A2ADoorGoogleClientID: "client", A2ADoorAllowedUsers: []string{"dev@example.com"},
+		A2ADoorEntraTenantID: "tenant", A2ADoorEntraClientID: "app", A2ADoorEntraAllowedUsers: []string{"oid"},
+	}
+	o := a2aDoorOptions(cfg, slog.Default())
+	if o.PublicURL != cfg.A2ADoorPublicURL || o.DefaultAddressee != cfg.DefaultAddressee || o.TaskDeadline != cfg.TaskDeadline {
+		t.Errorf("door options = %+v", o)
+	}
+	if o.GoogleClientID != cfg.A2ADoorGoogleClientID || len(o.GoogleAllowedUsers) != 1 {
+		t.Errorf("the Google class is not carried: %+v", o)
+	}
+	if o.EntraTenantID != cfg.A2ADoorEntraTenantID || o.EntraClientID != cfg.A2ADoorEntraClientID || len(o.EntraAllowedUsers) != 1 {
+		t.Errorf("the Entra class is not carried: %+v", o)
+	}
+	if o.Logger == nil {
+		t.Error("no logger")
 	}
 }

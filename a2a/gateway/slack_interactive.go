@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/slack-go/slack"
@@ -105,6 +106,11 @@ type slackClickPayload struct {
 		// SelectedConversation is a conversations_select's pick: the Home
 		// tab's channel picker (slack_home_pick.go).
 		SelectedConversation string `json:"selected_conversation"`
+		// SelectedOption is a radio button's or a static select's pick:
+		// the Home tab dial's level and repository (slack_home_dial.go).
+		SelectedOption struct {
+			Value string `json:"value"`
+		} `json:"selected_option"`
 	} `json:"actions"`
 	ActionTS string `json:"action_ts"`
 	// TriggerID opens a modal for the clicker (a 👎's note,
@@ -302,17 +308,28 @@ func asksQuestion(choices []chatmsg.Choice) bool {
 // question already answered: the same layout with the answered line added
 // where slackAnsweredLayout would put it, or, for text alone, the text as a
 // section with the line under it (text past a section's cap posts as text
-// alone, without the line).
+// alone, without the line). A message marked for rating (m.Feedback, which
+// the caller clears when the controls are off) keeps its rating controls as
+// the last block, under the line.
 func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
 	text := toMrkdwn(m.Text)
 	note := map[string]any{"type": slackContextBlock, "elements": []any{
 		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
 	if m.Chat == nil {
 		if utf8.RuneCountInString(text) > slackChatSectionMax {
+			if m.Feedback != "" {
+				opts, err := slackRatedTextOptions(m)
+				// chat.update keeps a side bar it is not sent.
+				return append(opts, slack.MsgOptionAttachments([]slack.Attachment{}...)), err
+			}
 			return slackMessageOptions(m)
 		}
-		set, err := slackRawBlocks([]map[string]any{
-			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note})
+		blocks := []map[string]any{
+			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note}
+		if m.Feedback != "" {
+			blocks = append(blocks, slackFeedbackBlock(m.Feedback))
+		}
+		set, err := slackRawBlocks(blocks)
 		if err != nil {
 			return nil, err
 		}
@@ -334,6 +351,9 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 		last["blocks"] = append(inner, note)
 	} else {
 		layout.Blocks = append(layout.Blocks, note)
+	}
+	if m.Feedback != "" {
+		layout = withFeedback(layout, m.Feedback)
 	}
 	return slackChatOptions(layout, text)
 }
@@ -428,6 +448,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		// real click has no timestamp and is dropped.
 		p.ActionTS = p.Actions[0].ActionTS
 	}
+	// Every block action, a turn or not: the lag is Slack's leg, whatever
+	// the click turns out to be.
+	if p.Type == slackBlockActions {
+		s.metrics.slackIngress(time.Now(), p.ActionTS)
+	}
 	if p.Type == slackViewSubmission {
 		// A 👎's note, sent from its modal: never a turn.
 		s.feedbackNote(raw)
@@ -452,6 +477,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if strings.HasPrefix(action.ActionID, slackBoardActionPrefix) {
 		// A board-health row's Retry or Drop: never a turn (slack_board.go).
 		s.boardClick(p, action.ActionID, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
+	if strings.HasPrefix(action.ActionID, slackDialActionPrefix) {
+		// The Home tab's autonomy dial: never a turn (slack_home_dial.go).
+		s.dialClick(p, action.ActionID, action.Value, action.SelectedOption.Value)
 		return InboundMessage{}, false
 	}
 	if action.ActionID == slackHomePickAction {

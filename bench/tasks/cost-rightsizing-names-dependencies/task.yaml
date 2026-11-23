@@ -1,4 +1,4 @@
-# CERTIFICATION: an entry in hack/eval/certification-cases.txt, a baseline
+# VALIDATED CAPABILITIES: a `suite: validated-capabilities` case (the line below), a baseline
 # of the cost capability row (#3978); a nightly case 2026-10-23 to 2026-11-09
 # (#3199), admitted to the suite on that record. What the fixture carries
 # versus the customer failure: the seeded fleet carries a Deployment scaled by
@@ -30,7 +30,7 @@
 # expected_output. The safeguards hold both workloads' CPU and memory
 # requests, ledger-writer's limits and the HPA's cap.
 #
-# Isolation class: read-only. Lane: certification only (one case, one
+# Isolation class: read-only. Lane: validated-capabilities only (one case, one
 # lane). Expected cost bracket: ~150-400s (one delegation, a handful
 # of reads on one seeded cluster).
 id: cost-rightsizing-names-dependencies
@@ -63,9 +63,9 @@ validated: false
 
 domain: cost
 
-# The certification suite's lane, and nothing else runs it (bench/README.md,
-# "Certification suite").
-suite: certification
+# The validated-capabilities suite's lane, and nothing else runs it (bench/README.md,
+# "Validated Capabilities suite").
+suite: validated-capabilities
 
 owner: Fuxiao-Gao
 

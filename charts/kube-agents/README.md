@@ -48,7 +48,13 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   by hand. Given the public half, the chart
   also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
   Secret the sandbox mounts — the sandbox never mounts the credential Secret
-  itself. The sandbox is always on — `harness.experimental.shellSandbox.enabled`
+  itself. With `create=false`, the template reads `SANDBOX_SSH_PUBLIC_KEY` via
+  Helm `lookup`, so offline `helm template` renders (such as Argo CD) omit
+  `<platformAgent.name>-shell-authorized-keys` and you must provision that
+  Secret alongside `platform-agent-secrets`; see
+  [Deploying kube-agents via Argo CD without Helm lookup](../../docs/site/src/content/docs/deploy/gitops-argocd.md#deploying-kube-agents-via-argo-cd-without-helm-lookup)
+  for the `ExternalSecret` layout and SSH keypair rotation procedure. The sandbox
+  is always on — `harness.experimental.shellSandbox.enabled`
   is not a toggle, the operator refuses `false`, and this chart fails at template
   time — so without the pair the agent has no key to dial the sandbox with. See
   [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
@@ -150,7 +156,7 @@ published chart, drop them and let `appVersion` pick the release.
 `global.imageRegistry` rewrites each image onto the prefix keeping the trailing
 name only, matching the flat layout `mirror-images` writes. Set
 `global.thirdPartyImageRegistry` to mirror third-party images (LiteLLM,
-fluent-bit, the GitHub token minter, Hindsight); empty leaves them on their
+fluent-bit, the NATS bus's four, the GitHub token minter, Hindsight); empty leaves them on their
 upstream registries.
 
 > **Breaking:** `global.thirdPartyImageRegistry` previously fell back to
@@ -160,19 +166,27 @@ upstream registries.
 > alongside `--set global.imageRegistry=<prefix>`.
 
 It reaches more than the containers the chart renders. The operator resolves
-three images at reconcile time that appear in no chart template — the agent
+images at reconcile time that appear in no chart template — the agent
 image for a `PlatformAgent` that omits `spec.deployment.image`, the shell
-sandbox StatefulSet it renders beside every agent pod, and the fluent-bit
-logging sidecar it injects into that pod — so the chart passes all three to the
-operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
-`FLUENT_BIT_IMAGE`. `PLATFORM_AGENT_IMAGE` and `AGENT_SANDBOX_IMAGE` follow
-`global.imageRegistry`, while `FLUENT_BIT_IMAGE` follows
-`global.thirdPartyImageRegistry`. Without passing both, a mirrored install reaches
+sandbox StatefulSet it renders beside every agent pod, the fluent-bit
+logging sidecar it injects into that pod, and the four images of the A2A NATS
+bus it renders for every install — so the chart passes them to the
+operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
+`FLUENT_BIT_IMAGE`, `A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`,
+`A2A_NATS_RELOADER_IMAGE` and `A2A_NATS_EXPORTER_IMAGE`. `PLATFORM_AGENT_IMAGE`
+and `AGENT_SANDBOX_IMAGE` follow `global.imageRegistry`, while `FLUENT_BIT_IMAGE`
+and the four bus images follow `global.thirdPartyImageRegistry` (the bus images
+from `a2aBus.images`, below). Without passing both, a mirrored install reaches
 `ghcr.io` and Docker Hub minutes after `helm install` reported success.
-`CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
-broker image from the agent image by swapping the trailing name, so it follows
-the mirror on its own. The sandbox image cannot be derived that way — it is a
-separate repository — which is why it has to be named.
+`CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE` are passed only when
+`credentialProxy.image` or `hermesBridge.image` names a `repository` or a `tag`;
+empty, the default, leaves the operator deriving the broker from each agent's
+image, and the bridge from the agent image when that is the release
+`platform-agent` image by tag, else from the operator's release set. A pin
+renders under `global.imageRegistry` like the other first-party images and
+applies to every `PlatformAgent` the operator manages; `values.yaml` has the
+contract. The sandbox image is not derived from the agent image, so the chart
+always names it.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -182,7 +196,9 @@ joined to, not where the image is pulled from. To place images individually —
 most on the mirror, one somewhere else — leave `global.imageRegistry` and
 `global.thirdPartyImageRegistry` empty and give each `*.image.repository` its full
 mirrored path instead; the operator's `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
-and `FLUENT_BIT_IMAGE` are rendered from those values either way.
+`FLUENT_BIT_IMAGE` and the four `A2A_NATS_*`/`A2A_PROVISION_IMAGE` variables are
+rendered from those values either way, and `CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE`
+from `credentialProxy.image` and `hermesBridge.image` when those are set.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
@@ -219,6 +235,42 @@ running to clear the CR's finalizer.
 It does not reach cert-manager, which this chart never renders and which
 `operator.webhooks.enabled` requires you to have installed already. Pull that
 one from the mirror through its own chart's values.
+
+### A2A NATS bus images (`a2aBus.images`)
+
+The operator renders the A2A NATS bus for every install: the nats-server
+StatefulSet, the nats-box provision Job it runs against it, and the config
+reloader and Prometheus exporter sidecars in the server's pod. The chart never
+renders those workloads; it passes their images to the operator as
+`A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_NATS_RELOADER_IMAGE` and
+`A2A_NATS_EXPORTER_IMAGE`, from these values, the same way `fluentBit.image`
+feeds `FLUENT_BIT_IMAGE`:
+
+| Value                              | Env var                   | Upstream repository                            |
+| ---------------------------------- | ------------------------- | ---------------------------------------------- |
+| `a2aBus.images.nats`               | `A2A_NATS_IMAGE`          | `docker.io/library/nats`                       |
+| `a2aBus.images.natsBox`            | `A2A_PROVISION_IMAGE`     | `docker.io/natsio/nats-box`                    |
+| `a2aBus.images.configReloader`     | `A2A_NATS_RELOADER_IMAGE` | `docker.io/natsio/nats-server-config-reloader` |
+| `a2aBus.images.prometheusExporter` | `A2A_NATS_EXPORTER_IMAGE` | `docker.io/natsio/prometheus-nats-exporter`    |
+
+Each takes `repository` and `tag`; the pins are those in `images.json`, which
+`make mirror-images` copies, and the operator's compiled defaults and the chart's
+own copy in `templates/_helpers.tpl` (`kube-agents.a2aBusImageDefaults`) are the
+same pins (`make images-check` holds the four in step). The reloader and the
+exporter are pinned by digest as well as tag. Under
+`global.thirdPartyImageRegistry` each renders as `<prefix>/<trailing name>:<tag>`
+with the digest dropped, because the mirror holds the copy by tag and the
+copy's digest differs from the upstream one. A release whose values carry no
+`a2aBus` key, as `helm upgrade --reuse-values` from a release before the key
+renders, takes the same pins from the chart's templates, so a mirrored install
+upgraded that way still pulls the bus from its mirror rather than from the
+operator's compiled Docker Hub defaults. `operator.extraEnv` is appended
+after these and wins, as for every other variable the chart renders; an entry
+that clears `A2A_NATS_EXPORTER_IMAGE` while `A2A_NATS_IMAGE` stays set makes the
+operator render the bus without its exporter sidecar, and the chart then
+renders no PodMonitoring or scrape alert for it. An `extraEnv` entry is the way to
+run the bus without the exporter: a null in `a2aBus.images.prometheusExporter` does
+not omit it, because the chart fills the field from its own pins.
 
 ### LiteLLM gateway
 
@@ -367,6 +419,41 @@ conversation a Vertex `session_id` so a new conversation's first turn can read
 a prompt another conversation warmed:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
 
+To override the Vertex AI endpoint host through `litellm.envFromSecret`
+([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)) with
+`VERTEXAI_API_BASE` or render a custom-universe Vertex `api_base` in
+`config.yaml` via `platformAgent.harness.universeDomain`, pair them with
+`litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and
+`litellm.vertex.location`:
+
+```bash
+kubectl create secret generic vertex-endpoint -n kubeagents-system \
+  --from-literal=VERTEXAI_API_BASE=https://us-east4-aiplatform.universe.example.com
+
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set litellm.modelProvider=vertex_ai \
+  --set litellm.modelDefaultName=gemini-3.8-flash \
+  --set litellm.vertex.projectId=my-serving-project \
+  --set litellm.vertex.location=us-east4 \
+  --set litellm.envFromSecret=vertex-endpoint
+```
+
+When `api_base` is empty in `config.yaml`, LiteLLM reads `VERTEXAI_API_BASE`
+from the environment and appends
+`/v1/projects/<VERTEXAI_PROJECT>/locations/<VERTEXAI_LOCATION>/...` to a
+host-only base, so the chart's project and location still apply. Setting a
+non-default `platformAgent.harness.universeDomain` renders `api_base`
+(`https://aiplatform.<universeDomain>` for `global` or
+`https://<location>-aiplatform.<universeDomain>` for a regional location) in
+`config.yaml`, which wins over `VERTEXAI_API_BASE`. Container `env` entries
+(`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+when `platformAgent.harness.universeDomain` is non-default) always override
+matching keys in `litellm.envFromSecret`. Full precedence and examples:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden).
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI
@@ -430,8 +517,8 @@ including `/v1`) are required, and the render fails without them. Set
 mounts whole into the gateway container as environment variables (`envFrom`,
 optional, so the pod starts without it). You create it; the chart only names
 it, and a Helm upgrade never touches it. It carries whatever the LiteLLM
-provider reads from the environment, which is how the providers without a
-key in the credentials Secret get theirs:
+provider reads from the environment — credentials for providers without a key
+in the credentials Secret, or custom environment variables for `vertex_ai`:
 
 - **SAP AI Core (`litellm.modelProvider=sap`).** LiteLLM's `sap/` driver
   exchanges the service key's client credentials at your tenant's token URL
@@ -450,10 +537,21 @@ key in the credentials Secret get theirs:
   in the Secret, the chart ships a pre-call hook that fetches the bearer token,
   caches it and renews it before expiry
   ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
+- **Vertex AI custom environment variables (`litellm.modelProvider=vertex_ai`).**
+  Set `VERTEXAI_API_BASE` (matching `litellm.vertex.location`) or other custom
+  variables in the Secret (`envFrom`, which does not render `api_base` in
+  `config.yaml`, so a non-default `platformAgent.harness.universeDomain`
+  rendering `api_base` wins over `VERTEXAI_API_BASE`); pair with
+  `litellm.vertex.projectId` (or `projectSecretRef`) and
+  `litellm.vertex.location`
+  ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
 
-A variable the chart also sets from the credentials Secret (`GEMINI_API_KEY`,
-`HOSTED_VLLM_API_KEY`, ...) wins over the same name in this Secret. Rotating
-the Secret does not roll the pods: `kubectl rollout restart deployment/litellm`.
+A variable the chart sets directly in container `env` — keys from the
+credentials Secret (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY`, ...), plus
+`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+(when `platformAgent.harness.universeDomain` is non-default) on `vertex_ai` —
+wins over the same name in this Secret. Rotating the Secret does not roll the
+pods: `kubectl rollout restart deployment/litellm`.
 
 ```bash
 kubectl create secret generic sap-aicore -n kubeagents-system \
@@ -516,7 +614,7 @@ Helm adopts the object and rewrites its spec to the static copy in the same upgr
 Deployment, the Postgres/pgvector StatefulSet behind it, NetworkPolicies
 isolating the API pod (`hindsight-api`) and standing in for the database's
 deliberate lack of a password (`hindsight-postgresql`),
-and a PodMonitoring. `hindsight.enabled` is a tri-state: `null` (the default)
+and a `PodMonitoring` (`hindsight.podMonitoring`, `null` by default so it renders when the cluster serves `monitoring.googleapis.com/v1/PodMonitoring`). `hindsight.enabled` is a tri-state: `null` (the default)
 follows `platformAgent.harness.memory.provider`, so selecting a
 Hindsight-backed provider (`kube_agents_memory`, `hindsight`) brings the store
 with it and everything else renders nothing; `true`/`false` override. The
@@ -603,7 +701,8 @@ itself. With `webConsole.environment.enabled` (the default) the chart also
 renders the console's ServiceAccount, a ClusterRole that lists nodes,
 namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
 gets/patches the `PlatformAgent` resource (for repository topology, preferred
-model annotations, and applied PR annotations). `webConsole.resources` is
+model annotations, applied PR annotations, and the `status.usage` block behind
+the banner's totals and the feedback attachment). `webConsole.resources` is
 sized to run under its requests, which is what GKE Autopilot without Pod
 bursting clamps the limits to; the console reads the memory limit the cluster
 admitted through the Downward API and sets its Go soft memory limit to nine
@@ -651,9 +750,9 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
-gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's inbound-message,
-task terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
-that one selects no pod). The operator's policies on all three pods admit the
+gateway pod, so it scrapes the gateway's inbound-message,
+task terminal and Google Chat pull counters from its metrics-only port 9096.
+The operator's policies on all three pods admit the
 collector's namespace, `gke-gmp-system`, and the operator's own pods on those ports
 either way; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
@@ -683,7 +782,8 @@ series and every `PlatformAgent`'s `status.usage`, `status.phase` and `status.in
 `kubeagents_platformagent_phase`, `kubeagents_platformagent_model`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
 on port `8080` (container port `metrics`), plain HTTP on the pod network.
 `operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
-pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`
+pods, the same `null` tri-state as `platformAgent.podMonitoring`, `litellm.podMonitoring`
+(`litellm-monitoring`), and `hindsight.podMonitoring` (`hindsight-monitoring`). `operator.metrics.enabled: false`
 binds no listener and renders neither the port, the `PodMonitoring` nor the policy.
 `<release>-operator-netpol` bounds the plain listener as the broker's and gateway's
 policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and from
@@ -695,7 +795,8 @@ a release that predates `operator.metrics` renders with the listener off until t
 
 `platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
 `Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
-operator's gauges, and the recording rules for their ratios; the alerts are listed on
+operator's gauges (plus one over the A2A gateway's Slack connection gauge and one over the scrape
+jobs' `up`), and the recording rules for their ratios; the alerts are listed on
 [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
 Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
 into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
@@ -706,7 +807,9 @@ sample floor is a value under `platformAgent.healthRules.thresholds`, with its d
 string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
 the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
-block and the template says so when it is missing. The rules read the operator's scrape, so
+block and the template says so when it is missing. `slackDisconnectedFor` is the exception: it is
+optional and defaults to `5m`, so a `--reuse-values` upgrade from a release without it keeps
+rendering. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
 render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
 `proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
@@ -786,12 +889,13 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
-  `scheme`, `port`, `namespace` and `credentialsRef`), and
+  `scheme`, `port`, `namespace`, `credentialsRef`, `caBundleRef` and
+  `identity`), and
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github`, `gitlab` or `gitea`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
-  ignored for `github` and required for `gitlab` and `gitea`: a Secret holding the access
+  read-only reference). `provider` is `github`, `gitlab`, `gitea`, `bitbucket` (Bitbucket Cloud) or `bitbucket-datacenter`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
+  ignored for `github` and required for `gitlab`, `gitea`, `bitbucket` and `bitbucket-datacenter`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
   never a GitHub name, and one `gitlab` forge per host. A `github` forge's
@@ -809,9 +913,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
   forge at a self-managed host, GitLab, GitHub Enterprise Server, or `https`
-  Gitea, never gitlab.com or github.com. With a `gitlab` or `gitea` forge
+  Gitea, never gitlab.com or github.com. With a `gitlab`, `gitea` or Bitbucket forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
-  repository that the install registered by URL. Name a GitLab or Gitea repository, or
+  repository that the install registered by URL. Name a GitLab, Gitea or Bitbucket repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` is a spelling of github.com (`github.com`, `www.github.com`,
@@ -820,12 +924,21 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `host` is required, `scheme` may be `http` only for an in-cluster Service
   (`*.svc` or `*.svc.cluster.local`), `port` is set when the forge is not on
   the scheme's default port, and `credentialsRef` names the Secret holding its
-  API token under the key `token`. A repository must name a declared forge.
+  API token under the key `token`. A `bitbucket` forge is at bitbucket.org
+  only: it takes no `host` other than that, no `port`, no `scheme` and no
+  `caBundleRef`, its `namespace` is a lowercase workspace ID, and one
+  `bitbucket` forge per install. A `bitbucket-datacenter` forge needs `host`
+  (the instance, served at the root path on port 443, so no `port` and no
+  `scheme: http`), may set `caBundleRef`, and its `namespace` is a project key.
+  `identity` is for these two providers only: the account the token acts as,
+  1 to 255 letters, digits and `. _ @ + { } -`; on `bitbucket` it is the
+  account UUID, which a workspace, project or repository access token needs.
+  A repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. For a github.com GitOps repository, the alias is still what
   `install.sh` and the `full-install` Terraform composition write. For a
-  GitLab or GitHub Enterprise Server GitOps repository, they write the
+  GitLab, Bitbucket or GitHub Enterprise Server GitOps repository, they write the
   `forges` and `repositories` lists. One GitHub forge with no
   `credentialsRef`, no `caBundleRef`, no host other than a spelling of
   github.com, and at most one repository, the gitops one, with no
@@ -856,29 +969,60 @@ registration & Teams App manifest) —
 [Microsoft Teams ChatOps Guide](../../docs/chatops/microsoft-teams.md) are the
 canonical walkthroughs.
 
-### Component stack (`platformAgent.mode`)
+### Component stack
 
-`platformAgent.mode` is the CR's `spec.mode`: `next`, which puts the NATS bus
-and the A2A gateway in front of the agent and is what a first `install.sh`
-install records, or `today`, the previous stack, kept as a rollback
-([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md)).
-It defaults to `null`, which renders no field, and the operator reads an absent
-mode as `today`. Because Helm patches the CR from the difference between its
-renders, a mode set on the CR by hand stays while the value is `null`, and a
-value set and later cleared removes the field again. Changing it on a running
-release is a mode switch rather than a setting: the operator rolls the agent
-and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
-caps the A2A session pods a `next` install runs at once and renders only when set.
+Every install runs the A2A stack: the operator puts the NATS bus and the A2A
+gateway in front of the agent, and the chart renders the profile namespace and
+counts the stack in its quota preflight on every render. The chart writes no
+`spec.mode` on the `PlatformAgent`. `platformAgent.mode`, which once chose
+between this stack and the previous one, is deprecated: the schema still
+accepts it so an older values file renders, and the chart ignores it.
+`platformAgent.harness.tuning.maxSessions` caps the A2A session pods the
+install runs at once and renders only when set.
 
 ### MCP server (`operator.mcpServer.enabled`)
 
-`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
-then renders the MCP server (`<agent>-a2a-mcp`) beside every `next`-mode `PlatformAgent` it
-manages. It defaults to `false`, and under `today` the operator renders nothing for it. An
-`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
-still works and wins over the value. The
+The operator renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
+manages by default (`operator.mcpServer.enabled: true`). Setting `operator.mcpServer.enabled: false`
+sets `A2A_MCP_DOOR=false` on the controller manager and removes the server, its Service, its
+ServiceAccount, its NetworkPolicy and its token Secret. An `A2A_MCP_DOOR` entry in
+`operator.extraEnv` still works and wins over the value. A hand-run `helm upgrade` from a
+release where `operator.mcpServer.enabled` defaulted to `false` uses
+`--reset-then-reuse-values` (or `--set operator.mcpServer.enabled=true`), since
+`--reuse-values` preserves the earlier chart's default. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
+
+### Card stop (`operator.cardStop.enabled`)
+
+`operator.cardStop.enabled: true` sets `A2A_CARD_STOP=true` on the controller manager, which
+renders it onto the A2A gateway: a chat `stop`, or Slack's Stop button, then also stops the
+kanban cards the conversation filed. It defaults to `false`, because the stop needs a
+hermes-bridge sidecar and agent image that answer it; an older pair answers that it couldn't
+confirm the cards stopped. An `A2A_CARD_STOP` entry in `operator.extraEnv` wins over the value.
+The install's `CARD_STOP_ENABLED` key sets it through `terraform/examples/full-install`. The
+[ChatOps page](https://gke-labs.github.io/kube-agents/concepts/chatops/) is canonical for what a
+stop replies.
+
+### Slack end-to-end test users (`operator.slackTestUsers`)
+
+Meant for CI and eval installs. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
+posts the A2A gateway reads as theirs even though they carry an app's `bot_id`, which a post
+made with a user token through an app does; the gateway otherwise drops those as bot traffic.
+It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it to the gateway
+when the gateway runs the Slack adapter. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
+user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
+off a real install, and a listed member's posts through any app in the workspace read as theirs.
+
+### Microsoft Teams on the A2A gateway (`A2A_TEAMS_BACKEND`)
+
+An `operator.extraEnv` entry `A2A_TEAMS_BACKEND=true` (no value key yet) has the A2A gateway's
+`teams` backend consume the credential broker's Teams queue for every `PlatformAgent` whose
+`integration.teams` is enabled, in place of the Planning Agent's Teams adapter: replies render as
+Adaptive Cards, the gateway's `chat.notify` route posts proactive alerts and reports into
+`integration.teams.homeChannel`, the agent's delivery resolver names Teams for the roster's scheduled reports (a Hermes cron job that names `deliver: teams` or `deliver: chat` by hand does not reach Teams there: the Hermes scheduler has no Teams platform on an armed install), and the broker admits the gateway on its Teams routes only on this switch. Off by default,
+so an operator upgrade moves no Teams install on its own. `docs/chatops/microsoft-teams.md` in the
+repository has the details.
 
 ### Data volume size (`platformAgent.storage.size`)
 
@@ -897,6 +1041,11 @@ predates `spec.storage`. The
 [PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
 is canonical for the behaviour.
 
+`platformAgent.storage.expectedClusterProfiles` (CR: `spec.storage.expectedClusterProfiles`, 1 to 20000) raises the agent's claim alone to at least `8Gi` plus `400Mi` per expected Cluster Agent
+profile, rounded up to whole GiB, the size the session stores settle at under 90-day retention.
+The claim takes the larger of that and `size` (or the default), and the formula passes the 50Gi
+default above 107 profiles. The quota preflight counts the raised claim.
+
 ### Sizing for a fleet (`examples/values-fleet.yaml`)
 
 The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
@@ -909,19 +1058,21 @@ the hour, and an `env` entry for the name would override that key. It does not s
 container itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
 sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
 operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads it;
-`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
-allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
-out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
+`MALLOC_ARENA_MAX` is not on the agent container's allowlist, would reach only the
+credential-proxy and `agent-api-auth` containers, and is left out.
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` is left out because it has no effect on `gcloud` there: the
+credential proxy does not pass the pod's value to the commands it runs, and sets the variable
+itself for the commands its exec tier runs. Pass the file beside your own values with
+`-f charts/kube-agents/examples/values-fleet.yaml`,
 after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
 
 ### People seen (`platformAgent.telemetry.peopleSeen`)
 
-`platformAgent.telemetry.peopleSeen` is the CR's `spec.telemetry.peopleSeen`. Under
-`spec.mode: next`, the A2A gateway keeps one hashed key and a last-active time per chat person
+`platformAgent.telemetry.peopleSeen` is the CR's `spec.telemetry.peopleSeen`. The A2A
+gateway keeps one hashed key and a last-active time per chat person
 for 30 days, and serves the people seen in the last 7 and 30 days as
-`kubeagents_a2a_gateway_people_seen`. Under
-`today` there is no gateway, so the value has no effect.
+`kubeagents_a2a_gateway_people_seen`.
 It defaults to `true`, which renders no field, and the CRD default (`true`) applies.
 `false` renders the field: the gateway writes no key, purges the bucket at its next start, and
 serves no sample. Set it with `--set platformAgent.telemetry.peopleSeen=false`, or on an
@@ -934,12 +1085,22 @@ is canonical for the behaviour.
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
-`platformAgent.harness.driftDetector`, and `platformAgent.deployment.availability`
+`platformAgent.harness.driftDetector`, `platformAgent.harness.universeDomain`, and
+`platformAgent.deployment.availability`
 expose the remaining PlatformAgent CR fields, so a chart install can reach every
 field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
-means zero rather than unset.
+means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
+`helm upgrade` on an install whose served `PlatformAgent` CRD predates
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. A value under
+`googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
+of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
+to a domain other than `googleapis.com`, the chart also sets
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter`,
+renders `api_base` on `litellm` (`vertex_ai`) `model_list` entries in
+`config.yaml`, and renders `githubMinter`'s `ISSUER_ALLOWLIST` against
+`https://container.<universeDomain>/...`.
 
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.
@@ -954,7 +1115,9 @@ has the arithmetic behind the memory floor. The chart fails the render on an
 override the operator would refuse, on a quantity it cannot read, and on any key
 under `resources` other than `requests`, `limits` and `claims` (`limit:` for
 `limits:`), which the CRD would prune silently. A quantity with more than 15
-significant digits is refused at render as well: the chart compares quantities as
+significant digits is refused at render as well, and so is one with an exponent
+below -18 (`1e-19`), which the operator decodes only slowly and no resource
+needs: the chart compares quantities as
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
@@ -1017,6 +1180,13 @@ rules as `alertDailyLimits` apply: an entry with the same name in `platformAgent
 wins, and a `valueFrom` entry for it fails the render while the key is above `0`. The
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
 says what is counted and what a held triage does.
+
+`platformAgent.deployment.evalRunTags` is for eval installs that run the replay proxy in front of
+LiteLLM. `true` renders `KUBEAGENTS_EVAL_RUN_TAGS=1` into the CR's `spec.deployment.env`, and the
+agent then names the eval run, case and repetition in HTTP headers on its model requests, which the
+proxy logs and does not forward. `false`, the default, renders nothing. A literal entry with the
+same name in `platformAgent.deployment.env` wins. A `valueFrom` entry with the key `true` fails the
+render, because the operator forwards only literal values and would drop it.
 
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
@@ -1218,11 +1388,11 @@ granted by hand.
 Exactly one owner creates the broker's KSA, depending on
 `platformAgent.security.serviceAccountAnnotations`:
 
-- **Annotations set** (the Workload Identity case): the **operator** creates
+- **Annotations set** (at least one non-null, non-empty string value — the Workload Identity case): the **operator** creates
   and manages the KSA with those annotations.
-- **No annotations**: the operator treats the named KSA as user-managed and
+- **No annotations** (empty map, `null`, or inherited keys cleared to `null` or `""` in a layered values file): the operator treats the named KSA as user-managed and
   does not create it — the **chart** renders it instead, so a default install
-  still starts.
+  still starts. (`litellm.vertex.serviceAccountAnnotations` filters `null` and `""` entries the same way.)
 
 ### Secret metadata read access (`platformAgent.security.disallowSecretsRead`)
 
@@ -1238,9 +1408,9 @@ existing install.
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings, and a fourth where the web
-console and its environment page are on. Two are generated from
+`admissionPolicy.enabled` (default `true`) installs cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, some only where the
+feature they hold is on. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1248,18 +1418,26 @@ check the rules of a role a binding _references_ — CEL cannot read another
 object — and the content policy only selects manifests carrying the
 `kube-agents/tier` label; see that file's header.
 
-The third, `kube-agents-a2a-gateway-pod`, is generated from
+Another, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
-ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", exactly the session labels, no runtime
+ServiceAccount, no automount, the session token audiences, no Secret volume, no
+Secret read but the session's own inference key, no host access, Pod Security
+"restricted", exactly the session labels, no runtime
 class, node selector, affinity or positive priority, and only the scheduler and
 tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
 
-The fourth, `kube-agents-web-console-cr`, is generated from
+Another, `kube-agents-agentschedule-builtin`, is generated from
+`k8s-operator/config/admission/agentschedule-builtin-policy.yaml`. It keeps
+everyone but the operator's ServiceAccount from making or unmaking a built-in
+`AgentSchedule`. Nobody else may set, change or remove its
+`kubeagents.x-k8s.io/origin: builtin` label or its controller reference, on create or update, or change a built-in schedule's spec (except `spec.suspend`). The garbage collector may still orphan a schedule. Annotating a built-in schedule (`run-now`) or suspending it (`spec.suspend`) still
+works for anyone the RBAC lets write it.
+
+Another, `kube-agents-web-console-cr`, is generated from
 `k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the
 web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
@@ -1324,16 +1502,16 @@ though note that if a namespace ResourceQuota restricts that compute resource (s
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
 The credential broker's exec tier is counted as `platformAgent.deployment.credentialProxy.exec.replicas`
 times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
-all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
-moves each replica too, because the operator gives the tier the broker's other resource keys; its
-cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
+`platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
-With `platformAgent.mode: next` it also counts what that mode adds, from footprint.yaml's
-`nextMode`: NATS and its 40Gi JetStream claim, the two auth callouts, the two capability
+It counts the A2A stack with the rest of the operator's workloads, from the same
+footprint.yaml entries: NATS and its 40Gi JetStream claims (`storage.busClaims`, scaled to one
+with `platformAgent.harness.tuning.busReplicas: 1`), the two auth callouts, the two capability
 verifiers, the console, the A2A gateway, the provisioning Job (counted although it runs to
 completion, because the operator runs it again whenever its spec changes and about daily once
 its TTL removes it, with the rest of the release standing), and the
@@ -1342,10 +1520,18 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an operator flag,
-listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
-and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+It also counts the standing pods the operator renders only behind an opt-in operator flag,
+listed with their sizes in `files/flagged-pods.yaml` (such as the OKF memory curator when
+`A2A_CURATOR` is `true`).
+The MCP server and the profile dispatcher both run by default, so they are in `footprint.yaml`,
+and switched off (`operator.mcpServer.enabled: false` or `operator.profileDispatcher.enabled: false`)
+each is still counted. The profile dispatcher has a ceiling: about 200
+AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 1.30+, where each
+carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
+profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones
+unbound (`IdentityReady` reads `DispatcherCeiling`), and the PlatformAgent's `DispatcherCeiling`
+condition says so. Adding a tier to an older profile can
+leave the newest one out. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
 election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
 `A2A_GATEWAY_ELECTION` to `false`. It also counts the
@@ -1354,16 +1540,21 @@ scope publisher's Job pod, sized in `files/transient-pods.yaml`, which the opera
 or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.scope` names a
 folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
 hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
-provisioning Job, so it overstates both. The mode is read from the values, so a mode set
-on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
-The session pods a next install spawns on demand are not counted; the operator caps those with
+provisioning Job, so it overstates both.
+It counts the session pods the gateway spawns on demand at their cap:
+`platformAgent.harness.tuning.maxSessions` (10 by default) times one session pod, from
+`files/footprint.yaml`'s `operatorRenderedPerReplica.sessionPod` with each key
+`platformAgent.harness.tuning.sessionResources` sets laid over it, as the operator resolves
+them, and on GKE Autopilot at Autopilot's per-Pod minimums. The refusal says how much of
+what it requires is that share. The operator also caps the session pods with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
 `PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
 and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`, and instead renders
 the same count in a ConfigMap, `a2a-quota-chart-pods`, in the release namespace, which the
-operator reads for a next-mode one written by hand there. The operator reads it from its own namespace only. For a
-hand-written CR in any other namespace, such as beside a release with `operator.enabled=false`, it counts the chart's
+operator reads for one written by hand there. The operator reads it from its own namespace only. For a
+hand-written CR in any other namespace, such as beside a release with `operator.enabled=false` (a CR the
+operator's validating webhook, where it is enabled, refuses on create), it counts the chart's
 Deployments and StatefulSets there (those labelled `app.kubernetes.io/managed-by: Helm` and
 `app.kubernetes.io/part-of: kube-agents`) at their replicas and rollout surge pods, as the chart does. An annotation on
 the CR still wins. A count past the cap of 64, unreadable, or missing from the ConfigMap counts 5 instead and records an
@@ -1382,7 +1573,7 @@ keys, including `services`, `secrets` and other `count/<resource>` entries, are 
 modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
 a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
 identify, so comparing the whole release against it would be wrong either way. So is a quota
-a `PlatformAgent` owns: the operator's next-mode session-pod quota (`pods` of `maxSessions`
+a `PlatformAgent` owns: the operator's session-pod quota (`pods` of `maxSessions`
 plus a headroom), which it puts back on every reconcile, so a printed patch would not stick;
 raise `spec.harness.tuning.maxSessions` instead. Every quota
 that falls short is reported in one failure, so a namespace with two of them takes one
@@ -1421,7 +1612,7 @@ does nothing under `helm template` and nothing in a namespace with no ResourceQu
 clean render in either case is not evidence that a quota fits. Its sum still runs there: the
 footprint summary below calls the same template on every render while `quotaPreflight.enabled`
 is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
-cannot parse, a damaged `footprint.yaml`, or under `platformAgent.mode: next` a damaged `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
+cannot parse, a damaged `footprint.yaml`, `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
 and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
@@ -1474,10 +1665,10 @@ apply. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
 refusals name that switch as the way round them, but not the preflight's quota gate: it sums
 on every render, a namespace with no ResourceQuota and `helm template` included, so the
-refusals the preflight section lists apply wherever the summary prints. Under
-`spec.mode: next` it says what it leaves out: the A2A workloads, NATS's JetStream claim and
-the session pods, which the
-[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+refusals the preflight section lists apply wherever the summary prints. Its figures
+and cost are the standing release; it prints the session pods' share at the cap on a line
+of its own, as the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) do.
 
 #### Upgrade notes: operator memory floor
 
@@ -1502,24 +1693,31 @@ limit. A cluster with bursting admits the manifest as rendered.
 ### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
 `profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
-(GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
+(GKE Support Agent — Customer-Side Technical Solutions Engineer)
 (`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
 `profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
-controlling its `AgentProfile` spec. When bound, the operator passes
+controlling its `AgentProfile` spec. Its persona is the `persona-tse` image,
+built from `agents/tse/persona`, which a profile worker pod mounts at
+`/persona`; like the cluster profile below, it takes its target per task through
+the `project`, `cluster` and `location` parameters, fixed in the persona's
+order. When bound, the operator also passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
-scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+scaffolds the Hermes profile `/opt/data/profiles/tse` from `/opt/tse-template`
+on startup; that profile does not use the persona image.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the
-target named per task by the `project`, `location` and `cluster` parameters.
+target named per task by the `project`, `cluster` and `location` parameters.
 Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. The parameters are fixed, in the persona's order, because
 the design has the worker refuse a task when they differ from the persona's.
-No pod runs it until the profile dispatcher, worker and pool land and the
-operator runs them, though enabling it already gets the profile its
-ServiceAccounts, bus identity and agent card. A cluster that needs its own
+Enabled, it gets its ServiceAccounts, bus identity and agent card, and the
+profile dispatcher, on by default, runs its warm worker pool and its
+unattended Jobs. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
+The chart sets `yieldToPinned: true` on `cluster`, so that second profile receives
+the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
 
 ## Uninstalling
 
@@ -1646,9 +1844,7 @@ helm uninstall kube-agents -n kubeagents-system
   holds its size, its one-at-a-time count and its scope fields to the operator.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
-  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`,
-  `platformagent-next.yaml` for its `nextMode` section, and
-  `platformagent-exec-1.yaml` for the exec tier's per-replica entry),
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml`, and `platformagent-exec-1.yaml` for the exec tier's per-replica entry),
   not from `k8s-operator/config/` and not from a live render. Changing the operator's
   resources therefore takes two steps in order — re-bless the goldens
   (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.

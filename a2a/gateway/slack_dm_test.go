@@ -184,6 +184,7 @@ func (d *slackDMRig) awaitTasks(t *testing.T, n int) []*lib.Envelope {
 // and stays in that thread. A second top-level question is a second
 // conversation with a second thread. Nothing in the DM is posted top-level.
 func TestSlackDMQuestionsAnswerInTheirOwnThreads(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 
@@ -261,6 +262,7 @@ func TestSlackDMQuestionsAnswerInTheirOwnThreads(t *testing.T) {
 // top-level, where its ask was. A top-level DM sent while it runs is a new
 // question in its own thread, not a steer into the old task.
 func TestSlackLegacyDMRecordStillRelaysItsTerminal(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 
@@ -293,6 +295,7 @@ func TestSlackLegacyDMRecordStillRelaysItsTerminal(t *testing.T) {
 // asks two top-level questions (two conversations now) hears it once, in
 // the first question's thread, and nothing is published.
 func TestSlackDMRefusalIsOncePerSenderAcrossThreads(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	// One at a time: two top-level DMs are two conversations, whose queue
 	// workers run concurrently, so sent together either could post first.
@@ -320,6 +323,7 @@ func TestSlackDMRefusalIsOncePerSenderAcrossThreads(t *testing.T) {
 // unchanged by DM threading -- a mention roots its session on its own ts and
 // the placeholder posts in that thread.
 func TestSlackChannelMentionStillThreadsOnTheMention(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet", "300.1", "")
 	d.awaitTasks(t, 1)
@@ -331,6 +335,7 @@ func TestSlackChannelMentionStillThreadsOnTheMention(t *testing.T) {
 // must not claim the DM is idle, and it must say where the stop goes. The
 // question's task is not cancelled.
 func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
@@ -374,6 +379,7 @@ func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
 // the deploy doing") is a real ask with nothing to report on, so it starts
 // a task.
 func TestSlackDMTopLevelStatusPointsAtTheThread(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
@@ -427,6 +433,7 @@ func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 // mention reading "stop" gets the plain notice and one reading "any
 // update?" is the ordinary turn it always was.
 func TestSlackChannelTopLevelControlPhrasesUnchanged(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> stop", "400.1", "")
 	d.awaitPost(t, "the plain notice in the mention's thread", "C1", "400.1", "nothing is running")

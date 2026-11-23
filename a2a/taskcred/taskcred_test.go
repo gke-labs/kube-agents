@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +237,7 @@ func TestTheAudienceMustMatch(t *testing.T) {
 	}
 	proxy := validClaims(now)
 	proxy.Audience = AudienceCredentialProxy
+	proxy.Target = &Target{Project: "my-project", Location: "us-central1", Cluster: "prod-1"}
 	if _, err := Verify(mint(t, kp, proxy), []string{pub}, AudienceNATS, now, testLifetime, testSkew); err == nil {
 		t.Error("a credential-proxy credential verified for nats")
 	}
@@ -362,10 +364,48 @@ func TestATargetIsForTheCredentialProxyAlone(t *testing.T) {
 		t.Errorf("target = %+v, want %+v", got.Target, target)
 	}
 
+	// With no target it is a report credential or nothing (#5619): see
+	// TestATargetlessProxyCredentialIsAReportCredentialAlone.
 	c.Target = nil
-	got, err = Verify(mint(t, kp, c), []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew)
-	if err != nil || got.Target != nil {
-		t.Errorf("a proxy credential without a target: %+v, %v", got.Target, err)
+	if _, err := Mint(kp, c); err == nil {
+		t.Error("Mint made a read-tier proxy credential with no target and no trigger")
+	}
+}
+
+// A proxy credential with no target confines nothing, so Go holds it to the
+// Python verifier's rule (#5619): only a ReportTier task with a trigger may
+// omit the target, at Mint and at Verify both.
+func TestATargetlessProxyCredentialIsAReportCredentialAlone(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+	trig := Trigger{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit"}
+	report := validClaims(now)
+	report.Audience, report.Tier, report.Trigger = AudienceCredentialProxy, ReportTier, &trig
+	got, err := Verify(mint(t, kp, report), []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew)
+	if err != nil || got.Target != nil || got.Trigger == nil || *got.Trigger != trig || got.Tier != ReportTier {
+		t.Fatalf("a report credential: %+v, %v", got, err)
+	}
+
+	for name, edit := range map[string]func(*Claims){
+		"the read tier, a trigger":        func(c *Claims) { c.Tier = "read" },
+		"a custom tier, a trigger":        func(c *Claims) { c.Tier = "nightly" },
+		"the unattended tier, no trigger": func(c *Claims) { c.Trigger = nil },
+	} {
+		c := report
+		edit(&c)
+		if _, err := Mint(kp, c); err == nil || !strings.Contains(err.Error(), "names no target") {
+			t.Errorf("%s: Mint err = %v; want the no-target refusal", name, err)
+		}
+		tok := handMint(t, kp, now, func(gc *jwt.GenericClaims) {
+			gc.Audience = string(AudienceCredentialProxy)
+			gc.Data["tier"] = c.Tier
+			if c.Trigger != nil {
+				gc.Data["trigger"] = map[string]any{"name": c.Trigger.Name, "origin": c.Trigger.Origin, "stream": c.Trigger.Stream}
+			}
+		})
+		if _, err := Verify(tok, []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew); err == nil {
+			t.Errorf("%s: Verify accepted a proxy credential with no target", name)
+		}
 	}
 }
 
@@ -540,6 +580,114 @@ func TestTheClaimsVersionIsJWTv2s(t *testing.T) {
 		payload := strings.Replace(base, `"version":2,`, repl, 1)
 		if _, err := Verify(signRaw(t, kp, jwt.AlgorithmNkey, payload), []string{pub}, AudienceNATS, now, testLifetime, testSkew); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// natsBlock decodes a token's nats claim block as raw JSON values, so a test
+// can see which keys a minted credential carries, not just what Verify reads.
+func natsBlock(t *testing.T, token string) map[string]json.RawMessage {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top struct {
+		Nats map[string]json.RawMessage `json:"nats"`
+	}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatal(err)
+	}
+	return top.Nats
+}
+
+func TestPermitsAreForTheCredentialProxyAlone(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+
+	c := validClaims(now)
+	c.Permits = []Permit{PermitVCSProposalCreate}
+	if _, err := Mint(kp, c); err == nil {
+		t.Error("Mint put permits on a nats credential")
+	}
+	// Hand-minted, so the verifier's own check is what refuses it, not Mint's.
+	tok := handMint(t, kp, now, func(gc *jwt.GenericClaims) {
+		gc.Data["permits"] = []string{string(PermitVCSProposalCreate)}
+	})
+	_, err := Verify(tok, []string{pub}, AudienceNATS, now, testLifetime, testSkew)
+	if err == nil || !strings.Contains(err.Error(), "may not carry permits") {
+		t.Errorf("a nats credential with permits: err = %v, want the permits refusal", err)
+	}
+
+	c.Audience = AudienceCredentialProxy
+	c.Target = &Target{Project: "p", Location: "l", Cluster: "c"}
+	got, err := Verify(mint(t, kp, c), []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew)
+	if err != nil {
+		t.Fatalf("a proxy credential with a permit was refused: %v", err)
+	}
+	if len(got.Permits) != 1 || got.Permits[0] != PermitVCSProposalCreate {
+		t.Errorf("permits = %v, want [%s]", got.Permits, PermitVCSProposalCreate)
+	}
+}
+
+func TestMalformedPermitsAreRefused(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+	for name, permits := range map[string][]Permit{
+		"an unknown permit":             {"vcs:proposal-merge"},
+		"a known permit twice":          {PermitVCSProposalCreate, PermitVCSProposalCreate},
+		"a known and an unknown permit": {PermitVCSProposalCreate, "vcs:branch-delete"},
+	} {
+		c := validClaims(now)
+		c.Audience = AudienceCredentialProxy
+		c.Target = &Target{Project: "p", Location: "l", Cluster: "c"}
+		c.Permits = permits
+		if _, err := Mint(kp, c); err == nil {
+			t.Errorf("Mint accepted %s", name)
+		}
+	}
+	for name, value := range map[string]interface{}{
+		"an unknown permit":            []string{"vcs:proposal-merge"},
+		"a case variant of the permit": []string{"VCS:proposal-create"},
+		"the permit twice":             []string{"vcs:proposal-create", "vcs:proposal-create"},
+		"an empty list":                []string{},
+		"a null":                       nil,
+		"a bare string":                "vcs:proposal-create",
+		"a number in the list":         []interface{}{1},
+		"an object in the list":        []interface{}{map[string]string{"name": "vcs:proposal-create"}},
+		"an object":                    map[string]bool{"vcs:proposal-create": true},
+	} {
+		tok := handMint(t, kp, now, func(gc *jwt.GenericClaims) {
+			gc.Audience = string(AudienceCredentialProxy)
+			gc.Data["permits"] = value
+		})
+		if _, err := Verify(tok, []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// A credential minted with no permit carries no permits key at all, never an
+// empty list, so it is the same claim set a verifier from before the claim
+// existed accepts.
+func TestNoPermitOmitsTheClaim(t *testing.T) {
+	kp, _ := signingKey(t)
+	now := time.Now()
+	want := []string{"pod", "pod_uid", "profile", "target", "task", "tier", "type", "version"}
+	for name, permits := range map[string][]Permit{"nil": nil, "empty": {}} {
+		c := validClaims(now)
+		c.Audience = AudienceCredentialProxy
+		c.Target = &Target{Project: "p", Location: "l", Cluster: "c"}
+		c.Permits = permits
+		block := natsBlock(t, mint(t, kp, c))
+		var got []string
+		for k := range block {
+			got = append(got, k)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s permits: nats keys = %v, want exactly %v", name, got, want)
 		}
 	}
 }

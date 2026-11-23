@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
-	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -70,23 +69,18 @@ func ruleReaches(rule rbacv1.PolicyRule, group, resource, verb string) bool {
 	return false
 }
 
-// operatorClusterRole is the operator's own ClusterRole as it ships, parsed
-// rather than grepped so a wildcard rule is seen for what it is.
+// operatorClusterRole is the operator's own RBAC as it ships -- the ClusterRole
+// and the namespaced Role role.yaml carries beside it -- parsed rather than
+// grepped so a wildcard rule is seen for what it is. Both documents are
+// swept: a grant that arrives through the Role installs as readily.
 func operatorClusterRole(t *testing.T) renderedRole {
 	t.Helper()
-	const path = "../../config/rbac/role.yaml"
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
+	roles := loadGeneratedRoles(t)
+	rules := append([]rbacv1.PolicyRule(nil), roles.clusterRole.Rules...)
+	for _, role := range roles.roles {
+		rules = append(rules, role.Rules...)
 	}
-	var cr rbacv1.ClusterRole
-	if err := yaml.UnmarshalStrict(raw, &cr); err != nil {
-		t.Fatalf("parsing %s: %v", path, err)
-	}
-	if len(cr.Rules) == 0 {
-		t.Fatalf("%s parsed to no rules; the sweep would pass vacuously", path)
-	}
-	return renderedRole{path, cr.Rules}
+	return renderedRole{generatedRolePath, rules}
 }
 
 // Nothing this deployment renders may mint a ServiceAccount token.
@@ -161,6 +155,36 @@ func TestPodsCreateIsTheGatewayAndTheOperatorOnly(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("%s cannot create pods; the exemption this test grants it is now unused and should go", op.from)
+	}
+}
+
+// The agent's cluster-wide audit ClusterRole only reads. Its write grants are
+// namespaced Roles in the install's own namespace. This checks the role, not
+// every binding the agent's ServiceAccount holds, nor GKE IAM.
+//
+// Evals lean on this: bench/tf/prebuilt/triage-start-burst records the pods it
+// plants in a ConfigMap beside them, and the triage_starts check grades from
+// that record, so an agent able to write there could rewrite what it is graded
+// against; this role is the grant that reaches that namespace.
+func TestTheAgentsClusterRoleOnlyReads(t *testing.T) {
+	read := []string{"get", "list", "watch"}
+	agent := a2aTestAgent()
+	roles := []renderedRole{
+		{"buildMinimalPlatformRoleWithSecrets(true)", buildMinimalPlatformRoleWithSecrets(agent, true).Rules},
+		{"buildMinimalPlatformRoleWithSecrets(false)", buildMinimalPlatformRoleWithSecrets(agent, false).Rules},
+	}
+	for _, r := range roles {
+		if len(r.rules) == 0 {
+			t.Fatalf("%s renders no rules; this sweep would check nothing", r.from)
+		}
+		for i, rule := range r.rules {
+			for _, verb := range rule.Verbs {
+				if !slices.Contains(read, verb) {
+					t.Errorf("%s rule %d grants %q on %v in %v; the agent's cluster-wide role must only read",
+						r.from, i, verb, rule.Resources, rule.APIGroups)
+				}
+			}
+		}
 	}
 }
 

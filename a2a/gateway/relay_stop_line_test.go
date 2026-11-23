@@ -16,6 +16,7 @@ import (
 // it: a backend that draws a Stop control draws it while the task runs and
 // takes it off when the task ends.
 func TestTheLiveLineCarriesStopUntilTheTerminal(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/stop-line", true)
 	waitFor(t, "the working line with Stop", func() bool {
@@ -86,6 +87,7 @@ func TestTheHealEndsTheLiveLineWithoutStop(t *testing.T) {
 // closes it as canceled, without Stop, and the new task's line carries the
 // control instead.
 func TestANewTurnClosesASupersededStoppedLine(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/superseded-line"
 	startChatTask(t, r, conv, false)
@@ -124,6 +126,7 @@ func TestANewTurnClosesASupersededStoppedLine(t *testing.T) {
 // "canceled" with no "canceled" notice posted. A second press changes
 // nothing.
 func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-press"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -149,9 +152,23 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 		}
 		return false
 	})
+	first := waitForRecord(t, r, conv, "the detached, closed task", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.Detached && rec.ActiveTask.LineClosed
+	})
+	firstRef, ok := first.TaskRefFor(origin.TaskID)
+	if !ok {
+		t.Fatalf("missing task ref for %s in %+v", origin.TaskID, first)
+	}
 	edits := len(r.adapter.editTexts())
 	press(line + "#t2")
+	waitForRecord(t, r, conv, "the second press recorded", func(rec *SessionRecord) bool {
+		return rec.LastUserMessage.After(first.LastUserMessage)
+	})
 	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "still going"}}, false, false)
+	waitForRecord(t, r, conv, "the progress event relayed", func(rec *SessionRecord) bool {
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && len(ref.RelayedSeqs) > len(firstRef.RelayedSeqs)
+	})
 	if err := exec.PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +197,7 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 // pressed on, and cancels nothing: the running task keeps its line and its
 // Stop, and ends as it would have.
 func TestAStalePressAnswersOnItsOwnLineAndCancelsNothing(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-stale"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -260,6 +278,7 @@ func TestAPressWithNoLineSpeaksAsATypedStop(t *testing.T) {
 // record knows ended otherwise leaves the line its end wrote, since the
 // terminal edit may have landed a moment before the press.
 func TestAStalePressOnAKnownTaskKeepsOrRestoresItsTerminalLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-known"
 	say := func(id, text string) {
@@ -339,6 +358,7 @@ func TestAStalePressOnAKnownTaskKeepsOrRestoresItsTerminalLine(t *testing.T) {
 // edits of a detached task carry no Stop meanwhile. A press whose message is
 // not the task's own line (a delegating parent's) closes that message too.
 func TestAPressRetriesAFailedCloseAndClosesThePressedLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-retry"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -398,6 +418,7 @@ func TestAPressRetriesAFailedCloseAndClosesThePressedLine(t *testing.T) {
 // With the card stop armed, a press on the running task takes the typed
 // stop's path: the cancel sent post, the cards stopped, their replies.
 func TestAPressWithTheCardStopArmedIsATypedStop(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false, func(c *Config) {
 		c.CardStop = true
 		c.CardStopTimeout = 200 * time.Millisecond
@@ -448,6 +469,7 @@ func awaitTaskAfter(t *testing.T, r *rig, addressee string, seen *lib.Envelope) 
 // makes it "canceled" with no "canceled" notice posted. The typed messages
 // themselves are not edited.
 func TestAChatTypedStopAnswersOnTheLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:dm/spaces/S1/threads/T-typed"
 	say := func(id, text string) {
@@ -555,6 +577,7 @@ func TestAChatTypedStopWithNoLineKeepsItsPosts(t *testing.T) {
 // stop's path: the "cancel sent" post, the cards stopped, their replies,
 // and the line left to the relay.
 func TestAChatTypedStopWithTheCardStopArmedKeepsItsPosts(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false, func(c *Config) {
 		c.CardStop = true
 		c.CardStopTimeout = 200 * time.Millisecond
@@ -579,11 +602,12 @@ func TestAChatTypedStopWithTheCardStopArmedKeepsItsPosts(t *testing.T) {
 	}
 }
 
-// A stop typed on Discord keeps today's replies, line or no line: the
-// "cancel sent" post, the line moving on with no Stop, and the relay's
-// "canceled" notice beside the terminal edit. Discord draws no button, and
-// the posts are its contract.
+// A stop typed on Discord keeps its reply, line or no line: the "cancel
+// sent" post and the terminal edit. Discord draws no button, and the post is
+// its contract. The relay's "canceled" notice is gone: nothing a stopped
+// task writes reaches the room.
 func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/typed-stop"
 	origin := startChatTask(t, r, conv, false)
@@ -604,13 +628,13 @@ func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the canceled notice", func() bool {
-		return slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "canceled") })
-	})
 	waitFor(t, "the terminal edit", func() bool {
 		texts := r.adapter.editTexts()
 		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "canceled")
 	})
+	if slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "canceled") }) {
+		t.Fatalf("a stopped task's terminal posted a notice: %q", r.adapter.postTexts())
+	}
 	for _, e := range r.adapter.editTexts() {
 		if strings.Contains(e, "cancel sent") {
 			t.Errorf("a Discord typed stop edited the line to %q", e)
@@ -622,6 +646,7 @@ func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 // on the line: "could not send the stop", with the Stop control kept for
 // another try, and nothing posted. The task stays attached and unmarked.
 func TestAChatTypedStopThatCannotSendSaysSoOnTheLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-typed-nosend"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -659,6 +684,7 @@ func TestAChatTypedStopThatCannotSendSaysSoOnTheLine(t *testing.T) {
 // cancel went, so the typed stop's post says so, and the line stays open
 // for the next stop to close.
 func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-close-fails"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -687,5 +713,58 @@ func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
 		if strings.Contains(e, "cancel sent") {
 			t.Fatalf("the failed edit was recorded: %q", e)
 		}
+	}
+}
+
+// A Stop press on Google Chat from a member the allowlist does not admit
+// posts nothing: the press asked the bot for nothing, and the unverified
+// sender's notice, which names the presser, would land in a thread the
+// space reads. Nor are they told privately, as a listed member the
+// requester gate refuses is (gchat_stop_gate_test.go): the allowlist drops
+// the press before the gate reads it, named viewer or not. The task runs
+// on. (A typed message from the same member still gets the notice once.)
+func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
+	t.Parallel()
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-unlisted-press"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	line := r.adapter.stopLinesCopy()[0].MessageID
+	before := len(r.adapter.postTextsFor(conv))
+	press := line + "#t1"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: press, Intent: IntentCancel, TaskID: origin.TaskID, Click: true, Viewer: "users/000000000000000000002"}
+	// The press's verdict reaches the adapter after verifySender has posted
+	// whatever it posts, so once it is observed the press's own posts are on
+	// record: there must be none. (Without the skip, the press would post the
+	// notice here and the typed message below would be silent, which is why
+	// the typed message alone is no proof.)
+	waitFor(t, "the press to be dropped", func() bool {
+		return slices.Contains(r.adapter.verifiedCalls(), press+":false")
+	})
+	if posts := r.adapter.postTextsFor(conv); len(posts) != before {
+		t.Fatalf("an unlisted member's press posted %q", posts[before:])
+	}
+	if got := r.adapter.privatePosts(); len(got) != 0 {
+		t.Fatalf("an unlisted member's press told them privately: %+v", got)
+	}
+	// The same member's typed message still gets the notice, once.
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: "spaces/S1/messages/M2", Text: "hello"}
+	awaitPostIn(t, r, "the typed message's unverified notice", conv, "I can't verify who you are")
+	posts := r.adapter.postTextsFor(conv)
+	if n := len(posts) - before; n != 1 {
+		t.Fatalf("the press and the message posted %d line(s): %q; want the message's notice alone", n, posts[before:])
+	}
+	if slices.ContainsFunc(inSubjectEnvelopes(t, r.url, "platform"), func(e *lib.Envelope) bool {
+		return e.TaskID == origin.TaskID && e.Kind == lib.KindCancel
+	}) {
+		t.Fatal("an unlisted member's press cancelled the task")
 	}
 }

@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -18,17 +20,17 @@ type fakeFrames struct {
 
 type fakeNotifyFrame struct {
 	conversation, messageID, text, replyTo string
-	edit                                   bool
+	report, edit                           bool
 }
 
-func (f *fakeFrames) PostNotifyFrame(conversation, messageID, text, replyTo string, edit bool) (string, error) {
+func (f *fakeFrames) PostNotifyFrame(conversation, messageID, text, replyTo string, report, edit bool) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if messageID == "" {
 		f.next++
 		messageID = "n-test-" + string(rune('0'+f.next))
 	}
-	f.frames = append(f.frames, fakeNotifyFrame{conversation, messageID, text, replyTo, edit})
+	f.frames = append(f.frames, fakeNotifyFrame{conversation, messageID, text, replyTo, report, edit})
 	return messageID, nil
 }
 
@@ -53,16 +55,61 @@ func TestTheConsoleNotifierPostsOneFrameNamingTheTurn(t *testing.T) {
 	n, frames, conv := newTestConsoleNotifier(t)
 	report := strings.Repeat("the fleet is green. ", 400)
 	got := serveJSON(t, n, lib.NotifyRequest{Text: report, Conversation: testConsoleConversation,
-		ContextID: testConsoleContext, ReplyTo: "task-7"})
+		ContextID: testConsoleContext, ReplyTo: "task-7", Report: true})
 	if got.Error != "" || got.MessageID == "" || got.ThreadID != testConsoleConversation {
 		t.Fatalf("reply = %+v, want a post into the conversation", got)
 	}
-	want := fakeNotifyFrame{testConsoleConversation, got.MessageID, report, "task-7", false}
+	want := fakeNotifyFrame{testConsoleConversation, got.MessageID, report, "task-7", true, false}
 	if len(frames.frames) != 1 || frames.frames[0] != want {
 		t.Fatalf("frames = %+v, want exactly one whole frame naming task-7", frames.frames)
 	}
 	if len(conv.posts) != 0 {
 		t.Fatalf("the report also went out as chat posts: %+v", conv.posts)
+	}
+}
+
+// Every post into a console thread names its task on the frame, so a client
+// can gather a turn's posts; the report mark rides the frame too, on the
+// card's report alone, so a client offers a reply under that post and not
+// under a progress note or a plan line.
+func TestAConsoleFrameCarriesTheReportMarkOnACardsReportAlone(t *testing.T) {
+	n, frames, _ := newTestConsoleNotifier(t)
+	serveJSON(t, n, lib.NotifyRequest{Text: "⏳ reading pod state", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7"})
+	serveJSON(t, n, lib.NotifyRequest{Text: "1 of 3", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7", Update: "plan"})
+	serveJSON(t, n, lib.NotifyRequest{Text: "np-quartz-7 is at 92%", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7", Report: true})
+	var got []string
+	for _, f := range frames.frames {
+		got = append(got, fmt.Sprintf("%s|%s|%t", f.text, f.replyTo, f.report))
+	}
+	want := []string{"⏳ reading pod state|task-7|false", "1 of 3|task-7|false", "np-quartz-7 is at 92%|task-7|true"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("frames (text|replyTo|report) = %q, want %q", got, want)
+	}
+}
+
+// A post marked as a card's report that names its task is kept for the
+// reply under it. Not kept: a progress note on a console card (reply_to,
+// no update, no report mark: the console's rolling lines are unkeyed, since
+// the stand-in cannot edit), a keyed plan line, a report naming no task,
+// and a post that was refused; so a sibling card's note never shadows a
+// report.
+func TestTheConsoleNotifierKeepsReportsOnly(t *testing.T) {
+	n, _, conv := newTestConsoleNotifier(t)
+	serveJSON(t, n, lib.NotifyRequest{Text: "np-quartz-7 is at 92%", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7", Report: true})
+	serveJSON(t, n, lib.NotifyRequest{Text: "⏳ reading pod state", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7"})
+	serveJSON(t, n, lib.NotifyRequest{Text: "1 of 3", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7", Update: "plan"})
+	serveJSON(t, n, lib.NotifyRequest{Text: "a report on no task", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, Report: true})
+	serveJSON(t, n, lib.NotifyRequest{Text: "refused", Conversation: testConsoleConversation, ContextID: "ctx-other", Report: true})
+	want := []string{testConsoleConversation + " task-7 np-quartz-7 is at 92%"}
+	if !reflect.DeepEqual(conv.kept, want) {
+		t.Fatalf("kept = %q, want %q", conv.kept, want)
 	}
 }
 
@@ -137,7 +184,7 @@ func TestTheConsoleNotifierRepliesToTheChainsRoot(t *testing.T) {
 		root:              "task-root",
 	})
 	got := serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConsoleConversation,
-		ContextID: testConsoleContext, ReplyTo: "task-child"})
+		ContextID: testConsoleContext, ReplyTo: "task-child", Report: true})
 	if got.Error != "" || len(frames.frames) != 1 || frames.frames[0].replyTo != "task-root" {
 		t.Fatalf("reply = %+v, frames = %+v, want replyTo task-root", got, frames.frames)
 	}

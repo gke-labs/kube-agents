@@ -11,7 +11,7 @@ import (
 // read-modify-write of shared state files is serialized across processes.
 // The returned func releases it.
 func LockFile(path string) (func(), error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, FilePermMode)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, FilePermMode) // #nosec G304 G703 -- the lock file beside the CLI's own config, from its flag, env or the user's home
 	if err != nil {
 		return nil, err
 	}

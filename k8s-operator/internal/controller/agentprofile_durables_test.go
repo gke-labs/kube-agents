@@ -3,6 +3,10 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -132,7 +136,7 @@ func TestSyncingAProfilesDurablesDropsATiersQueue(t *testing.T) {
 	})
 	sync := func(want []profileDurable) {
 		t.Helper()
-		if err := syncDurables(ctx, js, "tse", want); err != nil {
+		if err := syncDurables(ctx, js, "tse", want, a2aBuiltinTierNames); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -141,9 +145,9 @@ func TestSyncingAProfilesDurablesDropsATiersQueue(t *testing.T) {
 		return err == nil
 	}
 	sync(desiredProfileDurables(&both))
-	for _, name := range allProfileDurableNames("tse") {
-		if !exists(name) {
-			t.Fatalf("%s missing with both tiers", name)
+	for _, d := range desiredProfileDurables(&both) {
+		if !exists(d.name) {
+			t.Fatalf("%s missing with both tiers", d.name)
 		}
 	}
 	readOnly := testAgentProfile("ns", "tse")
@@ -152,9 +156,52 @@ func TestSyncingAProfilesDurablesDropsATiersQueue(t *testing.T) {
 		t.Error("dropping unattended didn't leave exactly the read durables")
 	}
 	sync(nil)
-	for _, name := range allProfileDurableNames("tse") {
-		if exists(name) {
-			t.Errorf("%s survived the profile's withdrawal", name)
+	for _, d := range desiredProfileDurables(&both) {
+		if exists(d.name) {
+			t.Errorf("%s survived the profile's withdrawal", d.name)
+		}
+	}
+}
+
+// A durable of a tier that is neither read nor unattended (a Tier resource,
+// since deleted or dropped) is found by name from the probe tiers and removed, while another
+// profile's durables, including one whose name shares a prefix, and a durable
+// the operator didn't make, are left alone (#3659).
+func TestADroppedCustomTiersDurablesAreFoundAndOthersLeftAlone(t *testing.T) {
+	js := jetStreamWithProfileSubmits(t)
+	ctx := context.Background()
+	nightly := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "nightly"} })
+	neighbour := testAgentProfile("ns", "tse-b", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} })
+	probe := []string{"read", "nightly"}
+	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&nightly), probe); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncDurables(ctx, js, "tse-b", desiredProfileDurables(&neighbour), probe); err != nil {
+		t.Fatal(err)
+	}
+	// A consumer under this profile's name pattern that the operator didn't make.
+	if _, err := js.CreateOrUpdateConsumer(ctx, a2aProfileSubmitStream, jetstream.ConsumerConfig{
+		Durable: "profile-tse-hand-top", FilterSubject: "a2a.submit.tse.hand.top.*",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readOnly := testAgentProfile("ns", "tse")
+	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&readOnly), probe); err != nil {
+		t.Fatal(err)
+	}
+	exists := func(name string) bool { _, err := js.Consumer(ctx, a2aProfileSubmitStream, name); return err == nil }
+	if exists("profile-tse-nightly-top") || exists("profile-tse-nightly-child") {
+		t.Error("the dropped custom tier's durables survived")
+	}
+	if !exists("profile-tse-read-top") || !exists("profile-tse-b-read-top") || !exists("profile-tse-hand-top") {
+		t.Error("a kept, a neighbour's or an unmarked durable was deleted")
+	}
+	for name, want := range map[string]bool{
+		"profile-tse-read-top": true, "profile-tse-nightly-child": true, "profile-tse-b-read-top": false,
+		"profile-tse-read": false, "profile-tse-read-top-x": false, "profile-tse-ni-ght-top": false,
+	} {
+		if got := profileDurableOf("tse", name); got != want {
+			t.Errorf("profileDurableOf(tse, %s) = %v, want %v", name, got, want)
 		}
 	}
 }
@@ -232,7 +279,7 @@ func TestATierSwapFitsOnAFullStream(t *testing.T) {
 	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: a2aProfileSubmitStream, Subjects: []string{a2aProfileSubmitPrefix + ">"}, MaxConsumers: 2}); err != nil {
 		t.Fatal(err)
 	}
-	sync := func(want []profileDurable) error { return syncDurables(ctx, js, "tse", want) }
+	sync := func(want []profileDurable) error { return syncDurables(ctx, js, "tse", want, a2aBuiltinTierNames) }
 	read := testAgentProfile("ns", "tse")
 	if err := sync(desiredProfileDurables(&read)); err != nil {
 		t.Fatalf("read tier: %v", err)
@@ -272,4 +319,237 @@ func TestRenderedHeldDurableFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkFixture(t, heldDurableFixturePath, string(body)+"\n")
+}
+
+var a2aBuiltinTierNames = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+
+// The operator's durable sync works under the operator's own bus grants
+// (operatorIdentity, with a dispatcher): consumer create, info and delete on
+// PROFILE_SUBMITS and nothing more. A sync that listed the stream's consumers
+// (stream info, consumer names) was refused on a live install and held every
+// profile's card and finalizer (#3659, 2b-i's live run).
+func TestTheDurableSyncNeedsOnlyTheOperatorsGrants(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "dispatcher:test")
+	id, ok := operatorIdentity()
+	if !ok {
+		t.Fatal("no operator identity")
+	}
+	s, err := natsserver.NewServer(&natsserver.Options{Port: -1, JetStream: true, StoreDir: t.TempDir(),
+		Users: []*natsserver.User{
+			{Username: "admin", Password: "admin"},
+			{Username: "operator", Password: "operator", Permissions: &natsserver.Permissions{
+				Publish:   &natsserver.SubjectPermission{Allow: id.publish},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{"_INBOX.>"}},
+			}},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(5 * time.Second) {
+		t.Fatal("nats-server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	ctx := context.Background()
+	admin, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	ajs, _ := jetstream.New(admin)
+	if _, err := ajs.CreateStream(ctx, jetstream.StreamConfig{Name: a2aProfileSubmitStream, Subjects: []string{a2aProfileSubmitPrefix + ">"}}); err != nil {
+		t.Fatal(err)
+	}
+	op, err := nats.Connect(s.ClientURL(), nats.UserInfo("operator", "operator"), nats.CustomInboxPrefix("_INBOX."+a2aOperatorBusUser))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(op.Close)
+	ojs, _ := jetstream.New(op)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// The grants refuse a list, which is what the live install hit: the
+	// sync below must not need one.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err = ojs.Stream(probeCtx, a2aProfileSubmitStream)
+	probeCancel()
+	if err == nil {
+		t.Fatal("the operator's grants allow stream info; this test no longer guards the list")
+	}
+	nightly := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "nightly"} })
+	probe := []string{"read", "unattended", "nightly"}
+	if err := syncDurables(ctx, ojs, "tse", desiredProfileDurables(&nightly), probe); err != nil {
+		t.Fatalf("create under the operator's grants: %v", err)
+	}
+	readOnly := testAgentProfile("ns", "tse")
+	if err := syncDurables(ctx, ojs, "tse", desiredProfileDurables(&readOnly), probe); err != nil {
+		t.Fatalf("drop a tier under the operator's grants: %v", err)
+	}
+	if _, err := ajs.Consumer(ctx, a2aProfileSubmitStream, "profile-tse-nightly-top"); err == nil {
+		t.Error("the dropped tier's durable survived")
+	}
+	if err := syncDurables(ctx, ojs, "tse", nil, probe); err != nil {
+		t.Fatalf("withdraw under the operator's grants: %v", err)
+	}
+}
+
+// A durable is marked as having existed when its tier is in the profile's
+// status.durableTiers, which only a successful durable sync writes; a tier
+// new to the profile, or a profile whose durables were never made, gets its
+// durables at once (#6283).
+func TestADurableExistedWhenItsTierIsInDurableTiers(t *testing.T) {
+	p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.AllowedTiers = []string{"read", "oncall"}
+		p.Status.RenderedTiers = []string{"read", "oncall"}
+		p.Status.DurableTiers = []string{"read"}
+	})
+	for _, d := range desiredProfileDurables(&p) {
+		if want := strings.Contains(d.name, "-read-"); d.existed != want {
+			t.Errorf("%s existed = %v, want %v", d.name, d.existed, want)
+		}
+	}
+}
+
+// A durable that existed and now can't be found isn't re-created on the
+// first miss: a lookup can answer "not found" while a new stream leader
+// lacks the assignment, and a re-create starts the durable over from the
+// stream's first message. It is re-created once still missing
+// durableRecreateDelay later; a durable new to the profile is made at once,
+// and the other durables of the pass are still made (#6283).
+func TestADurableThatExistedIsReCreatedOnlyAfterASecondMiss(t *testing.T) {
+	js := jetStreamWithProfileSubmits(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	gate := newDurableRecheck()
+	gate.now = func() time.Time { return now }
+	p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.AllowedTiers = []string{"read", "oncall"}
+		p.Status.DurableTiers = []string{"read"}
+	})
+	want := desiredProfileDurables(&p)
+	exists := func(name string) bool {
+		_, err := js.Consumer(ctx, a2aProfileSubmitStream, name)
+		return err == nil
+	}
+
+	err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate)
+	if !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("first pass: %v, want the re-check held back", err)
+	}
+	for _, d := range want {
+		if exists(d.name) == d.existed {
+			t.Errorf("first pass: %s exists = %v; a durable that existed waits, a new one is made", d.name, exists(d.name))
+		}
+	}
+
+	now = now.Add(durableRecreateDelay - time.Second)
+	if err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate); !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("before the delay: %v, want still held back", err)
+	}
+
+	now = now.Add(time.Second)
+	if err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate); err != nil {
+		t.Fatalf("after the delay: %v", err)
+	}
+	for _, d := range want {
+		if !exists(d.name) {
+			t.Errorf("after the delay: %s missing", d.name)
+		}
+	}
+}
+
+// A durable found again before the delay ends its wait: a later miss starts
+// a new one rather than re-creating it at once.
+func TestADurableFoundAgainEndsItsWait(t *testing.T) {
+	js := jetStreamWithProfileSubmits(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	gate := newDurableRecheck()
+	gate.now = func() time.Time { return now }
+	p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Status.DurableTiers = []string{"read"} })
+	d := desiredProfileDurables(&p)[0]
+
+	if err := ensureDurableGated(ctx, js, d, gate); !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("first miss: %v", err)
+	}
+	// The assignment arrives: the durable is there on the next look.
+	if err := ensureDurable(ctx, js, d); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDurableGated(ctx, js, d, gate); err != nil {
+		t.Fatalf("found again: %v", err)
+	}
+	if err := js.DeleteConsumer(ctx, a2aProfileSubmitStream, d.name); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(durableRecreateDelay)
+	if err := ensureDurableGated(ctx, js, d, gate); !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("a new miss after being found: %v, want a fresh wait", err)
+	}
+}
+
+// A tier dropped while its durable waits takes the wait with it: added back
+// later with the durable missing, it starts a new wait rather than finding
+// the old miss already due (#6283).
+func TestADroppedTiersWaitIsCleared(t *testing.T) {
+	js := jetStreamWithProfileSubmits(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	gate := newDurableRecheck()
+	gate.now = func() time.Time { return now }
+	p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Status.DurableTiers = []string{"read"} })
+	want := desiredProfileDurables(&p)
+	if err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate); !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("first miss: %v", err)
+	}
+	// The tier is dropped: nothing wanted, its names deleted.
+	if err := syncDurablesGated(ctx, js, "tse", nil, a2aBuiltinTierNames, gate); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * durableRecreateDelay)
+	if err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate); !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("added back: %v, want a fresh wait", err)
+	}
+}
+
+// Draining tiers have no cap of their own, so the record is bounded in code:
+// rendered tiers always kept, draining ones filled in by name up to the CRD's
+// MaxItems, so the status write is never refused (#6292 review).
+func TestDurableTiersStayWithinTheCRDCap(t *testing.T) {
+	v := tierVerdict{renderable: []string{"zeta", "read"}, draining: map[string]time.Time{}}
+	for i := 0; i < 2*maxDurableTiers; i++ {
+		v.draining[fmt.Sprintf("d%03d", i)] = time.Now()
+	}
+	got := durableTiersOf(v)
+	if len(got) != maxDurableTiers {
+		t.Fatalf("durableTiers has %d entries, want the cap %d", len(got), maxDurableTiers)
+	}
+	for _, tier := range []string{"read", "zeta", "d000"} {
+		if !slices.Contains(got, tier) {
+			t.Errorf("durableTiers %v lacks %q", got, tier)
+		}
+	}
+	if slices.Contains(got, fmt.Sprintf("d%03d", maxDurableTiers)) {
+		t.Errorf("durableTiers %v kept a draining tier past the cap", got)
+	}
+	if !slices.IsSorted(got) {
+		t.Errorf("durableTiers %v is not sorted", got)
+	}
+	small := durableTiersOf(tierVerdict{renderable: []string{"read"}, draining: map[string]time.Time{"oncall": time.Now()}})
+	if !slices.Equal(small, []string{"oncall", "read"}) {
+		t.Errorf("durableTiers = %v, want [oncall read]", small)
+	}
+}
+
+// The code cap and the CRD's MaxItems must agree.
+func TestMaxDurableTiersMatchesTheCRD(t *testing.T) {
+	src, err := os.ReadFile("../../api/v1alpha1/agentprofile_types.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("// +kubebuilder:validation:MaxItems=%d\n\t// +kubebuilder:validation:items:MaxLength=10\n\t// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`\n\t// +optional\n\tDurableTiers", maxDurableTiers)
+	if !strings.Contains(string(src), want) {
+		t.Errorf("DurableTiers' MaxItems is not %d (maxDurableTiers)", maxDurableTiers)
+	}
 }

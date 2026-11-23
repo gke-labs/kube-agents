@@ -34,13 +34,13 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// The MCP server as a credential-broker caller. Under its flag the MCP pod
-// runs as a ServiceAccount of its own and presents a projected token minted
-// for an audience of its own, and the broker confers the `mcp` role by that
-// audience. Every piece here hangs off a2aMCPBrokerEnabled, so an install
-// without the MCP server renders none of it: no audience on the broker, no
-// extra caller, no extra ingress peer, and an mcp-audience token from anywhere
-// is "another audience", 401.
+// The MCP server as a credential-broker caller. Unless A2A_MCP_DOOR=false, the
+// MCP pod runs as a ServiceAccount of its own and presents a projected token
+// minted for an audience of its own, and the broker confers the `mcp` role by
+// that audience. Every piece here hangs off a2aMCPBrokerEnabled, so an install
+// with the MCP server switched off renders none of it: no audience on the
+// broker, no extra caller, no extra ingress peer, and an mcp-audience token
+// from anywhere is "another audience", 401.
 //
 // The pattern is the session pod's (credentialProxySessionAudience) and the
 // A2A gateway's (credentialProxyA2AChatAudience): a projected token, an
@@ -96,12 +96,9 @@ const (
 )
 
 // a2aMCPBrokerEnabled is the one predicate every MCP broker render asks: the
-// MCP server's flag, on a mode-next install. The MCP Deployment itself renders
-// only from reconcileA2A, which runs only under next; the broker renders in
-// both modes, so it needs the mode spelled out or a today install carrying the
-// flag would confer a role nobody can hold.
+// MCP server's flag.
 func a2aMCPBrokerEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return renderMode(agent, "a2a-mcp") == ModeNext && a2aMCPDoorEnabled()
+	return a2aMCPDoorEnabled()
 }
 
 // a2aMCPServiceAccountName is the MCP pod's own ServiceAccount: the identity
@@ -221,8 +218,7 @@ func newA2AMCPServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.Service
 // enabled and removes it when not. reconcileA2A runs it just ahead of
 // reconcileA2AMCP, so the account exists before the pod that names it; on the
 // way down it goes in the same pass as the Deployment, and a pod still
-// terminating keeps the token it already holds for at most its hour. The flip
-// to today sweeps it with the rest of the MCP server (cleanupA2A's list).
+// terminating keeps the token it already holds for at most its hour.
 //
 // An account under the reserved name that this PlatformAgent does not control
 // is treated as removeA2AMCP treats the rest of the MCP objects and

@@ -176,7 +176,12 @@ class FakeSandbox:
 
 class Base(unittest.TestCase):
     def setUp(self) -> None:
+        # Each piece is undone by a cleanup and not in `tearDown`: cleanups run
+        # last-in first-out and after `tearDown`, so the environment patch of a
+        # subclass, started later, stops before this one. In the other order the
+        # subclass's stop puts the values below back for every later test.
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / "watch"
         # The scope reader looks for the reconcile's snapshot under the agent
         # home and the operator's render under its variable: an install that
@@ -197,8 +202,10 @@ class Base(unittest.TestCase):
             clear=False,
         )
         self.env.start()
+        self.addCleanup(self.env.stop)
         self.clock = mock.patch.object(watch, "now_utc", return_value=NOW)
         self.clock.start()
+        self.addCleanup(self.clock.stop)
 
     def declare_scope(
         self, projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None, retiring: list[str] | None = None
@@ -206,11 +213,6 @@ class Base(unittest.TestCase):
         (Path(self.tmp.name) / fleet_scope_targets.SNAPSHOT_FILE).write_text(
             json.dumps(declared_snapshot(projects, unread, exclude, containers, retiring)), encoding="utf-8"
         )
-
-    def tearDown(self) -> None:
-        self.clock.stop()
-        self.env.stop()
-        self.tmp.cleanup()
 
     @staticmethod
     def failed(detail: str, reason: str = watch.FAILED_REASON_ERROR, admin: bool | None = None) -> str:
@@ -2606,6 +2608,97 @@ class DeclaredScope(Base):
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
 
+class UnusableResolvedScope(Base):
+    """Under spec.mode: next a resolved scope that names no member (missing,
+    too-large, error, stale) leaves the member projects out of the roster. The
+    table is partial then, and the ledger keeps what members pended (#5621)."""
+
+    MEMBER_KEY = "member-a/us-central1-a/c2"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.roster = mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: "p1"})
+        self.roster.start()
+        self.addCleanup(self.roster.stop)
+
+    @staticmethod
+    def scope(usable: bool) -> fleet_scope_targets.ScopeClusters:
+        live = fleet_scope_targets.ProjectClusters("p1", fleet_scope_targets.STATUS_LIST_LIVE)
+        if usable:
+            member_a = fleet_scope_targets.ProjectClusters("member-a", fleet_scope_targets.STATUS_LISTED, (("member-a", "us-central1-a", "c2"),))
+            return fleet_scope_targets.ScopeClusters(source=fleet_scope_targets.SOURCE_RESOLVED_SCOPE, projects=(live, member_a))
+        gap = fleet_scope_targets.ProjectClusters(fleet_scope_targets.UNRESOLVED_SCOPE_ROW, fleet_scope_targets.STATUS_UNREAD, reason="too-large")
+        return fleet_scope_targets.ScopeClusters(source=fleet_scope_targets.SOURCE_RESOLVED_SCOPE, projects=(live, gap), note="is in state 'too-large'")
+
+    def reads(self, *answers):
+        if len(answers) == 1:
+            return mock.patch.object(watch.fleet_scope_targets, "list_scope_clusters", return_value=answers[0])
+        return mock.patch.object(watch.fleet_scope_targets, "list_scope_clusters", side_effect=list(answers))
+
+    def test_a_shared_version_keeps_its_member_clusters_and_is_not_retired(self) -> None:
+        self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b", self.MEMBER_KEY])
+        with self.reads(self.scope(False)):
+            self.run_tick(FakeSandbox(envelope([member("b", "lagging", target=OLDER_TARGET)])))
+        self.assertIn(self.MEMBER_KEY, self.ledger()["targets"][OLDER_TARGET]["pending"])
+        # p1's cluster upgrades while the scope is still unusable: member-a is
+        # still behind, so the version stays.
+        with self.reads(self.scope(False)):
+            code, out = self.run_tick(FakeSandbox(envelope([member("b", "current", target=OLDER_TARGET)])))
+        self.assertEqual(code, 0)
+        self.assertNotIn("is no longer pending", out)
+        self.assertEqual(self.ledger()["targets"][OLDER_TARGET]["pending"], [self.MEMBER_KEY])
+
+    def test_a_version_only_members_pend_is_still_due(self) -> None:
+        self.seed(OLDER_TARGET, None, [self.MEMBER_KEY])
+        with self.reads(self.scope(False)):
+            code, out = self.run_tick(FakeSandbox(envelope([])), ["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"dry run: would report {OLDER_TARGET}", out)
+        self.assertNotIn("would retire", out)
+
+    def test_the_tick_reads_the_resolved_scope_once(self) -> None:
+        # The roster and the gap check see one snapshot: a document that comes
+        # back mid-tick must not make a table of the live projects complete.
+        self.seed(OLDER_TARGET, NOW, [self.MEMBER_KEY])
+        with self.reads(self.scope(False), self.scope(True)) as read:
+            code, out = self.run_tick(FakeSandbox(envelope([])))
+        self.assertEqual(code, 0)
+        self.assertEqual(read.call_count, 1)
+        self.assertNotIn("is no longer pending", out)
+        self.assertIn(OLDER_TARGET, self.ledger()["targets"])
+
+    def test_an_explicit_roster_ignores_the_resolved_scope(self) -> None:
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1"}), self.reads(self.scope(False)) as read:
+            code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
+        self.assertEqual(code, 0)
+        self.assertEqual(read.call_count, 0)
+        self.assertNotIn("the version table was partial", out)
+
+    def test_an_unreadable_scope_render_in_the_cluster_read_fails_as_scope_unreadable(self) -> None:
+        with mock.patch.object(watch.fleet_scope_targets, "list_scope_clusters", side_effect=fleet_scope_targets.ScopeRenderUnreadable("scope.json: bad")):
+            code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")])))
+        self.assertEqual(code, 0)
+        self.assertIn(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_SCOPE_UNREADABLE, next=watch.FAILED_NEEDS_ADMIN), out)
+
+
+class EnvironmentRestored(unittest.TestCase):
+    def test_a_tick_test_with_an_environment_of_its_own_leaves_none_of_it_behind(self) -> None:
+        # A class that patches the environment after `Base.setUp` and stops its
+        # patch as a cleanup: the two must unwind last-in first-out, or the
+        # values of `Base` stay for every test that runs later.
+        # Inside a patch of its own, so a leak that this finds does not stay for
+        # the tests that run later.
+        with mock.patch.dict(os.environ):
+            before = dict(os.environ)
+            result = unittest.TestResult()
+            UnusableResolvedScope("test_an_explicit_roster_ignores_the_resolved_scope").run(result)
+            self.assertTrue(result.wasSuccessful(), result.failures + result.errors)
+            self.assertEqual(result.skipped, [])
+            changed = sorted(key for key in set(before) | set(os.environ) if before.get(key) != os.environ.get(key))
+        # Names only: a failure must not print the environment into the log.
+        self.assertEqual(changed, [])
+
+
 class Projects(unittest.TestCase):
     def test_the_explicit_list_wins(self) -> None:
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2, p1,p2", watch.MANAGEMENT_PROJECT_ENV: "mgmt"}):
@@ -2657,6 +2750,56 @@ class Projects(unittest.TestCase):
             ):
                 self.assertEqual(watch.roster_projects(), {"tenant-a", "tenant-b", "tenant-c"})
 
+
+    def test_next_mode_reads_the_resolved_scope_and_never_walks_the_profiles(self) -> None:
+        # #5621: under spec.mode: next the roster is every project the resolved
+        # scope names (the report lists each one's clusters itself); a profile
+        # that would name another project is not read.
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            (root / "profiles" / "cluster-ghost").mkdir(parents=True)
+            (root / "profiles" / "cluster-ghost" / "config.yaml").write_text(
+                "cluster_identity:\n  project: ghost-proj\n  cluster: g\n  location: l\n", encoding="utf-8")
+            (root / "scope.json").write_text(json.dumps({"present": True, "projects": ["explicit-a"], "folders": ["1"]}), encoding="utf-8")
+            (root / "resolved-scope.json").write_text(json.dumps({
+                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": __import__("scope_publisher").member_hash(json.loads((root / "scope.json").read_text())), "excludedProjects": [],
+                "projects": [{"id": "member-a", "via": ["folders/1"], "outcome": "ok"}, {"id": "member-b", "via": ["folders/1"], "outcome": "denied"}],
+                "clusters": {"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["l", "c"]]}},
+            }), encoding="utf-8")
+            env = {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: "mgmt",
+                   watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                   watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json")}
+            with mock.patch.dict(os.environ, env), mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home), mock.patch.object(
+                watch.fleet_scope_targets, "profile_identities", side_effect=AssertionError("walked the profiles")
+            ):
+                self.assertEqual(watch.roster_projects(), {"mgmt", "explicit-a", "member-a", "member-b"})
+                self.assertEqual(watch.projects(), ["explicit-a", "member-a", "member-b", "mgmt"])
+
+
+    def test_an_unusable_resolved_scope_makes_the_table_partial(self) -> None:
+        # A too-large or missing document names no member, so the roster holds
+        # only the live projects. That must not read as a complete table, or
+        # every version only member clusters pend would be retired and come
+        # back as new once the document returns.
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            (root / "scope.json").write_text(json.dumps({"present": True, "projects": ["explicit-a"], "folders": ["1"]}), encoding="utf-8")
+            (root / "resolved-scope.json").write_text(json.dumps({"v": 1, "state": "too-large", "projects": []}), encoding="utf-8")
+            env = {watch.MANAGEMENT_PROJECT_ENV: "mgmt",
+                   watch.PROJECTS_ENV: "",
+                   watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                   watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json")}
+            with mock.patch.dict(os.environ, env), mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home):
+                gap = watch.resolved_scope_gap()
+                self.assertIsNotNone(gap)
+                self.assertEqual(gap[watch.ERROR_KIND_KEY], watch.ERROR_KIND_RESOLVED_SCOPE_UNREAD)
+                self.assertIsNone(gap[watch.MEMBER_ID_KEYS[1]])
+                self.assertIn("too-large", gap[watch.MESSAGE_KEY])
+            # Today mode, or a usable document, has no gap.
+            with mock.patch.dict(
+                os.environ, {watch.PROJECTS_ENV: "", watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: ""}
+            ), mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home):
+                self.assertIsNone(watch.resolved_scope_gap())
 
 class Loader(unittest.TestCase):
     def setUp(self) -> None:

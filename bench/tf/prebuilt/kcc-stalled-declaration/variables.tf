@@ -22,9 +22,9 @@ variable "project_id" {
   default     = ""
 }
 
-# No pool project runs Config Connector today, so these have no default: the
-# case is a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py until one
-# does, and the apply refuses an empty value.
+# These have no default. hack/ci-eval-pr.sh gives them from the seeded-a
+# cluster, which runs Config Connector in each pool project, and the apply
+# refuses an empty value.
 variable "kcc_cluster_name" {
   type        = string
   description = "Cluster that runs Config Connector, where the stalled object is planted"

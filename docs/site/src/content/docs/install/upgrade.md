@@ -1,6 +1,6 @@
 ---
 title: Upgrade
-description: Moving an existing install to a newer release with upgrade.sh — its modes, how the target version is resolved, and what a run refuses before any of the new release is applied.
+description: Moving an existing install to a newer release with upgrade.sh — its upgrade modes, how the target version is resolved, and what a run refuses before any of the new release is applied.
 ---
 
 `upgrade.sh` is the Day-2 engine for an install `install.sh` created. It re-applies the same
@@ -21,8 +21,9 @@ GitHub, the links between pages do not work: open each linked page at the same t
 
 ## Before you start
 
-A GitLab install needs nothing extra for an upgrade: no token and no flag. See
-[Upgrade and uninstall](/kube-agents/install/gitlab/#upgrade-and-uninstall).
+A GitLab or Bitbucket install needs nothing extra for an upgrade: no token and no flag. See
+[Upgrade and uninstall](/kube-agents/install/gitlab/#upgrade-and-uninstall) for GitLab and
+[Upgrade and uninstall](/kube-agents/install/bitbucket/#upgrade-and-uninstall) for Bitbucket.
 
 Record what the install runs now, so you can tell afterwards what moved:
 
@@ -36,7 +37,7 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 helm history kube-agents -n kubeagents-system
 ```
 
-The third command prints the install's `spec.mode`; an empty line means `today`.
+The third command prints the install's `spec.mode` as the release you run now stores it. An empty line or `today` means the install runs without the A2A stack, and the upgrade adds it: read [Moving to the A2A stack](#moving-to-the-a2a-stack) first. `next` means it already has the stack.
 
 Read the release notes for every release between the one you run and the one you are moving to.
 
@@ -119,7 +120,6 @@ Each path is a `jq` path on `values.json`.
 | `CLUSTER_NAME`                                   | `.platformAgent.harness.clusterName`                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `REGION`                                         | `.platformAgent.harness.location`                                                     | Copy it exactly. It can be a zone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `NAMESPACE`                                      | the release namespace                                                                 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `PLATFORM_AGENT_MODE`                            | `.platformAgent.mode`                                                                 | Empty means `today`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `PLATFORM_AGENT_STORAGE_SIZE`                    | `.platformAgent.storage.size`                                                         | Empty means the operator default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `MODEL_PROVIDER`                                 | `.litellm.modelProvider`                                                              |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `MODEL_DEFAULT_NAME`                             | `.litellm.modelDefaultName`                                                           |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -127,7 +127,7 @@ Each path is a `jq` path on `values.json`.
 | `MODEL_MAX_TOKENS`                               | `.litellm.maxTokens`                                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`           | `.litellm.vertex.projectId`, `.litellm.vertex.location`                               | `vertex_ai` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `LITELLM_REDACTION_ENABLED`                      | `.litellm.redaction.enabled`                                                          | If it is `true`, also copy `.litellm.redaction.ip.action` to `LITELLM_REDACTION_IP_ACTION`, `.litellm.redaction.ip.allowCidrs` to `LITELLM_REDACTION_IP_ALLOW_CIDRS` and `.litellm.redaction.rules` to `LITELLM_REDACTION_RULES` (as JSON in single quotes).                                                                                                                                                                                                                                                      |
-| `GOOGLE_CHAT_ENABLED`                            | `.platformAgent.integration.googleChat.enabled`                                       | If it is `true`, also copy these fields of `.platformAgent.integration.googleChat`: `topicName` to `CHAT_TOPIC_NAME`, `subscriptionName` to `CHAT_SUB_NAME`, `mode` to `GOOGLE_CHAT_MODE`, `allowedUsers` to `ALLOWED_USERS` and `homeChannel` to `GOOGLE_CHAT_HOME_CHANNEL`.                                                                                                                                                                                                                                     |
+| `GOOGLE_CHAT_ENABLED`                            | `.platformAgent.integration.googleChat.enabled`                                       | If it is `true`, also copy these fields of `.platformAgent.integration.googleChat`: `topicName` to `CHAT_TOPIC_NAME`, `subscriptionName` to `CHAT_SUB_NAME`, `mode` to `GOOGLE_CHAT_MODE`, `allowedUsers` to `ALLOWED_USERS`, `homeChannel` to `GOOGLE_CHAT_HOME_CHANNEL` and `homeChannelPolicy` to `GOOGLE_CHAT_HOME_CHANNEL_POLICY`.                                                                                                                                                                           |
 | `SLACK_ENABLED`                                  | `.platformAgent.integration.slack.enabled`                                            | If it is `true`, also copy these fields of `.platformAgent.integration.slack`: `allowedUsers` to `SLACK_ALLOWED_USERS`, `homeChannel` to `SLACK_HOME_CHANNEL`, `homeChannelName` to `SLACK_HOME_CHANNEL_NAME` and `homeChannelPolicy` to `SLACK_HOME_CHANNEL_POLICY`.                                                                                                                                                                                                                                             |
 | `GITOPS_ORG`                                     | `.platformAgent.integration.github.org`                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `GITOPS_REPO`                                    | `.platformAgent.integration.github.gitRepo`                                           | The value is `<org>/<repo>`. Write only the part after the `/`.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -136,11 +136,12 @@ Each path is a `jq` path on `values.json`.
 | `MINTER_SHARED_KEY`                              | None                                                                                  | Only on an install that shares a minter key on purpose: its `<keyring>/<key>`, which Helm does not hold.                                                                                                                                                                                                                                                                                                                                                                                                          |
 | GitLab keys                                      | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `gitlab`, set `GITOPS_FORGE=gitlab`. Copy the forge's `host` to `GITOPS_HOST`, `credentialsRef.name` to `GITLAB_TOKEN_SECRET` and `caBundleRef.name` to `GITOPS_CA_SECRET`, and the repository's `repository` to `GITOPS_REPO`.                                                                                                                                                                                                                                                      |
 | GitHub Enterprise Server keys                    | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `github` and it has a `host`, set `GITOPS_FORGE=github`. Copy the forge's `host` to `GITOPS_HOST`, `caBundleRef.name` to `GITOPS_CA_SECRET` and `namespace` to `GITOPS_ORG`, and the repository's `repository` to `GITOPS_REPO`.                                                                                                                                                                                                                                                     |
-| `ENABLE_GVISOR`                                  | `.platformAgent.deployment.availability.runtimeClassName`                             | `gvisor` means `true`. Always write the key: the upgrade's default is `false`, not the installer's `true`.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `ENABLE_GVISOR`                                  | `.platformAgent.deployment.availability.runtimeClassName`                             | `gvisor` means `true`. Write the key: absent, the upgrade reads the live install, and an apply that would drop the gVisor pool stops for `--allow-node-pool-destroy`.                                                                                                                                                                                                                                                                                                                                             |
 | `MEMORY`                                         | `.platformAgent.harness.memory.provider`                                              | `kube_agents_memory` is `hindsight`, `multiuser_memory` is `file` and `none` is `off`.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `USER_PROFILE_ENABLED`                           | `.platformAgent.harness.memory.userProfileEnabled`                                    |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `HERMES_DASHBOARD_ENABLED`                       | `.platformAgent.harness.hermes.dashboardEnabled`                                      | The upgrade does not read the old `ENABLE_WEBUI` name.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `WEB_CONSOLE_ENABLED`                            | `.webConsole.enabled`                                                                 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `CARD_STOP_ENABLED`                              | `.operator.cardStop.enabled`                                                          |
 | `ENABLE_DRIFT_DETECTOR`                          | `.platformAgent.harness.driftDetector`                                                | If `enabled` is `true`, write `true`. If the path is absent (`null`), write `false`. If it has a `subscription` but no `enabled`, write `false` and `TF_VAR_enable_drift_pubsub=true`.                                                                                                                                                                                                                                                                                                                            |
 | `ENABLE_PUBSUB_PLATFORM`                         | `.plugins.pubsubPlatform.enabled`                                                     | When `.plugins.stockoutInvestigator.enabled` is `true`, this value is always `true` and does not show the key. Write the key only if you know its old value.                                                                                                                                                                                                                                                                                                                                                      |
 | `ENABLE_STOCKOUT_INVESTIGATOR`                   | `.plugins.stockoutInvestigator.enabled`                                               | If it is `true`, also copy these fields of `.plugins.stockoutInvestigator.pubsub`: `topic` to `TF_VAR_stockout_pubsub_topic`, `subscription` to `TF_VAR_stockout_pubsub_subscription` and `sink` to `TF_VAR_stockout_pubsub_sink`.                                                                                                                                                                                                                                                                                |
@@ -150,6 +151,7 @@ Each path is a `jq` path on `values.json`.
 | `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX` | `.global.imageRegistry`, `.global.thirdPartyImageRegistry`                            | If `.global.imageRegistry` was set but `.global.thirdPartyImageRegistry` was empty, check what the mirror holds. For an install created before the third-party fallback was removed whose mirror holds third-party images (the `make mirror-images MIRROR_PREFIX=` default), copy `.global.imageRegistry` to `THIRD_PARTY_REGISTRY_PREFIX` to keep third-party images on the mirror. Step 5 exits 2 on this key; keep it. If the mirror holds only first-party images, leave `THIRD_PARTY_REGISTRY_PREFIX` unset. |
 | `PLATFORM_AGENT_GSA_NAME`                        | `.platformAgent.security.serviceAccountAnnotations["iam.gke.io/gcp-service-account"]` | Write the part before the `@`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `GITHUB_MINTER_GSA_NAME`                         | `.githubMinter.gsaName`                                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `GITHUB_MINTER_KSA_NAME`                         | `.githubMinter.ksaName`                                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `LITELLM_GSA_NAME`                               | `.litellm.vertex.serviceAccountAnnotations["iam.gke.io/gcp-service-account"]`         | `vertex_ai` only. Write the part before the `@`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `TF_VAR_agent_ksa_name`                          | `.platformAgent.security.serviceAccountName`                                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `TF_VAR_image_pull_secrets`                      | `.global.imagePullSecrets`                                                            | Write it as a JSON list in single quotes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -254,17 +256,60 @@ Before a move across several releases:
 
 The release notes list pull request titles only. A `!` before the colon marks a breaking change.
 0.10.0 and 0.11.0 have no `!` changes. The table also lists changes with no `!` that turn on something new for an existing install.
-A row labelled `pending` is for a change that had not shipped in a release when the row was written; the row is relabelled with the release number after the release ships.
+A row labelled `pending` is for a change that had not shipped in a release when the row was written; the row is relabelled with the release number after the release ships. Rows run newest first, with `pending` rows on top, so the top of the table is what the newest release changed.
 
+<!-- For contributors: put a new `pending` row where its Change text sorts among the other `pending` rows,
+ignoring case, backticks and a `#<number>: ` prefix, not at the very top. Changes open at the same time then
+add rows at different places and merge without a conflict; `make docs-check-upgrade-releases` names the row a
+misplaced one belongs below. The table is kept out of Prettier, so a new row is a one-line change. (#6286) -->
+<!-- prettier-ignore -->
 | Release | Change                                                                     | What an existing install meets                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| pending | Google Chat's Stop button takes a press from the thread's requesters alone | `spec.mode: next` only. The Stop button on a Google Chat status line now takes a press from someone who asked for work in the thread, the person who asked or anyone who sent a follow-up while the task ran, as Slack's does. Anyone else's press cancels nothing and gets no reply. A typed `stop` is unchanged. See [Follow-ups while a task runs](/kube-agents/concepts/chatops/#follow-ups-while-a-task-runs).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| pending | `install.sh` and `upgrade.sh` default `sizingProfile` to `auto`            | Installs without `PLATFORM_AGENT_SIZING_PROFILE` move to `spec.deployment.sizingProfile: auto` on `upgrade.sh --upgrade-mode=full` (and on `harness` when unset in release values and supported by the CRD). Fleets at 10 or 25+ clusters promote runtime pods to `medium` or `fleet` on upgrade, restarting changed workloads. On GKE Standard at 25+ clusters, `fleet` requires nodes with 8+ vCPU (`TF_VAR_sizing_profile=fleet`). Set `PLATFORM_AGENT_SIZING_PROFILE=small` in `install.env` to keep `small` instead.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 0.38.0  | the dispatcher no longer cleans up Jobs under their pre-0.35.0 names | When a task ends, the dispatcher deletes only its Job under the current name. A Job an earlier dispatcher than 0.35.0 launched under the old name ends with its pod or its TTL. Upgrading from 0.35.0 or later, there are none. |
+| 0.37.0  | only the operator may make an AgentSchedule built-in                       | With `admissionPolicy.enabled` on Kubernetes 1.30+, a new `ValidatingAdmissionPolicy` refuses anyone but the operator's ServiceAccount who sets, changes or removes an `AgentSchedule`'s `kubeagents.x-k8s.io/origin: builtin` label or its controller reference, or changes a built-in schedule's spec (except `spec.suspend`). Annotations such as `run-now`, and suspending a built-in schedule (`spec.suspend`), still pass. A schedule someone else labelled `builtin` before this now reads `Accepted=False` (`BuiltinNotFromOperator`) and doesn't run. Its next write still passes, because the label and reference are unchanged, but it doesn't run as built-in either: the operator renders no built-in schedules yet. Rollback removes the policy with the release.                                                                                                                                                                                                                     |
+| 0.37.0  | the MCP server runs by default                                             | The operator renders the [MCP server](/kube-agents/reference/a2a-mcp/) (`<name>-a2a-mcp` Deployment, Service and ServiceAccount, `<name>-a2a-mcp-netpol`, and `<name>-a2a-mcp-token`) beside every `PlatformAgent` unless `operator.mcpServer.enabled` is `false` (`A2A_MCP_DOOR=false`). The credential broker rolls once to add `CREDENTIAL_PROXY_MCP_AUDIENCE` and `CREDENTIAL_PROXY_MCP_CALLERS`, and already-enabled installs roll `<name>-a2a-mcp` once for its `64Mi` `ephemeral-storage` request and limit. Session quota counts one more pod while enabled; `quotaPreflight` counts one unconditionally (`100m` / `128Mi` requested, `500m` / `256Mi` limits, `64Mi` ephemeral; [Footprint](/kube-agents/install/prerequisites/#footprint)). `upgrade.sh` picks up the default automatically; hand-run `helm upgrade` needs `--reset-then-reuse-values` (or `--set operator.mcpServer.enabled=true`). Set `operator.mcpServer.enabled: false` to keep it off. |
+| 0.36.0  | a profile task writes only on the branches and proposals it made           | A permitted profile write reaches only a branch the same task pushed while the name was free, or a proposal it opened, which the broker records in memory. A task can't continue another task's branch or proposal. A task in flight across the upgrade, or across a later broker restart, can't publish to, open a proposal from, or update what it made before it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 0.36.0  | a TASKS reshape can be asked for                                           | Nothing changes on its own. A person can now annotate the PlatformAgent `kubeagents.x-k8s.io/bus-reshape=<value>` to recreate TASKS at the width it renders, keeping its messages, behind a write freeze of a few minutes ([Recreating TASKS wider](/kube-agents/operator/platformagent-crd/#recreating-tasks-wider)). Roll back only to 0.35.0 or later, which hold a migration of a leg they do not run (`A2ABusMigrationLegUnknown`): an older operator misreads a reshape under way. A reshape that has finished is inert to any release.                                                                                                                                                                                                                                                                                                                                                                                    |
+| 0.36.0  | Google Chat learns its home channel from the first mention                 | With `GOOGLE_CHAT_HOME_CHANNEL` empty, the first top-level mention of the agent in a named space makes that space the home channel, and alerts and scheduled reports start to post there. Set the key, or set `GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual`, to keep the earlier behaviour. A configured home channel on the other platform still takes a single-destination alert before a learned one. On an install with Google Chat and no Slack, the agent pod and the gateway pod each restart once. On an install with both, only the gateway pod does. A Slack-only install restarts neither.                                                                                                                                                                                                                                                                                                                                 |
+| 0.36.0  | `kanban.admission` rejects `memoryBudgetMiB` below `workerRssCapMiB`       | Where the validating webhook is enabled, new `PlatformAgent` creates and updates are refused when effective `memoryBudgetMiB` is below `workerRssCapMiB`, and Helm renders setting `platformAgent.harness.tuning.admission` fail the same invariant against defaults. An existing CR with a sub-cap `spec.deployment.resources` or `admission` override still passes unrelated updates with a warning. On reconcile it reports `Degraded` (`InvalidKanbanAdmission`) and a `Warning` Event, and `upgrade.sh` warns before planning or dispatch. Raise `memoryBudgetMiB` (or `spec.deployment.resources` memory when `memoryBudgetMiB` is unset) to at least `workerRssCapMiB`, or lower `workerRssCapMiB`.                                                                                                                                                                                                                       |
+| 0.35.0  | `--reuse-values` upgrades render the A2A bus images from the chart's pins  | A `helm upgrade --reuse-values` run by hand from a release before `a2aBus.images` now renders the four bus image env vars from the chart's own pins. Unmirrored, the pins are the operator's compiled defaults written in full (`docker.io/library/nats:…` where the operator's default reads `nats:…`), so the bus pulls the same image and rolls once on the reference change. Under `global.thirdPartyImageRegistry` the bus pulls from the mirror and rolls once. An install that sets `a2aBus.images.nats` or `A2A_NATS_IMAGE` itself keeps its own image.                                                                                                                                                                                                                                                                                                                                                                  |
+| 0.35.0  | a busReplicas change completes again, after 0.34.0                         | Known issue on 0.34.0: changing `spec.harness.tuning.busReplicas` on an existing bus doesn't complete. One to three restarts the auth callout repeatedly, and three to one stops partway and can leave streams with a single replica. Don't change `busReplicas` on 0.34.0: upgrade to this release first, then change it. An install that doesn't change `busReplicas` is not affected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 0.35.0  | a confirmed profile change runs in its own Job                             | A profile task whose request was confirmed for a change runs in its own one-pod Job, never on a warm pool pod. Where its tier has no Job runner, as on installs without the chart's dispatch Job admission policy, it is refused with `change-needs-job` and changes nothing. Upgrade the dispatcher before, or with, a gateway that sends confirms, and don't roll the dispatcher back past this release while one does.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 0.35.0  | a profile durable that existed is re-created a pass later                  | The operator re-creates a missing profile durable on `PROFILE_SUBMITS` only if it is still missing 30s after the first miss, and records in the AgentProfile's new `status.durableTiers` which durables a successful sync made. On the first pass after the upgrade no profile has that record, so a missing durable is made at once, as before. That pass's sync finds the durables already there and writes the record, so the 30s check applies from the second pass. A rollback leaves the field, which the older operator ignores.                                                                                                                                                                                                                                                                                                                                                                                          |
+| 0.35.0  | an upgrade that cannot read the live Secret stops                          | When install.env leaves out a credential and the live `platform-agent-secrets` Secret cannot be read, `upgrade.sh` and `install.sh` now stop before Terraform and name what they could not recover. They used to go on and write those values empty. Re-run once the cluster answers, export the values, or name the ones to leave empty in `ALLOW_EMPTY_SECRET_KEYS`. `uninstall.sh` warns and goes on.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 0.35.0  | every profile gets a Job template per tier                                 | Under Job mode the operator renders a `DispatchJobTemplate` for each live tier of every profile, named `kube-agents-dispatch-job-tier-<profile>.<tier>` beside the unattended tier's. A confirmed change then runs in its own one-pod Job at the read tier, where it was refused with `change-needs-job`. Once any profile is bound under Job mode, the pods quota's Job term doubles; the warm workers' share is unchanged, so read Jobs take none of their slots. A read-only profile outside Autopilot's cpu-to-memory ratio now shows `JobResourcesFit` `False`. Upgrade the dispatcher with the operator. When a task ends, the dispatcher also deletes the old-named Job an older dispatcher launched for it, if that Job's annotations name the same task.                                                                                                                                                                |
+| 0.35.0  | rolling back per-tier Job templates                                        | An older dispatcher leaves Jobs under the new names until their pods exit or their TTL removes them, and may launch a second, old-named Job for a task not yet confirmed. An older operator leaves the per-tier params in place, unused, until Job mode is turned off and its teardown removes them.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 0.35.0  | the A2A gateway gets a token for reading audit reports                     | Every install. The operator projects a `kubeagents-credential-proxy-a2a-reports` token into the A2A gateway pod at `/var/run/secrets/a2a-reports/token` and names it and the broker in `A2A_REPORT_STORE_TOKEN_FILE` and `A2A_REPORT_STORE_URL`, so the gateway pod rolls once. The broker gains the audience and binds it to the gateway's ServiceAccount, and that account joins the broker's callers and its NetworkPolicy on installs without Google Chat; the broker pod rolls once too. A rollback drops all of it. An install whose own NetworkPolicies cover the broker should admit TCP 8765 from the A2A gateway's pods.                                                                                                                                                                                                                                                                                               |
+| 0.35.0  | the AgentProfile worker pod sets no `ANTHROPIC_API_KEY`                    | The operator does not put the placeholder model key in the AgentProfile worker pod spec now: the worker image adds it to the harness env when the task starts. Thus an AgentProfile's `spec.harness.image` must be at this release or later. The chart sets that image from `profiles.<name>.harness.image.tag`, else from `platformAgent.deployment.image.tag`, else from the chart version. With an older worker image, the profile tasks fail at model authentication. The session worker (`A2A_WORKER_IMAGE`) is not affected.                                                                                                                                                                                                                                                                                                                                                                                               |
+| 0.35.0  | the auth callout rolls once more for the held-profile list                 | The dispatcher's identity-map entry gains `held`, the profiles held until every bus server has loaded their config, so a bucketed dispatcher connection gets none of their grants early. The schema moves to 9, which also carries the bus migration's expiry field and the gateway entry's deny fields, so the upgrade restarts the callout pods once. New bus connections retry for those seconds; established ones are not touched. Rolling back restarts them once more.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 0.35.0  | the callout, gateway and Platform Agent pod roll once for `defaultRoute`   | The PlatformAgent gains `spec.harness.tuning.defaultRoute`. Routing is unchanged: unset means `platform`, as before. The upgrade rolls the auth callout once, as its reserved addressee list becomes `platform,session`, and the A2A gateway and the Platform Agent pod once each, for their new `A2A_DEFAULT_ADDRESSEE=platform` env. Creating an AgentProfile named `session` is now refused; one that already exists keeps working. A rollback rolls the three once more.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 0.35.0  | the quota check counts the session pods                                    | The chart's quota preflight counts the session pods at the cap: `platformAgent.harness.tuning.maxSessions` (10) times one pod, 150m CPU and 320Mi requested, 2 CPU and 2Gi limits, 1088Mi ephemeral storage, or `sessionResources` where set. At the defaults that adds 10 pods, 1.5 CPU and 3200Mi of requests, 20 CPU and 20Gi of limits. On GKE Autopilot each pod counts at Autopilot's minimums, 250m and 512Mi. A namespace `ResourceQuota` sized without them refuses `helm upgrade` and prints a patch; the gateway would otherwise be refused session pods at run time. Raise the quota, lower `maxSessions`, or set `quotaPreflight.enabled=false`. See [Prerequisites](/kube-agents/install/prerequisites/#footprint).                                                                                                                                                                                                |
+| 0.34.0  | a profile change reloads the A2A bus instead of rolling it                 | A three-server bus rolls once on the upgrade, one server at a time while R3 streams keep serving, as its pod template drops the profile list; a one-server bus doesn't restart. After that, binding or removing an AgentProfile reloads every server in place, usually within a minute, with no roll. A newly bound profile stays `BusConfigPending` until every server is confirmed on the new config. Rolling the operator back rolls a three-server bus once more, and a reload still pending then is confirmed again, or the bus restarted, by the older operator. On a one-server bus, a profile change still pending when the upgrade lands is confirmed by restarting the server at its original bound, with a `BusConfigReloadFailed` Warning.                                                                                                                                                                           |
+| 0.34.0  | the operator's profile-namespace Role renders in every mode                | A Helm release whose `platformAgent.mode` is not `next` gains `<release>-operator-namespaced-role` and its RoleBinding in `<namespace>-profiles`, with the same rules the operator's Role already has in the install namespace. If you created that Role or RoleBinding by hand, delete it before you upgrade: Helm doesn't adopt an object it didn't create, and the upgrade fails on it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 0.34.0  | session pods request less, and the requests are configurable               | Each A2A session pod requests 150m CPU and 320Mi of memory, down from 250m and 512Mi. At the default cap of 10 that reserves 1.5 CPU and about 3.1Gi, not 2.5 and 5Gi. An install whose sessions need more sets `spec.harness.tuning.sessionResources` (chart: `platformAgent.harness.tuning.sessionResources`); each key it sets replaces its default, and a request set alone above its default limit raises the limit to match. On Autopilot without Pod bursting, its per-pod minimums of 250m and 512Mi still apply, so nothing changes there. A LimitRange whose `maxLimitRequestRatio` is below 40/3 (13.33…) for CPU or 6.4 for memory, or whose `min` is above 150m or 320Mi, refuses new session pods; set requests that fit it.                                                                                                                                                                                       |
+| 0.34.0  | a `PlatformAgent` must be in the operator's namespace                      | Where the validating webhook is enabled, a `PlatformAgent` created in any namespace but the operator's own is refused; both install paths place the CR there, so a stock install meets no change. A CR that already exists elsewhere is updated with a warning that names the namespaces that need the operator's Role, and keeps reporting `RBACIncomplete` until they hold it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 0.34.0  | `system-metadata` and sandbox `sshd` claims request `4Gi` on new installs  | New `system-metadata` and `sshd-<agent>-shell-0` claims request `4Gi` instead of `1Gi` so C3-only clusters using `hyperdisk-balanced` meet its 4 GB minimum. Existing claims keep `1Gi`; the operator orphan-recreates `<agent>-shell` once for its `volumeClaimTemplates` update while leaving the running sandbox pod in place. The chart's `quotaPreflight` counts `6Gi` more `requests.storage` (`228Gi` default, `148Gi` at one NATS server, `236Gi` with Hindsight): raise a tight namespace storage `ResourceQuota` by `6Gi` before `helm upgrade`.                                                                                                                                                                                                                                                                                                                                                                       |
+| 0.34.0  | the A2A bus's NATS image is pinned by version and digest                   | The bus runs `nats:2.10.29-alpine` pinned by digest, the image the floating `2.10-alpine` tag has pointed at since 2026-01-28, so no server version changes. The upgrade rolls every bus once because the image reference changes: a three-server bus one server at a time while R3 streams keep serving, and a one-server bus with a brief restart. An install that sets `a2aBus.images.nats` or `A2A_NATS_IMAGE` keeps its own image.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 0.34.0  | the audit-report store listener renders with the A2A stack                 | Every install. The operator adds the `<name>-report-store` Service and, with `spec.networkPolicy.enabled` on, a rule in `<name>-gateway-netpol` that admits only the credential broker's pods to port 8700 on the gateway pod. A rollback to an earlier operator drops the rule and leaves the Service, which is inert: nothing listens on 8700 there. The gateway pod and the broker pod each roll once, for the new port and env on `agent-api-auth` and the broker's new projected token and its store env. An install whose own NetworkPolicies cover the gateway pod should admit TCP 8700 from the broker's pods.                                                                                                                                                                                                                                                                                                          |
+| 0.34.0  | changing `busReplicas` migrates the A2A bus, keeping its data              | The auth callout rolls once on the upgrade: its identity map gains the expiry field the migration's per-run identities carry. Changing `busReplicas` between 1 and 3 on an existing bus now migrates it, where it was refused. One to three freezes the bus's writes for a few minutes. See [Changing the bus's server count](/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 0.34.0  | the auth callout rolls once for deny lists in the identity map             | The identity map gains deny lists in its grants and an entry for the A2A gateway's ServiceAccount, which nothing uses yet: the gateway still connects with its password (`A2A_GATEWAY_BUS_AUTH=password`, the default). The upgrade restarts the callout pods once. New bus connections retry for those seconds; established ones are not touched. Upgrade the callout image with the operator: an older callout refuses the new map, so its rollout stalls with the reason on the pod while the old pods keep serving the previous map. Rolling back the operator restarts the callout once more.                                                                                                                                                                                                                                                                                                                               |
+| 0.33.0  | Slack joins Google Chat on the A2A gateway                                 | Google Chat and Slack both enabled. An operator upgrade alone moves Slack to the gateway: the broker drops the Slack tokens and the Hermes Slack platform turns off. Slash commands return Slack's timeout error. A `/sethome` home channel does not carry over. See [After the switch: the Slack app](#after-the-upgrade-the-slack-app). A full upgrade refuses an email in the Slack allowlist, a home channel that is no channel id, and several bot tokens, and warns on an empty home channel; `operator` and `harness` runs do neither. The gateway serves one Slack workspace: install one bot token from one workspace, or turn Slack off. An alert goes to one platform with a home channel, Chat first; with none, Google Chat's digest keeps it.                                                                                                                                                                      |
+| 0.32.0  | a newly bound AgentProfile waits until the bus has loaded it               | On a three-server bus the upgrade rolls the servers once, one at a time, as the profile list joins their pod template; R3 streams keep serving through it. After that, a newly bound profile's card and dispatch wait until every bus server has loaded its config: about a minute on one server, one roll on three. On one server, two profile changes inside one kubelet sync end in a restart of the bus pod about four minutes later (a Normal `BusConfigReloadFolded` Event), which drops bus connections as any bus restart does. `CardPublished` reports the wait as `False` with reason `BusConfigPending`. Rolling back the operator rolls a three-server bus once more.                                                                                                                                                                                                                                                |
+| 0.32.0  | every install runs the A2A stack                                           | `spec.mode` is deprecated and ignored. An install that ran `today`, or no mode, gets the A2A stack: the NATS bus, the A2A gateway, callout, verifier, console, `hermes-bridge` container and the `<release namespace>-profiles` Namespace. Three NATS servers need three nodes: a Standard cluster that cannot reach three sets `platformAgent.harness.tuning.busReplicas: 1` before this upgrade, since an existing bus keeps its count. Google Chat moves to the gateway; for Slack, see the row "Slack joins Google Chat on the A2A gateway". Before upgrading, check that `SLACK_ALLOWED_USERS` holds member IDs, not emails, that `SLACK_BOT_TOKEN` is one workspace's, and that a `/sethome` home channel is in `GOOGLE_CHAT_HOME_CHANNEL`. The footprint grows ([Footprint](/kube-agents/install/prerequisites/#footprint)); an existing bus restarts once. No switch back exists.                                        |
+| 0.31.0  | the A2A bus caps `TASKS` and `TOPICS-JOURNAL` lower                        | `spec.mode: next` only. A new bus creates `TASKS` at 8 GiB and `TOPICS-JOURNAL` at 1 GiB. An existing bus keeps 20 and 5 GiB, since provisioning does not edit a stream: the operator records a `Warning` Event, reason `A2ABusStreamCapAboveRender`, with the `nats stream edit` that lowers each and whether applying it now is safe. Run it with your own NATS credentials.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| 0.31.0  | the `gemini` and `vertex_ai` default model is `gemini-3.8-flash`           | An install that names no model (`MODEL_DEFAULT_NAME` unset, Terraform `model_default_name` or Helm `litellm.modelDefaultName` empty) moves from `gemini-3.5-flash` to `gemini-3.8-flash` at its next upgrade; its key or Vertex project must serve that model. An `install.sh` install keeps the name it recorded in `install.env`. Set the name to keep the old model.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 0.31.0  | the auth callout rolls once for a new identity-map shape                   | The identity map gains a field for the dispatcher's bucketed grants (`A2A_DISPATCHER_BUCKETED_GRANTS`, on by default), so the upgrade restarts the callout pods once. New bus connections retry for those seconds; established ones are not touched. The AgentProfile dispatcher runs by default (`operator.profileDispatcher.enabled`; off only at `A2A_PROFILE_DISPATCHER=false`), and its image must be upgraded with the operator: an older dispatcher binds no profile's durables under the new map and stays not Ready until it is. `A2A_DISPATCHER_BUCKETED_GRANTS=false` on the operator keeps the old shape.                                                                                                                                                                                                                                                                                                            |
+| 0.29.0  | a refused Stop press on Google Chat tells the presser, privately           | `spec.mode: next` only. In a space or a group chat, a press of the Stop button by someone who did not ask for the work now posts one line that the presser alone sees: `Only the person who asked can press Stop here. If it must stop, type stop.` Nobody else in the thread is notified. Nothing changes in a direct message, or on Slack. There is no switch; the way back is the previous release's gateway image. See [Follow-ups while a task runs](/kube-agents/concepts/chatops/#follow-ups-while-a-task-runs).                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 0.29.0  | Google Chat's status line no longer reads `completed`                      | `spec.mode: next` only. When a task completes, the status line each ask posts on Google Chat ends as a bare ✅ after the answer posts. When the work goes to a card, the line becomes the one-line acknowledgement instead, and the card's plan and report follow. Nothing reads `✅ completed`. A task that fails, is cancelled or is rejected keeps its line and its notice as before. The change has no switch; the way back is the previous release's gateway image. See [What a task looks like](/kube-agents/concepts/chatops/#on-google-chat-and-the-a2a-console).                                                                                                                                                                                                                                                                                                                                                        |
+| 0.29.0  | the A2A bus runs three NATS servers by default                             | `spec.mode: next` only. An existing bus keeps its one server and restarts once on the upgrade. The chart's quota check counts three servers unless `platformAgent.harness.tuning.busReplicas` is `1`: under a namespace quota sized for one server, set that value before the upgrade, or `helm upgrade` is refused. A `today` install's first switch to `next` creates three servers, each on its own node. [The A2A bus](#the-a2a-bus) has the details.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 0.28.0  | Google Chat's Stop button takes a press from the thread's requesters alone | `spec.mode: next` only. The Stop button on a Google Chat status line now takes a press from someone who asked for work in the thread, the person who asked or anyone who sent a follow-up while the task ran, as Slack's does. Anyone else's press cancels nothing and gets no reply. A typed `stop` is unchanged. See [Follow-ups while a task runs](/kube-agents/concepts/chatops/#follow-ups-while-a-task-runs).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | 0.28.0  | session pods may not set scheduling fields                                 | `spec.mode: next` only, with `admissionPolicy.enabled`. The A2A gateway's pod policy refuses a session pod with a node selector or a positive priority. A default GKE ComputeClass, cluster-wide or set by a label on the release namespace, adds a node selector to every pod. A PriorityClass with `globalDefault: true` and a positive value gives every pod that priority. On such a cluster every delegation fails with "session pod could not be created", and only the gateway's log names the cause. Check `kubectl get computeclass`, the release namespace's labels and `kubectl get priorityclass` first. If either applies, leave the release namespace out of both, or set `admissionPolicy.enabled: false`.                                                                                                                                                                                                        |
 | 0.26.0  | Google Chat's status line has a Stop button under `spec.mode: next`        | `spec.mode: next` only. The status line each ask posts on Google Chat carries a **Stop** button while the task runs. Anyone the allowed-users list admits can press it, and the line itself answers: `🛑 cancel sent — the task ends when the executor confirms` with the button gone, then `🛑 canceled`. A typed `stop` on Google Chat answers on the line the same way and posts no `cancel sent` or `canceled` message. The button has no switch; the way back is the previous release's gateway image. See [Follow-ups while a task runs](/kube-agents/concepts/chatops/#follow-ups-while-a-task-runs).                                                                                                                                                                                                                                                                                                                     |
 | 0.26.0  | requests rise for the Autopilot clamp                                      | The operator requests 100m CPU and 256Mi (from 50m and 128Mi). A `next` agent pod's `hermes-bridge` container requests 250m and 512Mi, limits 1 CPU and 1Gi; the web console and the `next` console 100m and 128Mi, limits 500m and 256Mi; hindsight-api 500m and 2Gi (from 250m and 1Gi). Autopilot without bursting sets limits equal to requests, so each now fits the request it runs under. Autopilot bills the requests; the chart's quota check counts the operator, the web console and hindsight-api, and under `platformAgent.mode: next` the bridge and the `next` console as well. The bridge and both consoles set their Go soft memory limit from the admitted limit, and a `cli` bridge refuses an answer over 8 MiB.                                                                                                                                                                                             |
 | 0.26.0  | a workload's repeat events fold into one incident by default               | `INCIDENT_WORKLOAD_DEDUP_SECONDS` is on at `3600` on every install: within an hour of an alert, a later Warning event for the same workload, or a later Critical after a Critical, posts nothing and starts no triage turn ([one incident per workload](/kube-agents/concepts/chatops/#one-incident-per-workload)). The chart renders the entry into the CR's `spec.deployment.env`, so the agent pod and the credential-proxy pod restart once, and entries added to that list by hand are replaced on the first apply; move them to `platformAgent.deployment.env` first. `platformAgent.deployment.incidentWorkloadDedupSeconds: 0` turns it off.                                                                                                                                                                                                                                                                             |
 | 0.26.0  | Google Chat answers can be rated under `spec.mode: next`                   | `spec.mode: next` only. The final answer to each ask on Google Chat ends with 👍 and 👎. A 👎 opens a card only the rater sees for an optional note, and each rating keeps the question and answer in the install's `feedback` bucket for its max age. To turn it off, set `spec.integration.googleChat.answerFeedback: false` (the chart's `platformAgent.integration.googleChat.answerFeedback`). See [Answer feedback](/kube-agents/concepts/chatops/#answer-feedback).                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| 0.25.0  | the A2A bus separates control-plane, console and worker accounts           | `spec.mode: next` only. The bus places control-plane services in the `TRUSTED` account, the web console and its MCP server (`console-mcp`) in `CONSOLE`, and agent and session workers in `APP`. On first start the bus moves its existing JetStream file store from `/data/jetstream/APP` to `/data/jetstream/TRUSTED` before `nats-server` opens it, so existing streams and key-value buckets stay in place. A rollback goes through `today` and moves `/data/jetstream/TRUSTED` back to `/data/jetstream/APP` before returning to `next`: the earlier bus cannot resolve the `TRUSTED` folder and never becomes Ready. `upgrade.sh` refuses a direct rollback without `--allow-breaking-downgrade`; [the rollback page](/kube-agents/deploy/rollback/#a-bus-left-down-by-a-rollback-under-next) has the steps.                                                                                                               |
+| 0.25.0  | the A2A bus separates control-plane, console and worker accounts           | `spec.mode: next` only. The bus places control-plane services in the `TRUSTED` account, the web console and its MCP server (`console-mcp`) in `CONSOLE`, and agent and session workers in `APP`. On first start the bus moves its existing JetStream file store from `/data/jetstream/APP` to `/data/jetstream/TRUSTED` before `nats-server` opens it, so existing streams and key-value buckets stay in place. A rollback goes through `today` and moves `/data/jetstream/TRUSTED` back to `/data/jetstream/APP` before returning to `next`: the earlier bus cannot resolve the `TRUSTED` folder and never becomes Ready. `upgrade.sh` refuses a direct rollback without `--allow-breaking-downgrade`; [the rollback page](/kube-agents/deploy/rollback/#a-bus-left-down-by-a-rollback) has the steps.                                                                                                                          |
 | 0.24.0  | the identity map is sharded and minter policies name one repository        | `spec.mode: next`: the callout's identity map moves from ConfigMap `<agent>-a2a-authmap` to `<agent>-a2a-authmap-0` (and `-1`, `-2`, … where it would not fit one), the old object is deleted, and the callout rolls once. Anything you read by hand reads `-0`. Under GitHub, every managed repository's `<repo>.yaml` in `github-token-minter-config` is rewritten to list that repository alone, and a run that writes to two managed repositories mints a token for each.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | 0.24.0  | the profile ceiling follows `maxInProgress`                                | `spec.mode: next` only. With `spec.harness.tuning.profiles.ceiling` unset, the install-wide AgentProfile ceiling now defaults to `maxInProgress` instead of 8. The ceiling and the profile namespace's pod quota move by `maxInProgress` minus 8. That is down 2 at the default of 6, and down 5 where the stockout investigator sets `maxInProgress: 3`. Above 8 they go up, to the ceiling's maximum of 1000. To keep 8, set `spec.harness.tuning.profiles.ceiling: 8` (the chart's `platformAgent.harness.tuning.profiles.ceiling`). See [`spec.harness.tuning`](/kube-agents/operator/platformagent-crd/#specharnesstuning).                                                                                                                                                                                                                                                                                                 |
 | 0.24.0  | the credential proxy may use 2 CPU                                         | The proxy's CPU limit rises from 1 to 2 CPU, so it no longer waits on a full core from about six clusters. A namespace ResourceQuota on `limits.cpu` needs 1 CPU more. On GKE Autopilot its requests rise to 2 CPU and 2Gi: without bursting, Autopilot sets limits equal to requests, and with bursting, a pod only bursts into capacity that other pods leave unused. Autopilot bills the requests, so this adds about 1.5 vCPU and 1 GiB per install, and a ResourceQuota needs room for them. The chart's quota check counts them. On Standard the requests stay 500m and 1Gi. A `credentialProxy.resources` that set a lower `limits.cpu` or `limits.memory` alone keeps working: the request follows the limit down.                                                                                                                                                                                                       |
@@ -318,8 +363,7 @@ list, add the entry to that list, because Helm replaces a list as a whole. See
   `crds/` on an upgrade — then re-tags the operator image the same way.
 - `--upgrade-mode=full`, the default, applies the CRDs and then runs a full `terraform apply`
   through the install engine: every image tag moves, and every setting in `install.env` is
-  re-rendered. It is the only mode that applies `PLATFORM_AGENT_MODE`, so it is the one that
-  [switches `spec.mode`](#switching-specmode).
+  re-rendered.
 
 The operator moves before the harness because the operator owns the resources the harness runs as.
 Every mode needs the `kube-agents` Helm release to exist in the target namespace; an install
@@ -428,93 +472,98 @@ The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-repor
 
 ### Slack
 
-On an install with Slack enabled, check that Slack still answers. Which process holds the Slack
-connection depends on `spec.mode` (the third command under [Before you start](#before-you-start)):
+On an install with Slack enabled, check that Slack still answers. The A2A gateway holds the
+connection, with or without Google Chat:
 
-- **Empty or `today`**, or `next` with Google Chat also enabled: the credential broker.
+```bash
+kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system \
+  | grep -E 'slack connected|chat backend stopped'
+```
 
-  ```bash
-  kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system \
-    | grep -E 'Slack relay enabled|Slack relay initialization failed|Slack bot token authentication failed'
-  ```
+The last line contains `"msg":"slack connected"` and names the bot user and the workspace
+(`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token,
+and then opens the Socket Mode connection. A `chat backend stopped` line after it means that
+connection failed. One with no `slack connected` before it means the gateway's first call to
+Slack failed: its `err` reads `invalid_auth` when Slack refused the bot token, and anything else
+(a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
+way.
 
-  The pattern matches exactly three kinds of line. `Slack relay enabled workspaces=1` as the last line is
-  the healthy reading: the number counts the bot tokens Slack accepted, one per workspace.
-  `Slack bot token authentication failed` means Slack refused one of the bot tokens; it gives the
-  error type and Slack's error, not which token. `Slack relay initialization failed; retrying`
-  means no bot token was accepted or the Socket Mode connection failed, and the broker tries again
-  every 30 seconds. No output has no reading of its own (on a broker that has run for a while the
-  startup lines may have rotated out of the log): go by the DM test below.
-
-- **`next`**: the A2A gateway.
-
-  ```bash
-  kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system \
-    | grep -E 'slack connected|chat backend stopped'
-  ```
-
-  The last line contains `"msg":"slack connected"` and names the bot user and the workspace
-  (`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token,
-  and then opens the Socket Mode connection. A `chat backend stopped` line after it means that
-  connection failed. One with no `slack connected` before it means the gateway's first call to
-  Slack failed: its `err` reads `invalid_auth` when Slack refused the bot token, and anything else
-  (a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
-  way.
-
-  No output means the gateway has not tried Slack yet: it first joins the bus and binds its event
-  relay, and until the provisioning Job has created the `TASKS` stream it waits, logging `waiting
+No output means the gateway has not tried Slack yet: it first joins the bus and binds its event
+relay, and until the provisioning Job has created the `TASKS` stream it waits, logging `waiting
 for the stream to be created`, with the pod reading `0/1` ready. Wait a minute and run the
-  command again. If the pod's restart count is climbing instead, `kubectl logs ... --previous`
-  shows why the last run exited.
+command again. If the pod's restart count is climbing instead, `kubectl logs ... --previous`
+shows why the last run exited.
 
-Either way, DM the app a question such as `what clusters can you see?` and wait for the answer (an
+Then DM the app a question such as `what clusters can you see?` and wait for the answer (an
 AI agent asks a person to do this): the log line does not prove that messages reach the agent. If
 nothing comes back, [Slack app setup → Verify](/kube-agents/install/slack-app/#verify) has the next
 checks.
 
-## Switching `spec.mode`
+<a id="switching-specmode"></a>
 
-`PLATFORM_AGENT_MODE` in `install.env` sets the install's `spec.mode`: `next`, which a first install
-gets, or `today`, the previous stack, kept as a rollback. A file with no such line means `today` in
-`upgrade.sh`, so upgrading an install made before `next` became the default leaves it on `today`.
-`install.sh` keeps the mode the cluster runs and records it there, and a full `upgrade.sh` over such
-a file is refused when the install may run `next`. Of `upgrade.sh`'s modes only
-full applies the key; a re-run of `install.sh` applies it too.
-[`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
-has the rules for the key, and
+## Moving to the A2A stack
+
+Every install runs the A2A stack: the NATS bus, the A2A gateway, the auth callout, the capability
+verifier, the A2A console and the `hermes-bridge` container in the agent pod. The chart also creates the `<release namespace>-profiles` Namespace for
+profile pods, with its ResourceQuota and NetworkPolicy. Earlier releases rendered it only for `spec.mode: next`, and an install made
+before `next` became the default ran without it, as `spec.mode: today`. The upgrade moves such an
+install with no action of yours.
+
+`spec.mode` is deprecated and ignored. The CRD defaults an absent field to `next`, and the admission
+webhook rewrites `today` to `next` on the next write. The operator patches a stored `today` to
+`next` on its first pass, and records an Event with reason `ModeMigrated` on the `PlatformAgent`.
+`PLATFORM_AGENT_MODE` in `install.env` is read and ignored, with one notice; delete the line. There
+is no switch back: the way back is the previous release
+([Rolling back a release](/kube-agents/deploy/rollback/)).
+
 [`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md)
-what a switch changes inside the install. This section covers what a switch does to chat: Google Chat first, then
-Slack, in order.
+is the design of record for the stack. This section covers what the move does to an install that
+ran without the stack: the bus first, then Google Chat, then Slack. An install already on `next`
+meets none of it.
 
-With Google Chat or Slack on, a full run prints the chat setup checklist for the mode it applied
-after "Upgrade Complete!", so the app steps that mode needs are on the screen after the switch.
+### The A2A bus
+
+An install that ran without the stack has no A2A bus, so the upgrade creates one, and a new bus
+runs three NATS servers on separate nodes, each with a 40Gi JetStream claim
+([Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements)). On a Standard
+cluster that cannot grow to three nodes, set the chart value
+`platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before the upgrade. Once the
+bus exists, changing the count migrates it, keeping its data
+([Changing the bus's server count](/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count)).
+The chart's quota check counts the whole stack
+([Footprint](/kube-agents/install/prerequisites/#footprint)); under a namespace quota sized for the
+previous stack, `helm upgrade` is refused until the quota has room.
+
+With Google Chat or Slack on, a full run prints the chat setup checklist after "Upgrade
+Complete!", so the app steps the gateway needs are on the screen after the move.
 
 ### Google Chat
 
-With Google Chat enabled, Google Chat takes the A2A gateway under `next`. Each top-level
+With Google Chat enabled, the A2A gateway takes Google Chat. Each top-level
 message you send the app in a DM is then its own conversation, answered in its own thread, as on
 Slack ([ChatOps → Google Chat](/kube-agents/concepts/chatops/#google-chat)). The thing to set for
-it is the home channel, where alerts and scheduled reports land. Under `next` the gateway posts them
-only to `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (the `PlatformAgent`'s
-`spec.integration.googleChat.homeChannel`), and it must be a space name, `spaces/<id>`. A home
-channel set from chat with `/sethome`, or by the install's first chat message, is kept in the
-Planning Agent's profile and does not count. With the key unset or not a space name, the agent posts
-nothing to Google Chat unprompted.
+it is the home channel, where alerts and scheduled reports land. The gateway posts them
+to `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (the `PlatformAgent`'s
+`spec.integration.googleChat.homeChannel`), which must be a space name, `spaces/<id>`, or, with
+the key unset, to the space it learns from the first mention (below). A home
+channel set from chat with `/sethome`, or by the install's first chat message, before the move is
+kept in the Planning Agent's profile and does not count.
 
-Before switching to `next`, set `GOOGLE_CHAT_HOME_CHANNEL` in the same `install.env` as
-`PLATFORM_AGENT_MODE`, so the one full run applies both
-([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After the switch, check
-that a scheduled report or an alert reaches that space.
+With the key not a space name, the agent posts nothing to Google Chat unprompted. With it unset,
+the gateway makes the space of the first top-level mention of the agent in a named space the home
+channel, and the agent posts nothing unprompted until then.
 
-With Slack enabled too, Slack stays on the credential broker under `next`, as under `today`. Then
-none of the Slack steps below apply: switch, check Slack as in [Checking the result](#slack), and
-leave the Slack app as it is. The rest of this section is for an install whose Slack takes the
-gateway.
+Before the upgrade, set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env`, so the full run applies it
+([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After it, check that
+a scheduled report or an alert reaches that space.
 
-### Before the switch
+With Slack enabled too, the same gateway takes Slack. The Slack steps below apply as they do
+with Google Chat off.
+
+### Before the upgrade
 
 1. Check that Slack answers now, as in [Checking the result](#slack).
-2. Check the Slack settings `next` depends on. A full upgrade refuses a switch to `next` that
+2. Check the Slack settings the gateway depends on. A full upgrade refuses a run that
    would hand the gateway a setting it cannot use, and names it
    ([When an upgrade is refused](#when-an-upgrade-is-refused)); `--plan` warns of the same
    ones. Checking first saves a refused run:
@@ -534,18 +583,20 @@ gateway.
    - `SLACK_ALLOWED_USERS` in `install.env` holds member IDs such as `U0123ABCD`, not emails
      ([Allowed users](/kube-agents/install/slack-app/#allowed-users)).
    - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
-     reports: `C…`, or `G…` for some private channels. Under `next` the gateway posts the agent's
+     reports: `C…`, or `G…` for some private channels. The gateway posts the agent's
      proactive messages to this channel, or, with it empty and `homeChannelPolicy` auto (the
-     default), to the channel of the first top-level mention of the agent. A home channel set with
-     `/sethome` lives in the Planning Agent's
-     profile and does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
+     default), to the channel of the first top-level mention of the agent. A `/sethome` home
+     channel does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
      notify route, and with it the reports of board cards
      ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
-     channel those posts are refused while conversations keep working: the run warns, and the
-     `PlatformAgent` carries the `HomeChannelUnset` condition.
-   - Keep the agent image at the operator's release. A learned home channel reaches the agent through
+     channel those posts go to Google Chat's home channel, or are refused when Chat has none either,
+     while conversations keep working. The run warns, and the `PlatformAgent` carries
+     `HomeChannelUnset`.
+   - Keep the agent image at the operator's release, on Slack and on Google Chat. A learned home channel reaches the agent through
      a file the operator mounts; an older agent image reads env only and never sees it, while the CR
      shows no condition.
+     An older agent image on an install with no home channel on the CR also sends no proactive
+     posts.
    - An allowed member moves the home channel later from the app's Home tab (the Home channel panel);
      the record keeps who moved it and when. On a rollback to a gateway without the panel, a published
      Home view keeps the picker until the member reopens the tab; the old gateway drops a pick and
@@ -562,38 +613,16 @@ gateway.
 
    Wait until neither command lists a card: answer each blocked card in its Slack thread, and let
    running ones finish ([What carries over](#what-carries-over) says why). If scheduled jobs keep
-   filing cards, switch between their runs.
+   filing cards, upgrade between their runs.
 
-4. Switch when nobody is using the agent, and tell its users that Slack will not answer for a
+4. Upgrade when nobody is using the agent, and tell its users that Slack will not answer for a
    while.
 
-### The switch
+Then [run the upgrade](#run-the-upgrade) in the default full mode: pass no `--upgrade-mode`. An
+operator run moves the install too, since the operator renders the stack whatever the chart says,
+but only a full run re-renders `install.env`'s Slack and Google Chat settings onto the resource.
 
-Edit the `install.env` the upgrade reads ([Before you start](#before-you-start) says where it
-looks). Set the key, adding the line if the file has none:
-
-```bash
-PLATFORM_AGENT_MODE=next
-```
-
-[Run the upgrade](#run-the-upgrade) again at the release the install runs, in the default full
-mode: pass no `--upgrade-mode`. Before it applies anything, the run warns:
-
-```text
-This apply switches the install from spec.mode today to next (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change.
-```
-
-It does not stop to ask. To stay on `today`, press Ctrl-C at that warning and set the key back.
-
-`--upgrade-mode=harness` and `--upgrade-mode=operator` leave the mode as it is and say that a full
-upgrade would switch it. If the run says instead that the `PlatformAgent` carries a `spec.mode` set
-outside the installer, the resource was patched by hand with `kubectl patch`. That
-mode survives upgrades, because Helm sees no change in a value the release already renders, so the
-run leaves the resource as it is. To bring the two together, patch `spec.mode` on the resource to
-the mode you want, or apply once with `PLATFORM_AGENT_MODE` set to the mode the resource carries and
-then again with the one you want.
-
-### During the switch
+### During the upgrade
 
 The operator moves Slack in three steps:
 
@@ -614,7 +643,7 @@ The operator moves Slack in three steps:
    naming it. It then checks the bot token with Slack, logs `slack connected`, and opens the
    Socket Mode connection.
 
-The broker's connection stops when the switch starts, and the gateway exists only once the bus is
+The broker's connection stops when the move starts, and the gateway exists only once the bus is
 up, so in practice the two never take the same message. How long Slack goes unanswered depends on
 how fast the cluster schedules and pulls the new pods. Slack has no connection to deliver a message
 sent in that gap to, and nothing in kube-agents fetches it later: treat it as lost, and ask its
@@ -641,7 +670,7 @@ If the loop prints nothing, the `Ready` condition's message names what the
 operator is waiting on, and
 [Troubleshooting](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops)
 has the checks for the bus and the gateway. Slack stays unanswered until the gateway connects or
-you [switch back](#switching-back-to-today).
+you roll back to the previous release.
 
 ```bash
 kubectl get platformagent platform-agent -n kubeagents-system \
@@ -652,10 +681,10 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 
 - **The same app, tokens and allowlist.** The gateway reads the tokens from the same Secret.
 - **The board and the agent's data volume.** The new pod mounts the same volume.
-- **Not the conversations.** Under `next` the agent starts every Slack conversation with no
-  history from `today`. In a channel, a reply without a mention in a thread started before the
-  switch gets no answer: mention the app.
-- **Not the cards in flight, outside the home channel.** A card filed before the switch from a
+- **Not the conversations.** The agent starts every Slack conversation with no history from
+  before the move. In a channel, a reply without a mention in a thread started before the
+  upgrade gets no answer: mention the app.
+- **Not the cards in flight, outside the home channel.** A card filed before the upgrade from a
   DM or from any channel other than the home channel posts nothing after it: the gateway refuses
   the post and, with a home channel set, logs `thread "<channel>/<ts>" is not a thread of the home channel`. A card filed
   in a home-channel thread still posts its progress and report there. Either way its buttons stop
@@ -663,58 +692,27 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 - **The home channel only from `install.env`**, as in step 2 above.
 
 Slash commands, buttons, cards and the other Slack features that do not carry over are listed in
-[ChatOps → What carries over from `today`](/kube-agents/concepts/chatops/#what-carries-over-from-today).
+[ChatOps → What the gateway changes on Slack](/kube-agents/concepts/chatops/#what-the-gateway-changes-on-slack).
 
-### After the switch: the Slack app
+### After the upgrade: the Slack app
 
 Once a DM gets an answer as in [Checking the result](#slack), edit the app as
-[Slack app setup → Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
+[Slack app setup → Moving an app made for the Hermes listener](/kube-agents/install/slack-app/#moving-an-app-made-for-the-hermes-listener)
 describes. Delete the slash commands from its manifest and leave interactivity on, since the gateway
-answers the buttons it draws. Edit the app rather than pasting the `next` manifest over it: a
-manifest replaces the app's whole configuration, including its name. Do it after the switch rather
-than before, because the `today` listener answers slash commands until then. Until you do, a slash
+answers the buttons it draws. Edit the app rather than pasting the gateway's manifest over it: a
+manifest replaces the app's whole configuration, including its name. Do it after the upgrade rather
+than before, because the Hermes listener answers slash commands until then. Until you do, a slash
 command gets Slack's timeout error.
 
-### Switching back to `today`
-
-1. Set `PLATFORM_AGENT_MODE=today` in `install.env`, or delete the line, and run the upgrade again
-   in full mode. The run warns
-   `This apply switches the install from spec.mode next to today (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change.`
-2. The operator restarts the credential broker with the Slack tokens and deletes the A2A stack,
-   the gateway with it. For the seconds the gateway pod takes to stop, both can hold a
-   connection, and a message the stopping gateway takes gets no answer. The bus volume and its
-   credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-specmode-next-leaves-behind)
-   says how to remove them. Wait for the broker, for up to 5 minutes:
-
-   ```bash
-   for i in $(seq 30); do
-     kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system 2>/dev/null \
-       | grep -q 'Slack relay enabled' && { echo connected; break; }
-     sleep 10
-   done
-   ```
-
-   It prints `connected` once the broker has connected to Slack. If it prints nothing, read the
-   broker's log as in [Checking the result](#slack).
-
-3. Put the slash commands back. Print the `today` manifest:
-
-   ```bash
-   kubectl exec deploy/platform-agent-gateway -c platform-agent -n kubeagents-system -- \
-     hermes slack manifest
-   ```
-
-   Before you paste it into the app's **App Manifest** page, change its `name`, `description` and
-   `display_name` to the app's current values: the manifest replaces the app's whole
-   configuration. [Slack app setup](/kube-agents/install/slack-app/#create-the-app) covers its
-   options; read its warning about agent view first. Reinstall the app if Slack asks.
-
-4. Check Slack as in [Checking the result](#slack).
-
-Conversations and cards started under `next` do not carry back, for the same reasons as above.
-
-To roll back to an older release, switch to `today` first:
-[Rolling back a release](/kube-agents/deploy/rollback/#before-you-start) says why.
+A rollback to a release before the stack was unconditional keeps the stack: that release's
+operator reads `spec.mode: next` on the migrated object ([Rolling back a release](/kube-agents/deploy/rollback/)).
+Slack returns to the credential broker and the Hermes listener only after that release's own
+switch back. A full run with `PLATFORM_AGENT_MODE=today` alone renders no field and changes
+nothing, so patch `spec.mode` to `today` first (the rollback page has the command). They answer
+the slash commands again then, so put the `commands` block back in the app's manifest. Conversations and cards started on the gateway do not carry back,
+for the same reasons as above. The bus volume and its credentials Secret stay;
+[Uninstall](/kube-agents/install/uninstall/#what-the-a2a-stack-leaves-behind) says how to remove
+them.
 
 ## The gateway's own ServiceAccount
 
@@ -746,7 +744,8 @@ Every one of these stops the run before any of the new release is applied. The f
 settled before the run touches the cluster at all. The last six need the cluster: they are settled
 after `kubectl` has been pointed at it, and except for the breaking-change check, after a real run's
 pre-flight Secret backfills (a plan skips those). They still run before any CRD, chart or Terraform
-change of the new release.
+change of the new release. One is the exception: the gVisor node-pool refusal comes from the
+Terraform apply itself, so a full upgrade it stops has already applied the new release's CRDs.
 
 - **The sources do not match the release.** The checkout's `HEAD` is not the release's commit, the
   tree has uncommitted changes, or an unpacked tree names a release other than the one asked for —
@@ -774,6 +773,13 @@ change of the new release.
   names each one. Read them, then re-run with `--allow-breaking-downgrade`, in any mode. `--plan`
   warns instead. A move between two release tags to the newer one is not checked, and neither is a
   run whose tag is read off the install. See [Rolling back a release](/kube-agents/deploy/rollback/).
+- **The apply would destroy the gVisor node pool.** A full upgrade whose `ENABLE_GVISOR` resolves
+  to `false` on a Standard install that runs the gVisor pool stops before `terraform apply`, after
+  the CRDs (see above). With no
+  `ENABLE_GVISOR` in `install.env`, the upgrade reads the live install instead: the Terraform state,
+  then the cluster's node pools. On Autopilot with no state to read, it keeps the sandbox. To keep
+  the pool, set `ENABLE_GVISOR="true"`. To turn the sandbox off on purpose, re-run with
+  `--allow-node-pool-destroy` (full mode only).
 - **No Helm release.** The target namespace has no `kube-agents` release to upgrade.
 - **The memory store cannot be checked and nothing named one.** When the configuration records no
   `MEMORY`, the upgrade asks the cluster whether it runs the Hindsight memory store, so that a store
@@ -787,8 +793,7 @@ change of the new release.
   `--upgrade-mode=full`, which renders `install.env` onto the chart instead. On a rollback to a
   release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
   that flag, since it has no recorded values to drop.
-- **A Slack setting the A2A gateway cannot use.** A full upgrade applies `PLATFORM_AGENT_MODE` from
-  `install.env`. With `next`, Slack on and Google Chat off, the A2A gateway takes Slack, and the run
+- **A Slack setting the A2A gateway cannot use.** With Slack on, the A2A gateway takes Slack, with or without Google Chat. The run
   refuses three settings it cannot use, naming each one:
   - a `SLACK_ALLOWED_USERS` entry with an `@`: the list matches Slack member IDs exactly, so an
     email matches nobody. Replace it with the person's member ID (in Slack, their profile, then
@@ -797,15 +802,16 @@ change of the new release.
     does not arm, so proactive posts and board-card reports stop. The ID is at the bottom of the
     channel details' About tab.
   - a `SLACK_BOT_TOKEN` that holds several tokens, or one with a comma or space left in it: the
-    gateway takes one workspace's token, whole. The run gives the count, never the token. Keep a
-    multi-workspace install on `today`.
+    gateway takes one workspace's token, whole. The run gives the count, never the token. Install
+    one bot token from one workspace, or turn Slack off (`SLACK_ENABLED=false`).
 
   `--plan` warns of the same three without refusing.
 
-- **A `SLACK_HOME_CHANNEL_POLICY` that is not `auto` or `manual`.** The key renders
-  `spec.integration.slack.homeChannelPolicy`, and the CRD accepts only those two values (empty
-  means `auto`). The run stops before it writes `terraform.tfvars`, in every mode and with Slack on
-  or off, and names the key. `--plan` stops the same way.
+- **A `SLACK_HOME_CHANNEL_POLICY` or `GOOGLE_CHAT_HOME_CHANNEL_POLICY` that is not `auto` or
+  `manual`.** Each key renders its platform's `homeChannelPolicy` under `spec.integration`, and the
+  CRD accepts only those two values (empty means `auto`). The run stops before it writes
+  `terraform.tfvars`, in every mode and with the platform on or off, and names the key. `--plan`
+  stops the same way.
 
 - **The apply would remove GitOps.** The PlatformAgent opens pull requests through the GitHub token
   minter, but `install.env` does not carry that repository in `GITOPS_ORG`, `GITOPS_REPO` and
@@ -838,18 +844,17 @@ change of the new release.
 
 ## What stops during an upgrade
 
-This section describes `spec.mode: today`, which an install made before `next` became the first-install default keeps.
-
 At the default of one replica, the agent gateway and the credential broker each run one pod with
-the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so chat stops
-until the new pods are ready. The operator and LiteLLM keep serving. The operator starts its new
+the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so a turn the
+agent pod was running stops with it and gets no answer, and chat stops until the new pods are
+ready. The operator and LiteLLM keep serving. The operator starts its new
 pod first, and LiteLLM runs two replicas and keeps one serving.
 
-| Mode       | What restarts                                                                                                                                                                                                         |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `operator` | The operator. The agent gateway also restarts if the run added keys to `platform-agent-secrets`. The agent gateway, the credential broker and the shell sandbox restart if the new operator renders them differently. |
-| `harness`  | The agent gateway, the credential broker, whose image tag follows the agent's, and the shell sandbox.                                                                                                                 |
-| `full`     | The workloads of both other modes, and each object that a changed setting touches.                                                                                                                                    |
+| Mode       | What restarts                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operator` | The operator, and the A2A gateway, callout, verifier and console, whose images derive from the operator's; chat through the A2A gateway pauses until its new pod is ready. The agent gateway also restarts if the run added keys to `platform-agent-secrets`. The agent gateway, the credential broker and the shell sandbox restart if the new operator renders them differently. |
+| `harness`  | The agent gateway, the credential broker, whose image tag follows the agent's unless `credentialProxy.image` pins it, and the shell sandbox. The run's image read-back leaves a container on a `credentialProxy.image` or `hermesBridge.image` pin out of its verdict.                                                                                                             |
+| `full`     | The workloads of both other modes, and each object that a changed setting touches.                                                                                                                                                                                                                                                                                                 |
 
 In each mode, a chart workload such as LiteLLM also restarts if the target release's chart changed
 it. In CI runs, a harness upgrade made the agent unavailable for 41 seconds to about 3 minutes. A
@@ -860,13 +865,8 @@ the script can end before chat is back.
 
 During the restart:
 
-- **Slack.** The broker confirms each Slack event to Slack when it arrives, and keeps it in memory
-  until the agent takes it. If the broker restarts, the events it holds are lost. If only the agent
-  restarts, the broker gives its events to the new agent. The sender must send an event again in
-  two cases: the old agent took it but did not finish it, or it arrived up to 20 seconds after
-  the old agent stopped.
-- **Google Chat.** A message stays in the Pub/Sub subscription until the agent confirms it. If the
-  agent took a message but did not confirm it, Pub/Sub delivers it again after 60 seconds.
+- **Google Chat.** Google Chat retries a message the gateway did not acknowledge, so a message sent while the gateway pod restarts arrives once the new pod answers. A turn the gateway's session pod was running ends without an answer.
+- **Slack.** The gateway confirms each Slack event when it arrives, and nothing retries one it could not confirm. While the gateway pod restarts, Slack has no connection to deliver to: a message sent in that gap is lost, so ask its sender to send it again. A turn the gateway's session pod was running ends without an answer.
 - **Board cards.** The board is on the agent's volume, so the cards stay. A card that was running
   usually goes back to `ready` soon after the new pod starts, and runs again from the start. This
   does not count against the card's retries. If the old worker's process ID is in use in the new

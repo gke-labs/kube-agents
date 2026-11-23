@@ -35,27 +35,33 @@ The load-bearing properties, in rough order of what they cost if wrong:
 
 from __future__ import annotations
 
+import http.client
 import io
+import importlib.util
 import json
 import os
 import re
+import socket
+import ssl
 import tempfile
 import time
 import tomllib
+import urllib.error
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
+
 from unittest import mock
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from devops_bench.verification.base import VERIFIERS
+from devops_bench.verification.base import VERIFIERS, VerificationResult
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
 
-from kube_agents_bench import fleet, transcript, verifiers
+from kube_agents_bench import fleet, forges, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
     DelegatedToVerifier,
@@ -806,6 +812,51 @@ def test_worker_commands_absolute_local_git_is_not_the_bare_name():
     assert v.verify(5.0).status == "pass"
 
 
+def test_tool_called_on_the_workers_grades_zero_calls_on_the_no_worker_calls_entry():
+    """#5371: with the harness's no-worker-calls entry and no tagged entry,
+    a workers-scope check grades zero calls (a required call fails, a
+    forbidden one passes) instead of erroring as unobservable."""
+    from kube_agents_bench import worker_trajectory
+
+    marker = worker_trajectory.no_worker_calls_entry(["t_1"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        required = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert required.status == "fail", required.reason
+    transcript.set("ok", [{"name": "kanban_create"}], final_message="ok", started_at=1.0)
+    try:
+        unobserved = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert unobserved.status == "error"
+    # A capture gap beside the entry still leaves the workers unobservable.
+    gap = worker_trajectory.gap_entry(["session store for cluster-a: locked"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker, gap], final_message="ok", started_at=1.0)
+    try:
+        gapped = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert gapped.status == "error"
+    # A result pattern is not graded beside the entry, on either transport (the scorer sets it aside).
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        with_result = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete"], scope="workers", result="done"
+        ).verify(5.0)
+    finally:
+        transcript.clear()
+    assert with_result.status == "error"
+    # The ``all`` scope reads the router's calls too, which the entry does not speak for.
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        both = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="all").verify(5.0)
+    finally:
+        transcript.clear()
+    assert both.status == "error"
+
+
 def test_worker_commands_missing_required_fails_and_counts():
     _stash_commands(["cat README.md"])
     v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py"])
@@ -891,6 +942,123 @@ def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
     res = v.verify(5.0)
     assert res.status == "fail" and not res.success
     assert "across 0 command(s) (1 exempted)" in res.reason
+
+
+# The pod stores each typed terminal call through ``worker_trajectory``'s scrub (the audit
+# redactor, then ``worker_transcript.scrub_step_text``) before it reaches the trajectory, so
+# the tests store their calls the same way.
+def _pod_module(name: str, *parts: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[2].joinpath(*parts))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_REDACTOR = _pod_module("kube_agents_audit_redactor_for_tests", "agents", "chat", "defaults", "plugins", "common", "redactor.py").AuditRedactor
+_TRANSCRIPT = _pod_module("worker_transcript_for_tests", "agents", "platform", "scripts", "worker_transcript.py")
+
+
+def _stored(command: str) -> str:
+    return json.loads(_TRANSCRIPT.scrub_step_text(_REDACTOR, "tool_call", json.dumps({"command": command}), "withheld"))["command"]
+
+
+def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1", clipped: bool = False) -> str:
+    """The verdict of a grep-cut check whose forbidden word is ``route``, on one card's rows
+    and typed calls; ``card=None`` stashes the rows with no card, as an older capture did,
+    and ``clipped`` sends each call as the pod sends one whose arguments it clipped."""
+    calls = [
+        {
+            "agent": "w",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"raw": json.dumps({"command": c})[:-2] + " ...[clipped 9 chars]"} if clipped else {"command": _stored(c)},
+            "at": float(i),
+        }
+        for i, c in enumerate(typed)
+    ]
+    transcript.set("", calls, worker_commands=[{"task": card, "command": r} if card else {"command": r} for r in rows])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    return res.status
+
+
+def test_worker_commands_grep_cut_grades_the_rows_of_a_card_with_a_multi_line_call_whole():
+    # The row joins a typed newline into a space, so a dangling grep's pattern
+    # slot can hold the next line's first word (#5237). Every spelling that got
+    # past a comparison of first words stays graded whole: a quote that spans
+    # lines, a leading redirection, a dangling value option, a redaction mark,
+    # and rows that name no card.
+    row = "grep -rn route=1 curl x"
+    assert _grep_cut_status([row], []) == "pass"
+    for rows, typed in (
+        ([row], "grep -rn\nroute=1\ncurl x"),
+        ([row], "grep -rn\n   route=1 curl x"),
+        (['grep -rn "route =1" curl x'], 'grep -rn\n"route   =1"\ncurl x'),
+        ([row], "grep -rn\n> /dev/null route=1\ncurl x"),
+        ([row], "grep -rn\n2>&1 route=1\ncurl x"),
+        (['grep -rn route=1 X=" " curl x'], 'grep -rn\nroute=1 X="\n"\ncurl x'),
+        (["grep -rn -m curl route x"], "grep -rn -m\ncurl route x"),
+        (["grep -rn U=http://u:pw@route curl x"], "grep -rn\nU=http://u:pw@route\ncurl x"),
+    ):
+        assert _grep_cut_status(rows, [typed]) == "fail", typed
+    assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"], card=None) == "fail"
+
+
+def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call():
+    # A clip keeps a call's head, so the lines that would show the join may be
+    # gone: the card's grep rows are graded whole.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], clipped=True) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None, clipped=True) == "fail"
+    # The pod's scrub stores an escaped backslash at a line end as an escaped
+    # space, so a backslash before a blank may hide a line break: its card's
+    # grep rows are graded whole, an honest escaped space included.
+    assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn X=\\ route=1 curl x"], ["grep -rn\nX=\\  route=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\ file"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\\tfile"]) == "fail"
+    # A call the shell reader cannot split has no lines to read either.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "cat <<EOF\ndon't\nEOF"]) == "fail"
+
+
+def test_worker_commands_grep_cut_reads_no_execute_code_program_as_shell():
+    # An ``execute_code`` program is Python, so its quotes say nothing about
+    # the card's shell lines.
+    calls = [
+        {"agent": "w", "name": "terminal", "task": "t_1", "args": {"command": "grep -rn route f"}, "at": 0.0},
+        {"agent": "w", "name": "execute_code", "task": "t_1", "args": {"code": "msg = 'can\\'t parse'\nprint(msg)"}, "at": 1.0},
+    ]
+    transcript.set("", calls, worker_commands=[{"task": "t_1", "command": "grep -rn route f"}])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    assert res.status == "pass", res.reason
+
+
+def test_worker_commands_grep_cut_keeps_the_rows_of_a_card_whose_calls_are_one_line():
+    # A grep typed on one line, piped to a pager the row drops, or continued
+    # with a backslash (the pod folds the continuation) keeps the cut.
+    for typed in ("grep -rn route f", "grep -rn route f | head -20", "grep -rn \\\nroute f", "grep -rn route f\n"):
+        assert _grep_cut_status(["grep -rn route f"], [typed]) == "pass", typed
+    # Rows that name no card, beside one-line calls only, are cut too.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None) == "pass"
+
+
+def test_worker_commands_grep_cut_grades_a_multi_line_card_whole():
+    # Any multi-line call on the card grades its grep rows whole, whatever the
+    # next line starts with: a glob, a clobber redirect, an escaped blank. An
+    # honest multi-line call on the card is a spurious red the same way.
+    for typed in (
+        "grep\n***/route list",
+        "grep -rn\n>| /dev/null route=1\ncurl x",
+        "grep -rn\nX=\\\t route=1\ncurl x",
+        "grep -rn route f\nls",
+    ):
+        row = " ".join(typed.split())
+        assert _grep_cut_status([row], [typed]) == "fail", typed
 
 
 def test_worker_commands_is_registered_under_its_type():
@@ -3008,6 +3176,13 @@ def test_tool_called_still_reads_a_key_a_cut_name_cannot_complete():
     assert _verdicts() == ("pass", "fail")
 
 
+def test_tool_called_reads_a_clip_marker_inside_a_value_as_text():
+    # The command itself printed a clipped record; the pod's own marker ends the string.
+    head = '{"command": "echo ...[clipped 5 chars] done", "x": "' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("pass", "fail")
+
+
 def test_tool_called_leaves_a_scalar_json_refuses_unread():
     head = '{"timeout": 030, "command": "' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
@@ -3784,6 +3959,16 @@ def github(monkeypatch):
     return type("GH", (), {"routes": routes, "calls": calls})()
 
 
+@pytest.fixture
+def minted_token(monkeypatch, tmp_path):
+    """The grading token as CI hands it over: the ledger App's, in the renewed file."""
+    minted = tmp_path / "ledger-token"
+    minted.write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(minted))
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+
 def _api(number: int = 42, repo: str = "kube-agents-evals-infra") -> str:
     return f"https://api.github.com/repos/gke-agentic/{repo}/issues/{number}"
 
@@ -4558,6 +4743,51 @@ def test_finding_objects_mirrors_the_renderers_reader():
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", excerpt=where)),
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{row}"), finding_ids=named),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n", finding_ids=named),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "no-memory-limit",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "default-sa-automount",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                        "remediation": {
+                            "note": (
+                                f"{renderer.SHARED_ACCOUNT_SHIELD_PREFIX}"
+                                " `Deployment/other` (org/repo:notes/sa.md) — "
+                                "kept `kind: manual` so the namespace-wide ServiceAccount patch is not proposed."
+                            )
+                        },
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"),
         _ledger_body(
             findings="#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
@@ -5320,6 +5550,51 @@ def test_a_rename_away_from_a_kept_path_is_a_change_to_it(token, github):
     assert _pr_check(unchanged_paths=_KEPT).verify(5.0).status == "fail"
 
 
+def test_files_read_under_a_rate_limit_name_the_limit_not_a_permission(token, github):
+    """#6105: a pull request's files answered with the installation's limit
+    used to read as "needs `pull_requests: read`"; the reason names the limit."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (
+        403, {"message": "API rate limit exceeded for installation ID 157029058."}
+    )
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_rate_limit_reason_reads_the_reads_headers(monkeypatch):
+    """A 403 whose body names no limit but whose headers do (no budget left)
+    is a limit; with neither, there is no limit reason."""
+    verifiers._last_forge_error_headers.set({"X-RateLimit-Remaining": "0"})
+    assert "rate-limited" in verifiers._rate_limit_reason(403, {"message": "Forbidden"}, "x")
+    verifiers._last_forge_error_headers.set(None)
+    assert verifiers._rate_limit_reason(403, {"message": "Resource not accessible by integration"}, "x") is None
+
+
+def test_a_nan_header_waits_as_if_absent(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100"}) == 101.0
+
+
+def test_a_429_on_the_commits_page_names_the_limit(token, github):
+    """A 429 that outlasts the wait on `_head_push`'s commits page used to
+    fall through to "unexpected GitHub response 429"; it names the limit,
+    as every other grading read does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (429, {"message": "Too many requests"})
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason, res.reason
+    assert "unexpected GitHub response" not in res.reason
+
+
 def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())
@@ -5328,6 +5603,44 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+# ---- body_contains: the description carries the evidence (#4966)
+
+_EVIDENCE_PHRASES = ["## Evidence", "**Verify after merge:**"]
+
+
+def test_a_pull_request_whose_description_lacks_the_evidence_is_a_fail(token, github):
+    """The one-line body of #4966 passes every other clause."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        {**_pr_payload(), "body": "Applies a PDB (minAvailable: 1) for the checkout deployment."},
+    )
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "fail"
+    assert "'## Evidence'" in res.reason and "body_contains" in res.reason
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_pull_request_with_no_description_is_a_fail_under_body_contains(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": None})
+    _pr_head_routes(github)
+    assert _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0).status == "fail"
+
+
+def test_a_pull_request_carrying_the_evidence_passes(token, github):
+    _stash_pr_report()
+    body = (
+        "Adds a PDB.\n\n## Evidence\n\n**Finding:** no PDB\n\n"
+        "**Verify after merge:**\n\n```bash\nkubectl get pdb -A\n```\n"
+    )
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": body})
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "pass", res.reason
 
 
 # ---- changed_paths_only: an allowlist gates every sibling manifest and IaC path
@@ -5764,7 +6077,7 @@ def test_a_field_path_is_checked_when_the_case_loads():
 
 
 def test_an_added_file_is_read_from_the_listing_alone(token, github):
-    """The grading credential has no `contents: read`; a file the pull request
+    """The check makes no `/contents` read; a file the pull request
     adds is whole in its patch, so nothing else is fetched."""
     _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
@@ -6738,6 +7051,403 @@ def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):
     assert "listing the commits of" in res.reason
     assert "pull_requests: read" in res.reason
     assert _closed_from() in [url for url, _ in github.calls]
+
+
+# #5222: a read of the spent-branch check that the forge failed transiently
+# marks the check's error, so scoring can grade it as infrastructure; a read
+# the forge answered about the run, or refused for the credential, does not.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (503, {"message": "Service Unavailable"}),
+        (429, {"message": "Too Many Requests"}),
+        (403, {"message": "API rate limit exceeded for installation ID 1."}),
+        (403, {"message": "You have exceeded a secondary rate limit."}),
+        urllib.error.URLError(TimeoutError("timed out")),
+        TimeoutError("The read operation timed out"),
+        ConnectionResetError("Connection reset by peer"),
+    ],
+    ids=["503", "429", "primary-rate-limit-403", "secondary-rate-limit-403", "url-timeout", "timeout", "reset"],
+)
+def test_a_spent_branch_read_the_forge_failed_marks_the_error(minted_token, github, answer):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    if isinstance(answer, OSError):
+        def fail():
+            raise answer
+
+        github.routes[_commits_of()] = fail
+    else:
+        github.routes[_commits_of()] = answer
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER + " (")
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (403, {"message": "Resource not accessible by integration"}),
+        (401, {"message": "Bad credentials"}),
+        (422, {"message": "Validation Failed"}),
+        urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+        OSError("BENCH_FORGE=svn names no forge this harness grades"),
+    ],
+    ids=["permission-403", "401", "422", "certificate", "configuration"],
+)
+def test_a_spent_branch_read_refused_for_any_other_reason_leaves_the_error_plain(minted_token, github, answer):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    if isinstance(answer, OSError):
+        def fail():
+            raise answer
+
+        github.routes[_commits_of()] = fail
+    else:
+        github.routes[_commits_of()] = answer
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+class _NotingCheck:
+    """A check that notes the given reads and returns what it is given."""
+
+    def __init__(self, status, note=True, also_plain=False):
+        self.status, self.note, self.also_plain = status, note, also_plain
+
+    @verifiers._marks_forge_unavailable
+    def verify(self, timeout_sec):
+        if self.note:
+            verifiers._note_forge_read(True, "answered 503")
+        if self.also_plain:
+            verifiers._note_forge_read(False, "answered 403")
+        return VerificationResult(success=self.status == "pass", status=self.status, reason="the check's own reason", elapsed_time=0.0)
+
+
+def test_one_read_that_failed_for_another_reason_keeps_the_error_plain():
+    """A 503 on one candidate and a permission 403 on another: the error may be the 403's."""
+    assert _NotingCheck("error", also_plain=True).verify(5.0).reason == "the check's own reason"
+
+
+@pytest.mark.parametrize(
+    "status, note, marked",
+    [("error", True, True), ("error", False, False), ("fail", True, False), ("pass", True, False)],
+)
+def test_only_an_error_after_a_transient_read_is_marked(status, note, marked):
+    """A pass or a fail was decided on what did answer; an error with no such read is plain."""
+    res = _NotingCheck(status, note).verify(5.0)
+    assert res.status == status
+    assert res.reason.endswith("the check's own reason")
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
+
+
+class _TwoCandidates:
+    """pull_request_opened's shape: each candidate unresolved, A on a 503."""
+
+    def __init__(self, b_reads_503):
+        self.b_reads_503 = b_reads_503
+
+    @verifiers._marks_forge_unavailable
+    def verify(self, timeout_sec):
+        unresolved = verifiers._UnresolvedCandidates()
+        unresolved.begin()
+        verifiers._note_forge_read(True, "answered 503")
+        unresolved.append("A: unexpected GitHub response 503")
+        unresolved.begin()
+        if self.b_reads_503:
+            verifiers._note_forge_read(True, "answered 502")
+        unresolved.append("B: GitHub returned no head ref")
+        return VerificationResult(success=False, status="error", reason="; ".join(unresolved), elapsed_time=0.0)
+
+
+@pytest.mark.parametrize("b_reads_503, marked", [(False, False), (True, True)])
+def test_a_candidate_unevaluable_without_a_failed_read_keeps_the_error_plain(b_reads_503, marked):
+    """B's malformed answer is not an outage: A's 503 must not excuse it."""
+    assert _TwoCandidates(b_reads_503).verify(5.0).reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
+
+
+def test_a_read_outside_a_check_notes_nothing():
+    verifiers._note_forge_read(True, "answered 503")
+    assert verifiers._forge_unavailable.get() is None
+    assert _NotingCheck("error", note=False).verify(5.0).reason == "the check's own reason"
+
+
+@pytest.mark.parametrize(
+    "raised, cause, transient",
+    [
+        (OSError("RemoteDisconnected: Remote end closed connection without response"),
+         http.client.RemoteDisconnected("closed"), True),
+        (OSError("IncompleteRead: IncompleteRead(10 bytes read)"), http.client.IncompleteRead(b"0" * 10), True),
+        (OSError("InvalidURL: nonnumeric port: 'abc'"), http.client.InvalidURL("nonnumeric port: 'abc'"), False),
+        (urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided")), None, False),
+        (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), None, False),
+        (ConnectionRefusedError(61, "Connection refused"), None, False),
+        (urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")), None, False),
+    ],
+    ids=["remote-disconnected", "incomplete-read", "invalid-url", "dns", "refused-url", "refused", "certificate"],
+)
+def test_which_transport_failures_are_transient(raised, cause, transient):
+    def fake(url, tok, timeout):
+        if cause is not None:
+            raise raised from cause
+        raise raised
+
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(verifiers, "_http_get_json", fake)
+            with pytest.raises(OSError):
+                verifiers._forge_get_json("https://api.github.com/x", "t", 1.0)
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert [t for t, _ in seen] == [transient]
+
+
+@pytest.mark.parametrize(
+    "forge, token_file, noted",
+    [("github", "ghs_fake\n", True), ("github", None, False), ("github", "", False), ("gitlab", "ghs_fake\n", False)],
+    ids=["github-ci-token", "github-local-token", "github-empty-file-beside-a-local-token", "gitlab"],
+)
+def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeypatch, tmp_path, forge, token_file, noted):
+    """The CI token is the ledger App's, which the agent cannot spend. A local
+    token, or GitLab's (one user for both), can be the agent's own; so can
+    BENCH_GITHUB_TOKEN when the file holds no usable token and read_token
+    falls back to it."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, forge)
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN", "ghp_personal")
+    if token_file is None:
+        monkeypatch.delenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, raising=False)
+    else:
+        (tmp_path / "t").write_text(token_file)
+        monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
+    sent = forges.read_token(forges.forge_name())
+    monkeypatch.setattr(verifiers, "_http_get_json", lambda url, tok, timeout: (429, {"message": "Retry later"}))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://forge.example/x", sent, 1.0)[0] == 429
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert seen == [(noted, "answered 429")]
+
+
+def _ci_grading_token(monkeypatch, tmp_path) -> str:
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    (tmp_path / "t").write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
+    return forges.read_token(forges.forge_name())
+
+
+def _limited_then(answers):
+    """A fake _http_get_json that plays answers in order, each (status,
+    payload, headers), setting the headers as the real one does for an error."""
+    remaining = list(answers)
+
+    def get(url, tok, timeout):
+        status, payload, headers = remaining.pop(0)
+        if status // 100 != 2:
+            verifiers._last_forge_error_headers.set(headers)
+        return status, payload
+
+    return get
+
+
+_INSTALLATION_LIMIT = {"message": "API rate limit exceeded for installation ID 157029058."}
+
+
+def test_a_grading_read_waits_out_the_installation_limit_until_its_reset(monkeypatch, tmp_path):
+    """#6105: the shared installation's limit answers a 403 with no
+    Retry-After and an X-RateLimit-Reset minutes away; the read waits until
+    then and answers what the read after the reset says, noting nothing."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([
+        (403, _INSTALLATION_LIMIT, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}),
+        (200, [], None),
+    ]))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0) == (200, [])
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert slept == [121.0]
+    assert seen == []
+
+
+def test_a_limit_that_outlasts_the_budget_answers_as_transient(monkeypatch, tmp_path):
+    """The wait is bounded: past the budget the read answers the 403, noted
+    transient, so the check reads as the forge's weather, and the process
+    has waited exactly the budget."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "150")
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, _INSTALLATION_LIMIT, {"Retry-After": "60"})] * 10))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0)[0] == 403
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert slept == [60.0, 60.0, 30.0]
+    assert seen == [(True, "answered 403")]
+
+
+def test_a_local_token_and_a_permission_403_never_wait(monkeypatch, tmp_path):
+    """Only the CI grading token waits: a local token can be the agent's own.
+    And a 403 that names no limit is a permission, answered at once."""
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    monkeypatch.delenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, raising=False)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, _INSTALLATION_LIMIT, {"Retry-After": "60"})]))
+    assert verifiers._forge_get_json("https://api.github.com/x", "ghp_personal", 1.0)[0] == 403
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, {"message": "Resource not accessible by integration"}, {})]))
+    assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0)[0] == 403
+    assert slept == []
+
+
+def test_a_secondary_limit_with_budget_left_waits_the_default_not_the_reset(monkeypatch):
+    """#6177: X-RateLimit-Reset is when the hourly budget returns, so it is
+    the wait only when that budget is spent; a secondary limit with budget
+    left waits the default, not up to a slice."""
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "3000"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}) == 121.0
+
+
+def test_a_token_renewal_during_the_wait_does_not_stop_it(monkeypatch, tmp_path):
+    """#6177: the job renews the grading token file every 40 minutes. A
+    renewal while the read waits must not make the next pass read the sent
+    token as someone else's and stop waiting."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+
+    def renew_while_sleeping(_seconds):
+        (tmp_path / "t").write_text("ghs_renewed\n")
+
+    monkeypatch.setattr(verifiers.time, "sleep", renew_while_sleeping)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (200, [], None),
+    ]))
+    assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0) == (200, [])
+
+
+def test_a_gitlab_limit_is_named_as_gitlabs(monkeypatch):
+    """#6177: only GitHub's evals repositories share one installation, so a
+    GitLab 429 names GitLab and not the shared budget."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "gitlab")
+    verifiers._last_forge_error_headers.set(None)
+    reason = verifiers._rate_limit_reason(429, None, "the issue")
+    assert reason.startswith("GitLab rate-limited")
+    assert "installation" not in reason
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    assert "installation" in verifiers._rate_limit_reason(429, None, "the issue")
+
+
+def test_a_past_reset_waits_the_floor_and_an_infinite_budget_is_capped(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "inf")
+    assert verifiers._forge_rate_limit_budget() == verifiers._FORGE_RATE_LIMIT_BUDGET_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "0")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == 0
+
+
+@pytest.mark.parametrize(
+    "status, payload, headers, limited",
+    [
+        (429, None, None, True),
+        (403, _INSTALLATION_LIMIT, None, True),
+        (403, {"message": "You have exceeded a secondary rate limit."}, None, True),
+        (403, None, {"X-RateLimit-Remaining": "0"}, True),
+        (403, None, {"Retry-After": "5"}, True),
+        (403, {"message": "Resource not accessible by integration"}, {"X-RateLimit-Remaining": "4000"}, False),
+        (404, _INSTALLATION_LIMIT, None, False),
+    ],
+)
+def test_what_reads_as_a_rate_limit(status, payload, headers, limited):
+    assert verifiers.is_rate_limit_answer(status, payload, headers) is limited
+
+
+def test_a_handled_issues_404_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_resolve falls back from /issues to /pulls on a 404; the 404 is a route."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (404, {"message": "Not Found"})
+    github.routes[_pr_api("pulls")] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_an_absent_commits_page_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_head_push reads a 404 commits page as "dates nothing"; the closed-head
+    listing's outage after it still marks the error."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[_commits_of()] = (404, {"message": "Not Found"})
+    github.routes[_closed_from()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert _commits_of() in [url for url, _ in github.calls]
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def _three_pr_reply():
+    return "Opened " + ", ".join(_PR_URL.replace("/7", f"/{n}") for n in (5, 6, 7))
+
+
+def test_a_rejected_candidate_drops_only_its_own_reads(minted_token, github):
+    """#5 is unevaluable on a malformed answer (a plain entry), #6 is rejected
+    on a 404, #7 hits a 503. #6's rejection must not take #5's entry with it,
+    so the error stays plain."""
+    _stash_pr_report(final_message=_three_pr_reply())
+    github.routes[_pr_api(number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api("pulls", number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api(number=7)] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def test_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    _stash_pr_report(final_message="Opened " + _PR_URL.replace("/7", "/6") + " and " + _PR_URL)
+    github.routes[_pr_api()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_a_handled_404_is_dropped_only_for_its_own_read():
+    """handled() takes the entry of the read just made, and only a plain one."""
+    seen = [(True, "answered 503")]
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+        seen.append((False, "answered 404"))
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+    finally:
+        verifiers._forge_unavailable.reset(token)
 
 
 def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
@@ -7866,9 +8576,16 @@ def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, fa
 
 
 _WEBHOOK_RUN = "the-readiness-run-happened"
-# The route objective's whole check, the run it requires and the hand survey it forbids, so the
-# table below exercises both halves as the case runs them.
-_WEBHOOK_RUN_CHECK = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+# The route objective is two members under `all`. The first reads the card log's rows: the run it
+# requires and the hand survey it forbids, and the table below exercises both halves on rows. The
+# second reads the same forbidden survey on each worker call as typed; the tests further down grade
+# the two together, as the case runs them.
+_WEBHOOK_RUN_ENTRY = next(e for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+# Read by what each member holds, so that a changed case fails its pin test below and not the
+# import of this file.
+_WEBHOOK_RUN_MEMBERS = _WEBHOOK_RUN_ENTRY["check"].get("checks") or [_WEBHOOK_RUN_ENTRY["check"]]
+_WEBHOOK_RUN_CHECK = next(m for m in _WEBHOOK_RUN_MEMBERS if m.get("required_runs"))
+_WEBHOOK_TYPED_CHECK = next((m for m in _WEBHOOK_RUN_MEMBERS if m.get("after_result_pattern") is not None), {})
 _WEBHOOK_RUNS = _WEBHOOK_RUN_CHECK["required_runs"]
 _SCRIPT_PATH = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py"
 _SCRIPTS_DIR = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts"
@@ -8118,9 +8835,51 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
             WorkerRun(**bad)
 
 
+def test_shell_argvs_reads_a_substitution_mark_text_on_a_line_with_no_substitution():
+    """The reader marks a substitution inside the line with NUL, ``S``, an index, NUL. A line
+    that holds that text and no substitution raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00S0\x00") == [["echo", "\x00S0\x00"]]
+    # the same text in quotes, inside a word, behind an escape, and with an index that fits no list
+    assert _shell_argvs("echo '\x00S0\x00' \"\x00S1\x00\" a\x00S2\x00b") == [["echo", "\x00S0\x00", "\x00S1\x00", "a\x00S2\x00b"]]
+    assert _shell_argvs("echo \\\x00S0\x00") == [["echo", "\x00S0\x00"]]
+    assert _shell_argvs("echo \x00S9999999999999999999999\x00") == [["echo", "\x00S9999999999999999999999\x00"]]
+    # in a span that the line leaves open, and in the command line that a substitution or a shell runs
+    assert _shell_argvs("echo $(date \x00S0\x00") == [["echo", "$(date", "\x00S0\x00"]]
+    assert _shell_argvs("echo $(echo \x00S0\x00)") == [["echo", "$(echo \x00S0\x00)"], ["echo", "\x00S0\x00"]]
+    assert _shell_argvs("bash -c 'echo \x00S0\x00'")[-1] == ["echo", "\x00S0\x00"]
+
+
+def test_shell_argvs_reads_an_operator_mark_text_on_a_line_with_no_operator():
+    """The operator mark is NUL, ``O``, an index, NUL, as a word of its own. A line that holds
+    that word and no operator raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00O0\x00 x") == [["echo", "\x00O0\x00", "x"]]
+    assert _shell_argvs("eval echo \x00O0\x00 x")[-1] == ["echo", "\x00O0\x00", "x"]
+    # a NUL character alone, and the text of the reader's own literal mark, stay as they are
+    assert _shell_argvs("echo \x00 \x00N\x00") == [["echo", "\x00", "\x00N\x00"]]
+
+
+def test_shell_argvs_reads_a_mark_text_with_a_valid_index_as_text():
+    """With a substitution or an operator on the line, the same text has an index that exists.
+    It read as that substitution or that operator, so the words were not the words of the line."""
+    from kube_agents_bench.shell_words import _ShellOperator, _shell_argvs, _shell_words_and_spans
+
+    # was: the second `$(date)` in the place of the text
+    assert _shell_argvs("echo $(date) \x00S0\x00") == [["echo", "$(date)", "\x00S0\x00"], ["date"]]
+    # was: a `;` in the place of the text, so `echo` and `x` were two commands
+    assert _shell_argvs("echo a; echo \x00O0\x00 x") == [["echo", "a"], ["echo", "\x00O0\x00", "x"]]
+    # was: a second `>` with no target, which is a line that the reader refuses
+    words, _ = _shell_words_and_spans("ls > out \x00O0\x00")
+    assert words == ["ls", ">", "out", "\x00O0\x00"]
+    assert [isinstance(word, _ShellOperator) for word in words] == [False, True, False, False]
+
+
 def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
     # The forbid, not the run reader, is what refuses a survey that stands beside the dictated
-    # run: with the survey the objective fails and names the pattern; without it, it passes.
+    # run: with the survey the rows member fails and names the pattern; without it, it passes.
     _stash_commands([f"python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json", "kubectl --context gke_p_l_seeded-b get pdb -A -o json"])
     res = WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0)
     assert res.status == "fail" and "forbidden run" in res.reason and "kubectl ran as" in res.reason, res.reason
@@ -8131,6 +8890,115 @@ def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
 
     with pytest.raises(ValueError):
         WorkerRun(script="kubectl", word_patterns=["("])
+
+
+_ROUTE_RUN = f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/r.json"
+# The survey as a worker types it over several kubeconfigs: one call, four lines.
+_SURVEY_LOOP = 'for f in /data/kubeconfig_*.yaml; do\n  echo "=== $f ==="\n  kubectl --kubeconfig="$f" get pdb -A\ndone'
+
+
+def _as_row(command: str) -> str:
+    """A call as the card log shows it: on one line."""
+    return " ".join(command.split())
+
+
+def _route_objective(entries, rows=None) -> str:
+    """The whole objective as the case runs it, on the calls as typed and on the card log's rows
+    (each call on one line, unless `rows` names them)."""
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries] if rows is None else rows)
+    return VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status
+
+
+def test_the_route_objective_has_the_same_forbidden_survey_in_both_members():
+    assert _WEBHOOK_RUN_ENTRY["check"]["type"] == "all" and len(_WEBHOOK_RUN_MEMBERS) == 2
+    assert _WEBHOOK_TYPED_CHECK["forbidden_runs"] == _WEBHOOK_RUN_CHECK["forbidden_runs"]
+    assert set(_WEBHOOK_TYPED_CHECK) == {"type", "after_result_pattern", "forbidden_runs"}
+
+
+def test_the_route_objective_sees_a_survey_on_a_later_line_of_a_call():
+    # On the row the loop is one line and `kubectl` reads as a word of the `echo`, so the rows
+    # member passes it; the typed member reads each line as an argv of its own.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=2)]
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
+    typed = WorkerCommandsVerifier(**_WEBHOOK_TYPED_CHECK).verify(5.0)
+    assert typed.status == "fail" and "kubectl ran as" in typed.reason, typed.reason
+    assert _route_objective(entries) == "fail"
+
+
+@pytest.mark.parametrize(
+    "calls, on_rows, verdict",
+    [
+        # the dictated run alone, and beside a kubectl that is not the survey
+        ([_ROUTE_RUN], "pass", "pass"),
+        ([_ROUTE_RUN, "for c in a b; do\n  kubectl --context $c get nodes\ndone"], "pass", "pass"),
+        # the survey on a later line, which the rows member does not see: in a loop, after an
+        # `echo`, after a `cd`, and on a line that a backslash continues
+        ([_ROUTE_RUN, _SURVEY_LOOP], "pass", "fail"),
+        ([_ROUTE_RUN, 'echo "webhooks next"\nkubectl get validatingwebhookconfigurations -o json'], "pass", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c describe pdb pinned-batch-runner -n seeded-upgrade"], "pass", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c \\\n  get pdb -A"], "pass", "fail"),
+        # the survey with no run at all: the rows member already fails it, on the missing run
+        ([_SURVEY_LOOP], "fail", "fail"),
+        # a mention on a later line is one word and no command
+        ([_ROUTE_RUN, 'cd /opt/data/scratch\ngrep -n "kubectl get pdb -A" notes.md'], "pass", "pass"),
+        ([_ROUTE_RUN, 'echo "next step"\necho "not running kubectl get validatingwebhookconfigurations"'], "pass", "pass"),
+        # Known limit: a heredoc body is read line by line, so a survey line fails in a script
+        # that never ran and in a notes file alike.
+        ([_ROUTE_RUN, "cat > /tmp/later.sh <<'EOF'\nkubectl get pdb -A\nEOF"], "pass", "fail"),
+        ([_ROUTE_RUN, "cat > /opt/data/scratch/notes.md <<'EOF'\nTo check by hand:\nkubectl get pdb -A\nEOF"], "pass", "fail"),
+        # Known limit: neither member reads a survey whose resource comes from a variable.
+        ([_ROUTE_RUN, "for r in pdb validatingwebhookconfigurations; do\n  kubectl get $r -A\ndone"], "pass", "pass"),
+    ],
+)
+def test_the_route_objective_reads_each_typed_line_as_a_command(calls, on_rows, verdict):
+    entries = [_terminal(command, at=index) for index, command in enumerate(calls, 1)]
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == on_rows, calls
+    assert _route_objective(entries) == verdict, calls
+
+
+def test_the_route_objective_does_not_read_a_survey_that_a_program_runs():
+    # Known limit: the typed read splits shell text into argvs; it does not read what a program
+    # in `execute_code` starts.
+    program = {"code": 'import subprocess\nsubprocess.run(["kubectl", "get", "pdb", "-A"])'}
+    entries = [_terminal(_ROUTE_RUN, at=1), {**_terminal("", at=2, args=program), "name": "execute_code"}]
+    _stash_terminal(entries, commands=[_as_row(_ROUTE_RUN)])
+    assert VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status == "pass"
+
+
+def test_the_route_objective_is_an_error_when_a_typed_call_has_no_time():
+    # Known limit: an untimed call makes the typed member `error`, also beside a survey it can see.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal("kubectl get nodes", at=None)]
+    assert _route_objective(entries) == "error"
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=None)]
+    assert _route_objective(entries) == "error"
+
+
+def test_the_route_objective_sees_a_survey_the_row_shows_as_a_count():
+    # The card log shows a chain as its first command and a count; the typed call keeps the chain.
+    entries = [_terminal(f"{_ROUTE_RUN} && kubectl --context c get pdb -A", at=1)]
+    assert _route_objective(entries, rows=[f"{_ROUTE_RUN} + 1 command"]) == "fail"
+
+
+def test_the_route_objective_fails_a_typed_survey_that_the_terminal_refused():
+    # The typed read does not know whether a call ran: an attempt at the survey fails too.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, _REFUSAL, at=2)]
+    assert entries[1]["status"] == "error"
+    assert _route_objective(entries) == "fail"
+
+
+def test_the_route_objective_still_reads_a_survey_that_only_the_card_log_has():
+    entries = [_terminal(_ROUTE_RUN, at=1)]
+    assert _route_objective(entries, rows=[_as_row(_ROUTE_RUN), "kubectl --context c get pdb -A"]) == "fail"
+
+
+def test_the_route_objective_is_an_error_without_a_readable_typed_call():
+    # Known limit: with no tagged worker call the typed member cannot say that no survey ran,
+    # so the objective is `error` and not a pass, although the rows member passes.
+    _stash_commands([_as_row(_ROUTE_RUN)])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
+    assert VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status == "error"
 
 
 def test_worker_commands_required_run_names_what_did_not_run():
@@ -9658,6 +10526,34 @@ def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
     assert res.status == "pass" and "not checked" not in res.reason, res
 
 
+def test_verified_claims_backed_reads_the_head_up_to_the_pods_marker_not_a_printed_one():
+    # The worker's own output quotes a clipped record; the pod's marker opens the kept tail.
+    from kube_agents_bench import worker_trajectory
+
+    output = "earlier: a ...[clipped 12 chars] record\nnode-b NotReady " + "x" * 4000 + "\nverdict: done"
+    out = json.dumps({"output": output, "exit_code": 0})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    res = _grade_claims(_block("kubectl get nodes", "node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+    assert verifiers._clipped_result_marker(clipped).start() == limit
+
+
+def test_verified_claims_backed_a_kept_tail_does_not_make_a_clipped_result_whole():
+    # The tail closes the JSON string and object again, so a whole-object decode
+    # succeeds; an excerpt from the dropped middle is unchecked, not invented.
+    from kube_agents_bench import worker_trajectory
+
+    output = "head " + "x" * 2500 + " middle node-b NotReady " + "y" * 2500 + " tail"
+    out = json.dumps({"output": output, "exit_code": 0, "error": None})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    text, was_clipped = verifiers._terminal_output(clipped)
+    assert was_clipped and "[clipped" not in text and text.startswith("head ")
+    res = _grade_claims(_block("kubectl get nodes", "middle node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" in res.reason and "output clipped" in res.reason, res
+
+
 def test_verified_claims_backed_masks_addresses_as_the_pod_does():
     out = json.dumps({"output": "user:[REDACTED_EMAIL] roles/viewer", "exit_code": 0})
     res = _grade_claims(_block("gcloud projects get-iam-policy p", "user:ana@example.com roles/viewer"),
@@ -10746,6 +11642,105 @@ def test_issue_state_unreadable_comments_are_an_error(token, gitops_repo, github
     res = _state_check().verify(5.0)
     assert res.status == "error"
     assert "comments of" in res.reason
+
+
+def test_issue_state_comments_the_forge_failed_mark_the_error(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api()] = (502, {"message": "Bad Gateway"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_already_rejected_stays_a_fail_when_its_comments_fail(token, gitops_repo, github):
+    """A fail outranks an error: the open, unlabelled ticket is a verdict, and
+    the comment read the forge failed does not make it infrastructure."""
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "is open, not closed" in res.reason
+    assert "its comments could not be read" in res.reason
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def test_ledger_read_the_forge_failed_marks_the_error(token, github):
+    _stash_report()
+    github.routes[_api()] = (503, {"message": "Service Unavailable"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_ledger_read_refused_for_permission_leaves_the_error_plain(token, github):
+    _stash_report()
+    github.routes[_api()] = (403, {"message": "Resource not accessible by integration"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def _two_ticket_reply():
+    return f"{_TICKET_REPLY}\nAlso https://github.com/gke-agentic/{_TICKET_REPO}/issues/709"
+
+
+@pytest.mark.parametrize("second", ["issue", "comments"])
+def test_issue_state_an_earlier_candidates_outage_does_not_excuse_a_malformed_answer(
+    token, gitops_repo, github, second
+):
+    """#708 is rejected while its comment read answered 503; #709 then errors
+    on a 200 that is not the shape asked for, which no failed read explains."""
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    if second == "issue":
+        github.routes[_ticket_api(709)] = (200, ["not", "an", "object"])
+    else:
+        github.routes[_ticket_api(709)] = (200, _ticket() | {"number": 709})
+        github.routes[_ticket_comments_api(709)] = (200, {"message": "not a list"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+# #5346: a read the check handled, or a candidate it rejected, leaves the
+# forge-unavailable decision, so a later outage on the read that errors is
+# marked. A rejection beside a transient read keeps the error plain.
+
+
+def test_ledger_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(token, github):
+    _stash_report(final_message=f"Ledger: {_LEDGER_URL.replace('/42', '/41')} and {_LEDGER_URL}")
+    github.routes[_api(41)] = (404, {"message": "Not Found"})
+    github.routes[_api()] = (503, {"message": "Service Unavailable"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_rejected_candidate_does_not_keep_a_later_outage_on_rung_2(token, gitops_repo, github):
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (404, {"message": "Not Found"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_candidate_rejected_beside_a_transient_read_keeps_the_error_plain(
+    token, gitops_repo, github
+):
+    """#708 is rejected on its state while its comment read answered 503: the
+    code cannot tell that rejection from an outage, so its reads stay, and
+    #709's outage does not mark the error."""
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
 
 
 def test_issue_state_missing_token_is_an_error_naming_the_variable(monkeypatch, github):

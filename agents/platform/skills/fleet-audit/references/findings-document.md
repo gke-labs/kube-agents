@@ -110,7 +110,7 @@ Part of the `fleet-audit` skill (`/opt/data/profiles/platform/skills/fleet-audit
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
 real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
-`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis` and `stockout-prevention` have one today, because their SOPs have a step that writes the list. A
+`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis`, `stockout-prevention`, `gce-compute-fleet-audit` and `gcp-networking-fabric-audit` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
 everywhere.)
 
@@ -127,7 +127,7 @@ field, and publishes nothing:
     "2.6" and not prose). An unknown slug or a duplicate is rejected.
   - **`command`** — the literal invocation you issued on that cluster for that check, with its
     `--context`/`--project` and the namespace or resource it targeted. It must name one of
-    `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`, or the upgrade audit's readiness reporter
+    `kubectl`, `gcloud`, `bq`, `helm`, or `curl`, or the upgrade audit's readiness reporter
     `fleet_upgrade_report.py`; `echo`, `cat`, `python3 -c`, a call back
     into `audit_report.py`, and anything under eight characters are all rejected. One command per
     entry — the one that produced the evidence, not a summary of your approach.
@@ -367,7 +367,7 @@ What the shape enforces:
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
-  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream, eight for the waste audit and one for the stockout audit (3.9's zone-locked arm; the at-ceiling arm shares the slug and the join leaves it a finding), and the validator rejects any other check with exit 2. A
+  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream, eight for the waste audit, one for the stockout audit (3.9's zone-locked arm; the at-ceiling arm shares the slug and the join leaves it a finding) one for the GCE compute audit (2.5, the orphaned snapshot, one arm and one object kind, `Snapshot/`) and one for the networking audit (2.4, the peered-MTU mismatch, one arm and one object kind, `NetworkPeering/`), and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
   document that lists it under `declared` publishes nothing. One fault the slug alone cannot
   name is held to the manifest instead: a `single-zone-nodepool` entry written for a pool the

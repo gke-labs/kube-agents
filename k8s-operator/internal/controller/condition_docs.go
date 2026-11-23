@@ -26,17 +26,23 @@ type conditionDoc struct {
 }
 
 // degradedConditionReasons are the reasons the Degraded condition carries,
-// for its row. Listed by constant, so a renamed reason fails to compile; a
+// for its row, in the order updateStatusReady ranks them. A parked pass reads
+// the ones ahead of A2ABusStreamsMissing as ranked above it
+// (degradedRanksAboveBusStreams), so a new reason goes where the chain puts
+// it. Listed by constant, so a renamed reason fails to compile; a
 // new reason has to be added here by hand (the writer passes it as a value,
 // which the completeness test cannot follow).
 var degradedConditionReasons = []string{
 	conditionReasonInvalidGitRepoURL,
 	conditionReasonCorruptManagedRepos,
 	conditionReasonMinterPruningHeld,
+	conditionReasonA2ABusStreamsMissing,
+	conditionReasonA2AGatewayWaitingForTasks,
 	conditionReasonInvalidCredentialProxyResources,
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
 	conditionReasonInvalidCredentialProxyExec,
+	conditionReasonInvalidKanbanAdmission,
 	reasonRBACIncomplete,
 }
 
@@ -45,7 +51,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    readyConditionType,
 		Written: "Always",
-		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when.",
+		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`ReservedServiceAccountName`, `RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `UniverseDomainMismatch`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ShellSandboxKeysMissing`, and `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what `UniverseDomainMismatch`, `ShellSandboxKeysMissing`, and `A2AProvisionFailed` mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when. With the A2A gateway's election on, the gateway counts as ready only while its elected leader is, after a 30-second grace from the leader's election; with no current leader (no holder, its pod gone, or a holder that stopped renewing) it counts its ready replicas.",
 	},
 	{
 		Type:    degradedConditionType,
@@ -55,42 +61,62 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    busCredentialsReadyCondition,
-		Written: "Under `mode: next`, and while a callout Deployment exists",
-		Meaning: "Whether every replica the callout Deployment asks for is ready, and therefore both serving an identity map and attached to the bus. `Reason: CalloutServing` (`True`), `CalloutUnavailable`, or `CalloutAbsent`. The operator's own gates do not read it, and it reads `False` with `1 of 2 replicas ready` while the gateway exists and dispatches; [What `BusCredentialsReady` reports](#what-buscredentialsready-reports) has the gate it differs from and when it is removed.",
+		Written: "While a callout Deployment exists",
+		Meaning: "Whether every replica the callout Deployment asks for is ready, and therefore both serving an identity map and attached to the bus. `Reason: CalloutServing` (`True`), `CalloutUnavailable`, or `CalloutAbsent`. The operator's own gates do not read it, and it reads `False` with `1 of 2 replicas ready` while the gateway exists and dispatches; [What `BusCredentialsReady` reports](#what-buscredentialsready-reports) has the gate it differs from.",
 	},
 	{
 		Type:    dispatcherJobModeCondition,
-		Written: "Under `mode: next`, while the operator runs the profile dispatcher (`A2A_DISPATCHER_IMAGE`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
-		Meaning: "Whether the dispatcher runs unattended profile tasks as Jobs. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
+		Written: "While the operator runs the profile dispatcher (on by default; `operator.profileDispatcher.enabled`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
+		Meaning: "Whether the dispatcher runs profile tasks as Jobs: unattended ones, and permit-carrying ones at any tier. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
+	},
+	{
+		Type:    dispatcherCeilingCondition,
+		Written: "While the profile dispatcher is switched on",
+		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 650 profiles at two tiers; the config fills first only for profiles that declare many parameters.",
 	},
 	{
 		Type:    a2aIdentityMapAppliedConditionType,
-		Written: "Under `mode: next`, once the operator renders an identity map",
+		Written: "Once the operator renders an identity map",
 		Meaning: "Whether the auth callout took the identity map this operator rendered, read from every Ready callout pod's `/status` by pod IP, again every 30 seconds while unsettled. `True`, `Serving`: every Ready pod answered and serves it. `False`, `Refused`: a pod refused it and serves its previous map, which can be wider; the message quotes the refusal. `False`, `Pending`: a pod is still on an older map or mid-way through its shards. `Unknown`, `StatusUnreadable`: a Ready pod didn't answer and may hold a refusal, so turning to it is a Warning event (a NetworkPolicy on the callout must admit the operator). `Unknown`, `NoReadyCallout`: no pod is Ready. Removed when the A2A stack is off.",
 	},
 	{
 		Type:    a2aCalloutStalledConditionType,
-		Written: "Under `mode: next`, while the auth callout Deployment's rollout is past its progress deadline",
+		Written: "While the auth callout Deployment's rollout is past its progress deadline",
 		Meaning: "`status: True`, `Reason: ProgressDeadlineExceeded`. The bus applies a config change without waiting for every callout replica to load the current identity map, so until the rollout finishes some connections may be placed by the previous map. Check the `<agent>-a2a-callout` Deployment's rollout (`kubectl rollout status`) and its pods' events. Removed once the rollout completes.",
 	},
 	{
 		Type:    a2aGatewayConditionType,
-		Written: "Under `mode: next`, only on an install upgraded from an operator that ran the A2A gateway at zero replicas for want of a chat backend: from the pass that scales it back to one replica until that replica is ready. Written and cleared by every pass that renders the stack, whichever phase it ends on (`Ready`, `Provisioning`, or `Degraded` for `A2AProvisionFailed` and `ShellSandboxKeysMissing`), so only a pass that stops before rendering leaves it as it was",
-		Meaning: "`status: False`, `Reason: WaitingForReplica`. Every `mode: next` install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.",
+		Written: "Only on an install upgraded from an operator that ran the A2A gateway at zero replicas for want of a chat backend: from the pass that scales it back to one replica until that replica is ready. Written and cleared by every pass that renders the stack, whichever phase it ends on (`Ready`, `Provisioning`, or `Degraded` for `A2AProvisionFailed` and `ShellSandboxKeysMissing`), so only a pass that stops before rendering leaves it as it was",
+		Meaning: "`status: False`, `Reason: WaitingForReplica`. Every install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.",
 	},
 	{
 		Type:    busProvisionedConditionType,
-		Written: "Under `mode: next`, from the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs and removed with the stack when the mode flips to `today`",
+		Written: "From the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs",
 		Meaning: "`status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.",
 	},
 	{
+		Type:    a2aProfileSupervisorFormCondition,
+		Written: "`True` once, from the first pass that finds every profile-task reader (the A2A gateway, the agent pod and, with its door on, the MCP server) on this release's image and fully rolled out and the bus provisioning Job that adds the gateway relay's third filter complete; never removed. `False` while this install renders a reader on an image other than this release's (a pinned `spec.deployment.image`)",
+		Meaning: "`status: True`, `Reason: SixTokenSupervisorSubject`. The dispatcher writes a profile task's terminal on the six-token supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`) instead of the five-token one, and the gateway relay filters both. It is a latch: a later upgrade that rolls a reader again keeps the dispatcher on the six-token form rather than moving it back for the length of the roll. Until it is written, the dispatcher writes the five-token form, which every reader watches. `status: False`, `Reason: ReaderNotOnReleaseImage`: the operator renders the reader the message names on an image other than this release's, the hermes-bridge of a pinned `spec.deployment.image`, so the install stays on the five-token form. A later release that drops that form keeps it for this install while this holds. Setting the pin to this release's tag, or removing it, clears it. A reader still on an older release's image, before or during its rollout, writes nothing.",
+	},
+	{
+		Type:    busStreamsPresentConditionType,
+		Written: "Once `BusProvisioned` is True",
+		Meaning: "Whether the streams and KV buckets the provisioning Job creates are still on the bus, read every five minutes from the bus's metrics exporter on port 7777. `True`, `AllPresent`: every one was seen. `False`, `StreamsMissing`: three polls in a row found the ones the message names missing, and the operator deletes the completed provisioning Job so it runs again and recreates them (`Reprovisioning` while it runs); once `TASKS` is back after a loss, however it came back, the operator restarts the A2A gateway and the agent pod whose client container has been running since before the loss, because their `TASKS` consumers don't come back on their own (`A2ABusClientsRestarted`); one that started since binds by itself, and a restart that fails is retried on every poll, with `Reprovisioning` saying so. A loss of `TASKS` counts once three polls in a row saw it, or once the operator re-runs the Job while it's missing. It's kept in the `kubeagents.x-k8s.io/a2a-bus-tasks-lost` annotation, so removing the re-run record doesn't clear an owed restart; removing that annotation does. Re-runs are at most one per 15 minutes and three per 6 hours, recorded in the `kubeagents.x-k8s.io/a2a-bus-reprovision` annotation. A re-run that completed without bringing some of them back stops the re-runs for exactly those names (`ReprovisionDidNotRestore`), each lifted on its own once seen back or all of them when the annotation is removed. A loss of any other stream is still confirmed and re-run while a stop holds, and its message names the stopped ones. A failed Job is not re-run. While `False`, `Degraded` reads `A2ABusStreamsMissing`. `Unknown`, `DetectionUnavailable`: the bus runs without its exporter ([`A2A_NATS_EXPORTER_IMAGE`](/kube-agents/deploy/docker-images/)). `Unknown`, `ExporterUnreachable`: three polls in a row had no usable answer. No verdict is taken while the bus rolls, converts or provisions, and the condition keeps its last one meanwhile, however long that lasts; the bus's own conditions report the rollout.",
+	},
+	{
 		Type:    a2aVerifierConditionType,
-		Written: "Under `mode: next`, while the capability verifier's Deployment exists and has no ready replica. A pass that cannot read the Deployment leaves it as it stands",
+		Written: "While the capability verifier's Deployment exists and has no ready replica. A pass that cannot read the Deployment leaves it as it stands",
 		Meaning: "`status: False`, `Reason: VerifierNotReady`. A capability check that gets no answer is refused, so every submission is refused terminally while this holds. The CR stays `Ready`: the verifier is on the request path, not the readiness path. Check the `<agent>-a2a-verifier` Deployment's pods and their logs, including the previous container's: a verifier that cannot bind its capability bucket exits, and its log says why. Removed once a replica is ready.",
 	},
 	{
+		Type:    a2aBusMetaConditionType,
+		Written: "On a multi-server bus, on a pass that checks the JetStream meta group before creating the provision Job: present while the group isn't formed, a server isn't running, or a server's view can't be read, and removed on the pass that sees it formed. Also removed on any pass where the provision Job already exists, on a one-server bus, on a pass where another hold (the callout, or the bus rolling out) keeps the check from running, and when the mode flips to `today`",
+		Meaning: "`status: False`. `Reason: ServerOutsideMetaGroup` names the server or servers that don't report the meta leader a quorum agrees on, or that the leader doesn't list as current. The provision Job waits, so no stream is created, and the CR isn't `Ready`. A server still outside 3 minutes later is restarted once, with an `A2ABusServerRestarted` Warning, when it is the only one outside, the rest are a quorum, the bus hasn't been provisioned yet with no server holding a stream or consumer, and its own meta node has started. A server already restarted once and still outside is named as left for a person: delete its pod, or wipe the bus. When no leader is agreed at all, on a fresh bus under the same guards (never provisioned, no server holding a stream or consumer, every meta node started, none restarted before), every server is restarted once after the same 3 minutes, with an `A2ABusMetaGroupRestarted` Warning; a bus still without a leader after that, or one where a server was already restarted, is named as left for a person (wipe the bus). `Reason: ServerNotRunning` names a server whose pod is absent, being deleted, or not Running while the others run, such as the one just restarted: the Job waits for it, and nothing is restarted on that account. `Reason: MetaGroupUnknown` names a running server whose view couldn't be read, or says no server is running; nothing is held or restarted on its account. The check also runs when the Job is re-created on a running bus, where it can hold the re-run and set this condition; it never restarts anything on a bus that has been provisioned, so it doesn't repair a server that drops out of a running bus.",
+	},
+	{
 		Type:    gatewayElectedConditionType,
-		Written: "Under `mode: next` with the election on, from the first pass that reads a gateway pod holding the Lease. Kept while the gateway runs that image or the operator's own release. Removed on a roll to another image, with the election off, or when the mode flips to `today`",
+		Written: "With the election on, from the first pass that reads a gateway pod holding the Lease. Kept while the gateway runs that image or the operator's own release. Removed on a roll to another image, or with the election off",
 		Meaning: "`status: True`, `Reason: LeaseHeld`. The message is the image the Lease holder runs. The operator renders `availability.a2aGateway.replicas` gateway replicas only while it is set, since a gateway from before the election would act beside an elected one. A status condition doesn't survive most restores, so a restored install runs one replica until a gateway takes the Lease again.",
 	},
 	{
@@ -105,8 +131,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    kanbanDispatcherFailingCondition,
-		Written: "From the first time the task-board dispatcher fails for a whole poll",
-		Meaning: "`True` (`TicksFailing`) once the dispatcher has failed 60 ticks in a row on a board, about one five-minute poll at its 5-second interval. The message names the board, the streak and the last error class. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where every streak is below 60. A good tick resets a streak, and a board the dispatcher stops ticking drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves the condition as it is. A board quarantined as corrupt is not counted.",
+		Written: "From the first time the task-board dispatcher fails for a whole poll, or a tick on a board runs past 300 s or fails on a database lock after a busy timeout",
+		Meaning: "`True` with reason `TicksFailing` once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old. `True` with reason `TickStuck` once a board's tick runs past 300 s or fails on a database lock after waiting the busy timeout (120 s by default), as on a locked board; a stuck board takes precedence over a streak, and a good tick that runs past 300 s can set it for one poll. The message names the board and the streak with the last error class, or the stuck tick, and it is written again when the reason changes. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets any rule. A good tick resets a streak and a stuck board, and a quick failure of another kind ends a stuck board; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt drops out after ten minutes too.",
 	},
 	{
 		Type:    scopeUndeclaredCondition,
@@ -115,27 +141,32 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    homeChannelUnsetConditionType,
-		Written: "Under `mode: next`, while the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted)",
-		Meaning: "`status: True`, `Reason: NoHomeChannel`. Proactive posts are refused while conversation replies still arrive. The gateway keeps them for one digest once a channel is set; with Slack on too they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The message says which. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the `next` stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
+		Written: "While the A2A gateway holds a chat backend whose `homeChannel` is empty (Google Chat, Slack, or Microsoft Teams with the operator's `A2A_TEAMS_BACKEND` switch on, any of them) and no learned channel or space is admitted for it",
+		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When another platform has a home channel, proactive posts go there meanwhile (Chat's first, then Slack's, then Teams'). When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform; the `install.env` key beside the field only for the platforms the installer configures. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or under `homeChannelPolicy` `auto` mention the agent in a channel or a space, or on Slack pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
+	},
+	{
+		Type:    a2aBusMigratingConditionType,
+		Written: "While a bus migration runs (True), and after one ended without converting the bus (False, `Abandoned`) or stopped for a person (False, `Failed`); absent once one converted the bus, or when none has run",
+		Meaning: "`status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. A reshape (leg `Reshape`, [recreating TASKS wider](#recreating-tasks-wider)) reads the same way, its message naming TASKS rather than a server count. `True`, `LegUnknown`: the run's leg is one this operator does not run, a later release's found after a rollback; it is held where it is, with the freeze, until that release is back or a person abandons it ([a run this operator does not run](#a-run-this-operator-does-not-run)). An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases.",
 	},
 	{
 		Type:    noChatPlatformConditionType,
-		Written: "Under `mode: next`, while neither Google Chat nor Slack is enabled",
-		Meaning: "`status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`) to clear it.",
+		Written: "While neither Google Chat nor Slack is enabled, and the gateway's Microsoft Teams backend is not armed",
+		Meaning: "`status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`, or `spec.integration.teams` on an operator running with `A2A_TEAMS_BACKEND=true`) to clear it.",
 	},
 	{
 		Type:    shellSandboxImagePinnedConditionType,
 		Written: "While `spec.harness.experimental.shellSandbox.image` names an image other than the one the operator would run without it",
-		Meaning: "`status: True`, `Reason: ImageDiffersFromOperator`. The message names both images. A pin survives operator and agent upgrades, and a sandbox older than the agent fails every `kubectl` call at the credential proxy with a policy refusal. Not `Degraded`; `Ready` is unaffected, since a pin to a mirror or a test build can be deliberate. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that parks `Degraded` on `ShellSandboxKeysMissing` or `A2AProvisionFailed`, in either mode. Clear the field, or set it to the operator's image, to clear it.",
+		Meaning: "`status: True`, `Reason: ImageDiffersFromOperator`. The message names both images. A pin survives operator and agent upgrades, and a sandbox older than the agent fails every `kubectl` call at the credential proxy with a policy refusal. Not `Degraded`; `Ready` is unaffected, since a pin to a mirror or a test build can be deliberate. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that parks `Degraded` on `ShellSandboxKeysMissing` or `A2AProvisionFailed`. Clear the field, or set it to the operator's image, to clear it.",
 	},
 	{
 		Type:    a2aMCPIdentityConditionType,
-		Written: "Under `mode: next` with the operator's `A2A_MCP_DOOR` flag on, while a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control",
+		Written: "While the operator runs the MCP server (on by default; `operator.mcpServer.enabled`) and a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control",
 		Meaning: "`status: True`, `Reason: UnownedServiceAccount` or `UnownedTokenSecret`. Both names are reserved: an account somebody else created would run the MCP server as whatever Workload Identity it carries, and a foreign Secret would arm it with their credential. So the server is not rendered; a server and Service rendered earlier are removed, while the fence and the operator's own token stay. For an unowned account the broker's caller list and `CREDENTIAL_PROXY_MCP_CALLERS` do not name it. `Ready` is unaffected. The message names the object. Delete it; the condition clears on the next periodic pass, within 15 minutes. A controller reference is not a remedy: the operator would adopt the object as it is, annotations and contents included.",
 	},
 	{
 		Type:    scopeResolvedConditionType,
-		Written: "Under `mode: next`, while `spec.scope` declares a folder, organization, Shared VPC host or Metrics Scope",
+		Written: "While `spec.scope` declares a folder, organization, Shared VPC host or Metrics Scope",
 		Meaning: "A Job named `<agent>-scope-publisher-<suffix>` (shortened for long names) resolves those members into the `<agent>-resolved-scope` ConfigMap 15 minutes after each start, or at once for a new membership when no run is active. `True`, `Resolved`: a lookup answered within twice the sum of 15 minutes and 5 minutes per started 100 of `maxProjects` (40 minutes at the default). `False` reasons: `Missing`, no readable result yet. `Stale`, no lookup answered within that bound. `HashMismatch`, the result predates the membership. `TooLarge`, the members did not fit. `Error`, read the Job's log. `UnownedServiceAccount`, somebody else owns `<agent>-scope-publisher`; delete it; it clears within 15 minutes. `ScopeRoleNotConferred`, the install has no `kube-agents-a2a-gateway-pod` admission policy from the chart, which the broker's scope role needs. `Ready` is unaffected.",
 	},
 	{
@@ -151,7 +182,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    credentialProxyExecReadyConditionType,
 		Written: "Only while `credentialProxy.exec.replicas` is above 0 and the agent's name is accepted for the tier",
-		Meaning: "`status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`) leaves it as it stands, count included, until the park clears.",
+		Meaning: "`status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`, `UniverseDomainMismatch`) leaves it as it stands, count included, until the park clears.",
 	},
 	{
 		Type:    sizingCappedByQuotaConditionType,
@@ -160,7 +191,12 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    dataVolumeExpansionConditionType,
-		Written: "Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default) and its StorageClass cannot expand it",
-		Meaning: "`status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it.",
+		Written: "Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default, raised by `expectedClusterProfiles` for the agent's claim) and its StorageClass cannot expand it",
+		Meaning: "`status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it. The agent's claim, when it is below that size and will not grow (its class cannot expand it, or this PlatformAgent does not control it), also gets one `DataVolumeUndersized` Warning Event per state.",
+	},
+	{
+		Type:    externalModelEgressConditionType,
+		Written: "Only while the resolved Google Cloud universe domain is not `googleapis.com` and `status.inference.provider` is an external SaaS provider (any provider other than `openai_compatible`, `vertex_ai`, `hosted_vllm`, `vllm`, `ollama`, or `custom`)",
+		Meaning: "`status: True`, `Reason: ExternalSaaSProviderInCustomUniverse`. Prompts, cluster telemetry excerpts, and tool results leave the sovereign or partner universe boundary to reach the external model provider. Not `Degraded`: `Ready` is unaffected, since an operator may authorize external model egress deliberately. Switch LiteLLM to an in-universe endpoint (`openai_compatible` or `vertex_ai` with `platformAgent.harness.universeDomain` set on the chart) to clear it.",
 	},
 }

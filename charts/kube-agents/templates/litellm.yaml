@@ -83,6 +83,15 @@
 {{- if $openaiCompatibleCA.name }}
 {{- $_ := set $configEndpoint "sslVerify" (printf "%s/%s" $openaiCompatibleCADir $openaiCompatibleCA.key) }}
 {{- end }}
+{{- else if eq $provider "vertex_ai" }}
+{{- $vertexUniverseDomain := ((.Values.platformAgent).harness).universeDomain | default "" }}
+{{- if and $vertexUniverseDomain (ne $vertexUniverseDomain "googleapis.com") }}
+{{- if eq $vertexLocation "global" }}
+{{- $_ := set $configEndpoint "apiBase" (printf "https://aiplatform.%s" $vertexUniverseDomain) }}
+{{- else }}
+{{- $_ := set $configEndpoint "apiBase" (printf "https://%s-aiplatform.%s" $vertexLocation $vertexUniverseDomain) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- $redaction := .Values.litellm.redaction | default dict }}
 {{- $redactionEnabled := $redaction.enabled | default false }}
@@ -325,9 +334,10 @@ metadata:
   labels:
     app.kubernetes.io/name: litellm
     {{- include "kube-agents.labels" . | nindent 4 }}
-  {{- with $vertex.serviceAccountAnnotations }}
+  {{- $vertexAnnotations := include "kube-agents.nonEmptyStringMap" $vertex.serviceAccountAnnotations }}
+  {{- if $vertexAnnotations }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- $vertexAnnotations | nindent 4 }}
   {{- end }}
 {{- end }}
 ---
@@ -447,6 +457,11 @@ spec:
               value: {{ $retryAfter | quote }}
             {{- end }}
             {{- if eq $provider "vertex_ai" }}
+            {{- $vertexUniverseDomain := ((.Values.platformAgent).harness).universeDomain | default "" }}
+            {{- if and $vertexUniverseDomain (ne $vertexUniverseDomain "googleapis.com") }}
+            - name: GOOGLE_CLOUD_UNIVERSE_DOMAIN
+              value: {{ $vertexUniverseDomain | quote }}
+            {{- end }}
             - name: VERTEXAI_PROJECT
               {{- if $vertexProjectRef.name }}
               valueFrom:
@@ -767,6 +782,13 @@ spec:
     metadata:
       labels:
         {{- include "kube-agents.replayShadowSelectorLabels" . | nindent 8 }}
+      {{- if eq $replayShadowMode "replay" }}
+      # A replay pod's seeded cache is in its emptyDir and a replacement starts
+      # empty: the collector seeds it only at its turn in a later pass, minutes
+      # in which every request misses. Scale-down must not remove one.
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+      {{- end }}
     spec:
       {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.litellm.topologySpread | default dict).enabled "replicas" .Values.litellm.replayShadow.replicaCount "selectorLabels" (include "kube-agents.replayShadowSelectorLabels" .))) }}
       {{- . | nindent 6 }}
@@ -1081,7 +1103,7 @@ spec:
     - Ingress
     - Egress
 {{- end }}
-{{- if .Values.litellm.podMonitoring }}
+{{- if include "kube-agents.litellmPodMonitoring" . }}
 ---
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring

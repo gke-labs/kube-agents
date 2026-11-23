@@ -176,8 +176,16 @@ func TestGchatStopClickIsACancel(t *testing.T) {
 		t.Fatalf("stop click dropped: %s", reason)
 	}
 	if msg.Intent != IntentCancel || msg.Text != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != sessionKindDM ||
-		msg.AuthorID != "sender@example.com" || msg.MessageID != gchatClickID(ev.Message.Name, ev.click.EventTime) || !msg.Click || msg.TaskID != "task-9" {
+		msg.AuthorID != "sender@example.com" || msg.MessageID != gchatClickID(ev.Message.Name, ev.click.EventTime) || !msg.Click || msg.TaskID != "task-9" ||
+		msg.Viewer != "users/100000000000000000042" {
 		t.Errorf("stop turn = %+v", msg)
+	}
+	// A clicker Chat names by no user name is no viewer: nothing private
+	// is addressed to them.
+	nameless := stopClick()
+	nameless.click.User.Name = "people/42"
+	if msg, reason := a.classify(nameless); reason != "" || msg.Viewer != "" || msg.AuthorID != "sender@example.com" {
+		t.Errorf("a nameless clicker's stop = %+v (%s)", msg, reason)
 	}
 	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatStopDuplicate) {
 		t.Errorf("a redelivered stop click: %q", reason)
@@ -223,5 +231,64 @@ func TestGchatStopClickIsACancel(t *testing.T) {
 		if msg, reason := a.classify(ev); reason != "" || msg.MessageID != ev.Message.Name {
 			t.Errorf("a stop click without a time: %+v (%s)", msg, reason)
 		}
+	}
+}
+
+// PostPrivate is one create with the viewer set, in the thread, as the note
+// card is posted: text alone, no widgets. A viewer that is not a user's name
+// is refused with no call. A private thread reply Chat refuses is posted
+// once more at the top level, still private; any other failure is returned
+// as it is, once.
+func TestGchatPostPrivateIsACreateTheViewerAloneSees(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/AAA/messages/P1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	conv := "gchat:spaces/AAA/threads/T1"
+	if err := a.PostPrivate(conv, "users/42", refusedPressNotice); err != nil {
+		t.Fatal(err)
+	}
+	c := f.call(0)
+	body := callBody(t, c)
+	if c.method != "create" || c.arguments["parent"] != "spaces/AAA" || c.arguments["messageReplyOption"] == nil {
+		t.Fatalf("call 0 = %+v", c)
+	}
+	if v, _ := body["privateMessageViewer"].(map[string]any); v["name"] != "users/42" {
+		t.Errorf("privateMessageViewer = %+v", body["privateMessageViewer"])
+	}
+	if th, _ := body["thread"].(map[string]any); th["name"] != "spaces/AAA/threads/T1" {
+		t.Errorf("thread = %+v", body["thread"])
+	}
+	if body["text"] != refusedPressNotice || body["accessoryWidgets"] != nil || body["cardsV2"] != nil {
+		t.Errorf("body = %+v", body)
+	}
+
+	// A group chat has no thread: the line posts at the top level.
+	if err := a.PostPrivate("gchat:space/spaces/G1", "users/42", refusedPressNotice); err != nil {
+		t.Fatal(err)
+	}
+	if g := f.call(1); g.arguments["parent"] != "spaces/G1" || g.arguments["messageReplyOption"] != nil || callBody(t, g)["thread"] != nil {
+		t.Errorf("a group chat's private post = %+v", g)
+	}
+	f.calls = f.calls[:1]
+
+	if err := a.PostPrivate(conv, "people/42", "x"); !errors.Is(err, errGchatNoViewer) || relayCallCount(f) != 1 {
+		t.Errorf("a viewer that is not a user: err=%v calls=%d", err, relayCallCount(f))
+	}
+	if err := a.PostPrivate("slack:C1/1.0", "users/42", "x"); err == nil || relayCallCount(f) != 1 {
+		t.Errorf("not a gchat conversation: err=%v calls=%d", err, relayCallCount(f))
+	}
+
+	f.queue["spaces.messages/create"] = append(f.queue["spaces.messages/create"], fakeChatAPIError{status: 400, reason: "private replies unsupported"})
+	if err := a.PostPrivate(conv, "users/42", "x"); err != nil || relayCallCount(f) != 3 {
+		t.Fatalf("a refused thread reply: err=%v calls=%d", err, relayCallCount(f))
+	}
+	top := callBody(t, f.call(2))
+	if v, _ := top["privateMessageViewer"].(map[string]any); v["name"] != "users/42" || top["thread"] != nil || f.call(2).arguments["messageReplyOption"] != nil {
+		t.Errorf("the top-level retry = %+v %+v", f.call(2).arguments, top)
+	}
+
+	f.queue["spaces.messages/create"] = append(f.queue["spaces.messages/create"], fakeChatAPIError{status: 429, reason: "slow down"})
+	if err := a.PostPrivate(conv, "users/42", "x"); err == nil || relayCallCount(f) != 4 {
+		t.Errorf("a rate limit: err=%v calls=%d; want the error returned, no retry", err, relayCallCount(f))
 	}
 }

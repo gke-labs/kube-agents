@@ -11,10 +11,12 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import subprocess
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from pathlib import Path
 from mcp.server import MCPServer
 import sandbox_exec
+import first_run_report
 from agent_common_server import _run_env
 from untrusted_text import strip_unsafe
 from chat_platforms import HOME_CHANNEL_ENV_SUFFIX, enabled_chat_platforms
@@ -74,6 +76,49 @@ NON_CHAT_SESSION_ORIGINS = frozenset({"api_server", "k8s-watcher"})
 # reads the same finding twice. The measured relay is ~9s; the old 10s bound
 # left that one second of headroom.
 CRON_REPORT_TIMEOUT_SECONDS = 360.0
+
+# `get_first_run_report`'s caps, and the sandbox read's bound. Both reads are
+# cut at the ceiling delivery moves the ranked report whole under
+# (bootstrap_delivery.REPORT_MAX_BYTES; test_platform_mcp_server pins them
+# equal), so a report that was delivered comes back whole; cut rather than
+# refused, since a part of the report answers the question delivery's refusal
+# does not. The full read took the conversation post's 96 KiB once, and a real
+# sweep's INVENTORY.raw.md (105,584 bytes on one install) came back cut, which
+# sent the worker to the terminal for the rest; at 256 KiB the cap is about
+# 60k-75k tokens of Markdown tables, the price of keeping the worker on the tool.
+# `truncated` says when a file was still cut. The timeout is delivery's
+# (bootstrap_delivery.SANDBOX_TIMEOUT_SECONDS): one ssh round trip for a file.
+FIRST_RUN_REPORT_RANKED_MAX_BYTES = 256 * 1024
+FIRST_RUN_REPORT_FULL_MAX_BYTES = 256 * 1024
+FIRST_RUN_REPORT_SANDBOX_TIMEOUT_SECONDS = 30
+# What the ERROR line names when the read failed.
+FIRST_RUN_REPORT_SUBJECT = "the first-run report"
+
+# `get_alert_history`'s window and page. The route cuts the window (`since`);
+# one call is one page of it, and a larger ask than either ceiling is clamped.
+ALERT_HISTORY_DEFAULT_HOURS = 24
+# A sanity ceiling this tool owns, not a mirror of the retention. The ledger
+# holds only its retention (the daemon's CLEANUP_TTL_DAYS, 14 days by default),
+# so a wider window returns what it still holds. The tool reads no env for it:
+# this server runs as the platform_control MCP child, whose environment is the
+# `env:` block of agents/platform/config.yaml, not the pod's.
+ALERT_HISTORY_MAX_HOURS = 24 * 31
+ALERT_HISTORY_DEFAULT_LIMIT = 50
+# The tool's own page cap, under the route's (session_kv_server.FEED_EVENTS_MAX_LIMIT,
+# 500, stays the route's): a page is text the model reads whole, and 500 rows
+# measured ~300K characters pretty-printed (#6331 review). 200 compact rows
+# with the message bound below are ~100K characters, ~25k tokens, at the worst.
+ALERT_HISTORY_MAX_LIMIT = 200
+# Each row's `message` is cut here on the way out, with the sanitizer's mark.
+# The daemon stores up to LEDGER_MESSAGE_MAX_CHARS (512 unset), which at a full
+# page would be the larger half of it; 240 keeps a cluster event's whole text.
+ALERT_HISTORY_MESSAGE_MAX_CHARS = 240
+# The route's `since` form (session_kv_server.FEED_EVENTS_SINCE_FORMAT):
+# `intercepted_events.created_at` is SQLite's CURRENT_TIMESTAMP, UTC, no zone.
+ALERT_HISTORY_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+# What a failed Session KV call is named in the ERROR line each tool returns.
+FINDINGS_SUBJECT = "the findings queue"
+ALERT_HISTORY_SUBJECT = "the alert ledger"
 
 # Initialize the MCP server
 mcp = MCPServer("GKE Platform Control Plane")
@@ -379,8 +424,16 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
 # tree on the agent pod's PVC), so the agent cannot resolve a kanban assignee from
 # its terminal. This server runs in the agent pod, where the tree is.
 
+def _data_root() -> Path:
+    """The agent pod's data root: the chat profile's home, where the Cluster Agent profiles and
+    onboarding's markers are. PLATFORM_AGENT_HOME (in this child's env block; the operator sets
+    it from spec.harness.hermes.agentHome), else DEFAULT_AGENT_HOME; never HERMES_HOME, which in
+    this child is the platform profile's own home under it."""
+    return Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME)
+
+
 def _profiles_dir() -> Path:
-    return profiles_base(Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME))
+    return profiles_base(_data_root())
 
 
 def _cluster_agent_roster() -> list[dict]:
@@ -853,6 +906,12 @@ def send_notification(message: str, session_id: str = "") -> str:
     """
     Post a formatted alert or operational notification directly to configured chat platforms (Google Chat and/or Slack).
 
+    Where the A2A gateway holds the platform (Slack, Google Chat), every post
+    goes to the home channel, and `session_id` makes it a reply in a thread of
+    that channel. With no home channel set the post is recorded for the
+    gateway's one notice (`KEPT:`), not delivered, so a missing home channel is
+    answered, never probed with a post.
+
     Link every artifact you name in the message — issue, PR, cluster, workload,
     console view — as a markdown link `[text](url)` with the URL written out in
     full. Never a bare `#39` and never a repo-relative reference: a chat message
@@ -877,9 +936,10 @@ def send_notification(message: str, session_id: str = "") -> str:
     # token by design and a home channel rendered regardless, which is why it
     # could name Slack on a pod whose CR had turned Slack off (#743). Every other
     # reader of this question already reads the managed scope first. That copy
-    # also appended `chat_notify.routed_platform()` after its environment
-    # fallback; `enabled_chat_platforms` covers the routed platform itself, per
-    # platform rather than as an append, so nothing is lost with the copy.
+    # also appended the routed platform (now `chat_notify.routed_platforms()`)
+    # after its environment fallback; `enabled_chat_platforms` covers each
+    # routed platform itself, per platform rather than as an append, so nothing
+    # is lost with the copy.
     enabled_platforms = enabled_chat_platforms()
     threaded_targets = []
     chat_id = None
@@ -1145,17 +1205,22 @@ def _findings_request(method: str, path: str, body: dict | None = None) -> Any:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _findings_call(method: str, path: str, body: dict | None = None) -> str:
-    try:
-        return json.dumps(_findings_request(method, path, body), indent=2)
-    except urllib.error.HTTPError as exc:
+def _loopback_error(exc: Exception, subject: str) -> str:
+    """The ERROR line a tool returns when its Session KV route failed."""
+    if isinstance(exc, urllib.error.HTTPError):
         try:
             detail = json.loads(exc.read().decode("utf-8")).get("detail")
         except Exception:
             detail = None
-        return f"ERROR: the findings queue refused this ({exc.code}): {detail or exc.reason}"
+        return f"ERROR: {subject} refused this ({exc.code}): {detail or exc.reason}"
+    return f"ERROR: could not reach {subject}: {exc}"
+
+
+def _findings_call(method: str, path: str, body: dict | None = None) -> str:
+    try:
+        return json.dumps(_findings_request(method, path, body), indent=2)
     except Exception as exc:
-        return f"ERROR: could not reach the findings queue: {exc}"
+        return _loopback_error(exc, FINDINGS_SUBJECT)
 
 
 @mcp.tool()
@@ -1384,6 +1449,110 @@ def findings_publication(
         body["content_hash"] = content_hash
     return _findings_call(
         "PUT", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}", body
+    )
+
+
+@mcp.tool()
+def get_first_run_report(which: str = first_run_report.WHICH_RANKED) -> str:
+    """
+    The first-run (onboarding) inventory report the agent already wrote, and what became of it.
+
+    Reads the report where onboarding left it (the shell sandbox's data volume,
+    or the agent pod's data root with the sandbox off) and the delivery markers
+    in that data root. No new scan. `state` is `delivered` (posted into the chat
+    the first person wrote in; `path_taken` is `origin` for the chat the
+    onboarding job was linked to, `conversation` for the thread recorded under
+    the gateway), `filed` (a ledger issue; `filed` carries its repo, number, url
+    and time), `retired` (a week passed with nobody arriving; the findings are
+    still in the queue when `findings_registered` is true), `pending` (written,
+    not yet delivered) or `absent` (no report yet: the sweep has not written one).
+    `report` is `kind`, the text, `source` (the file it came from), `bytes` and
+    `truncated`; null when the asked-for file is not there.
+
+    Args:
+        which: `ranked` (default) for the report the user received, criticals
+            and roll-up as written; `full` for the sweep's complete findings,
+            every cluster and workload. Each at most 256 KiB, `truncated` set
+            when cut. This tool is the only route to the report: never read
+            `/opt/data/INVENTORY*` (the report, or the sweep's working files)
+            with a terminal or file tool.
+    """
+    if which not in first_run_report.REPORT_KINDS:
+        return f"ERROR: which must be one of {', '.join(first_run_report.REPORT_KINDS)}, not {which!r}"
+    cap = FIRST_RUN_REPORT_RANKED_MAX_BYTES if which == first_run_report.WHICH_RANKED else FIRST_RUN_REPORT_FULL_MAX_BYTES
+
+    def sandbox_read(path: str, max_bytes: int) -> bytes | None:
+        return sandbox_exec.read_bytes(path, max_bytes=max_bytes, timeout=FIRST_RUN_REPORT_SANDBOX_TIMEOUT_SECONDS)
+
+    try:
+        result = first_run_report.read_first_run_report(
+            _data_root(),
+            which=which,
+            max_bytes=cap,
+            sandbox_read=sandbox_read if sandbox_exec.sandbox_enabled() else None,
+        )
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
+        return f"ERROR: could not reach {FIRST_RUN_REPORT_SUBJECT}: {exc}"
+    except (sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed, OSError) as exc:
+        return f"ERROR: could not read {FIRST_RUN_REPORT_SUBJECT}: {exc}"
+    if result["report"] is not None:
+        # The report is prose a worker wrote from cluster data, so it carries what
+        # a workload's name or a probe's message carried, as a pod's logs do.
+        result["report"]["text"] = _neutralize_tokens(_strip_unsafe_chars(result["report"]["text"]))
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_alert_history(
+    since_hours: int = ALERT_HISTORY_DEFAULT_HOURS, limit: int = ALERT_HISTORY_DEFAULT_LIMIT
+) -> str:
+    """
+    What the alert path saw and did: the event ledger over a window, newest first.
+
+    One row per event a producer forwarded (a cluster event, a drift record, a
+    controller stall), whether or not it reached chat; `status` says what became
+    of it (the alert-history skill has the table), `session_id` is its thread,
+    `pull_request` its fix. A row is dated at its first sighting: an excluded
+    event that keeps recurring is one row an hour, dated at its first sighting
+    in that hour. The ledger keeps at most its retention (14 days by default);
+    a quiet follow-up is a card comment, not a row.
+
+    Args:
+        since_hours: Window back from now, in hours (default 24, at most 744;
+            the ledger holds only its retention, 14 days by default, so a wider
+            window returns what it still holds).
+        limit: Most rows to return (default 50, at most 200: a page is text the
+            model reads whole). `truncated` true means the window holds more rows
+            than were returned; narrow the window rather than asking for more.
+
+    Returns compact JSON (no indentation); each row's `message` is cut at 240
+    characters and ends in ` ... [truncated]` when it was longer.
+    """
+    try:
+        hours = max(1, min(int(since_hours), ALERT_HISTORY_MAX_HOURS))
+        page = max(1, min(int(limit), ALERT_HISTORY_MAX_LIMIT))
+    except (TypeError, ValueError) as exc:
+        return f"ERROR: since_hours and limit must be whole numbers: {exc}"
+    window_start = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(ALERT_HISTORY_TIME_FORMAT)
+    query = urllib.parse.urlencode({"since": window_start, "limit": page})
+    try:
+        feed = _findings_request("GET", f"/v1/intercepted-events?{query}")
+    except Exception as exc:
+        return _loopback_error(exc, ALERT_HISTORY_SUBJECT)
+    events = feed.get("events") or []
+    return json.dumps(
+        {
+            "since_hours": hours,
+            "window_start": window_start,
+            "returned": len(events),
+            # The route counted the window's rows, so this is its word.
+            "truncated": bool(feed.get("truncated")),
+            # Cluster-originated text: an event message carries what a probe or
+            # a controller wrote, as a pod's logs do. The bound cuts every string
+            # of a row; `message` is the only one that reaches it.
+            "events": _sanitize_json_value(events, max_len=ALERT_HISTORY_MESSAGE_MAX_CHARS),
+        },
+        separators=(",", ":"),
     )
 
 

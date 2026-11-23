@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -788,6 +789,71 @@ class DanglingComputeClassTest(unittest.TestCase):
         # nodeSelector values are case-sensitive; `balanced` is not `Balanced`.
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "balanced"})
         self.assertIsNotNone(fs.check_dangling_compute_class(d, {}, None, autopilot=True))
+
+    @staticmethod
+    def class_with_status(*conditions):
+        """`general-ccc` as GKE reports it; the conditions are the live read of
+        a class whose node pool carries the class label and no class taint."""
+        cc = compute_class("general-ccc", [{"nodepools": ["default-pool"]}], node_pool_auto_creation=False)
+        cc["status"] = {"conditions": [
+            {"type": kind, "status": state, "reason": reason, "message": message}
+            for kind, state, reason, message in conditions
+        ]}
+        return cc
+
+    TAINT_MISSING = ("NodepoolMisconfigured", "True", "TaintMissing", "Crd taint is missing for the nodepool default-pool.")
+    NOT_HEALTHY = ("Health", "False", "Health", "Crd is not healthy.")
+
+    def test_a_class_gke_reports_misconfigured_is_a_hit_that_quotes_the_condition(self):
+        hit = fs.check_compute_class_status(self.class_with_status(self.TAINT_MISSING, self.NOT_HEALTHY))
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertEqual(
+            hit["excerpt"],
+            "status condition NodepoolMisconfigured is True (TaintMissing): Crd taint is missing for the nodepool "
+            "default-pool.; status condition Health is False (Health): Crd is not healthy.",
+        )
+
+    def test_either_condition_alone_is_a_hit(self):
+        autoscaling_off = ("CrdMisconfigured", "True", "", "Nodepool default-pool specified by name has autoscaling disabled")
+        for condition in (self.TAINT_MISSING, self.NOT_HEALTHY, autoscaling_off):
+            with self.subTest(condition=condition[0]):
+                self.assertIsNotNone(fs.check_compute_class_status(self.class_with_status(condition)))
+
+    def test_a_healthy_class_or_one_with_no_status_is_not_judged(self):
+        healthy = self.class_with_status(
+            ("NodepoolMisconfigured", "False", "", ""), ("Health", "True", "Health", "Crd is healthy."),
+            ("SomeOtherCondition", "True", "", ""),
+        )
+        self.assertIsNone(fs.check_compute_class_status(healthy))
+        self.assertIsNone(fs.check_compute_class_status(compute_class("cc1", [{"machineFamily": "n4"}])))
+        self.assertIsNone(fs.check_compute_class_status({**compute_class("cc1", []), "status": {"conditions": ["junk", None]}}))
+
+    def test_the_class_captured_from_the_fleet_is_a_hit_marked_for_triage(self):
+        """The stored capture is the live read of the fleet's class: the shape
+        the predicate is written against, not a shape typed from memory."""
+        capture = Path(__file__).resolve().parent / "testdata" / "computeclass_taint_missing.json"
+        hit = fs.check_compute_class_status(json.loads(capture.read_text(encoding="utf-8")))
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertIn("status condition NodepoolMisconfigured is True (TaintMissing)", hit["excerpt"])
+        self.assertIn("status condition Health is False (Health)", hit["excerpt"])
+        self.assertEqual(hit["needs_triage"], fs.CLASS_STATUS_TRIAGE)
+        self.assertIn(fs.CLASS_STATUS_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_a_long_condition_message_is_clipped(self):
+        long_message = ("NodepoolMisconfigured", "True", "TaintMissing", "x" * 1000)
+        excerpt = fs.check_compute_class_status(self.class_with_status(long_message))["excerpt"]
+        self.assertLess(len(excerpt), 300)
+
+    def test_the_collector_files_the_class_and_stamps_the_read(self):
+        cc = self.class_with_status(self.TAINT_MISSING, self.NOT_HEALTHY)
+        for pools_rc in (0, 1):
+            with self.subTest(pools_rc=pools_rc):
+                entry = CollectClusterTest().run_with(dump_items=[cc], pools_rc=pools_rc)
+                hits = [c for c in entry["candidates"] if c["check"] == "dangling-compute-class"]
+                self.assertEqual([c["object"] for c in hits], ["ComputeClass/general-ccc"])
+                self.assertEqual(hits[0]["severity"], "critical")
+                self.assertIn("kubectl get", hits[0]["command"])
+                self.assertEqual(hits[0]["needs_triage"], fs.CLASS_STATUS_TRIAGE)
 
     def test_the_collector_tells_the_check_the_cluster_mode(self):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "Balanced"})
@@ -2160,7 +2226,7 @@ class CollectClusterTest(unittest.TestCase):
         declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
         # `spot-scarcity-risk` rides along because this fixture's cluster asks
         # for no Spot capacity at all, which is its own declared non-applicability.
-        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk"})
+        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk", fs.UNBACKED_MANUAL_FALLBACK})
         self.assertIn("Autopilot", declared["single-zone-nodepool"])
 
     def test_autopilot_never_issues_the_node_pools_read(self):
@@ -2582,7 +2648,7 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
         self.assertEqual(
             {e["check"] for e in entry["checks_unevaluated"]},
-            {"single-zone-nodepool", "spot-scarcity-risk"},
+            {"reservation-mismatch-risk", "single-zone-nodepool", "spot-scarcity-risk"},
         )
         self.assertIn("spot-scarcity-risk read no Spot node pool", entry["limitations"])
 
@@ -2718,6 +2784,91 @@ class CollectClusterTest(unittest.TestCase):
                 self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
                 self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
                 self.assertIn("not a JSON list of entries", entry["limitations"])
+
+    @staticmethod
+    def _without_durations(entry):
+        """The cluster entry less what two runs never share: each command's
+        duration, and the temporary directory each run keeps its kubeconfig in."""
+        clean = json.loads(re.sub(r'[^ "=]*/kubeconfig_', "KUBECONFIG_DIR/kubeconfig_", json.dumps(entry)))
+        for command in clean["commands"]:
+            command.pop("duration_s", None)
+        return clean
+
+    def test_the_relay_read_gives_the_same_entry_as_the_gcloud_read(self):
+        """The same entries through either door: the candidates, the recorded
+        command, the limitations and the outcome agree. (Both doors are handed one
+        text here, so the digests agree too; live, `gcloud` prints the list
+        indented and the relay's is compact, and nothing compares the digests.)"""
+        logged = [ERROR_MSG_ENTRY, {"jsonPayload": {}}]
+        by_gcloud = self.run_with(dump_items=[], log_entries=logged)
+        self.assertTrue([a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]])
+        with patch.object(fs.logging_reads, "read_json", return_value=json.dumps(logged)) as relay:
+            by_relay = self.run_with(dump_items=[], log_rc=1)
+        self.assertEqual([], [a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]])
+        self.assertEqual(self._without_durations(by_gcloud), self._without_durations(by_relay))
+        self.assertTrue([c for c in by_relay["candidates"] if c["check"] == "autoscaler-out-of-resources"])
+        (project, filter_text, limit), _ = relay.call_args
+        self.assertEqual((self.CLUSTER["project"], fs.AUTOSCALER_LOG_LIMIT), (project, limit))
+        # What gcloud sends for --freshness: the bound first, then the argv's filter.
+        gcloud_filter = by_gcloud["commands"][0]["command"]
+        bound, _, rest = filter_text.partition(" AND ")
+        self.assertRegex(bound, r'^timestamp>="\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z"$')
+        self.assertIn(f'resource.labels.cluster_name="{self.CLUSTER["name"]}"', rest)
+        self.assertTrue(any(shlex.quote(rest) in c["command"] for c in by_gcloud["commands"]), gcloud_filter)
+
+    def test_a_relay_that_does_not_answer_leaves_the_gcloud_read(self):
+        with patch.object(fs.logging_reads, "read_json", return_value=None):
+            entry = self.run_with(dump_items=[], log_entries=[ERROR_MSG_ENTRY])
+        self.assertEqual(1, len([a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]]))
+        self.assertTrue([c for c in entry["candidates"] if c["check"] == "autoscaler-out-of-resources"])
+
+    def test_a_relay_read_that_spends_the_cap_is_a_timed_out_read_and_gcloud_is_not_run(self):
+        timed_out = fs.logging_reads.ReadTimedOut("timed out after 60 seconds")
+        with patch.object(fs.logging_reads, "read_json", side_effect=timed_out) as relay:
+            entry = self.run_with(dump_items=[], log_entries=[ERROR_MSG_ENTRY])
+        self.assertEqual([], [a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]])
+        self.assertEqual(fs.DEFAULT_TIMEOUT_S, relay.call_args.kwargs["timeout_s"])
+        self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertIn(f"`gcloud logging read` failed (rc={fs.TIMEOUT_RC})", entry["limitations"])
+        self.assertIn("timed out after 60 seconds", entry["limitations"])
+
+    def test_gcloud_gets_what_the_relay_left_of_the_cap(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(kwargs)
+            return run_of(0, "[]")
+
+        argv = ["gcloud", "logging", "read", "x"]
+        for spent, expected in ((0.4, {}), (25.0, {"timeout": fs.DEFAULT_TIMEOUT_S - 25})):
+            with self.subTest(spent=spent):
+                calls.clear()
+                ticks = iter([100.0, 100.0 + spent])
+                with patch.object(fs.logging_reads, "read_json", return_value=None), \
+                        patch.object(fs.time, "monotonic", lambda: next(ticks)):
+                    fs.run_logging_read(argv, run=run, project="p", filter_text="x", freshness=fs.timedelta(hours=1), limit=10)
+                self.assertEqual([expected], calls)
+
+    def test_an_empty_relay_read_is_a_clean_window(self):
+        with patch.object(fs.logging_reads, "read_json", return_value="[]"):
+            entry = self.run_with(dump_items=[], log_rc=1)
+        self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("autoscaler-out-of-resources", {e["check"] for e in entry.get("checks_unevaluated", [])})
+        self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["candidates"]})
+
+    def test_a_full_relay_page_leaves_the_check_unevaluated_as_a_full_gcloud_page_does(self):
+        full = json.dumps([{"jsonPayload": {}}] * fs.AUTOSCALER_LOG_LIMIT)
+        with patch.object(fs.logging_reads, "read_json", return_value=full):
+            entry = self.run_with(dump_items=[], log_rc=1)
+        self.assertIn("older entries", entry["limitations"])
+        self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+
+    def test_the_freshness_the_relay_sends_is_the_one_the_argv_names(self):
+        self.assertEqual(f"{fs.AUTOSCALER_FRESHNESS_HOURS}h", fs.AUTOSCALER_FRESHNESS)
+        with patch.object(fs.logging_reads, "freshness_filter", wraps=fs.logging_reads.freshness_filter) as bound, \
+                patch.object(fs.logging_reads, "read_json", return_value="[]"):
+            self.run_with(dump_items=[])
+        self.assertEqual(fs.timedelta(hours=fs.AUTOSCALER_FRESHNESS_HOURS), bound.call_args.args[1])
 
     def test_an_empty_autoscaler_read_is_still_clean(self):
         entry = self.run_with(dump_items=[], log_stdout="\n")
@@ -3588,6 +3739,332 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual(entry["candidates"], [])
 
 
+def reserved_node_pool(name, reservation, zones=("us-central1-c",), **config):
+    """A trimmed copy of a `clusters list` item's node pool, read from a
+    throwaway cluster (GKE 1.35.8-gke.1796000) on 2026-11-18, with the names
+    replaced. GKE accepted the pool while the reservation was missing."""
+    return {
+        "name": name,
+        "locations": list(zones),
+        "status": "RUNNING",
+        "autoscaling": {"enabled": True, "locationPolicy": "BALANCED", "maxNodeCount": 1},
+        "config": {
+            "labels": {"pool-role": name},
+            "machineType": "n1-standard-1",
+            "reservationAffinity": {"consumeReservationType": "SPECIFIC_RESERVATION", "key": "compute.googleapis.com/reservation-name", "values": reservation.split(",")},
+            "resourceLabels": {"goog-gke-node-pool-provisioning-model": "reservation"},
+            "taints": [{"effect": "NO_SCHEDULE", "key": "pool-role", "value": name}],
+            **config,
+        },
+    }
+
+
+def listed_reservation(name, zone, project="acme"):
+    """A trimmed copy of one `gcloud compute reservations list --format json`
+    item from the same read: `zone` is a URL and the counts are strings."""
+    return {
+        "kind": "compute#reservation",
+        "name": name,
+        "shareSettings": {"shareType": "LOCAL"},
+        "specificReservation": {"assuredCount": "1", "count": "1", "inUseCount": "0", "instanceProperties": {"machineType": "n1-standard-1"}},
+        "specificReservationRequired": True,
+        "status": "READY",
+        "zone": f"https://www.googleapis.com/compute/v1/projects/{project}/zones/{zone}",
+    }
+
+
+class ReservedPoolTest(unittest.TestCase):
+    """§3.10(d): a node pool that consumes only named reservations, none of
+    which exists in one of the pool's zones (#3006)."""
+
+    SLUG = "reservation-mismatch-risk"
+    POOLS_COMMAND = "gcloud container clusters list --project acme --format json"
+    # What `CollectClusterTest.run_with` reads from its test case.
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+
+    def entry(self, *pools, **extra):
+        reserved = [{**fs.reserved_pool(pool, "acme"), "command": self.POOLS_COMMAND} for pool in pools]
+        return {
+            "name": "acme/us-central1/c1", "project": "acme", "location": "us-central1", "outcome": "collected",
+            "commands": [{"check": self.SLUG, "command": "kubectl get computeclasses", "rc": 0}],
+            "candidates": [],
+            fs.RESERVED_POOLS_KEY: reserved,
+            **extra,
+        }
+
+    def filed(self, *pools, reservations=(), swept=("acme",), read=("acme",), **extra):
+        entry = self.entry(*pools, **extra)
+        zones = {project: fs.reservation_zones([r for r in reservations if f"/projects/{project}/" in r["zone"]]) for project in read}
+        fs.file_reserved_pools(entry, zones, frozenset(swept))
+        self.assertNotIn(fs.RESERVED_POOLS_KEY, entry)
+        return entry
+
+    def test_the_pool_shape_gke_returns(self):
+        self.assertEqual(
+            fs.reserved_pool(reserved_node_pool("res-pool", "r1", zones=("us-central1-c", "us-central1-a")), "acme"),
+            {"pool": "res-pool", "zones": ["us-central1-a", "us-central1-c"], "reservations": [("acme", "r1")]},
+        )
+
+    def test_a_zero_node_pool_with_no_autoscaling_is_reserved_too(self):
+        """The shape the seeded fixture plants: GKE omits `autoscaling` and
+        `initialNodeCount` for it."""
+        pool = reserved_node_pool("missing-reservation-pool", "seeded-absent-reservation")
+        del pool["autoscaling"]
+        self.assertEqual(fs.reserved_pool(pool, "acme")["reservations"], [("acme", "seeded-absent-reservation")])
+
+    def test_other_pools_are_not_reserved(self):
+        any_reservation = reserved_node_pool("p", "r1")
+        any_reservation["config"]["reservationAffinity"] = {"consumeReservationType": "ANY_RESERVATION"}
+        # The type decides, not a `values` list that is present.
+        typed_otherwise = reserved_node_pool("p", "r1")
+        typed_otherwise["config"]["reservationAffinity"]["consumeReservationType"] = "ANY_RESERVATION"
+        no_affinity = reserved_node_pool("p", "r1")
+        del no_affinity["config"]["reservationAffinity"]
+        no_name = reserved_node_pool("p", "r1")
+        no_name["config"]["reservationAffinity"]["values"] = []
+        # No zone to compare a reservation with.
+        no_zones = reserved_node_pool("p", "r1", zones=())
+        for pool in (
+            any_reservation,
+            typed_otherwise,
+            no_affinity,
+            no_name,
+            no_zones,
+            # §3.10 does not flag non-production.
+            reserved_node_pool("dev-pool", "r1"),
+            reserved_node_pool("p", "r1", resourceLabels={"environment": "staging"}),
+            reserved_node_pool("p", "r1", labels={"env": "dev"}),
+        ):
+            with self.subTest(pool=pool["name"], config=pool["config"]):
+                self.assertIsNone(fs.reserved_pool(pool, "acme"))
+
+    def test_the_owner_of_a_named_reservation(self):
+        for value, owner in (
+            ("r1", "acme"),
+            ("projects/host/reservations/r1", "host"),
+            # A part of the reservation is named: the reservation is the same.
+            ("r1/reservationBlocks/b1", "acme"),
+            ("projects/host/reservations/r1/reservationBlocks/b1", "host"),
+            ("https://www.googleapis.com/compute/v1/projects/host/zones/us-central1-c/reservations/r1", "host"),
+            # A path with no project: the name is the segment after `reservations`.
+            ("zones/us-central1-c/reservations/r1", "acme"),
+            ("reservations/r1", "acme"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(fs.reservation_owner(value, "acme"), (owner, "r1"))
+
+    def test_the_zones_of_a_reservations_list(self):
+        listed = [listed_reservation("r1", "us-central1-c"), listed_reservation("r1", "us-central1-f"), listed_reservation("dev-r2", "us-central1-a")]
+        self.assertEqual(fs.reservation_zones(listed), {"r1": ["us-central1-c", "us-central1-f"], "dev-r2": ["us-central1-a"]})
+
+    def test_a_reservation_that_does_not_exist_is_a_critical_finding(self):
+        entry = self.filed(reserved_node_pool("res-missing", "no-such-reservation"))
+        [candidate] = entry["candidates"]
+        self.assertEqual((candidate["check"], candidate["object"], candidate["severity"]), (self.SLUG, "NodePool/res-missing", "critical"))
+        self.assertEqual(
+            candidate["excerpt"],
+            "reservationAffinity=SPECIFIC_RESERVATION, pool zones us-central1-c; "
+            "reservation no-such-reservation: found in no zone of project acme",
+        )
+        # The arm's own sentence, which `finish` adopts over the model's. It
+        # holds for a pool with no autoscaling too.
+        self.assertIn("cannot add a node; with autoscaling on, the autoscaler reports `scale.up.error.reservation.not.found`", candidate["impact"])
+        self.assertTrue(candidate["impact_authoritative"])
+        # Each fix costs money or replaces the pool, so the sweep opens no
+        # pull request for it, whatever kind the published remediation has.
+        self.assertEqual(candidate["needs_triage"], fs.RESERVED_POOL_TRIAGE)
+        self.assertIn(fs.RESERVED_POOL_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertEqual(candidate["command"], f"{self.POOLS_COMMAND}; gcloud compute reservations list --project acme --format json")
+        # The check ran here: its record stays and nothing is unevaluated.
+        self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertNotIn("limitations", entry)
+
+    def test_a_reservation_in_another_zone_is_the_same_finding(self):
+        entry = self.filed(reserved_node_pool("res-other-zone", "r1"), reservations=[listed_reservation("r1", "us-central1-f")])
+        [candidate] = entry["candidates"]
+        self.assertEqual(candidate["object"], "NodePool/res-other-zone")
+        self.assertIn("reservation r1: found only in us-central1-f of project acme", candidate["excerpt"])
+
+    def test_a_reservation_in_the_pool_s_zone_is_not_flagged(self):
+        entry = self.filed(reserved_node_pool("res-same-zone", "r1"), reservations=[listed_reservation("r1", "us-central1-c")])
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("limitations", entry)
+
+    def test_a_reservation_in_one_of_the_pool_s_zones_is_not_flagged(self):
+        pool = reserved_node_pool("regional", "r1", zones=("us-central1-a", "us-central1-c"))
+        entry = self.filed(pool, reservations=[listed_reservation("r1", "us-central1-c")])
+        self.assertEqual(entry["candidates"], [])
+
+    def test_an_owner_project_outside_the_run_is_a_limitation_and_no_finding(self):
+        entry = self.filed(reserved_node_pool("shared", "projects/host/reservations/r1"))
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])
+        self.assertIn("owner project is not a project ID of this run: shared (project host)", entry["limitations"])
+
+    def test_one_of_two_named_reservations_in_a_zone_is_enough(self):
+        entry = self.filed(reserved_node_pool("two", "r1,r2"), reservations=[listed_reservation("r2", "us-central1-c")])
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("limitations", entry)
+
+    def test_two_named_reservations_that_are_both_missing_are_one_finding(self):
+        pool = reserved_node_pool("two", "projects/host/reservations/r2,r1")
+        entry = self.filed(pool, reservations=[listed_reservation("r2", "us-central1-f", project="host")], swept=("acme", "host"), read=("acme", "host"))
+        [candidate] = entry["candidates"]
+        self.assertIn("reservation r1: found in no zone of project acme; reservation r2: found only in us-central1-f of project host", candidate["excerpt"])
+        self.assertTrue(
+            candidate["command"].endswith(
+                "gcloud compute reservations list --project acme --format json; gcloud compute reservations list --project host --format json"
+            )
+        )
+
+    def test_an_unread_owner_decides_before_an_owner_outside_the_run(self):
+        pool = reserved_node_pool("two", "projects/host/reservations/r1,projects/far/reservations/r2")
+        entry = self.filed(pool, swept=("acme", "host"))
+        self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG])
+        self.assertIn("two (project host)", entry["checks_unevaluated"][0]["reason"])
+
+    def test_an_owner_outside_the_run_stops_a_finding_for_the_other_name(self):
+        """The reservation that could not be compared can be the one in the
+        pool's zone."""
+        entry = self.filed(reserved_node_pool("two", "projects/far/reservations/r2,r1"))
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("two (project far)", entry["limitations"])
+
+    def test_a_shared_reservation_of_a_swept_project_is_compared(self):
+        pool = reserved_node_pool("shared", "projects/host/reservations/r1")
+        missing = self.filed(pool, swept=("acme", "host"), read=("acme", "host"))
+        [candidate] = missing["candidates"]
+        self.assertIn("found in no zone of project host", candidate["excerpt"])
+        self.assertTrue(candidate["command"].endswith("gcloud compute reservations list --project host --format json"))
+        present = self.filed(pool, reservations=[listed_reservation("r1", "us-central1-c", project="host")], swept=("acme", "host"), read=("acme", "host"))
+        self.assertEqual(present["candidates"], [])
+
+    def test_an_owner_project_whose_reservations_were_not_read_is_unevaluated(self):
+        """As every failed read here: the check recorded as run would publish
+        the pool as compared and clean. The pool that was compared still files."""
+        entry = self.filed(
+            reserved_node_pool("shared", "projects/host/reservations/r1"),
+            reserved_node_pool("res-missing", "no-such-reservation"),
+            swept=("acme", "host"),
+            limitations="an earlier limitation",
+            checks_unevaluated=[{"check": "spot-scarcity-risk", "reason": "x"}],
+        )
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["NodePool/res-missing"])
+        self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG, "spot-scarcity-risk"])
+        self.assertIn("were not read in this run: shared (project host)", entry["checks_unevaluated"][0]["reason"])
+        self.assertEqual(entry["commands"], [])
+        self.assertTrue(entry["limitations"].startswith("an earlier limitation; reservation-mismatch-risk could not be judged: "))
+
+    def test_an_entry_with_no_reserved_pool_is_left_as_it_is(self):
+        entry = {"name": "acme/us-central1/c1", "project": "acme", "outcome": "gate-failed", "error": "x"}
+        fs.file_reserved_pools(entry, {}, frozenset({"acme"}))
+        self.assertEqual(entry, {"name": "acme/us-central1/c1", "project": "acme", "outcome": "gate-failed", "error": "x"})
+
+    def test_collect_cluster_hands_the_reserved_pools_to_the_fleet(self):
+        entry = CollectClusterTest.run_with(self, pools=[reserved_node_pool("res-missing", "no-such-reservation"), {"name": "plain", "locations": ["us-central1-a"], "config": {}}])
+        [reserved] = entry[fs.RESERVED_POOLS_KEY]
+        self.assertEqual((reserved["pool"], reserved["zones"], reserved["reservations"]), ("res-missing", ["us-central1-c"], [("acme", "no-such-reservation")]))
+        self.assertEqual(reserved["command"], next(c["command"] for c in entry["commands"] if c["check"] == "single-zone-nodepool"))
+
+    def test_an_unread_pool_list_leaves_the_check_unevaluated_and_the_affinity_arm_filed(self):
+        bypassing = compute_class("cc1", [{"machineFamily": "n4", "reservations": {"affinity": "Automatic"}}])
+        entry = CollectClusterTest.run_with(self, dump_items=[bypassing], pools_rc=1)
+        self.assertIn(self.SLUG, {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
+        self.assertIn("reservation-mismatch-risk compared no node pool", entry["limitations"])
+        [candidate] = [c for c in entry["candidates"] if c["check"] == self.SLUG]
+        # Stamped, since the slug's record is gone.
+        self.assertIn("kubectl get computeclasses", candidate["command"])
+
+    def fleet(self, pool, *, reservations_rc=0, reservations=()):
+        """One project, one cluster whose listing carries `pool`."""
+        listing = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": [pool]}])
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, listing)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(reservations_rc, json.dumps(list(reservations)) if not reservations_rc else "", "denied")
+            if argv[:3] == ["gcloud", "compute", "regions"]:
+                return run_of(0, json.dumps({"quotas": []}))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet("acme", run=run)
+        self.assertNotIn(fs.RESERVED_POOLS_KEY, json.dumps(manifest))
+        self.assertNotIn(fs.RESERVATION_ZONES_KEY, json.dumps(manifest))
+        return manifest, next(e for e in manifest["clusters"] if e["name"] == "acme/us-central1/c1")
+
+    def test_the_fleet_files_the_finding_on_the_cluster_entry(self):
+        _, cluster = self.fleet(reserved_node_pool("res-other-zone", "r1"), reservations=[listed_reservation("r1", "us-central1-f")])
+        [candidate] = [c for c in cluster["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual((candidate["object"], candidate["severity"]), ("NodePool/res-other-zone", "critical"))
+        self.assertIn("found only in us-central1-f of project acme", candidate["excerpt"])
+        # Both reads, each one a command `finish` accepts as evidence.
+        audit_report.validate_check_command(candidate["command"], cluster["name"], self.SLUG)
+        self.assertIn("gcloud container clusters list", candidate["command"])
+        self.assertIn("gcloud compute reservations list --project acme", candidate["command"])
+
+    def test_the_fleet_files_nothing_for_the_pool_that_can_grow(self):
+        _, cluster = self.fleet(reserved_node_pool("res-same-zone", "r1"), reservations=[listed_reservation("r1", "us-central1-c")])
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+        self.assertIn(self.SLUG, {c["check"] for c in cluster["commands"]})
+
+    def test_a_non_production_reservation_in_the_pool_s_zone_counts(self):
+        """The idle-capacity arm skips a non-production reservation; a pool
+        that names one is still not missing it."""
+        _, cluster = self.fleet(reserved_node_pool("res-pool", "dev-res"), reservations=[listed_reservation("dev-res", "us-central1-c")])
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+
+    def test_an_owner_project_that_could_not_be_listed_is_unevaluated_not_outside_the_run(self):
+        pool = reserved_node_pool("shared", "projects/beta/reservations/r1")
+
+        def cluster_list(project):
+            if project == "beta":
+                return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+            return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": [pool]}]))
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet(run=fleet_run({}, cluster_list=cluster_list))
+        cluster = next(e for e in manifest["clusters"] if e["name"] == "acme/us-central1/c1")
+        self.assertIn(self.SLUG, {e["check"] for e in cluster["checks_unevaluated"]})
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+
+    def test_a_failed_reservations_read_reaches_finish_as_a_gap_on_the_cluster(self):
+        manifest, cluster = self.fleet(reserved_node_pool("res-missing", "no-such-reservation"), reservations_rc=1)
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+        self.assertIn(self.SLUG, {e["check"] for e in cluster["checks_unevaluated"]})
+        data = {
+            "audit": "stockout-prevention",
+            "scope": {
+                "clusters": [
+                    {
+                        "name": e["name"],
+                        "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]],
+                        **({"limitations": e["limitations"]} if e.get("limitations") else {}),
+                    }
+                    for e in manifest["clusters"]
+                    if e["outcome"] == "collected"
+                ],
+                "skipped": [{"cluster": fs.UNENUMERATED_PROJECTS_TARGET, "reason": "scope narrowed by --project"}],
+            },
+        }
+        audit_report.cross_check_manifest(data, manifest)  # must not raise
+        claimed = next(c for c in data["scope"]["clusters"] if c["name"] == cluster["name"])
+        claimed["checks_run"].append({"check": self.SLUG, "command": "kubectl get computeclasses -A -o json"})
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(data, manifest)
+
+
 class CrashIsolationTest(unittest.TestCase):
     def test_one_cluster_crashing_costs_that_cluster_and_no_other(self):
         """`future.result()` re-raises, and the SOP redirects this collector's
@@ -4227,6 +4704,300 @@ class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
         text = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}"
         self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
         self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
+
+
+def manual_pool(name, machine_type, compute_class_label=None):
+    labels = {fs.COMPUTE_CLASS_LABEL: compute_class_label} if compute_class_label else {}
+    return {"name": name, "locations": ["us-central1-a", "us-central1-b"], "config": {"machineType": machine_type, "labels": labels}}
+
+
+# The seeded fleet's shape: one `nodepools` rule on the labelled pool, then two
+# machine-family rules no pool backs, node pool auto-creation off.
+FLEET_CLASS_RULES = [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}, {"machineFamily": "c3"}]
+FLEET_POOL = manual_pool("default-pool", "e2-medium", "general-ccc")
+# The finding's detail for that shape, in the words a reader with no knowledge
+# of ComputeClasses gets.
+FLEET_CLASS_DETAIL = (
+    "This class lists 3 machine options in order. Only option 1 (default-pool) has a node pool. "
+    "Options 2 (n4) and 3 (c3) have none, and automatic node pool creation is off, so GKE cannot create them. "
+    "If default-pool cannot grow, pods that use this class wait."
+)
+
+
+class CccUnbackedManualFallbackTest(unittest.TestCase):
+    def check(self, priorities, pools, **spec):
+        cc = compute_class("general-ccc", priorities, node_pool_auto_creation=False)
+        cc["spec"].update(spec)
+        return fs.check_ccc_unbacked_manual_fallback(cc, pools)
+
+    def test_the_fleet_s_class_is_flagged_for_its_two_unbacked_rules(self):
+        hit = self.check(FLEET_CLASS_RULES, [FLEET_POOL])
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertEqual(hit["excerpt"], FLEET_CLASS_DETAIL)
+
+    def test_a_class_with_a_pool_behind_every_rule_passes(self):
+        pools = [FLEET_POOL, manual_pool("n4-pool", "n4-standard-4", "general-ccc"), manual_pool("c3-pool", "c3-standard-8", "general-ccc")]
+        self.assertIsNone(self.check(FLEET_CLASS_RULES, pools))
+
+    def test_a_pool_of_the_family_without_the_class_label_backs_no_rule(self):
+        pools = [FLEET_POOL, manual_pool("n4-pool", "n4-standard-4"), manual_pool("c3-pool", "c3-standard-8", "another-class")]
+        self.assertEqual(self.check(FLEET_CLASS_RULES, pools)["excerpt"], FLEET_CLASS_DETAIL)
+
+    def test_a_machine_type_rule_needs_that_type_not_only_its_family(self):
+        rules = [{"nodepools": ["default-pool"]}, {"machineType": "n4-standard-8"}]
+        self.assertIn(
+            "Option 2 (n4-standard-8) has none, and automatic node pool creation is off, so GKE cannot create it.",
+            self.check(rules, [FLEET_POOL, manual_pool("n4-pool", "n4-standard-4", "general-ccc")])["excerpt"],
+        )
+        self.assertIsNone(self.check(rules, [FLEET_POOL, manual_pool("n4-pool", "n4-standard-8", "general-ccc")]))
+
+    def test_a_nodepools_rule_that_names_no_existing_pool_is_unbacked(self):
+        rules = [{"nodepools": ["gone-pool"]}, {"nodepools": ["default-pool"]}]
+        hit = self.check(rules, [FLEET_POOL])
+        self.assertEqual(
+            hit["excerpt"],
+            "This class lists 2 machine options in order. Only option 2 (default-pool) has a node pool. "
+            "Option 1 (gone-pool) names no node pool that exists. If default-pool cannot grow, pods that use this class wait.",
+        )
+        both_gone = self.check([{"nodepools": ["a"]}, {"nodepools": ["b"]}, {"nodepools": ["default-pool"]}], [FLEET_POOL])
+        self.assertIn("Options 1 (a) and 2 (b) name no node pool that exists.", both_gone["excerpt"])
+
+    def test_a_class_with_no_node_pool_of_its_own_is_filed_for_every_rule(self):
+        """The rule as the issue locks it: any rule with no manual node pool
+        files the class, also when no rule has one."""
+        for pools in ([], [manual_pool("other", "n4-standard-4"), manual_pool("else", "c3-standard-8", "another-class")]):
+            hit = self.check(FLEET_CLASS_RULES, pools)
+            self.assertEqual(
+                hit["excerpt"],
+                "This class lists 3 machine options in order. Options 2 (n4) and 3 (c3) have no node pool, "
+                "and automatic node pool creation is off, so GKE cannot create them. "
+                "Option 1 (default-pool) names no node pool that exists. Pods that use this class wait.",
+            )
+
+    def test_a_labelled_pool_that_backs_no_rule_is_filed(self):
+        """3.12 (c) passes on the label, so nothing else names this class."""
+        hit = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")])
+        self.assertIn("Options 1 (n4) and 2 (c3) have no node pool", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith("Node pool e2-pool (e2-medium) has this class's label and matches no option. GKE adds no node for options 1 (n4) and 2 (c3)."))
+        two = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc"), manual_pool("bare-pool", "", "general-ccc")])
+        self.assertIn("Node pools e2-pool (e2-medium) and bare-pool have this class's label and match no option.", two["excerpt"])
+        self.assertNotIn("wait", hit["excerpt"])
+        workload = deployment("api", node_selector={fs.COMPUTE_CLASS_LABEL: "general-ccc"})
+        cc = compute_class("general-ccc", [{"machineFamily": "n4"}, {"machineFamily": "c3"}], node_pool_auto_creation=False)
+        self.assertIsNone(fs.check_dangling_compute_class(workload, {"general-ccc": cc}, {"general-ccc"}))
+
+    def test_a_labelled_pool_behind_no_option_is_named_beside_a_backed_option(self):
+        """Pods may still run on that pool, so the detail does not say that they wait."""
+        hit = self.check([{"nodepools": ["a"]}, {"machineFamily": "n4"}], [manual_pool("a", "e2-medium"), manual_pool("e2-pool", "e2-standard-4", "general-ccc")])
+        self.assertEqual(
+            hit["excerpt"],
+            "This class lists 2 machine options in order. Only option 1 (a) has a node pool. "
+            "Option 2 (n4) has none, and automatic node pool creation is off, so GKE cannot create it. "
+            "Node pool e2-pool (e2-standard-4) has this class's label and matches no option. GKE adds no node for option 2 (n4).",
+        )
+        # The last sentence names every option with no pool: the machine option and the one that names a missing pool.
+        mixed = self.check([{"nodepools": ["a"]}, {"machineFamily": "n4"}, {"nodepools": ["gone-pool"]}], [manual_pool("a", "e2-medium"), manual_pool("e2-pool", "e2-standard-4", "general-ccc")])
+        self.assertTrue(mixed["excerpt"].endswith("Option 3 (gone-pool) names no node pool that exists. Node pool e2-pool (e2-standard-4) has this class's label and matches no option. GKE adds no node for options 2 (n4) and 3 (gone-pool)."))
+
+    def test_the_detail_speaks_only_for_the_options_that_were_checked(self):
+        accelerator_only = {"gpu": {"type": "nvidia-l4", "count": 1}}
+        gpu_pool = manual_pool("gpu-pool", "g2-standard-4", "general-ccc")
+        beside_backed = self.check([{"nodepools": ["a"]}, {"machineFamily": "n4"}, accelerator_only], [manual_pool("a", "e2-medium"), gpu_pool])
+        self.assertEqual(
+            beside_backed["excerpt"],
+            "This class lists 3 machine options in order. Option 1 (a) has a node pool. "
+            "Option 2 (n4) has none, and automatic node pool creation is off, so GKE cannot create it. "
+            "Option 3 could not be checked: it names no node pool and no machine type. "
+            "Node pool gpu-pool (g2-standard-4) has this class's label and matches no option that was checked. "
+            "GKE adds no node for option 2 (n4).",
+        )
+        none_backed = self.check([{"machineFamily": "n4"}, accelerator_only], [gpu_pool])
+        self.assertTrue(none_backed["excerpt"].endswith("Option 2 could not be checked: it names no node pool and no machine type. Node pool gpu-pool (g2-standard-4) has this class's label and matches no option that was checked. GKE adds no node for option 1 (n4)."))
+        self.assertNotIn("Only", none_backed["excerpt"])
+
+    def test_the_procedure_carries_the_collector_s_headline(self):
+        """The ledger title comes from the procedure and the chat summary from
+        the renderer; one sentence, held in step here."""
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.UNBACKED_MANUAL_FALLBACK}`)")[1]
+        remediation_line = next(line for line in section.splitlines() if line.startswith("- **Remediation:**"))
+        self.assertIn(audit_report.CHECK_PHRASES[fs.UNBACKED_MANUAL_FALLBACK].format(object="<name>"), remediation_line)
+
+    def test_the_procedure_carries_the_collector_s_impact_sentence(self):
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.UNBACKED_MANUAL_FALLBACK}`)")[1]
+        impact_line = next(line for line in section.splitlines() if line.startswith("- **Impact:**"))
+        self.assertIn(fs.IMPACT[fs.UNBACKED_MANUAL_FALLBACK], impact_line)
+
+    def test_the_cluster_default_class_is_not_judged_by_the_check(self):
+        """Node pools serve the default class without the class label where the
+        cluster's setting is on, which the collector does not read; the
+        procedure's by-hand list has the class."""
+        cc = compute_class(fs.CLUSTER_DEFAULT_CLASS, [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}], node_pool_auto_creation=False)
+        for pools in ([manual_pool("default-pool", "e2-medium")], [manual_pool("default-pool", "e2-medium"), manual_pool("n4-pool", "n4-standard-4")]):
+            self.assertIsNone(fs.check_ccc_unbacked_manual_fallback(cc, pools))
+
+    def test_an_n1_custom_pool_backs_an_n1_rule(self):
+        rules = [{"nodepools": ["default-pool"]}, {"machineFamily": "n1"}]
+        self.assertIsNone(self.check(rules, [FLEET_POOL, manual_pool("custom-pool", "custom-4-8192", "general-ccc")]))
+        self.assertIsNotNone(self.check(rules, [FLEET_POOL, manual_pool("custom-pool", "n2-custom-4-8192", "general-ccc")]))
+        self.assertIsNone(self.check(rules, [FLEET_POOL, manual_pool("small-pool", "g1-small", "general-ccc")]))
+
+    def test_a_nodepools_rule_with_several_names_is_backed_by_one_that_exists(self):
+        rules = [{"nodepools": ["gone-pool", "default-pool"]}, {"machineFamily": "n4"}]
+        hit = self.check(rules, [FLEET_POOL])
+        self.assertIn("Only option 1 (default-pool) has a node pool.", hit["excerpt"])
+        self.assertNotIn("gone-pool", hit["excerpt"])
+        self.assertIn("If default-pool cannot grow, pods that use this class wait.", hit["excerpt"])
+
+    def test_the_finding_is_marked_for_triage(self):
+        self.assertEqual(self.check(FLEET_CLASS_RULES, [FLEET_POOL])["needs_triage"], fs.MANUAL_POOL_TRIAGE)
+        self.assertIn(fs.MANUAL_POOL_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_auto_creation_on_is_out_of_scope(self):
+        cc = compute_class("general-ccc", FLEET_CLASS_RULES, node_pool_auto_creation=True)
+        self.assertIsNone(fs.check_ccc_unbacked_manual_fallback(cc, [FLEET_POOL]))
+
+    def test_an_omitted_auto_creation_field_reads_as_off(self):
+        """The CRD defaults the field to off, so leaving it out is the usual
+        way to have it off."""
+        cc = compute_class("general-ccc", FLEET_CLASS_RULES)
+        del cc["spec"]["nodePoolAutoCreation"]
+        self.assertIsNotNone(fs.check_ccc_unbacked_manual_fallback(cc, [FLEET_POOL]))
+
+    def test_a_single_rule_has_no_fallback_to_back(self):
+        self.assertIsNone(self.check([{"machineFamily": "n4"}], []))
+
+    def test_an_autopilot_mode_class_is_out_of_scope(self):
+        self.assertIsNone(self.check(FLEET_CLASS_RULES, [FLEET_POOL], autopilot={"enabled": True}))
+
+    def test_a_rule_that_names_no_pool_and_no_machine_is_not_judged(self):
+        accelerator_only = {"gpu": {"type": "nvidia-l4", "count": 1}}
+        self.assertIsNone(self.check([{"nodepools": ["default-pool"]}, accelerator_only], [FLEET_POOL]))
+        hit = self.check([*FLEET_CLASS_RULES, accelerator_only], [FLEET_POOL])
+        self.assertIn("This class lists 4 machine options in order.", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith("Option 4 could not be checked: it names no node pool and no machine type."))
+        # An option that could not be checked may still place pods, so the detail does not say that they wait.
+        self.assertNotIn("wait", hit["excerpt"])
+        unbacked_and_unchecked = self.check([{"machineFamily": "n4"}, accelerator_only], [])
+        self.assertNotIn("wait", unbacked_and_unchecked["excerpt"])
+
+    def test_the_detail_counts_several_backed_and_several_unchecked_options(self):
+        accelerator_only = {"gpu": {"type": "nvidia-l4", "count": 1}}
+        rules = [{"nodepools": ["a"]}, {"machineFamily": "n4"}, {"nodepools": ["b"]}, accelerator_only, {"podFamily": "general-purpose"}]
+        hit = self.check(rules, [manual_pool("a", "e2-medium"), manual_pool("b", "e2-medium")])
+        self.assertIn("Options 1 (a) and 3 (b) have a node pool. Option 2 (n4) has none", hit["excerpt"])
+        self.assertNotIn("Only", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith("Options 4 and 5 could not be checked: they name no node pool and no machine type."))
+        checked = self.check(rules[:3], [manual_pool("a", "e2-medium"), manual_pool("b", "e2-medium")])
+        self.assertIn("Only options 1 (a) and 3 (b) have a node pool. Option 2 (n4) has none", checked["excerpt"])
+        self.assertTrue(checked["excerpt"].endswith("If a and b cannot grow, pods that use this class wait."))
+
+    def test_the_detail_keeps_the_case_of_a_name(self):
+        rules = [{"nodepools": ["default-pool"]}, {"machineType": "N4-Standard-8"}]
+        self.assertIn("Option 2 (N4-Standard-8) has none", self.check(rules, [FLEET_POOL])["excerpt"])
+
+    def test_no_customer_text_of_the_check_says_priority_rule(self):
+        """The finding is written for a reader who does not know ComputeClasses."""
+        texts = [
+            self.check(FLEET_CLASS_RULES, [FLEET_POOL])["excerpt"],
+            self.check(FLEET_CLASS_RULES, [])["excerpt"],
+            fs.IMPACT[fs.UNBACKED_MANUAL_FALLBACK],
+            audit_report.CHECK_PHRASES[fs.UNBACKED_MANUAL_FALLBACK],
+            audit_report.TRIAGE_REASONS[fs.MANUAL_POOL_TRIAGE],
+        ]
+        for text in texts:
+            self.assertNotIn("priority", text.lower())
+            self.assertNotIn("nodePoolAutoCreation", text)
+        self.assertEqual(audit_report.CHECK_PHRASES[fs.UNBACKED_MANUAL_FALLBACK], "ComputeClass `{object}` lists machine options that it cannot use")
+
+
+class UnbackedManualFallbackCollectTest(unittest.TestCase):
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    run_with = CollectClusterTest.run_with
+    SLUG = fs.UNBACKED_MANUAL_FALLBACK
+
+    def fleet_class(self):
+        return compute_class("general-ccc", FLEET_CLASS_RULES, node_pool_auto_creation=False)
+
+    def test_the_collector_files_the_fleet_s_class_as_major_with_both_reads(self):
+        entry = self.run_with(dump_items=[self.fleet_class()], pools=[FLEET_POOL])
+        [filed] = [c for c in entry["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual((filed["object"], filed["severity"], filed["namespace"]), ("ComputeClass/general-ccc", "major", ""))
+        self.assertEqual(filed["needs_triage"], fs.MANUAL_POOL_TRIAGE)
+        self.assertIn("kubectl get computeclasses -A -o json; gcloud container node-pools list", filed["command"])
+        self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_a_cluster_with_no_class_in_scope_records_the_check_as_run(self):
+        for pools_rc in (0, 1):
+            entry = self.run_with(dump_items=[compute_class("auto", FLEET_CLASS_RULES)], pools=[FLEET_POOL], pools_rc=pools_rc)
+            self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+            self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+            self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+
+    def test_unread_pools_leave_a_class_in_scope_unevaluated_not_flagged(self):
+        entry = self.run_with(dump_items=[self.fleet_class()], pools_rc=1)
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+        [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == self.SLUG]
+        self.assertTrue(reason.startswith("ComputeClass/general-ccc leaves automatic node pool creation off and lists machine options, and the node pools those options need were not read: "))
+        self.assertIn("node-pools list", reason)
+        second = compute_class("batch-ccc", FLEET_CLASS_RULES, node_pool_auto_creation=False)
+        two = self.run_with(dump_items=[self.fleet_class(), second], pools_rc=1)
+        [reason_for_two] = [e["reason"] for e in two["checks_unevaluated"] if e["check"] == self.SLUG]
+        self.assertTrue(reason_for_two.startswith("ComputeClass/general-ccc and ComputeClass/batch-ccc leave automatic node pool creation off and list machine options, "))
+        # The limitation is one line for every check on the cluster, so it lists the classes as the other checks do.
+        self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc, ComputeClass/batch-ccc: the node pools were not read", two["limitations"])
+        self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
+        self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc: the node pools were not read", entry["limitations"])
+        self.assertNotIn("priority", reason.lower())
+        # The failed read is named once, by the sentence before this one.
+        self.assertNotIn("the node pools were not read (", entry["limitations"])
+
+    def test_the_cluster_default_class_files_nothing_and_leaves_the_check_run(self):
+        """A standing unevaluated entry would keep the whole stream partial on
+        every run; the class is the procedure's by-hand sub-condition."""
+        default_class = compute_class(fs.CLUSTER_DEFAULT_CLASS, FLEET_CLASS_RULES, node_pool_auto_creation=False)
+        for pools_rc in (0, 1):
+            entry = self.run_with(dump_items=[default_class], pools=[FLEET_POOL], pools_rc=pools_rc)
+            self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+            self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+            self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+        entry = self.run_with(dump_items=[default_class, self.fleet_class()], pools=[FLEET_POOL])
+        self.assertEqual([c["object"] for c in entry["candidates"] if c["check"] == self.SLUG], ["ComputeClass/general-ccc"])
+
+    def test_the_procedure_lists_the_default_class_as_a_by_hand_sub_condition(self):
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        by_hand = sop.read_text().split("These sub-conditions are not in the collector")[1].split("**A cluster the collector covered")[0]
+        self.assertIn(f"3.13 for the cluster default class (`{fs.CLUSTER_DEFAULT_CLASS}`)", by_hand)
+
+    def test_autopilot_declares_the_check_not_applicable(self):
+        entry = self.run_with(dump_items=[self.fleet_class()], cluster={**self.CLUSTER, "autopilot": True})
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+        [reason] = [e["reason"] for e in entry["checks_not_applicable"] if e["check"] == self.SLUG]
+        self.assertEqual(reason, "GKE Autopilot: GKE creates the nodes for every ComputeClass, so no machine option waits on a node pool.")
+
+    def test_the_finding_s_command_stays_under_the_published_command_cap(self):
+        """The class read and the discovery listing as one line, at the longest
+        kubeconfig path the platform profile makes."""
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        class_read = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}"
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            return run_of(0, "[]")
+
+        fs.enumerate_clusters(LONGEST_PROJECT, run=run)
+        listing = issued[0]
+        self.assertEqual(listing[:4], ["gcloud", "container", "clusters", "list"])
+        for pools_read in (
+            shlex.join(listing),
+            shlex.join(["gcloud", "container", "node-pools", "list", "--cluster", LONGEST_CLUSTER, "--location", LONGEST_LOCATION, "--project", LONGEST_PROJECT, "--format", "json"]),
+        ):
+            text = f"{class_read}; {pools_read}"
+            self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", self.SLUG))
 
 
 if __name__ == "__main__":

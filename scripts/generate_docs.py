@@ -152,12 +152,16 @@ CRD_KINDS: dict[str, Path] = {
     "PlatformAgent": OPERATOR_DOCS_DIR / "platformagent-fields.md",
     "AgentProfile": OPERATOR_DOCS_DIR / "agentprofile-fields.md",
     "AgentPlugin": OPERATOR_DOCS_DIR / "agentplugin-fields.md",
+    "Tier": OPERATOR_DOCS_DIR / "tier-fields.md",
+    "AgentSchedule": OPERATOR_DOCS_DIR / "agentschedule-fields.md",
 }
 # The narrative guide each field page points its reader at, as a site route.
 CRD_GUIDES = {
     "PlatformAgent": "/kube-agents/operator/platformagent-crd/",
     "AgentProfile": "/kube-agents/operator/agentprofile-crd/",
     "AgentPlugin": "/kube-agents/operator/agentplugin-crd/",
+    "Tier": "/kube-agents/operator/tier-crd/",
+    "AgentSchedule": "/kube-agents/operator/agentschedule-crd/",
 }
 CRD_BLOCK_PREFIX = "crd-fields-"
 # Every block read from the operator's Go source, the field pages above and the
@@ -335,6 +339,10 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "submit-suggestion",
     ],
     "Meta": [
+        "alert-history",
+        "chat-delivery",
+        "decision-memory",
+        "first-run-report",
         "fleet-audit",
         "fleet-audit-reports",
         "github-issue-resolver",
@@ -382,6 +390,7 @@ CRON_CADENCE = {
     "0 * * * *": "Hourly",
     "11 * * * *": "Hourly at :11",
     "25 * * * *": "Hourly at :25",
+    "*/5 * * * *": "Every 5 minutes",
     "*/10 * * * *": "Every 10 minutes",
     "7,22,37,52 * * * *": "Four times an hour (:07, :22, :37, :52)",
     "*/30 * * * *": "Every 30 minutes",

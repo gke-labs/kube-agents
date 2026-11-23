@@ -28,8 +28,12 @@
 provider "kubernetes" {
   alias                  = "seeded_d"
   host                   = "https://${google_container_cluster.seeded_d.endpoint}"
-  token                  = data.google_client_config.default.access_token
   cluster_ca_certificate = base64decode(google_container_cluster.seeded_d.master_auth[0].cluster_ca_certificate)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "gke-gcloud-auth-plugin"
+  }
 }
 
 resource "kubernetes_namespace_v1" "seeded_topology" {
@@ -61,7 +65,7 @@ resource "kubernetes_network_policy_v1" "seeded_topology_default_deny" {
 }
 
 # The two small fixtures schedule ahead of the capacity one. Without this the
-# three compete for the same two e2-smalls in whatever order a node rebuild
+# three compete for seeded-d's two nodes in whatever order a node rebuild
 # happens to produce: capacity-starved-worker pods landing first leave too
 # little for zone-pinned-api, whose node affinity gives it nowhere else to
 # go, and the scheduling and volume fixtures then read as drifted for a reason
@@ -266,7 +270,7 @@ resource "kubernetes_pod_disruption_budget_v1" "zone_bound_store" {
 #
 # Two replicas, because one pod has no distribution to skew: the anomaly
 # check that owns this fixture scopes itself to replicas > 1. The class
-# below names only var.zone in allowedTopologies, so both claims bind there
+# above names only var.zone in allowedTopologies, so both claims bind there
 # and both pods sit in one zone for a reason no manifest edit can move.
 # Two 1Gi disks are the price. zone-pinned-api's maxUnavailable 1 budget is
 # carried here too, for the same reliability-SOP background reason.
@@ -309,7 +313,7 @@ resource "kubernetes_stateful_set_v1" "zone_bound_store" {
         }
 
         # Obtainability SOP 3.8: a soft spread on hostname, which the zonal
-        # class below overrides in practice and which keeps the two-replica
+        # class above overrides in practice and which keeps the two-replica
         # set off the no-spread list without touching the zone pin that is
         # the fixture.
         topology_spread_constraint {
@@ -353,8 +357,8 @@ resource "kubernetes_stateful_set_v1" "zone_bound_store" {
 
       spec {
         access_modes = ["ReadWriteOnce"]
-        # standard-rwo is zonal: the disk lands in whichever zone the first
-        # pod scheduled into, and from then on the pod is bound to that zone.
+        # seeded-zonal-pd's allowedTopologies names only var.zone, so every
+        # claim binds a disk there and its pod is bound to that zone.
         storage_class_name = kubernetes_storage_class_v1.seeded_zonal_pd.metadata[0].name
 
         resources {
@@ -371,18 +375,18 @@ resource "kubernetes_stateful_set_v1" "zone_bound_store" {
   depends_on = [google_container_node_pool.seeded_d_default]
 }
 
-# The capacity skew has to be planted, not left to chance. How much CPU each
-# e2-small has left depends on where GKE's own Deployments land, and if the
-# two nodes end up within a replica of each other the soft spread below puts
-# one capacity-starved-worker in each zone, two stay Pending, and the state
-# assertions pass on a cluster with no skew in it. var.zone's node is the
-# crowded one by construction: the other two fixtures and their claims are
-# pinned there. This sponge keeps it that way whatever a node rebuild does
-# to the system set: six 100m replicas pinned to var.zone, scheduled behind
+# The capacity skew has to be planted, not left to chance. How much CPU the
+# first zone's e2-small has left depends on where GKE's own Deployments land,
+# and if a 500m worker fits there the soft spread below puts one
+# capacity-starved-worker in each zone and the state assertions pass on a
+# cluster with no skew in it. var.zone's node is the crowded one by
+# construction: the other two fixtures and their claims are pinned there.
+# This sponge keeps it that way whatever a node rebuild does to the system
+# set: six 100m replicas, scheduled behind
 # the two fixtures and ahead of the capacity worker (priority 90, far below
 # anything GKE runs), pinned to the first zone's pool,
 # absorb whatever CPU that node has free in 100m steps and leave less than a
-# 120m replica behind; the replicas that do not fit stay Pending, which is
+# 500m worker behind; the replicas that do not fit stay Pending, which is
 # their job. Every capacity-starved-worker that runs therefore runs in the
 # second zone, and the surplus is Pending for want of CPU, not for a zone
 # pin an agent could blame. Memory is kept tiny so CPU stays the axis that
@@ -505,7 +509,8 @@ resource "kubernetes_pod_disruption_budget_v1" "first_zone_sponge" {
 
 # Defect (skew cause 3: capacity, not configuration). A Deployment whose
 # replicas cannot all be placed, because together they request more CPU than
-# the two e2-smalls have left. Some pods run, the rest stay Pending with an
+# seeded-d's two nodes (the first zone's e2-small, the second zone's
+# e2-standard-2) have left. Some pods run, the rest stay Pending with an
 # insufficient-cpu event -- the shape a real stockout produces, without
 # needing a real stockout.
 #

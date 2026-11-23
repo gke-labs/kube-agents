@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -44,6 +45,19 @@ class _Session:
 class GkeClusterReadsTest(unittest.TestCase):
     API = "https://container.googleapis.com/v1"
 
+    def setUp(self):
+        # `API` is the default universe's host. The module takes the universe
+        # from these two variables, which another test file in the process or a
+        # developer's shell can have set.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in (
+            reads.credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV,
+            reads.credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV,
+        ):
+            os.environ.pop(name, None)
+
     def _run(self, answers, request):
         session = _Session(answers)
         with mock.patch.object(reads, "_session", return_value=session):
@@ -51,17 +65,18 @@ class GkeClusterReadsTest(unittest.TestCase):
 
     def test_a_list_names_each_cluster_and_keeps_missing_zones(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"
-        out, _ = self._run({url: (200, {"clusters": [{"name": "a", "location": "us-central1"},
+        out, _ = self._run({url: (200, {"clusters": [{"name": "a", "location": "us-central1", "status": "RUNNING"},
                                                        {"name": "b", "location": "us-east1-b"}],
                                           "missingZones": ["europe-west1-b"]})},
                            {"projects": ["p1"]})
+        # The statuses sit beside the rows, in the same order; a row with none reads "".
         self.assertEqual({"status": 200, "clusters": [["a", "us-central1"], ["b", "us-east1-b"]],
-                          "missingZones": ["europe-west1-b"]}, out["lists"]["p1"])
+                          "statuses": ["RUNNING", ""], "missingZones": ["europe-west1-b"]}, out["lists"]["p1"])
 
     def test_an_empty_project_lists_no_clusters(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"
         out, _ = self._run({url: (200, {})}, {"projects": ["p1"]})
-        self.assertEqual({"status": 200, "clusters": []}, out["lists"]["p1"])
+        self.assertEqual({"status": 200, "clusters": [], "statuses": []}, out["lists"]["p1"])
 
     def test_an_error_is_reported_with_its_body_not_decided(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"

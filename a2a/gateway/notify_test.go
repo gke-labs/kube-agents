@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -218,6 +219,7 @@ func TestNotifyReportsAFirstPostFailure(t *testing.T) {
 // is dropped unanswered - the gateway does not reply on a subject the
 // requester chose freely.
 func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -233,7 +235,7 @@ func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
 	}
 	defer sub.Stop()
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +304,7 @@ func TestNotifyRefusesWhenTheQueueIsFull(t *testing.T) {
 	defer sub.Stop()
 	defer close(poster.release)
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,6 +335,7 @@ func TestNotifyRefusesWhenTheQueueIsFull(t *testing.T) {
 // left silent (silence reads as "may have posted" and is not retried). A
 // request arriving after Stop is refused, not sent on the closed queue.
 func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -351,7 +354,7 @@ func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +436,7 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 	done := make(chan struct{})
 	go func() { n.Run(runCtx, client); close(done) }()
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,6 +467,7 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 // A bind that cannot succeed (the client is closed) is retried, not given
 // up on, until the context ends.
 func TestRunRetriesAFailedBind(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -567,6 +571,14 @@ type fakeConversations struct {
 	// posts made by then.
 	marks       []string
 	postsAtMark []int
+	// kept records KeepReport calls as "conversation root text".
+	kept []string
+}
+
+func (f *fakeConversations) KeepReport(conversation, root, text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kept = append(f.kept, conversation+" "+root+" "+text)
 }
 
 func (f *fakeConversations) MarkConversation(conversation, update string, mark MarkState) {
@@ -798,7 +810,7 @@ func TestBlockingConversationLookupDoesNotHoldFollowingHomeRequestAcceptance(t *
 	defer sub.Stop()
 	defer close(release)
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -867,7 +879,7 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -951,6 +963,7 @@ func TestARecordThatDoesntDecodeIsMarkedAsSuch(t *testing.T) {
 // answered with the stopping refusal marked retry, which the CLI turns into
 // "route unavailable" rather than a failure charged to the destination.
 func TestARequestWhileStoppingIsARetry(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -969,7 +982,7 @@ func TestARequestWhileStoppingIsARetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { sub.Stop() }()
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1015,5 +1028,28 @@ func TestARequestWhileStoppingIsARetry(t *testing.T) {
 	}
 	if retries != 2 {
 		t.Fatalf("%d stopping refusals marked retry, want 2 (the new request and the queued one)", retries)
+	}
+}
+
+// A card's report posted into a chat thread is kept under the thread's key
+// with no task named, for the reply under it; a note without the report
+// mark is not kept, and a post into a key every top-level message shares
+// (a thread-less DM) is not a thread, so it is not kept either.
+func TestAChatThreadReportIsKeptUnderItsKeyAlone(t *testing.T) {
+	conv := &fakeConversations{contexts: map[string]string{"slack:C1/1699.1": "ctx-1", "slack:dm/D1": "ctx-2"}}
+	n := newTestSlackNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(conv)
+	for _, req := range []lib.NotifyRequest{
+		{Text: "np-quartz-7 is at 92%", Conversation: "slack:C1/1699.1", ContextID: "ctx-1", Report: true},
+		{Text: "⏳ reading pod state", Conversation: "slack:C1/1699.1", ContextID: "ctx-1"},
+		{Text: "a report in a DM", Conversation: "slack:dm/D1", ContextID: "ctx-2", Report: true},
+	} {
+		if got := serveJSON(t, n, req); got.Error != "" || got.MessageID == "" {
+			t.Fatalf("reply = %+v, want a post for %q", got, req.Text)
+		}
+	}
+	want := []string{"slack:C1/1699.1  np-quartz-7 is at 92%"}
+	if !reflect.DeepEqual(conv.kept, want) {
+		t.Fatalf("kept = %q, want %q", conv.kept, want)
 	}
 }

@@ -1,21 +1,23 @@
 """health.py calls the week of 2026-09-01 the way the eval crew did by hand.
 
 Two layers. The rule tests build small synthetic data.json documents and pin
-each threshold from both sides. The replay tests walk the REAL week --
-testdata_health/data.json.gz is a published data.json trimmed to the runs
+each threshold from both sides. The replay tests walk the week as it
+happened -- testdata_health/data.json.gz is a synthetic data.json in the shape
+of the published one (case ids, PR numbers, build ids and reasons invented;
+timestamps, results and counts kept; SCHEMA.md, Fixtures), trimmed to the runs
 that finished in [2026-09-01, 2026-09-09), the last of them on 09-08, and to
-the fields the adjudicator reads (SCHEMA.md, Fixtures) -- as if the job had
+the fields the adjudicator reads -- as if the job had
 ticked every 30 minutes, and assert the state timeline against the incidents
 filed that week:
 
-    #1171  compliance-rbac-overgrant collapsing on unrelated PRs from 09-02 ~02:00Z
-    #1189  rca-remediation-pr, same shape, 09-02 evening
+    #1171  case-09 collapsing on unrelated PRs from 09-02 ~02:00Z
+    #1189  case-23, same shape, 09-02 evening
     #1214  the 09-03 token-quota storm (five-hour builds, reps lost to infra)
     #1269  seeded-a saturated after the 09-07 auto-upgrade
     #1278  the crashloop trio redding every PR from 09-08
 
 The roster moved four times in that week (testdata_health/roster-history.json,
-from the commits that changed BOOTSTRAP_ADMITTED); the replay judges each
+a synthetic history with invented commit subjects); the replay judges each
 run by the roster at its start, which is what makes the 09-02 outage
 visible at all -- both cases were demoted the same day.
 """
@@ -31,7 +33,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 import pool_pressure  # the holder map's keys, pinned against health's
-from eval_dashboard import health, post_health, vertex_429
+from eval_dashboard import classify, health, post_health, vertex_429
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
@@ -44,16 +46,16 @@ DEADLINE_FIXTURE = TESTDATA / "deadline-kills-2026-09-22.json.gz"
 SLOW_FIXTURE = TESTDATA / "slow-gate-2026-09-14.json.gz"
 NEAR_DEADLINE_FIXTURE = TESTDATA / "near-deadline-2026-09-17.json.gz"
 ROSTER_0911 = [
-    "reliability-pdb-probe",
-    "security-overgrant-probe",
-    "upgrades-lagging-master-probe",
-    "consistency-authorized-networks-probe",
-    "cost-idle-pool-probe",
-    "obtainability-remediation-proposal",
-    "cluster-agent-crashloop-debug",
-    "cluster-agent-crashloop-misleading-symptom",
-    "cluster-agent-crashloop-evidence-chain",
-    "agent-kanban-smoke",
+    "case-02",
+    "case-29",
+    "case-27",
+    "case-13",
+    "case-01",
+    "case-35",
+    "case-19",
+    "case-14",
+    "case-18",
+    "case-24",
 ]
 CASE_NOTES = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "case-notes.yaml"
 
@@ -68,12 +70,12 @@ OVERFLOWS = 1e308
 HUGE_INT = 10**400
 
 CRASHLOOP_TRIO = [
-    "cluster-agent-crashloop-debug",
-    "cluster-agent-crashloop-evidence-chain",
-    "cluster-agent-crashloop-misleading-symptom",
+    "case-14",
+    "case-18",
+    "case-19",
 ]
-ADMITTED = frozenset(CRASHLOOP_TRIO + ["reliability-pdb-probe", "agent-kanban-smoke"])
-HOLD_OUT = "autoops-warning-event-triage"
+ADMITTED = frozenset(CRASHLOOP_TRIO + ["case-02", "case-24"])
+HOLD_OUT = "case-25"
 
 EMPTY_RECORD = "the record is not evidence of a real agent run: the trajectory is empty: the agent made no tool calls"
 NEVER_RAN = "the record shows no agent ever ran: the trajectory is empty and tokens.total is 0"
@@ -94,6 +96,26 @@ def _scorer_ceiling_marker() -> str:
 SCORER_CEILING_MARKER = _scorer_ceiling_marker()
 CEILING = f"{SCORER_CEILING_MARKER}: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
 
+# The 2026-11-16/17 shape (#6105): the GitHub-write safeguard, catastrophic,
+# errored on the grading App's spent budget and stayed on rung 2.
+FORGE_CHECK = "no-github-writes-the-case-did-not-request"
+FORGE_LEAF = "KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied the pull-request list on o/r"
+SAFEGUARD_MARKER = next(
+    line.split("=", 1)[1].strip().strip('"')
+    for line in (SCORER.parent / "forges.py").read_text(encoding="utf-8").splitlines()
+    if line.startswith("FORGE_SAFEGUARD_MARKER = ")
+)
+BARE_RUNG_2 = f"checks errored rather than ran: ['{FORGE_CHECK}'] -- {FORGE_CHECK}: {FORGE_LEAF}"
+FORGE_RUNG_2 = f"{SAFEGUARD_MARKER}: {BARE_RUNG_2}"
+# Rung-2 reasons and whether each is a forge rep: classify.py must agree. The
+# scorer marks only a block the forge alone explains; an unmarked one may hide
+# a failed check beside the errored safeguard.
+RUNG_2_CASES = (
+    (FORGE_RUNG_2, True),
+    (BARE_RUNG_2, False),
+    (f"{BARE_RUNG_2} ({SAFEGUARD_MARKER} quoted)", False),
+)
+
 
 # --------------------------------------------------------------------------- #
 # Synthetic data.json builders
@@ -105,6 +127,7 @@ REP_LETTER = {
     "i": {"result": "infra", "reason": RETRIES},
     "e": {"result": "fail", "reason": EMPTY_RECORD},
     "c": {"result": "infra", "reason": CEILING},
+    "g": {"result": "fail", "reason": FORGE_RUNG_2},
 }
 
 
@@ -172,6 +195,15 @@ def adjudicate(doc, now, prev=None, roster=None):
 # --------------------------------------------------------------------------- #
 
 
+# The top-level keys health.json carried before the issues repository setting
+# (`issues_repo`), frozen: the unset path writes the same document plus that
+# one key. A new key is added here on purpose, with its reader.
+GOLDEN_HEALTH_KEYS = sorted([
+    "advice", "cause", "condition", "dashboard_url", "evidence", "failing_cases", "fixture_holds", "fixture_state", "generated_at", "incident", "issue",
+    "metrics", "near_deadline", "open_conditions", "periodics", "periodics_read", "periodics_runs", "periodics_since", "periodics_streaks",
+    "periodics_superseded", "pool", "pool_state", "recovering", "schema_version", "since", "slow", "stale", "state", "tracking_issues", "vertex_429",
+])
+
 class RepKinds(unittest.TestCase):
     def test_the_harness_phrasings_are_storm_whatever_the_verdict_token(self):
         for reason in (EMPTY_RECORD, NEVER_RAN, RETRIES, "HTTP 429 from the endpoint", "RESOURCE_EXHAUSTED"):
@@ -182,6 +214,22 @@ class RepKinds(unittest.TestCase):
         self.assertEqual(health.rep_kind({"result": "fail", "reason": GRADED_FAIL}), "fail")
         self.assertEqual(health.rep_kind({"result": "fail", "reason": None}), "fail")
         self.assertEqual(health.rep_kind({"result": "pass", "reason": None}), "pass")
+
+    def test_a_rung_2_block_quoting_a_rate_limit_is_a_graded_fail(self):
+        # The scorer gives each errored check's reason, which can quote a 429.
+        reason = "blocked -- checks errored rather than ran: ['either-read'] -- either-read: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub said API rate limit exceeded / GitHub denied ..."
+        self.assertEqual(health.rep_kind({"result": "fail", "reason": reason}), "fail")
+
+    def test_the_safeguard_marker_is_the_bench_modules(self):
+        self.assertEqual((health.FORGE_SAFEGUARD_MARKER, classify.FORGE_SAFEGUARD_MARKER), (SAFEGUARD_MARKER, SAFEGUARD_MARKER))
+
+    def test_a_rung_2_block_the_scorer_marked_as_the_forges_is_a_forge_rep(self):
+        for reason, forge in RUNG_2_CASES:
+            with self.subTest(reason=reason):
+                self.assertEqual(health.rep_kind({"result": "fail", "reason": reason}), "forge" if forge else "fail")
+                self.assertEqual(classify.rep_kind({"result": "fail", "reason": reason}), "forge" if forge else "fail")
+        t = health.Task(task("x", "ggg"))
+        self.assertEqual((t.forges, t.fails, t.graded, t.collapsed), (3, 0, 0, False))
 
     def test_a_broken_replay_is_a_graded_fail_not_a_storm(self):
         broken_reasons = (
@@ -288,13 +336,34 @@ class RepKinds(unittest.TestCase):
         self.assertEqual((r.storm_reps, r.total_reps), (0, 3))
 
 
+    def test_the_forge_marker_is_the_bench_modules(self):
+        module = SCORER.parent / "forges.py"
+        marker = next(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in module.read_text(encoding="utf-8").splitlines()
+            if line.startswith("FORGE_UNAVAILABLE_MARKER = ")
+        )
+        self.assertEqual(health.FORGE_UNAVAILABLE_MARKER, marker)
+
+    def test_forge_reps_are_neither_graded_nor_storms(self):
+        forge = {"result": "infra", "reason": f"{health.FORGE_UNAVAILABLE_MARKER}: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"}
+        self.assertEqual(health.rep_kind(forge), "forge")
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": f"{RETRIES} {health.FORGE_UNAVAILABLE_MARKER}"}), "storm", "the marker must lead")
+        reps = [dict(forge, n=i + 1) for i in range(3)]
+        t = health.Task({"name": "x", "result": "infra", "reps": reps})
+        self.assertEqual((t.passes, t.fails, t.storms, t.forges, t.graded), (0, 0, 0, 3, 0))
+        self.assertFalse(t.collapsed)
+        r = health.Run({"build_id": "1", "pr": 1, "result": "SUCCESS", "tasks": [{"name": "x", "result": "infra", "reps": reps}]})
+        self.assertEqual((r.storm_reps, r.total_reps), (0, 3), "out of the storm signature, in the run's total")
+
+
 # --------------------------------------------------------------------------- #
 # Rule 1: shared break
 # --------------------------------------------------------------------------- #
 
 
 class SharedBreak(unittest.TestCase):
-    def broken_week(self, prs, cases=("cluster-agent-crashloop-debug",), spread_minutes=60):
+    def broken_week(self, prs, cases=("case-19",), spread_minutes=60):
         runs = []
         for i, pr in enumerate(prs):
             runs.append(run(100 + i, pr, T0 - timedelta(minutes=spread_minutes * (len(prs) - i)), tasks=broken_tasks(set(cases))))
@@ -303,8 +372,8 @@ class SharedBreak(unittest.TestCase):
     def test_three_runs_on_three_prs_is_an_outage_naming_the_case(self):
         result = assess(self.broken_week([1, 2, 3]), T0)
         self.assertEqual(result["state"], "OUTAGE")
-        self.assertEqual(result["failing_cases"], ["cluster-agent-crashloop-debug"])
-        self.assertIn("cluster-agent-crashloop-debug failed all graded reps on 3 runs from 3 PRs (#1, #2, #3)", result["evidence"][0])
+        self.assertEqual(result["failing_cases"], ["case-19"])
+        self.assertIn("case-19 failed all graded reps on 3 runs from 3 PRs (#1, #2, #3)", result["evidence"][0])
 
     def test_three_runs_on_two_prs_is_not(self):
         self.assertEqual(assess(self.broken_week([1, 2, 2]), T0)["state"], "GREEN")
@@ -316,34 +385,34 @@ class SharedBreak(unittest.TestCase):
     def test_one_pr_failing_twice_while_others_pass_is_pr_caused(self):
         # Two red runs of #11 (a retest), passes on two other PRs, bases unknown.
         doc = data(
-            run(1, 11, T0 - timedelta(hours=3), tasks=broken_tasks({"agent-kanban-smoke"})),
-            run(2, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"})),
+            run(1, 11, T0 - timedelta(hours=3), tasks=broken_tasks({"case-24"})),
+            run(2, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"case-24"})),
             run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set())),
             run(4, 13, T0 - timedelta(minutes=30), tasks=broken_tasks(set())),
         )
         result = assess(doc, T0)
         self.assertEqual(result["state"], "GREEN")
-        self.assertIn("PR-caused: agent-kanban-smoke failing on 2 runs of #11 (passing on 2 other PRs)", result["evidence"])
+        self.assertIn("PR-caused: case-24 failing on 2 runs of #11 (passing on 2 other PRs)", result["evidence"])
 
     def test_a_thin_record_is_not_pr_caused(self):
         # One graded fail beside two infra reps (a throttled run) is not a
         # collapse the PR owns, same base or not; two graded fails are.
-        passing = [task(name, "ppp") for name in sorted(ADMITTED - {"agent-kanban-smoke"})]
-        thin = run(1, 11, T0 - timedelta(hours=2), tasks=[task("agent-kanban-smoke", "ifi")] + passing, result="FAILURE", base_sha="aaaaaaa")
+        passing = [task(name, "ppp") for name in sorted(ADMITTED - {"case-24"})]
+        thin = run(1, 11, T0 - timedelta(hours=2), tasks=[task("case-24", "ifi")] + passing, result="FAILURE", base_sha="aaaaaaa")
         other = run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()), base_sha="aaaaaaa")
         self.assertFalse([line for line in assess(data(thin, other), T0)["evidence"] if line.startswith("PR-caused")])
         self.assertEqual(adjudicate(data(thin, other), T0)["metrics"]["pr_caused_reds"], 0)
-        solid = run(1, 11, T0 - timedelta(hours=2), tasks=[task("agent-kanban-smoke", "iff")] + passing, result="FAILURE", base_sha="aaaaaaa")
-        self.assertIn("PR-caused: agent-kanban-smoke failing only on #11 (passing on 1 other PRs built on the same main commit)", assess(data(solid, other), T0)["evidence"])
+        solid = run(1, 11, T0 - timedelta(hours=2), tasks=[task("case-24", "iff")] + passing, result="FAILURE", base_sha="aaaaaaa")
+        self.assertIn("PR-caused: case-24 failing only on #11 (passing on 1 other PRs built on the same main commit)", assess(data(solid, other), T0)["evidence"])
         # A retest pair where one run is thin is one solid run, not two.
-        thin_retest = run(2, 11, T0 - timedelta(hours=3), tasks=[task("agent-kanban-smoke", "ifi")] + passing, result="FAILURE")
-        solid_alone = run(1, 11, T0 - timedelta(hours=2), tasks=[task("agent-kanban-smoke", "iff")] + passing, result="FAILURE")
+        thin_retest = run(2, 11, T0 - timedelta(hours=3), tasks=[task("case-24", "ifi")] + passing, result="FAILURE")
+        solid_alone = run(1, 11, T0 - timedelta(hours=2), tasks=[task("case-24", "iff")] + passing, result="FAILURE")
         self.assertFalse([line for line in assess(data(thin_retest, solid_alone, run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()))), T0)["evidence"] if line.startswith("PR-caused")])
         # Two solid runs beside a thin one: the line counts the solid two, and
         # the digest counts the solid runs only, the thin one on the gate's side.
-        second = run(4, 11, T0 - timedelta(hours=4), tasks=[task("agent-kanban-smoke", "fff")] + passing, result="FAILURE")
+        second = run(4, 11, T0 - timedelta(hours=4), tasks=[task("case-24", "fff")] + passing, result="FAILURE")
         passer = run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()))
-        self.assertIn("PR-caused: agent-kanban-smoke failing on 2 runs of #11 (passing on 1 other PRs)", assess(data(thin_retest, solid_alone, second, passer), T0)["evidence"])
+        self.assertIn("PR-caused: case-24 failing on 2 runs of #11 (passing on 1 other PRs)", assess(data(thin_retest, solid_alone, second, passer), T0)["evidence"])
         metrics = adjudicate(data(thin_retest, solid_alone, second, passer), T0)["metrics"]
         self.assertEqual((metrics["pr_caused_reds"], metrics["infra_reds"]), (2, 1))
         self.assertEqual(adjudicate(data(thin, solid, other), T0)["metrics"]["pr_caused_reds"], 1, "a thin run beside a same-base solid one is the gate's")
@@ -352,9 +421,9 @@ class SharedBreak(unittest.TestCase):
         # A solid same-base collapse on #11 beside a storm's reps: the storm
         # owns the window, confirmed by a reading or not.
         stormy = [run(100 + i, pr, T0 - timedelta(minutes=20 * i), result="SUCCESS", tasks=[task(f"case-{k}", "eee") for k in range(2)] + [task(name, "ppp") for name in sorted(ADMITTED)]) for i, pr in enumerate((1, 2, 3))]
-        collapse = run(1, 11, T0 - timedelta(hours=1), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa")
+        collapse = run(1, 11, T0 - timedelta(hours=1), tasks=broken_tasks({"case-24"}), base_sha="aaaaaaa")
         other = run(3, 12, T0 - timedelta(minutes=50), tasks=broken_tasks(set()), base_sha="aaaaaaa")
-        line = "PR-caused: agent-kanban-smoke failing only on #11 (passing on 1 other PRs built on the same main commit)"
+        line = "PR-caused: case-24 failing only on #11 (passing on 1 other PRs built on the same main commit)"
         self.assertIn(line, assess(data(collapse, other), T0)["evidence"])
         with_storm = assess(data(*stormy, collapse, other), T0)
         self.assertEqual(with_storm["condition"], "storm")
@@ -366,7 +435,7 @@ class SharedBreak(unittest.TestCase):
         self.assertFalse([l for l in denied["evidence"] if l.startswith("PR-caused")])
         # A collapse that finished before the storm's reach (its first hit run
         # finished 40 minutes ago, calls up to three hours before) is named.
-        early = run(1, 11, T0 - timedelta(hours=5), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa")
+        early = run(1, 11, T0 - timedelta(hours=5), tasks=broken_tasks({"case-24"}), base_sha="aaaaaaa")
         early_other = run(3, 12, T0 - timedelta(hours=4, minutes=50), tasks=broken_tasks(set()), base_sha="aaaaaaa")
         self.assertIn(line, assess(data(*stormy, early, early_other), T0)["evidence"])
         # The digest's count keeps the floor only: a storm does not blank a day.
@@ -376,22 +445,22 @@ class SharedBreak(unittest.TestCase):
         # One red run of #11 and passes elsewhere on other main commits: a
         # flake or a moving main, so nothing is said.
         silent = data(
-            run(1, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa"),
+            run(1, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"case-24"}), base_sha="aaaaaaa"),
             run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()), base_sha="bbbbbbb"),
             run(4, 13, T0 - timedelta(minutes=30), tasks=broken_tasks(set())),
         )
         self.assertFalse([line for line in assess(silent, T0)["evidence"] if line.startswith("PR-caused")])
         # The same red beside a pass built on the same main commit: the PR's.
         same = data(
-            run(1, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa"),
+            run(1, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"case-24"}), base_sha="aaaaaaa"),
             run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()), base_sha="aaaaaaa"),
             run(4, 13, T0 - timedelta(minutes=30), tasks=broken_tasks(set()), base_sha="bbbbbbb"),
         )
-        self.assertIn("PR-caused: agent-kanban-smoke failing only on #11 (passing on 1 other PRs built on the same main commit)", assess(same, T0)["evidence"])
+        self.assertIn("PR-caused: case-24 failing only on #11 (passing on 1 other PRs built on the same main commit)", assess(same, T0)["evidence"])
         # Two red runs of #11 with no pass anywhere else: not the PR's either.
         alone = data(
-            run(1, 11, T0 - timedelta(hours=3), tasks=broken_tasks({"agent-kanban-smoke"})),
-            run(2, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"})),
+            run(1, 11, T0 - timedelta(hours=3), tasks=broken_tasks({"case-24"})),
+            run(2, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"case-24"})),
         )
         self.assertFalse([line for line in assess(alone, T0)["evidence"] if line.startswith("PR-caused")])
 
@@ -405,7 +474,7 @@ class SharedBreak(unittest.TestCase):
         # Three PRs share the collapse and four other reds are unrelated
         # single-PR failures, a different case each: the shared set explains
         # 3 of 7 reds, so not a shared break either.
-        singles = ["reliability-pdb-probe", "agent-kanban-smoke", "cluster-agent-crashloop-evidence-chain", "cluster-agent-crashloop-misleading-symptom"]
+        singles = ["case-02", "case-24", "case-18", "case-14"]
         others = [run(300 + i, 70 + i, T0 - timedelta(minutes=25 * i), tasks=broken_tasks({case})) for i, case in enumerate(singles)]
         doc = self.broken_week([1, 2, 3])
         doc["runs"] += others
@@ -420,7 +489,7 @@ class SharedBreak(unittest.TestCase):
     def test_roster_eras_apply_per_run(self):
         roster = health.Roster.from_history(
             [
-                {"since": (T0 - timedelta(days=2)).isoformat(), "admitted": ["cluster-agent-crashloop-debug"]},
+                {"since": (T0 - timedelta(days=2)).isoformat(), "admitted": ["case-19"]},
                 {"since": (T0 - timedelta(hours=4, minutes=30)).isoformat(), "admitted": []},
             ]
         )
@@ -773,6 +842,41 @@ class DelegationCeiling(unittest.TestCase):
         self.assertEqual((adjudicate(doc, later, held)["state"], adjudicate(doc, later, held)["recovering"]), ("DEGRADED", True))
 
 
+class ForgeOutage(unittest.TestCase):
+    """Rule 2c (#6105): a spent GitHub App budget is named, not read as reds."""
+
+    def wave(self, prs, letters):
+        tasks = [task("case-a", letters), task("case-b", letters)] + [task(name, "ppp") for name in sorted(ADMITTED)]
+        return data(*(run(100 + i, pr, T0 - timedelta(minutes=20 * i), result="FAILURE", tasks=tasks) for i, pr in enumerate(prs)))
+
+    def test_six_forge_reps_across_two_prs_degrade_under_their_own_name(self):
+        result = adjudicate(self.wave([1, 2], "ggp"), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "forge_outage"))
+        self.assertRegex(result["cause"], r"^forge outage: grading's GitHub reads failed on 2 PRs \d\d:\d\d–\d\d:\d\d UTC$")
+        self.assertIn("forge outage: 8 reps across 2 PRs", result["evidence"][0])
+        self.assertEqual(result["failing_cases"], [])
+        self.assertEqual(result["advice"], health.ADVICE_FORGE)
+        self.assertIn("rate limit", result["advice"])
+        self.assertIn("#6105", result["advice"])
+        message = post_health.render_change(result, None)
+        self.assertIn("#6105", message)
+        self.assertIn("grading could not read GitHub on 2 PRs", message)
+        self.assertNotIn("rep", post_health.cause_sentence(result), "no repetition count on a public sentence")
+
+    def test_it_does_not_fire_on_one_pr_or_too_few_reps(self):
+        self.assertEqual(assess(self.wave([1, 1, 1], "ggg"), T0)["state"], "GREEN", "one PR")
+        self.assertEqual(assess(self.wave([1, 2], "gpp"), T0)["state"], "GREEN", "4 reps")
+        self.assertEqual(assess(self.wave([1, 2], "ffp"), T0)["state"], "GREEN", "graded fails are not forge reps")
+
+    def test_the_ceiling_outranks_it_and_keeps_it_as_evidence(self):
+        doc = self.wave([1, 2], "ggg")
+        doc["runs"] += DelegationCeiling().wave([3, 4, 5], 6)["runs"]
+        result = assess(doc, T0)
+        self.assertEqual(result["condition"], "delegation_ceiling")
+        self.assertTrue(any(line.startswith("forge outage: 12 reps") for line in result["evidence"]), result["evidence"])
+        self.assertIn("forge_outage", result["open_conditions"])
+
+
 # --------------------------------------------------------------------------- #
 # Rule 3: setup deaths
 # --------------------------------------------------------------------------- #
@@ -857,7 +961,7 @@ def kill(build_id, pr, finished, minutes=363, **fields):
 
 def graded(build_id, pr, finished, verdict="GREEN", minutes=120):
     """A run that reached a verdict, green or red."""
-    tasks = broken_tasks(set()) if verdict == "GREEN" else broken_tasks({"agent-kanban-smoke"})
+    tasks = broken_tasks(set()) if verdict == "GREEN" else broken_tasks({"case-24"})
     return dict(run(build_id, pr, finished, minutes=minutes, tasks=tasks), eval_verdict=verdict)
 
 
@@ -876,7 +980,7 @@ class DeadlineKills(unittest.TestCase):
         self.assertFalse(health.Run(kill(8, 8, T0, merge_conflict=True)).deadline_kill)
         # #1875: the harness records cases as they finish, so a killed run may
         # carry graded tasks and still no verdict. Still a kill.
-        partial = kill(9, 9, T0, tasks=[task("agent-kanban-smoke", "ppp")])
+        partial = kill(9, 9, T0, tasks=[task("case-24", "ppp")])
         self.assertTrue(health.Run(partial).deadline_kill)
         self.assertFalse(health.Run(partial).setup_death)
 
@@ -901,7 +1005,7 @@ class DeadlineKills(unittest.TestCase):
         doc = self.kills([1, 1, 2])
         doc["runs"] += [lost(200 + i, 20 + i, T0 - timedelta(minutes=5 * i)) for i in range(3)]
         self.assertEqual(assess(doc, T0)["condition"], "deadline_kill")
-        doc["runs"] += [run(300 + i, 30 + i, T0 - timedelta(minutes=3 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(3)]
+        doc["runs"] += [run(300 + i, 30 + i, T0 - timedelta(minutes=3 * i), tasks=broken_tasks({"case-24"})) for i in range(3)]
         self.assertEqual(assess(doc, T0)["condition"], "shared_break")
 
     def test_recovery_needs_three_verdicts_on_distinct_prs_after_the_last_kill(self):
@@ -954,13 +1058,13 @@ class DeadlineKills(unittest.TestCase):
         # NOT EVALUATED records eval_verdict RED with no graded repetition
         # (SCHEMA.md): the delegation-ceiling shape when the suite finishes
         # under the margin. Three of those must not end the outage as GREEN.
-        not_evaluated = dict(run(500, 50, T0, tasks=[task("agent-kanban-smoke", "ccc")], result="FAILURE"), eval_verdict="RED")
+        not_evaluated = dict(run(500, 50, T0, tasks=[task("case-24", "ccc")], result="FAILURE"), eval_verdict="RED")
         self.assertFalse(health.Run(not_evaluated).has_verdict)
         self.assertTrue(health.Run(graded(501, 51, T0, "RED")).has_verdict, "a red that graded is a verdict")
         doc = self.kills([1, 1, 2])
         prev = adjudicate(doc, T0)
         later = T0 + timedelta(hours=3)
-        doc["runs"] += [dict(run(500 + i, 50 + i, later - timedelta(minutes=2 + i), tasks=[task("agent-kanban-smoke", "ccc")], result="FAILURE"), eval_verdict="RED") for i in range(3)]
+        doc["runs"] += [dict(run(500 + i, 50 + i, later - timedelta(minutes=2 + i), tasks=[task("case-24", "ccc")], result="FAILURE"), eval_verdict="RED") for i in range(3)]
         result = adjudicate(doc, later, prev)
         self.assertNotEqual(result["state"], "GREEN", result)
 
@@ -977,24 +1081,24 @@ class DeadlineKills(unittest.TestCase):
         raw = kill(1, 1, T0)
         del raw["eval_verdict"]
         self.assertFalse(health.Run(raw).deadline_kill)
-        self.assertTrue(health.Run(dict(raw, tasks=[task("agent-kanban-smoke", "ppp")])).has_verdict)
+        self.assertTrue(health.Run(dict(raw, tasks=[task("case-24", "ppp")])).has_verdict)
 
     def test_a_recorded_null_is_no_verdict_even_with_cases(self):
         # The harness died after some cases and before its verdict line: the
         # collector wrote null. Three of these must not end a deadline outage.
-        short = kill(1, 1, T0, minutes=120, tasks=[task("agent-kanban-smoke", "ppp")])
+        short = kill(1, 1, T0, minutes=120, tasks=[task("case-24", "ppp")])
         self.assertFalse(health.Run(short).deadline_kill)
         self.assertFalse(health.Run(short).has_verdict)
 
     def test_a_killed_run_with_cases_is_never_the_pull_requests_own_red(self):
         # #1875: its collapsed case may be unique to the PR, but the kill is
         # the gate's; the digest's split says infra, as the run page does.
-        partial = kill(1, 1, T0, tasks=[task("agent-kanban-smoke", "fff")])
+        partial = kill(1, 1, T0, tasks=[task("case-24", "fff")])
         out = adjudicate(data(partial, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"], out["deadline_kills"]), (0, 1, 1))
         # And it stays in the population: another PR's red collapsing the
         # same case is shared, not that PR's own, as the run page says.
-        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
+        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("case-24", "fff")], result="FAILURE")
         out = adjudicate(data(partial, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
 
@@ -1005,12 +1109,12 @@ class DeadlineKills(unittest.TestCase):
         # the PR's own -- the run page says nothing about the change is
         # implied, and the Reds tile counts the run among the gate's, so the
         # digest's split must too.
-        lost = dict(run(1, 1, T0, tasks=[task("agent-kanban-smoke", "fff"), task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        lost = dict(run(1, 1, T0, tasks=[task("case-24", "fff"), task("case-29", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["case-29"])
         out = adjudicate(data(lost, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 1))
         # And it stays in the population: another PR's red collapsing the
         # same case is shared, not that PR's own.
-        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
+        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("case-24", "fff")], result="FAILURE")
         out = adjudicate(data(lost, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
         # The same record without the suite's word is the PR's own red when
@@ -1026,18 +1130,18 @@ class DeadlineKills(unittest.TestCase):
         out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 1))
         # A second red run of the same PR, with another PR passing, makes both the PR's own.
-        again = dict(run(9, 1, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff"), task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED")
+        again = dict(run(9, 1, T0 - timedelta(minutes=10), tasks=[task("case-24", "fff"), task("case-29", "iii")], result="FAILURE"), eval_verdict="RED")
         out = adjudicate(data(graded_red, again, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (2, 0))
 
     def test_the_suites_word_on_an_aborted_build_is_not_the_not_evaluated_shape(self):
         # The field keys on Prow's FAILURE like lost_pod and deadline_kill:
         # a build aborted after the suite printed its line is an abort.
-        lost = dict(run(1, 1, T0, tasks=[task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        lost = dict(run(1, 1, T0, tasks=[task("case-29", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["case-29"])
         self.assertTrue(health.Run(lost).not_evaluated)
         aborted = dict(lost, result="ABORTED")
         self.assertFalse(health.Run(aborted).not_evaluated)
-        self.assertEqual(health.Run(aborted).not_evaluated_cases, ["security-overgrant-probe"], "the list is still read; the shape is not")
+        self.assertEqual(health.Run(aborted).not_evaluated_cases, ["case-29"], "the list is still read; the shape is not")
         out = adjudicate(data(aborted, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["red_runs"], out["pr_caused_reds"], out["infra_reds"], out["aborted_runs"]), (0, 0, 0, 1))
 
@@ -1158,14 +1262,14 @@ class LostPods(unittest.TestCase):
         doc = self.lost_doc(3)
         outage_issue = {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "shared_break"}
         self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": outage_issue})["issue"])
-        owner_issue = dict(outage_issue, number=1301, condition="lost_pods")
+        owner_issue = dict(outage_issue, number=1301, url="https://github.com/gke-labs/kube-agents/issues/1301", condition="lost_pods")
         cited = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": owner_issue})
         self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner_issue, ["#1301"]))
         # An issue from before the key was only ever an outage's: cited for
         # a shared break, never for lost pods.
         untagged = {"number": 1302, "url": "x"}
         self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": untagged})["issue"])
-        outage_doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))
+        outage_doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"case-24"})) for i in range(4)))
         self.assertEqual(health.adjudicate(outage_doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": untagged})["issue"], untagged)
 
     def test_trim_carries_how_the_build_ended(self):
@@ -1198,7 +1302,7 @@ class LostPods(unittest.TestCase):
 
 class Hysteresis(unittest.TestCase):
     def outage_doc(self):
-        return data(*(run(100 + i, i, T0 - timedelta(hours=5) + timedelta(minutes=30 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))
+        return data(*(run(100 + i, i, T0 - timedelta(hours=5) + timedelta(minutes=30 * i), tasks=broken_tasks({"case-24"})) for i in range(4)))
 
     def test_a_break_whose_last_three_runs_are_clean_does_not_enter_outage(self):
         doc = self.outage_doc()
@@ -1238,7 +1342,7 @@ class Hysteresis(unittest.TestCase):
         doc = self.outage_doc()
         prev = adjudicate(doc, T0 - timedelta(hours=2))
         later = T0 + timedelta(hours=7)
-        tasks = broken_tasks({"agent-kanban-smoke"})
+        tasks = broken_tasks({"case-24"})
         doc["runs"] += [run(300 + i, 30 + i, later - timedelta(minutes=10 * i), result="SUCCESS", tasks=tasks) for i in range(3)]
         self.assertEqual(adjudicate(doc, later, prev)["state"], "OUTAGE")
 
@@ -1248,16 +1352,16 @@ class Hysteresis(unittest.TestCase):
         # nobody, so three greens that still carry it are a recovery.
         doc = self.outage_doc()
         prev = adjudicate(doc, T0)
-        self.assertEqual(prev["failing_cases"], ["agent-kanban-smoke"])
+        self.assertEqual(prev["failing_cases"], ["case-24"])
         later = T0 + timedelta(hours=7)
         demoted = later - timedelta(hours=1)
         roster = health.Roster.from_history(
             [
                 {"since": (T0 - timedelta(days=1)).isoformat(), "admitted": sorted(ADMITTED)},
-                {"since": demoted.isoformat(), "admitted": sorted(ADMITTED - {"agent-kanban-smoke"})},
+                {"since": demoted.isoformat(), "admitted": sorted(ADMITTED - {"case-24"})},
             ]
         )
-        still_failing = broken_tasks({"agent-kanban-smoke"})
+        still_failing = broken_tasks({"case-24"})
         doc["runs"] += [run(300 + i, 30 + i, later - timedelta(minutes=10 * i), minutes=30, result="SUCCESS", tasks=still_failing) for i in range(3)]
         self.assertEqual(adjudicate(doc, later, prev)["state"], "OUTAGE", "with the case still admitted the greens carry the break")
         result = adjudicate(doc, later, prev, roster)
@@ -1315,7 +1419,7 @@ class NightlyTier(unittest.TestCase):
         return dict(run_doc, tier="nightly", pr=None)
 
     def test_a_shared_break_made_of_nightly_runs_is_not_an_outage(self):
-        broken = broken_tasks({"cluster-agent-crashloop-debug"})
+        broken = broken_tasks({"case-19"})
         runs = [run(100 + i, i, T0 - timedelta(minutes=60 * (3 - i)), tasks=broken) for i in range(3)]
         self.assertEqual(assess(data(*runs), T0)["state"], "OUTAGE", "as presubmit runs, the same three fire")
         doc = data(*(self.nightly(r) for r in runs))
@@ -1331,18 +1435,18 @@ class NightlyTier(unittest.TestCase):
         self.assertEqual(assess(data(*deaths), T0)["state"], "GREEN")
 
     def test_nightly_runs_change_nothing_about_a_presubmit_verdict(self):
-        presubmit = [run(100 + i, i, T0 - timedelta(hours=i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(1, 5)]
+        presubmit = [run(100 + i, i, T0 - timedelta(hours=i), tasks=broken_tasks({"case-24"})) for i in range(1, 5)]
         baseline = adjudicate(data(*presubmit), T0)
         self.assertEqual(baseline["state"], "OUTAGE")
         nightly_green = self.nightly(run(900, None, T0 - timedelta(minutes=5), tasks=broken_tasks(set())))
-        nightly_red = self.nightly(run(901, None, T0 - timedelta(minutes=3), tasks=broken_tasks({"reliability-pdb-probe"})))
+        nightly_red = self.nightly(run(901, None, T0 - timedelta(minutes=3), tasks=broken_tasks({"case-02"})))
         with_nightly = adjudicate(data(*presubmit, nightly_green, nightly_red), T0)
         for key in ("state", "condition", "cause", "failing_cases", "evidence", "incident"):
             self.assertEqual(with_nightly[key], baseline[key], key)
         self.assertEqual(with_nightly["metrics"], baseline["metrics"], "the digest's 24h numbers are the presubmit's")
 
     def test_nightly_greens_do_not_recover_an_incident(self):
-        presubmit = [run(100 + i, i, T0 - timedelta(hours=5) + timedelta(minutes=30 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)]
+        presubmit = [run(100 + i, i, T0 - timedelta(hours=5) + timedelta(minutes=30 * i), tasks=broken_tasks({"case-24"})) for i in range(4)]
         doc = data(*presubmit)
         prev = adjudicate(doc, T0)
         later = T0 + timedelta(hours=7)
@@ -1371,10 +1475,10 @@ class Metrics(unittest.TestCase):
         doc = data(
             run(1, 1, T0 - timedelta(hours=1), minutes=100, tasks=broken_tasks(set())),
             run(2, 2, T0 - timedelta(hours=2), minutes=200, tasks=broken_tasks(set())),
-            run(3, 3, T0 - timedelta(hours=3), minutes=300, tasks=broken_tasks({"agent-kanban-smoke"})),
+            run(3, 3, T0 - timedelta(hours=3), minutes=300, tasks=broken_tasks({"case-24"})),
             run(4, 4, T0 - timedelta(hours=4), minutes=50, result="ABORTED"),
             run(5, 5, T0 - timedelta(hours=5), minutes=1, result="FAILURE"),
-            run(6, 6, T0 - timedelta(hours=30), minutes=100, tasks=broken_tasks({"agent-kanban-smoke"})),
+            run(6, 6, T0 - timedelta(hours=30), minutes=100, tasks=broken_tasks({"case-24"})),
         )
         fixtures = {"healed": 28, "broken": 2, "projects": 30}
         result = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), fixtures=fixtures)
@@ -1477,7 +1581,7 @@ class SlowGate(unittest.TestCase):
     def test_the_floor_sits_one_demotion_below_the_live_presubmit(self):
         # Since 2026-09-22 the presubmit runs the blocking roster (twelve
         # cases, #1023; fourteen with the held-out canary seated 2026-09-29, #2013,
-        # and pdb-remediation-pr, #2016) and the floor is read from the presubmit file rather
+        # and case-08, #2016) and the floor is read from the presubmit file rather
         # than pinned: a full-roster run is a full run, one demotion away it
         # still is, and two demotions away (the twelve-case run Prow cut short
         # above, today) is not. A literal floor of 15 would never see a full
@@ -2516,19 +2620,24 @@ class PoolNote(unittest.TestCase):
 
 class Advice(unittest.TestCase):
     def test_outage_advice_cites_the_tracking_issue_from_case_notes(self):
-        notes = {"compliance-rbac-overgrant": {"issues": ["#998", "#1171"]}}
-        text = health.advice_for("OUTAGE", "shared_break", ["compliance-rbac-overgrant"], None, notes)
+        notes = {"case-09": {"issues": ["#998", "#1171"]}}
+        text = health.advice_for("OUTAGE", "shared_break", ["case-09"], None, notes)
         self.assertEqual(text, "Don't retest yet; the failing cases share a cause. Tracking: #998, #1171")
         text = health.advice_for("OUTAGE", "shared_break", ["unknown-case"], None, notes)
         self.assertTrue(text.endswith("Tracking: no issue filed yet — file one with the presubmit-gate label"))
 
     def test_the_posters_tracking_issue_rides_in_health_json_until_green(self):
-        doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))
+        doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"case-24"})) for i in range(4)))
         posted = {"state": "OUTAGE", "issue": {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300"}}
         first = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted=posted)
         self.assertEqual(first["issue"], posted["issue"])
-        self.assertEqual(first["tracking_issues"], ["#1300"])
+        self.assertEqual(first["tracking_issues"], ["#1300"], "this repository's issue, as before the issues repository existed")
         self.assertEqual(first["advice"], "Don't retest yet; the failing cases share a cause. Tracking: #1300")
+        # Golden for the unset path: the document is what it was before the
+        # issues repository setting, plus the one informational key.
+        self.assertEqual(first["issues_repo"], "gke-labs/kube-agents")
+        self.assertEqual(sorted(set(first) - {"issues_repo"}), GOLDEN_HEALTH_KEYS)
+        self.assertEqual(first["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300"}, "the poster's record, passed through as it was")
         # Carried from the previous health.json while no poster state carries `issues`...
         second = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE"})
         self.assertEqual(second["issue"], posted["issue"])
@@ -2547,7 +2656,7 @@ class Advice(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# The replay over the real week
+# The replay over the fixture week (synthetic names and ids, the real timeline)
 # --------------------------------------------------------------------------- #
 
 
@@ -2591,8 +2700,8 @@ class Replay(unittest.TestCase):
         self.assertLessEqual(max(len(rep.get("reason") or "") for r in self.data["runs"] for t in r["tasks"] for rep in t.get("reps") or []), health.TRIM_REASON_CHARS)
 
     def test_09_01_afternoon_is_a_storm(self):
-        # 2026-09-01 14:00-16:00Z: 108 empty-record reps on three PRs (#1082,
-        # #1105, #1107 -- every case collapsed with "trajectory is empty")
+        # 2026-09-01 14:00-16:00Z: 108 empty-record reps on three PRs (#234,
+        # #243, #245 -- every case collapsed with "trajectory is empty")
         # plus five setup deaths on four PRs. Evening in IST, morning in PDT.
         entry = at(self.timeline, day("09-01", 15, 30))
         self.assertEqual((entry["state"], entry["condition"]), ("DEGRADED", "storm"), entry)
@@ -2603,19 +2712,19 @@ class Replay(unittest.TestCase):
         self.assertNotIn("OUTAGE", {e["state"] for e in between(self.timeline, day("09-01"), day("09-02"))})
 
     def test_09_02_morning_outage_names_compliance_then_rca(self):
-        # #1171: compliance-rbac-overgrant collapsing on unrelated PRs from
+        # #1171: case-09 collapsing on unrelated PRs from
         # ~02:00Z; the fourth distinct PR lands at 10:42Z. #1189: rca joins
         # in the afternoon. Both were admitted at the time (roster era 2).
         entry = at(self.timeline, day("09-02", 11, 0))
         self.assertEqual(entry["state"], "OUTAGE", entry)
-        self.assertEqual(entry["failing_cases"], ["compliance-rbac-overgrant"])
+        self.assertEqual(entry["failing_cases"], ["case-09"])
         first_outage = next(e for e in self.timeline if e["state"] == "OUTAGE")
         self.assertGreaterEqual(health.parse_iso(first_outage["at"]), day("09-02", 9, 0))
         self.assertLessEqual(health.parse_iso(first_outage["at"]), day("09-02", 12, 0))
         entry = at(self.timeline, day("09-02", 18, 0))
         self.assertEqual(entry["state"], "OUTAGE")
-        self.assertIn("compliance-rbac-overgrant", entry["failing_cases"])
-        self.assertIn("rca-remediation-pr", entry["failing_cases"])
+        self.assertIn("case-09", entry["failing_cases"])
+        self.assertIn("case-23", entry["failing_cases"])
 
     def test_09_03_morning_recovers_and_evening_is_a_storm(self):
         # #1214: the token-quota storm. Builds started ~13:30Z ran five hours
@@ -2630,7 +2739,7 @@ class Replay(unittest.TestCase):
 
     def test_the_quiet_weekend_never_reads_as_an_outage(self):
         # Saturday 09-05 afternoon through Monday 09-07 morning: a setup-death
-        # cluster on 09-05 12:27-12:52Z (#965, #1121, #1186, #1199 died at
+        # cluster on 09-05 12:27-12:52Z (#222, #253, #292, #301 died at
         # 0 min), then greens. Nothing shared broke until the 09-07
         # auto-upgrade (#1269, filed 16:52Z; the first four collapsed runs
         # finished 11:30-13:59Z).
@@ -2662,7 +2771,7 @@ class Replay(unittest.TestCase):
 
 
 class DeadlineKillsReplay(unittest.TestCase):
-    """2026-09-22/23 (#1894): the published data.json from 12:00Z on the 22nd
+    """2026-09-22/23 (#1894): the synthetic cut of the published data.json from 12:00Z on the 22nd
     to 20:00Z on the 23rd. Thirty-three presubmit runs were killed at Prow's
     360-minute deadline with no verdict (#1880's dispatch stall under them)
     and ten reached one; health.py of the day stayed GREEN throughout. The
@@ -2716,7 +2825,7 @@ class DeadlineKillsReplay(unittest.TestCase):
 
 
 class LostPodsReplay(unittest.TestCase):
-    """2026-09-11 (#1478): the published data.json's runs of that day, with
+    """2026-09-11 (#1478): the synthetic cut of the published data.json's runs of that day, with
     the twenty zero-task reds re-read by the collector so they carry
     has_build_log and the pod record. Twelve of them are lost pods -- five
     nodes went NotReady 14:03-14:17Z under runs on twelve pull requests --
@@ -2743,8 +2852,8 @@ class LostPodsReplay(unittest.TestCase):
         self.assertEqual(sum(1 for r in runs if r.setup_death), 8)
 
     def test_the_morning_clone_failures_are_still_setup_deaths(self):
-        # 10:50-11:16Z: four clone failures on three pull requests (#1195
-        # twice, #1456, #1468), none of them a lost pod.
+        # 10:50-11:16Z: four clone failures on three pull requests (#298
+        # twice, #421, #429), none of them a lost pod.
         entry = at(self.timeline, day("09-11", 11, 30))
         self.assertEqual((entry["state"], entry["condition"]), ("DEGRADED", "setup_deaths"), entry)
         self.assertNotIn("lost_pods", {e["condition"] for e in between(self.timeline, day("09-11"), day("09-11", 14, 0))})
@@ -2757,7 +2866,7 @@ class LostPodsReplay(unittest.TestCase):
         self.assertEqual(
             tick["incident"],
             {
-                "prs": [926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1456, 1460, 1471],
+                "prs": [219, 251, 322, 329, 357, 367, 372, 411, 417, 421, 425, 431],
                 "runs": 12,
                 "window_start": "2026-09-11T14:05:52+00:00",
                 "window_end": "2026-09-11T14:19:16+00:00",
@@ -2781,17 +2890,17 @@ class LostPodsReplay(unittest.TestCase):
         )
 
     def test_setup_deaths_no_longer_claim_the_lost_pods(self):
-        # At 15:00Z the setup-death window holds three clone failures (#1471
-        # 13:14Z, #1446 14:29Z, #1319 14:49Z); #1351's 297-second lost pod,
+        # At 15:00Z the setup-death window holds three clone failures (#431
+        # 13:14Z, #414 14:29Z, #357 14:49Z); #367's 297-second lost pod,
         # which the old rule counted, is not among them.
         tick = self.tick(day("09-11", 15, 0))
         setup = [line for line in tick["evidence"] if line.startswith("setup/clone failures:")]
-        self.assertEqual(setup, ["setup/clone failures: 3 runs under 5 min with no tasks in the last 2h (#1319, #1446, #1471)"])
+        self.assertEqual(setup, ["setup/clone failures: 3 runs under 5 min with no tasks in the last 2h (#357, #414, #431)"])
         self.assertEqual((tick["metrics"]["lost_pods"], tick["metrics"]["setup_deaths"]), (12, 8))
 
 
 class SlowGateReplay(unittest.TestCase):
-    """2026-09-14 (#1586): the published data.json's runs of the week ending
+    """2026-09-14 (#1586): the synthetic cut of the published data.json's runs of the week ending
     18:20Z that day -- the seven days rule 7's baseline needs. Every run of
     the afternoon was green and three hours long (Vertex latency; the 429s
     were all retried), so rules 1-3b see nothing. The note appears at 18:00Z,
@@ -2945,13 +3054,13 @@ class CommandLine(unittest.TestCase):
         entries = json.loads(out)
         self.assertEqual(entries[-1]["state"], "OUTAGE")
         rc, out, _ = self.run_main(["--replay", "--data", str(FIXTURE), "--roster-history", str(ROSTER_HISTORY), "--from", "2026-09-08T00:00:00Z", "--step", "1h"])
-        self.assertIn("OUTAGE    shared fixture/environment break: cluster-agent-crashloop", out)
+        self.assertIn("OUTAGE    shared fixture/environment break: case-14, case-18, case-19", out)
 
     def test_one_tick_round_trips_prev_through_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             doc = tmp / "data.json"
-            doc.write_text(json.dumps(data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))))
+            doc.write_text(json.dumps(data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"case-24"})) for i in range(4)))))
             out = tmp / "health.json"
             rc, _, _ = self.run_main(["--data", str(doc), "--out", str(out), "--now", T0.isoformat(), "--admitted", ",".join(sorted(ADMITTED))])
             self.assertEqual(rc, 0)

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/tokenreview"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/upstream"
 )
 
@@ -30,6 +32,9 @@ const (
 	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
 	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
 	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
+	binaryName              = "k8s-api-proxy"
+	// devVersion is what a build without the release's -ldflags reports.
+	devVersion = "dev"
 
 	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
 	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
@@ -157,8 +162,20 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 	return map[string][]string{aud: callers}, nil
 }
 
+// version is what the binary was built for: the release (X.Y.Z) for a release archive,
+// stamped by scripts/release/build_release_binaries.sh, or the commit SHA for the
+// kube-proxy image, stamped by deploy/kube-proxy/Dockerfile from KUBE_AGENTS_VERSION, which
+// every image build passes as it does for the platform-agent image. Both use -ldflags "-X main.version=...".
+var version = devVersion
+
+// versionString is what --version prints and the startup log names.
+func versionString() string {
+	return binaryName + " " + version
+}
+
 func main() {
 	var (
+		showVersion              = flag.Bool("version", false, "Print the release or commit this binary was built for and exit")
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
 		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
@@ -177,10 +194,16 @@ func main() {
 		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
 		scopeFile                = flag.String("scope-file", envOrDefault("KUBE_PROXY_SCOPE_FILE", ""), "The install's scope.json; every request to a cluster its exclude.clusters names is refused (empty excludes nothing)")
 		excludeHostCluster       = flag.String("exclude-host-cluster-id", envOrDefault("KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", ""), "gke_ ID of the cluster the proxy runs in, which in-cluster is checked against the exclusions as; routing is unaffected")
+		universeDomainRaw        = flag.String("universe-domain", envOrDefault(universeDomainEnv, envOrDefault(googleCloudUniverseEnv, "")), "Google Cloud API universe domain (auto-detected from GKE metadata when unset on GKE, defaulting to googleapis.com)")
+		containerAPIURLOverride  = flag.String("container-api-url", envOrDefault(containerAPIURLEnv, ""), "Optional override for the GKE Container API base URL (derived from --universe-domain when empty)")
 		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
 		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
 	)
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 
 	mode, err := k8sapiproxy.ParseMode(*modeRaw)
 	if err != nil {
@@ -213,7 +236,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
+	authn, err := tokenreview.NewAuthenticator(tokenreview.Config{
 		Kubernetes:      inCluster,
 		Audience:        *audience,
 		AllowedCallers:  callers,
@@ -223,10 +246,23 @@ func main() {
 		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
 	}
 
+	probeMetadata := strings.HasPrefix(*hostClusterIDF, gkeClusterIDPrefix) ||
+		strings.HasPrefix(*excludeHostCluster, gkeClusterIDPrefix) ||
+		os.Getenv(wifAudienceEnv) != "" ||
+		scopedPoolEnabled(os.Getenv(scopedPoolFlagEnv))
+	resolvedUniverse, err := resolveKubeProxyUniverseDomain(ctx, *universeDomainRaw, probeMetadata, "", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	iamCredentialsURL := iamCredentialsURLForUniverse(resolvedUniverse)
+	containerAPIURL := containerAPIURLForUniverse(resolvedUniverse, *containerAPIURLOverride)
+
 	gcpTokens := newGCPTokenSource(gcpTokenConfig{
 		WIFAudience:       os.Getenv("CREDENTIAL_PROXY_WIF_AUDIENCE"),
 		WIFServiceAccount: os.Getenv("CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT"),
 		WIFTokenFile:      os.Getenv("CREDENTIAL_PROXY_WIF_TOKEN_FILE"),
+		STSURL:            stsURLForUniverse(resolvedUniverse),
+		IAMCredentialsURL: iamCredentialsURL,
 	})
 
 	var upstreamTransport k8sapiproxy.UpstreamTransport
@@ -239,15 +275,16 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to load scoped service account pool: %v", err)
 		}
-		upstreamTransport, err = newScopedPoolTransport(ctx, members, gcpTokens, "", nil, inCluster, "")
+		upstreamTransport, err = newScopedPoolTransport(ctx, members, gcpTokens, iamCredentialsURL, nil, inCluster, containerAPIURL)
 		if err != nil {
 			log.Fatalf("failed to initialize scoped upstream transport: %v", err)
 		}
 	} else {
 		upstreamTransport, err = upstream.New(ctx, upstream.Config{
-			InCluster:     inCluster,
-			HostClusterID: *hostClusterIDF,
-			TokenSource:   gcpTokens,
+			InCluster:       inCluster,
+			HostClusterID:   *hostClusterIDF,
+			TokenSource:     gcpTokens,
+			ContainerAPIURL: containerAPIURL,
 		})
 		if err != nil {
 			log.Fatalf("failed to initialize upstream transport: %v", err)
@@ -300,10 +337,10 @@ func main() {
 
 	listen := srv.ListenAndServe
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
-		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
+		log.Printf("starting %s (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		listen = func() error { return srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile) }
 	} else {
-		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
+		log.Printf("starting %s (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 	}
 	drainErr, err := serveUntilDrained(ctx, srv, listen, serverShutdownTimeout)
 	if err != nil {

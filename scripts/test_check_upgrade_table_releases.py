@@ -10,13 +10,18 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().with_name("check_upgrade_table_releases.py")
 PAGE = "docs/site/src/content/docs/install/upgrade.md"
 TRACES = "scripts/upgrade_table_traces.txt"
 HEADING = "### Breaking changes in recent releases\n\n"
+# A tag time inside and outside the check's 48-hour grace window for a freshly shipped `pending` row.
+FRESH_TAG_AGE = 3600
+STALE_TAG_AGE = 72 * 3600
 HEADER = "| Release | Change | What an existing install meets |\n| --- | --- | --- |\n"
 
 
@@ -112,6 +117,123 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.repo = Repo(Path(self.tmp.name))
         self.repo.commit("start", row=row("0.9.0", "an old change"))
         self.repo.tag("0.9.0")
+
+    def test_order_reads_the_table_alone_by_version_number_and_allows_a_release_twice(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        def page(*rows_: str, other: str = "") -> str:
+            return "# Upgrade\n\n" + HEADING + HEADER + "".join(rows_) + "\n" + other
+        # Two rows of one release, and 0.10.0 above 0.9.0 by number (not by string).
+        ordered = page(row("pending", "p"), row("0.10.0", "a"), row("0.10.0", "b"), row("0.9.0", "c"))
+        self.assertEqual(check.order_problems(ordered), [])
+        disordered = page(row("0.9.0", "c"), row("0.10.0", "a"))
+        self.assertEqual(len(check.order_problems(disordered)), 1)
+        # A version row in another table on the page, after this one, is neither checked (its 0.40.0
+        # would sit below 0.9.0) nor counted as the table's.
+        other = "## Versions\n\n| Version | Supported |\n| --- | --- |\n| 0.40.0 | yes |\n\n"
+        self.assertEqual(check.order_problems(page(row("0.10.0", "a"), row("0.9.0", "c"), other=other)), [])
+        self.assertEqual([r.change for r in check.table_rows(page(row("0.9.0", "c"), other=other))], ["c"])
+
+    def test_pending_rows_run_in_order_of_their_change_text_and_a_misplaced_one_is_told_where(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        def page(*rows_: str) -> str:
+            return "# Upgrade\n\n" + HEADING + HEADER + "".join(rows_) + "\n"
+        # Case, backticks and a `#<number>: ` prefix don't count, so these run in order.
+        ordered = page(row("pending", "a change"), row("pending", "`B` change"), row("pending", "#12: c change"),
+                       row("pending", "D change"), row("0.10.0", "z"))
+        self.assertEqual(check.order_problems(ordered), [])
+        # One row added on top: it is named, with the row it belongs below.
+        problems = check.order_problems(page(row("pending", "m change"), row("pending", "a change"),
+                                             row("pending", "z change")))
+        self.assertEqual(len(problems), 1)
+        self.assertIn('the `pending` row "a change" is out of order', problems[0])
+        self.assertIn('move it to the top of the `pending` rows', problems[0])
+        problems = check.order_problems(page(row("pending", "a change"), row("pending", "z change"),
+                                             row("pending", "m change")))
+        self.assertEqual(len(problems), 1)
+        self.assertIn('move it below the row "a change"', problems[0])
+        # Released rows are placed by release alone, not by their change text.
+        self.assertEqual(check.order_problems(page(row("0.10.0", "z"), row("0.10.0", "a"))), [])
+
+    def test_the_misplaced_row_is_the_one_named_even_with_duplicates_and_a_row_on_top(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        def page(*changes: str) -> str:
+            return "# Upgrade\n\n" + HEADING + HEADER + "".join(row("pending", c) for c in changes) + "\n"
+        def where(*changes: str) -> list[str]:
+            return [p.split("so move it ")[1] for p in check.order_problems(page(*changes))]
+        # A row added on top of three: that row is named once, not each row it pushed down.
+        self.assertEqual(where("x", "a", "b", "c"), ['below the row "c"'])
+        # It belongs below the last row that sorts before it, not the first.
+        self.assertEqual(where("a", "b", "x", "c", "d"), ['below the row "d"'])
+        # Equal keys are in order, and the row named is never the flagged row's own twin.
+        self.assertEqual(where("b", "a", "a"), ['below the row "a"'])
+        self.assertEqual(where("a", "c", "b", "b"), ['below the row "b"'])
+        self.assertEqual(where("a", "a", "b"), [])
+
+    def test_the_pending_key_drops_a_number_prefix_backticks_and_case(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        self.assertEqual(check.pending_key("#123: The `Foo` change"), "the foo change")
+
+    def test_a_row_the_check_cannot_read_is_reported(self):
+        # The table is out of Prettier, so a row without the usual spacing would skip every check.
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + "|pending|zz|y|\n").split("\n")
+        with mock.patch.object(check, "working_file_lines", return_value=lines):
+            problems = check.release_cell_problems()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("so the check cannot read it", problems[0])
+
+    def test_a_row_indented_before_its_bar_is_reported(self):
+        # #6429: an indented row ends the table, so it and every row below it would skip every check.
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + " " + row("pending", "b")
+                 + row("pending", "c")).split("\n")
+        with mock.patch.object(check, "working_file_lines", return_value=lines):
+            problems = check.release_cell_problems()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("starts with a space before its", problems[0])
+        self.assertIn(f":{lines.index(' ' + row('pending', 'b').rstrip()) + 1}:", problems[0])
+        # Prose after the table, or a blank line, ends it without a report.
+        for tail in ("\nSome prose.\n", "Some prose.\n", "  indented prose\n"):
+            with self.subTest(tail=tail):
+                lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + tail).split("\n")
+                with mock.patch.object(check, "working_file_lines", return_value=lines):
+                    self.assertEqual(check.release_cell_problems(), [])
+
+    def test_a_disorder_already_on_main_warns_a_pull_request_that_leaves_the_page_alone(self):
+        self.repo.commit("feat: a", row=row("pending", "change a"))
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: b", row=row("pending", "change b"))
+        self.repo.tag("1.1.0")
+        self.repo.rows = [row("1.0.0", "change a"), row("1.1.0", "change b")] + self.repo.rows[2:]
+        self.repo.write_page()
+        self.repo.commit("docs: out of order", code=False)
+        self.repo.pull_request(page=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
+        self.assertEqual(code, 0)
+        self.assertIn("warning: ", err)
+        self.assertIn("runs newest first", err)
+
+    def test_a_newer_release_row_below_an_older_one_fails_and_pending_rows_are_not_placed(self):
+        self.repo.commit("feat: a", row=row("pending", "change a"))
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: b", row=row("pending", "change b"))
+        self.repo.tag("1.1.0")
+        self.repo.rows = [row("1.0.0", "change a"), row("pending", "change c"), row("1.1.0", "change b")] + self.repo.rows[2:]
+        self.repo.write_page()
+        self.repo.commit("docs: out of order", code=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('the row "change b" is labelled 1.1.0 but sits below a 1.0.0 row', err)
+        self.repo.rows = [row("pending", "change c"), row("1.1.0", "change b"), row("1.0.0", "change a")] + self.repo.rows[3:]
+        self.repo.write_page()
+        self.repo.commit("docs: in order", code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
 
     def test_a_row_its_release_contains_passes(self):
         self.repo.commit("feat: a", row=row("1.0.0", "change a"))
@@ -290,7 +412,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f'the row "change p" is labelled pending, but 1.0.0 contains {added[:12]}', err)
         self.assertIn("Relabel it as 1.0.0.", err)
-        self.assertIn("Relabel a pending row before you reword it", err)
+        self.assertIn("To reword a pending row after its release, label the new text with the release", err)
 
     def test_a_pending_row_names_the_first_release_in_version_order(self):
         self.repo.commit("feat: p", row=row("pending", "change p"))
@@ -330,6 +452,296 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"but 1.0.0 contains {first[:12]}, the commit {TRACES} names for it. Relabel it as 1.0.0.", err)
 
+    def _shipped_pending_row(self):
+        """A `pending` row "change q" that 1.0.0 contains, with origin/main at it; returns its commit."""
+        first = self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        return first
+
+    def test_a_change_that_rewords_a_shipped_pending_row_fails(self):
+        first = self._shipped_pending_row()
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.commit("docs: reword q", code=False)  # as on a pull request, HEAD holds the removal
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn(f'this change removes the pending row "change q", which 1.0.0 already contains. If you '
+                      f'reworded it, label the new row 1.0.0 and name its commit ({first})', err)
+        self.assertIn("relabel it as 1.0.0 first and remove it in a later change", err)
+
+    def test_a_change_that_rewords_an_unshipped_pending_row_passes(self):
+        first = self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.commit("docs: reword q", code=False)
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_change_that_relabels_a_shipped_pending_row_passes(self):
+        self._shipped_pending_row()
+        self.repo.relabel("change q", "1.0.0")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_shipped_row_relabelled_first_can_be_removed_later(self):
+        self._shipped_pending_row()
+        self.repo.relabel("change q", "1.0.0")
+        relabelled = self.repo.commit("docs: label q", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", relabelled)
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_reword_of_a_shipped_pending_row_recorded_in_the_traces_passes(self):
+        first = self._shipped_pending_row()
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.relabel("change q, reworded", "1.0.0")
+        self.repo.trace(f"{first} change q, reworded")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_trace_for_another_row_does_not_excuse_a_removed_pending_row(self):
+        first = self.repo.commit("feat: q and r", row=row("pending", "change r"))
+        self.repo.rows.insert(0, row("pending", "change q"))
+        self.repo.write_page()
+        self.repo.git("commit", "-q", "--amend", "-a", "--no-edit")
+        first = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.tag("1.0.0")
+        self.repo.reword("change r", "change r2")
+        self.repo.relabel("change r2", "1.0.0")
+        self.repo.trace(f"{first} change r2")  # main already records the reword of r
+        base = self.repo.commit("docs: reword r", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.reword("change q", "change q2")  # this change rewords q and records nothing
+        self.repo.commit("docs: reword q", code=False)
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change q"', err)
+
+    def test_one_recorded_reword_excuses_only_one_removed_row(self):
+        first = self.repo.commit("feat: q and s", row=row("pending", "change s"))
+        self.repo.rows.insert(0, row("pending", "change q"))
+        self.repo.write_page()
+        self.repo.git("commit", "-q", "--amend", "-a", "--no-edit")
+        first = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.reword("change q", "change q2")
+        self.repo.relabel("change q2", "1.0.0")
+        self.repo.trace(f"{first} change q2")  # q's reword is recorded
+        self.repo.reword("change s", "change s2")  # s's reword stays pending and is not
+        self.repo.commit("docs: reword q and s", code=False)
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("this change removes the pending row"), 1)
+
+    def test_a_reword_labelled_with_a_later_release_is_not_excused(self):
+        first = self._shipped_pending_row()
+        self.repo.reword("change q", "change q2")
+        self.repo.relabel("change q2", "2.0.0")  # no tag yet, so the release-row check reads nothing
+        self.repo.trace(f"{first} change q2")
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change q", which 1.0.0 already contains', err)
+
+    def test_a_reword_recorded_with_the_cherry_pick_passes(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.git("checkout", "-q", "-b", "release", base)
+        self.repo.write_page()
+        picked = self.repo.commit("feat: q, cherry-picked")
+        self.repo.tag("1.0.0")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.repo.reword("change q", "change q2")
+        self.repo.relabel("change q2", "1.0.0")
+        self.repo.trace(f"{picked} change q2")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_dropping_the_prefix_of_a_shipped_pending_row_is_not_a_removal(self):
+        first = self.repo.commit("feat: j", row=row("pending", "#12: change j"))
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.reword("#12: change j", "change j")
+        self.repo.relabel("change j", "1.0.0")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_space_added_to_a_traced_row_does_not_excuse_a_removal(self):
+        self.repo.rows.insert(0, row("1.0.0", "change r"))
+        first = self.repo.commit("feat: q and r", row=row("pending", "change q"))
+        self.repo.tag("1.0.0")
+        self.repo.trace(f"{first} change r")
+        base = self.repo.commit("docs: trace r", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.rows = [r.replace("| change r |", "|  change r |") for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change q"', err)
+
+    def test_removing_a_pending_row_a_release_contains_through_its_trace_fails(self):
+        shipped = self.repo.commit("feat: t")
+        self.repo.tag("1.0.0")
+        self.repo.trace(f"{shipped} change t")
+        base = self.repo.commit("docs: note t", row=row("pending", "change t"), code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.rows = [r for r in self.repo.rows if "change t" not in r]
+        self.repo.write_page()
+        (self.repo.root / TRACES).unlink()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change t", which 1.0.0 already contains', err)
+
+    def test_a_space_added_before_a_removal_does_not_hide_a_shipped_pending_row(self):
+        first = self._shipped_pending_row()
+        self.repo.rows = [r.replace("| change q |", "|  change q |") for r in self.repo.rows]
+        self.repo.write_page()
+        spaced = self.repo.commit("docs: a space in q", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", spaced)
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn(f'this change removes the pending row "change q", which 1.0.0 already contains. If you '
+                      f'reworded it, label the new row 1.0.0 and name its commit ({first})', err)
+
+    def test_a_removed_prefixed_pending_row_names_its_commit(self):
+        first = self.repo.commit("feat: j", row=row("pending", "#12: change j"))
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.rows = [r for r in self.repo.rows if "change j" not in r]
+        self.repo.write_page()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn(f'removes the pending row "change j", which 1.0.0 already contains. If you reworded it, '
+                      f'label the new row 1.0.0 and name its commit ({first})', err)
+
+    def test_a_trace_entry_copied_from_a_prefixed_cell_matches_its_row(self):
+        shipped = self.repo.commit("feat: j")
+        self.repo.tag("1.0.0")
+        self.repo.commit("docs: note j", row=row("1.0.0", "#12: change j"), code=False)
+        self.repo.trace(f"{shipped} #12: change j")
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_a_base_trace_entry_with_a_prefix_is_read_by_the_removal_rule(self):
+        shipped = self.repo.commit("feat: t")
+        self.repo.tag("1.0.0")
+        self.repo.trace(f"{shipped} #12: change t")
+        base = self.repo.commit("docs: note t", row=row("pending", "#12: change t"), code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.rows = [r for r in self.repo.rows if "change t" not in r]
+        self.repo.write_page()
+        (self.repo.root / TRACES).unlink()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change t", which 1.0.0 already contains', err)
+
+    def _removed_pending_row(self):
+        """Remove the `pending` row "change q" from the page, with origin/main at the commit that has it."""
+        self.repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        return self.repo.check()
+
+    def test_removing_a_pending_row_an_open_candidate_contains_fails(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_2611100000_abc1234")
+        code, err = self._removed_pending_row()
+        self.assertEqual(code, 1)
+        self.assertIn('removes the pending row "change q", which the release candidate staging_2611100000_abc1234 '
+                      "already contains, so its release ships the old text", err)
+
+    def test_a_candidate_a_release_contains_gives_the_release_message(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_2611100000_abc1234")
+        self.repo.tag("1.0.0")
+        code, err = self._removed_pending_row()
+        self.assertEqual(code, 1)
+        self.assertIn('removes the pending row "change q", which 1.0.0 already contains', err)
+        self.assertNotIn("release candidate", err)
+
+    def test_removing_a_pending_row_no_candidate_contains_passes(self):
+        self.repo.tag("staging_2611100000_abc1234")  # cut before the row was written
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
+    def test_a_tag_that_only_looks_like_a_candidate_is_ignored(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_manual")  # matches the glob, not the pipeline's shape
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
+    def test_a_candidate_tag_off_main_is_ignored(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.git("checkout", "-q", "-b", "elsewhere", base)
+        self.repo.write_page()
+        self.repo.commit("feat: q, elsewhere")
+        self.repo.tag("staging_2611100000_abc1234")  # not on main: not a candidate the pipeline made
+        self.repo.git("checkout", "-q", "main")
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
+    def test_a_released_candidate_that_held_an_earlier_copy_of_the_row_is_not_open(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_2611100000_abc1234")  # holds the row, and 1.0.0 ships it below
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        self.repo.commit("revert: q")
+        self.repo.tag("1.0.0")  # contains the candidate, but not the row
+        self.repo.commit("feat: q again", row=row("pending", "change q"))
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
+    def test_a_push_does_not_read_a_removed_pending_row(self):
+        self._shipped_pending_row()
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.commit("docs: reword q", code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))  # the stated limit: no base
+
+    def test_a_second_table_under_the_heading_is_not_read_for_release_cells(self):
+        self.repo.commit("feat: a", row=row("1.0.0", "change a"))
+        page = self.repo.root / PAGE
+        page.write_text(page.read_text(encoding="utf-8") + "\n| Key | Meaning |\n| --- | --- |\n| `K` | a key |\n",
+                        encoding="utf-8")
+        self.repo.commit("docs: a second table", code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+        self.repo.rows.insert(0, row("Pending", "change m"))  # the real table is still read, first row included
+        self.repo.write_page()
+        page.write_text(page.read_text(encoding="utf-8") + "\n| Key | Meaning |\n| --- | --- |\n| `K` | a key |\n",
+                        encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('the Release cell "Pending" is neither a release number nor pending', err)
+
+    def test_a_table_before_the_breaking_changes_table_does_not_hide_it(self):
+        self.repo.rows.insert(0, row("Pending", "change m"))
+        self.repo.write_page()
+        page = self.repo.root / PAGE
+        intro = "| Mode | Meaning |\n| --- | --- |\n| next | x |\n\n"  # under the heading, before the table
+        page.write_text(page.read_text(encoding="utf-8").replace(HEADING, HEADING + intro), encoding="utf-8")
+        self.repo.commit("feat: m")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('the Release cell "Pending" is neither a release number nor pending', err)
+        self.assertNotIn('"next"', err)
+
+    def test_an_earlier_table_with_a_release_column_does_not_hide_the_table(self):
+        self.repo.rows.insert(0, row("Pending", "change m"))
+        self.repo.write_page()
+        page = self.repo.root / PAGE
+        intro = "| Release | Notes |\n| --- | --- |\n| next | x |\n\n"
+        page.write_text(page.read_text(encoding="utf-8").replace(HEADING, HEADING + intro), encoding="utf-8")
+        self.repo.commit("feat: m")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('the Release cell "Pending" is neither a release number nor pending', err)
+        self.assertNotIn('"next"', err)
+
+    def test_a_renamed_table_header_fails(self):
+        page = self.repo.root / PAGE
+        page.write_text(page.read_text(encoding="utf-8").replace("| Release | Change |", "| `Release` | Change |"),
+                        encoding="utf-8")
+        self.repo.commit("docs: rename the header", code=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('no table under "### Breaking changes in recent releases" starts with the header '
+                      '"| Release | Change |"', err)
+
     def test_a_misspelt_release_cell_fails(self):
         for cell in ("`pending`", "Pending", "next"):
             self.repo.rows = [r for r in self.repo.rows if "change m" not in r]
@@ -346,6 +758,70 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
         self.assertIn("labelled pending, but 1.0.0 contains", err)
+
+    def _pending_row_tagged(self, age: int) -> str:
+        """A `pending` row "change p" that 1.0.0, tagged `age` seconds ago, contains; returns its commit."""
+        added = self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.git("tag", "-a", "1.0.0", "-m", "1.0.0", at=int(time.time()) - age)
+        return added
+
+    def test_a_pending_row_a_fresh_release_contains_warns_a_push(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 0)
+        self.assertIn(f'warning: {PAGE}', err)
+        self.assertIn(f"labelled pending, but 1.0.0 contains {added[:12]}", err)
+        self.assertIn("the release job's relabel pull request is expected to relabel them", err)
+
+    def test_a_pending_row_a_release_tagged_past_the_grace_window_contains_fails_a_push(self):
+        self._pending_row_tagged(STALE_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn("Relabel it as 1.0.0.", err)
+
+    def test_a_pull_request_that_touches_a_freshly_shipped_pending_row_fails(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        self.repo.trace(f"{added} change p")  # the pull request edits the row's trace entry
+        self.repo.commit("docs: trace p", code=False)
+        event = Path(self.tmp.name) / "event.json"
+        event.write_text(json.dumps({"pull_request": {"base": {"sha": added}}}), encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request", GITHUB_EVENT_PATH=str(event))
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn("labelled pending, but 1.0.0 contains", err)
+
+    def test_a_merge_group_that_touches_a_freshly_shipped_pending_row_fails(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        self.repo.trace(f"{added} change p")
+        self.repo.commit("docs: trace p", code=False)
+        event = Path(self.tmp.name) / "event.json"
+        event.write_text(json.dumps({"merge_group": {"base_sha": added}}), encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="merge_group", GITHUB_EVENT_PATH=str(event))
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+
+    def test_a_graced_row_does_not_hide_a_wrong_label_on_another_row(self):
+        self.repo.mislabel()  # "change b", labelled 1.0.0, which 1.0.0 does not contain
+        added = self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.git("tag", "-a", "1.1.0", "-m", "1.1.0", at=int(time.time()) - FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f'warning: {PAGE}:', err)
+        self.assertIn(f"labelled pending, but 1.1.0 contains {added[:12]}", err)
+        failures = [line for line in err.splitlines() if not line.startswith("warning:")]
+        self.assertTrue(any('the row "change b" is labelled 1.0.0, but 1.0.0 does not contain' in line
+                            for line in failures))
+        self.assertFalse(any("change p" in line for line in failures))
+
+    def test_a_wrong_release_label_gets_no_grace(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("fix: b", row=row("1.0.0", "change b"))
+        self.repo.git("tag", "-a", "1.0.0", "-m", "1.0.0", base, at=int(time.time()) - FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn('the row "change b" is labelled 1.0.0, but 1.0.0 does not contain', err)
 
     def test_a_relabelled_row_passes(self):
         base = self.repo.commit("feat: before the branch point")
@@ -534,7 +1010,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
         self.assertEqual(code, 0)
         self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
-        self.assertIn("main's push run fails until a pull request relabels them", err)
+        self.assertIn("main's push run fails until a pull request relabels them (pending rows once their release is 48 hours old)", err)
 
     def test_a_push_to_main_fails_on_a_wrong_label(self):
         head = self.repo.mislabel()

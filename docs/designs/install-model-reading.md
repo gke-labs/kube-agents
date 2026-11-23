@@ -75,7 +75,7 @@ A new status block beside `status.usage`, not inside it:
 | Field                       | Type   | Value                                                                                                                                                                                   |
 | --------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `status.inference.provider` | string | the provider slug, the part before the first `/` (`gemini`, `vertex_ai`, `anthropic`, `openai`, `hosted_vllm`, `sap`; the chart writes its `openai_compatible` choice as `hosted_vllm`) |
-| `status.inference.model`    | string | the model name as typed after the provider (`gemini-3.5-flash`, `claude-opus-5`, `meta-llama/Llama-3.1-8B-Instruct`), or the resource id alone for a resource reference                 |
+| `status.inference.model`    | string | the model name as typed after the provider (`gemini-3.8-flash`, `claude-opus-5`, `meta-llama/Llama-3.1-8B-Instruct`), or the resource id alone for a resource reference                 |
 
 Both absent on a definite negative: no candidate ConfigMap in the namespace, a `model-default`
 entry whose model has an empty provider or an empty name after the split, or no `model-default`
@@ -91,9 +91,9 @@ prunes the fields, the operator notices from the echo and lands them once the CR
 
 The operator serves the pair as an info gauge on its metrics port, beside the usage gauges:
 
-| Series                                                                    | Value | Labels                                                                  |
-| ------------------------------------------------------------------------- | ----- | ----------------------------------------------------------------------- |
-| `kubeagents_platformagent_model{agent_namespace, agent, provider, model}` | 1     | the two label names the usage gauges carry, plus `provider` and `model` |
+| Series                                                                                      | Value | Labels                                                                                                          |
+| ------------------------------------------------------------------------------------------- | ----- | --------------------------------------------------------------------------------------------------------------- |
+| `kubeagents_platformagent_model{agent_namespace, agent, provider, model, reasoning_effort}` | 1     | the two label names the usage gauges carry, plus `provider`, `model` and, since section 2.5, `reasoning_effort` |
 
 One sample per agent; when the model changes the old label pair is deleted
 (`DeletePartialMatch` on the agent's two labels, as `forgetUsage` does) before the new one is set,
@@ -168,7 +168,7 @@ alone writes it; the chart writes a checksum, so it is not a source both install
 ### 2.4 The zero-PII contract
 
 `status.usage` stays "static enums and integer counts only". The new block is beside it and holds
-two short strings: the provider slug as LiteLLM names it (`gemini`, `vertex_ai`, `anthropic`,
+two short strings (three since section 2.5 added the reasoning effort): the provider slug as LiteLLM names it (`gemini`, `vertex_ai`, `anthropic`,
 `openai`, `sap`, `hosted_vllm`, a chart-set slug outside the table such as `azure`, or whatever a
 hand-edited config says), passed through unchanged, and the model name, passed through as typed.
 On a self-hosted or custom provider (`hosted_vllm`, which is also how the chart writes
@@ -178,8 +178,47 @@ self-hosted install is the case where the name says what is running. The resourc
 of section 2.1 is what keeps a project id, a region or an account id out of the status, the gauge
 label and the summary for the two shapes it covers; it is the only transformation, and the
 operator applies no allowlist. `usage-counters-producer.md`'s security section gets a
-sentence that names the block, says its two strings come from the install's own LiteLLM config,
+sentence that names the block, says its strings come from the install's own LiteLLM config,
 and states the rule.
+
+### 2.5 The reasoning effort (added 2026-11-20)
+
+The maintainers' next headcount is "how many installs run at each reasoning effort". The chart
+renders `litellm.reasoningEffort` as `reasoning_effort` on the same `model_list` entries, so the
+value rides the read of section 2.3 with no new source: the `reasoning_effort` of the entry that
+answers the model (the `model-default` entry, else the first well-formed provider-qualified
+entry), as typed. It is absent when the key is missing, empty, not a string (LiteLLM's config
+accepts a bare number, and the parser must not fail the pair over it), or holds any whitespace; a
+malformed effort drops the effort alone and the pair stays. There is no cap on its length, as the
+model name has none, and no table of allowed words: the chart writes `low`, `medium` or `high`,
+and a vLLM template reads whatever its author chose. Absent means the model thinks at its own
+default; never a stand-in word.
+
+The carriers are the three the pair already has. `status.inference.reasoningEffort`, a string,
+`omitempty`, written by the Ready writer in the same block. The gauge
+`kubeagents_platformagent_model` gains a label, `reasoning_effort`, the empty string while the
+status holds no effort, so one sample per install stays, `sum by (provider, model)` is what it was
+and `sum by (reasoning_effort)` is the new headcount; a second gauge was rejected for the join
+it would force and the second publish path. Both summary copies print `reasoning effort:` directly
+under `model:`: the value, `unset` when the model is known and the status holds none, and
+`unavailable` whenever the model line is `unavailable`; each copy's line cap rises by one, as the
+origin line's did, and the line joins the model and origin lines the audit skips, because an
+effort word is a setting an install may be named after and must never be the reason a block is
+refused. The script's ConfigMap fallback, taken only when the status has no `inference`
+key, reads the key from the `model-default` entry alone, and prints `unavailable` when the
+first-qualified scan answered the model, whose entry that reader does not know.
+
+A served CRD from before the field keeps the pair and prunes the effort, so the Ready writer's
+echo rule gains a case: a pair that comes back as written with the effort alone dropped is pruning,
+recorded under the block's one record. Without it an operator newer than its CRD would write the
+status on every reconcile. The record holds a write only while it would change nothing the served
+CRD keeps: with the block pruned nothing is served, so the five-minute reprobe holds as before; with
+the effort alone pruned the pair is served, so a provider or model change, or a negative, writes at
+once and only the effort waits for the reprobe. Under that skew the summary prints `unset` for the
+install; it makes no extra ConfigMap read to tell the two apart.
+
+Out of scope, as for the pair: the fallback alias's own effort, `max_tokens`, a request's own
+`reasoning_effort` (which wins over the configured one), and what each provider maps the value to.
 
 ## 3. What changes, by component
 
@@ -198,6 +237,9 @@ and states the rule.
   a definite negative and kept on a read error, the gauge's single sample, the label swap on a
   change and its removal on delete, and both watch mappings (a LiteLLM Deployment generation
   change and a `litellm-config` ConfigMap change each enqueue the agent).
+  Section 2.5 adds to the same files: the entry's `reasoning_effort` in the parser and the
+  `inferenceModel` triple, the third gauge label, the effort-only case in the echo rule, and
+  their tests.
 - **Feedback summary** (`feedback_summary.py`, `a2a/gateway/feedback_summary.go`,
   `test_feedback_summary.py`, `feedback_summary_test.go`): the status-first `model:` line in the
   script and its narrowed trimming rule (the two resource-reference shapes), the new line in the
@@ -205,6 +247,9 @@ and states the rule.
   line's fallback condition (the `inference` key absent) with the entry rule ported into the
   script's fallback,
   the environment keys as a shared list, the copy test extended to it.
+  Section 2.5 adds the `reasoning effort:` line to both copies, the script's fallback read of the
+  key, the effort line among the lines printed by design that the audit skips, and one more line
+  on each copy's cap.
 - **Docs**: `platformagent-fields.md` (generated), `platformagent-crd.md` (`## status`, the skew
   list), `observability.md` (the gauges table, the summary paragraph, the headcount query),
   `usage-counters-producer.md` (the status-as-gauges and security sections), the chart README's
@@ -218,8 +263,8 @@ and states the rule.
 
 ## 4. Goals, non-goals, what stays out
 
-Goals: one `provider/model` per install, readable from the CR, the operator's gauges and both
-summary copies, with no new egress.
+Goals: one `provider/model` per install, and the reasoning effort configured beside it, readable
+from the CR, the operator's gauges and both summary copies, with no new egress.
 
 Non-goals: the model that served a request (fallbacks, per-profile models, per-request overrides);
 a per-model request mix or its movement over time; a model per AgentProfile in status.

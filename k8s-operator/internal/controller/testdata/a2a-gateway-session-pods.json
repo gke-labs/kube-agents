@@ -113,9 +113,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -157,6 +157,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}
@@ -292,9 +300,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -341,6 +349,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}
@@ -464,9 +480,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -508,6 +524,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}
@@ -681,9 +705,9 @@
               "memory": "2Gi"
             },
             "requests": {
-              "cpu": "250m",
+              "cpu": "150m",
               "ephemeral-storage": "1088Mi",
-              "memory": "512Mi"
+              "memory": "320Mi"
             }
           },
           "volumeMounts": [
@@ -735,6 +759,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}

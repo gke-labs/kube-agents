@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -56,6 +57,7 @@ const (
 	usageTestBrokerIP  = "10.0.0.20"
 	usageTestGatewayB  = "10.0.0.11"
 	usageTestA2AIP     = "10.0.0.12"
+	usageTestLiteLLMIP = "10.0.0.30"
 )
 
 func usageClock(minute int) time.Time {
@@ -108,7 +110,7 @@ func usageGatewayPod(name, uid, ip string, created time.Time) *corev1.Pod {
 	}
 }
 
-// usageA2AGatewayPod is a running A2A gateway pod, the one a next-mode
+// usageA2AGatewayPod is a running A2A gateway pod, the one an
 // install runs, with its metrics port on the gateway container.
 func usageA2AGatewayPod(name, uid, ip string, created time.Time) *corev1.Pod {
 	agent := usageTestAgent(created)
@@ -147,6 +149,37 @@ func usageBrokerPod(name, uid, ip string, created time.Time) *corev1.Pod {
 	}
 }
 
+// usageLiteLLMPod is a running LiteLLM pod as the chart renders it: the
+// app label alone, the litellm-container with its port declared by number
+// and no name, and the container Ready.
+func usageLiteLLMPod(name, uid, ip string, created time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: usageTestNamespace, UID: types.UID(uid),
+			CreationTimestamp: metav1.NewTime(created),
+			Labels:            litellmPodSelector(),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: litellmContainerName, Ports: []corev1.ContainerPort{{ContainerPort: litellmPort}}}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: ip,
+			ContainerStatuses: []corev1.ContainerStatus{{Name: litellmContainerName, Ready: true}},
+		},
+	}
+}
+
+// usageReplayShadowPod is the chart's replay-shadow proxy: the same app
+// label as LiteLLM, a different container, forwarding to LiteLLM behind it.
+func usageReplayShadowPod(name, uid, ip string, created time.Time) *corev1.Pod {
+	pod := usageLiteLLMPod(name, uid, ip, created)
+	pod.Spec.Containers[0].Name = "replay-shadow-proxy"
+	pod.Status.ContainerStatuses[0].Name = "replay-shadow-proxy"
+	return pod
+}
+
+func litellmAddr() string { return usageTestLiteLLMIP + ":8080" }
+
 // stubUsageSource answers scrapes from a table keyed by address.
 type stubUsageSource struct {
 	mu       sync.Mutex
@@ -154,15 +187,22 @@ type stubUsageSource struct {
 	errs     map[string]error
 	blocking map[string]bool
 	calls    []string
+	// paths records the path each address was last scraped at, so a test can
+	// hold a target to the path its listener serves.
+	paths map[string]string
 	// hook, when set, is called at the start of every Scrape with the address
 	// being scraped, before the blocking wait: a seam for a test that must act
 	// (cancel a parent context, say) while a scrape is in flight.
 	hook func(addr string)
 }
 
-func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
+func (s *stubUsageSource) Scrape(ctx context.Context, addr, path string, counters []string, kinds []usageReadingKind) (usageReading, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, addr)
+	if s.paths == nil {
+		s.paths = map[string]string{}
+	}
+	s.paths[addr] = path
 	block := s.blocking[addr]
 	err := s.errs[addr]
 	reading, ok := s.readings[addr]
@@ -335,6 +375,16 @@ func (s *stubUsageSource) setDispatcher(addr string, failing ...usageDispatcherF
 	s.readings[addr] = reading
 }
 
+// setDispatcherStuck gives addr's reading the plugin's stuck boards beside the
+// failing ones.
+func (s *stubUsageSource) setDispatcherStuck(addr string, stuck []usageDispatcherStuck, failing ...usageDispatcherFailure) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Dispatcher = &usageDispatcherReading{Failing: failing, Stuck: stuck}
+	s.readings[addr] = reading
+}
+
 // setDataVolume gives addr's reading the watcher's data volume series, which
 // set leaves in place.
 func (s *stubUsageSource) setDataVolume(addr string, total, free int64) {
@@ -374,6 +424,13 @@ func (s *stubUsageSource) scraped(addr string) bool {
 	return false
 }
 
+// pathOf is the path addr was last scraped at, "" for an address never read.
+func (s *stubUsageSource) pathOf(addr string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paths[addr]
+}
+
 // gaugeValue reads a gauge field as a test compares it: -1 for absent.
 func gaugeValue(v *int64) int64 {
 	if v == nil {
@@ -401,6 +458,10 @@ const usageTestPeopleNulls = `"peopleSeen7d":null,"peopleSeen30d":null`
 
 // usageTestOriginsNulls is the nine origin readings as merge-patch deletions.
 const usageTestOriginsNulls = `"proposalsFromChat":null,"proposalsFromConsole":null,"proposalsFromApi":null,"proposalsFromEvent":null,"proposalsFromDrift":null,"proposalsFromAudit":null,"proposalsFromScheduled":null,"proposalsFromIssue":null,"proposalsFromOther":null`
+
+// usageTestInferenceNulls is the three inference totals as merge-patch
+// deletions.
+const usageTestInferenceNulls = `"inputTokensTotal":null,"outputTokensTotal":null,"spendMicrosUSDTotal":null`
 
 // usageHarness is a poller over a fake client, with the writes it makes
 // counted.
@@ -445,6 +506,9 @@ type usageHarness struct {
 	pruningFeedback   bool
 	// pruningPositive is a CRD serving all but positiveFeedbackTotal.
 	pruningPositive bool
+	// pruningAutonomous is a CRD serving all but the two autonomous feedback
+	// totals.
+	pruningAutonomous bool
 	// pruningChatSessions is a CRD serving all but chatSessionsTotal.
 	pruningChatSessions bool
 	// pruningPeople is a CRD serving all but the two people readings.
@@ -453,6 +517,8 @@ type usageHarness struct {
 	pruningTopTools bool
 	// pruningOrigins is a CRD serving all but the nine origin readings.
 	pruningOrigins bool
+	// pruningInference is a CRD serving all but the three inference totals.
+	pruningInference bool
 	// pruningStorage makes the fake behave like a served CRD from before
 	// status.storageStatus carried its byte fields.
 	pruningStorage bool
@@ -469,8 +535,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningPositive || h.pruningChatSessions || h.pruningPeople || h.pruningTopTools || h.pruningOrigins) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"positiveFeedbackTotal":null,"chatSessionsTotal":null,"topTools":null,` + usageTestPeopleNulls + `,` + usageTestOriginsNulls + `}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningPositive || h.pruningAutonomous || h.pruningChatSessions || h.pruningPeople || h.pruningTopTools || h.pruningOrigins || h.pruningInference) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"positiveFeedbackTotal":null,"autonomousNegativeFeedbackTotal":null,"autonomousPositiveFeedbackTotal":null,"chatSessionsTotal":null,"topTools":null,` + usageTestPeopleNulls + `,` + usageTestOriginsNulls + `,` + usageTestInferenceNulls + `}}}`
 				if h.pruningReadings {
 					strip = `{"status":{"usage":{` + usageTestReadingsNulls + `}}}`
 				}
@@ -498,6 +564,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				if h.pruningPositive {
 					strip = `{"status":{"usage":{"positiveFeedbackTotal":null}}}`
 				}
+				if h.pruningAutonomous {
+					strip = `{"status":{"usage":{"autonomousNegativeFeedbackTotal":null,"autonomousPositiveFeedbackTotal":null}}}`
+				}
 				if h.pruningChatSessions {
 					strip = `{"status":{"usage":{"chatSessionsTotal":null}}}`
 				}
@@ -509,6 +578,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningOrigins {
 					strip = `{"status":{"usage":{` + usageTestOriginsNulls + `}}}`
+				}
+				if h.pruningInference {
+					strip = `{"status":{"usage":{` + usageTestInferenceNulls + `}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -555,6 +627,10 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			if isAgent && (h.pruningGauges || h.pruningPositive) {
 				pa.Status.Usage.PositiveFeedbackTotal = 0
 			}
+			if isAgent && (h.pruningGauges || h.pruningAutonomous) {
+				pa.Status.Usage.AutonomousNegativeFeedbackTotal = 0
+				pa.Status.Usage.AutonomousPositiveFeedbackTotal = 0
+			}
 			if isAgent && (h.pruningGauges || h.pruningChatSessions) {
 				pa.Status.Usage.ChatSessionsTotal = 0
 			}
@@ -569,6 +645,11 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOrigins) {
 					*usageReadingStatusField(&pa.Status.Usage, spec.field) = nil
 				}
+			}
+			if isAgent && (h.pruningGauges || h.pruningInference) {
+				pa.Status.Usage.InputTokensTotal = 0
+				pa.Status.Usage.OutputTokensTotal = 0
+				pa.Status.Usage.SpendMicrosUSDTotal = 0
 			}
 			if err == nil && isAgent && h.pruningStorage {
 				stored := pa.DeepCopy()
@@ -869,7 +950,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0, usageCounterNegativeFeedback: 0, usageCounterPositiveFeedback: 0},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0, usageCounterNegativeFeedback: 0, usageCounterPositiveFeedback: 0, usageCounterAutonomousNegativeFeedback: 0, usageCounterAutonomousPositiveFeedback: 0, usageCounterInputTokens: 0, usageCounterOutputTokens: 0, usageCounterSpendMicros: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
 			usagePodEntryKey("gw-a", usageCounterEventsIngested):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
@@ -1564,7 +1645,7 @@ func TestUsagePoller_AnOldProcessOnANeverReadPodIsBaselined(t *testing.T) {
 	}
 }
 
-// On a next-mode install the A2A gateway owns Chat ingress and counts the
+// The A2A gateway owns Chat ingress and counts the
 // messages it accepts; the poller reads its pod as a fourth target into the
 // same chat counter, with an entry and a streak of its own, beside the
 // plugin's entry on the gateway pod (which counts nothing there: a turn the
@@ -2580,7 +2661,7 @@ func TestUsagePoller_AChatServingCRDWithoutTheFeedbackCounterKeepsTheOthersFlowi
 	}
 }
 
-// On a next-mode install the A2A gateway's answer ratings count too: its
+// The A2A gateway's answer ratings count too: its
 // thumbs-downs join the reaction hook's in negativeFeedbackTotal, and its
 // thumbs-ups are positiveFeedbackTotal. Neither is activity.
 func TestUsagePoller_AnswerRatingsCountFromTheA2AGateway(t *testing.T) {
@@ -2612,6 +2693,75 @@ func TestUsagePoller_AnswerRatingsCountFromTheA2AGateway(t *testing.T) {
 	}
 }
 
+// The ratings of the posts the agent made on its own count from the A2A
+// gateway into their own pair, apart from the answer ratings: a thumbs-down on
+// an alert leaves negativeFeedbackTotal where it was. Neither is activity.
+func TestUsagePoller_PostRatingsCountApartFromAnswerRatings(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	a2a := usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), a2a)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.set(a2aAddr(), 0, ptr.To(1.0))
+	h.stub.setSample(a2aAddr(), usageCounterPositiveFeedback, 1)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousNegativeFeedback, 2)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousPositiveFeedback, 1)
+	h.poll(5)
+	h.stub.setSample(a2aAddr(), usageCounterPositiveFeedback, 2)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousNegativeFeedback, 6)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousPositiveFeedback, 3)
+	h.poll(10)
+	status := h.status()
+	if status.AutonomousNegativeFeedbackTotal != 4 || status.AutonomousPositiveFeedbackTotal != 2 {
+		t.Fatalf("after 4 thumbs-downs and 2 thumbs-ups on posts: %+v, want 4 and 2", status)
+	}
+	if status.NegativeFeedbackTotal != 0 || status.PositiveFeedbackTotal != 1 || status.ChatMessagesInboundTotal != 0 {
+		t.Fatalf("the post ratings reached the answer counters: %+v, want no thumbs-downs, the one Good answer and nothing else", status)
+	}
+	if status.LastActiveTime != nil {
+		t.Fatalf("a rating alone moved lastActiveTime: %v", status.LastActiveTime)
+	}
+	doc := h.document()
+	for _, counter := range []string{usageCounterAutonomousNegativeFeedback, usageCounterAutonomousPositiveFeedback} {
+		if doc.Pods[usagePodEntryKey("a2a-c", counter)] == nil || doc.Pods[usagePodEntryKey("gw-a", counter)] != nil {
+			t.Fatalf("the %s entry belongs to the A2A gateway alone: %v", counter, doc.Pods)
+		}
+	}
+}
+
+// A served CRD from the release before this one prunes the two autonomous
+// feedback totals: their absence is recorded against each, and the answer
+// ratings beside them keep landing.
+func TestUsagePoller_ACRDWithoutTheAutonomousCountersKeepsTheAnswerRatingsFlowing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	a2a := usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, created)
+	h := newUsageHarness(t, agent, append(usageDefaultObjects(created), a2a)...)
+	h.pruningAutonomous = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.set(a2aAddr(), 0, ptr.To(1.0))
+	h.poll(5)
+	h.stub.setSample(a2aAddr(), usageCounterPositiveFeedback, 2)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousNegativeFeedback, 1)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousPositiveFeedback, 1)
+	h.poll(10)
+	if status := h.status(); status.PositiveFeedbackTotal != 2 || status.AutonomousNegativeFeedbackTotal != 0 || status.AutonomousPositiveFeedbackTotal != 0 {
+		t.Fatalf("after 2 Good answers and a rating of each kind on posts: %+v, want 2 thumbs-ups and no autonomous counters", status)
+	}
+	if h.p.newerFieldPruned(agent, usageCounterPositiveFeedback) ||
+		!h.p.newerFieldPruned(agent, usageCounterAutonomousNegativeFeedback) || !h.p.newerFieldPruned(agent, usageCounterAutonomousPositiveFeedback) {
+		t.Fatal("the autonomous counters' absence was not recorded against them alone")
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the autonomous counters alone behind re-patched the status while their records were fresh")
+	}
+}
+
 // An upgrade that starts asking a listener the document already reads for a
 // family it never asked before finds the pod's history, not a pod that
 // started from zero: the first sample is the baseline even for a pod created
@@ -2638,15 +2788,21 @@ func TestUsagePoller_AFamilyFirstAskedOfAKnownListenerIsBaselined(t *testing.T) 
 	h.stub.set(a2aAddr(), 10, ptr.To(1.0))
 	h.stub.setSample(a2aAddr(), usageCounterNegativeFeedback, 5)
 	h.stub.setSample(a2aAddr(), usageCounterPositiveFeedback, 4)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousNegativeFeedback, 7)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousPositiveFeedback, 3)
 	h.poll(10)
-	if doc := h.document(); doc.Totals[usageCounterNegativeFeedback] != 0 || doc.Totals[usageCounterPositiveFeedback] != 0 {
-		t.Fatalf("totals after the first asking = %v, want both feedback counters baselined at 0", doc.Totals)
+	if doc := h.document(); doc.Totals[usageCounterNegativeFeedback] != 0 || doc.Totals[usageCounterPositiveFeedback] != 0 ||
+		doc.Totals[usageCounterAutonomousNegativeFeedback] != 0 || doc.Totals[usageCounterAutonomousPositiveFeedback] != 0 {
+		t.Fatalf("totals after the first asking = %v, want all four feedback counters baselined at 0", doc.Totals)
 	}
 	h.stub.setSample(a2aAddr(), usageCounterNegativeFeedback, 6)
 	h.stub.setSample(a2aAddr(), usageCounterPositiveFeedback, 5)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousNegativeFeedback, 8)
+	h.stub.setSample(a2aAddr(), usageCounterAutonomousPositiveFeedback, 4)
 	h.poll(15)
-	if doc := h.document(); doc.Totals[usageCounterNegativeFeedback] != 1 || doc.Totals[usageCounterPositiveFeedback] != 1 {
-		t.Fatalf("totals after one more of each = %v, want 1 and 1", doc.Totals)
+	if doc := h.document(); doc.Totals[usageCounterNegativeFeedback] != 1 || doc.Totals[usageCounterPositiveFeedback] != 1 ||
+		doc.Totals[usageCounterAutonomousNegativeFeedback] != 1 || doc.Totals[usageCounterAutonomousPositiveFeedback] != 1 {
+		t.Fatalf("totals after one more of each = %v, want 1 each", doc.Totals)
 	}
 }
 
@@ -2812,7 +2968,13 @@ func TestUsagePoller_MigratesAVersionOneDocument(t *testing.T) {
 // for the counter, so a later pod older than the document is baselined.
 func TestUsagePoller_MigratesAVersionOneDocument_BrokerFailsTheMigratingPoll(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
-	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	// A LiteLLM pod beside the default set: the three inference totals are
+	// counters the migrated document lacks too, and the poll that first reads
+	// the pod adds its whole sample and clears them from the unfolded set, as
+	// the proposals counter's first read does for it.
+	litellm := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), litellm)...)
+	h.stub.setLiteLLM(litellmAddr(), 1_000_000, 50_000, 5_000_000, ptr.To(300.0))
 	moved := metav1.NewTime(usageClock(3))
 	h.writeDocument(&usageDocument{
 		Version:       usageDocumentVersionPodKeyed,
@@ -2843,10 +3005,13 @@ func TestUsagePoller_MigratesAVersionOneDocument_BrokerFailsTheMigratingPoll(t *
 	if doc.Totals[usageCounterRemediationsProposed] != 2 || doc.Totals[usageCounterToolExecutions] != 13 {
 		t.Fatalf("totals after the recovery poll: %v, want remediationsProposedTotal 2 (the whole sample) and toolExecutionsTotal 13", doc.Totals)
 	}
-	// positiveFeedbackTotal stays unseen: only the A2A gateway serves it, and
-	// this install runs none, so its first sample, whenever one comes, adds
-	// whole.
-	if !slices.Equal(doc.Unfolded, []string{usageCounterPositiveFeedback}) {
+	if doc.Totals[usageCounterInputTokens] != 1_000_000 || doc.Totals[usageCounterOutputTokens] != 50_000 || doc.Totals[usageCounterSpendMicros] != 5_000_000 {
+		t.Fatalf("totals after the recovery poll: %v, want the LiteLLM pod's whole samples, added on its first read", doc.Totals)
+	}
+	// positiveFeedbackTotal and the two autonomous feedback totals alone stay
+	// unseen: only the A2A gateway serves them, and this install runs none, so
+	// their first samples, whenever they come, add whole.
+	if !slices.Equal(doc.Unfolded, []string{usageCounterAutonomousNegativeFeedback, usageCounterAutonomousPositiveFeedback, usageCounterPositiveFeedback}) {
 		t.Fatalf("the unfolded set outlived the first recorded sample: %v", doc.Unfolded)
 	}
 	if got := h.status().RemediationsProposedTotal; got != 2 {
@@ -4166,16 +4331,15 @@ func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
 	}
 }
 
-// usagePeopleTestAgent is a next-mode CR with Chat on and, when slack is set,
-// Slack too; Slack then stays on its legacy consumer, served through Hermes.
-func usagePeopleTestAgent(created time.Time, slack bool) *agentv1alpha1.PlatformAgent {
+// usagePeopleTestAgent is a CR with Chat on and, when teams is set, Teams
+// too; Teams has no gateway backend and is served through Hermes.
+func usagePeopleTestAgent(created time.Time, teams bool) *agentv1alpha1.PlatformAgent {
 	agent := usageTestAgent(created)
-	agent.Spec.Mode = ptr.To(string(ModeNext))
 	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
 		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 	}
-	if slack {
-		agent.Spec.Integration.Slack = &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)}
+	if teams {
+		agent.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true)}
 	}
 	return agent
 }
@@ -4222,7 +4386,7 @@ func TestUsagePoller_ThePeopleReadingsLandAsPointerFieldsAndNeverMoveLastActiveT
 	}
 }
 
-func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.T) {
+func TestUsagePoller_ThePeopleReadingStaysAbsentWhileTeamsIsOnHermes(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usagePeopleTestAgent(created, true)
 	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
@@ -4233,7 +4397,7 @@ func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.
 	h.poll(10)
 	status := h.status()
 	if status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
-		t.Fatalf("people = %d/%d with Slack on Hermes, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		t.Fatalf("people = %d/%d with Teams on Hermes, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
 	}
 	if misses, _ := h.peopleMisses(agent); misses != 0 {
 		t.Fatalf("a closed gate recorded %d people misses, want 0", misses)
@@ -4242,14 +4406,14 @@ func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.
 	if err := h.cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
 		t.Fatalf("reading the agent: %v", err)
 	}
-	stored.Spec.Integration.Slack.Enabled = ptr.To(false)
+	stored.Spec.Integration.Teams.Enabled = ptr.To(false)
 	if err := h.cl.Update(context.Background(), stored); err != nil {
-		t.Fatalf("disabling Slack: %v", err)
+		t.Fatalf("disabling Teams: %v", err)
 	}
 	h.poll(15)
 	status = h.status()
 	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
-		t.Fatalf("people = %d/%d after Slack left Hermes, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		t.Fatalf("people = %d/%d after Teams left Hermes, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
 	}
 }
 
@@ -4342,28 +4506,11 @@ func TestUsagePoller_ThePeopleReadingsHaveTheirOwnPruningRecord(t *testing.T) {
 	}
 }
 
-// An install that renders no A2A stack has no people reading to take: the
-// pair stays absent and no miss is counted. A next install whose gateway pod
-// goes missing has a configured target with no body: one poll is a miss and
-// keeps the pair, the second clears it.
-func TestUsagePoller_NoA2AStackLeavesThePairAbsentWithoutAMissAndAMissingGatewayPodIsAMiss(t *testing.T) {
+// An install whose gateway pod goes missing has a configured target with no
+// body: one poll is a miss and keeps the pair, the second clears it.
+func TestUsagePoller_AMissingGatewayPodIsAMiss(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
-	t.Run("today", func(t *testing.T) {
-		agent := usageTestAgent(created)
-		h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
-		h.stub.set(gatewayAddr(), 0, nil)
-		h.stub.set(brokerAddr(), 0, nil)
-		h.poll(5)
-		h.poll(10)
-		h.poll(15)
-		if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
-			t.Fatalf("people = %d/%d with no A2A gateway, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
-		}
-		if misses, ok := h.peopleMisses(agent); ok {
-			t.Fatalf("no A2A gateway recorded a people miss streak of %d, want none", misses)
-		}
-	})
-	t.Run("next, the gateway pod gone", func(t *testing.T) {
+	t.Run("the gateway pod gone", func(t *testing.T) {
 		agent := usagePeopleTestAgent(created, false)
 		objects := usagePeopleObjects(created)
 		h := newUsageHarness(t, agent, objects...)
@@ -4769,12 +4916,12 @@ func (s *usageBodySource) serve(body string) {
 	s.body, s.served = body, true
 }
 
-func (s *usageBodySource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
+func (s *usageBodySource) Scrape(ctx context.Context, addr, path string, counters []string, kinds []usageReadingKind) (usageReading, error) {
 	s.mu.Lock()
 	body, served := s.body, s.served
 	s.mu.Unlock()
 	if addr != s.addr || !served {
-		return s.stub.Scrape(ctx, addr, counters, kinds)
+		return s.stub.Scrape(ctx, addr, path, counters, kinds)
 	}
 	return foldUsageBody(strings.NewReader(body), counters, kinds)
 }
@@ -4801,4 +4948,209 @@ func TestUsagePoller_StaleOriginReadingsClearAfterTwoPolls(t *testing.T) {
 	source.serve(usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
 	h.poll(20)
 	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "a fresh read again")
+}
+
+// usageLiteLLMObjects is the default pod set plus a Ready LiteLLM pod, the
+// chart's replay-shadow proxy under the same label, and a LiteLLM pod whose
+// container is not Ready yet.
+func usageLiteLLMObjects(created time.Time) []client.Object {
+	notReady := usageLiteLLMPod("litellm-ddd", "litellm-d", "10.0.0.31", created)
+	notReady.Status.ContainerStatuses[0].Ready = false
+	return append(usageDefaultObjects(created),
+		usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created),
+		usageReplayShadowPod("inference-replay-shadow-eee", "replay-e", "10.0.0.32", created),
+		notReady,
+	)
+}
+
+// setLiteLLM plants one LiteLLM body's three samples at addr.
+func (s *stubUsageSource) setLiteLLM(addr string, tokensIn, tokensOut, spendMicros int64, start *float64) {
+	s.set(addr, tokensIn, start)
+	s.setSample(addr, usageCounterOutputTokens, tokensOut)
+	s.setSample(addr, usageCounterSpendMicros, spendMicros)
+}
+
+// The fifth group: every Ready LiteLLM pod is read at the fixed port and the
+// slashed path, the replay-shadow proxy under the same label and a pod whose
+// container is not Ready are not, the three totals fold under the token and
+// spend ceilings rather than the common one, land in their three status
+// fields, and move neither lastActiveTime nor lastHumanActiveTime.
+func TestUsagePoller_InferenceTotalsCountFromTheLiteLLMPods(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageLiteLLMObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000_000, 50_000, 5_000_000, ptr.To(300.0))
+	h.poll(5)
+	if got := h.stub.pathOf(litellmAddr()); got != usageLiteLLMMetricsPath {
+		t.Fatalf("LiteLLM was read at %q, want %q", got, usageLiteLLMMetricsPath)
+	}
+	for _, addr := range []string{"10.0.0.31:8080", "10.0.0.32:8080"} {
+		if h.stub.scraped(addr) {
+			t.Fatalf("%s was read: a not-Ready LiteLLM pod or the replay-shadow proxy", addr)
+		}
+	}
+	doc := h.document()
+	for _, counter := range usageLiteLLMCounters {
+		if doc.Pods[usagePodEntryKey("litellm-c", counter)] == nil {
+			t.Fatalf("no entry for the LiteLLM pod's %s: %v", counter, doc.Pods)
+		}
+	}
+	if status := h.status(); status.InputTokensTotal != 0 || status.LastActiveTime != nil {
+		t.Fatalf("the first poll wrote the status: %+v", status)
+	}
+
+	// Sixty thousand tokens in, a thousand out and thirty cents in five
+	// minutes: past the common ceiling, under the token and spend ceilings.
+	h.stub.setLiteLLM(litellmAddr(), 1_060_000, 51_000, 5_300_000, ptr.To(300.0))
+	h.poll(10)
+	status := h.status()
+	if status.InputTokensTotal != 60_000 || status.OutputTokensTotal != 1_000 || status.SpendMicrosUSDTotal != 300_000 {
+		t.Fatalf("after the second poll: %+v, want 60000 in, 1000 out, 300000 micros", status)
+	}
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("an inference advance moved a time: %+v", status)
+	}
+	if status.ToolExecutionsTotal != 0 || status.ChatMessagesInboundTotal != 0 {
+		t.Fatalf("an inference advance moved another counter: %+v", status)
+	}
+	// A LiteLLM restart: the pod's counters start again at zero under a new
+	// start time, and the totals hold, then grow from the new process.
+	h.stub.setLiteLLM(litellmAddr(), 500, 20, 2_500, ptr.To(400.0))
+	h.poll(15)
+	status = h.status()
+	if status.InputTokensTotal != 60_500 || status.OutputTokensTotal != 1_020 || status.SpendMicrosUSDTotal != 302_500 {
+		t.Fatalf("after a LiteLLM restart: %+v, want the totals plus the new process's whole sample", status)
+	}
+}
+
+// A LiteLLM pod replaced by a rollout folds from its first body: the new
+// pod was created after the document and adds its whole sample, under the
+// token ceiling rather than the common one, on top of the stored total.
+func TestUsagePoller_AReplacedLiteLLMPodFoldsOntoTheStoredTotal(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	old := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), old)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000_000, 50_000, 5_000_000, ptr.To(300.0))
+	h.poll(5)
+	h.stub.setLiteLLM(litellmAddr(), 1_060_000, 51_000, 5_300_000, ptr.To(300.0))
+	h.poll(10)
+	if status := h.status(); status.InputTokensTotal != 60_000 {
+		t.Fatalf("before the rollout: %+v", status)
+	}
+
+	ctx := context.Background()
+	if err := h.cl.Delete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	replacement := usageLiteLLMPod("litellm-fff", "litellm-f", "10.0.0.33", usageClock(12))
+	if err := h.cl.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	h.stub.setLiteLLM("10.0.0.33:8080", 70_000, 2_000, 400_000, ptr.To(720.0))
+	h.poll(15)
+	status := h.status()
+	if status.InputTokensTotal != 130_000 || status.OutputTokensTotal != 3_000 || status.SpendMicrosUSDTotal != 700_000 {
+		t.Fatalf("after the rollout: %+v, want the stored totals plus the new pod's whole sample", status)
+	}
+	doc := h.document()
+	if doc.Pods[usagePodEntryKey("litellm-c", usageCounterInputTokens)] != nil {
+		t.Fatalf("the departed pod kept its entry: %v", doc.Pods)
+	}
+	if doc.Pods[usagePodEntryKey("litellm-f", usageCounterSpendMicros)] == nil {
+		t.Fatalf("the replacement has no entry: %v", doc.Pods)
+	}
+}
+
+// A served CRD from before the three inference totals prunes them together:
+// their absence is one record, the other counters keep landing, the three
+// gauge rows are held back, and a poll with the three alone behind does not
+// re-patch while the record is fresh.
+func TestUsagePoller_TheInferenceTotalsShareOnePruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	litellm := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, agent, append(usageDefaultObjects(created), litellm)...)
+	h.pruningInference = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 10, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000, 100, 10_000, ptr.To(300.0))
+	h.poll(5)
+	h.stub.set(brokerAddr(), 13, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 2_000, 200, 20_000, ptr.To(300.0))
+	h.poll(10)
+	if status := h.status(); status.ToolExecutionsTotal != 3 || status.InputTokensTotal != 0 || status.SpendMicrosUSDTotal != 0 {
+		t.Fatalf("status under a CRD without the inference totals: %+v, want 3 tool executions and no totals", status)
+	}
+	if !h.p.newerFieldPruned(agent, usageNewerFieldInference) {
+		t.Fatal("the absence of the three totals was not recorded against their shared record")
+	}
+	for _, counter := range usageLiteLLMCounters {
+		if h.p.newerFieldPruned(agent, counter) {
+			t.Fatalf("a record was kept under %s alone", counter)
+		}
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of the three totals was recorded as the counters' pruning")
+	}
+	if doc := h.document(); doc.Totals[usageCounterInputTokens] != 1_000 || doc.Totals[usageCounterSpendMicros] != 10_000 {
+		t.Fatalf("the ConfigMap fell behind under the pruning CRD: %v", doc.Totals)
+	}
+	patches := h.patches
+	h.stub.setLiteLLM(litellmAddr(), 3_000, 300, 30_000, ptr.To(300.0))
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the inference totals alone behind re-patched the status while their record was fresh")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName}, stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	held := h.r.heldUsageFields(stored)
+	for _, counter := range usageLiteLLMCounters {
+		if !held[counter] {
+			t.Errorf("held fields %v, want %s held", held, counter)
+		}
+	}
+	if held[usageCounterToolExecutions] {
+		t.Errorf("held fields %v, want toolExecutionsTotal published", held)
+	}
+
+	// The CRD applied and the record expired: the next poll lands everything
+	// the ConfigMap accumulated, in one patch.
+	h.pruningInference = false
+	h.p.expireNewerFieldsRecordForTest(agent)
+	h.poll(20)
+	if status := h.status(); status.InputTokensTotal != 2_000 || status.OutputTokensTotal != 200 || status.SpendMicrosUSDTotal != 20_000 {
+		t.Fatalf("after the CRD landed: %+v, want the accumulated totals", status)
+	}
+	if h.p.newerFieldPruned(agent, usageNewerFieldInference) {
+		t.Fatal("the echo carried the totals and the record was not cleared")
+	}
+}
+
+// The Warning for a failing LiteLLM listener names the three status fields
+// and the response guidance, as a 307 from the bare path would: the listener
+// answered, and what it answered could not be used.
+func TestUsagePoller_AFailingLiteLLMListenerNamesItsThreeFields(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	litellm := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), litellm)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.errs[litellmAddr()] = &usageScrapeError{Kind: usageScrapeKindStatus, Status: http.StatusTemporaryRedirect}
+	h.poll(5)
+	h.poll(10)
+	select {
+	case event := <-h.recorder.Events:
+		for _, want := range []string{usageScrapeFailingReason, "pod litellm-ccc (status.usage.inputTokensTotal, status.usage.outputTokensTotal, status.usage.spendMicrosUSDTotal): status: HTTP 307", usageScrapeResponseGuidance} {
+			if !strings.Contains(event, want) {
+				t.Errorf("event %q lacks %q", event, want)
+			}
+		}
+	default:
+		t.Fatal("no Warning after two failed polls of the LiteLLM listener")
+	}
 }

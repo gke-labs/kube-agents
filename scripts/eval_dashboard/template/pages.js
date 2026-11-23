@@ -64,7 +64,7 @@ const PAGE = {
   // lost pods and deadline kills 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000, deadline_kill: 2 * 3600 * 1000 },
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000, forge_outage: 2 * 3600 * 1000, deadline_kill: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -94,6 +94,11 @@ const PAGE = {
   gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
+  // A bare "#N" is an issue of the source repository (case-notes.yaml's,
+  // the allowlist's); the bots' own issues arrive as full URLs and may live
+  // in another repository (health.json's issues_repo), which the link text
+  // then names.
+  sourceRepo: "gke-labs/kube-agents",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
   rulesUrl: "https://github.com/gke-labs/kube-agents/blob/main/scripts/eval_dashboard/classify.py",
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
@@ -142,6 +147,8 @@ const PAGE = {
   // The chat-turn target the opening turn's p95 is shown beside, as advice
   // only (nightly.py's TURN1_P95_TARGET_S).
   turn1P95TargetS: 10,
+  // The nights an estimated Slack p95 is averaged over (slack_estimate.P95_NIGHTS).
+  slackP95Nights: 7,
   // The Trend page (trend.py): a judged metric's name as a URL parameter,
   // the chart geometry (SVG user units; the chart scales to its card), and
   // where "score" is defined once.
@@ -487,8 +494,12 @@ const transcriptUrl = (run, kase, n = 1) => {
 // rep_n); rep 1, as the pages always linked, when the row names none.
 const repOf = (c) => (Number.isInteger(c.rep_n) && c.rep_n > 0 ? c.rep_n : 1);
 const issueLink = (issue) => {
-  const match = /^#(\d+)$/.exec(String(issue).trim());
-  return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
+  const text = String(issue).trim();
+  const bare = /^#(\d+)$/.exec(text);
+  if (bare) return `<a href="${PAGE.issueUrl}/${bare[1]}">${esc(text)}</a>`;
+  const full = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)$/.exec(text);
+  if (full) return `<a href="${esc(text)}">${esc(full[1] === PAGE.sourceRepo ? `#${full[2]}` : `${full[1]}#${full[2]}`)}</a>`;
+  return esc(text);
 };
 const projectShort = (project) => (project ? String(project).replace(/^kube-agents-/, "") : "unknown");
 
@@ -634,6 +645,25 @@ function stormFacts(inc, inWindow) {
   ];
 }
 
+// The forge-outage brief's facts (#6105): the ceiling's shape over forge reps,
+// the repetitions whose checks errored on a GitHub read during grading.
+function forgeFacts(inc, inWindow) {
+  let reps = 0, forge = 0;
+  const prs = new Set();
+  for (const run of inWindow) {
+    let mine = 0;
+    for (const c of run.cases || []) { reps += repTotal(c.reps); forge += c.reps.forge || 0; mine += c.reps.forge || 0; }
+    if (mine && run.pr != null) prs.add(run.pr);
+  }
+  const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
+  const passed = graded.filter((c) => c.outcome === "passed" || c.outcome === "partial").length;
+  return [
+    fact(true, `<b>${forge} of ${reps} repetitions</b> lost their checks to a GitHub read that failed during grading, across ${plural(prs.size, "PR")}; none counted against a case.`),
+    fact(prs.size > 1, "The evals repositories share one GitHub App installation and its hourly budget, so a second PR already points at the budget, not a branch."),
+    fact(graded.length > 0, graded.length ? `What was graded mostly passed: ${passed} of ${graded.length} graded gate cases.` : "Nothing was graded in this window at all."),
+  ];
+}
+
 // The delegation-ceiling brief's facts (#1874): the storm's shape over
 // ceiling reps. `ceiling_reps` on the run doc anchors the incident's first run.
 function ceilingFacts(inc, inWindow) {
@@ -776,6 +806,12 @@ function briefHeadline(inc, inWindow) {
       lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The front door delegated and the card was still running when the eval stopped waiting, so nothing was graded; those runs read not evaluated, not red. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).`,
     };
   }
+  if (inc.condition === "forge_outage") {
+    return {
+      head: inc.past ? "Grading could not read GitHub" : "Grading cannot read GitHub",
+      lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The GitHub App's hourly rate limit ran out, so checks that read GitHub errored; a catastrophic safeguard among them keeps a run red with nothing about the pull request graded (#6105).`,
+    };
+  }
   if (inc.condition === "deadline_kill") {
     return {
       head: inc.past ? "Runs were killed at the job deadline with nothing graded" : "Runs are being killed at the job deadline with nothing graded",
@@ -824,16 +860,20 @@ function whyTitle(inc) {
   if (inc.condition === "storm") return "Why we think it's a quota storm";
   if (inc.condition === "setup_deaths") return "Why we think it's the setup, not the PRs";
   if (inc.condition === "delegation_ceiling") return "Why we think it's the workers, not the PRs";
+  if (inc.condition === "forge_outage") return "Why we think it's GitHub, not the PRs";
   if (inc.condition === "deadline_kill") return "Why we think it's the gate, not the PRs";
   return "What the data shows";
 }
+
+// The case class that carries an infra condition's own words, for agentSawHtml.
+const INFRA_CLS = { storm: "storm", delegation_ceiling: "delegation-ceiling", forge_outage: "forge-unavailable" };
 
 function agentSawHtml(inc, inWindow) {
   const cases = new Set(inc.cases);
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (INFRA_CLS[inc.condition] ? (c.outcome === "infra" || c.cls === "forge-unavailable") && c.cls === INFRA_CLS[inc.condition] && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -861,7 +901,7 @@ function agentSawHtml(inc, inWindow) {
 
 function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
-  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : inc.condition === "deadline_kill" ? r.cls === "deadline-kill" : (r.storm_reps || 0) > 0));
+  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : inc.condition === "forge_outage" ? (r.cases || []).some((c) => (c.reps.forge || 0) > 0) : inc.condition === "deadline_kill" ? r.cls === "deadline-kill" : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
   if (firstRedMs == null) {
     // Same anchor as mergesFact: without it there is no "before" to show.
@@ -885,6 +925,7 @@ function beingDoneHtml(inc) {
     lines.push(`<p>Wait it out${retest != null ? `: retest after ${esc(et(retest))}` : ""}. The API quota is fixed, so fewer runs at once is the only lever; a retest inside the storm loses repetitions the same way.</p>`);
   } else if (inc.condition === "setup_deaths" && !inc.past) lines.push(`<p>Check the leased pool projects before spending another run: a stuck Helm release or a failing image pull is the usual cause. Retest once the deaths stop.</p>`);
   else if (inc.condition === "delegation_ceiling" && !inc.past) lines.push(`<p>Retest once workers are finishing again. Read <code>platform-agent-gateway.log</code> in a run's artifacts for <code>kanban dispatcher stuck</code> and <code>RESOURCE_EXHAUSTED</code> lines: a stalled dispatcher is #1879, starved workers are the quota.</p>`);
+  else if (inc.condition === "forge_outage" && !inc.past) lines.push(`<p>Retest once the GitHub App's hourly rate limit has reset; a retest before then errors the same checks. The evals repositories of a shard share one App installation's budget (#6105).</p>`);
   else if (inc.condition === "deadline_kill" && !inc.past) lines.push(`<p>Don't retest: a run started now ends the same way. Each killed run's <code>build-log.txt</code> shows how far its units got, and the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. The bot reports healthy once the newest ${PAGE.recoveryGreenRuns} runs with a verdict, green or red, are on distinct PRs and all follow the last kill.</p>`);
   if (inc.past) lines.push(`<p class="mut">This incident is over${inc.untilMs != null ? `; the gate was reported healthy again at ${esc(et(inc.untilMs))}` : ""}.</p>`);
   if (inc.stale) lines.push(`<p class="stale">The data behind this state stopped refreshing; the state is as old as the data.</p>`);
@@ -915,6 +956,7 @@ function runsListHtml(inWindow, inc, title) {
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
     // A run whose every recorded case went ungraded (a storm, or every
     // worker at the delegation ceiling) passed nothing; the chips say why.
+    else if (run.cls === "forge-unavailable") note = '<span class="chip inf">safeguard could not read GitHub</span>';
     else if (!failed.length) note = (run.cases || []).some((c) => c.outcome !== "infra") ? '<span class="chip ok">all gate cases passed</span>' : '<span class="chip inf">nothing graded</span>';
     const stormChip = (run.storm_reps || 0) >= 5 ? `<span class="chip inf">${run.storm_reps} reps lost</span>` : "";
     const ceilingChip = (run.ceiling_reps || 0) >= 5 ? `<span class="chip inf">${run.ceiling_reps} reps at the delegation ceiling</span>` : "";
@@ -934,7 +976,8 @@ function numbers(sinceMs, untilMs) {
   const done = full.filter(concluded);
   const green = done.filter(isGreen);
   const reds = done.length - green.length;
-  const own = done.filter((r) => !isGreen(r) && r.verdict === "red").length;
+  // A red only the forge safeguard explains (classify.py's run-level forge class) is the gate's, not the PR's.
+  const own = done.filter((r) => !isGreen(r) && r.verdict === "red" && r.cls !== "forge-unavailable").length;
   // Named inside the gate's reds, where health.py's infra_reds (the daily
   // digest's "N infra") also counts them: its pr_caused_reds never takes a
   // not-evaluated run, collapsed gate case or not, so the two surfaces agree
@@ -967,7 +1010,7 @@ function lastIncidentHtml() {
   const past = historyIncidents().map(incidentFromHistory).filter((inc) => inc.sinceMs != null).sort((a, b) => b.sinceMs - a.sinceMs);
   if (!past.length) return brief.history ? `<p class="mut">No incident on record yet.</p>` : `<p class="mut">No incident history is published yet, so only the current state is shown.</p>`;
   const inc = past[0];
-  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : inc.condition === "deadline_kill" ? "runs killed at the job deadline" : "a degraded gate";
+  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : inc.condition === "forge_outage" ? "grading unable to read GitHub (rate limit)" : inc.condition === "deadline_kill" ? "runs killed at the job deadline" : "a degraded gate";
   return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a> <a href="${esc(trendHref(inc.cases, inc.sinceMs, inc.untilMs))}">The record on main around the night it started →</a></p>`;
 }
 
@@ -1159,7 +1202,7 @@ function briefHtml(link) {
       beingDoneHtml(inc) + footHtml();
   }
   const { head, lede } = briefHeadline(inc, inWindow);
-  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "deadline_kill" ? deadlineFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
+  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "deadline_kill" ? deadlineFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : inc.condition === "forge_outage" ? forgeFacts(inc, inWindow) : [];
   const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}${inc.stale ? " · STALE" : ""}`;
   let recoveringLine = "";
   if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on distinct PRs so far. A retest is reasonable.</div>`;
@@ -1199,6 +1242,7 @@ function bannerHtml(run) {
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "deadline_kill" && h.recovering) text = `<b>Deadline-kill outage recovering ${when}</b>: runs are reaching verdicts again, so a kill now may be the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "deadline_kill") text = `<b>Runs killed at the deadline ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs reach the job timeout with no verdict, so nothing can pass; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "forge_outage") text = `<b>Grading cannot read GitHub ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: the GitHub App's hourly rate limit ran out, so checks that read GitHub error and those runs say nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "delegation_ceiling") text = `<b>Workers not finishing ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: repetitions end at the harness's delegation wait with the card still running; those runs read not evaluated, not red. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
@@ -1212,6 +1256,7 @@ function tagFor(c) {
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
+  if (c.cls === "forge-unavailable") return '<span class="tag storm">forge unavailable</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
@@ -1220,22 +1265,30 @@ function tagFor(c) {
 // (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
 // the total or a three-rep case would read "all 0 reps lost". `fixture` is
 // the repetitions never run because the lease-time scan saw a fixture the
-// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way.
-function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0); }
+// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way,
+// and `forge` the repetitions whose checks errored on a forge read that failed
+// during grading (REP_FORGE).
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0) + (reps.forge || 0); }
 function lostText(reps) {
   const parts = [];
   if (reps.infra) parts.push(`${reps.infra} lost`);
   if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
   if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
   return parts.length ? ` (${parts.join(", ")})` : "";
 }
 function ungradedText(reps) {
   const total = plural(repTotal(reps), "rep");
-  if (reps.fixture && !reps.infra && !reps.ceiling) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
-  if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
-  const fixture = reps.fixture ? `, ${reps.fixture} not run, fixture drifted` : "";
-  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling${fixture}`;
-  if (reps.fixture) return `all ${total} ungraded: ${reps.infra} lost before grading${fixture}`;
+  if (reps.fixture && !reps.infra && !reps.ceiling && !reps.forge) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
+  if (reps.ceiling && !reps.infra && !reps.forge) return `all ${total} hit the delegation ceiling with the worker still running`;
+  if (reps.forge && !reps.infra && !reps.ceiling && !reps.fixture) return `all ${total} not graded: a forge read failed during grading`;
+  // A mix: each kind that has repetitions, in lostText's order.
+  const parts = [];
+  if (reps.infra) parts.push(`${reps.infra} lost before grading`);
+  if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
+  if (parts.length > 1) return `all ${total} ungraded: ${parts.join(", ")}`;
   return `all ${total} lost before grading`;
 }
 
@@ -1287,6 +1340,9 @@ function whatToDoHtml(run) {
     items.push("<li><b>Nothing right now.</b> Retesting before the gate is healthy will fail the same way.</li>");
     items.push("<li>Run <code>/retest</code> once the brief says healthy again (the Chat space announces it).</li>");
     items.push('<li>If a case here were marked <span class="tag yours">only your PR</span>, the fix would be on you: the transcript usually names the problem.</li>');
+  } else if (run.cls === "forge-unavailable") {
+    items.push(runDoHtml(run.do));
+    items.push("<li>The run is red because a catastrophic safeguard could not read GitHub, not because a check failed; nothing here is about your change.</li>");
   } else {
     const yours = (run.cases || []).filter((c) => c.cls === "only-this-pr").length;
     items.push(`<li><b>Fix the PR.</b> ${yours ? "Retesting won't change this: the case passes for everyone else." : "Nothing on other PRs matches the unexplained failure, so treat it as yours until the transcript says otherwise."}</li>`);
@@ -1314,16 +1370,22 @@ function runHtml(link) {
   // the held-out tag). A named case this run has no record of (the log
   // parsed no task for it) is listed by name under the same heading.
   const suiteLost = new Set(run.verdict === "not_evaluated" && Array.isArray(run.not_evaluated) ? run.not_evaluated.map(String) : []);
-  const lost = cases.filter((c) => c.outcome === "infra" && (c.admitted || suiteLost.has(c.case)));
+  // Cases whose checks could not read GitHub (classify.py's forge class): a
+  // safeguard-blocked one can red the run whether it is admitted, held out,
+  // partial or ungraded, so they are listed together, never as passed.
+  const forge = cases.filter((c) => c.cls === "forge-unavailable");
+  const notForge = (c) => c.cls !== "forge-unavailable";
+  const lost = cases.filter((c) => notForge(c) && c.outcome === "infra" && (c.admitted || suiteLost.has(c.case)));
   const lostUnrecorded = [...suiteLost].filter((name) => !cases.some((c) => c.case === name));
-  const partial = cases.filter((c) => c.admitted && c.outcome === "partial");
+  const partial = cases.filter((c) => notForge(c) && c.admitted && c.outcome === "partial");
   const passed = cases.filter((c) => c.admitted && c.outcome === "passed");
-  const heldPassed = cases.filter((c) => !c.admitted && (c.outcome === "passed" || c.outcome === "partial"));
+  const heldPassed = cases.filter((c) => notForge(c) && !c.admitted && (c.outcome === "passed" || c.outcome === "partial"));
   const heldFailed = cases.filter((c) => !c.admitted && c.outcome === "failed");
   let body = "";
   if (failed.length) body += `<div class="sec"><h2>Failed gate cases · ${failed.length}</h2>${failed.map((c) => caseCard(run, c)).join("")}</div>`;
   if (lost.length || lostUnrecorded.length) body += `<div class="sec"><h2>Not graded · ${lost.length + lostUnrecorded.length}</h2>${lost.map((c) => caseCard(run, c)).join("")}` +
     (lostUnrecorded.length ? `<div class="passed">${lostUnrecorded.map((name) => `<span>${esc(name)}</span>`).join("")}</div><p class="mut small">Named by the suite's verdict; this run's log recorded no grading for ${lostUnrecorded.length === 1 ? "it" : "them"}.</p>` : "") + "</div>";
+  if (forge.length) body += `<div class="sec"><h2>Could not read GitHub · ${forge.length}</h2>${forge.map((c) => caseCard(run, c)).join("")}<p class="mut small">These checks errored on a GitHub read during grading (usually the GitHub App's hourly rate limit); a catastrophic safeguard among them keeps the run red, held-out case or not, with nothing about your change graded.</p></div>`;
   if (partial.length) body += `<div class="sec"><h2>Passed on retry · ${partial.length}</h2><div class="passed">${partial.map((c) => `<span>${esc(c.case)}</span>`).join("")}</div><p class="mut small">Some repetitions failed; the gate counts a case as failed only when every graded repetition fails.</p></div>`;
   if (passed.length || heldPassed.length) body += `<div class="sec"><h2>Passed · ${passed.length + heldPassed.length}</h2><div class="passed">${passed.map((c) => `<span>${esc(c.case)}</span>`).join("")}${heldPassed.length ? `<span class="held">+${heldPassed.length} held out</span>` : ""}</div></div>`;
   if (heldFailed.length) body += `<div class="sec"><h2>Held out · failed · ${heldFailed.length}</h2><div class="passed">${heldFailed.map((c) => `<span class="held">${esc(c.case)}</span>`).join("")}</div><p class="mut small">Held-out cases are measured but never block a PR.</p></div>`;
@@ -1566,7 +1628,7 @@ function gridMarkers(win, cols) {
       seen.push({ t, cls });
       markers.push({ t, cls, label, title: `${et(t)} · ${label}` });
     };
-    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : inc.condition === "deadline_kill" ? "deadline kills" : "degraded");
+    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : inc.condition === "forge_outage" ? "forge outage" : inc.condition === "deadline_kill" ? "deadline kills" : "degraded");
     for (const inc of historyIncidents().map(incidentFromHistory)) {
       add(inc.sinceMs, "incident", `${inc.state.toLowerCase()}: ${what(inc)}`);
       add(inc.untilMs, "recovered", "healthy again");
@@ -1685,7 +1747,7 @@ function detailHtml() {
   const others = (run.cases || []).filter((x) => x.case !== c.case && x.outcome === "passed").length;
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
   const length = startMs != null && finishMs != null ? ` · ${minutesText(finishMs - startMs)} run` : "";
-  const tag = c.outcome === "failed" || c.outcome === "infra" ? ` · ${tagFor(c)}` : "";
+  const tag = c.outcome === "failed" || c.outcome === "infra" || c.cls === "forge-unavailable" ? ` · ${tagFor(c)}` : "";
   const n = repOf(c), url = transcriptUrl(run, c.case, n), log = buildUrl(run);
   return `<div class="detail" id="detail"><h3><code>${esc(c.case)}</code> · ${prLink(run.pr)} · ${esc(et(runFinish(run)))} · project ${esc(projectShort(run.project))}<button type="button" class="close" data-toggle="close">close ×</button></h3>` +
     `<div class="sub">${esc(how)}${esc(length)} · ${plural(others, "other case")} passed in this run${tag}</div>` +
@@ -1809,7 +1871,9 @@ function nightCaseRow(night, c, newly) {
   const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`,
     // A name the link grammar refuses could not reach the timing section.
     linkCaseIds([c.case]).length ? `<a href="${esc(nightTimingHref(night, [c.case]))}">timing</a>` : ""].filter(Boolean).join(" · ");
-  const p90 = Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "";
+  const p90 = (Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "") +
+    // The estimated end-to-end Slack time beside the agent time (slack_estimate.py).
+    (Number.isFinite(c.slack_e2e_s) ? `<br><small class="mut" title="estimated: agent time + that night's Slack delivery lag + a Slack post's time per message the reply posted">Slack ≈ ${esc(secText(c.slack_e2e_s))}</small>` : "");
   return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
     `<td>${nightStatePill(c)}</td>` +
     `<td class="num" title="repetitions passed / graded">${esc(nightRepText(c))}</td>` +
@@ -1817,6 +1881,17 @@ function nightCaseRow(night, c, newly) {
     nightShapeCell(c) +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
+}
+
+// The night's estimated Slack times, when the Slack lane recorded its overhead
+// that night (SCHEMA.md: nights[].slack); nothing otherwise.
+function nightSlackHtml(night) {
+  const s = night.slack;
+  if (!s || !Number.isFinite(s.e2e_p50_s)) return "";
+  const ack = Number.isFinite(s.first_ack_p50_s) ? ` · time to first ack p50 ${secText(s.first_ack_p50_s)}${Number.isFinite(s.first_ack_p95_s) ? `, p95 ${secText(s.first_ack_p95_s)}` : ""}` : "";
+  const p95 = Number.isFinite(s.e2e_p95_7n_s) ? ` (${PAGE.slackP95Nights}-night average ${secText(s.e2e_p95_7n_s)})` : "";
+  return `<p class="small"><b>Slack, estimated:</b> end to end p50 ${secText(s.e2e_p50_s)}, p95 ${secText(s.e2e_p95_s)}${p95}${ack}.</p>` +
+    `<p class="mut small">How: each case's agent time (median) + that night's Slack delivery lag + a Slack post's time for each message its reply posted, from the A2A gateway's metrics on the Slack lane's canaries. It is a lower bound: it misses what a busy workspace adds, such as rate limits under load, other posters in the channel, and a person's client rendering the message.</p>`;
 }
 
 function nightCasesTable(night) {
@@ -1932,7 +2007,7 @@ function nightlyHtml(link) {
     tile("Newly failing", `${night.previous_build == null || nightWithheldBy(night) ? "—" : night.newly_failing.length}`, nightWithheldBy(night) ? `no ${PAGE.nightPartWords[nightWithheldBy(night)] || nightWithheldBy(night)} on record` : night.previous_build == null ? "first night on record" : "against the night before") +
     (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     (shape ? tile("Opens on answer", `${pct(shape.opens_on_verdict / shape.n)}`, [`of ${plural(shape.n, "rep")}`, Number.isFinite(shape.answer_words_p50) ? `answer p50 ${plural(shape.answer_words_p50, "word")}` : "", `${shape.apology} with an apology`].filter(Boolean).join(" · ")) : "") +
-    `</div></div>`;
+    `</div>${nightSlackHtml(night)}</div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
     `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. Opens on answer counts the repetitions whose reply opens on its verdict rather than a lead-in or a heading, out of those measured, with the answer's median length under it; it is reported, never graded. The transcript is the first repetition's.</p></div>` +

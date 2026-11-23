@@ -21,7 +21,8 @@
 id: node-pid-pressure-fork-exhaustion
 name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit)"
 domain: fleet-audits
-suite: certification
+suite: validated-capabilities
+suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -32,7 +33,7 @@ prompt: >-
   gce-compute-fleet-audit SOP.
 expected_output: >-
   Reads the fleet's existing multi-process workload on a pool with no pod PID
-  limit. Customer failure: kubelet PIDPressure and eviction. Certified means:
+  limit. Customer failure: kubelet PIDPressure and eviction. Validated means:
   the ledger issue carries a finding that names Deployment
   `multi-process-worker` in namespace `seeded-shapes` as a multi-process
   workload on pool `default-pool`, whose kubelet configuration sets no pod PID

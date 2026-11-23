@@ -47,8 +47,9 @@ below say where violations hide; the paragraph is the test.
   flag a progress line that survives the answer.
 - **No plumbing in user text**: Flag task ids, card ids, session keys, file paths, tool names,
   JSON, CLI flags, exit codes and roster ids used as names. Allow a cluster, a workload, a linked
-  pull request, a specialist's name where `SOUL.md` asks for attribution, and a board read's short
-  task id.
+  pull request, a specialist's name where `SOUL.md` asks for attribution, a board read's short
+  task id, and the command and output fences of the evidence section `kanban_complete` renders
+  from `verified_claims`.
 - **Choices are buttons**: Flag a choice offered without buttons, a button that does not send its
   answer, "reply X", "type X" or "say X" in a message body; flag more than 5 buttons in one row.
   Allow the text fallback listing the options.
@@ -56,7 +57,9 @@ below say where violations hide; the paragraph is the test.
   line, a gateway notice longer than that line, a failure that does not say what would work instead,
   a retry or re-route offered as text rather than a button, or a retry promise; for each promise, find the code that retries and flag it when none runs on that path.
 - **Speak up only when it matters**: Flag a new message of its own that is not the
-  acknowledgement, a pull request opened, a question only the user can answer, a failure, or done.
+  acknowledgement, a pull request opened, a question only the user can answer, a failure, done, or
+  a home-channel notice once per change (set by a mention, set or moved on Slack's Home tab, or the
+  one digest of kept posts when a home arrives).
 - **A destructive action needs the asker's confirm**: Flag a destructive action reachable without
   stating the resolved target back and the asker's explicit confirm, or a confirm another
   participant can satisfy.

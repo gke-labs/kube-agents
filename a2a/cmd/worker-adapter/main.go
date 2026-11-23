@@ -134,6 +134,12 @@ const (
 	// checks that the variable is non-empty.
 	defaultModelBaseURL = "http://inference-gateway"
 	defaultModelAPIKey  = "a2a-playground" // #nosec G101 -- placeholder, not a secret
+
+	// The env names that tell the harness how to reach the model.
+	modelBaseURLEnv   = "ANTHROPIC_BASE_URL"
+	modelAPIKeyEnv    = "ANTHROPIC_API_KEY"    // #nosec G101 -- env name, not a credential
+	modelAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN" // #nosec G101 -- env name, not a credential
+	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
 func main() {
@@ -151,11 +157,27 @@ func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	// `worker-adapter mcp` is not a task run: it is the stdio MCP server the
-	// harness launches as a subprocess of itself, forwarding the session's
-	// one delegate tool call to this adapter process over a unix socket
-	// (worker-adapter/mcp.go). It has none of the task env below, so it is
-	// dispatched before configFromEnv rather than folded into it.
+	// The two subcommands are not task runs: each is a stdio MCP server the
+	// harness launches as a subprocess of itself, with none of the task env
+	// below, so they are dispatched before configFromEnv rather than folded
+	// into it.
+	//
+	// `worker-adapter mcp-relay <url>` is what a profile persona's broker
+	// servers are rendered as (worker-adapter/mcprelay.go): it carries
+	// messages to the broker's relay with the pod's credentials.
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.MCPRelayCommand {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: worker-adapter mcp-relay <broker relay URL>")
+			return 2
+		}
+		if err := workeradapter.ServeMCPRelay(context.Background(), os.Args[2], os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintln(os.Stderr, "mcp-relay:", err)
+			return 1
+		}
+		return 0
+	}
+	// `worker-adapter mcp` forwards the session's one delegate tool call to
+	// this adapter process over a unix socket (worker-adapter/mcp.go).
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
 		if err := serveMCP(context.Background(), os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintln(os.Stderr, "mcp:", err)
@@ -205,7 +227,12 @@ func run() int {
 			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
-			ResetPaths:    resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
+			// The persona's MCP servers through the broker's relay (#5495).
+			Relay:      workeradapter.ProfileRelay(selfPath(), os.Getenv),
+			ResetPaths: resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
+			// What a script-run task's credential is verified against
+			// (#5622): rendered into Job templates only.
+			TaskSigningKeys: os.Getenv("A2A_TASK_SIGNING_PUBLIC_KEYS"),
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
@@ -448,10 +475,7 @@ func harnessCommand() []string {
 		// and speaks MCP to it over stdio; strictMCPConfigFlag above keeps a
 		// stray project or user MCP config from adding tools the gateway
 		// never vetted.
-		self, err := os.Executable()
-		if err != nil || self == "" {
-			self = "/usr/local/bin/worker-adapter"
-		}
+		self := selfPath()
 		sock := workeradapter.DelegateSocketPath()
 		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
 			workeradapter.DelegateMCPServer: map[string]any{
@@ -600,7 +624,8 @@ var busCredentialEnv = []string{"NATS_PASSWORD", "NATS_USER", "NATS_URL"}
 // credential, plus model-auth defaults. With nothing configured, the harness
 // talks to the install's own LiteLLM - Vertex-backed via the install's
 // credentials, no per-worker key (playground posture; the deployment spec's
-// auth story replaces this).
+// auth story replaces this). The placeholder key goes in whenever the pod
+// sets no key, no bearer token and no Vertex, so a pod spec never needs one.
 func harnessEnv() []string {
 	withheld := make(map[string]bool, len(busCredentialEnv))
 	for _, key := range busCredentialEnv {
@@ -616,12 +641,18 @@ func harnessEnv() []string {
 	has := func(key string) bool {
 		return os.Getenv(key) != ""
 	}
-	if !has("ANTHROPIC_BASE_URL") && !has("CLAUDE_CODE_USE_VERTEX") && !has("ANTHROPIC_API_KEY") {
-		env = append(env,
-			"ANTHROPIC_BASE_URL="+defaultModelBaseURL,
-			// LiteLLM here runs keyless; the value only satisfies the
-			// harness's "an API key exists" check.
-			"ANTHROPIC_API_KEY="+defaultModelAPIKey)
+	if !has(modelBaseURLEnv) && !has(modelUseVertexEnv) && !has(modelAPIKeyEnv) {
+		env = append(env, modelBaseURLEnv+"="+defaultModelBaseURL)
+	}
+	// The gateway runs keyless. The placeholder only satisfies the harness's
+	// "an API key exists" check. The adapter adds it here, in the child env,
+	// also when the pod sets ANTHROPIC_BASE_URL (an AgentProfile worker sets
+	// the full gateway name). Thus a pod spec does not need a literal model
+	// key, which the AI workload audit flags (fleet-audit check 3.5,
+	// model-credential-plaintext-env). Vertex and a bearer token do not use
+	// the key, so the adapter does not add it.
+	if !has(modelAPIKeyEnv) && !has(modelUseVertexEnv) && !has(modelAuthTokenEnv) {
+		env = append(env, modelAPIKeyEnv+"="+defaultModelAPIKey)
 	}
 	for _, kv := range []string{
 		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
@@ -679,7 +710,7 @@ func readPrimer(log *slog.Logger) string {
 	if path == "" {
 		return ""
 	}
-	b, err := os.ReadFile(path) // #nosec G304 -- the spawner's own mount path
+	b, err := os.ReadFile(path) // #nosec G304 G703 -- the spawner's own mount path (lib.EnvPrimerFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Warn("could not read the transcript primer; this turn runs without the conversation so far", "path", path, "error", err)
@@ -695,4 +726,15 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// selfPath is this binary's path, for the harness to launch it again as an
+// MCP server (`mcp`, `mcp-relay`): the image's install path when the running
+// executable can't be found.
+func selfPath() string {
+	self, err := os.Executable()
+	if err != nil || self == "" {
+		return "/usr/local/bin/worker-adapter"
+	}
+	return self
 }

@@ -10,6 +10,7 @@ deployments continue to use the direct path.
 import argparse
 import email.message
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -37,10 +38,24 @@ import repo_ref  # noqa: E402 — needs the sys.path lines above
 import wif_credentials  # noqa: E402 — needs the sys.path lines above
 from credential_proxy_client import authorization_headers  # noqa: E402
 
+# A URL's userinfo, the part between "<scheme>://" and the last "@" before
+# the path, query or fragment, where a URL parser ends it: it can carry a
+# credential, so nothing this script logs keeps it. Greedy, so an "@" inside
+# the userinfo can't leave the rest of it behind.
+# No word-boundary anchor, so a scheme glued to the text before it is still
+# found, and a bounded scheme keeps the scan linear on long lines.
+_URL_USERINFO = re.compile(r"(?i)([a-z][a-z0-9+.-]{0,30}://)[^\s/?#]*@")
+
+
+def redact_url(text: str) -> str:
+    """text with the userinfo of every URL in it replaced by [REDACTED]."""
+    return _URL_USERINFO.sub(r"\1[REDACTED]@", text)
+
 
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
+    # Every line is redacted here, whatever its caller formatted into it.
+    print(f"[{timestamp}] [SRE-AUTH] {redact_url(msg)}", file=sys.stderr, flush=True)
 
 
 TOKEN_BROKER_URL = os.getenv(
@@ -140,10 +155,32 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 #: Opened without a proxy and without following redirects: the broker forwards
-#: HTTP_PROXY into this helper for its GitHub and Minty traffic, and a
-#: link-local metadata address must never be sent through it or lead anywhere
-#: else. Module-level so a test can stand in for it.
+#: HTTP_PROXY into this helper for its traffic to GitHub and to a token minter
+#: outside the cluster, and a link-local metadata address must never be sent
+#: through it or lead anywhere else. Module-level so a test can stand in for it.
 metadata_open = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
+
+#: The host name suffixes of a Service of this cluster, the two that the
+#: suggested NO_PROXY names, and the name of the loopback host.
+CLUSTER_HOST_SUFFIXES = (".svc", ".cluster.local")
+LOOPBACK_HOST_NAME = "localhost"
+
+#: Opened without a proxy: the credential broker, and a token minter that is a
+#: Service of this cluster or on this pod. urllib does not leave out a cluster
+#: or a loopback host by itself, and for an http URL the proxy would get the
+#: request with its token.
+_IN_CLUSTER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _inside_the_cluster(url: str) -> bool:
+    """Whether `url` names a Service of this cluster or a loopback address, which no egress proxy serves."""
+    host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == LOOPBACK_HOST_NAME or host.endswith(CLUSTER_HOST_SUFFIXES):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 #: How the broker identity token was minted on this run, for the one line the
 #: refresh writes last: the sidecar logs the tail of this helper's output, so
@@ -362,13 +399,16 @@ def github_repo_from_remote(url: str) -> str | None:
     """
     ref = repo_ref.try_parse(url)
     if ref is None:
-        log(f"Ignoring git remote: '{url}' is not a repository URL.")
+        # A remote that was refused is never quoted: it came from outside the
+        # script and may carry a credential in a shape no redaction names.
+        # The operator reads it from .git/config.
+        log("Ignoring git remote: it is not a repository URL.")
         return None
     if not ref.host_stated:
-        log(f"Ignoring git remote: '{url}' names no host.")
+        log("Ignoring git remote: it names no host.")
         return None
     if not ref.is_github:
-        log(f"Ignoring git remote: host '{ref.host}' is not a GitHub host.")
+        log("Ignoring git remote: its host is not a GitHub host.")
         return None
     if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH:
         log(f"Ignoring git remote: path '{ref.path}' is not an owner/repo slug.")
@@ -604,9 +644,14 @@ def request_minty_token(
             req = urllib.request.Request(
                 TOKEN_BROKER_URL, data=req_data, headers=headers, method="POST"
             )
-            with urllib.request.urlopen(
-                req, timeout=MINTY_REQUEST_TIMEOUT_SECONDS
-            ) as response:
+            # The operator's minter is a Service of this cluster and takes no
+            # proxy; a minter outside the cluster keeps the environment's.
+            opened = (
+                _IN_CLUSTER_OPENER.open(req, timeout=MINTY_REQUEST_TIMEOUT_SECONDS)
+                if _inside_the_cluster(TOKEN_BROKER_URL)
+                else urllib.request.urlopen(req, timeout=MINTY_REQUEST_TIMEOUT_SECONDS)
+            )
+            with opened as response:
                 if response.status == 200:
                     token = response.read().decode("utf-8").strip()
                     break
@@ -844,7 +889,7 @@ def refresh_git_credentials(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=SIDECAR_REFRESH_TIMEOUT_SECONDS) as response:
+            with _IN_CLUSTER_OPENER.open(request, timeout=SIDECAR_REFRESH_TIMEOUT_SECONDS) as response:
                 if response.status == 200:
                     log(
                         f"GitHub credentials refreshed in credential sidecar for {repository}."
