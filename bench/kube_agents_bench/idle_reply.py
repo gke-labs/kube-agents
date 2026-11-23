@@ -167,7 +167,10 @@ def session_pod(pods_json: str | None, conversation: str) -> str | None:
 
     ``pods_json`` is ``kubectl get pods -o json`` over the session pods.
     ``None`` when the read failed (``pods_json`` is ``None`` or not JSON);
-    ``""`` when no live pod matches. A pod being deleted doesn't count.
+    ``""`` when no live pod matches. A pod being deleted, or one whose worker
+    exited (phase ``Succeeded`` or ``Failed``; session pods never restart), doesn't
+    count: the same pods the gateway's own live list skips (``SessionPods`` in
+    ``a2a/gateway/spawn.go``), so the harness and the gateway agree on which pod is live.
     """
     import json
 
@@ -180,6 +183,8 @@ def session_pod(pods_json: str | None, conversation: str) -> str | None:
     for pod in items:
         meta = pod.get("metadata") or {}
         if meta.get("deletionTimestamp"):
+            continue
+        if (pod.get("status") or {}).get("phase") in ("Succeeded", "Failed"):
             continue
         if (meta.get("annotations") or {}).get(SESSION_KEY_ANNOTATION) == conversation:
             return str(meta.get("name") or "")

@@ -222,6 +222,22 @@ def test_session_pod_finds_the_live_pod_for_the_conversation():
     assert idle_reply.session_pod("not json", CONVERSATION) is None
 
 
+def test_session_pod_skips_a_pod_whose_worker_exited():
+    """A session pod never restarts, so one in a terminal phase stays listed
+    until the gateway's sweep deletes it. It is not the live pod: the harness
+    skips it as the gateway's own live list does, whether or not a live pod
+    sorts after it."""
+    import json
+
+    def pod(name, phase):
+        return {"metadata": {"name": name, "annotations": {idle_reply.SESSION_KEY_ANNOTATION: CONVERSATION}}, "status": {"phase": phase}}
+
+    for phase in ("Succeeded", "Failed"):
+        assert idle_reply.session_pod(json.dumps({"items": [pod("chat-a", phase), pod("chat-b", "Running")]}), CONVERSATION) == "chat-b"
+        assert idle_reply.session_pod(json.dumps({"items": [pod("chat-a", phase)]}), CONVERSATION) == ""
+    assert idle_reply.session_pod(json.dumps({"items": [pod("chat-a", "Pending")]}), CONVERSATION) == "chat-a"
+
+
 def test_an_opening_turn_that_did_not_complete_waits_for_nothing(monkeypatch):
     monkeypatch.setattr(harness.time, "sleep", lambda s: pytest.fail("the harness waited"))
     monkeypatch.setattr(
