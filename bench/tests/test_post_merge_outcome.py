@@ -48,7 +48,7 @@ def pod(tmp_path, monkeypatch):
     db = tmp_path / "kv.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, merged_at TEXT, applied_at TEXT, "
+            "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, kind TEXT, merged_at TEXT, applied_at TEXT, "
             "health_result TEXT, outcome TEXT, outcome_at TEXT, outcome_detail TEXT, reported_at TEXT)"
         )
     jobs = tmp_path / "jobs.json"
@@ -62,9 +62,10 @@ def pod(tmp_path, monkeypatch):
 
 def _set_record(db: Path, **row) -> None:
     with sqlite3.connect(db) as conn:
-        conn.execute("INSERT OR REPLACE INTO post_merge_records (url, outcome, outcome_detail, reported_at) "
-                     "VALUES (?, ?, ?, ?)",
-                     (PR, row.get("outcome"), row.get("outcome_detail"), row.get("reported_at", "silent: 2026-11-18")))
+        conn.execute("INSERT OR REPLACE INTO post_merge_records (url, kind, outcome, outcome_detail, reported_at) "
+                     "VALUES (?, ?, ?, ?, ?)",
+                     (PR, row.get("kind", "no-pdb"), row.get("outcome"), row.get("outcome_detail"),
+                      row.get("reported_at", "silent: 2026-11-18")))
 
 
 class Forge:
@@ -136,7 +137,7 @@ def _no_kubectl(real):
 
 def _verifier(**overrides) -> post_merge.PostMergeOutcomeVerifier:
     fields = {"type": "post_merge_outcome", "owner": "gke-agentic", "outcome": "verified_fixed",
-              "apply_fixture_role": "no-pdb-workload", **overrides}
+              "apply_fixture_role": "no-pdb-workload", "recipe": "no-pdb", **overrides}
     return post_merge.PostMergeOutcomeVerifier(**fields)
 
 
@@ -286,7 +287,20 @@ def test_read_record_needs_the_sentinel():
 
 
 def test_a_spec_with_the_check_parses():
-    parse_node({"type": "post_merge_outcome", "outcome": "verified_fixed", "apply_fixture_role": "no-pdb-workload"})
+    parse_node({"type": "post_merge_outcome", "outcome": "verified_fixed", "apply_fixture_role": "no-pdb-workload",
+                "recipe": "no-pdb"})
+
+
+def test_a_bad_recipe_name_fails_at_load():
+    for bad in ("No_PDB", "", "-x"):
+        with pytest.raises(ValueError):
+            _verifier(recipe=bad)
+
+
+def test_a_record_of_another_recipe_fails(world):
+    _set_record(world.pod.db, kind="blocking-pdb", outcome="verified_fixed")
+    status, reason, _ = _verifier()._check(5)
+    assert status == "fail" and "recorded as a 'blocking-pdb' fix, not the 'no-pdb' recipe" in reason
 
 
 def test_the_entry_point_is_published():
