@@ -1,0 +1,78 @@
+# WHAT THIS GRADES: at the session cap, a new conversation gets the busy
+# notice, then its answer (#6882, part of #6538's front-door parity). With
+# every session worker busy and none idle to evict, the gateway used to refuse
+# the turn ("🚦 not started: N session workers are already running (cap N)")
+# and nothing ran. Now the turn waits in a bounded line: one queued notice
+# (`⏳ queued — every session worker is busy ...`), then, once a worker frees,
+# the task starts on the same conversation and answers.
+#
+# HOW. The prompt's first line is the harness's session-cap directive
+# (bench/kube_agents_bench/session_cap.py). The harness reads the install's
+# session cap off the gateway Deployment (A2A_MAX_SESSIONS), opens that many
+# `/session` conversations through the inject door, each running `sleep 240`
+# so its worker stays busy, then sends the ask below on one conversation
+# more. The door answers that POST with the `queued` refusal and the notice;
+# the harness then cancels the fillers, so a worker frees, and follows the
+# queued turn's task to its answer. The fillers are cancelled whatever
+# happens. A literal block (|-) keeps the directive on its own line.
+#
+# WHAT IT NEEDS: a session cap of at most 2 (max-cap=2), and the inject door
+# (AGENT_TRANSPORT=inject, every CI lane). `/session` reaches the session
+# route on either front door. The case can't set the cap itself. On an
+# install whose cap is above 2 (the shipped 10; the presubmit-sized nightly's
+# 6) it is not evaluable and the harness reports it as infrastructure, naming
+# the cap, before it sends anything: the bench has no "not applicable" class
+# for a case precondition. The same goes for a run where the cap never filled
+# (a filler's task ended before the ask went, so the ask started at once).
+# Its evidence runs come from twins whose twin-only commit sets the cap to 2
+# (hack/ci-deploy.sh: MODE_NEXT_MAX_SESSIONS=2 just before
+# MAX_SESSIONS_HELM_SETS is built, which renders
+# platformAgent.harness.tuning.maxSessions=2). Other units sharing the
+# install's cap only make the line longer: the queued turn may wait behind
+# theirs, inside the gateway's five-minute bound.
+#
+# Red without the line: the ask gets the cap's "not started" refusal and no
+# task, so harness_session_cap_queued fails (with the refusal as the output)
+# and the answer check finds no PINEAPPLE. Green: the queued notice, then the
+# task the queued turn started, then its answer, which says PINEAPPLE.
+#
+# Isolation class: read-only; it writes nothing to any cluster or repository.
+# Eligible tier: nightly (registered in hack/eval/nightly-cases.txt).
+id: session-front-door-cap-busy-notice
+name: At the session cap, a new conversation gets the busy notice, then its answer
+prompt: |-
+  [bench:session-cap-queue] max-cap=2
+  /session Reply with the single word PINEAPPLE and nothing else.
+expected_output: >-
+  Every session worker is busy, so the conversation first gets the gateway's
+  queued notice. Once a worker frees, its task starts on the same
+  conversation and the answer is the single word PINEAPPLE.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a chat question routed to the agent that
+# can answer it.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+verification_spec:
+  # The conversation shows the queued notice, then the task the queued turn
+  # started, then a post of that task's. A turn refused at the cap fails it.
+  - name: the-turn-was-queued-then-started
+    role: objective
+    # assert, not the converge default: the record is fixed once the run
+    # ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["harness_session_cap_queued"]
+      require_success: true
+  - name: the-queued-turn-answered
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["pineapple"]

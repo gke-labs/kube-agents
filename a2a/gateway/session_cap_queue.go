@@ -11,9 +11,10 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
-// The session-cap line (#6882). At the cap with nothing to evict, a chat
-// turn that needs a fresh session pod waits in a bounded FIFO line instead
-// of being refused, and starts when a slot frees.
+// The session-cap line (#6882). At the cap with nothing to evict, a turn
+// that needs a fresh session pod waits in a bounded FIFO line instead of
+// being refused, and starts when a slot frees. Chat backends, the console and
+// the inject door park; the A2A door classes keep the refusal (parksAtCap).
 //
 // Parking never blocks a goroutine. Inbound turns run one at a time per
 // conversation on its inbox worker (keyedQueue), under its session lock, so
@@ -117,9 +118,9 @@ type capWaiter struct {
 }
 
 // capParkKey carries the turn a session-cap check may park, set by
-// routeTurn for a turn whose backend can show the notice. A check without
-// it (a door turn, a test calling refuseAtSessionCap directly) refuses at
-// the cap as before the line existed.
+// routeTurn for a turn whose backend may park (parksAtCap). A check without
+// it (an A2A door turn, a test calling refuseAtSessionCap directly) refuses
+// at the cap as before the line existed.
 type capParkKey struct{}
 
 func withParkableTurn(ctx context.Context, msg InboundMessage) context.Context {
@@ -131,13 +132,54 @@ func parkableTurn(ctx context.Context) (InboundMessage, bool) {
 	return msg, ok
 }
 
-// parksAtCap reports whether a turn from backend may wait in the line. The
-// door classes may not: their callers are programs holding the turn to a
-// bound, which read a turn that ended without a task as "nothing started"
-// (InjectAdapter.claimTurn), so a task that started later would be one
-// nobody is waiting for. They keep the cap's refusal, as busyNoticeBackend
-// keeps them off the busy notice.
-func parksAtCap(backend string) bool { return busyNoticeBackend(backend) }
+// parksAtCap reports whether a turn from backend may wait in the line: the
+// chat backends, the console, and the inject door. The inject door is the
+// eval harness's stand-in for a chat user (armed only on an eval install), so
+// its turns wait as a chat user's do, and its caller learns so as a fact: the
+// gateway tells the door the turn is queued (CapLineObserver.TurnQueued), the
+// POST is answered with the queued refusal rather than "no task", and the
+// queued notice, the task the turn later starts and its answer land on the
+// conversation the caller reads, as they land in a chat thread. The A2A door
+// classes keep the cap's refusal: their callers are programs that read a turn
+// ended without a task as nothing started, so a task that started later would
+// be one nobody is waiting for.
+func parksAtCap(backend string) bool {
+	return backend == injectBackend || busyNoticeBackend(backend)
+}
+
+// CapLineObserver is implemented by an adapter whose caller is a program
+// that has to know what the session-cap line does with its turns: the inject
+// door. Both are called on the conversation's inbox worker or the line's
+// loop: record and return.
+//
+// TurnQueued says the turn now ending waits in the line (parked, or a
+// later message held behind a parked turn), so it is not a turn that started
+// nothing. ClaimRedelivery is asked before the line puts n messages back on
+// the conversation's inbox, which ends in n turns no caller handed over; the
+// adapter counts them as handed, so its own bookkeeping of which turn is
+// whose stays whole, and reports false while a turn it handed over has not
+// ended, in which case nothing is put back and the line tries again later.
+type CapLineObserver interface {
+	TurnQueued(conversation string)
+	ClaimRedelivery(conversation string, n int) bool
+}
+
+// observeTurnQueued tells a CapLineObserver adapter that key's turn waits in
+// the line.
+func (g *Gateway) observeTurnQueued(key string) {
+	if observer, ok := g.adapter.(CapLineObserver); ok {
+		observer.TurnQueued(key)
+	}
+}
+
+// claimRedelivery asks a CapLineObserver adapter whether n messages may go
+// back on key's inbox now; any other adapter always says yes.
+func (g *Gateway) claimRedelivery(key string, n int) bool {
+	if observer, ok := g.adapter.(CapLineObserver); ok {
+		return observer.ClaimRedelivery(key, n)
+	}
+	return true
+}
 
 func (g *Gateway) initCap() {
 	g.capOnce.Do(func() {
@@ -257,6 +299,7 @@ func (g *Gateway) capPark(key string, msg InboundMessage, after *[]func()) bool 
 		return false
 	}
 	g.log.Info("session cap: turn queued", "conversation", key, "position", n)
+	g.observeTurnQueued(key)
 	*after = append(*after, func() {
 		g.postCapNotice(w)
 		g.kickCapQueue()
@@ -333,8 +376,15 @@ func (g *Gateway) retryCapHead() {
 		return
 	}
 	w := g.capQueue[0]
-	w.retrying = true
 	msgs := append([]InboundMessage{w.msg}, w.followUps...)
+	// A door with a turn of its own still running on the conversation says
+	// not yet; the next nudge or poll tries again. Asked under capMu so
+	// the count the door takes is the count put back.
+	if !g.claimRedelivery(w.key, len(msgs)) {
+		g.capMu.Unlock()
+		return
+	}
+	w.retrying = true
 	msgs[0].capRetry = w.ticket
 	for i := range msgs {
 		msgs[i].capReplay = true
@@ -419,6 +469,7 @@ func (g *Gateway) routeParked(rec *SessionRecord, msg InboundMessage, backend st
 		msg.capRetry, msg.capReplay = 0, false
 		w.followUps = append(w.followUps, msg)
 		g.capMu.Unlock()
+		g.observeTurnQueued(rec.Key)
 	}
 	return true
 }

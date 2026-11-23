@@ -89,12 +89,14 @@ __all__ = [
     "PROBES_PER_POLL",
     "PROBE_BOUND_SECONDS",
     "PROBE_PARAM",
+    "QUEUED_START_WAIT_SECONDS",
     "REASON_CANCELED_BEFORE_START",
     "REASON_PREFIX",
     "REFUSAL_NO_ANSWER",
     "REFUSAL_NO_CANCEL",
     "REFUSAL_NO_TASK",
     "REFUSAL_PUBLISH_FAILED",
+    "REFUSAL_QUEUED",
     "REFUSAL_UNVERIFIED_AUTHOR",
     "RETRYABLE_STATUSES",
     "STATE_COMPLETED",
@@ -461,6 +463,12 @@ REFUSAL_UNVERIFIED_AUTHOR = "unverified-author"
 REFUSAL_PUBLISH_FAILED = "publish-failed"
 REFUSAL_NO_TASK = "no-task"
 REFUSAL_NO_ANSWER = "no-answer"
+# Not like the four above: the turn waits in the gateway's session-cap line
+# (#6882), with its queued notice in the reply's entries, and the task it
+# starts when a session worker frees lands on the same conversation later
+# (InjectTask.await_queued_start). It is infrastructure only when that never
+# happens inside the line's bound.
+REFUSAL_QUEUED = "queued"
 # The cancel route's own: the turn ended without a cancel reaching the bus.
 REFUSAL_NO_CANCEL = "cancel-not-published"
 # What each one means, in the words the run's record carries. The publish
@@ -479,6 +487,10 @@ _REFUSAL_DETAIL = {
         "the gateway answered the turn without starting a task (a steer, a status answer, or a stop)"
     ),
     REFUSAL_NO_ANSWER: "the gateway did not say what it did with the prompt inside its own bound",
+    REFUSAL_QUEUED: (
+        "every session worker was busy, and the turn the gateway queued did not start inside "
+        "the line's bound"
+    ),
     REFUSAL_NO_CANCEL: (
         "the gateway put no cancel on the bus: it refused the task or could not publish one, so whatever the task was doing it is still doing"
     ),
@@ -593,6 +605,17 @@ POLL_TIMEOUT_MARGIN_SECONDS = 30.0
 # dead tunnel and tear down a healthy port-forward.
 PROBE_BOUND_SECONDS = 60.0
 PROBES_PER_POLL = 2
+
+# How long a turn the gateway queued at the session cap is waited on for its
+# task to start: the gateway's own bound on a wait in line
+# (sessionCapWaitMax in a2a/gateway/session_cap_queue.go, five minutes), past
+# which it posts the cap's refusal instead, plus a margin for the retry that
+# follows a freed slot.
+QUEUED_START_WAIT_SECONDS = 5 * 60 + 60.0
+# What the gateway's queued notice carries, whatever its place in line
+# (sessionQueuedNotice in a2a/gateway/session_cap_queue.go). Read only to keep
+# the notice itself from passing for the gateway's refusal to start the turn.
+QUEUED_NOTICE_MARK = "**queued**"
 
 # How much of the conversation's last post a log line or an infrastructure
 # message quotes, so a stalled task's last words are on the record without
@@ -1521,6 +1544,15 @@ class InjectTask:
         # recover_task_id reads only then; a door that answered, with a task
         # or a refusal, has nothing to recover.
         self.unanswered_post = False
+        # For a turn the gateway queued at the session cap (REFUSAL_QUEUED):
+        # the sequence the POST's reply started at, so the wait for the
+        # queued turn's task reads the conversation from there, and the
+        # queued notice's text. ``line_refusal`` is the post the gateway
+        # made instead of starting it (the cap's refusal after the wait, a
+        # stop, a restart), when it made one.
+        self.queued_after = 0
+        self.queued_notice = ""
+        self.line_refusal = ""
 
     def preflight(self) -> Probe:
         """Read the conversation before anything is started.
@@ -1602,6 +1634,19 @@ class InjectTask:
         self.note = str(body.get("note") or "")
         self.refusal = str(body.get("refusal") or "")
         self.task_id = str(body.get("taskId") or "")
+        if self.refusal == REFUSAL_QUEUED:
+            seqs, notice = [], ""
+            for entry in body.get("entries") or []:
+                if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int):
+                    continue
+                seqs.append(entry["seq"])
+                if entry.get("kind") == ENTRY_POST and not notice:
+                    notice = str(entry.get("text") or "")
+            # A retried POST the door deduped may carry no entries; the
+            # first reply's reading stands then.
+            if seqs:
+                self.queued_after = min(seqs) - 1
+                self.queued_notice = notice
         if self.task_id:
             self.submitted_at = time.monotonic()
             if body.get("deduplicated"):
@@ -1623,6 +1668,53 @@ class InjectTask:
                 self.note,
             )
         return self.task_id
+
+    def await_queued_start(self, deadline: float) -> str:
+        """The task a queued turn starts, or ``""`` when it never does.
+
+        For a submission the door answered with :data:`REFUSAL_QUEUED`: the
+        gateway parked the turn at the session cap, and when a worker frees
+        it runs the turn again, which starts a task on this conversation as a
+        chat user's queued turn would. That task is the first ``task`` entry
+        after the queued notice. A post with no task before it is the
+        gateway saying it will not start the turn (the cap's refusal after
+        the line's wait, a stop, a restart): it is kept in
+        :attr:`line_refusal` and the wait ends. So does ``deadline``
+        (``time.monotonic()``), with neither.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        if self.task_id:
+            return self.task_id
+        after = self.queued_after
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log.warning("inject: the queued turn on %s did not start in time", self.conversation)
+                return ""
+            body = self._poll("", after, remaining, probe=False)
+            for entry in body.get("entries") or []:
+                if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int):
+                    continue
+                after = max(after, entry["seq"])
+                kind = entry.get("kind")
+                text = str(entry.get("text") or "")
+                if kind == ENTRY_TASK and entry.get("taskId"):
+                    self.task_id = str(entry["taskId"])
+                    self.submitted_at = time.monotonic()
+                    _log.info(
+                        "inject: the queued turn on %s started task %s", self.conversation, self.task_id
+                    )
+                    return self.task_id
+                if kind == ENTRY_POST and text != self.queued_notice and QUEUED_NOTICE_MARK not in text:
+                    self.line_refusal = text
+                    _log.warning(
+                        "inject: the queued turn on %s was not started: %s",
+                        self.conversation,
+                        text[:LAST_POST_EXCERPT_CHARS],
+                    )
+                    return ""
 
     def recover_task_id(self) -> str:
         """The conversation's active task id from one read, or ``""``.

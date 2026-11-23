@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -270,18 +271,115 @@ func TestBelowTheCapNoTurnWaits(t *testing.T) {
 	}
 }
 
-// A door's turn never waits: its caller holds the turn to a bound, so it
-// keeps the cap's refusal.
-func TestDoorTurnsDoNotWaitAtTheCap(t *testing.T) {
-	for _, b := range []string{injectBackend, a2aBackend, a2aGoogleBackend, a2aEntraBackend} {
+// Which doors park. The chat backends, the console and the inject door (the
+// eval harness's stand-in for a chat user) wait in line; the A2A door classes
+// keep the cap's refusal, since their callers read a turn that ended without
+// a task as nothing started.
+func TestWhichDoorsWaitAtTheCap(t *testing.T) {
+	for _, b := range []string{a2aBackend, a2aGoogleBackend, a2aEntraBackend} {
 		if parksAtCap(b) {
 			t.Errorf("%s turns park at the cap", b)
 		}
 	}
-	for _, b := range []string{discordBackend, slackBackend, gchatBackend, teamsBackend, consoleBackend} {
+	for _, b := range []string{injectBackend, discordBackend, slackBackend, gchatBackend, teamsBackend, consoleBackend} {
 		if !parksAtCap(b) {
 			t.Errorf("%s turns do not park at the cap", b)
 		}
+	}
+}
+
+// An inject turn at the cap waits as a chat turn does, and its caller sees
+// it the way a chat user would: the POST is answered with the queued refusal
+// and the queued notice; once a slot frees, the task the turn starts, its
+// answer and its terminal land on the same conversation, after the notice.
+// The door's turn bookkeeping survives the redelivery: the conversation's
+// next POST is answered with its own task, not the redelivered one's.
+func TestAnInjectTurnWaitsAtTheCapAndItsCallerReadsTheAnswer(t *testing.T) {
+	t.Parallel()
+	spawn := &fakeSpawner{liveSpawns: true, live: 1}
+	r := startInjectRigSpawning(t, func(c *Config) {
+		c.DefaultAddressee = RouteSession
+		c.MaxSessions = 1
+	}, spawn)
+
+	first := r.inject(t, "cap-queue", injectTestAuthor, "reply with the word PINEAPPLE")
+	if first.Refusal != injectRefusalQueued || first.TaskID != "" || first.Accepted {
+		t.Fatalf("the parked POST: refusal=%q task=%q accepted=%v, want the queued refusal and no task",
+			first.Refusal, first.TaskID, first.Accepted)
+	}
+	key := first.Conversation
+	if posts := entryTexts(first.Entries, InjectEntryPost); len(posts) != 1 || posts[0] != sessionQueuedNext {
+		t.Fatalf("the parked POST's entries %q, want the queued notice alone", posts)
+	}
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d spawns at a full cap", n)
+	}
+
+	spawn.mu.Lock()
+	spawn.live--
+	spawn.mu.Unlock()
+	r.g.kickCapQueue()
+	waitFor(t, "the parked turn's spawn", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	origin := r.awaitTask(t, session)
+	completeTask(t, r.execFor(t, origin, session), "PINEAPPLE")
+	r.waitForTerminal(t, key, origin.TaskID)
+
+	entries, _, _ := r.adapter.snapshot(key, 0, "")
+	noticeSeq, taskSeq, answerSeq := 0, 0, 0
+	for _, e := range entries {
+		switch {
+		case e.Kind == InjectEntryPost && e.Text == sessionQueuedNext && noticeSeq == 0:
+			noticeSeq = e.Seq
+		case e.Kind == InjectEntryTask && e.TaskID == origin.TaskID:
+			taskSeq = e.Seq
+		case e.Kind == InjectEntryPost && strings.Contains(e.Text, "PINEAPPLE") && answerSeq == 0:
+			answerSeq = e.Seq
+		}
+	}
+	if noticeSeq == 0 || taskSeq <= noticeSeq || answerSeq <= taskSeq {
+		t.Fatalf("notice at %d, task at %d, answer at %d: want the notice, then the task, then the answer\n%+v",
+			noticeSeq, taskSeq, answerSeq, entries)
+	}
+	if edits := entryTexts(entries, InjectEntryEdit); !slices.Contains(edits, sessionQueuedStarting) {
+		t.Fatalf("the queued notice was never closed on starting: edits %q", edits)
+	}
+
+	r.awaitTurnEnd(t, key)
+	r.awaitRecordRelease(t, key)
+	second := r.inject(t, "cap-queue", injectTestAuthor, "and again")
+	if !second.Accepted || second.TaskID == "" || second.TaskID == origin.TaskID {
+		t.Fatalf("the next POST: accepted=%v task=%q refusal=%q, want its own task (the redelivered one was %s)",
+			second.Accepted, second.TaskID, second.Refusal, origin.TaskID)
+	}
+}
+
+// The door counts a redelivery as handed, and refuses one while a turn it
+// handed over has not ended, so a POST waiting on its turn never reads a
+// redelivered turn's task as its own.
+func TestTheInjectDoorClaimsARedeliveryOnlyWhenQuiet(t *testing.T) {
+	t.Parallel()
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = injectKeyPrefix + "redeliver"
+	door.mu.Lock()
+	door.conversationLocked(key).handed = 1
+	door.mu.Unlock()
+	if door.ClaimRedelivery(key, 2) {
+		t.Fatal("a redelivery claimed while a POST's turn runs")
+	}
+	door.TurnFinished(key)
+	if !door.ClaimRedelivery(key, 2) {
+		t.Fatal("a redelivery refused on a quiet conversation")
+	}
+	door.mu.Lock()
+	conv := door.conversationLocked(key)
+	handed, turns := conv.handed, conv.turns
+	door.mu.Unlock()
+	if handed != 3 || turns != 1 {
+		t.Fatalf("handed=%d turns=%d after the claim, want 3 and 1", handed, turns)
 	}
 }
 

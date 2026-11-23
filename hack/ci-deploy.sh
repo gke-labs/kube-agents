@@ -1711,10 +1711,11 @@ fi
 # doors (scripts/eval_front_door_ab.py). EVAL_FRONT_DOOR_SESSIONS picks how a
 # session run sizes its session cap: fair (the default) gives it one session
 # per parallel conversation plus FRONT_DOOR_SESSION_HEADROOM, so the cap's
-# eviction (the gateway evicts the longest-idle pod at the cap, or refuses;
-# nothing queues) doesn't land on a multi-turn case between its turns; shipped
-# leaves the cap at the install default, what a customer install gets, and an
-# eviction or refusal there is a finding about that default.
+# eviction (the gateway evicts the longest-idle pod at the cap, or queues the
+# turn for up to five minutes, then refuses) doesn't land on a multi-turn case
+# between its turns; shipped leaves the cap at the install default, what a
+# customer install gets, and an eviction, a wait or a refusal there is a
+# finding about that default.
 EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
