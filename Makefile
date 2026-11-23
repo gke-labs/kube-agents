@@ -965,14 +965,14 @@ docs-generate: persona-manifests ## Regenerate the generated doc regions and fil
 
 # A shipped persona's skills_manifest.sha256 is committed beside it, because a
 # persona image's Dockerfile is only FROM and COPY (hack/check-image-inventory.sh);
-# a2a/cmd/persona's tests fail while one doesn't match its persona. Files git
-# ignores (a local __pycache__) are removed first: a clean checkout, which CI
-# builds the image from, doesn't have them, so the manifest must not list them.
+# a2a/cmd/persona's tests fail while one doesn't match its persona. --git
+# covers only the files a clean checkout holds, which is what CI builds the
+# image from, so an ignored local file (a __pycache__) is left out and left
+# alone.
 PERSONA_DIRS := $(wildcard agents/*/persona)
 persona-manifests: ## Rewrite each shipped persona's content manifest (agents/*/persona/skills_manifest.sha256).
 	@for d in $(PERSONA_DIRS); do \
-		git clean -fdXq -- "$$d" && \
-		go -C a2a run ./cmd/persona manifest --in "../$$d" || exit 1; \
+		go -C a2a run ./cmd/persona manifest --git --in "../$$d" || exit 1; \
 	done
 
 # Everything CI enforces about the docs, in one command.

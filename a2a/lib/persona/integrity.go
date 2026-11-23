@@ -347,6 +347,56 @@ func WriteIntegrityManifest(dir string) error {
 	if err != nil {
 		return err
 	}
+	return writeManifestFile(dir, files)
+}
+
+// WriteIntegrityManifestOf writes dir's IntegrityManifestFile over exactly
+// the files rels names (slash-separated, relative to dir), such as a
+// repository's tracked files, so anything else in the directory (an ignored
+// cache, say) is left out and left alone. A name that is not a plain path
+// inside dir, holds a line break, or is not a regular file is an error.
+func WriteIntegrityManifestOf(dir string, rels []string) error {
+	files := map[string][]byte{}
+	for _, rel := range rels {
+		switch {
+		case rel == IntegrityManifestFile:
+			continue
+		case !LocalPath(rel) || path.Clean(rel) != rel:
+			return fmt.Errorf("%q: not a plain path inside the persona", rel)
+		case strings.ContainsAny(rel, manifestLineBreaks):
+			return fmt.Errorf("%q: a line break in a name can't be written as one manifest line", rel)
+		}
+		f, err := openNoFollow(filepath.Join(dir, filepath.FromSlash(rel)))
+		if errors.Is(err, errSymlink) {
+			return fmt.Errorf("%s: not a regular file; %s covers regular files only", rel, IntegrityManifestFile)
+		}
+		if err != nil {
+			return err
+		}
+		data, err := readRegular(f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
+		files[rel] = data
+	}
+	return writeManifestFile(dir, files)
+}
+
+// readRegular reads an open file that must be a regular file.
+func readRegular(f *os.File) ([]byte, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file; %s covers regular files only", IntegrityManifestFile)
+	}
+	return io.ReadAll(f)
+}
+
+// writeManifestFile writes files' manifest into dir.
+func writeManifestFile(dir string, files map[string][]byte) error {
 	// Written beside it and renamed over it, so a symlink planted at the
 	// manifest's path is replaced rather than followed.
 	tmp, err := os.CreateTemp(dir, IntegrityManifestFile+".tmp-*")

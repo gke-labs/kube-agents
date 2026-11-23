@@ -2,7 +2,7 @@
 // (a2a/lib/persona), for CI and for checking a persona locally:
 //
 //	persona validate --in <dir> [--require-integrity]
-//	persona manifest --in <dir>
+//	persona manifest --in <dir> [--git]
 //	persona render --harness claude-code --in <dir> --out <dir> \
 //	    [--relay-url <url> --relay-command '<cmd> <arg> ... {url} ...']
 //
@@ -12,7 +12,10 @@
 //
 // manifest writes the persona's content manifest
 // (persona.IntegrityManifestFile) at the root of --in, over every other file
-// in it, replacing any manifest already there. A shipped persona's manifest
+// in it, replacing any manifest already there. With --git it covers only the
+// files git would put in a clean checkout of --in (tracked, or untracked and
+// not ignored), so an ignored cache in the directory is left out and left
+// alone. A shipped persona's manifest
 // is committed beside it, because a persona image's Dockerfile is only
 // FROM and COPY (hack/check-image-inventory.sh) and so can't run the recipe.
 package main
@@ -24,6 +27,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
@@ -90,17 +96,52 @@ func manifestCmd(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("manifest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	in := fs.String("in", "", "the persona directory")
+	fromGit := fs.Bool("git", false, "cover only the files git lists for --in (tracked, or untracked and not ignored)")
 	if err := fs.Parse(args); err != nil {
 		return usageError(err.Error())
 	}
 	if *in == "" {
 		return usageError("manifest needs --in")
 	}
-	if err := persona.WriteIntegrityManifest(*in); err != nil {
+	if !*fromGit {
+		if err := persona.WriteIntegrityManifest(*in); err != nil {
+			return err
+		}
+		_, err := persona.LoadWithOptions(*in, persona.Options{RequireIntegrity: true})
 		return err
 	}
-	_, err := persona.LoadWithOptions(*in, persona.Options{RequireIntegrity: true})
-	return err
+	rels, err := gitPersonaFiles(*in)
+	if err != nil {
+		return err
+	}
+	return persona.WriteIntegrityManifestOf(*in, rels)
+}
+
+// gitListArgs lists, relative to the directory git runs in, the files a
+// clean checkout of it would hold: tracked ones, and untracked ones git
+// doesn't ignore (a new file not yet added), NUL-separated.
+var gitListArgs = []string{"ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."}
+
+// gitPersonaFiles is dir's files as gitListArgs lists them, sorted, less any
+// that no longer exist on disk (tracked but deleted in the working tree).
+func gitPersonaFiles(dir string) ([]string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, gitListArgs...)...) // #nosec G204 -- fixed git arguments; dir is the operator's own flag
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("listing %s with git: %w", dir, err)
+	}
+	var rels []string
+	for _, rel := range strings.Split(string(out), "\x00") {
+		if rel == "" {
+			continue
+		}
+		if _, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(rel))); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	return rels, nil
 }
 
 type result struct {

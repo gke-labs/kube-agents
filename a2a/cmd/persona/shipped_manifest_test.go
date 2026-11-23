@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -32,9 +33,28 @@ const (
 // start. A persona edited without regenerating its manifest fails here, not
 // in a pod.
 func TestShippedPersonasCarryAMatchingManifest(t *testing.T) {
-	dirs := shippedPersonaDirs(t)
-	for _, dir := range dirs {
-		p, err := persona.LoadWithOptions(dir, persona.Options{RequireIntegrity: true})
+	for _, dir := range shippedPersonaDirs(t) {
+		// What the image holds: the files a clean checkout has, so an
+		// ignored local file can't fail (or pass) this.
+		rels, err := gitPersonaFiles(dir)
+		if err != nil {
+			t.Skipf("git can't list %s: %v", dir, err)
+		}
+		image := t.TempDir()
+		for _, rel := range rels {
+			data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(image, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dst, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p, err := persona.LoadWithOptions(image, persona.Options{RequireIntegrity: true})
 		if err != nil {
 			t.Errorf("%s: %v\nregenerate the shipped personas' manifests from the repository root: %s", dir, err, regenerate)
 			continue
@@ -204,5 +224,59 @@ func TestManifestCommandFollowsASymlinkedDir(t *testing.T) {
 	}
 	if code := run([]string{"validate", "--require-integrity", "--in", dir}, &out, &errb); code != 0 {
 		t.Fatalf("validate of the target = %d: %s", code, errb.String())
+	}
+}
+
+// manifest --git covers what git would check out and nothing else: an
+// ignored file in the directory is neither listed nor removed, and a new
+// file not yet added is listed.
+func TestManifestCommandFromGitLeavesIgnoredFilesAlone(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	repo := t.TempDir()
+	dir := filepath.Join(repo, "persona")
+	if err := os.Rename(copyDir(t, "../../lib/persona/testdata/example"), dir); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("__pycache__/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("init", "-q")
+	git("add", ".")
+	git("commit", "-qm", "persona")
+	ignored := filepath.Join(dir, "skills/triage/scripts/__pycache__/events.cpython-312.pyc")
+	if err := os.MkdirAll(filepath.Dir(ignored), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ignored, []byte("bytecode"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skills/notes/new.md"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb strings.Builder
+	if code := run([]string{"manifest", "--git", "--in", dir}, &out, &errb); code != 0 {
+		t.Fatalf("manifest --git = %d: %s", code, errb.String())
+	}
+	manifest, err := os.ReadFile(filepath.Join(dir, persona.IntegrityManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(manifest), "__pycache__") {
+		t.Errorf("the ignored file is in the manifest:\n%s", manifest)
+	}
+	if !strings.Contains(string(manifest), "./skills/notes/new.md") {
+		t.Errorf("the new, unignored file is not in the manifest:\n%s", manifest)
+	}
+	if _, err := os.Stat(ignored); err != nil {
+		t.Errorf("the ignored file was removed: %v", err)
 	}
 }
