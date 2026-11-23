@@ -12,7 +12,10 @@ package gateway
 // is a frozen control the presser cannot tell from a slow one, and the
 // gateway tells the presser alone, in the thread, through a post only they
 // see (PrivatePoster, Chat's privateMessageViewer): refusedPressNotice. It
-// notifies nobody else. It posts only when the click named the presser as a
+// notifies nobody else. On Teams the button is the adapter's drawing too,
+// and Teams has no post only one member sees, so the refusal is said on the
+// pressed line itself, which the task's next progress writes over
+// (tellRefusedOnLine). The private post goes out only when the click named the presser as a
 // user (InboundMessage.Viewer), since a post with no viewer would be
 // public, and never in a direct message, where there is no other member to
 // refuse (tellsRefusedPresser). A member the allowlist drops never reaches
@@ -34,11 +37,14 @@ const refusedPressNotice = "Only the person who asked can press Stop here. If it
 
 // stopGatedBackends are the backends with a Stop button, and what its press
 // looks like on the wire; the one place that says which backends the gate
-// holds. Slack's adapter sets IntentCancel only on agent_session_stopped, and
-// Google Chat's only on a kage.stop click, which it marks as one.
+// holds. Slack's adapter sets IntentCancel only on agent_session_stopped,
+// Google Chat's only on a kage.stop click, which it marks as one, and
+// Teams's only on a press of the Stop button on its card (teams_press.go),
+// marked the same way.
 var stopGatedBackends = map[string]func(InboundMessage) bool{
 	slackBackend: func(msg InboundMessage) bool { return msg.Intent == IntentCancel },
 	gchatBackend: func(msg InboundMessage) bool { return msg.Intent == IntentCancel && msg.Click },
+	teamsBackend: func(msg InboundMessage) bool { return msg.Intent == IntentCancel && msg.Click },
 }
 
 // isStopPress reports a stop from a backend's Stop button rather than the word:

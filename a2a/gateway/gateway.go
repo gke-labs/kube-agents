@@ -1623,6 +1623,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// presser to type stop would be stale advice, so nothing is said.
 		if active := rec.ActiveTask; active == nil || !active.Detached {
 			g.tellRefusedPresser(rec.Key, msg, backend)
+			g.tellRefusedOnLine(rec, msg, backend)
 		}
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)

@@ -36,10 +36,16 @@ import (
 // have written it a moment before the press.
 const staleStopNotice = "ℹ️ this task has ended"
 
-// isChatStopPress reports a stop from Google Chat's Stop button rather than
-// the word, as stopGatedBackends describes Chat's press (stopgate.go).
+// lineStopBackends are the backends whose Stop button is the adapter's own
+// drawing on the task's line, and so is answered on that line: Google Chat,
+// and Teams, whose button is on the line's card (teams_press.go).
+var lineStopBackends = map[string]bool{gchatBackend: true, teamsBackend: true}
+
+// isChatStopPress reports a stop from a Stop button drawn on the task's
+// line (lineStopBackends) rather than the word, as stopGatedBackends
+// describes that backend's press (stopgate.go).
 func isChatStopPress(msg InboundMessage, backend string) bool {
-	return backend == gchatBackend && isStopPress(msg, backend)
+	return lineStopBackends[backend] && isStopPress(msg, backend)
 }
 
 // chatStopPress answers a Stop press on rec's active task: the quiet cancel,
@@ -115,6 +121,29 @@ func (g *Gateway) chatTypedStop(ctx context.Context, rec *SessionRecord, authori
 		return
 	}
 	g.stopOnLine(ctx, rec, authority)
+}
+
+// refusedPressLineMark opens the line a refused press is answered on
+// (tellRefusedOnLine): a hand, not a state, since the task's state is
+// whatever it was.
+const refusedPressLineMark = "✋ "
+
+// tellRefusedOnLine answers a refused Stop press on Teams, which has no
+// message only the presser sees (tellRefusedPresser's way on Google Chat):
+// the pressed line reads refusedPressNotice, its Stop button kept, until
+// the task's next progress writes over it. Without it the button a
+// non-requester pressed looks slow rather than refused. Only for a press on
+// the running task's own line, and never in a direct message, where the
+// only other member is the one who asked. The notice names nobody.
+func (g *Gateway) tellRefusedOnLine(rec *SessionRecord, msg InboundMessage, backend string) {
+	active := rec.ActiveTask
+	if backend != teamsBackend || msg.Kind == sessionKindDM || active == nil || active.StatusMsgID == "" ||
+		gchatClickMessage(msg.MessageID) != active.StatusMsgID {
+		return
+	}
+	if g.editLine(rec.Key, active.StatusMsgID, withLineNote(refusedPressLineMark+refusedPressNotice, active.LineNote), active.TaskID) {
+		g.log.Info("refused stop press: said on the line", "backend", backend, "conversation", rec.Key)
+	}
 }
 
 // closeLineOnPress edits the active task's line to text with no Stop

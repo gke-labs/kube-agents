@@ -157,9 +157,14 @@ type teamsActivity struct {
 	// Timestamp is read for the ingress lag alone and kept raw, so a
 	// timestamp of an unexpected JSON type cannot fail the decode and drop
 	// the turn.
-	Timestamp    json.RawMessage `json:"timestamp"`
-	Text         string          `json:"text"`
-	ServiceURL   string          `json:"serviceUrl"`
+	Timestamp  json.RawMessage `json:"timestamp"`
+	Text       string          `json:"text"`
+	ServiceURL string          `json:"serviceUrl"`
+	// ReplyToID and Value are a card press's: the message whose card was
+	// pressed, and the pressed action's data (teams_press.go). Value is kept
+	// raw, since a message may carry one of any shape.
+	ReplyToID string          `json:"replyToId"`
+	Value     json.RawMessage `json:"value"`
 	Conversation struct {
 		ID               string `json:"id"`
 		ConversationType string `json:"conversationType"`
@@ -371,13 +376,18 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 	if strings.TrimSpace(act.From.AadObjectID) == "" && strings.TrimSpace(act.From.ID) == "" {
 		return InboundMessage{}, "sender has no id"
 	}
-	text := teamsStripBotMentions(act)
-	if text == "" {
-		return InboundMessage{}, "empty ask (bare mention)"
-	}
 	kind := sessionKindGroup
 	if strings.EqualFold(act.Conversation.ConversationType, teamsConversationPerson) {
 		kind = sessionKindDM
+	}
+	// A press of a button the adapter drew arrives as a message whose value
+	// is the button's data and whose text is empty (teams_press.go).
+	if press := teamsCardPress(act.Value); press.Action != "" {
+		return a.classifyPress(act, press, conversation, kind)
+	}
+	text := teamsStripBotMentions(act)
+	if text == "" {
+		return InboundMessage{}, "empty ask (bare mention)"
 	}
 
 	a.mu.Lock()
@@ -647,13 +657,20 @@ func teamsRelayError(prefix string, body []byte) error {
 // PieceSize, teamsPieceBytes here), so one call is one piece, and the
 // adapter only fits it under the activity budget (teamsFitActivity).
 func (a *TeamsAdapter) Post(conversation, text string) (string, error) {
+	return a.post(conversation, text, nil)
+}
+
+// post is Post with the card's buttons: actions, when there are any, are
+// drawn under the text on the card, and dropped with it when the activity
+// goes out as plain text (teamsFitActivityWith).
+func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any) (string, error) {
 	convID := teamsConversationFromID(conversation)
 	if convID == "" {
 		return "", fmt.Errorf("teams: malformed conversation id %q", conversation)
 	}
 	serviceURL := a.serviceURLFor(convID)
 	endpoint := teamsConversationsPath + convID + teamsActivitiesSuffix
-	activity := teamsFitActivity(text, a.adaptiveCards, teamsMaxActivityBytes)
+	activity := teamsFitActivityWith(text, a.adaptiveCards, teamsMaxActivityBytes, actions)
 	payload, err := json.Marshal(map[string]any{
 		"serviceUrl": serviceURL, "endpoint": endpoint, "method": http.MethodPost, "payload": activity,
 	})
@@ -766,6 +783,12 @@ func teamsThreadInHome(thread, home string) bool {
 // passthrough, which admits that one PUT path. The rolling status line
 // edits its message with it as artifacts arrive.
 func (a *TeamsAdapter) Edit(conversation, messageID, text string) error {
+	return a.edit(conversation, messageID, text, nil)
+}
+
+// edit is Edit with the card's buttons (post): an update replaces the whole
+// card, so an edit that names no actions removes the ones the message had.
+func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[string]any) error {
 	convID := teamsConversationFromID(conversation)
 	if convID == "" {
 		return fmt.Errorf("teams: malformed conversation id %q", conversation)
@@ -773,7 +796,7 @@ func (a *TeamsAdapter) Edit(conversation, messageID, text string) error {
 	if strings.TrimSpace(messageID) == "" {
 		return fmt.Errorf("teams: edit names no activity")
 	}
-	activity := teamsFitActivity(text, a.adaptiveCards, teamsMaxActivityBytes)
+	activity := teamsFitActivityWith(text, a.adaptiveCards, teamsMaxActivityBytes, actions)
 	activity["id"] = messageID
 	// No summary on an update: Teams renders an updated activity that carries
 	// one as that text, in a plain bubble, and drops the card (seen on every
@@ -796,12 +819,20 @@ func (a *TeamsAdapter) Edit(conversation, messageID, text string) error {
 }
 
 // PostMessage and EditMessage post text only: a chat message falls back to
-// its text (ErrTextOnly), rendered as an Adaptive Card by Post.
+// its text (ErrTextOnly), rendered as an Adaptive Card by Post. A running
+// task's line (m.Stop) carries the Stop button on that card
+// (teams_press.go); an edit that names no task removes it.
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil && m.Stop != "" {
+		return a.post(conversation, m.Text, teamsStopActions(m.Stop))
+	}
 	return postTextOnly(a.Post, conversation, m)
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	if m.Chat == nil && m.Stop != "" {
+		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
+	}
 	return editTextOnly(a.Edit, conversation, messageID, m)
 }
 
@@ -853,12 +884,19 @@ func (a *TeamsAdapter) RemoveReaction(string, string, string) error { return nil
 // line, so short lines inflate it), then the longest prefix that fits with
 // teamsTruncationMarker.
 func teamsFitActivity(text string, cards bool, cap int) map[string]any {
+	return teamsFitActivityWith(text, cards, cap, nil)
+}
+
+// teamsFitActivityWith is teamsFitActivity for a card that carries buttons:
+// actions ride the card alone, so the plain-text forms drop them, and a
+// reader of such a message stops a task by typing the word.
+func teamsFitActivityWith(text string, cards bool, cap int, actions []map[string]any) map[string]any {
 	size := func(m map[string]any) int {
 		b, _ := json.Marshal(m)
 		return len(b)
 	}
 	if cards {
-		if card := teamsCardActivity(text); size(card) <= cap {
+		if card := teamsCardActivityWith(text, actions); size(card) <= cap {
 			return card
 		}
 	}
@@ -888,12 +926,22 @@ func teamsTextActivity(text string) map[string]any {
 // the plain summary chat lists and notifications preview (without one Teams
 // shows "Card - access it on cards.unsupported").
 func teamsCardActivity(text string) map[string]any {
+	return teamsCardActivityWith(text, nil)
+}
+
+// teamsCardActivityWith is teamsCardActivity with the card's buttons, under
+// the card's own actions key; none leaves the card as it was.
+func teamsCardActivityWith(text string, actions []map[string]any) map[string]any {
+	card := teamsMarkdownToCard(text)
+	if len(actions) > 0 {
+		card[teamsCardActionsKey] = actions
+	}
 	return map[string]any{
 		"type":    teamsActivityMessage,
 		"summary": teamsActivitySummary(text),
 		"attachments": []map[string]any{{
 			"contentType": teamsCardContentType,
-			"content":     teamsMarkdownToCard(text),
+			"content":     card,
 		}},
 	}
 }
