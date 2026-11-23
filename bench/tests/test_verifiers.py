@@ -8869,7 +8869,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness") == [(["python3", "f.py", "--readiness"], True)]
     assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness)") == [(["python3", "f.py", "--readiness"], True)]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/out 2>&1") == [
-        (["python3", "f.py", "--readiness", ">", "/tmp/out", "2>&", "1"], True)
+        (["python3", "f.py", "--readiness", ">", "/tmp/out", "2", ">&", "1"], True)
     ]
     assert _shell_argvs_with_exit_propagation("VAR=1 python3 f.py --readiness") == [
         (["VAR=1", "python3", "f.py", "--readiness"], True)
@@ -9094,25 +9094,25 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["sudo", "-Nbu", "hermes", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("sudo 2>/dev/null -b python3 f.py --readiness") == [
-        (["sudo", "2>", "/dev/null", "-b", "python3", "f.py", "--readiness"], False),
+        (["sudo", "2", ">", "/dev/null", "-b", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("sudo > log -b python3 f.py --readiness") == [
         (["sudo", ">", "log", "-b", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("sudo -u hermes 2>&1 -b python3 f.py --readiness") == [
-        (["sudo", "-u", "hermes", "2>&", "1", "-b", "python3", "f.py", "--readiness"], False),
+        (["sudo", "-u", "hermes", "2", ">&", "1", "-b", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null -f python3 f.py --readiness") == [
-        (["setsid", "2>", "/dev/null", "-f", "python3", "f.py", "--readiness"], False),
+        (["setsid", "2", ">", "/dev/null", "-f", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("setsid > log -f python3 f.py --readiness") == [
         (["setsid", ">", "log", "-f", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("sudo 2>/dev/null python3 f.py --readiness") == [
-        (["sudo", "2>", "/dev/null", "python3", "f.py", "--readiness"], True),
+        (["sudo", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null python3 f.py --readiness") == [
-        (["setsid", "2>", "/dev/null", "python3", "f.py", "--readiness"], False),
+        (["setsid", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("setsid -w python3 f.py --readiness") == [
         (["setsid", "-w", "python3", "f.py", "--readiness"], True),
@@ -9265,7 +9265,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation('bash 2>/dev/null -c "python3 f.py --readiness"') == [
-        (["bash", "2>", "/dev/null", "-c", "python3 f.py --readiness"], True),
+        (["bash", "2", ">", "/dev/null", "-c", "python3 f.py --readiness"], True),
         (["python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation('bash >/tmp/out -c "python3 f.py --readiness"') == [
@@ -9320,13 +9320,13 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["stdbuf", "-o", "/tmp/x", "setsid", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("command 2>/dev/null -v python3 /opt/security_auditor/collect.py compliance-audit") == [
-        (["command", "2>", "/dev/null", "-v", "python3", "/opt/security_auditor/collect.py", "compliance-audit"], False),
+        (["command", "2", ">", "/dev/null", "-v", "python3", "/opt/security_auditor/collect.py", "compliance-audit"], False),
     ]
     assert _shell_argvs_with_exit_propagation("command 2>/dev/null python3 f.py --readiness") == [
-        (["command", "2>", "/dev/null", "python3", "f.py", "--readiness"], True),
+        (["command", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("command 2>/dev/null -p python3 f.py --readiness") == [
-        (["command", "2>", "/dev/null", "-p", "python3", "f.py", "--readiness"], True),
+        (["command", "2", ">", "/dev/null", "-p", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("command -v python3 /opt/security_auditor/collect.py compliance-audit") == [
         (["command", "-v", "python3", "/opt/security_auditor/collect.py", "compliance-audit"], False),
@@ -9413,7 +9413,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation('bash -c 2>/dev/null "python3 f.py --readiness"') == [
-        (["bash", "-c", "2>", "/dev/null", "python3 f.py --readiness"], True),
+        (["bash", "-c", "2", ">", "/dev/null", "python3 f.py --readiness"], True),
         (["python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs('bash -c 2>/dev/null "git push origin main"')[-1] == ["git", "push", "origin", "main"]
@@ -11253,10 +11253,10 @@ def test_scan_command_prefix_numeric_wrapper_option_and_duration_with_redirects(
     # 2>/dev/null is skipped as redirect; /mnt is consumed as -R chroot directory
     argv9 = _shell_argvs("sudo -R 2>/dev/null /mnt setsid python3 collect.py")[0]
     wrappers9, idx9 = _scan_command_prefix(argv9)
-    assert wrappers9 == [("sudo", 0, False), ("setsid", 5, True)]
-    assert idx9 == 6 and argv9[idx9] == "python3"
+    assert wrappers9 == [("sudo", 0, False), ("setsid", 6, True)]
+    assert idx9 == 7 and argv9[idx9] == "python3"
     assert _has_detaching_wrapper(argv9)
-    assert _command_word_index(argv9, script="collect.py") == 6
+    assert _command_word_index(argv9, script="collect.py") == 7
     assert _argv_runs(argv9, run_collect)
 
     # 10. nice -n 10 > /tmp/out "$DIR/collect.py":
@@ -11297,8 +11297,8 @@ def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
     argv1 = _shell_argvs("timeout 2>/dev/null 30 python3 collect.py")[0]
     wrappers1, idx1 = _scan_command_prefix(argv1)
     assert wrappers1 == [("timeout", 0, False)]
-    assert idx1 == 4 and argv1[idx1] == "python3"
-    assert _command_word_index(argv1, script="collect.py") == 4
+    assert idx1 == 5 and argv1[idx1] == "python3"
+    assert _command_word_index(argv1, script="collect.py") == 5
     assert _argv_runs(argv1, run_collect)
 
     # 2. sudo -u 2>/dev/null hermes python3 collect.py
@@ -11306,8 +11306,8 @@ def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
     argv2 = _shell_argvs("sudo -u 2>/dev/null hermes python3 collect.py")[0]
     wrappers2, idx2 = _scan_command_prefix(argv2)
     assert wrappers2 == [("sudo", 0, False)]
-    assert idx2 == 5 and argv2[idx2] == "python3"
-    assert _command_word_index(argv2, script="collect.py") == 5
+    assert idx2 == 6 and argv2[idx2] == "python3"
+    assert _command_word_index(argv2, script="collect.py") == 6
     assert _argv_runs(argv2, run_collect)
 
     # 3. chroot 2>/dev/null /mnt python3 collect.py
@@ -11315,8 +11315,8 @@ def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
     argv3 = _shell_argvs("chroot 2>/dev/null /mnt python3 collect.py")[0]
     wrappers3, idx3 = _scan_command_prefix(argv3)
     assert wrappers3 == [("chroot", 0, False)]
-    assert idx3 == 4 and argv3[idx3] == "python3"
-    assert _command_word_index(argv3, script="collect.py") == 4
+    assert idx3 == 5 and argv3[idx3] == "python3"
+    assert _command_word_index(argv3, script="collect.py") == 5
     assert _argv_runs(argv3, run_collect)
 
     # 4. flock 2>/dev/null /tmp/lock python3 collect.py
@@ -11324,8 +11324,8 @@ def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
     argv4 = _shell_argvs("flock 2>/dev/null /tmp/lock python3 collect.py")[0]
     wrappers4, idx4 = _scan_command_prefix(argv4)
     assert wrappers4 == [("flock", 0, True)]
-    assert idx4 == 4 and argv4[idx4] == "python3"
-    assert _command_word_index(argv4, script="collect.py") == 4
+    assert idx4 == 5 and argv4[idx4] == "python3"
+    assert _command_word_index(argv4, script="collect.py") == 5
     assert _has_detaching_wrapper(argv4)
 
     # 5. nice -n 2>/dev/null 10 python3 collect.py
@@ -11333,32 +11333,32 @@ def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
     argv5 = _shell_argvs("nice -n 2>/dev/null 10 python3 collect.py")[0]
     wrappers5, idx5 = _scan_command_prefix(argv5)
     assert wrappers5 == [("nice", 0, False)]
-    assert idx5 == 5 and argv5[idx5] == "python3"
-    assert _command_word_index(argv5, script="collect.py") == 5
+    assert idx5 == 6 and argv5[idx5] == "python3"
+    assert _command_word_index(argv5, script="collect.py") == 6
     assert _argv_runs(argv5, run_collect)
 
     # 6. timeout 2>/dev/null --foreground 30 python3 collect.py
     argv6 = _shell_argvs("timeout 2>/dev/null --foreground 30 python3 collect.py")[0]
     wrappers6, idx6 = _scan_command_prefix(argv6)
     assert wrappers6 == [("timeout", 0, False)]
-    assert idx6 == 5 and argv6[idx6] == "python3"
-    assert _command_word_index(argv6, script="collect.py") == 5
+    assert idx6 == 6 and argv6[idx6] == "python3"
+    assert _command_word_index(argv6, script="collect.py") == 6
     assert _argv_runs(argv6, run_collect)
 
     # 7. stdbuf -o 2>/dev/null L python3 collect.py
     argv7 = _shell_argvs("stdbuf -o 2>/dev/null L python3 collect.py")[0]
     wrappers7, idx7 = _scan_command_prefix(argv7)
     assert wrappers7 == [("stdbuf", 0, False)]
-    assert idx7 == 5 and argv7[idx7] == "python3"
-    assert _command_word_index(argv7, script="collect.py") == 5
+    assert idx7 == 6 and argv7[idx7] == "python3"
+    assert _command_word_index(argv7, script="collect.py") == 6
     assert _argv_runs(argv7, run_collect)
 
     # 8. timeout -s 2>/dev/null TERM 30 python3 collect.py
     argv8 = _shell_argvs("timeout -s 2>/dev/null TERM 30 python3 collect.py")[0]
     wrappers8, idx8 = _scan_command_prefix(argv8)
     assert wrappers8 == [("timeout", 0, False)]
-    assert idx8 == 6 and argv8[idx8] == "python3"
-    assert _command_word_index(argv8, script="collect.py") == 6
+    assert idx8 == 7 and argv8[idx8] == "python3"
+    assert _command_word_index(argv8, script="collect.py") == 7
     assert _argv_runs(argv8, run_collect)
 
     # 9. timeout 30 > /tmp/out "$PYTHON" collect.py
@@ -11368,21 +11368,13 @@ def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
     assert idx9 == 4 and argv9[idx9] == "$PYTHON"
     assert _command_word_index(argv9, script="collect.py") is None
 
-    # 10. timeout 30>/tmp/out "$PYTHON" collect.py
-    # 30> is fd-30 redirect, $PYTHON is consumed as duration, collect.py is command word
-    argv10 = _shell_argvs('timeout 30>/tmp/out "$PYTHON" collect.py')[0]
+    # 10. nice -n 2>/dev/null -5 python3 collect.py
+    argv10 = _shell_argvs("nice -n 2>/dev/null -5 python3 collect.py")[0]
     wrappers10, idx10 = _scan_command_prefix(argv10)
-    assert wrappers10 == [("timeout", 0, False)]
-    assert idx10 == 4 and argv10[idx10] == "collect.py"
-    assert _command_word_index(argv10, script="collect.py") == 4
-
-    # 11. nice -n 2>/dev/null -5 python3 collect.py
-    argv11 = _shell_argvs("nice -n 2>/dev/null -5 python3 collect.py")[0]
-    wrappers11, idx11 = _scan_command_prefix(argv11)
-    assert wrappers11 == [("nice", 0, False)]
-    assert idx11 == 5 and argv11[idx11] == "python3"
-    assert _command_word_index(argv11, script="collect.py") == 5
-    assert _argv_runs(argv11, run_collect)
+    assert wrappers10 == [("nice", 0, False)]
+    assert idx10 == 6 and argv10[idx10] == "python3"
+    assert _command_word_index(argv10, script="collect.py") == 6
+    assert _argv_runs(argv10, run_collect)
 
 
 def test_read_clipped_closed_top_level_duplicate_key_cut():

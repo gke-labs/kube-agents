@@ -231,27 +231,10 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 previous = _SUBSTITUTION_MARK[-1]
                 i = close
                 continue
-            is_digit_redirect = False
-            d_end = i + 1
-            if quote is None and previous in _SHELL_WORD_OPENERS and char.isdigit():
-                while d_end < len(command) and command[d_end].isdigit():
-                    d_end += 1
-                if d_end < len(command) and command[d_end] in "<>":
-                    is_digit_redirect = True
-
-            if quote is None and (
-                char in _SHELL_OPERATOR_RUN_CHARS
-                or char in _SHELL_PARENS
-                or char == _SHELL_LINE_END
-                or is_digit_redirect
-            ):
+            if quote is None and (char in _SHELL_OPERATOR_RUN_CHARS or char in _SHELL_PARENS or char == _SHELL_LINE_END):
                 # A bare newline starts a new command as `;` does, so it is an operator too.
                 end = i + 1
-                if is_digit_redirect:
-                    end = d_end + 1
-                    while end < len(command) and command[end] in _SHELL_OPERATOR_RUN_CHARS:
-                        end += 1
-                elif char in _SHELL_OPERATOR_RUN_CHARS:
+                if char in _SHELL_OPERATOR_RUN_CHARS:
                     while end < len(command) and command[end] in _SHELL_OPERATOR_RUN_CHARS:
                         end += 1
                 operators.append(command[i:end])
@@ -394,6 +377,25 @@ _GENERIC_WRAPPER_VAL_OPTS = {
     "flock": frozenset(("-w", "--timeout", "-E", "--conflict-exit-code")),
     "time": frozenset(("-f", "--format", "-o", "--output")),
 }
+_NUMERIC_WRAPPER_VAL_OPTS = {
+    "nice": frozenset(("-n", "--adjustment")),
+    "watch": frozenset(("-n", "--interval")),
+    "flock": frozenset(("-w", "--timeout", "-E", "--conflict-exit-code")),
+    "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata", "--pid")),
+    "timeout": frozenset(("-s", "-k", "--signal", "--kill-after")),
+    "stdbuf": frozenset(("-i", "-o", "-e", "--input", "--output", "--error")),
+    "xargs": frozenset(("-P", "-n", "-s", "-L", "--max-procs")),
+    "sudo": frozenset(("-C", "-T", "--close-from", "--command-timeout")),
+}
+_SHELL_SIGNAL_NAMES = frozenset((
+    "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1",
+    "SEGV", "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD", "CONT", "STOP",
+    "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH",
+    "POLL", "PWR", "SYS", "RTMIN", "RTMAX",
+    "SIGTERM", "SIGKILL", "SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGUSR1", "SIGUSR2",
+))
+
+
 def _next_shell_arg(argv: list[str], idx: int) -> tuple[str | None, int]:
     """Return the next argument in argv from idx, skipping redirects and their targets."""
     redirect_target = False
@@ -403,8 +405,8 @@ def _next_shell_arg(argv: list[str], idx: int) -> tuple[str | None, int]:
             redirect_target = False
             idx += 1
             continue
-        if _is_redirect(w):
-            redirect_target = True
+        if _is_redirect(w) or (w.isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+            redirect_target = not w.isdigit()
             idx += 1
             continue
         return w, idx
@@ -510,8 +512,8 @@ def _scan_command_prefix(
             redirect_target = False
             idx += 1
             continue
-        if _is_redirect(word):
-            redirect_target = True
+        if _is_redirect(word) or (word.isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+            redirect_target = not word.isdigit()
             idx += 1
             continue
         if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
@@ -528,8 +530,8 @@ def _scan_command_prefix(
             redirect_target = False
             idx += 1
             continue
-        if _is_redirect(word):
-            redirect_target = True
+        if _is_redirect(word) or (word.isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+            redirect_target = not word.isdigit()
             idx += 1
             continue
         if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
@@ -560,6 +562,23 @@ def _scan_command_prefix(
                 continue
             if _is_redirect(argv[idx]):
                 redirect_target = True
+                idx += 1
+                continue
+            if argv[idx].isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1]):
+                if duration_needed:
+                    val_after, _ = _next_shell_arg(argv, idx + 1)
+                    is_fd_redirect = (
+                        val_after is not None
+                        and (
+                            (not options_ended and val_after.startswith("-") and val_after != "-")
+                            or bool(_SHELL_COUNT_RE.match(val_after))
+                        )
+                    )
+                    if not is_fd_redirect:
+                        duration_needed = False
+                        idx += 1
+                        continue
+                redirect_target = False
                 idx += 1
                 continue
 
@@ -695,6 +714,10 @@ def _scan_command_prefix(
                 idx += 1
                 if takes_val:
                     # Consume next non-redirect argument as value
+                    opt_needs_numeric = (
+                        wrapper_name in _NUMERIC_WRAPPER_VAL_OPTS
+                        and any(w == opt or w.endswith(opt.lstrip("-")) for opt in _NUMERIC_WRAPPER_VAL_OPTS[wrapper_name])
+                    )
                     while idx < len(argv):
                         if redirect_target:
                             redirect_target = False
@@ -702,6 +725,31 @@ def _scan_command_prefix(
                             continue
                         if _is_redirect(argv[idx]):
                             redirect_target = True
+                            idx += 1
+                            continue
+                        if (
+                            argv[idx].isdigit()
+                            and idx + 1 < len(argv)
+                            and _is_redirect(argv[idx + 1])
+                        ):
+                            if opt_needs_numeric:
+                                val_after, _ = _next_shell_arg(argv, idx + 1)
+                                if wrapper_name == "timeout" and duration_needed:
+                                    is_val_after = bool(val_after and val_after.upper() in _SHELL_SIGNAL_NAMES)
+                                else:
+                                    is_val_after = (
+                                        val_after is not None
+                                        and (
+                                            (wrapper_name == "stdbuf" and val_after in ("0", "L", "B"))
+                                            or (wrapper_name == "timeout" and val_after.upper() in _SHELL_SIGNAL_NAMES)
+                                            or bool(re.match(r"^-?\d+$", val_after))
+                                            or bool(_SHELL_COUNT_RE.match(val_after))
+                                        )
+                                    )
+                                if not is_val_after:
+                                    idx += 1
+                                    break
+                            redirect_target = not argv[idx].isdigit()
                             idx += 1
                             continue
                         # Found option value
