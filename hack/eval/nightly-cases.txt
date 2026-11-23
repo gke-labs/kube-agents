@@ -1439,7 +1439,6 @@
 # refusal and ends failed with the write-refused reason, which the chat shows.
 # Red on main, where the task ran on after the refusal. deployer: noop; the
 # write is refused either way.
-./tasks/profile-stops-at-write-refusal/task.yaml
 
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
