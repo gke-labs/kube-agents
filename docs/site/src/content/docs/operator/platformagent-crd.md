@@ -1072,18 +1072,18 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
   The render also writes two environment variables onto every `sidecars` entry — `POD_NAMESPACE` (downward API) and `A2A_CAPABILITY_REQUIRED` — with different precedence. The operator's `A2A_CAPABILITY_REQUIRED` wins, so a value set for that name in the CR is discarded on every reconcile, while `POD_NAMESPACE` is supplied only as a default and a CR value for it survives. Both are inputs to the A2A capability check the sidecar executor performs, not container configuration; nothing else in the container is rewritten.
 
-- `extraVolumes` — custom volumes for the main container. Both halves of the reservation apply: a reserved name, and a source that would carry the A2A bus credential, are each refused at admission; see [Reconcile behavior](#reconcile-behavior).
+- `extraVolumes` — custom volumes for the main container. Both halves of the reservation apply: a reserved name, and a source that would carry the A2A bus credential or watcher token, are each refused at admission; see [Reconcile behavior](#reconcile-behavior).
 - `extraVolumeMounts` — custom mounts for the main container. A mount has no source, so only the name half applies: an entry naming a reserved volume is refused at admission.
 - `sidecarVolumes` — custom volumes for the sidecar containers. Same reservations as `extraVolumes`.
 - The watchers' broker token is reserved on all five surfaces. The webhook refuses the volume name
   `watcher-credential-proxy-token` on `sidecars`, `initContainers`, `sidecarVolumes`, `extraVolumes`
-  and `extraVolumeMounts`. Where the webhook did not run, an `extraVolumeMounts` entry naming it
-  degrades the CR with `ForbiddenVolumeMount`, as one naming the broker's own volumes does, and no
-  Pod is rendered. On the other surfaces the controller leaves out of the Pod template any user
-  volume under that name, or projecting a token for the `kubeagents-credential-proxy-watcher`
-  audience under another name, together with every `volumeMount` naming it. The `VolumesDropped`
-  condition names those volumes. The token belongs to the gateway's `agent-api-auth` container
-  alone.
+  and `extraVolumeMounts`, and any volume projecting the `kubeagents-credential-proxy-watcher`
+  audience under another name. Where the webhook did not run, the controller leaves out of the Pod
+  template any user volume under that name or projecting that audience, together with every
+  `volumeMount` naming one across all five surfaces. The `VolumesDropped` condition names the
+  dropped volumes and bare `watcher-credential-proxy-token` mounts with reason
+  `WatcherTokenVolumeDropped` (or `HostPathVolumeDropped` when a `hostPath` volume is dropped too).
+  The token belongs to the gateway's `agent-api-auth` container alone.
 - A `hostPath` entry on either volume list is refused at admission, and on an install where the
   webhook did not run (the Helm chart ships it off, and one enabled through the chart fails open at
   its default `failurePolicy: Ignore`) the controller leaves it out of the Pod template at render,
@@ -2454,13 +2454,13 @@ computed restarts each stamped pod once in the same way.
 - On delete, it garbage-collects owned resources (note that `litellm-policy` is owned by `Deployment/litellm` rather than `PlatformAgent`, so deleting `PlatformAgent` preserves `litellm-policy` while LiteLLM is still running to prevent fail-open egress).
 - The admission webhook (behind cert-manager) validates the spec before it's persisted. It enforces at most one `PlatformAgent` per cluster, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), and requires each `imagePullSecrets` entry to name a Secret. It refuses a `spec.storage.size` lower than the size the stored object resolves to (the `50Gi` default when it sets none), not above zero or above `64Ti`. It also acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`).
 
-  The `hostPath` refusal has a second layer in the controller: a `hostPath` volume that reaches the reconcile anyway — the Helm chart ships the webhook off, and one enabled through the chart fails open at its default `failurePolicy: Ignore` — is left out of the Pod template at render with every mount naming it, and the `VolumesDropped` condition reports it. Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
+  The `hostPath` and watcher-token refusals have a second layer in the controller: a `hostPath` or watcher-token entry that reaches the reconcile anyway — the Helm chart ships the webhook off, and one enabled through the chart fails open at its default `failurePolicy: Ignore` — is left out of the Pod template at render with every mount naming it, and the `VolumesDropped` condition reports it. Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
 
 - The webhook admits that one `PlatformAgent` in the operator's own namespace only. A `PlatformAgent` created in any other namespace is refused on `metadata.namespace`: the Role that carries the operator's write verbs is bound in the operator's namespace and its profile namespace only ([Security and IAM](/kube-agents/reference/security-and-iam/#the-operator-controller-is-a-separate-identity)). One that already exists elsewhere, created while the webhook was off, is updated with a warning naming the two namespaces that need the Role. It reports [`RBACIncomplete`](#what-degraded-reports) until they hold it.
 
-- The webhook also refuses a user volume or mount on `spec.deployment` that would carry the A2A bus credential by a route other than the operator's own projection. The refused shapes are the reserved volume name `a2a-bus-token`, a `serviceAccountToken` projection for the bus audience (`a2a-bus`) under any name, and a `secret` volume or projected `secret` source naming one of the Secrets the operator renders with bus credentials or keys in them (`<name>-a2a-nats-creds`, `<name>-a2a-nats-config`, `<name>-a2a-callout-keys`, `<name>-a2a-nats-tls`, `<name>-a2a-nats-ca`, `<name>-a2a-task-signing-key`).
+- The webhook also refuses a user volume or mount on `spec.deployment` that would carry the A2A bus credential or the credential proxy's watcher token by a route other than the operator's own projection. The refused shapes are the reserved volume names `a2a-bus-token` and `watcher-credential-proxy-token`, a `serviceAccountToken` projection for the bus audience (`a2a-bus`) or watcher audience (`kubeagents-credential-proxy-watcher`) under any name, and a `secret` volume or projected `secret` source naming one of the Secrets the operator renders with bus credentials or keys in them (`<name>-a2a-nats-creds`, `<name>-a2a-nats-config`, `<name>-a2a-callout-keys`, `<name>-a2a-nats-tls`, `<name>-a2a-nats-ca`, `<name>-a2a-task-signing-key`).
 
-  The render also leaves the same entries, and every mount naming them, out of the Pod. That happens whether or not admission ran; it is not a fallback for a skipped webhook, though a skipped webhook is when it is the only thing left. `env` references to those Secrets are not checked. This is a guard against misconfiguration rather than a boundary between the containers of one Pod, since a ServiceAccount token is pod-scoped.
+  The render also leaves the same entries, and every mount naming them, out of the Pod (reporting the watcher-token ones on `VolumesDropped`). That happens whether or not admission ran; it is not a fallback for a skipped webhook, though a skipped webhook is when it is the only thing left. `env` references to those Secrets are not checked. This is a guard against misconfiguration rather than a boundary between the containers of one Pod, since a ServiceAccount token is pod-scoped.
 
 - The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
 - The `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` annotation on a `PlatformAgent` opts the shared `litellm-policy` out of operator reconciliation and deletes any managed copy without affecting the agent pod's own NetworkPolicy. Note that deleting the managed policy leaves LiteLLM unselected (fail-open) unless a replacement NetworkPolicy is managed out-of-band.
