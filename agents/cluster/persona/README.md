@@ -15,6 +15,13 @@ worker pod mounts the image at `/persona`. No pod runs it until the profile
 dispatcher, worker and pool land (#4148, #4483, #4484) and the operator runs
 them.
 
+`skills_manifest.sha256` is this directory's content manifest, which the
+profile worker checks the image's files against at start
+([Content manifest](../../../a2a/lib/persona/README.md#content-manifest)).
+After changing any file here, regenerate it from `a2a/` with
+`go run ./cmd/persona manifest --in ../agents/cluster/persona`;
+`a2a/cmd/persona`'s tests fail until it matches.
+
 The Hermes cluster profiles don't use it. The platform-agent image also builds
 it into `/opt/cluster-template/persona` with the rest of `agents/cluster/`, but
 `OVERLAY_ITEMS` in `agents/platform/scripts/cluster_agent_profile.py` leaves it

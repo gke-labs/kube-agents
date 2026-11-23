@@ -1,13 +1,20 @@
 // persona validates a persona directory and renders it for a harness
 // (a2a/lib/persona), for CI and for checking a persona locally:
 //
-//	persona validate --in <dir>
+//	persona validate --in <dir> [--require-integrity]
+//	persona manifest --in <dir>
 //	persona render --harness claude-code --in <dir> --out <dir> \
 //	    [--relay-url <url> --relay-command '<cmd> <arg> ... {url} ...']
 //
 // render writes the harness config files under --out, which must be empty
 // or absent, and prints {"args", "model", "warnings"} as JSON on stdout. The
 // relay flags stand in for what the profile worker supplies in the pod.
+//
+// manifest writes the persona's content manifest
+// (persona.IntegrityManifestFile) at the root of --in, over every other file
+// in it, replacing any manifest already there. A shipped persona's manifest
+// is committed beside it, because a persona image's Dockerfile is only
+// FROM and COPY (hack/check-image-inventory.sh) and so can't run the recipe.
 package main
 
 import (
@@ -29,7 +36,7 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: persona validate|render [flags]")
+		fmt.Fprintln(stderr, "usage: persona validate|render|manifest [flags]")
 		return 2
 	}
 	var err error
@@ -38,8 +45,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = validate(args[1:], stderr)
 	case "render":
 		err = renderCmd(args[1:], stdout, stderr)
+	case "manifest":
+		err = manifestCmd(args[1:], stderr)
 	default:
-		fmt.Fprintf(stderr, "persona: unknown command %q (validate, render)\n", args[0])
+		fmt.Fprintf(stderr, "persona: unknown command %q (validate, render, manifest)\n", args[0])
 		return 2
 	}
 	var usage usageError
@@ -63,13 +72,34 @@ func validate(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	in := fs.String("in", "", "the persona directory")
+	require := fs.Bool("require-integrity", false, "refuse a persona without "+persona.IntegrityManifestFile+" (one that has it is checked either way)")
 	if err := fs.Parse(args); err != nil {
 		return usageError(err.Error())
 	}
 	if *in == "" {
 		return usageError("validate needs --in")
 	}
-	_, err := persona.Load(*in)
+	_, err := persona.LoadWithOptions(*in, persona.Options{RequireIntegrity: *require})
+	return err
+}
+
+// manifestCmd writes --in's content manifest, then loads the persona with
+// the manifest required, so a persona that doesn't load is reported rather
+// than given a manifest.
+func manifestCmd(args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("manifest", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	in := fs.String("in", "", "the persona directory")
+	if err := fs.Parse(args); err != nil {
+		return usageError(err.Error())
+	}
+	if *in == "" {
+		return usageError("manifest needs --in")
+	}
+	if err := persona.WriteIntegrityManifest(*in); err != nil {
+		return err
+	}
+	_, err := persona.LoadWithOptions(*in, persona.Options{RequireIntegrity: true})
 	return err
 }
 

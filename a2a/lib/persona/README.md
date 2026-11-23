@@ -87,6 +87,11 @@ session worker uses it on its Claude Code home, where only `CLAUDE.md` and
 Paths outside the scope are not entered, and a manifest entry outside it is
 refused.
 
+The personas this repository ships commit their manifest beside them, since
+a persona image's Dockerfile is only `FROM` and `COPY`:
+`persona manifest --in <dir>` (`a2a/cmd/persona`) writes it, and that
+package's tests fail while a shipped persona's manifest doesn't match it.
+
 A worker that predates this check refuses `skills_manifest.sha256` as a
 top-level file the format does not define. A persona image must not carry
 one until every worker it can run under accepts the name.

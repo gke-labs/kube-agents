@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -42,6 +43,9 @@ const (
 	// sha256sumTextSeparator is what sha256sum writes between a digest and
 	// its path in text mode.
 	sha256sumTextSeparator = "  "
+	// integrityManifestMode is the manifest's file mode: readable by all,
+	// like the files it describes.
+	integrityManifestMode = 0o644
 	// manifestFieldSeparators split a manifest line's digest from its path.
 	manifestFieldSeparators = " \t"
 )
@@ -298,4 +302,42 @@ func FormatIntegrityManifest(files map[string][]byte) []byte {
 		b.WriteString(hex.EncodeToString(sum[:]) + sha256sumTextSeparator + findDotPrefix + rel + "\n")
 	}
 	return []byte(b.String())
+}
+
+// WriteIntegrityManifest writes dir's IntegrityManifestFile over every
+// regular file under it but the root manifest, replacing one already there.
+// A symlink or other non-regular entry is an error: the check would refuse
+// it, so a manifest can't describe it.
+func WriteIntegrityManifest(dir string) error {
+	files := map[string][]byte{}
+	err := filepath.WalkDir(dir, func(full string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, full)
+		rel = filepath.ToSlash(rel)
+		switch {
+		case rel == ".", d.IsDir() && d.Type()&fs.ModeSymlink == 0:
+			return nil
+		case rel == IntegrityManifestFile:
+			return nil
+		case !d.Type().IsRegular():
+			return fmt.Errorf("%s: not a regular file; %s covers regular files only", rel, IntegrityManifestFile)
+		}
+		f, err := openNoFollow(full)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return err
+		}
+		files[rel] = data
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, IntegrityManifestFile), FormatIntegrityManifest(files), integrityManifestMode) // #nosec G306 -- a build input committed beside the persona; read by everyone by design
 }

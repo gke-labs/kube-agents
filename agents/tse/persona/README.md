@@ -14,6 +14,13 @@ this directory under `/files`), and the chart's `profiles.tse.enabled` renders
 the `tse` AgentProfile that names it. A profile worker pod mounts the image at
 `/persona`.
 
+`skills_manifest.sha256` is this directory's content manifest, which the
+profile worker checks the image's files against at start
+([Content manifest](../../../a2a/lib/persona/README.md#content-manifest)).
+After changing any file here, regenerate it from `a2a/` with
+`go run ./cmd/persona manifest --in ../agents/tse/persona`;
+`a2a/cmd/persona`'s tests fail until it matches.
+
 The Hermes `tse` profile doesn't use it. The platform-agent image copies it to
 `/opt/tse-template/persona` with the rest of `agents/tse/`, but the optional
 profile sync in `deploy/shared/docker-entrypoint.sh` (`OPTIONAL_SYNC_ITEMS`
