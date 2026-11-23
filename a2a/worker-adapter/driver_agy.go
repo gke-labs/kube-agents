@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
@@ -53,6 +54,15 @@ const (
 	agyPrintTimeoutToken     = "print-timeout"
 	agyPermissionDeniedToken = "permission-denied"
 )
+
+// agyDetailCap bounds the detail an agy failure carries into its reason:
+// agy's error text is the upstream API's, and an HTML error page or a long
+// list of skipped calls has no business in a one-line reason.
+const agyDetailCap = 200
+
+// msPerSecond turns agy's duration_seconds into the usage artifact's
+// milliseconds.
+const msPerSecond = float64(time.Second / time.Millisecond)
 
 // agyPrintTimeoutReason is the finished_reason of a turn --print-timeout
 // cut short: its status is SUCCESS and its response partial or empty.
@@ -233,53 +243,61 @@ func (d *agyDecoder) result(r agyResult) Event {
 }
 
 // telemetry is this result's turn: the difference between its cumulative
-// usage and duration and the last result's. agy reports no cost (until #6808), so there
+// usage and duration and the last accepted one. agy reports no cost (#6808), so there
 // is no running total. duration_seconds is wall time since the process
 // started (the probe's second turn read 47.3s after a first of 18.0s and a
 // 25s pause before its message), so the difference includes any wait between
 // one result and the next message; with steers written at the boundary that
 // wait is the adapter's own, and short.
+//
+// A field that is absent or null is no figure at all, and leaves its
+// baseline alone. A baseline moves only when its figure is accepted: a
+// figure that comes out negative is dropped, and the next result still
+// counts from the last good total rather than from the bad one.
 func (d *agyDecoder) telemetry(r agyResult) resultTelemetry {
 	t := resultTelemetry{usage: lib.Usage{Model: d.model}}
 	var secs float64
 	switch {
-	case len(r.DurationSeconds) == 0:
+	case agyAbsent(r.DurationSeconds):
 	case json.Unmarshal(r.DurationSeconds, &secs) != nil:
 		t.dropped = append(t.dropped, "duration_seconds")
 	default:
-		if ms, ok := lib.UsageFigure((secs - d.duration) * 1000); ok {
+		if ms, ok := lib.UsageFigure((secs - d.duration) * msPerSecond); ok {
 			t.usage.DurationMs = ms
+			d.duration = secs
 		} else {
 			t.dropped = append(t.dropped, "duration_seconds")
 		}
-		d.duration = secs
 	}
 	var u agyUsage
 	switch {
-	case len(r.Usage) == 0:
+	case agyAbsent(r.Usage):
 	case json.Unmarshal(r.Usage, &u) != nil:
 		t.dropped = append(t.dropped, "usage")
 	default:
 		input := u.InputTokens + u.CacheReadTokens
 		if n, ok := lib.UsageFigure(input - d.input); ok {
 			t.usage.InputTokens = n
+			d.input = input
 		} else {
 			t.dropped = append(t.dropped, "usage.input_tokens")
 		}
 		if n, ok := lib.UsageFigure(u.OutputTokens - d.output); ok {
 			t.usage.OutputTokens = n
+			d.output = u.OutputTokens
 		} else {
 			t.dropped = append(t.dropped, "usage.output_tokens")
 		}
-		d.input, d.output = input, u.OutputTokens
 	}
 	return t
 }
 
-// agyDetailCap bounds the detail an agy failure carries into its reason:
-// agy's error text is the upstream API's, and an HTML error page or a long
-// list of skipped calls has no business in a one-line reason.
-const agyDetailCap = 200
+// agyAbsent reports a result field that carries no figure: missing, or a
+// JSON null, which a json.RawMessage keeps as the four bytes "null".
+func agyAbsent(raw json.RawMessage) bool {
+	v := strings.TrimSpace(string(raw))
+	return v == "" || v == "null"
+}
 
 // withDetail is token, and the non-empty details joined after the reason
 // separator, as the adapter's own terminals spell it: whitespace collapsed to
@@ -314,6 +332,9 @@ func deniedDetail(actions []agyDeniedAction) string {
 		case a.DisplayName != "":
 			names = append(names, a.DisplayName)
 		}
+	}
+	if len(names) == 0 {
+		return fmt.Sprintf("skipped for want of approval: %d unnamed action(s)", len(actions))
 	}
 	return "skipped for want of approval: " + strings.Join(names, ", ")
 }
