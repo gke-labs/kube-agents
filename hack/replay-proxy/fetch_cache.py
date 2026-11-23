@@ -1,6 +1,6 @@
 """Download what recent trusted nightlies selected from the shared replay cache, for the replay lane.
 
-The nightly uploads answers from runs that passed and, per call, a record of
+The nightly uploads answers from graded runs and, per call, a record of
 the objects it confirmed in the bucket, with each one's size and, for a slot,
 the answer it points at (publish_cache.py). The lane replays those nights: this
 lists the records under gs://<bucket>/replay-cache/builds/ younger than
@@ -17,7 +17,7 @@ night's newest record (one small object per older build). With
 night --print-commit chooses from, below), so the report can grade each case
 against the night that ran the commit the lane replays (lane_report.py).
 
-An answer is loaded only when a build in the window says its passing runs
+An answer is loaded only when a build in the window says its graded runs
 produced it: an alternate (`alts/`) must be in an in-window record's
 `produced` list or `produced_counts` for its build, so a record that merely
 found an older night's object in the bucket never brings it in, and no answer
@@ -34,7 +34,7 @@ can be as old as the bucket's lifecycle.
 
 For each key two or more alternates arrived for, it writes
 `weights/<fingerprint>.json` (replay_cache.WEIGHTS_DIR): per answer, how many
-requests from passing runs got it, which the proxy serves the key's answers in
+requests from graded runs got it, which the proxy draws the key's answers in
 proportion to. A build's records count every answer it put up again on each
 call (`produced_counts`), so a build's count is its newest in-window record's,
 never a sum of its records; builds are different runs, so their counts add.
@@ -170,7 +170,7 @@ NESTED_KINDS = (P.VARIANTS, P.ALTS)
 NOT_PRODUCED = "not_produced"
 # An alternate every build in the window that produced it now counts 0 times
 # (a producer later found disagreeing with its tag: publish_cache.py), so no
-# passing run vouches for it any more.
+# graded run vouches for it any more.
 ZERO_COUNT = "zero_count"
 # The size an alternate is planned at when no in-window record confirmed it
 # (its build's confirming record aged out): costed for real once downloaded.
@@ -351,7 +351,7 @@ class Fetcher:
         return out
 
     def _produced(self, record: Dict[str, object]) -> Set[Tuple[str, str]]:
-        """(fingerprint, answer) of every alternate a record says its night's passing runs produced, at this version.
+        """(fingerprint, answer) of every alternate a record says its night's graded runs produced, at this version.
 
         Refused when the field is there but not in its shape: the writer is
         then not the code this reads.
@@ -713,14 +713,14 @@ class Fetcher:
 
 def weight(pair: Tuple[str, str], produced_by: Dict[str, Set[Tuple[str, str]]],
            counted: Dict[str, Dict[Tuple[str, str], int]]) -> int:
-    """How often the window's passing runs produced one alternate: summed over the builds that produced it.
+    """How often the window's graded runs produced one alternate: summed over the builds that produced it.
 
     A build's records count again on every call (publish_cache.RECORD_PRODUCED_COUNTS),
     so its newest record's count is the build's and its records are not
     summed; different builds are different runs, so they are. A build whose
     records give no count (written before them) adds 1: it published the
     answer, so it produced it at least once. A build whose newest count is 0
-    adds nothing: an answer it put up on an earlier pass lost its passing
+    adds nothing: an answer it put up on an earlier pass lost its graded
     producer. 0 overall means no build in the window vouches for the answer,
     and fetch refuses it.
     """
