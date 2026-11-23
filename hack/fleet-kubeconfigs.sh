@@ -80,6 +80,9 @@
 # Inputs (all optional except a project):
 #   FLEET_PROJECT_ID          project holding the fleet; defaults to PROJECT_ID
 #   FLEET_CATALOG             path to fixtures.json
+#   FLEET_VARIABLES           path to the fleet stack's variables.tf, which a
+#                             role's `projects_var` names a list in (default:
+#                             variables.tf beside the catalog)
 #   BENCH_FLEET_KUBECONFIG_DIR  where to write; defaults under TMPDIR
 #   FLEET_READONLY_SA         service account to mint a read-only token for
 #   FLEET_ALLOW_RUNNER_CREDENTIAL  1 to run without FLEET_READONLY_SA on a
@@ -145,12 +148,18 @@ _FLEET_CRED_API_VERSION="client.authentication.k8s.io/v1"
 # are `<kind>/<name-prefix>*`, and the `*` is a glob character, so the caller
 # reads them into an array with `read -a`, never with word splitting.
 #
+# A role with `projects_var` is planted only on the projects that list of the
+# fleet stack names (its default in variables.tf, the switch a pull request
+# flips). On any other project, given as the second argument, its row is
+# `<role> ! - <projects_var>`: the caller probes nothing and says the role is
+# not planted there by design. With no project, every role is emitted as usual.
+#
 # Parsed with the standard library rather than jq: the Prow image is not
 # guaranteed to carry jq, and it already runs python3 for every task-file read
 # in ci-eval-pr.sh.
 _fleet_catalog_rows() {
   python3 -c "
-import json, re, sys
+import json, os, re, sys
 NAME = re.compile(r'[a-z0-9]+(-[a-z0-9]+)*')
 # A probe reaches kubectl as a kind plus either a name or a label selector.
 # Anchored so nothing in the catalog can smuggle a flag, a space or a shell
@@ -158,8 +167,25 @@ NAME = re.compile(r'[a-z0-9]+(-[a-z0-9]+)*')
 PROBE = re.compile(r'[a-z][a-z0-9.]*(/[a-z0-9][a-z0-9.-]*|\?[A-Za-z0-9][A-Za-z0-9._/=,-]*)')
 # A project-scoped role's probe: a Compute Engine kind and a name prefix.
 PROJECT_PROBE = re.compile(r'(instance|firewall|network|snapshot)/[a-z0-9][a-z0-9-]*\*')
+VAR = re.compile(r'[a-z][a-z0-9_]*')
 with open(sys.argv[1]) as fh:
     catalog = json.load(fh)
+project = sys.argv[2] if len(sys.argv) > 2 else ''
+variables_path = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else os.path.join(os.path.dirname(sys.argv[1]), 'variables.tf')
+_lists = {}
+def listed(name):
+    # The list variable's default in variables.tf: the projects the fleet plants on.
+    if name not in _lists:
+        try:
+            text = open(variables_path).read()
+        except OSError as exc:
+            sys.exit(f'fleet catalog gates a role on {name!r} but {variables_path} cannot be read: {exc}')
+        block = re.search(r'variable \"' + name + r'\" \{(.*?)\n\}', text, re.S)
+        default = re.search(r'default\s*=\s*\[(.*?)\]', block.group(1), re.S) if block else None
+        if default is None:
+            sys.exit(f'fleet catalog gates a role on {name!r}, which {variables_path} declares with no list default')
+        _lists[name] = set(re.findall(r'\"([^\"]+)\"', default.group(1)))
+    return _lists[name]
 roles = catalog.get('roles') or {}
 slots = catalog.get('cluster_slots') or {}
 if not roles:
@@ -191,12 +217,18 @@ for role, spec in sorted(roles.items()):
     for probe in probes:
         if not isinstance(probe, str) or not shape.fullmatch(probe):
             sys.exit(f'fleet catalog role {role!r} declares a malformed probe {probe!r}')
+    gate = spec.get('projects_var')
+    if gate is not None and not (isinstance(gate, str) and VAR.fullmatch(gate)):
+        sys.exit(f'fleet catalog role {role!r} names a malformed projects_var {gate!r}')
+    if gate and project and project not in listed(gate):
+        print(role, '!', '-', gate)
+        continue
     if project_scoped:
         slot = '-'
     if namespace:
         probes = [f'namespace/{namespace}'] + probes
     print(role, slot, namespace if namespace else '-', *probes)
-" "$1"
+" "$@"
 }
 
 # Is the object a probe names present on $1 right now? The role's namespace is
@@ -554,9 +586,10 @@ write_fleet_kubeconfigs() {
   # A malformed catalog is a repository bug and fails the caller. An
   # unreachable cluster below is weather and does not.
   local rows slots
-  rows="$(_fleet_catalog_rows "$catalog")" || return 1
-  # `-` is the slot of a project-scoped role, not a cluster slot.
-  slots="$(printf '%s\n' "$rows" | awk '$2 != "-" {print $2}' | sort -u)"
+  rows="$(_fleet_catalog_rows "$catalog" "$project" "${FLEET_VARIABLES:-}")" || return 1
+  # `-` is the slot of a project-scoped role and `!` a role this project does
+  # not plant by design; neither is a cluster slot.
+  slots="$(printf '%s\n' "$rows" | awk '$2 != "-" && $2 != "!" {print $2}' | sort -u)"
 
   # Rebuilt from scratch: a file left by a previous run is a credential for a
   # previous project, and pointing a check at the wrong project's fixture is
@@ -583,12 +616,12 @@ write_fleet_kubeconfigs() {
   # appended below as each slot resolves, never a missing slot record a
   # reader would take for an older runner or an uncatalogued role.
   printf 'project=%s\n' "$project" >"${dir}/.fleet-context"
-  printf '%s\n' "$rows" | awk 'NF >= 2 && $2 != "-" { printf "slot.%s=%s\n", $1, $2 }' >>"${dir}/.fleet-context"
+  printf '%s\n' "$rows" | awk 'NF >= 2 && $2 != "-" && $2 != "!" { printf "slot.%s=%s\n", $1, $2 }' >>"${dir}/.fleet-context"
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
   local slot cluster location slot_config listing discovered errors named
   local role namespace probe probes confirmed missing unreadable unreadable_why probe_rc
-  local written=0 unresolved=0 unplanted=0 found=0 labelled=0
+  local written=0 unresolved=0 unplanted=0 gated=0 found=0 labelled=0
   if ! listing="$(_fleet_list_seeded_clusters "$project")"; then
     echo "WARNING: could not list clusters in ${project}; every fleet check will report status=error" >&2
     listing=""
@@ -669,6 +702,15 @@ write_fleet_kubeconfigs() {
   local project_probes
   while read -r role slot namespace probes; do
     [ -n "$role" ] || continue
+    if [ "$slot" = "!" ]; then
+      # Not planted on this project by design: the fleet stack plants it only
+      # on the projects its `${probes}` list names. Nothing is probed, so its
+      # checks report status=error here, and the fixture-state scan reads it
+      # as not checked rather than absent.
+      echo "WARNING: fixture role '${role}' is not planted on project ${project} by design: the project is not in ${probes} (bench/tf/fleet/variables.tf), so it was not checked." >&2
+      gated=$((gated + 1))
+      continue
+    fi
     if [ "$slot" = "-" ]; then
       # A project-scoped role: Compute Engine objects no cluster carries, read
       # with gcloud in the project, as the caller (on the CI health bot's scan,
@@ -773,7 +815,7 @@ write_fleet_kubeconfigs() {
   done <<<"$rows"
 
   export BENCH_FLEET_KUBECONFIG_DIR="$dir"
-  echo "Seeded-fleet kubeconfigs: ${written} role(s) written to ${dir}, ${unresolved} on clusters that could not be resolved or reached, ${unplanted} whose fixtures were not present (project ${project})" >&2
+  echo "Seeded-fleet kubeconfigs: ${written} role(s) written to ${dir}, ${unresolved} on clusters that could not be resolved or reached, ${unplanted} whose fixtures were not present, ${gated} not planted on this project by design (project ${project})" >&2
   if [ -z "$sa" ]; then
     echo "WARNING: FLEET_READONLY_SA is unset, so these kubeconfigs carry the runner's own credential, which can WRITE to the shared fleet. See bench/tf/fleet/README.md, 'A read-only credential for evaluations'." >&2
   fi

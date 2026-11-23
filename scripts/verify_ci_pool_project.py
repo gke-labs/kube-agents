@@ -322,6 +322,9 @@ _FLEET_SUMMARY = re.compile(
     r"Seeded-fleet kubeconfigs: (?P<written>\d+) role\(s\) written to \S+, "
     r"(?P<unresolved>\d+) on clusters that could not be resolved or reached, "
     r"(?P<unplanted>\d+) whose fixtures were not present"
+    # A role the fleet stack plants only on listed projects (`projects_var` in
+    # fixtures.json) is not expected on an unlisted one.
+    r"(?:, (?P<gated>\d+) not planted on this project by design)?"
 )
 
 # Three get-credentials calls and a kubectl probe per fixture object, against
@@ -2898,6 +2901,7 @@ def _fleet_presence_result(
     written = int(match.group("written"))
     unresolved = int(match.group("unresolved"))
     unplanted = int(match.group("unplanted"))
+    expected -= int(match.group("gated") or 0)
     if written == expected and not unresolved and not unplanted:
         return CheckResult(name, True, f"All {expected} fixture roles planted and reachable")
 

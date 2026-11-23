@@ -10,8 +10,9 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`,
-# `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot` are
+# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `rotated-console-vm`,
+# `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and
+# `orphan-snapshot` are
 # project-scoped, so they have no cluster slot). fixtures.json carries all but
 # `orphan-disks` as project-scoped roles (`cluster_slot: null`), which the runner
 # probes in the project with gcloud; `orphan-disks` is in this file alone. A
@@ -269,6 +270,20 @@ fixtures:
       exits 1 on every boot. The guest agent prints the failure line once
       per boot, and the serial buffer rotates it out within about three
       weeks, so each reconcile resets the VM to print it again.
+
+  - role: rotated-console-vm
+    slot: null # Project-scoped, in var.zone; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - instance/serial-flood-<prefix>
+    defect: >-
+      A standalone e2-micro, serial-flood-<prefix>, whose startup script
+      fails at boot and whose systemd timer then writes about 2 MiB of
+      counted filler lines to serial port 1, two minutes after boot and
+      every 24 hours after. The 1 MiB serial buffer keeps only the filler,
+      so the boot's failure lines rotate out minutes after boot. The
+      reconcile does not reset this VM: the rotated console is its healthy
+      state, and the VM's own daily pass renews it.
 
   - role: world-open-ingress
     slot: null # Project-scoped, in var.zone; not attached to any cluster.

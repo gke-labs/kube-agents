@@ -9080,11 +9080,12 @@ def test_the_route_objective_has_the_same_forbidden_survey_in_both_members():
 
 
 def test_the_route_objective_sees_a_survey_on_a_later_line_of_a_call():
-    # On the row the loop is one line and `kubectl` reads as a word of the `echo`, so the rows
-    # member passes it; the typed member reads each line as an argv of its own.
+    # On the row the loop is one line and `kubectl` reads as a word of the `echo`. The rows
+    # member also reads the logged card's call as typed (#6106), as the typed member does: each
+    # line is an argv of its own.
     entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=2)]
     _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries])
-    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "fail"
     typed = WorkerCommandsVerifier(**_WEBHOOK_TYPED_CHECK).verify(5.0)
     assert typed.status == "fail" and "kubectl ran as" in typed.reason, typed.reason
     assert _route_objective(entries) == "fail"
@@ -9096,19 +9097,21 @@ def test_the_route_objective_sees_a_survey_on_a_later_line_of_a_call():
         # the dictated run alone, and beside a kubectl that is not the survey
         ([_ROUTE_RUN], "pass", "pass"),
         ([_ROUTE_RUN, "for c in a b; do\n  kubectl --context $c get nodes\ndone"], "pass", "pass"),
-        # the survey on a later line, which the rows member does not see: in a loop, after an
-        # `echo`, after a `cd`, and on a line that a backslash continues
-        ([_ROUTE_RUN, _SURVEY_LOOP], "pass", "fail"),
-        ([_ROUTE_RUN, 'echo "webhooks next"\nkubectl get validatingwebhookconfigurations -o json'], "pass", "fail"),
-        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c describe pdb pinned-batch-runner -n seeded-upgrade"], "pass", "fail"),
-        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c \\\n  get pdb -A"], "pass", "fail"),
+        # the survey on a later line, which the row does not show and the rows member reads in
+        # the card's typed call (#6106): in a loop, after an `echo`, after a `cd`, and on a line
+        # that a backslash continues
+        ([_ROUTE_RUN, _SURVEY_LOOP], "fail", "fail"),
+        ([_ROUTE_RUN, 'echo "webhooks next"\nkubectl get validatingwebhookconfigurations -o json'], "fail", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c describe pdb pinned-batch-runner -n seeded-upgrade"], "fail", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c \\\n  get pdb -A"], "fail", "fail"),
         # the survey with no run at all: the rows member already fails it, on the missing run
         ([_SURVEY_LOOP], "fail", "fail"),
         # a mention on a later line is one word and no command
         ([_ROUTE_RUN, 'cd /opt/data/scratch\ngrep -n "kubectl get pdb -A" notes.md'], "pass", "pass"),
         ([_ROUTE_RUN, 'echo "next step"\necho "not running kubectl get validatingwebhookconfigurations"'], "pass", "pass"),
-        # Known limit: a heredoc body is read line by line, so a survey line fails in a script
-        # that never ran and in a notes file alike.
+        # Known limit of the typed member: a heredoc body is read line by line, so a survey line
+        # fails in a script that never ran and in a notes file alike. The rows member leaves a
+        # call with a heredoc on its row.
         ([_ROUTE_RUN, "cat > /tmp/later.sh <<'EOF'\nkubectl get pdb -A\nEOF"], "pass", "fail"),
         ([_ROUTE_RUN, "cat > /opt/data/scratch/notes.md <<'EOF'\nTo check by hand:\nkubectl get pdb -A\nEOF"], "pass", "fail"),
         # Known limit: neither member reads a survey whose resource comes from a variable.
@@ -9132,11 +9135,12 @@ def test_the_route_objective_does_not_read_a_survey_that_a_program_runs():
 
 
 def test_the_route_objective_is_an_error_when_a_typed_call_has_no_time():
-    # Known limit: an untimed call makes the typed member `error`, also beside a survey it can see.
+    # Known limit: an untimed call makes the typed member `error`.
     entries = [_terminal(_ROUTE_RUN, at=1), _terminal("kubectl get nodes", at=None)]
     assert _route_objective(entries) == "error"
+    # The rows member orders nothing, so it reads the untimed survey and its fail wins.
     entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=None)]
-    assert _route_objective(entries) == "error"
+    assert _route_objective(entries) == "fail"
 
 
 def test_the_route_objective_sees_a_survey_the_row_shows_as_a_count():
@@ -9170,6 +9174,137 @@ def test_worker_commands_required_run_names_what_did_not_run():
     v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
     res = v.verify(5.0)
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+
+
+# ------------------------------- the checked-webhooks case's lines and its route
+#
+# upgrades-readiness-checked-webhooks-named asks which fail-closed webhooks the readiness check
+# tested and whether each backend answered: one fixed-form line per webhook. The planted gate's
+# line must say its backend is missing; one webhook line must say `ready`, on a line that names no
+# planted dead gate; and the route check is the failclosed-webhook case's, held equal here so that
+# case's route tables stand for both.
+
+_CHECKED_CASE = TASKS / "upgrades-readiness-checked-webhooks-named" / "task.yaml"
+_CHECKED_SPEC = yaml.safe_load(_CHECKED_CASE.read_text(encoding="utf-8"))
+_CHECKED_GATE = "the-gate-line-says-its-backend-is-missing"
+_CHECKED_LIVE = "a-webhook-whose-backend-answered-is-named"
+_CHECKED_ROUTE = "the-names-come-from-the-readiness-run"
+
+
+def _checked_verdict(objective: str, text: str) -> str:
+    check = next(e["check"] for e in _CHECKED_SPEC["verification_spec"] if e["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="checked-webhooks-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_CHECKED_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status
+
+
+def _checked_line(obj: str, backend: str, cluster: str = "seeded-b", kind: str = "webhook") -> str:
+    return f"{cluster}/{obj}: kind {kind}; backend: {backend}"
+
+
+_CHECKED_GATE_LINE = _checked_line("seeded-fail-closed-gate", "missing")
+# A fail-closed webhook with a Service backend on a GKE cluster (Managed Prometheus's operator).
+_CHECKED_LIVE_LINE = _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com", "ready")
+
+
+def test_the_checked_webhooks_route_is_the_failclosed_case_route():
+    route = next(e for e in _CHECKED_SPEC["verification_spec"] if e["name"] == _CHECKED_ROUTE)
+    assert route["check"] == _WEBHOOK_RUN_ENTRY["check"]
+    assert (route["role"], route["mode"]) == (_WEBHOOK_RUN_ENTRY["role"], _WEBHOOK_RUN_ENTRY["mode"])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _CHECKED_GATE_LINE + "\n" + _CHECKED_LIVE_LINE,
+        # the gate by its webhook, a live webhook on another cluster by its configuration kind, a
+        # closing stop the fold drops, prose between the lines
+        _checked_line("gate.seeded.invalid", "missing") + "\n\nThe Service it calls does not exist.\n" + _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com", "ready", cluster="seeded-a", kind="validatingwebhookconfiguration") + ".",
+        # several live webhooks on several clusters, and one left out: the check names none of them
+        "\n".join([_CHECKED_LIVE_LINE, _CHECKED_GATE_LINE, _checked_line("sidecar-injector.example.com", "ready", kind="mutatingwebhookconfigurations"), _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com", "ready", cluster="seeded-c")]),
+        # the gate's line with a closing stop, and the only ready line by its mutating configuration
+        _CHECKED_GATE_LINE + ".\n" + _checked_line("sidecar-injector.example.com", "ready", kind="mutatingwebhookconfiguration"),
+        # the webhook's own name after the configuration's, and a project before the cluster
+        _CHECKED_GATE_LINE + "\n" + _checked_line("gmp-operator.gmp-system.monitoring.googleapis.com/validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com", "ready", cluster="eval-project/seeded-a"),
+        # the kind field in other words: the check reads it for the word webhook, not for its form
+        _CHECKED_GATE_LINE + "\n" + "seeded-a/gmp-operator.gmp-system.monitoring.googleapis.com/validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com: validating webhook; backend: ready",
+        "seeded-b/seeded-fail-closed-gate/gate.seeded.invalid: ValidatingWebhookConfiguration webhook; backend: missing\nseeded-c/gmp-operator.gmp-system.monitoring.googleapis.com: MutatingWebhookConfiguration webhook; backend: ready",
+        _CHECKED_GATE_LINE + "\n" + "seeded-d/gmp-operator.gmp-system.monitoring.googleapis.com: kind: webhook; backend: ready",
+        # slot b's other planted dead gate, where the fleet has it, with its backend missing
+        "\n".join([_CHECKED_GATE_LINE, _checked_line("seeded-crd-gate", "missing"), _CHECKED_LIVE_LINE]),
+        # a planted dead gate by its Service name with its backend missing: the forbids are for
+        # another value only
+        "\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-admission-gate", "missing"), _checked_line("nonexistent-crd-gate", "missing"), _CHECKED_LIVE_LINE]),
+        # a real name that starts with a digit, or with a refused word and a dot: the refusal is
+        # for a segment that is a refused word or a number, alone or before a hyphen or a space,
+        # not for a start that goes on with a letter or a dot
+        _CHECKED_GATE_LINE + "\n" + _checked_line("1password.example.com", "ready"),
+        _CHECKED_GATE_LINE + "\n" + _checked_line("each.example.com", "ready"),
+    ],
+)
+def test_the_checked_webhooks_lines_accepted(text):
+    assert (_checked_verdict(_CHECKED_GATE, text), _checked_verdict(_CHECKED_LIVE, text)) == ("pass", "pass"), text
+
+
+@pytest.mark.parametrize(
+    ("text", "gate", "live"),
+    [
+        # the dead gate alone: the answer of a report that names no webhook whose backend answered
+        (_CHECKED_GATE_LINE + "\n5 more fail-closed webhooks have a backend that answered.", "pass", "fail"),
+        # no line at all
+        ("The readiness check tested 6 webhooks on seeded-b.", "fail", "fail"),
+        # the gate written as ready: wrong for the gate, and not the ready line the second asks for
+        (_checked_line("seeded-fail-closed-gate", "ready"), "fail", "fail"),
+        # the gate hedged
+        (_checked_line("seeded-fail-closed-gate", "missing, probably") + "\n" + _CHECKED_LIVE_LINE, "fail", "pass"),
+        # a second line about the gate that contradicts the first
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("seeded-fail-closed-gate", "ready") + "\n" + _CHECKED_LIVE_LINE, "fail", "pass"),
+        # slot b's other planted dead gate written as ready, by configuration, webhook or Service
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("seeded-crd-gate", "ready"), "fail", "fail"),
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("crd-gate.seeded.invalid", "ready"), "fail", "fail"),
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("nonexistent-crd-gate", "ready"), "fail", "fail"),
+        # a ready line of another kind, and a webhook whose backend is not ready
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("inference-server", "ready", kind="pdb"), "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("warden-validating", "missing"), "pass", "fail"),
+        # the gate by its webhook name written as ready
+        (_checked_line("gate.seeded.invalid", "ready") + "\n" + _CHECKED_LIVE_LINE, "fail", "pass"),
+        # the gate's Service written as a ready webhook: not the ready line, and no gate line
+        (_checked_line("nonexistent-admission-gate", "ready"), "fail", "fail"),
+        # slot b's other planted dead gate written as ready beside a true ready line: the gate
+        # objective's second forbid
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("seeded-crd-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("crd-gate.seeded.invalid", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        # either planted dead gate written as ready by its Service name beside a true ready line:
+        # the second objective passes on the true line, so the gate objective's forbids refuse it
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-crd-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        ("\n".join([_CHECKED_GATE_LINE, _checked_line("nonexistent-admission-gate", "ready"), _CHECKED_LIVE_LINE]), "fail", "pass"),
+        # a count in the line form, the nearest thing an answer with no names can write: a word for
+        # the rest or a number in the place of the name, with or without the word webhooks
+        (_CHECKED_GATE_LINE + "\nseeded-a/others: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/other: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/rest: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/remaining: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/each: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/every: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/12: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-b/all-other-webhooks: validating webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/4 webhooks: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\n- 12 webhooks have a backend that answers (ready).", "pass", "fail"),
+        # more fields after ready, and a kind field that is not a webhook's
+        (_CHECKED_GATE_LINE + "\nseeded-a/gmp-operator.gmp-system.monitoring.googleapis.com: kind webhook; backend: ready; blocks the upgrade: no", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\nseeded-a/webhook-budget: kind pdb; backend: ready", "pass", "fail"),
+        # a ready line that names no webhook: a summary, and a copy of the prompt's form
+        (_CHECKED_GATE_LINE + "\nall other webhooks: kind webhook; backend: ready", "pass", "fail"),
+        (_CHECKED_GATE_LINE + "\n<cluster>/<configuration name>: kind webhook; backend: ready", "pass", "fail"),
+        # a hedge on the ready field
+        (_CHECKED_GATE_LINE + "\n" + _checked_line("warden-validating", "ready, as far as the Service shows"), "pass", "fail"),
+    ],
+)
+def test_the_checked_webhooks_lines_refused(text, gate, live):
+    assert (_checked_verdict(_CHECKED_GATE, text), _checked_verdict(_CHECKED_LIVE, text)) == (gate, live), text
 
 
 # ------------------------------- the retrospective's drained-budget case's line

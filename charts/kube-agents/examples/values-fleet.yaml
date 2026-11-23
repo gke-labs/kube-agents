@@ -57,7 +57,8 @@ platformAgent:
     # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE (and
     # KUBEAGENTS_KUBECTL_COST_TIER, left unset here: set it to fleet only when
     # the clusters hold tens of thousands of Pods each) to the shell sandbox,
-    # where the audits run, and passes every name it does not reserve to the
+    # where the audits run, sends the tier to the A2A gateway's session pods
+    # too, and passes every name it does not reserve to the
     # credential-proxy and agent-api-auth containers. The name here reaches the
     # container that reads it. MALLOC_ARENA_MAX is not on the
     # agent container's allowlist: set here it would reach the credential-proxy

@@ -56,6 +56,7 @@
     "post-merge-sync-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-post-merge",
+      "projects_var": "post_merge_sync_projects",
       "probes": ["deployment/order-ledger", "reposync/repo-sync"],
       "fixture": "order-ledger Deployment, two replicas, in a namespace Config Sync syncs from the pool repository's clusters/seeded-a/seeded-post-merge/ (post-merge-sync.tf). Its steady state is fixed: order-ledger-pdb.yaml is merged there (scripts/provision_ci_pool_post_merge_sync.sh seeds it) and Config Sync keeps the budget applied, so no audit finds the workload unbudgeted. Only post-merge-verified-fixed changes it: its setup removes the file and waits for the prune, the agent's fix is merged and applied again, and the setup's teardown puts the file back",
       "state": [
@@ -1412,6 +1413,34 @@
           "op": "serial_contains",
           "value": "Script \"startup-script\" failed with error",
           "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector finds no failure line and files nothing, so gce-startup-script-failure has no finding to grade. Each reconcile resets the VM to print it again"
+        }
+      ]
+    },
+    "rotated-console-vm": {
+      "cluster_slot": null,
+      "namespace": null,
+      "probes": ["instance/serial-flood-*"],
+      "fixture": "serial-flood-<prefix>, a standalone e2-micro in the fleet's zone whose startup script fails at boot and whose systemd timer then writes about 2 MiB of counted filler lines to serial port 1, one bounded pass two minutes after boot and one every 24 hours after. The serial buffer keeps about 1 MiB, so the boot's failure lines rotate out minutes after boot and only the filler remains: the rotated-console state the GCE compute audit's notes have to report. hack/fleet_reconcile.py does not reset this VM -- its reset reads only the state address google_compute_instance.startup_fail -- and must not: the rotated console is this fixture's healthy state, and the VM's own daily pass renews it. Project-scoped, as startup-fail-vm is",
+      "state": [
+        {
+          "subject": "instance/serial-flood-*",
+          "path": "status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "the GCE compute audit reads the serial console of RUNNING instances only; a stopped or terminated VM has no console read, and the rotated-console case has nothing to grade"
+        },
+        {
+          "subject": "instance/serial-flood-*",
+          "path": "metadata.items[?(@.key=='startup-script')].key",
+          "op": "any_eq",
+          "value": "startup-script",
+          "why": "the startup-script metadata is the fixture's declaration of the failing boot; the systemd units persist on the boot disk, so the VM floods at the next boot with or without it, and this assertion catches the drifted declaration, not a stopped flood"
+        },
+        {
+          "subject": "instance/serial-flood-*",
+          "op": "serial_contains",
+          "value": "eval fixture: serial-flood filler",
+          "why": "one flood pass is about twice the buffer, so filler in the buffer means the boot's failure lines have rotated out -- the state the rotated-console notes grade; a console without it still shows the boot, which is the startup-fail shape, not this one. For a few minutes after a boot the console shows the failure line and not yet the filler, so one scan in that window can read the role drifted; the next flood pass heals it. No reconcile reset repairs this role: the rotated console is the designed state, and the VM's own daily pass renews the filler against the guest agent's slow output"
         }
       ]
     },
