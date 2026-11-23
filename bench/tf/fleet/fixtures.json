@@ -56,6 +56,7 @@
     "post-merge-sync-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-post-merge",
+      "projects_var": "post_merge_sync_projects",
       "probes": ["deployment/order-ledger", "reposync/repo-sync"],
       "fixture": "order-ledger Deployment, two replicas, in a namespace Config Sync syncs from the pool repository's clusters/seeded-a/seeded-post-merge/ (post-merge-sync.tf). Its steady state is fixed: order-ledger-pdb.yaml is merged there (scripts/provision_ci_pool_post_merge_sync.sh seeds it) and Config Sync keeps the budget applied, so no audit finds the workload unbudgeted. Only post-merge-verified-fixed changes it: its setup removes the file and waits for the prune, the agent's fix is merged and applied again, and the setup's teardown puts the file back",
       "state": [

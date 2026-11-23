@@ -576,6 +576,10 @@ class ScanHarness(unittest.TestCase):
         self.world_path = self.tmp / "world.json"
         self.workdir = self.tmp / "work"
         self.roles = fixture_state.catalog_roles(CATALOG)
+        # The fake pool's projects are listed for the post-merge fixture, so the
+        # runner plants every role there; the unlisted test passes its own.
+        self.variables = self.tmp / "variables.tf"
+        self.variables.write_text(f'variable "post_merge_sync_projects" {{\n  default = ["{PROJECT}", "{OTHER}"]\n}}\n')
 
     def environ(self, **extra):
         env = {
@@ -584,6 +588,7 @@ class ScanHarness(unittest.TestCase):
             "STUB_WORLD": str(self.world_path),
             "TMPDIR": str(self.tmp),
             "HOME": os.environ.get("HOME", str(self.tmp)),
+            "FLEET_VARIABLES": str(self.variables),
         }
         env.update(extra)
         return env
@@ -877,6 +882,19 @@ class NotChecked(ScanHarness):
         self.assertIsNotNone(summary, proc.stderr)
         self.assertEqual(tuple(int(n) for n in summary.groups()), (len(self.roles) - 1, 1, 0), proc.stderr)
         self.assertIn("could not be read from", proc.stderr)
+
+    def test_a_role_an_unlisted_project_does_not_plant_is_not_checked_not_absent(self):
+        # post-merge-sync-workload is planted only on projects in
+        # post_merge_sync_projects; on another it is not the fleet's drift, so
+        # the scan reads it not checked, names why, and counts no absent role.
+        unlisted = self.tmp / "unlisted.tf"
+        unlisted.write_text('variable "post_merge_sync_projects" {\n  default = []\n}\n')
+        doc, _ = self.scan(healthy_world(PROJECT), FLEET_VARIABLES=str(unlisted))
+        entry = doc["projects"][PROJECT]
+        self.assertEqual(self.states(doc)["post-merge-sync-workload"], "not_checked")
+        self.assertIn("by design", entry["roles"]["post-merge-sync-workload"]["detail"][0])
+        self.assertEqual(entry["summary"]["absent"], 0)
+        self.assertEqual(doc["summary"]["absent_projects"], 0)
 
     def test_a_probe_the_cluster_refused_is_not_checked_not_absent(self):
         # A 403 or a 5xx on the presence probe says nothing about whether the

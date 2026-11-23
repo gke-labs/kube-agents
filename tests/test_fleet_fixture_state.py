@@ -2615,6 +2615,21 @@ class ReportTest(_Harness):
     bot's scan (scripts/eval_dashboard/fixture_state.py), which runs this
     script per project and must not parse its warnings."""
 
+    def test_a_role_an_unlisted_project_does_not_plant_is_unpublished_not_drifted(self):
+        # The runner publishes nothing for post-merge-sync-workload on a
+        # project outside post_merge_sync_projects (its projects_var): the
+        # pass reports it unpublished, which the health bot reads as not
+        # checked, and writes no drift file for it.
+        self.provision(roles=[role for role in self.catalog["roles"] if role != "post-merge-sync-workload"])
+        report = self.tmp / "report.json"
+        done = self.run_script(_healthy_world(), "--report", str(report))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        doc = json.loads(report.read_text())
+        self.assertEqual(doc["roles"]["post-merge-sync-workload"]["state"], "unpublished")
+        self.assertEqual(doc["summary"]["drifted"], 0)
+        self.assertNotIn("post-merge-sync-workload", self.drift_files())
+        self.assertIn("projects_var", self.catalog["roles"]["post-merge-sync-workload"])
+
     def test_the_report_carries_every_roles_verdict(self):
         world = _healthy_world()
         world["kubectl"]["deployment/checkout-gateway"] = {"status": {"readyReplicas": 0, "replicas": 2}}

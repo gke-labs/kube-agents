@@ -361,6 +361,12 @@ here in the same change; a `bench/tests/test_fleet_verifier.py` test fails when 
 `task.yaml` names a role the catalog lacks, or reads a namespace through a role the
 catalog puts elsewhere.
 
+A role the stack plants only on some projects names the list variable that says which in
+`projects_var` (`post-merge-sync-workload` names `post_merge_sync_projects`). On a project that list
+leaves out, `hack/fleet-kubeconfigs.sh` probes nothing for the role and reports it as not planted
+there by design, apart from its written, unreached and unplanted counts; the pool verifier does not
+expect it there, and the fixture-state scan reads it as not checked rather than absent.
+
 The chain, end to end:
 
 1. `hack/fleet-kubeconfigs.sh` **discovers** the seeded clusters in `$FLEET_PROJECT_ID` (defaulting

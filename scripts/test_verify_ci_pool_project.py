@@ -728,6 +728,24 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertEqual([], result.warnings)
         self.assertIn("in their designed state", result.message)
 
+    def test_a_role_the_project_does_not_plant_by_design_is_not_expected(self):
+        # A role with projects_var (post-merge-sync-workload) on a project its
+        # list leaves out: the runner writes it nowhere and counts it apart, so
+        # every other role written is a full pass, not a fleet incomplete.
+        gated_line = self._summary(self._roles() - 1).replace(
+            " (project kube-agents-evals-5)", ", 1 not planted on this project by design (project kube-agents-evals-5)"
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", gated_line),
+                (0, "", self._state(self._roles() - 1)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual([], result.warnings)
+        self.assertIn(f"All {self._roles() - 1} fixture roles planted", checker._fleet_presence_result("n", "p", self._roles(), 0, gated_line).message)
+
     def test_an_assertion_the_script_had_no_credential_for_is_advice_not_an_unread(self):
         # The declared-intent note with no `gh` login: the roles were read and
         # are in shape, the note was not asserted. The script's own line is
