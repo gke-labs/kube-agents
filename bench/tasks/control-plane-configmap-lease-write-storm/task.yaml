@@ -1,19 +1,57 @@
 # Control plane, setup, cost and CLI (gce-compute-fleet-audit): a controller
-# or leader-election sidecar updates a ConfigMap or Lease hundreds of times a
-# second with no client rate limit, and the API server answers 429 to every
-# other client. A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#5412, which proposes
+# or leader-election sidecar runs with its client-side rate limit turned off
+# and updates a ConfigMap or Lease hundreds of times a second; other
+# controllers that run in Pods share its API priority level and can see added
+# latency or 429 when the level is over its concurrency. Three documented
+# behaviours carry the claim. client-go, `rest.Config`
+# field `QPS`: "If it's zero, the created RESTClient will use DefaultQPS: 5.
+# Setting this to a negative value will disable client-side ratelimiting
+# unless `Ratelimiter` is also set."
+# (https://pkg.go.dev/k8s.io/client-go/rest#Config). API Priority and
+# Fairness: "The workload-low priority level is for requests from any other
+# service account, which will typically include all requests from controllers
+# running in Pods", and "When a given priority level exceeds its permitted
+# concurrency, requests can experience increased latency or be dropped with
+# an HTTP 429 (Too Many Requests) error."
+# (https://kubernetes.io/docs/concepts/cluster-administration/flow-control/).
+# The same page bounds the claim twice: "an ill-behaved Pod that floods the
+# API server with requests cannot prevent leader election or actions by the
+# built-in controllers from succeeding", and inside one level "Requests are
+# dispatched from queues using a fair queuing technique so that, for example,
+# a poorly-behaved controller need not starve others (even at the same
+# priority level)." So the harm is to the workloads of that level, not to
+# every client, and fair queuing limits what one controller takes from the
+# others.
+# A live test (2026-11-20, GKE Standard 1.35.8, one run) agrees with these
+# bounds and did not reach the failure: 40 loops patched a ConfigMap with no
+# client-side limit for 150 seconds. At GKE's own `workload-low` level (25
+# seats) 1879 writes succeeded, about 12 a second, and none got 429; a second
+# service account of the same level got no error, and its median request time
+# rose from 0.021 s to 0.108 s; a new Deployment was ready in 13 s during the
+# flood. In a level of the test's own with 1 seat the flooder got 429 on 6961
+# of 10094 requests, and the second account still got none. Not tested:
+# hundreds of writes a second, a flood that fills GKE's own level, etcd over
+# hours, Autopilot.
+# A declared gap: expected_fail until the
+# check lands (gke-labs/kube-agents#5412, which proposes
 # `apiserver-configmap-lease-write-storm`). Nothing is planted today: the
 # shape (a one-replica Deployment `state-sync-controller` in seeded-shapes
-# whose arguments disable client rate limits, writing nothing) lands in the
-# pull request that adds the check, which rebinds this case to its role and
-# flips the marker in the same diff. The customer failure, hundreds of writes
+# whose one argument is `--kube-api-qps=-1`, a negative QPS, writing nothing)
+# lands in the pull request that adds the check, which rebinds this case to
+# its role and flips the marker in the same diff. A zero is not the shape:
+# by the source above a QPS of 0 is the default limit of 5, so a check that
+# names `--kube-api-qps=0` names a limited client. The flag is spelled as
+# kube-controller-manager spells it ("--kube-api-qps float Default: 20 QPS to
+# use while talking with kubernetes apiserver",
+# https://kubernetes.io/docs/reference/command-line-tools-reference/kube-controller-manager/);
+# other programs spell it differently, so a check on arguments is a heuristic
+# and says so in its finding. The customer failure, hundreds of writes
 # a second, is never reproduced: a storm on a shared cluster is forbidden, and
 # a slow real writer was dropped because no check reads a rate, a kubectl
 # writer would show as an operator caller in the readiness report's audit-log
 # read on every run, and a Terraform-managed ConfigMap patched at run time
 # carries a perpetual diff. Two flip conditions: a check that reads a
-# controller's arguments for disabled rate limits (in this stream, or another,
+# controller's arguments for a negative client QPS (in this stream, or another,
 # which edits `audit:` and `finding_check` in the same diff) flips this case
 # once the shape is planted; a check that thresholds on an audit-log write
 # rate never flips it, because the shape writes nothing. `fixtures: []`: the run
@@ -22,7 +60,7 @@
 # cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: control-plane-configmap-lease-write-storm
-name: "ConfigMap and Lease write storm (declared gap; planted as a controller with rate limits disabled, writing nothing, when its check lands)"
+name: "ConfigMap and Lease write storm (declared gap; planted as a controller with a negative client QPS, writing nothing, when its check lands)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2
@@ -34,12 +72,14 @@ prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.
 expected_output: >-
-  Planted as a controller whose arguments disable client rate limits, writing
-  nothing, once its check lands. Customer failure: hundreds of writes a second
-  and 429s. Validated means: the ledger issue carries a finding that names
-  Deployment `state-sync-controller` as a controller without rate-limit
-  arguments; a rate check never flips this case. The closing response is the
-  SOP's one line with the ledger URL.
+  Planted as a controller whose argument `--kube-api-qps=-1` turns the
+  client-side rate limit off, writing nothing, once its check lands. Customer
+  failure: hundreds of writes a second; the other controllers of its priority
+  level can see added latency or 429 when the level is over its concurrency.
+  Validated means: the ledger issue carries a finding that names Deployment
+  `state-sync-controller` as a controller with a negative client QPS; a rate
+  check never flips this case. The closing response is the SOP's one line with
+  the ledger URL.
 infrastructure:
   deployer: noop
 validated: false

@@ -14,6 +14,14 @@
 # Neither fault filled a table: (A) reached 240 entries against a limit of
 # 100000. With the node's limit lowered in a separate step, a full table wrote
 # FailedMount, "No space left on device".
+# GKE documents one fault that does fill the table, on other versions than the
+# test's: its known-issues page lists "Nodes that mount NFS volumes accumulate
+# mount entries and stop creating containers" for 1.37.0-gke.2941000 and
+# later, fixed in 1.37.1-gke.1131000
+# (https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#nfs-mount-table-exhaustion,
+# read 2026-11-23; not tested). The upgrade readiness rule
+# `known-issues-matrix` names a cluster on those versions from
+# `known_issues.json`; it reads versions, not mounts.
 # The GCE compute collector reads serial consoles, MIG counters, sole-tenant
 # groups and snapshots and no DaemonSet or node mount count; no other stream
 # reads them on a schedule. Nothing is planted. A fixture for (A) is possible:
