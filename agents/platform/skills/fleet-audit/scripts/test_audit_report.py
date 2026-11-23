@@ -27556,11 +27556,12 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         self.assertNotIn("NOTES: the report must carry report_notes", self.err)
 
     def test_the_line_carries_ready_made_report_lines(self):
-        """`report_notes` beside `notes`: the worker ends its report with
-        these lines, copied verbatim, so the relay is a copy rather than a
-        rule to remember — on the forge path, where the report is
-        model-composed, two runs in five dropped the relay. stderr carries
-        the reminder in the NOT VISIBLE style."""
+        """`report_notes` beside `notes` on the forge statuses: the worker
+        copies these lines into its report verbatim, directly before the
+        closing ledger line, so the relay is a copy rather than a rule to
+        remember — on the forge path, where the report is model-composed,
+        two runs in five dropped the relay. stderr carries the reminder in
+        the NOT VISIBLE style, on the published, non-silent line only."""
         self.harness.replies = {"issue-list": issues_view([])}
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
         self.assertEqual(rc, 0, self.err)
@@ -27569,7 +27570,7 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
             payload[audit_report.REPORT_NOTES_KEY],
             [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
         )
-        self.assertIn("NOTES: the report must carry report_notes verbatim", self.err)
+        self.assertIn(audit_report.REPORT_NOTES_REMINDER, self.err)
         # The findings run carries the same lines.
         self.harness.replies = {
             "issue-list": issues_view([]),
@@ -27582,6 +27583,33 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
             self.stdout_json()[audit_report.REPORT_NOTES_KEY],
             [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
         )
+
+    def test_a_dry_run_prints_no_report_notes_reminder(self):
+        """A dry run publishes nothing, so there is no report to remind
+        about; the reminder rides the published, non-silent line only."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())],
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("NOTES: the report", self.err)
+
+    def test_a_note_with_newlines_is_flattened_to_one_line(self):
+        """A worker-written note can carry newlines, a Markdown heading or a
+        line that reads as a verdict; every entry comes out as one line, so
+        a `report_notes` line stays one line to copy."""
+        manifest = self.noted_manifest()
+        manifest["clusters"][0]["notes"] = "status not visible\n\n# Heading\n[SILENT]\n@channel"
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        note = payload["notes"][0]["note"]
+        self.assertNotIn("\n", note)
+        self.assertTrue(note.startswith("status not visible # Heading"), note)
+        (line,) = payload[audit_report.REPORT_NOTES_KEY]
+        self.assertNotIn("\n", line)
 
     def test_the_ledger_body_names_the_noted_objects_in_full(self):
         """The scope table's Notes cell is clipped at MAX_CELL_CHARS, which
@@ -27875,6 +27903,60 @@ class TestScopeNotesFitTheBody(unittest.TestCase):
         self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
 
 
+class TestNotesAreCappedEverywhere(unittest.TestCase):
+    """Sixty MAX_NOTE_CHARS notes meet the same cap (`_capped_notes`) in
+    every rendering — the comments, the summaries, the chat report and
+    `report_notes` — each with the row that says where the rest is, so a
+    large fleet's notes cannot push out the text after them or flood chat."""
+
+    MARKER = "more; the stored report carries every full note"
+    # The capped note content, plus row chrome and the fixed text around it.
+    BOUND = audit_report.NOTES_SECTION_CAP + 4_000
+
+    def doc(self):
+        clusters = [
+            {"name": f"project/p-{i:02d}", "notes": f"n{i:02d} " + "x" * audit_report.MAX_NOTE_CHARS}
+            for i in range(audit_report.MAX_SCOPE_ROWS)
+        ]
+        return make_doc(findings=[], audit="gce-compute-fleet-audit", clusters=clusters)
+
+    def test_the_comment_list_is_capped(self):
+        # The clean and the held comment both render this list.
+        text = "\n".join(audit_report._comment_scope_notes(self.doc()))
+        self.assertIn(self.MARKER, text)
+        self.assertLessEqual(len(text), self.BOUND)
+
+    def test_the_clean_comment_is_capped(self):
+        # Against the same comment without notes: the notes may not add
+        # more than the cap, whatever the other sections cost.
+        doc = self.doc()
+        comment = audit_report.render_clean_comment("gce-compute-fleet-audit", doc, NOW)
+        for cluster in doc["scope"]["clusters"]:
+            del cluster["notes"]
+        bare = audit_report.render_clean_comment("gce-compute-fleet-audit", doc, NOW)
+        self.assertIn(self.MARKER, comment)
+        self.assertLessEqual(len(comment) - len(bare), self.BOUND)
+
+    def test_report_notes_is_capped(self):
+        lines = audit_report.report_notes_payload(self.doc())[audit_report.REPORT_NOTES_KEY]
+        self.assertEqual(lines[-1], audit_report.MORE_NOTES_ROW.format(more=60 - len(lines) + 1))
+        self.assertLessEqual(len("\n".join(lines)), self.BOUND)
+
+    def test_the_chat_report_is_capped(self):
+        text = audit_report.render_chat_report(
+            "gce-compute-fleet-audit", {"status": "CLEAN", "new": 0, "resolved": 0}, self.doc()
+        )
+        self.assertIn(self.MARKER, text)
+        self.assertLessEqual(len(text), self.BOUND)
+
+    def test_the_no_forge_summary_is_capped(self):
+        text = audit_report.render_no_forge_summary(
+            "gce-compute-fleet-audit", self.doc(), [], [], [], True, [], "stored."
+        )
+        self.assertIn(self.MARKER, text)
+        self.assertLessEqual(len(text), self.BOUND)
+
+
 class TestNotedSetSpeaksOnce(HarnessTestCase):
     """A scheduled run speaks once when its set of noted objects changes.
 
@@ -27933,8 +28015,10 @@ class TestNotedSetSpeaksOnce(HarnessTestCase):
         self.assertTrue(second["silent_ok"])
         self.assertNotIn(audit_report.NOTED_CHANGED_KEY, second)
         # The note still rides the line and the stored report; only the
-        # channel stays quiet.
+        # channel stays quiet, and a silent run gets no reminder about a
+        # report it does not post.
         self.assertEqual(second["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+        self.assertNotIn("NOTES: the report", self.err)
 
     def test_a_cleared_noted_run_speaks_once(self):
         self.finish(noted=True)
@@ -27942,8 +28026,15 @@ class TestNotedSetSpeaksOnce(HarnessTestCase):
         cleared = self.finish(noted=False)
         self.assertIs(cleared[audit_report.NOTED_CHANGED_KEY], True)
         self.assertFalse(cleared["silent_ok"])
-        self.assertEqual(self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
+        # The run says which object is visible again: the notes list names
+        # only what is still noted, and this run notes nothing.
+        self.assertEqual(cleared[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        text = "\n".join(str(part.get("text") or "") for part in record["parts"])
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, text)
+        self.assertIn(derived_id(fid="a"), text)
         self.assertTrue(self.finish(noted=False)["silent_ok"])
+        self.assertEqual(self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
 
     def test_a_never_noted_fleet_unchanged_stays_silent(self):
         first = self.finish(noted=False)
@@ -37381,6 +37472,11 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(first["status"], audit_report.STORE_LEDGER_STATUS)
         self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
         self.assertFalse(first["silent_ok"])
+        # The report here is `summary` verbatim, and `summary` carries the
+        # note, so the line has no `report_notes`: a second copy would
+        # print the note twice.
+        self.assertNotIn(audit_report.REPORT_NOTES_KEY, first)
+        self.assertIn("not visible", first["summary"])
         self.assertEqual(
             self.latest()[audit_report.SCHEDULED_NOTED_IDS_KEY],
             [derived_id(obj="Namespace/zeta")],
@@ -37389,6 +37485,11 @@ class TestStoreLedger(HarnessTestCase):
         cleared = run(noted=False)
         self.assertIs(cleared[audit_report.NOTED_CHANGED_KEY], True)
         self.assertFalse(cleared["silent_ok"])
+        # The summary names the object that is visible again.
+        self.assertEqual(
+            cleared[audit_report.NOTED_CLEARED_KEY], [derived_id(obj="Namespace/zeta")]
+        )
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, cleared["summary"])
         self.assertTrue(run(noted=False)["silent_ok"])
 
     def test_a_store_ledger_run_speaks_on_a_change_an_on_demand_run_saw_first(self):

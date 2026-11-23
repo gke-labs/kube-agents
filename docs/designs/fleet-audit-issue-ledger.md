@@ -127,7 +127,8 @@ One open GitHub issue per audit stream per install, rewritten in place on every 
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
   `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, on a
-  scheduled run the same published ids as the last scheduled run (§7.5), and no
+  scheduled run the same published ids and the same set of noted objects as the last scheduled
+  run (§7.5), and no
   collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md)). If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
@@ -1970,7 +1971,8 @@ makes no edit when the close fails, adds no second banner, and keeps the old bod
 fails.
 
 **Silence cases** (§7.5): on a run that passed `--scheduled`, `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
-`false` whenever the run reported a new finding, a resolved finding, a new or changed coverage gap, or a
+`false` whenever the run reported a new finding, a resolved finding, a new or changed coverage gap, a
+changed set of noted objects (§7.5), or a
 remediation PR opened or closed, and `true` again over a gap that did not change — asserted on both `finish` branches, since each prints its own
 JSON. The same quiet runs without `--scheduled` give `false`, on both branches and with no
 forge, and a scheduled run after an on-demand run that first saw a gap still reports the gap.

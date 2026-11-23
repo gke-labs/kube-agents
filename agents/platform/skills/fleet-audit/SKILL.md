@@ -142,10 +142,14 @@ Run every script by its full path. A kanban worker starts in its card's workspac
 
    1. On a scheduled run with `silent_ok: true`, the final response is exactly `[SILENT]` and
       nothing else; a run `precheck` closed is reported from its line the same way.
-   2. On `status: "NO_FORGE"` or `"STORE_LEDGER"`, the report is `summary` verbatim.
-   3. Otherwise report `issue_url` in full and every URL in `prs_opened` and `prs_still_open`.
-   4. End the report with each line of `report_notes`, copied verbatim. Each line names an
-      object a check read but could not see; a report without them calls those objects clean.
+   2. On `status: "NO_FORGE"` or `"STORE_LEDGER"`, the report is `summary` verbatim; it already
+      carries the notes.
+   3. Otherwise report `issue_url` in full and every URL in `prs_opened` and `prs_still_open`,
+      and keep the line that carries the ledger URL as the last line.
+   4. Copy each line of `report_notes` verbatim, directly before that closing ledger line.
+      Each line names an object a check read but could not see; a report without them calls
+      those objects clean. Relay a `noted_cleared` line the same way: those objects are
+      visible again.
 
    An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
 

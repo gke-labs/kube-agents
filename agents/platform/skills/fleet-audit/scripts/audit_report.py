@@ -1839,24 +1839,47 @@ SCOPE_NOTES_KEY = "notes"
 NOTES_RESULT_KEY = "notes"
 NOTE_TARGET_FIELD = "target"
 NOTE_TEXT_FIELD = "note"
-# Beside `notes` on the JSON line: the same entries as ready-made report
-# lines, one per noted target. The worker ends its report with these lines,
-# copied verbatim — the SOP told it to "relay each entry of `notes`" and on
-# the forge path, where the report is model-composed rather than `summary`
-# verbatim, two runs in five dropped the relay. A line the worker copies is
-# a rule it cannot misremember. A `[SILENT]` run posts no report, so it
-# copies nothing; `notes` stays the structured field.
+# Beside `notes` on the JSON line of the two forge statuses: the same
+# entries as ready-made report lines, one per noted target. The worker
+# copies these lines into its report verbatim, directly before the closing
+# ledger line — the SOP told it to "relay each entry of `notes`" and on
+# the forge path, where the report is model-composed, two runs in five
+# dropped the relay. A line the worker copies is a rule it cannot
+# misremember. On `NO_FORGE` and `STORE_LEDGER` the report is `summary`
+# verbatim and `summary` already carries the notes, so those lines carry no
+# `report_notes` — a second copy would print each note twice. A `[SILENT]`
+# run posts no report, so it copies nothing; `notes` stays the structured
+# field on every status.
 REPORT_NOTES_KEY = "report_notes"
 # The lead of each `report_notes` line: what the note means for the reader.
+# The eval case gce-rotated-console-notes requires this lead in the report,
+# and bench/tests/test_gce_rotated_console_notes_patterns.py holds the two
+# equal; change them together.
 REPORT_NOTE_PREFIX = "Not visible, not clean:"
+# The stderr reminder beside a published, non-silent line that carries
+# `report_notes`, in the style of the NOT VISIBLE and HELD lines.
+REPORT_NOTES_REMINDER = (
+    "NOTES: the report must carry report_notes verbatim, directly before the closing ledger line."
+)
+# On the JSON line of a scheduled run whose noted set changed, when objects
+# left the set since the last scheduled run: their ledger ids. The chat
+# report and the no-forge and store-ledger summaries name them under
+# `VISIBLE_AGAIN_LEAD`, so a run that speaks only because a noted object
+# cleared says which one; the forge-path worker can relay the line.
+NOTED_CLEARED_KEY = "noted_cleared"
+VISIBLE_AGAIN_LEAD = "Visible again, no longer in the noted set"
 # The lead of the notes list in a comment and in the no-forge summary.
 NOTES_LEAD = "Read but not visible, which is not a coverage gap"
-# Ceiling on the un-clipped notes list in the ledger body (`_render_body_notes`).
-# The scope table's Notes cell is clipped at MAX_CELL_CHARS, which ends
-# before ROTATED_SERIAL_NOTE reaches the instance names, so the body carries
-# the full notes in a list of its own — bounded, so sixty projects of
-# MAX_NOTE_CHARS notes cannot squeeze the findings out of the budget.
+# Ceiling on every rendered notes list (`_capped_notes`): the ledger body's
+# list, the clean and held comments, `report_notes`, the chat report and
+# the no-forge and store-ledger summaries. The scope table's Notes cell is
+# clipped at MAX_CELL_CHARS, which ends before ROTATED_SERIAL_NOTE reaches
+# the instance names, so the body carries the full notes in a list of its
+# own — bounded, so sixty projects of MAX_NOTE_CHARS notes cannot squeeze
+# out the findings, overrun a comment, or flood chat.
 NOTES_SECTION_CAP = 6_000
+# The row that says what the cap left out, wherever the cap applied.
+MORE_NOTES_ROW = "…and {more} more; the stored report carries every full note"
 # A collected target's manifest entry may list the objects its `notes` names
 # as `{check, object}` (and `namespace` where the check has one, and an
 # optional `command`, the object's own read): each one an object a check read
@@ -5456,13 +5479,30 @@ def render_chat_report(
         lines.append(
             f"- The collector flagged {len(dropped)} candidate(s) this run's document does not carry."
         )
+    # A noted object that cleared: the notes list below names only what is
+    # still noted, so the run that speaks for the clear says which object
+    # is visible again (`noted_cleared_ids`).
+    cleared = [str(fid) for fid in payload.get(NOTED_CLEARED_KEY) or []]
+    if cleared:
+        shown_cleared, left_cleared = _capped_notes(cleared)
+        lines.append(
+            f"- {VISIBLE_AGAIN_LEAD} ({len(cleared)}): "
+            + ", ".join(shown_cleared)
+            + (f", {MORE_NOTES_ROW.format(more=left_cleared)}" if left_cleared else "")
+        )
     # The targets' notes, before the ledger line, which stays last for the
     # Slack headline. A `[SILENT]` run posts no report, so its notes stay in
     # the store — and a run whose noted set changed is not silent
-    # (`noted_set_changed`), so the change reaches the channel once.
+    # (`noted_set_changed`), so the change reaches the channel once. Capped
+    # (`_capped_notes`), so sixty long notes do not flood the channel.
     notes = scope_notes(data)
     if notes:
-        lines.append(f"- {NOTES_LEAD}: " + "; ".join(notes))
+        shown, left = _capped_notes(notes)
+        lines.append(
+            f"- {NOTES_LEAD}: "
+            + "; ".join(shown)
+            + (f"; {MORE_NOTES_ROW.format(more=left)}" if left else "")
+        )
     if payload.get("issue_url"):
         lines.append(CHAT_REPORT_LEDGER_LINE.format(url=payload["issue_url"]))
     return "\n".join(lines)
@@ -8447,7 +8487,11 @@ def scope_note_entries(data: dict) -> list[dict]:
     for cluster in (data.get("scope") or {}).get("clusters") or []:
         if not isinstance(cluster, dict):
             continue
-        note = publishable_text(str(cluster.get(SCOPE_NOTES_KEY) or "")).strip()
+        # Flattened to one line: a worker-written note can carry newlines, a
+        # Markdown heading or a line that reads as a verdict, and every
+        # reader of an entry — `report_notes`, the comments, the chat
+        # report — treats it as one line.
+        note = " ".join(publishable_text(str(cluster.get(SCOPE_NOTES_KEY) or "")).split())
         if note:
             name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
             out.append({NOTE_TARGET_FIELD: name, NOTE_TEXT_FIELD: note[:MAX_NOTE_CHARS]})
@@ -8455,22 +8499,58 @@ def scope_note_entries(data: dict) -> list[dict]:
 
 
 def notes_payload(data: dict) -> dict:
-    """`notes` and `report_notes` for the JSON line, or nothing when no target has a note.
+    """`{NOTES_RESULT_KEY: [...]}` for the JSON line, or nothing when no target has a note."""
+    entries = scope_note_entries(data)
+    return {NOTES_RESULT_KEY: entries} if entries else {}
 
-    `notes` is the structured field. `report_notes` is the same entries as
-    ready-made lines the worker ends its report with, verbatim
-    (`REPORT_NOTES_KEY`): the relay is a copy, not a rule to remember.
+
+def log_report_notes_reminder(payload: dict) -> None:
+    """The worker-facing reminder (`REPORT_NOTES_REMINDER`), in the style of
+    the NOT VISIBLE and HELD lines, printed beside a published line whose
+    report the worker composes: it carries `report_notes` and is not silent.
+    A `[SILENT]` run, a dry run and a refused document get none, and the
+    `summary` statuses carry the notes inside `summary`."""
+    if payload.get(REPORT_NOTES_KEY) and not payload.get("silent_ok"):
+        log(REPORT_NOTES_REMINDER)
+
+
+def report_notes_payload(data: dict) -> dict:
+    """`report_notes` for the JSON line of the two forge statuses, or nothing.
+
+    The same entries as `notes`, as ready-made lines the worker copies into
+    its report verbatim, directly before the closing ledger line
+    (`REPORT_NOTES_KEY`): the relay is a copy, not a rule to remember. Only
+    the forge statuses carry it — on `NO_FORGE` and `STORE_LEDGER` the
+    report is `summary` verbatim, and `summary` already carries the notes.
+    Capped like every rendered notes list (`_capped_notes`).
     """
     entries = scope_note_entries(data)
     if not entries:
         return {}
-    return {
-        NOTES_RESULT_KEY: entries,
-        REPORT_NOTES_KEY: [
-            f"{REPORT_NOTE_PREFIX} {e[NOTE_TARGET_FIELD]}: {e[NOTE_TEXT_FIELD]}"
-            for e in entries
-        ],
-    }
+    lines = [
+        f"{REPORT_NOTE_PREFIX} {e[NOTE_TARGET_FIELD]}: {e[NOTE_TEXT_FIELD]}"
+        for e in entries
+    ]
+    shown, left = _capped_notes(lines)
+    if left:
+        shown = [*shown, MORE_NOTES_ROW.format(more=left)]
+    return {REPORT_NOTES_KEY: shown}
+
+
+def _capped_notes(notes: list[str]) -> tuple[list[str], int]:
+    """The notes that fit `NOTES_SECTION_CAP` (at most `MAX_SCOPE_ROWS` of
+    them), and how many were left out. Every rendered notes list uses it, so
+    sixty MAX_NOTE_CHARS notes cannot overrun a body section, a comment, a
+    summary, the chat report or the JSON line; `MORE_NOTES_ROW` says where
+    the rest is."""
+    shown: list[str] = []
+    total = 0
+    for note in notes[:MAX_SCOPE_ROWS]:
+        if total + len(note) > NOTES_SECTION_CAP:
+            break
+        shown.append(note)
+        total += len(note)
+    return shown, len(notes) - len(shown)
 
 
 def scope_notes(data: dict) -> list[str]:
@@ -8489,10 +8569,11 @@ def _comment_scope_notes(data: dict) -> list[str]:
     notes = scope_notes(data)
     if not notes:
         return []
+    shown, left = _capped_notes(notes)
     out = ["", f"{NOTES_LEAD} ({len(notes)}):", ""]
-    out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in notes[:MAX_SCOPE_ROWS]]
-    if len(notes) > MAX_SCOPE_ROWS:
-        out.append(f"- _…and {len(notes) - MAX_SCOPE_ROWS} more_")
+    out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in shown]
+    if left:
+        out.append(f"- _{MORE_NOTES_ROW.format(more=left)}_")
     return out
 
 
@@ -8507,24 +8588,7 @@ def _render_body_notes(data: dict) -> list[str]:
     the findings out of the budget: the rows past the cap are counted, and
     every full note stays in the stored report and on the JSON line.
     """
-    notes = scope_notes(data)
-    if not notes:
-        return []
-    out = ["", f"{NOTES_LEAD} ({len(notes)}):", ""]
-    total = 0
-    shown = 0
-    for note in notes[:MAX_SCOPE_ROWS]:
-        row = f"- {_cell(note, limit=MAX_NOTE_CHARS)}"
-        if total + len(row) > NOTES_SECTION_CAP:
-            break
-        out.append(row)
-        total += len(row) + len(LINE_JOINER)
-        shown += 1
-    if shown < len(notes):
-        out.append(
-            f"- _…and {len(notes) - shown} more; the stored report carries every full note_"
-        )
-    return out
+    return _comment_scope_notes(data)
 
 
 def _noted_objects(manifest: dict | None):
@@ -10846,6 +10910,16 @@ def noted_set_changed(noted: set[str], memory: dict | None) -> bool:
     if baseline is None:
         return bool(noted)
     return set(noted) != set(baseline)
+
+
+def noted_cleared_ids(noted: set[str], memory: dict | None) -> list[str]:
+    """The ids that left the noted set since the last scheduled run: in the
+    baseline (`scheduled_noted_baseline`) and not noted now. A run that
+    speaks because a note cleared would otherwise say nothing about it —
+    the notes list names only what is still noted — so the chat report and
+    the summaries name these under `VISIBLE_AGAIN_LEAD`, and the JSON line
+    carries them under `NOTED_CLEARED_KEY`."""
+    return sorted(set(scheduled_noted_baseline(memory) or []) - set(noted))
 
 
 def first_stored_record(directory, trusted: Callable[[dict], bool]) -> dict | None:
@@ -13906,7 +13980,8 @@ def _render_scope(
             # Not a gap, so not in the Limitations column: the row's checks
             # ran, and this says what one of them could not see.
             # Clipped as the Limitations cell is: 60 rows of full notes do
-            # not fit in the body. The full note stays in the stored
+            # not fit in the body. The full note is in the body's own list
+            # under this table (`_render_body_notes`), in the stored
             # document and in the clean comment.
             row += f"| {_cell(cluster.get(SCOPE_NOTES_KEY, '')) or '—'} "
         out.append(row + "|")
@@ -24794,6 +24869,7 @@ def render_no_forge_summary(
     unaccounted: Iterable[str] = (),
     noun: str = DEFAULT_PROPOSAL_NOUN,
     noted: Iterable[str] = (),
+    cleared: Iterable[str] = (),
 ) -> str:
     """The chat summary of a run with no ledger issue, which is the only report its operator gets.
 
@@ -24821,7 +24897,10 @@ def render_no_forge_summary(
     `noted` is `noted_ids`: a held id in it gets its own line, because the
     collector does not flag it. The targets' notes (`scope_notes`) come
     before the coverage gaps, because the worker sends this text verbatim
-    and it is the only place they reach the operator.
+    and it is the only place they reach the operator; capped
+    (`_capped_notes`), so sixty long notes do not flood chat. `cleared` is
+    the JSON line's `noted_cleared`: the objects visible again, which the
+    notes list cannot name.
     """
     findings = list(data.get("findings") or [])
     noted = set(noted)
@@ -24899,9 +24978,22 @@ def render_no_forge_summary(
             f"{len(retired)} finding(s) retired with the ledger, not confirmed fixed: their "
             "cluster is no longer in the fleet listing: " + ", ".join(retired)
         )
+    cleared = [str(fid) for fid in cleared]
+    if cleared:
+        shown_cleared, left_cleared = _capped_notes(cleared)
+        lines.append(
+            f"{VISIBLE_AGAIN_LEAD} ({len(cleared)}): "
+            + ", ".join(shown_cleared)
+            + (f", {MORE_NOTES_ROW.format(more=left_cleared)}" if left_cleared else "")
+        )
     notes = scope_notes(data)
     if notes:
-        lines.append(f"{NOTES_LEAD}: " + "; ".join(notes))
+        shown_notes, left_notes = _capped_notes(notes)
+        lines.append(
+            f"{NOTES_LEAD}: "
+            + "; ".join(shown_notes)
+            + (f"; {MORE_NOTES_ROW.format(more=left_notes)}" if left_notes else "")
+        )
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
     lines.append(note)
@@ -25061,6 +25153,7 @@ def _finish_without_forge(
     # does not wake the channel.
     noted = noted_ids(manifest)
     noted_moved = noted_set_changed(noted, record)
+    noted_cleared = noted_cleared_ids(noted, record) if noted_moved else []
     # An id that left under a gap is not resolved. An id that an on-demand
     # run with full coverage resolved is resolved, also when this run has a gap.
     since_scheduled = since_last_scheduled(
@@ -25088,6 +25181,8 @@ def _finish_without_forge(
         **precheck_payload(),
         # The targets' notes, on every status: the line is what the worker
         # relays, and on a clean run with no ledger it is the only place.
+        # No `report_notes` here: the report is `summary` verbatim,
+        # and `summary` already carries the notes.
         **notes_payload(data),
         "issue_url": None,
         "new": len(new_ids),
@@ -25116,6 +25211,7 @@ def _finish_without_forge(
         "critical": severity_counts(findings)["critical"],
         **since_scheduled,
         **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+        **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
@@ -25175,6 +25271,7 @@ def _finish_without_forge(
         unread=unread,
         stored=stored,
         noted=noted,
+        cleared=payload.get(NOTED_CLEARED_KEY) or [],
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -25596,6 +25693,7 @@ def _finish_store_ledger(
     # does not wake the channel.
     noted = noted_ids(manifest)
     noted_moved = noted_set_changed(noted, scheduled_memory)
+    noted_cleared = noted_cleared_ids(noted, scheduled_memory) if noted_moved else []
     # As on the forge path, an id stays under `reported_under_gap` until a run
     # publishes it again or a run with full coverage does not find it.
     if gaps or stale_scheme:
@@ -25849,6 +25947,8 @@ def _finish_store_ledger(
         **precheck_payload(),
         # The targets' notes, on every status: the line is what the worker
         # relays, and on a clean run with no ledger it is the only place.
+        # No `report_notes` here: the report is `summary` verbatim,
+        # and `summary` already carries the notes.
         **notes_payload(data),
         "issue_url": None,
         "new": reported_new,
@@ -25867,6 +25967,7 @@ def _finish_store_ledger(
         **({RETIRED_UNLISTED_KEY: sorted(retired_ids)} if retired else {}),
         **since_scheduled,
         **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+        **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
         **collector_payload(plan.uncorroborated),
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
@@ -25933,6 +26034,7 @@ def _finish_store_ledger(
         unaccounted=unaccounted_ids,
         noun=noun,
         noted=noted,
+        cleared=payload.get(NOTED_CLEARED_KEY) or [],
     )
     append_chat_report(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -26487,11 +26589,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # Before the join: a hand-written `declared[]` entry for a pool the
         # collector reports at its ceiling is a declared fault, and exits 2.
         reject_declared_ceiling_pools(data, manifest)
-    if scope_note_entries(data):
-        # The worker-facing reminder, in the style of the NOT VISIBLE and
-        # HELD lines: the JSON line carries ready-made `report_notes` lines,
-        # and the report ends with them, copied verbatim (`REPORT_NOTES_KEY`).
-        log("NOTES: the report must carry report_notes verbatim, as its last lines.")
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.
@@ -27055,6 +27152,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # every run.
     noted = noted_ids(manifest)
     noted_moved = noted_set_changed(noted, scheduled_memory)
+    noted_cleared = noted_cleared_ids(noted, scheduled_memory) if noted_moved else []
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
@@ -27648,6 +27746,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             # The targets' notes, on every status: the line is what the worker
             # relays, and on a clean run with no ledger it is the only place.
             **notes_payload(data),
+            **report_notes_payload(data),
             "issue_url": existing_url,
             "new": 0,
             "resolved": clean_resolved,
@@ -27690,6 +27789,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             **since_scheduled,
             # Only when the run speaks because the noted set changed.
             **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+            **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
             **timer_payload(),
@@ -27816,6 +27916,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             refinish=bool(payload.get(REFINISH_KEY)),
             whole_run=whole_run,
         )
+        log_report_notes_reminder(payload)
         print(json.dumps(payload))
         return envelope if stored else None
 
@@ -28249,6 +28350,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # The targets' notes, on every status: the line is what the worker
         # relays, and on a clean run with no ledger it is the only place.
         **notes_payload(data),
+        **report_notes_payload(data),
         "issue_url": issue_url,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -28326,6 +28428,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **since_scheduled,
         **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+        **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }
@@ -28391,6 +28494,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         refinish=bool(payload.get(REFINISH_KEY)),
         whole_run=baseline.from_entry,
     )
+    log_report_notes_reminder(payload)
     print(json.dumps(payload))
     return envelope if stored else None
 

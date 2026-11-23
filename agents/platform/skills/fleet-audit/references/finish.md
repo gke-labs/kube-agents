@@ -87,12 +87,17 @@ target has one: a list of `{target, note}`, each one a sentence from the collect
 read on that target but could not see. A note is not a coverage gap: `partial` does not count it.
 The set of noted objects speaks once: a scheduled run is not silent when its set of noted objects
 is different from the set of the last scheduled run — a new noted object, or one whose note
-cleared — and its line then carries `noted_changed: true`. When the set is the same, the notes do
+cleared — and its line then carries `noted_changed: true`, with `noted_cleared`, the ids of the
+objects that left the set, when there are some: the notes list names only what is still noted, so
+this is how a reader hears that an object is visible again. When the set is the same, the notes do
 not stop `silent_ok`, so one long-lived noted object does not wake the channel each day. The
-comparison uses the objects' identities, not the note text. Beside `notes`, the line carries
-`report_notes`: the same entries as ready-made lines, one per noted target. End your report with
-each line of `report_notes`, copied verbatim, on every status, and do not report the objects it
-names as clean. The one exception is a scheduled run with `silent_ok: true`: it
+comparison uses the objects' identities, not the note text. Beside `notes`, the line of the two
+forge statuses carries `report_notes`: the same entries as ready-made lines, one per noted target,
+capped like every rendered notes list, with a closing "…and N more" row when the cap cut some.
+Copy each line of `report_notes` into your report verbatim, directly before the closing ledger
+line — the ledger URL stays the last line — and do not report the objects it
+names as clean. On `NO_FORGE` and `STORE_LEDGER` there is no `report_notes`: the report is
+`summary` verbatim, and `summary` already carries the notes. The one exception is a scheduled run with `silent_ok: true`: it
 answers `[SILENT]` and does not report the notes in chat, and they stay in the stored report. On
 any other scheduled run the chat relay posts the report `finish` leaves, which lists the notes too. A previous finding on such an object did not go away in this run's
 sight: report it again from the previous finding, because `finish` refuses a `resolved_because`
