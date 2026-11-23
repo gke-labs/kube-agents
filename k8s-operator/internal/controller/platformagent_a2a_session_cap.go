@@ -286,12 +286,19 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 		// cap the store can't keep.
 		logf.FromContext(ctx).Info("the served PlatformAgent CRD drops status.effectiveSessionCap; plain conversations stay with platform until the CRD is updated")
 		r.sessionCapPruned.Store(key, time.Now())
-		// Only the version is carried: the render copy holds status the
-		// store doesn't (resolvedUniverseDomain), and holdSessionCapPruned
-		// sets the cap and the condition.
+		// Only the version and the two session counts the patch wrote are
+		// carried: the render copy holds status the store doesn't
+		// (resolvedUniverseDomain). The counts are carried so
+		// holdSessionCapPruned compares with what the store now holds: a
+		// warm count the echo kept is cleared in this pass, not in a later
+		// one within the reprobe.
 		agent.ResourceVersion = written.ResourceVersion
+		agent.Status.EffectiveSessionCap = copyIntPtr(written.Status.EffectiveSessionCap)
+		agent.Status.EffectiveWarmSessions = copyIntPtr(written.Status.EffectiveWarmSessions)
 		if instance != nil {
 			instance.ResourceVersion = written.ResourceVersion
+			instance.Status.EffectiveSessionCap = copyIntPtr(written.Status.EffectiveSessionCap)
+			instance.Status.EffectiveWarmSessions = copyIntPtr(written.Status.EffectiveWarmSessions)
 		}
 		r.holdSessionCapPruned(ctx, agent, instance)
 		return
