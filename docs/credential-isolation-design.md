@@ -263,8 +263,7 @@ audit-report reader on every install and, when Google Chat is enabled, `kubeagen
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
-install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
-pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it), the session pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience
 `kubeagents-credential-proxy-profile`; see

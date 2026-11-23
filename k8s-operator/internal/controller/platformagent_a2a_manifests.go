@@ -352,9 +352,11 @@ const (
 	// broker's `session` role for read-only gcloud. A demo aid until
 	// declarative profiles (spec-subagent-profiles) carry a session's
 	// identity and tools; the flag and everything it renders go when they
-	// do. Operator-level and off by default for the reason
-	// a2aInjectBackendEnvVar is: the pod executes model output, and what
-	// widens its fence is a property of who deployed the operator.
+	// do. Since 2026-11-20 the view is on by default for the session route
+	// (#6538), and the flag is an operator-level override: "true" turns it
+	// on on any route, "false" turns it off on the session route
+	// (a2aSessionClusterViewEnabled). Unset, it follows the route, so a
+	// platform-route install still gets no view.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
 	// The platform agent's trusted-human allowlists, handed to the gateway
 	// so a session's request to delegate to the platform agent is checked
@@ -1971,11 +1973,23 @@ func a2aChatDisplayMode(mode string) string {
 }
 
 // a2aSessionClusterViewEnabled reports whether this install's session pods
-// get the temporary cluster view: the literal "true" on the operator, and a
-// mode-next CR (nothing else spawns a session pod). Anything but "true" is
-// off, so a typo leaves the fence as it is.
+// get the temporary cluster view (#6538, #6987). Since 2026-11-20 the view is
+// on by default for the session route: with the operator's
+// A2A_SESSION_CLUSTER_VIEW unset, it is on exactly when the resolved route is
+// session (resolveA2ADefaultRoute, so its fallbacks to platform turn it off
+// too). The flag overrides it until the view is replaced by the profile path
+// (#6483): "true" turns it on whatever the route, as before, and "false"
+// turns it off on the session route too. Any other value is off, so a typo
+// never widens the fence.
 func a2aSessionClusterViewEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return os.Getenv(a2aSessionClusterViewEnvVar) == "true"
+	switch os.Getenv(a2aSessionClusterViewEnvVar) {
+	case "true":
+		return true
+	case "":
+		return resolveA2ADefaultRoute(agent) == agentv1alpha1.DefaultRouteSession
+	default:
+		return false
+	}
 }
 
 // a2aCapabilityRequired renders "false" only for an explicit "false", so a

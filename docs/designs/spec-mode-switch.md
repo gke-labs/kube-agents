@@ -207,9 +207,7 @@ image overrides are already decided. The operator's render tests check that the 
 renders no part of the door, and the conformance suite that every render site consults the flag
 and that the flag is not a CRD field.
 
-A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
-`spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
-clusters. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
+The session pods the gateway spawns get a temporary read-only view of the clusters: on by default when the install's route is `session` (since 2026-11-20, #6538 and #6987), and otherwise with `A2A_SESSION_CLUSTER_VIEW=true` on the operator, a switch of the same kind as the one above. The flag overrides the default either way: `"true"` turns the view on on any route, and `"false"` turns it off on the session route too. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
 session audience (`CREDENTIAL_PROXY_SESSION_AUDIENCE`) on both `<agent>-kube-proxy` and the
 credential broker, where the broker's `session` role reaches `/v1/exec` for `gcloud` only and no
 other caller may present that audience. It opens ingress and session egress to `<agent>-kube-proxy`
