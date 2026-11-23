@@ -977,7 +977,7 @@ type encodedKindPayload struct {
 	jsonList []byte
 }
 
-func startCacheAPIServer(t testing.TB, specs []watchedKindSpec, count int) (*httptest.Server, meta.RESTMapper) {
+func startCacheAPIServer(t testing.TB, specs []watchedKindSpec, count int) (*httptest.Server, meta.RESTMapper, int64) {
 	t.Helper()
 	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{
 		appsv1.SchemeGroupVersion,
@@ -991,6 +991,7 @@ func startCacheAPIServer(t testing.TB, specs []watchedKindSpec, count int) (*htt
 	leaseGVR := coordinationv1.SchemeGroupVersion.WithResource("leases")
 	mapper.AddSpecific(leaseGVK, leaseGVR, leaseGVR, meta.RESTScopeNamespace)
 	routes := make(map[string]encodedKindPayload, len(specs))
+	var payloadBytes int64
 	for _, sp := range specs {
 		mapper.AddSpecific(sp.gvk, sp.gvr, sp.gvr, sp.scope)
 		listObj := sp.buildList(count)
@@ -1000,6 +1001,7 @@ func startCacheAPIServer(t testing.TB, specs []watchedKindSpec, count int) (*htt
 			t.Fatalf("encoding %s list: %v", sp.name, err)
 		}
 		routes[sp.path] = encodedKindPayload{jsonList: raw}
+		payloadBytes += int64(len(raw))
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1030,7 +1032,7 @@ func startCacheAPIServer(t testing.TB, specs []watchedKindSpec, count int) (*htt
 		_, _ = w.Write(payload.jsonList)
 	}))
 	t.Cleanup(srv.Close)
-	return srv, mapper
+	return srv, mapper, payloadBytes
 }
 
 func readLiveHeapBytes() (live uint64, heapAlloc uint64) {
@@ -1106,17 +1108,20 @@ func measureCacheWithOptions(t testing.TB, srv *httptest.Server, mapper meta.RES
 		t.Fatalf("cache.New: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cacheSyncTimeout)
-	defer func() {
-		cancel()
-		readLiveHeapBytes()
-	}()
 	for _, sp := range specs {
 		if _, err := c.GetInformer(ctx, sp.prototype); err != nil {
+			cancel()
 			t.Fatalf("GetInformer(%s): %v", sp.name, err)
 		}
 	}
+	startDone := make(chan error, 1)
 	go func() {
-		_ = c.Start(ctx)
+		startDone <- c.Start(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-startDone
+		readLiveHeapBytes()
 	}()
 	if !c.WaitForCacheSync(ctx) {
 		t.Fatal("cache did not sync within timeout")
@@ -1146,7 +1151,7 @@ func measureCacheWithOptions(t testing.TB, srv *httptest.Server, mapper meta.RES
 // the retained kubectl.kubernetes.io/last-applied-configuration annotation.
 func TestManagerCachePerObjectMemoryCost(t *testing.T) {
 	specs := watchedClusterScalingKinds()
-	srv, mapper := startCacheAPIServer(t, specs, cacheTestObjectsPerKind)
+	srv, mapper, payloadBytes := startCacheAPIServer(t, specs, cacheTestObjectsPerKind)
 
 	for _, sp := range specs {
 		t.Run(sp.name, func(t *testing.T) {
@@ -1185,12 +1190,13 @@ func TestManagerCachePerObjectMemoryCost(t *testing.T) {
 	managedFieldsSaved := mRawAll.liveHeapDeltaBytes - mMgrAll.liveHeapDeltaBytes
 	lastAppliedShare := mMgrAll.liveHeapDeltaBytes - mBothAll.liveHeapDeltaBytes
 
-	t.Logf("ALL 12 KINDS (total=%d objects, %d/kind): raw=%.2f MiB (%.2f KiB/obj) | ManagerCacheOptions=%.2f MiB (%.2f KiB/obj) | stripBoth=%.2f MiB (%.2f KiB/obj) | VmRSS=%.2f MiB VmHWM=%.2f MiB",
+	t.Logf("ALL 12 KINDS (total=%d objects, %d/kind): raw=%.2f MiB (%.2f KiB/obj) | ManagerCacheOptions=%.2f MiB (%.2f KiB/obj) | stripBoth=%.2f MiB (%.2f KiB/obj) | VmRSS=%.2f MiB VmHWM=%.2f MiB (includes %.2f MiB encoded list payloads held by the in-process fake API server)",
 		totalObjects, cacheTestObjectsPerKind,
 		float64(mRawAll.liveHeapDeltaBytes)/mebibyteBytes, float64(rawPerObj)/kibibyteBytes,
 		float64(mMgrAll.liveHeapDeltaBytes)/mebibyteBytes, float64(mgrPerObj)/kibibyteBytes,
 		float64(mBothAll.liveHeapDeltaBytes)/mebibyteBytes, float64(bothPerObj)/kibibyteBytes,
 		float64(mMgrAll.rssBytes)/mebibyteBytes, float64(mMgrAll.hwmBytes)/mebibyteBytes,
+		float64(payloadBytes)/mebibyteBytes,
 	)
 	t.Logf("SHARE BREAKDOWN across %d objects: managedFields stripped saves %.2f MiB (%.1f%% of raw); retained %s takes %.2f MiB (%.1f%% of ManagerCacheOptions cache)",
 		totalObjects,
@@ -1234,7 +1240,8 @@ func TestSoak_ManagerCacheClusterScale(t *testing.T) {
 	}
 
 	specs := watchedClusterScalingKinds()
-	srv, mapper := startCacheAPIServer(t, specs, count)
+	srv, mapper, payloadBytes := startCacheAPIServer(t, specs, count)
+	rssBefore := readProcStatusBytes(vmRSSField)
 
 	t.Logf("%-22s | %10s | %12s | %12s | %10s | %10s", "KIND", "RAW MiB/1k", "CACHED MiB/1k", "NO-ANN MiB/1k", "MF SAVED", "ANN SHARE")
 	for _, sp := range specs {
@@ -1262,18 +1269,18 @@ func TestSoak_ManagerCacheClusterScale(t *testing.T) {
 	bothOpts.DefaultTransform = transformStripManagedFieldsAndLastApplied()
 	mBothAll := measureCacheWithOptions(t, srv, mapper, specs, count, bothOpts)
 
-	t.Logf("SOAK TOTAL (%d objects across %d kinds): raw=%.2f MiB (%.2f KiB/obj) | ManagerCacheOptions=%.2f MiB (%.2f KiB/obj) | stripBoth=%.2f MiB (%.2f KiB/obj) | VmRSS=%.2f MiB VmHWM=%.2f MiB",
+	t.Logf("SOAK TOTAL (%d objects across %d kinds): raw=%.2f MiB (%.2f KiB/obj) | ManagerCacheOptions=%.2f MiB (%.2f KiB/obj) | stripBoth=%.2f MiB (%.2f KiB/obj) | VmRSS=%.2f MiB (was %.2f MiB after fake API server init; includes %.2f MiB encoded list payloads held by the in-process fake API server) VmHWM=%.2f MiB",
 		totalObjects, len(specs),
 		float64(mRawAll.liveHeapDeltaBytes)/mebibyteBytes, float64(mRawAll.liveHeapDeltaBytes)/float64(totalObjects)/kibibyteBytes,
 		float64(mMgrAll.liveHeapDeltaBytes)/mebibyteBytes, float64(mMgrAll.liveHeapDeltaBytes)/float64(totalObjects)/kibibyteBytes,
 		float64(mBothAll.liveHeapDeltaBytes)/mebibyteBytes, float64(mBothAll.liveHeapDeltaBytes)/float64(totalObjects)/kibibyteBytes,
-		float64(mMgrAll.rssBytes)/mebibyteBytes, float64(mMgrAll.hwmBytes)/mebibyteBytes,
+		float64(mMgrAll.rssBytes)/mebibyteBytes, float64(rssBefore)/mebibyteBytes, float64(payloadBytes)/mebibyteBytes, float64(mMgrAll.hwmBytes)/mebibyteBytes,
 	)
 }
 
 func BenchmarkManagerCachePerKind(b *testing.B) {
 	specs := watchedClusterScalingKinds()
-	srv, mapper := startCacheAPIServer(b, specs, cacheTestObjectsPerKind)
+	srv, mapper, _ := startCacheAPIServer(b, specs, cacheTestObjectsPerKind)
 
 	for _, sp := range specs {
 		b.Run(sp.name, func(b *testing.B) {
