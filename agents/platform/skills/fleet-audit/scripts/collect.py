@@ -667,6 +667,41 @@ CONFIGSYNC_TRANSIENT_ERROR_CODES = frozenset({"2016"})
 # How much of a reconciler message survives into the excerpt; the same budget
 # as a Config Connector message, for the same reason.
 MAX_CONFIGSYNC_MESSAGE_CHARS = MAX_KCC_WEDGE_MESSAGE_CHARS
+# The reconciler-manager's condition while it waits for the reconciler, and
+# the reason it carries while the thing it waits for is the reconciler's
+# Deployment.
+CONFIGSYNC_RECONCILING_CONDITION = "Reconciling"
+CONFIGSYNC_DEPLOYMENT_REASON = "Deployment"
+# How long `Reconciling` has to have held that reason before the Deployment is
+# read as down: the ten minutes after which Config Sync itself reports
+# `Stalled` for a Deployment that made no progress. A daily audit loses
+# nothing by waiting for the vendor's own verdict, and a shorter wait would
+# file a slow healthy start (new images on a new node, a scale-up) as a
+# critical finding. Past the ten minutes with no `Stalled`, Config Sync is
+# still waiting on a Deployment it does not call failed. A healthy start held
+# the condition for 12 and 14 seconds (two samples, Config Sync v1.25.2).
+CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS = 600
+# Config Sync runs every reconciler, root and namespace alike, in this
+# namespace, and labels each reconciler pod with the sync object it serves
+# (read on a live v1.25.2). Its source defines the three label names from
+# v1.14.0 (pkg/metadata/labels.go); v1.13.0 has no `sync-kind`. On a version
+# whose pods lack the labels no pod is kept, and the memory rule sees nothing
+# and says nothing. The container named below is the one that applies the
+# repository; the pod's other containers fetch, render and export metrics.
+CONFIGSYNC_RECONCILER_NAMESPACE = "config-management-system"
+CONFIGSYNC_RECONCILER_CONTAINER = "reconciler"
+CONFIGSYNC_SYNC_KIND_LABEL = "configsync.gke.io/sync-kind"
+CONFIGSYNC_SYNC_NAME_LABEL = "configsync.gke.io/sync-name"
+CONFIGSYNC_SYNC_NAMESPACE_LABEL = "configsync.gke.io/sync-namespace"
+# A reconciler container the kernel killed for memory. One kill a week ago is
+# history: the rule asks for a second restart and a kill inside this window,
+# which is three times the five minutes a crash loop's back-off tops out at.
+# The restart count is the container's lifetime count, so one fresh kill after
+# an older restart is read the same way; a reconciler that runs for longer
+# than the window between two kills is missed while it runs.
+CONFIGSYNC_OOM_REASON = "OOMKilled"
+CONFIGSYNC_OOM_MIN_RESTARTS = 2
+CONFIGSYNC_OOM_RECENT_SECONDS = 900
 # `check_serviceentry_host_collision` (§2.19). The Istio kind, fully qualified
 # so the read cannot land on another group's `serviceentries`.
 SERVICEENTRY_KIND = "serviceentries.networking.istio.io"
@@ -8442,7 +8477,78 @@ def _configsync_stage_errors(item: dict, ref: str) -> list[dict]:
     return [e for e in node if isinstance(e, dict)] if isinstance(node, list) else []
 
 
-def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
+def _configsync_oom_loop(pods: list, kind: str, name: str, namespace: str, now_s: float) -> str:
+    """Why this sync object's reconciler is down for memory, or "".
+
+    The pod is the one signal that held at every moment of a live loop. The
+    sync object flipped: each restart made the Deployment available for a
+    moment, `Reconciling` went False, and the next kill started it again.
+
+    Only the container that applies the repository is read. Another container
+    of the pod in the same loop is not this finding: whether the repository is
+    still applied then was not tested. The words carry no count and no time:
+    both move at every kill, and the ledger compares an excerpt byte for byte
+    to tell a finding that changed from one that did not.
+    """
+    for pod in pods:
+        if not isinstance(pod, dict):
+            continue
+        # A pod that ended (phase Failed, left beside its replacement) is not
+        # the reconciler any more; a container in a restart loop keeps its pod
+        # in phase Running.
+        if not _is_live_pod({"phase": (pod.get("status") or {}).get("phase")}):
+            continue
+        labels = (pod.get("metadata") or {}).get("labels") or {}
+        if (
+            labels.get(CONFIGSYNC_SYNC_KIND_LABEL) != kind
+            or labels.get(CONFIGSYNC_SYNC_NAME_LABEL) != name
+            or labels.get(CONFIGSYNC_SYNC_NAMESPACE_LABEL) != namespace
+        ):
+            continue
+        for status in (pod.get("status") or {}).get("containerStatuses") or []:
+            if not isinstance(status, dict) or status.get("name") != CONFIGSYNC_RECONCILER_CONTAINER:
+                continue
+            restarts = status.get("restartCount") or 0
+            for state_key in ("state", "lastState"):
+                killed = ((status.get(state_key) or {}).get("terminated")) or {}
+                if killed.get("reason") != CONFIGSYNC_OOM_REASON:
+                    continue
+                finished = _rfc3339(str(killed.get("finishedAt") or ""))
+                if finished is None or now_s - finished > CONFIGSYNC_OOM_RECENT_SECONDS:
+                    continue
+                if restarts < CONFIGSYNC_OOM_MIN_RESTARTS:
+                    continue
+                return (
+                    f"its reconciler container `{CONFIGSYNC_RECONCILER_CONTAINER}` was killed for memory "
+                    f"({CONFIGSYNC_OOM_REASON}) and has restarted more than once "
+                    f"(pod {(pod.get('metadata') or {}).get('name', '')})"
+                )
+    return ""
+
+
+def _configsync_deployment_down(item: dict, now_s: float) -> str:
+    """Why this sync object's reconciler Deployment has no available replica, or "".
+
+    The age is the age of the condition: the time `Reconciling` last became
+    True. A reason that changed to `Deployment` later does not restart it, so
+    the rollout that repairs a reconciler that was down for longer than the
+    wait is still named until `Reconciling` goes False.
+    """
+    reconciling = _condition(item, CONFIGSYNC_RECONCILING_CONDITION)
+    if (
+        reconciling is None
+        or str(reconciling.get("status")) != "True"
+        or reconciling.get("reason") != CONFIGSYNC_DEPLOYMENT_REASON
+    ):
+        return ""
+    since = _rfc3339(str(reconciling.get("lastTransitionTime") or ""))
+    if since is None or now_s - since < CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS:
+        return ""
+    # The time, not the age: an age would change the excerpt on every run.
+    return f"its reconciler has not come up since {reconciling.get('lastTransitionTime')} ({_condition_why(reconciling)})"
+
+
+def check_configsync_reconciler_stalled(context: dict, *, now: datetime.datetime | None = None) -> list[dict]:
     """Cluster-scoped: Config Sync RootSync and RepoSync objects whose
     reconciler has stopped applying the repository.
 
@@ -8452,19 +8558,34 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
     RootSync drifts the cluster from Git while every `manifest` remediation
     this audit opens against that cluster merges and applies nothing.
 
-    Two signals, both the reconciler's own verdict on the object. `Stalled=True`
-    is the reconciler-manager saying it cannot create or run the reconciler
-    (a Deployment that will not come up, an invalid spec). A `Syncing`
-    condition naming `errorSourceRefs` is the reconciler saying the current
-    commit failed to fetch, render or apply, and the stage it names holds the
-    error line. The stage summaries are not read on their own: they keep the
+    Four signals. `Stalled=True` is the reconciler-manager saying it cannot
+    create or run the reconciler: Config Sync writes it when the reconciler's
+    Deployment has made no progress for ten minutes (read live for a pod that
+    could not be scheduled) or the spec is invalid. A `Syncing` condition
+    naming `errorSourceRefs` is the reconciler saying the current commit
+    failed to fetch, render or apply, and the stage it names holds the error
+    line. The stage summaries are not read on their own: they keep the
     previous commit's errors until the next stage overwrites them, and a
     render in progress writes a transient error there that clears by itself,
-    so a count over them fires on a fix in flight. `Reconciling=True` alone
-    is not a finding: it is the state of every first sync, and a large
-    repository can hold it for longer than any threshold this check could
-    defend.
+    so a count over them fires on a fix in flight.
+
+    The other two cover a reconciler that is down and did not read `Stalled`
+    in the live tests (Config Sync v1.25.2, loops of up to 23 minutes): the
+    Deployment of a reconciler killed for memory at every start kept
+    `Progressing` True through the loop, and the object read `Reconciling`
+    True or, between two kills, False. Its pod says what the object does not
+    (`_configsync_oom_loop`). A reconciler that has not come up at all holds
+    `Reconciling=True` with the reason `Deployment`
+    (`_configsync_deployment_down`). `Reconciling=True` for any other reason,
+    or for less than the wait, is not a finding: it is the state of every
+    first sync.
+
+    Both ages are measured from the moment the check runs, which is after the
+    stream's last read of the cluster and so later than the read of the pods
+    by the time those reads took.
     """
+    now_s = (now if now is not None else datetime.datetime.now(datetime.timezone.utc)).timestamp()
+    pods = context.get("configsync_reconciler_pods") or []
     hits = []
     for item in context.get("configsync_objects") or []:
         if not isinstance(item, dict):
@@ -8483,19 +8604,30 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
             refs = [str(r) for r in syncing["errorSourceRefs"] if r]
             errors = [e for ref in refs for e in _configsync_stage_errors(item, ref)]
             real = [e for e in errors if str(e.get("code")) not in CONFIGSYNC_TRANSIENT_ERROR_CODES]
-            if errors and not real:
-                continue
-            first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
-            why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
-            if refs:
-                why = f"{why} (errors in {', '.join(refs)})"
+            # Only transient errors is a render in flight, not a verdict: the
+            # object gives no finding by this signal. The two rules below
+            # read the reconciler itself and still apply.
+            if real or not errors:
+                first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
+                why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
+                if refs:
+                    why = f"{why} (errors in {', '.join(refs)})"
+        # Config Sync's own verdict leads the excerpt when there is one. A
+        # reconciler that is down has none, so the excerpt says what was read:
+        # the kill for memory first, which names a cause, then the age.
+        lead = f"Config Sync reports {kind}/{name} is not applying its repository"
+        if not why:
+            lead = f"{kind}/{name} is not applying its repository"
+            why = _configsync_oom_loop(pods, kind, name, str(meta.get("namespace") or ""), now_s)
+        if not why:
+            why = _configsync_deployment_down(item, now_s)
         if not why:
             continue
         hits.append(
             {
                 "namespace": str(meta.get("namespace") or ""),
                 "object": f"{kind}/{name}",
-                "excerpt": f"Config Sync reports {kind}/{name} is not applying its repository: {why}",
+                "excerpt": f"{lead}: {why}",
             }
         )
     return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
@@ -9575,7 +9707,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
     "kcc-object-wedged": ("kcc",),
-    "configsync-reconciler-stalled": ("configsync",),
+    "configsync-reconciler-stalled": ("configsync", "workloads"),
     "lb-world-open": ("services",),
     "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
     SERVICEENTRY_HOST_COLLISION_SLUG: ("serviceentries",),
@@ -9664,8 +9796,13 @@ _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE: tuple[tuple[str, str], ...] = (
 )
 
 
-def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[str, dict]:
-    """One answer for §2.17's two reads.
+def _configsync_disposition(
+    runs: list[tuple[str, dict | None, Run]],
+    workload_read: tuple[str, Run] | None = None,
+) -> tuple[str, dict]:
+    """One answer for §2.17's two reads of the sync kinds. `workload_read` is
+    the stream's workload dump, command and result: the reconciler pods come
+    from it, so where a sync object exists the record names it as well.
 
     Returns `(reason, record)`: an `Undetermined:` reason when any read failed
     for a cause other than the API server not serving the kind (that read
@@ -9717,6 +9854,8 @@ def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[s
             "reconciliation could stall.",
             {},
         )
+    if workload_read is not None:
+        served.append(workload_read)
     combined = Run(
         [],
         0,
@@ -9846,7 +9985,18 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"
     ]
-    workload_record = _record(paged_text(COMPLIANCE_DUMP_KINDS), result)
+    # And once more, whole, for §2.17: the reconciler pods of Config Sync, by
+    # the label that names the sync object each one serves. Their container
+    # statuses say what a sync object cannot (`_configsync_oom_loop`).
+    context["configsync_reconciler_pods"] = [
+        i
+        for i in parsed.get("items", []) or []
+        if i.get("kind") == "Pod"
+        and (i.get("metadata") or {}).get("namespace") == CONFIGSYNC_RECONCILER_NAMESPACE
+        and CONFIGSYNC_SYNC_KIND_LABEL in ((i.get("metadata") or {}).get("labels") or {})
+    ]
+    workload_read = (paged_text(COMPLIANCE_DUMP_KINDS), result)
+    workload_record = _record(*workload_read)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
             commands[spec.slug] = workload_record
@@ -10057,7 +10207,10 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         configsync_runs.append((f"KUBECONFIG={kubeconfig} {shlex.join(argv)}", parsed, result))
         if parsed is not None:
             context["configsync_objects"].extend((parsed or {}).get("items") or [])
-    configsync_reason, configsync_record = _configsync_disposition(configsync_runs)
+    # The reconciler pods are already in hand, from the workload dump at the
+    # top of this function, so the record names that read after the sync
+    # reads. There is a record only where a sync object exists.
+    configsync_reason, configsync_record = _configsync_disposition(configsync_runs, workload_read)
     if configsync_reason.startswith(UNDETERMINED_PREFIX):
         context.setdefault("unevaluated", {})["configsync-reconciler-stalled"] = configsync_reason
     elif configsync_reason:
