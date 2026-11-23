@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -40,6 +41,41 @@ const (
 	a2aProfileSupervisorFormReason    = "SixTokenSupervisorSubject"
 	a2aProfileSupervisorFormValue     = "profile"
 )
+
+// The cutoff the readers take from the latch (#5301 PR 4). Past it, a
+// five-token supervisor terminal on a profile task is not that task's
+// terminal: the dispatcher writes the six-token form from the latch on, and
+// the margin covers its pick-up of the switched dispatch config and a
+// terminal already in flight. One stored before the cutoff still counts, so
+// history and heals keep every terminal the dispatcher wrote before it
+// switched.
+const (
+	// a2aProfileSupervisorCutoffEnvVar is lib.EnvProfileSupervisorCutoff in
+	// a2a/lib/supervisor_cutoff.go; the gateway and the MCP server read it.
+	a2aProfileSupervisorCutoffEnvVar = "A2A_PROFILE_SUPERVISOR_CUTOFF"
+	// a2aProfileSupervisorCutoffMargin is how long after the latch the
+	// cutoff falls.
+	a2aProfileSupervisorCutoffMargin = 10 * time.Minute
+)
+
+// a2aProfileSupervisorCutoffEnv is the cutoff env for the gateway and the MCP
+// server: the persisted ProfileSupervisorForm latch's LastTransitionTime plus
+// the margin, in RFC3339 UTC. It reads the condition as the API server holds
+// it, so it appears one pass after the pass that latches, and the latch never
+// moves once True, so the value is stable and the readers roll once.
+//
+// Not latched (absent, held, or a latch with no transition time to anchor
+// on), it is nil and the pod templates are exactly what they were: the
+// readers take both forms, as every install did before the cutoff, and
+// nothing rolls.
+func a2aProfileSupervisorCutoffEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	c := meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	if c == nil || c.Status != metav1.ConditionTrue || c.LastTransitionTime.IsZero() {
+		return nil
+	}
+	cutoff := c.LastTransitionTime.Add(a2aProfileSupervisorCutoffMargin).UTC().Format(time.RFC3339)
+	return []corev1.EnvVar{{Name: a2aProfileSupervisorCutoffEnvVar, Value: cutoff}}
+}
 
 // a2aDeploymentFullyOnTemplate reports whether dep has finished rolling out its
 // current template: the controller has observed this generation, every replica

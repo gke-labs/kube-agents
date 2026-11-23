@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -277,5 +278,133 @@ func TestAReaderOnAnOlderImageHoldsTheInstallAndSaysSo(t *testing.T) {
 	setProfileSupervisorFormCondition(agent, false, "anything", metav1.Now())
 	if !meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
 		t.Error("a hold replaced the latch")
+	}
+}
+
+// cutoffEnvOf is the cutoff env on the gateway's and the MCP server's
+// containers, by workload, with whether each carries it.
+func cutoffEnvOf(agent *agentv1alpha1.PlatformAgent) map[string]*corev1.EnvVar {
+	out := map[string]*corev1.EnvVar{"gateway": nil, "mcp": nil}
+	for name, spec := range map[string]corev1.PodSpec{
+		"gateway": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
+		"mcp":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
+	} {
+		for _, c := range spec.Containers {
+			for i := range c.Env {
+				if c.Env[i].Name == a2aProfileSupervisorCutoffEnvVar {
+					out[name] = &c.Env[i]
+				}
+			}
+		}
+	}
+	return out
+}
+
+// readerTemplates is the gateway's and the MCP server's pod templates, as
+// JSON, the bytes a roll is decided on.
+func readerTemplates(t *testing.T, agent *agentv1alpha1.PlatformAgent) string {
+	t.Helper()
+	b, err := json.Marshal([]corev1.PodTemplateSpec{
+		buildA2AGatewayDeployment(agent).Spec.Template,
+		buildA2AMCPDeployment(agent).Spec.Template,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// Until the install latches the six-token form, neither reader carries the
+// cutoff, and its pod template is byte for byte what an install with no
+// ProfileSupervisorForm condition renders, held or not: nothing rolls for it
+// (#5301 PR 4).
+func TestAnUnlatchedInstallRendersNoCutoffAndRollsNothing(t *testing.T) {
+	want := readerTemplates(t, a2aTestAgent())
+	held := a2aTestAgent()
+	setProfileSupervisorFormCondition(held, false, "kube-agents-agent", metav1.Now())
+	if !meta.IsStatusConditionFalse(held.Status.Conditions, a2aProfileSupervisorFormCondition) {
+		t.Fatal("the hold didn't set the condition False")
+	}
+	noAnchor := a2aTestAgent()
+	meta.SetStatusCondition(&noAnchor.Status.Conditions, metav1.Condition{Type: a2aProfileSupervisorFormCondition,
+		Status: metav1.ConditionTrue, Reason: a2aProfileSupervisorFormReason})
+	noAnchor.Status.Conditions[len(noAnchor.Status.Conditions)-1].LastTransitionTime = metav1.Time{}
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"no condition":           a2aTestAgent(),
+		"held on the five-token": held,
+		"latched with no anchor": noAnchor,
+	} {
+		for workload, env := range cutoffEnvOf(agent) {
+			if env != nil {
+				t.Errorf("%s: the %s carries %s=%q, want it absent", name, workload, env.Name, env.Value)
+			}
+		}
+		if got := readerTemplates(t, agent); got != want {
+			t.Errorf("%s: the reader templates differ from an install with no condition, so they would roll", name)
+		}
+	}
+}
+
+// Once latched, both readers carry the cutoff: the persisted condition's
+// LastTransitionTime plus the margin, RFC3339 in UTC. The latch never moves,
+// so a later pass (a later "now") renders the same bytes and the readers roll
+// once.
+func TestALatchedInstallRendersTheCutoffFromThePersistedLatch(t *testing.T) {
+	agent := a2aTestAgent()
+	latchedAt := time.Date(2026, 11, 23, 9, 30, 0, 0, time.FixedZone("PST", -8*3600))
+	setProfileSupervisorFormCondition(agent, true, "", metav1.NewTime(latchedAt))
+	want := "2026-11-23T17:40:00Z"
+	for workload, env := range cutoffEnvOf(agent) {
+		if env == nil || env.Value != want || env.ValueFrom != nil {
+			t.Errorf("the %s's cutoff is %+v, want %s=%s", workload, env, a2aProfileSupervisorCutoffEnvVar, want)
+		}
+	}
+	first := readerTemplates(t, agent)
+	setProfileSupervisorFormCondition(agent, true, "", metav1.NewTime(latchedAt.Add(time.Hour)))
+	if got := readerTemplates(t, agent); got != first {
+		t.Error("a later pass moved the cutoff; the latch's time must hold it")
+	}
+	if _, err := time.Parse(time.RFC3339, want); err != nil {
+		t.Fatalf("the cutoff doesn't parse as the readers parse it: %v", err)
+	}
+}
+
+// The cutoff comes from the condition as the API server holds it, never from
+// this pass's wanted latch: the pass that latches renders the readers as they
+// were, and the env arrives one pass later. And the roll it causes doesn't
+// reopen the gate: a latched install keeps the six-token form while the
+// readers roll onto the cutoff.
+func TestTheCutoffFollowsThePersistedLatchAndItsRollKeepsTheForm(t *testing.T) {
+	agent := a2aTestAgent()
+	var objs []client.Object
+	for _, rd := range a2aProfileSupervisorReaders(agent) {
+		objs = append(objs, readerDeployment(agent, rd, true))
+	}
+	job := a2aProvisionJobForm(agent, true)
+	job.Status.Succeeded = 1
+	r := supervisorFormReconciler(t, append(objs, job)...)
+	ctx := context.Background()
+	if _, form, err := r.a2aProfileSupervisorFormFor(ctx, agent); err != nil || form != a2aProfileSupervisorFormValue {
+		t.Fatalf("form %q err %v, want the latch wanted", form, err)
+	}
+	for workload, env := range cutoffEnvOf(agent) {
+		if env != nil {
+			t.Errorf("the pass that wants the latch rendered the %s's cutoff before it was persisted", workload)
+		}
+	}
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
+	// The readers now mid-roll onto the cutoff's template.
+	objs = nil
+	for _, rd := range a2aProfileSupervisorReaders(agent) {
+		objs = append(objs, readerDeployment(agent, rd, false))
+	}
+	r = supervisorFormReconciler(t, objs...)
+	if filter, form, err := r.a2aProfileSupervisorFormFor(ctx, agent); err != nil || !filter || form != a2aProfileSupervisorFormValue {
+		t.Fatalf("latched, readers rolling onto the cutoff: filter %v form %q err %v, want both kept", filter, form, err)
+	}
+	for workload, env := range cutoffEnvOf(agent) {
+		if env == nil {
+			t.Errorf("the persisted latch rendered no cutoff on the %s", workload)
+		}
 	}
 }

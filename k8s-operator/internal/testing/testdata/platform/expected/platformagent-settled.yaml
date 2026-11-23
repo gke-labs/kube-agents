@@ -5443,6 +5443,8 @@ spec:
               value: kubeagents-system
             - name: GOMEMLIMIT
               value: "228170137"
+            - name: A2A_PROFILE_SUPERVISOR_CUTOFF
+              value: <LATCH_TIME_PLUS_MARGIN_FOR_TESTS>
             - name: A2A_MCP_BROKER_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: A2A_MCP_BROKER_TOKEN_FILE
@@ -6202,6 +6204,8 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: A2A_REPORT_STORE_TOKEN_FILE
               value: /var/run/secrets/a2a-reports/token
+            - name: A2A_PROFILE_SUPERVISOR_CUTOFF
+              value: <LATCH_TIME_PLUS_MARGIN_FOR_TESTS>
             - name: A2A_TIERS_FILE
               value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest

@@ -7457,6 +7457,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// (a2a_report_reader.go).
 	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
 	env = append(env, reportEnv...)
+	// The profile supervisor cutoff, once the install has latched (#5301):
+	// absent until then, so an unlatched gateway's template is unchanged.
+	env = append(env, a2aProfileSupervisorCutoffEnv(agent)...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))

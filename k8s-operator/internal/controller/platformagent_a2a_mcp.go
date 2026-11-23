@@ -251,7 +251,9 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						Command: []string{a2aMCPCommand},
 						// Distroless, run as 1000: see buildA2AConsoleDeployment.
 						WorkingDir: "/",
-						Env: []corev1.EnvVar{
+						// The profile supervisor cutoff rides last, and only
+						// once the install has latched (#5301).
+						Env: append([]corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							a2aNATSCAFileEnvVar(),
 							{Name: a2aMCPEnvBusUser, Value: a2aConsoleMCPUser},
@@ -261,7 +263,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 							{Name: a2aMCPEnvAgent, Value: agent.Name},
 							{Name: a2aMCPEnvNamespace, Value: agent.Namespace},
 							{Name: a2aMCPEnvGoMemLimit, Value: a2aMCPGoMemLimit()},
-						},
+						}, a2aProfileSupervisorCutoffEnv(agent)...),
 						Ports: []corev1.ContainerPort{{Name: a2aMCPPortName, ContainerPort: a2aMCPPort}},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: a2aMCPBusKeyVolume, MountPath: a2aMCPBusKeyMountDir, ReadOnly: true},
