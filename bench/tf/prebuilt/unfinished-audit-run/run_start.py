@@ -120,9 +120,22 @@ def write_record(audit_report, audit_id, repo, now):
     # the nearest existing directory's owner, the sandbox user, not root.
     audit_report._make_store_dirs(target.parent)
     record = {"run_id": RUN_ID, "started_at": started_at, "scheduled": True, RECEIVED_KEY: started_at}
-    target.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
-    audit_report._adopt_owner(target, target.parent.stat())
+    write_owned(target, json.dumps(record, sort_keys=True), target.parent.stat())
     return target
+
+
+def write_owned(path, text, owner):
+    """Write `path`, owned like `owner` when this run is root.
+
+    The open refuses a symlink at `path`, and the chown goes through the open
+    descriptor, never the path, so a link planted in the store can't send a
+    root write, or the ownership change after it, anywhere else.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        if os.geteuid() == 0:
+            os.fchown(handle.fileno(), owner.st_uid, owner.st_gid)
+        handle.write(text)
 
 
 def write_note(audit_report, note_path, note):
@@ -130,8 +143,7 @@ def write_note(audit_report, note_path, note):
 
     Owned like the store it sits in, as audit_report owns what it writes there.
     """
-    note_path.write_text(json.dumps(note, sort_keys=True), encoding="utf-8")
-    audit_report._adopt_owner(note_path, note_path.parent.stat())
+    write_owned(note_path, json.dumps(note, sort_keys=True), note_path.parent.stat())
 
 
 def seed(audit_report, audit_id, repo, now):

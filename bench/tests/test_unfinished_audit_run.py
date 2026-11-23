@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -209,14 +210,33 @@ def test_a_root_seed_hands_what_it_creates_to_the_store_owner(store, monkeypatch
     store.mkdir(parents=True)
     chowned = []
     monkeypatch.setattr(audit_report.os, "geteuid", lambda: audit_report.ROOT_UID)
-    monkeypatch.setattr(audit_report.os, "chown", lambda path, uid, gid: chowned.append((str(path), uid, gid)))
+    # A file is chowned through its open descriptor, never its path; key both
+    # kinds by inode.
+    monkeypatch.setattr(
+        audit_report.os, "chown", lambda path, uid, gid, **_: chowned.append((os.lstat(path).st_ino, uid, gid))
+    )
+    monkeypatch.setattr(audit_report.os, "fchown", lambda fd, uid, gid: chowned.append((os.fstat(fd).st_ino, uid, gid)))
     owner = store.stat()
     plant.seed(audit_report, AUDIT, GITOPS, NOW)
     stream = audit_report.reports_dir_for(AUDIT, GITOPS)
-    paths = {p for p, _, _ in chowned}
-    for made in (stream, stream / "runs", stream / plant.RUN_STARTS_DIR, stream / plant.PLANT_NOTE):
-        assert str(made) in paths, f"{made} was not handed to the store owner"
+    inodes = {ino for ino, _, _ in chowned}
+    record = stream / plant.RUN_STARTS_DIR / f"{plant.RUN_ID}.json"
+    for made in (stream, stream / "runs", stream / plant.RUN_STARTS_DIR, record, stream / plant.PLANT_NOTE):
+        assert made.stat().st_ino in inodes, f"{made} was not handed to the store owner"
     assert all((uid, gid) == (owner.st_uid, owner.st_gid) for _, uid, gid in chowned)
+
+
+def test_the_seed_will_not_write_through_a_link_in_the_store(store, tmp_path):
+    # The store is the sandbox user's. A link planted at a name the seed
+    # writes, after its leftover check, must fail the write, not carry a root
+    # write (and the chown after it) to the link's target.
+    store.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    link = store / "planted.json"
+    link.symlink_to(elsewhere)
+    with pytest.raises(OSError):
+        plant.write_owned(link, "{}", store.stat())
+    assert not elsewhere.exists()
 
 
 def test_a_failed_seed_in_the_provisioner_runs_teardown():

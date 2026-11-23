@@ -719,7 +719,8 @@ def _adopt_store_owner(path: str, owner: os.stat_result) -> None:
     store's owner, can no longer write a record into.
     """
     if os.geteuid() == 0:
-        os.chown(path, owner.st_uid, owner.st_gid)
+        # Not through a link someone swapped in for the directory just made.
+        os.chown(path, owner.st_uid, owner.st_gid, follow_symlinks=False)
 
 
 def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
@@ -773,9 +774,14 @@ def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
         raise ValueError(f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
     staged = f"{target}.{os.getpid()}.tmp"
     try:
-        with open(staged, "wb") as handle:
+        # Exclusive and no-follow: a link or file planted at the staged name
+        # fails the write instead of taking it, and the chown goes through
+        # the descriptor, so it can't be redirected either.
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            if os.geteuid() == 0:
+                os.fchown(handle.fileno(), owner.st_uid, owner.st_gid)
             handle.write(data)
-        _adopt_store_owner(staged, owner)
         os.replace(staged, target)
     except BaseException:
         try:
