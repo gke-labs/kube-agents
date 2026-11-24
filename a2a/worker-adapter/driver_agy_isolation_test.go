@@ -327,3 +327,47 @@ func TestAnIdleGapThenANewAgyTurnStartsClean(t *testing.T) {
 		t.Errorf("the writer %v is still alive", alive)
 	}
 }
+
+// TestAWriteRefusalAfterTheResultStopsTheRespawn: a tool step's result that
+// arrives after the turn's result, with a steer held and a write refusal on
+// record, ends the task at the refusal. The held steer never starts a fresh
+// agy process.
+func TestAWriteRefusalAfterTheResultStopsTheRespawn(t *testing.T) {
+	dir := t.TempDir()
+	const session, taskID = "chat-agy-refusal-respawn", "task-agy-refusal-respawn"
+	recordFile := filepath.Join(t.TempDir(), "refusals.jsonl")
+	record := refusalRecord(t, true, kubernetesReadOnlyRule, "scale", taskID)
+	harness := stub(t, fmt.Sprintf(`
+dir=%q
+n=$(( $(cat "$dir/runs" 2>/dev/null || echo 0) + 1 )); echo $n > "$dir/runs"
+read first || exit 1
+echo '{"event":"init","conversation_id":"conv-r","init":{"model":"m"}}'
+echo 1 > "$dir/turn1"
+sleep 1.5
+echo '{"event":"result","result":{"conversation_id":"conv-r","status":"SUCCESS","response":"turn '$n'"}}'
+sleep 0.3
+printf '%%s\n' %q >> "$%s"
+echo '{"event":"step_update","step_update":{"conversation_id":"conv-r","step_index":3,"state":"DONE","step_type":"tool","tool_name":"run_command"}}'
+while read -r more; do :; done
+exit 0
+`, dir, record, EnvWriteRefusalFile))
+	url := startServer(t)
+	c := testClient(t, url)
+	origin := submit(t, c, session, taskID, "start")
+	cfg := adapterConfig(url, taskID, session, harness)
+	useAgyTestDriver(t, &cfg)
+	cfg.StopOnWriteRefusal = true
+	cfg.WriteRefusalFile = recordFile
+	cfg.HarnessEnv = append(cfg.HarnessEnv, EnvWriteRefusalFile+"="+recordFile, EnvWriteRefusalTask+"="+taskID)
+	done := runAdapter(context.Background(), cfg)
+	waitFile(t, filepath.Join(dir, "turn1"), 10*time.Second)
+	publishSteerFor(t, c, origin, session, "a steer during turn one")
+	out := waitOutcome(t, done, 30*time.Second)
+	if out.res.State != lib.StateFailed {
+		t.Errorf("state=%q err=%v; want failed at the write refusal", out.res.State, out.err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "runs"))
+	if got := strings.TrimSpace(string(b)); got != "1" {
+		t.Fatalf("%s agy processes ran; a write refusal must stop the held steer's respawn", got)
+	}
+}

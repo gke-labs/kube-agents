@@ -1349,9 +1349,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		prompt := nextPrompt
 		nextPrompt = ""
-		if sawResult || canceled || deadlineHit || a.abandoned() {
-			// The task ended while the last process wound down; the steer it
-			// took never ran.
+		if sawResult || canceled || deadlineHit || refused != nil || a.abandoned() {
+			// The task ended while the last process wound down (a result
+			// decided it, cancel, the deadline, a write refusal, an abandon);
+			// the steer it took never ran.
 			a.publishSteerRefusal(prompt, "")
 			break
 		}
