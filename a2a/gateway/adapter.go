@@ -135,6 +135,15 @@ type InboundMessage struct {
 	// name, so nothing is addressed to a name that is not a user's; empty
 	// on a typed message, and on every backend but Google Chat.
 	Viewer string
+
+	// capRetry is set by the gateway, never an adapter: the id of one try
+	// of a session-cap waiter (session_cap_queue.go), the parked turn
+	// re-delivered to try for a slot again. Zero on every message a backend
+	// delivers. capReplay marks any message the line delivers again, the
+	// parked turn and the follow-ups behind it, which were counted as
+	// inbound when they first arrived.
+	capRetry  uint64
+	capReplay bool
 }
 
 // IntentCancel stops the conversation's running

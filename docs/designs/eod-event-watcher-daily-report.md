@@ -253,12 +253,19 @@ informational churn. Each is **counted**, on its own line above the body:
   them out (see [Where the numbers come from](#where-the-numbers-come-from)).
   `clean_workload_name` in
   [`session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) sets the workload
-  name. It changes only Pod names, with two rules, and keeps all other names as they are:
+  name. It changes only Pod names, with three rules, and keeps all other names as they are:
   - A Pod name that ends in a segment of eight to ten hexadecimal characters and then a segment of
     five characters loses both segments. Thus, the pods of one Deployment fold into one workload.
     The pods of all the runs of one CronJob also fold into one workload, because the run minute
     has eight digits.
-  - If the first rule does not apply, a Pod name that ends in a segment of five lowercase letters
+  - Kubernetes cuts a generated Pod name at 63 characters. With a hash of ten characters, the pod
+    of a Deployment with a name of 47 to 56 characters ends in what is left of the hash and then
+    the five characters, with no hyphen between them. A Pod name of exactly 63 characters with
+    that ending loses it when four or more characters of the hash are left (a Deployment name of
+    up to 53 characters). With fewer, the start of a name segment can pass for a hash, and the Pod
+    name stays as it is. The rule reads only the name, so a last segment that starts with four or
+    more characters that a hash can hold also loses its end.
+  - If no rule above applies, a Pod name that ends in a segment of five lowercase letters
     or digits loses that segment. Thus, the pods of one DaemonSet (`fluentd-x7k2p`) fold into one
     workload, and the pod of a one-off Job folds to the Job name. The rule also removes a word of
     five letters, so the pods `ingest-batch` and `ingest-queue` both become `ingest` and count as

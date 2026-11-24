@@ -73,7 +73,7 @@ root runs the same scan over this module.
 hack/ghes-proxy/make-certs.sh ghes.eval.internal ~/dev/ghes-proxy-certs
 ```
 
-The script writes `ca.crt`, `tls.crt` and `tls.key` to the directory. It deletes the CA private key after it signs the server certificate, so nothing can sign a second certificate with that CA. It refuses a directory in this repository, so that you cannot commit a key. The certificates expire after 30 days; give a third argument to change this.
+The script writes `ca.crt`, `tls.crt` and `tls.key` to the directory. It deletes the CA private key after it signs the server certificate, so nothing can sign a second certificate with that CA. It refuses a directory in this repository, so that you cannot commit a key. The certificates expire after 30 days; give a third argument to change this. The keys use a named curve, which the `openssl` of macOS (LibreSSL) does not write by default.
 
 ## Run it on a workstation
 
