@@ -6458,8 +6458,9 @@ report_github_leftovers() {
   fi
   # A unit's token file is exported for that unit alone and unset at its stop
   # (stop_ledger_token_renewal), so a BENCH_GITHUB_TOKEN_FILE set here is the
-  # caller's shell's, and the listing would read it in preference to the token
-  # minted above.
+  # caller's shell's, and the listing would read it in preference to
+  # BENCH_GITHUB_TOKEN: the token minted above, or the mounted one when there
+  # is no App key. The units drop it the same way (start_ledger_token_renewal).
   unset BENCH_GITHUB_TOKEN_FILE
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then

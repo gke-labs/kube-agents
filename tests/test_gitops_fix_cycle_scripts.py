@@ -10,7 +10,8 @@ state file and logs every call, then asserts on the exit status, the calls
 made, and the state left behind. run-gitops-pilot.sh is run from its TASK/CASE
 resolution and its leaked-pin and pinned-base refusals, through its agent state reset, to its
 base-mode decision (step 2), and stops at the token read that follows, or, when the state answers that
-read, at the devops-bench call, whose token environment is recorded; its post-run pull-request listing is
+read, goes on to the devops-bench call, whose token environment is recorded and whose stub fails, and
+through the post-run steps with the leak check skipped; its post-run pull-request listing is
 gitops-run-prs.sh, run here with `gh` stubbed. The three scripts read the
 repository through gitops_repo.py, which these tests run through them. The
 stack's plan-time preconditions on the run branch are evaluated over its
