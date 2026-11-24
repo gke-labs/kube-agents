@@ -476,12 +476,14 @@ class TestScrubStepText(unittest.TestCase):
             "redis-cli -a pre{run} S3cretValue9",
             "curl https://admin:pre{run} S3cretValue9@host/x",
         )
-        # Known limits, the same on main and pinned so a fix flips them: the
-        # URL userinfo rules stop at a literal backslash (run 2 and more
-        # leaves one), and inside a quoted `bash -c "…"` script the short and
-        # user:pass flag rules do not run (`sub_shell_segments`).
+        # Known limits, pinned so a fix flips them: the URL userinfo rules
+        # stop at a literal backslash the redactor can't read as a JSON escape
+        # (an even run leaves one before the space; an odd run's pairs now
+        # read as escapes, so the password is masked), and inside a quoted
+        # `bash -c "…"` script the short and user:pass flag rules do not run
+        # (`sub_shell_segments`).
         def known_limit(shape, run, wrapper):
-            if "https://admin:" in shape and run > 1:
+            if "https://admin:" in shape and run > 1 and run % 2 == 0:
                 return True
             return wrapper == "bash -c" and any(f in shape for f in ("-u admin:", "-ppre", "-a pre"))
 
