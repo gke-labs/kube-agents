@@ -421,10 +421,11 @@ def _clean_clusters(value) -> dict:
 def _clusters_map(projects: list, probes: dict, previous: dict | None, resolved_at: str) -> dict:
     """The `clusters` map for this run's member rows and directly listed projects, by ID.
 
-    A member this run listed gets its clusters as (location, name) pairs, sorted. One it did
-    not list (its probe failed, or its source failed and it was carried unprobed) keeps the
-    previous document's entry when there is one, and otherwise has none: never an empty list
-    standing in for a listing that did not happen. Projects that are no longer rows drop out.
+    A project this run listed (a member row's, or one listed directly) gets its clusters as
+    (location, name) pairs, sorted. One it did not list (its probe failed, or its source failed
+    and it was carried unprobed) keeps the previous document's entry when there is one, and
+    otherwise has none: never an empty list standing in for a listing that did not happen. A
+    project in neither list any more drops out.
     """
     before = (previous or {}).get(DOC_CLUSTERS) or {}
     out = {}
@@ -625,8 +626,11 @@ def build_document(declared: dict, management: str | None, previous: dict | None
                    if not e[ROW_ID].isdigit() and not any(via in ROW_EXCLUDED_VIAS for via in e[ROW_VIA])]
         # The management project and the explicit projects the reconcile kept: an excluded or
         # over-cap explicit project is not counted. Probed for the clusters map alone.
+        # Only an ID the broker's argv check reads as a project ID: a domain-scoped or padded
+        # management project would be refused every run, an audit line each time, for nothing.
         direct = sorted(e[ROW_ID] for e in counted
-                        if not e[ROW_ID].isdigit() and any(via in ROW_EXCLUDED_VIAS for via in e[ROW_VIA]))
+                        if not e[ROW_ID].isdigit() and scope_policy.ARGUMENT_PATTERNS[scope_policy.SHAPE_CLUSTERS_LIST].match(e[ROW_ID])
+                        and any(via in ROW_EXCLUDED_VIAS for via in e[ROW_VIA]))
         # A source can carry a counted member only when the member's row names it.
         member_ids = {e[ROW_ID] for e in members}
         carried = [{ROW_ID: e[ROW_ID], ROW_VIA: e[ROW_VIA], ROW_OUTCOME: e[ROW_OUTCOME] or rec.OUTCOME_OK,

@@ -1476,6 +1476,17 @@ class ClustersMapTest(unittest.TestCase):
         self.assertNotIn("legacy-1", listed)
         self.assertNotIn("explicit-c", listed)
 
+    def test_a_management_project_the_broker_cannot_take_is_not_listed(self):
+        # A domain-scoped harness project fails the broker's project-ID check, so listing it would
+        # only add a refused request, and an audit line, to every run.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        declared = _scope(folders=[FOLDER_A.split("/")[1]])
+        with mock.patch.object(rec, "COMMAND_RUNNER", broker):
+            document = pub.build_document(declared, "example.com:hub", None)
+        listed = [argv[5] for argv in broker.calls if argv[:4] == list(SHAPE_PROBE[:4])]
+        self.assertNotIn("example.com:hub", listed)
+        self.assertNotIn("example.com:hub", document.get("clusters", {}))
+
     def test_a_failed_listing_of_a_direct_project_keeps_its_previous_entry(self):
         previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [],
                     "clusters": {MANAGEMENT: {"at": PREVIOUS_TIME, "clusters": [["us-east1", "hub"]]},
