@@ -61,9 +61,13 @@ const (
 	auditKeyUsername    = "caller_username"
 	auditKeyUID         = "caller_uid"
 	auditKeyGroups      = "caller_groups"
-	auditKeyUserAgent   = "user_agent"
-	auditKeyError       = "error"
-	auditKeyCache       = "cache"
+	auditKeyPartition   = "caller_partition"
+	// auditKeyAuthenticator says which authenticator admitted the caller. No credential is
+	// held under it.
+	auditKeyAuthenticator = "caller_authenticator"
+	auditKeyUserAgent     = "user_agent"
+	auditKeyError         = "error"
+	auditKeyCache         = "cache"
 )
 
 // AuditEvent describes one request the handler finished. The handler puts no request or
@@ -157,6 +161,12 @@ func (s slogAuditSink) Record(ctx context.Context, e AuditEvent) {
 		}
 		if len(e.Caller.Groups) > 0 {
 			attrs = append(attrs, slog.Any(auditKeyGroups, e.Caller.Groups))
+		}
+		if e.Caller.Partition != "" {
+			attrs = append(attrs, slog.String(auditKeyPartition, e.Caller.Partition))
+		}
+		if e.Caller.Authenticator != "" {
+			attrs = append(attrs, slog.String(auditKeyAuthenticator, e.Caller.Authenticator))
 		}
 	}
 	if e.Err != nil {

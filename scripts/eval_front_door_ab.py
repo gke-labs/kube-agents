@@ -41,8 +41,9 @@ It exits 2 when the two runs can't be compared: a directory it can't read, a
 run with no case hand-offs (often a path one level too high), every case of B
 unscored or missing (the session route broke before any case could be graded,
 which the harness classes as infrastructure), no case graded on both runs (run
-A graded nothing, or the two graded different cases), or the runs' ``front-door.txt``
-(written by the deploy) naming the doors the other way round. It reads only;
+A graded nothing, or the two graded different cases), the runs' ``front-door.txt``
+(written by the deploy) naming the doors the other way round, or a run whose
+resolved route differs from the one it asked for, or wasn't recorded (#6942). It reads only;
 nothing is written.
 
 Usage: scripts/eval_front_door_ab.py <run A artifacts> <run B artifacts>
@@ -138,14 +139,31 @@ def read_run(directory: Path) -> dict[str, Side]:
 
 
 def front_door(directory: Path) -> str:
-    """The front door a run's deploy recorded, platform when it recorded none."""
+    """The front door a run's install resolved, platform when it recorded none.
+
+    A deploy since #6942 records ``requested=<route>`` and ``resolved=<route>``
+    (hack/ci-deploy.sh, verify_front_door), and the resolved route is the one
+    the run graded. A run whose resolved route is unknown or differs from the
+    requested one is refused: its deploy should have failed, and its record
+    can't say which front door it graded. A record from before #6942 holds the
+    requested route alone, which is all such a run can say.
+    """
     path = directory / FRONT_DOOR_FILE
     try:
-        return path.read_text(encoding="utf-8").strip() or "platform"
+        text = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return "platform"
     except OSError as err:
         raise UnreadableRun(f"{path}: {err}") from err
+    fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    if not fields:
+        return text or "platform"
+    requested, resolved = fields.get("requested", "").strip(), fields.get("resolved", "").strip()
+    if not resolved or resolved == "unknown":
+        raise UnreadableRun(f"{path}: the route the install resolved was not recorded (requested {requested or 'nothing'})")
+    if requested and requested != resolved:
+        raise UnreadableRun(f"{path}: requested {requested} but the install resolved {resolved}, so the run graded {resolved}")
+    return resolved
 
 
 def check_comparable(

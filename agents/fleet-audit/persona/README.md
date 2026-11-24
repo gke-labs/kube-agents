@@ -8,7 +8,7 @@ It's published as the `persona-fleet-audit` image (`a2a/Dockerfile.persona-fleet
 
 `skills/fleet-audit/` is the persona's own [`SKILL.md`](skills/fleet-audit/SKILL.md) and [`references/findings-document.md`](skills/fleet-audit/references/findings-document.md), a copy of the platform skill's with its one path and three links to references the persona doesn't carry rewritten. `a2a/lib/persona/claudecode/fleet_audit_persona_test.go` holds the copy to its source with only those edits.
 
-The report scripts aren't in the persona: `audit_report.py` alone is over the persona loader's 1 MiB file limit. The worker image copies them from their sources at build time into `/opt/kube-agents/scripts/fleet-audit` (`a2a/Dockerfile.worker`), flat, with the modules they import beside them, and the build fails if one no longer imports from there. `tests/test_worker_fleet_audit_scripts.py` holds the list to its sources.
+The report scripts aren't in the persona: `audit_report.py` alone is over the persona loader's 1 MiB file limit. The worker image copies them from their sources at build time into `/opt/kube-agents/scripts/fleet-audit` (`a2a/Dockerfile.worker`), flat, with the modules they import beside them, and the build fails if one no longer imports from there. The image also carries the compliance audit's collector (`collect.py` and its closure), for a fan-out child to run for its one cluster (`--project` with `--cluster`; the persona's instructions to do so come in a later PR), with the fleet-upgrade-verification readiness modules its webhook check imports at `/opt/kube-agents/fleet-upgrade-verification/scripts`. `tests/test_worker_fleet_audit_scripts.py` holds both copies to their sources.
 
 ## What a run needs that isn't here
 

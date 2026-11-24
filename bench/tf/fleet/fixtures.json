@@ -866,6 +866,117 @@
         }
       ]
     },
+    "generated-name-job-family": {
+      "cluster_slot": "a",
+      "namespace": "seeded-family",
+      "probes": [
+        "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+        "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+        "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2"
+      ],
+      "fixture": "three finished Jobs named reindex-<uuid>, the shape a spawner leaves, with the common label app.kubernetes.io/part-of=reindex, no owner reference and no ttlSecondsAfterFinished, so each one stays in the cluster after it ran. The waste audit's terminal-pods check files each Job 7 days after it finished, under a name that no repository file declares, so only the template that creates the Jobs can fix them. The names are literals in the stack, the same on every project. Not ready, rather than drifted, for the first 7 days: completionTime is server-set, and a Job that is created again starts that clock again",
+      "state": [
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "status.succeeded",
+          "op": "eq",
+          "value": 1,
+          "why": "each member is a Job that ran to completion; a member that failed is a different defect, and the family then has fewer finished members than the cases were written against"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "status.succeeded",
+          "op": "eq",
+          "value": 1,
+          "why": "each member is a Job that ran to completion; a member that failed is a different defect, and the family then has fewer finished members than the cases were written against"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "status.succeeded",
+          "op": "eq",
+          "value": 1,
+          "why": "each member is a Job that ran to completion; a member that failed is a different defect, and the family then has fewer finished members than the cases were written against"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "spec.ttlSecondsAfterFinished",
+          "op": "absent",
+          "why": "the defect is the missing ttlSecondsAfterFinished: the terminal-pods check files no Job that has one, and the TTL controller deletes such a Job, so the member is gone"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "spec.ttlSecondsAfterFinished",
+          "op": "absent",
+          "why": "the defect is the missing ttlSecondsAfterFinished: the terminal-pods check files no Job that has one, and the TTL controller deletes such a Job, so the member is gone"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "spec.ttlSecondsAfterFinished",
+          "op": "absent",
+          "why": "the defect is the missing ttlSecondsAfterFinished: the terminal-pods check files no Job that has one, and the TTL controller deletes such a Job, so the member is gone"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "metadata.ownerReferences",
+          "op": "absent",
+          "why": "the terminal-pods check files no Job that a CronJob owns, and the family is the shape a spawner leaves: no owner object holds the members"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "metadata.ownerReferences",
+          "op": "absent",
+          "why": "the terminal-pods check files no Job that a CronJob owns, and the family is the shape a spawner leaves: no owner object holds the members"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "metadata.ownerReferences",
+          "op": "absent",
+          "why": "the terminal-pods check files no Job that a CronJob owns, and the family is the shape a spawner leaves: no owner object holds the members"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "status.completionTime",
+          "op": "ready_after_hours",
+          "value": 168,
+          "why": "the terminal-pods check files a Job once it finished 7 days ago (status.completionTime), so the member is invisible to the waste audit for its first 168 hours; until then the role is not ready, not drifted, and a case that reads the family waits for the date"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "status.completionTime",
+          "op": "ready_after_hours",
+          "value": 168,
+          "why": "the terminal-pods check files a Job once it finished 7 days ago (status.completionTime), so the member is invisible to the waste audit for its first 168 hours; until then the role is not ready, not drifted, and a case that reads the family waits for the date"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "status.completionTime",
+          "op": "ready_after_hours",
+          "value": 168,
+          "why": "the terminal-pods check files a Job once it finished 7 days ago (status.completionTime), so the member is invisible to the waste audit for its first 168 hours; until then the role is not ready, not drifted, and a case that reads the family waits for the date"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "reindex",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a finding that names the template's labels has nothing to name"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "reindex",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a finding that names the template's labels has nothing to name"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "reindex",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a finding that names the template's labels has nothing to name"
+        }
+      ]
+    },
     "guaranteed-qos-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-qos",
