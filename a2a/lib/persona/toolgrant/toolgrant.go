@@ -40,6 +40,11 @@ type Policy struct {
 	// ShellPrefixes are the only commands the shell may run, each a binary
 	// with optional subcommands ("kubectl", "gh pr list"). Empty: no shell.
 	ShellPrefixes []string
+	// Scripts are persona skill scripts the shell may run, each an
+	// absolute path to an executable (shebang, read-only) under a skill's
+	// directory, run directly, never through an interpreter word (which
+	// would also allow `python3 -c …`). Granting one registers the shell.
+	Scripts []string
 	// MCP grants tools of named MCP servers.
 	MCP []MCPGrant
 }
@@ -138,6 +143,9 @@ type CoreAgentGrant struct {
 
 var (
 	shellPrefix = regexp.MustCompile(`^[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)*$`)
+	// scriptPath is an absolute path of plain segments: no spaces, quotes,
+	// globs or shell syntax.
+	scriptPath = regexp.MustCompile(`^(/[A-Za-z0-9._-]+)+$`)
 	// mcpName keeps server and tool names inside the characters a model
 	// function name allows, so core-agent's namespacing (<server>_<tool>)
 	// never has to rewrite one and two tools can't collide.
@@ -160,18 +168,29 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		case c == classRead && p.ReadFiles, c == classWrite && p.WriteFiles:
 			g.Builtins = append(g.Builtins, name)
 			g.Allow = append(g.Allow, name+":"+inWorkspace)
-		case c == classShell && len(p.ShellPrefixes) > 0:
+		case c == classShell && (len(p.ShellPrefixes) > 0 || len(p.Scripts) > 0):
 			g.Builtins = append(g.Builtins, name)
 		case c == classRead, c == classWrite, c == classShell:
 			// Not registered, and denied should it reach the gate anyway.
 			g.Deny = append(g.Deny, name+":*")
 		}
 	}
+	// core-agent's bash allow rules: "<cmd>" allows exactly that command
+	// and "<cmd> *" that command with arguments, each only as a single
+	// simple command with a literal argv (no chaining, pipes, redirections,
+	// env prefixes or expansions); a command needs both to run with and
+	// without arguments.
 	for _, prefix := range p.ShellPrefixes {
 		if !shellPrefix.MatchString(prefix) {
 			return CoreAgentGrant{}, fmt.Errorf("shell prefix %q is not a binary and its subcommands", prefix)
 		}
-		g.Allow = append(g.Allow, "bash:"+prefix+" *")
+		g.Allow = append(g.Allow, "bash:"+prefix, "bash:"+prefix+" *")
+	}
+	for _, script := range p.Scripts {
+		if !scriptPath.MatchString(script) || path.Clean(script) != script {
+			return CoreAgentGrant{}, fmt.Errorf("script %q is not a clean absolute path", script)
+		}
+		g.Allow = append(g.Allow, "bash:"+script, "bash:"+script+" *")
 	}
 	for _, m := range p.MCP {
 		if !mcpName.MatchString(m.Server) {

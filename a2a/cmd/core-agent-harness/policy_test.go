@@ -214,3 +214,46 @@ func TestEveryBuiltinHasASwitch(t *testing.T) {
 		}
 	}
 }
+
+// TestTheGateRunsExactlyTheGrantedShell: through core-agent's real gate,
+// in allow mode, a granted prefix or skill script runs as a single literal
+// command, with or without arguments, and nothing else does: no chaining,
+// pipe, redirection, env prefix, expansion, interpreter word, sibling
+// script or path escape.
+func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
+	const script = "/var/lib/agent-persona/skills/stall/scripts/stall_report.py"
+	g, err := toolgrant.Policy{ShellPrefixes: []string{"kubectl"}, Scripts: []string{script}}.CoreAgent("/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := permissions.New(opts)
+	for cmd, want := range map[string]bool{
+		"kubectl":                       true,
+		"kubectl get pods -n x":         true,
+		script:                          true,
+		script + " --namespace x":       true,
+		"kubectl get pods; rm -rf /tmp": false,
+		"kubectl get pods | sh":         false,
+		"kubectl get pods > /tmp/out":   false,
+		"kubectl $(id)":                 false,
+		"FOO=1 kubectl get pods":        false,
+		"kubectlx get pods":             false,
+		"gcloud info":                   false,
+		script + " --namespace x; id":   false,
+		script + " | sh":                false,
+		"python3 " + script:             false,
+		"python3 -c 'import os'":        false,
+		script + "x":                    false,
+		"/var/lib/agent-persona/skills/stall/scripts/../../other/scripts/evil.py": false,
+		"/var/lib/agent-persona/skills/other/scripts/evil.py":                     false,
+		"sh -c id": false,
+	} {
+		if got := gate.CheckBash(context.Background(), cmd) == nil; got != want {
+			t.Errorf("CheckBash(%q) allowed=%v, want %v", cmd, got, want)
+		}
+	}
+}

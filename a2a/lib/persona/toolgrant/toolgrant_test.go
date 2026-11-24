@@ -40,7 +40,7 @@ func TestEachGrantRegistersItsToolsAndRules(t *testing.T) {
 			append(readAllow(), "write_file:/scratch/ws/*"), []string{"bash:*"}, false},
 		{"cluster view", Policy{ReadFiles: true, WriteFiles: true, ShellPrefixes: []string{"kubectl", "gcloud"}},
 			append([]string{"bash"}, append(slices.Clone(reads), "write_file")...),
-			append(append(readAllow(), "write_file:/scratch/ws/*"), "bash:kubectl *", "bash:gcloud *"), nil, false},
+			append(append(readAllow(), "write_file:/scratch/ws/*"), "bash:kubectl", "bash:kubectl *", "bash:gcloud", "bash:gcloud *"), nil, false},
 		{"web search alone", Policy{WebSearch: true}, nil, nil, append([]string{"bash:*", "write_file:*"}, readDeny()...), true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -173,6 +173,28 @@ func TestOnlyGrantableBuiltinsAreRegistrable(t *testing.T) {
 	for _, no := range []string{"edit_file", "delete_file", "fetch_url", "alert", "todo", "json_query", "record_plan", "sciontool_status", "wait_and_verify", "spawn_agent", "", "nonsense"} {
 		if CoreAgentRegistrable(no) {
 			t.Errorf("%s registrable", no)
+		}
+	}
+}
+
+// TestASkillScriptIsRunDirectlyByItsPath: a granted script registers the
+// shell and is allowed by its absolute path, with and without arguments;
+// a path with spaces, globs, quotes or ".." is refused.
+func TestASkillScriptIsRunDirectlyByItsPath(t *testing.T) {
+	const script = "/var/lib/agent-persona/skills/stall/scripts/stall_report.py"
+	g, err := Policy{Scripts: []string{script}}.CoreAgent(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(g.Builtins, []string{"bash"}) {
+		t.Errorf("builtins %q, want bash alone", g.Builtins)
+	}
+	if !slices.Equal(g.Allow, []string{"bash:" + script, "bash:" + script + " *"}) {
+		t.Errorf("allow %q", g.Allow)
+	}
+	for _, bad := range []string{"", "stall_report.py", "/a b/x.py", "/a/*.py", "/a/../b.py", "/a/./b.py", "/a/b.py/", "/a/'b'.py", "/a/$(x).py"} {
+		if _, err := (Policy{Scripts: []string{bad}}).CoreAgent(ws); err == nil {
+			t.Errorf("script %q accepted", bad)
 		}
 	}
 }
