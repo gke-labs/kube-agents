@@ -1065,8 +1065,12 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 			if keyClearlyNamesSecret(name) {
 				sink.emit(v)
 				// A quoted value is also tracked as its escapes read
-				// (a JSON or YAML "\"" is the value's own quote).
-				if decoded != "" && decoded != s[lo:hi] && lo == m[2*valueG]+1 {
+				// (a JSON or YAML "\"" is the value's own quote), past a
+				// scheme word as the value itself is.
+				if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(decoded); sloc != nil {
+					decoded = decoded[sloc[1]:]
+				}
+				if decoded != "" && decoded != v {
 					sink.emit(decoded)
 				}
 			}

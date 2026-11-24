@@ -917,3 +917,14 @@ func TestSeenSecrets_ATableValueAfterASchemeWordIsTrackedWithoutIt(t *testing.T)
 		t.Fatalf("the value was not tracked; tracked: %q", s.Values())
 	}
 }
+
+// A credential-named env value after an auth-scheme word, with an escape in
+// it, is tracked as its escapes read as well as written, without the scheme
+// word either way.
+func TestSeenSecrets_AnEnvValueAfterASchemeWordIsTrackedAsItsEscapesRead(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, `{"name": "API_TOKEN", "value": "Bearer synth\"token\"0001abcd"}`))
+	if !s.Has(`synth"token"0001abcd`) || !s.Has(`synth\"token\"0001abcd`) {
+		t.Fatalf("tracked: %q", s.Values())
+	}
+}
