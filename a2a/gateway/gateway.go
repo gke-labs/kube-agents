@@ -325,6 +325,10 @@ type Gateway struct {
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
 	reapCursor string
+	// waitingPass caches the reap pass's waiting-children counts by profile
+	// and tier (waitingChildren, #7015); reapOnce starts each pass with a
+	// fresh one.
+	waitingPass map[string]int
 	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
 	// Returning false halts the reap scan early.
 	reapScanHook func(rec *SessionRecord) bool

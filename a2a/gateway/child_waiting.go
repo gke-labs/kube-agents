@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // The waiting notice (#7015): a delegated child that hasn't started has its
@@ -18,16 +20,20 @@ import (
 // No plumbing (.agents/rules/chat_ux.md): the profile is named as the agent
 // the person asked for, not as an id, and "sent through me" says whose
 // requests are counted without naming the gateway.
+//
+// It says only what the gateway knows: the request hasn't started. It
+// doesn't claim why (busy workers, a cold start and a dispatcher that's down
+// all read the same from here) and promises no start.
 const (
-	waitingNoticeNone = "⏳ **waiting** — the %s agent's workers are all busy; it starts as soon as one frees up"
-	waitingNoticeOne  = "⏳ **waiting** — the %s agent's workers are all busy; 1 other request sent through me is waiting too"
-	waitingNoticeMany = "⏳ **waiting** — the %s agent's workers are all busy; %d other requests sent through me are waiting too"
+	waitingNoticeNone = "⏳ **waiting** — the %s agent hasn't started on this yet"
+	waitingNoticeOne  = "⏳ **waiting** — the %s agent hasn't started on this yet; 1 other request sent through me is waiting for it too"
+	waitingNoticeMany = "⏳ **waiting** — the %s agent hasn't started on this yet; %d other requests sent through me are waiting for it too"
 
 	// stillWaitingNotice closes a waiting line when the first-event grace
 	// runs out (noticeNoFirstEvent): one plain line, in place of the ⏳, that
 	// says the request didn't start and what to do instead, which is what the
 	// grace notice says for a line with no waiting notice.
-	stillWaitingNotice = "⚠️ **didn't start** — the %s agent's workers stayed busy for %s; send it again to start a new request (unless this one starts first)"
+	stillWaitingNotice = "⚠️ **didn't start** — the %s agent didn't start on this in %s; ask again to start a new request (unless this one starts first)"
 )
 
 // graceWords renders the first-event grace for the closing line: whole
@@ -85,38 +91,65 @@ func waitingChild(rec *SessionRecord) (TaskRef, bool) {
 	return ref, true
 }
 
-// childStillWaiting reports whether taskID's line is still at submitted, so
-// no first event has been relayed: the relay's own render state, this
-// gateway's (lineStillSubmitted). A task this process holds no relay state
-// for isn't counted or shown: nothing here can vouch it hasn't started.
-func (g *Gateway) childStillWaiting(taskID string) (*relayState, bool) {
+// lineStillWaiting reports whether taskID's line is still at submitted, by
+// the relay's render state (lineStillSubmitted). It reads relayState.state,
+// which the relay writes under the conversation's session lock, so callers
+// hold that lock.
+func (g *Gateway) lineStillWaiting(taskID string) (*relayState, bool) {
 	g.mu.Lock()
 	rs := g.relays[taskID]
 	g.mu.Unlock()
 	return rs, lineStillSubmitted(rs)
 }
 
-// childWaitingOthers counts this gateway's other delegated children for the
-// same profile and tier that haven't started, leaving out exclude. A count
-// that fails returns the error, and no notice is shown or changed.
-func (g *Gateway) childWaitingOthers(ctx context.Context, addressee, tier, exclude string) (int, error) {
+// childNotStarted reports whether a child's event stream is still empty,
+// read with direct gets and no consumer (probeTask), so it holds across a
+// restart and reads no other task's relay state.
+func (g *Gateway) childNotStarted(ctx context.Context, rec *SessionRecord, stream jetstream.Stream, ref TaskRef) bool {
+	probe, err := g.probeTask(ctx, stream, ref.Addressee, ref.ID, g.profileRead(rec, ref.ID, ref.Addressee))
+	return err == nil && probe.empty
+}
+
+// waitingChildren counts this gateway's delegated children for addressee at
+// tier that haven't started: every child task on a session record, a single
+// child or a batch's, not cancelled or ended, whose stream is still empty.
+// One count per (addressee, tier) per reap pass (waitingPass), however many
+// waiting children ask. A count that fails returns the error.
+func (g *Gateway) waitingChildren(ctx context.Context, addressee, tier string) (int, error) {
+	key := addressee + "\x00" + tier
+	g.mu.Lock()
+	if n, ok := g.waitingPass[key]; ok {
+		g.mu.Unlock()
+		return n, nil
+	}
+	g.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, busyCountTimeout)
 	defer cancel()
+	stream, err := g.tasksStream(ctx)
+	if err != nil {
+		return 0, err
+	}
 	n := 0
-	err := g.reg.eachSessionRecord(ctx, func(rec *SessionRecord) {
-		active := rec.ActiveTask
-		if active == nil || active.Detached || active.TaskID == exclude {
-			return
-		}
-		ref, ok := rec.TaskRefFor(active.TaskID)
-		if !ok || ref.Role != taskRoleChild || ref.Addressee != addressee || ref.Tier != tier {
-			return
-		}
-		if _, waiting := g.childStillWaiting(active.TaskID); waiting {
-			n++
+	err = g.reg.eachSessionRecord(ctx, func(rec *SessionRecord) {
+		for _, ref := range rec.Tasks {
+			if ref.Role != taskRoleChild || ref.Addressee != addressee || ref.Tier != tier ||
+				ref.Canceled || ref.TerminalObserved || ref.BatchEnd != nil {
+				continue
+			}
+			if g.childNotStarted(ctx, rec, stream, ref) {
+				n++
+			}
 		}
 	})
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	g.mu.Lock()
+	if g.waitingPass != nil {
+		g.waitingPass[key] = n
+	}
+	g.mu.Unlock()
+	return n, nil
 }
 
 // noticeChildWaiting shows, or refreshes, the waiting notice on rec's active
@@ -140,15 +173,17 @@ func (g *Gateway) noticeChildWaiting(ctx context.Context, rec *SessionRecord) {
 	if active.SubmittedAt.IsZero() || time.Since(active.SubmittedAt) < waitingNoticeAfter {
 		return
 	}
-	if _, waiting := g.childStillWaiting(active.TaskID); !waiting {
+	stream, err := g.tasksStream(ctx)
+	if err != nil || !g.childNotStarted(ctx, rec, stream, ref) {
 		return
 	}
-	others, err := g.childWaitingOthers(ctx, ref.Addressee, ref.Tier, active.TaskID)
+	waiting, err := g.waitingChildren(ctx, ref.Addressee, ref.Tier)
 	if err != nil {
 		g.log.Warn("waiting notice: count failed; the line is left as it is",
 			"conversation", rec.Key, "taskId", active.TaskID, "err", err)
 		return
 	}
+	others := max(waiting-1, 0) // this child is one of them
 	l := g.lockSession(rec.Key)
 	l.Lock()
 	defer l.Unlock()
@@ -163,16 +198,13 @@ func (g *Gateway) noticeChildWaiting(ctx context.Context, rec *SessionRecord) {
 	if !cur.WaitingNoticeAt.IsZero() && cur.WaitingNoticeOthers == others {
 		return
 	}
-	rs, waiting := g.childStillWaiting(cur.TaskID)
-	if !waiting {
+	rs, still := g.lineStillWaiting(cur.TaskID)
+	if !still {
 		return
 	}
-	line := withLineNote(waitingNotice(ref.Addressee, others), cur.LineNote)
-	if !g.editLine(fresh.Key, cur.StatusMsgID, line, cur.TaskID) {
-		return
-	}
-	rs.lastLine = line
-	rs.busyShown = true
+	// The record first: a line edited with no record of it would be left
+	// with its ⏳ at the grace (closeWaitingLine reads the record). A record
+	// written with an edit that then fails is closed at the grace as usual.
 	if cur.WaitingNoticeAt.IsZero() {
 		cur.WaitingNoticeAt = time.Now().UTC()
 	}
@@ -181,6 +213,12 @@ func (g *Gateway) noticeChildWaiting(ctx context.Context, rec *SessionRecord) {
 		g.log.Error("waiting notice: record write failed", "conversation", fresh.Key, "err", err)
 		return
 	}
+	line := withLineNote(waitingNotice(ref.Addressee, others), cur.LineNote)
+	if !g.editLine(fresh.Key, cur.StatusMsgID, line, cur.TaskID) {
+		return
+	}
+	rs.lastLine = line
+	rs.busyShown = true
 	g.log.Info("waiting notice shown on a delegated child's line",
 		"conversation", fresh.Key, "taskId", cur.TaskID, "profile", ref.Addressee, "tier", ref.Tier, "others", others)
 }
@@ -200,8 +238,8 @@ func (g *Gateway) closeWaitingLine(rec *SessionRecord) bool {
 	if !ok {
 		return false
 	}
-	rs, waiting := g.childStillWaiting(active.TaskID)
-	if !waiting {
+	rs, still := g.lineStillWaiting(active.TaskID)
+	if !still {
 		return false
 	}
 	line := withLineNote(fmt.Sprintf(stillWaitingNotice, ref.Addressee, graceWords(g.cfg.FirstEventGrace)), active.LineNote)

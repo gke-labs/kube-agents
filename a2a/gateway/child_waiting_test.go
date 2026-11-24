@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // seedWaitingChild puts a conversation whose active task is a delegated
@@ -32,6 +34,24 @@ func seedWaitingChild(t *testing.T, r *rig, conv, taskID, msgID, tier, backend s
 	return rec
 }
 
+// startChild puts a working status on a child's own events subject, as its
+// profile worker does when it starts.
+func startChild(t *testing.T, r *rig, rec *SessionRecord, taskID string) {
+	t.Helper()
+	payload, err := messagePayload("seeded", taskID, rec.ContextID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID,
+		"corr-"+taskID, payload, lib.WithTo(lib.Party{Session: "cluster"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.execFor(t, origin, "cluster").PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func waitingEdits(a *fakeAdapter, msgID string) []string {
 	var out []string
 	for _, e := range a.editsOf(msgID) {
@@ -55,7 +75,7 @@ func TestAWaitingChildsLineSaysItsWaiting(t *testing.T) {
 		t.Fatalf("a child inside the threshold got the notice: %q", got)
 	}
 	got := waitingEdits(r.adapter, "msg-old")
-	if len(got) != 1 || !strings.Contains(got[0], "the cluster agent's workers are all busy") || !strings.Contains(got[0], "1 other request sent through me") {
+	if len(got) != 1 || !strings.Contains(got[0], "the cluster agent hasn't started on this yet") || !strings.Contains(got[0], "1 other request sent through me") {
 		t.Fatalf("waiting edits = %q, want one naming cluster and the 1 other (young) child", got)
 	}
 	if _, err := r.client.TasksGet(ctx, "cluster", "task-old"); !isTaskNotFound(err) {
@@ -84,7 +104,7 @@ func TestTheWaitingCountIsSameTierAndEditsOnlyOnChange(t *testing.T) {
 	seedWaitingChild(t, r, "discord:g1/count-other-tier", "task-x", "msg-x", "unattended", "discord", age)
 	r.g.reapOnce(ctx)
 	r.g.reapOnce(ctx)
-	if got := waitingEdits(r.adapter, "msg-a"); len(got) != 1 || !strings.Contains(got[0], "it starts as soon as one frees up") {
+	if got := waitingEdits(r.adapter, "msg-a"); len(got) != 1 || strings.Contains(got[0], "other request") {
 		t.Fatalf("edits = %q, want one notice with no others (the other tier isn't counted) after two passes", got)
 	}
 	seedWaitingChild(t, r, "discord:g1/count-b", "task-b", "msg-b", "read", "discord", age)
@@ -130,7 +150,7 @@ func TestTheGraceClosesAWaitingLineInPlace(t *testing.T) {
 		t.Fatalf("edits = %q, want the waiting notice then the closing line", edits)
 	}
 	last := edits[len(edits)-1]
-	if strings.Contains(last, "⏳") || !strings.Contains(last, "**didn't start**") || !strings.Contains(last, "send it again to start a new request") || !strings.Contains(last, "minutes") {
+	if strings.Contains(last, "⏳") || !strings.Contains(last, "**didn't start**") || !strings.Contains(last, "ask again to start a new request") || !strings.Contains(last, "minutes") {
 		t.Fatalf("closing line = %q", last)
 	}
 	if got := noticePosts(r.adapter, "task-grace"); len(got) != 0 {
@@ -151,5 +171,70 @@ func TestGraceWords(t *testing.T) {
 		if got := graceWords(d); got != want {
 			t.Errorf("graceWords(%v) = %q, want %q", d, got, want)
 		}
+	}
+}
+
+// The count reads each child's stream, not this gateway's relay state: a
+// fan-out's children are counted, and a child that has started (an event on
+// its stream) or ended isn't, whatever its relay shows.
+func TestTheWaitingCountReadsTheStreamAndCountsBatchChildren(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	age := waitingNoticeAfter + 10*time.Second
+	seedWaitingChild(t, r, "discord:g1/count-me", "task-me", "msg-me", "read", "discord", age)
+	started := seedWaitingChild(t, r, "discord:g1/count-started", "task-started", "msg-started", "read", "discord", age)
+	startChild(t, r, started, "task-started")
+	// A fan-out on another conversation: two children at the same profile
+	// and tier, one still waiting and one that ended.
+	batch := &SessionRecord{
+		Key: "discord:g1/batch", ContextID: "ctx-batch", Kind: "group", LastActivity: time.Now().UTC(),
+		BusSession: "chat-otter-1", Addressee: "chat-otter-1",
+		Tasks: []TaskRef{
+			{ID: "batch-parent", Addressee: "chat-otter-1", Requester: &TaskRequester{Backend: "discord", Subject: "s"}},
+			{ID: "batch-0", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent"},
+			{ID: "batch-1", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent",
+				BatchEnd: &BatchEnd{}},
+		},
+	}
+	if err := r.g.reg.Put(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	r.g.reapOnce(ctx)
+	got := waitingEdits(r.adapter, "msg-me")
+	if len(got) != 1 || !strings.Contains(got[0], "1 other request sent through me") {
+		t.Fatalf("edits = %q, want one counting only the waiting batch child", got)
+	}
+	if got := waitingEdits(r.adapter, "msg-started"); len(got) != 0 {
+		t.Fatalf("a started child got the notice: %q", got)
+	}
+}
+
+// One count per profile and tier per pass, however many children ask.
+func TestTheWaitingCountIsReadOncePerPass(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	age := waitingNoticeAfter + 10*time.Second
+	seedWaitingChild(t, r, "discord:g1/once-a", "task-once-a", "msg-once-a", "read", "discord", age)
+	seedWaitingChild(t, r, "discord:g1/once-b", "task-once-b", "msg-once-b", "read", "discord", age)
+	r.g.reapOnce(ctx)
+	r.g.mu.Lock()
+	n, ok := r.g.waitingPass["cluster\x00read"]
+	r.g.mu.Unlock()
+	if !ok || n != 2 {
+		t.Fatalf("pass cache = %d (%v), want 2 for cluster/read", n, ok)
+	}
+	// A child minted after the count isn't seen until the next pass.
+	seedWaitingChild(t, r, "discord:g1/once-c", "task-once-c", "msg-once-c", "read", "discord", age)
+	if got, _ := r.g.waitingChildren(ctx, "cluster", "read"); got != 2 {
+		t.Fatalf("waitingChildren inside the pass = %d, want the cached 2", got)
+	}
+	r.g.reapOnce(ctx)
+	r.g.mu.Lock()
+	n = r.g.waitingPass["cluster\x00read"]
+	r.g.mu.Unlock()
+	if n != 3 {
+		t.Fatalf("next pass count = %d, want 3", n)
 	}
 }

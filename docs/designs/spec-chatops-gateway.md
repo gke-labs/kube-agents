@@ -360,6 +360,27 @@ no worker has as running, and the inject door hands every edit to the eval harne
 fallback post would be worse again, since both read every unedited post of a task as its
 output.
 
+**The waiting notice.** A delegated child's line gets the same kind of notice from the reap
+scan, since a child is minted by the session and no turn is there to count for it. A child
+whose line is still at submitted 30 seconds after its submission, with nothing on its stream
+(probeTask, the never-started test), has its own line edited to "⏳ **waiting** — the cluster
+agent hasn't started on this yet", with "; N other requests sent through me are waiting for it
+too" when there are others. It claims no cause: busy workers, a dispatcher queue, a cold pod
+and a dispatcher that is down all look the same from the gateway, which sees only an empty
+stream. N is this gateway's other children for the same profile and tier, single or fan-out,
+not cancelled or ended, whose streams are empty, counted once per profile and tier per reap
+pass from the session records and the stream, so it holds across a restart and reads no other
+conversation's relay state. The record is marked (`waitingNoticeAt`, with the count) before the
+edit, and the line is edited again only when the count changes. The edit is made under the
+conversation's session lock and only while the line is still submitted, and sets the relay's
+`busyShown` so its own submitted render doesn't replace it; its first edit past submitted
+does. Doors that read the line as data (`busyNoticeBackend`, by the delegating turn's backend)
+get none. At the first-event grace, a line that carries the notice is closed in place to "⚠️
+**didn't start** — the cluster agent didn't start on this in 10 minutes; ask again to start a
+new request (unless this one starts first)" instead of the grace's separate post, so no ⏳ is
+left on a line nothing will move; the grace itself, its marker and its release are unchanged,
+and nothing is published.
+
 ## The Delegate flow (added 8/31)
 
 A turn starting with the word "delegate" plus a separator routes that one task to a
@@ -987,7 +1008,8 @@ evidence, a first event that is merely late could still arrive, and no superviso
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
 posts one line once the grace has passed with nothing on the stream, naming the task and
-saying the next message starts a new task. It marks the active-task record before it
+saying the next message starts a new task (a delegated child's line that carries the waiting
+notice above is closed in place instead). It marks the active-task record before it
 posts, so the line goes out at most once per task, across gateway restarts, and it
 releases nothing; the release stays with the next turn, which reads the stream again
 first. The line is for a placeholder somebody may still be watching, so it has a ceiling:

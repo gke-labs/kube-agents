@@ -11,6 +11,7 @@ paths:
   - "a2a/gateway/*chat*.go"
   - "a2a/gateway/relay*.go"
   - "a2a/gateway/busy.go"
+  - "a2a/gateway/child_waiting.go"
   - "a2a/gateway/stopgate.go"
   - "a2a/hermes-bridge/chat*.go"
   - "a2a/lib/chatmsg/**"

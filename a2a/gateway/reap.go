@@ -56,6 +56,8 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 
 	g.mu.Lock()
 	cursor := g.reapCursor
+	// A fresh waiting-children count for this pass (noticeChildWaiting).
+	g.waitingPass = map[string]int{}
 	g.mu.Unlock()
 
 	nextCursor, done, err := g.reg.ScanSessions(ctx, cursor, func(rec *SessionRecord) (bool, error) {
