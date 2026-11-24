@@ -84,9 +84,11 @@ ROW_CONFIRMED_AT = "confirmedAt"
 # declared source still lists every member it admits.
 DOC_NUMBERS = rec.NUMBERS_KEY
 DOC_CARRIED = "carried"
-# A third optional key the gateway and the operator do not read (#5621): the clusters of each
-# **member project** a probe listed, for the agent's helper scripts (their reader in
-# `fleet_scope_targets.py` comes next, #5621). It counts toward the document's budget, and goes
+# A third optional key the operator does not read (#5621): the clusters of each **member
+# project** a probe listed. Its readers are the agent's helper scripts
+# (`fleet_scope_targets.list_scope_clusters`) and the A2A gateway's scopeClusters page for a
+# delegating profile task (spec-a2a-payloads.md, "Scope clusters"); the gateway admits targets on
+# the rows alone, never on this map. It counts toward the document's budget, and goes
 # first when the document is over it (encode_document). Member projects only: the management project and explicit projects
 # are never probed here (the broker's `scope` role runs `clusters list` only for a project an
 # earlier lookup returned), so a reader lists those itself. Keyed by project ID:
@@ -458,9 +460,11 @@ def write_document(namespace: str, name: str, text: str, resource_version: str |
 def encode_document(document: dict) -> str:
     """The document as compact JSON, or the `too-large` document when it is over the budget.
 
-    The `clusters` map goes first: it is for the helper scripts, and the rows are what the
-    gateway admits on, so a document whose rows fit is published without the map rather than
-    as `too-large` with no rows. A reader then finds every member unread until a run fits.
+    The `clusters` map goes first: it is for cluster listings (the helper scripts and the A2A
+    gateway's scopeClusters page), and the rows are what the gateway admits on, so a document
+    whose rows fit is published without the map rather than as `too-large` with no rows. A
+    helper-script reader then finds every member unread until a run fits, and the gateway's
+    page reads its cluster count as unknown.
     """
     text = json.dumps(document, separators=(",", ":"), ensure_ascii=False)
     if len(text.encode("utf-8")) <= MAX_DOCUMENT_BYTES:

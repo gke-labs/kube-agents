@@ -393,9 +393,13 @@ listed it and its probe answered `ok`. Explicit projects and the management proj
 A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
 fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
 number-to-ID memo and the members counted against the cap that have no row. A third field the
-gateway and the operator do not read, `clusters` (added 11/11, #5621), keeps what each member's
-probe listed, `{"<project>": {"at": <when>, "clusters": [[location, name], ...]}}`, for the
-agent's helper scripts ([`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8). It
+operator does not read, `clusters` (added 11/11, #5621), keeps what each member's probe listed,
+`{"<project>": {"at": <when>, "clusters": [[location, name], ...]}}`. Its readers are the agent's
+helper scripts (`fleet_scope_targets.list_scope_clusters`;
+[`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8) and the A2A gateway's
+`scopeClusters` page for a delegating profile task
+([`spec-a2a-payloads.md`](spec-a2a-payloads.md), "Scope clusters"), which reads unknown when the
+map is absent. The gateway admits targets on the rows alone, never on this map. It
 covers member projects only, since the management project and explicit projects are never
 probed. A probe that fails keeps the previous entry, `at` included, and never writes an empty list
 for a project it could not read. The `projects` rows don't change with it. The map counts toward the 900 KiB budget, but it is
