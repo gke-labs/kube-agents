@@ -4591,6 +4591,13 @@ class KubeAgentsHarness(AgentHarness):
                 f"exchange ended {exchange.outcome}, so the reply could not be sent on its record"
             )
         opening_pod = _session_pod_of(exchange.conversation)
+        if opening_pod is None:
+            # The runner's read failed: that's a runner fault, not a pod the
+            # agent's session didn't have, so no wait is spent on it.
+            return _infra_failure(
+                f"{idle_reply.DIRECTIVE}: the session pods could not be read after the opening turn on "
+                f"{exchange.conversation}, so the reply was not sent"
+            )
         _log.info("reply after idle: waiting %ds on %s before the reply", replay.idle_seconds, exchange.conversation)
         started = time.monotonic()
         time.sleep(replay.idle_seconds)
@@ -4600,9 +4607,13 @@ class KubeAgentsHarness(AgentHarness):
         )
         if failure is not None:
             return failure
-        entry = idle_reply.wait_entry(
-            exchange.conversation, replay.idle_seconds, waited, opening_pod, _session_pod_of(exchange.conversation)
-        )
+        reply_pod = _session_pod_of(exchange.conversation)
+        if reply_pod is None:
+            return _infra_failure(
+                f"{idle_reply.DIRECTIVE}: the session pods could not be read after the reply on "
+                f"{exchange.conversation}, so which pod it ran on is unknown"
+            )
+        entry = idle_reply.wait_entry(exchange.conversation, replay.idle_seconds, waited, opening_pod, reply_pod)
         return idle_reply.merge(opening, reply, entry)
 
     def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:

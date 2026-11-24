@@ -190,7 +190,6 @@ def test_the_wait_records_how_long_it_slept(monkeypatch):
         ("chat-heron-1", "chat-heron-1", "was not reaped"),
         ("", "chat-otter-2", "after the opening"),
         ("chat-heron-1", "", "after the reply"),
-        (None, "chat-otter-2", "after the opening"),
     ],
 )
 def test_a_reply_that_did_not_reach_a_fresh_pod_is_an_errored_wait(monkeypatch, pods, opening_pod, reply_pod, says):
@@ -203,6 +202,27 @@ def test_a_reply_that_did_not_reach_a_fresh_pod_is_an_errored_wait(monkeypatch, 
     assert entry["name"] == idle_reply.WAIT_ENTRY and entry["status"] == "error"
     assert says in entry["result"]["reason"]
     assert got.output == "KA-7741-ORCHID"
+
+
+@pytest.mark.parametrize(
+    "opening_pod, reply_pod, says, replied",
+    [
+        (None, "chat-otter-2", "after the opening turn", False),
+        ("chat-heron-1", None, "after the reply", True),
+    ],
+)
+def test_a_failed_session_pod_read_is_infrastructure(monkeypatch, pods, opening_pod, reply_pod, says, replied):
+    """A kubectl read that failed on the runner is a runner fault, never the agent's red."""
+    pods[:] = [opening_pod, reply_pod]
+    sent: list = []
+    monkeypatch.setattr(harness.time, "sleep", lambda s: sent.append(("sleep", s)))
+    monkeypatch.setattr(
+        harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: sent.append("reply") or _answered()
+    )
+    got = harness.KubeAgentsHarness()._reply_after_idle(_opening(), _completed_exchange(), idle_reply.parse(PROMPT))
+    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER), got.errors
+    assert "could not be read" in got.errors[0] and says in got.errors[0]
+    assert ("reply" in sent) is replied
 
 
 def _pods_json(*pods) -> str:
