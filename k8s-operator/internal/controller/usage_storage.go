@@ -50,6 +50,10 @@ const (
 	dataVolumeReasonHasSpace   = "HasSpace"
 
 	dataVolumeNearlyFullHint = "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
+	// dataVolumeFiguresHint says where the current figures are: the message
+	// holds none, so that it is written once for each state. A served CRD from
+	// before the byte fields prunes them, so the metric is named beside them.
+	dataVolumeFiguresHint = "The current figures are in status.storageStatus (capacityBytes and freeBytes, where the installed CRD has them) and in the " + dataVolumeSeries + " metric."
 
 	// dataVolumeNewerField keys the byte fields' pruning record: a served CRD
 	// from before this release prunes them, and without the record every poll
@@ -101,12 +105,16 @@ func dataVolumeCondition(agent *agentv1alpha1.PlatformAgent, reading *usageDataV
 	used := dataVolumeUsedPercent(reading)
 	wasFull := meta.IsStatusConditionTrue(agent.Status.Conditions, dataVolumeNearlyFullCondition)
 	full := used >= dataVolumeFullPercent || (wasFull && used >= dataVolumeClearPercent)
-	usage := fmt.Sprintf("The agent's data volume is %d%% full (%.1f of %.1f GiB used).",
-		used, float64(reading.Total-reading.Free)/float64(bytesPerGiB), float64(reading.Total)/float64(bytesPerGiB))
+	// The two lines that decide the status, and where the current figures are.
+	// Not the percentage or the bytes: each changes at every poll, and the
+	// condition is written when its message changes.
 	if full {
-		cond.Status, cond.Reason, cond.Message = metav1.ConditionTrue, dataVolumeReasonNearlyFull, usage+" "+dataVolumeNearlyFullHint
+		cond.Status, cond.Reason = metav1.ConditionTrue, dataVolumeReasonNearlyFull
+		cond.Message = fmt.Sprintf("The agent's data volume reached %d%% full and is not back under %d%%. %s %s",
+			dataVolumeFullPercent, dataVolumeClearPercent, dataVolumeFiguresHint, dataVolumeNearlyFullHint)
 	} else {
-		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, dataVolumeReasonHasSpace, usage
+		cond.Status, cond.Reason = metav1.ConditionFalse, dataVolumeReasonHasSpace
+		cond.Message = fmt.Sprintf("The agent's data volume is under %d%% full. %s", dataVolumeFullPercent, dataVolumeFiguresHint)
 	}
 	return cond
 }
@@ -128,11 +136,17 @@ func dataVolumeFieldsMoved(status agentv1alpha1.StorageStatus, reading *usageDat
 	return delta >= max(reading.Total/dataVolumeWriteStepDivisor, 1)
 }
 
+// dataVolumeFieldsDiffer reports whether the byte fields are not this reading's.
+func dataVolumeFieldsDiffer(status agentv1alpha1.StorageStatus, reading *usageDataVolume) bool {
+	return reading != nil && (status.CapacityBytes == nil || status.FreeBytes == nil ||
+		*status.CapacityBytes != reading.Total || *status.FreeBytes != reading.Free)
+}
+
 // projectDataVolume writes this poll's data volume reading to the CR: the byte
-// fields when they moved, and the condition when its status or reason changed.
-// The message is left as written while the status holds, so a volume filling
-// slowly does not rewrite the condition every poll; the byte fields carry the
-// current figures. The patch carries the resource version, because it replaces
+// fields when they moved, and the condition when its status, its reason or its
+// message changed. The message holds no figure, so a volume filling slowly
+// does not rewrite the condition every poll; the byte fields carry the current
+// figures. The patch carries the resource version, because it replaces
 // the conditions list whole and the reconciler writes other conditions in it;
 // a conflict is left for the next poll rather than reported as a failure.
 func (p *UsageCounterPoller) projectDataVolume(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reading *usageDataVolume, known bool) error {
@@ -142,7 +156,15 @@ func (p *UsageCounterPoller) projectDataVolume(ctx context.Context, agent *agent
 	base := agent.DeepCopy()
 	changed := false
 	wroteBytes := false
-	if !p.newerFieldPruned(agent, dataVolumeNewerField) && dataVolumeFieldsMoved(agent.Status.StorageStatus, reading) {
+	// Read before the byte fields change: the condition's status comes from the
+	// conditions list, which the fields do not touch.
+	want := dataVolumeCondition(agent, reading)
+	existing := meta.FindStatusCondition(agent.Status.Conditions, dataVolumeNearlyFullCondition)
+	// A change of status carries the reading that caused it, also inside the
+	// write step: the message points at the byte fields, and at 90.2% they must
+	// not still say 89.5%.
+	turned := want != nil && (existing == nil || existing.Status != want.Status) && dataVolumeFieldsDiffer(agent.Status.StorageStatus, reading)
+	if !p.newerFieldPruned(agent, dataVolumeNewerField) && (turned || dataVolumeFieldsMoved(agent.Status.StorageStatus, reading)) {
 		if reading == nil {
 			agent.Status.StorageStatus.CapacityBytes, agent.Status.StorageStatus.FreeBytes = nil, nil
 		} else {
@@ -151,12 +173,10 @@ func (p *UsageCounterPoller) projectDataVolume(ctx context.Context, agent *agent
 		}
 		changed = true
 	}
-	want := dataVolumeCondition(agent, reading)
-	existing := meta.FindStatusCondition(agent.Status.Conditions, dataVolumeNearlyFullCondition)
 	switch {
 	case want == nil:
 		changed = meta.RemoveStatusCondition(&agent.Status.Conditions, dataVolumeNearlyFullCondition) || changed
-	case existing == nil || existing.Status != want.Status || existing.Reason != want.Reason:
+	case existing == nil || existing.Status != want.Status || existing.Reason != want.Reason || existing.Message != want.Message:
 		meta.SetStatusCondition(&agent.Status.Conditions, *want)
 		changed = true
 	}
