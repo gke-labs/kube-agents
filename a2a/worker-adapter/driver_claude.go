@@ -90,6 +90,9 @@ func (claudeDecoder) Decode(line []byte) ([]Event, error) {
 	return nil, nil
 }
 
+// toolResultBlockType is a user line's content block that answers a tool call.
+const toolResultBlockType = "tool_result"
+
 // assistantEvents maps one assistant message's content blocks onto events:
 // thinking, the model's prose, and tool invocations. A block with nothing in
 // it is no event.
@@ -115,22 +118,28 @@ func (ev harnessEvent) assistantEvents() []Event {
 	return out
 }
 
-// toolResultEvents maps the tool_result blocks on one user message onto
-// events, one per result (adapter: answerscrub.Seen.CollectToolResult). The
-// harness reports a result's content as a JSON string, which goes in as it
-// is, or as a list of content blocks, whose text blocks go in as one JSON
-// list of strings (an image's data is not read). A result with no content
-// is no event.
+// toolResultEvents is one EventToolResult per tool_result block on a user
+// line: a line carries one block per tool call it answers, and parallel calls
+// share a line. Each carries its result's content for the seen-values set
+// (adapter: answerscrub.Seen.CollectToolResult). The harness reports the
+// content as a JSON string, which goes in as it is, or as a list of content
+// blocks, whose text blocks go in as one JSON list of strings (an image's
+// data is not read). A result with no content is still an event, with no
+// ToolResult: its tool step has ended all the same.
 func (ev harnessEvent) toolResultEvents() []Event {
 	if ev.Message == nil {
 		return nil
 	}
 	var out []Event
 	for _, block := range ev.Message.Content {
-		if block.Type != "tool_result" || len(block.Content) == 0 {
+		if block.Type != toolResultBlockType {
 			continue
 		}
-		out = append(out, Event{Kind: EventToolResult, ToolResult: toolResultRaw(block.Content)})
+		e := Event{Kind: EventToolResult}
+		if len(block.Content) > 0 {
+			e.ToolResult = toolResultRaw(block.Content)
+		}
+		out = append(out, e)
 	}
 	return out
 }

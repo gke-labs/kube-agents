@@ -57,10 +57,20 @@ const (
 	// gchatRateLimitedName counts the ones answered 429. The event pull and
 	// its ack are relay routes, not Chat API calls, and are not timed; the
 	// pull is a long poll gchatPullsName already counts.
-	gchatAPIDurationName   = "gchat_api_request_duration_seconds"
-	gchatRateLimitedName   = "gchat_api_rate_limited_total"
-	chatMessagesName       = "chat_messages_total"
-	notifyMarksDroppedName = "notify_marks_dropped_total"
+	gchatAPIDurationName = "gchat_api_request_duration_seconds"
+	gchatRateLimitedName = "gchat_api_rate_limited_total"
+	// The Teams backend's equivalents: each pull of the broker's Teams queue
+	// by outcome and the events it carried; each Bot Framework call the
+	// adapter makes through the broker's passthrough, by operation and
+	// outcome, and the ones Microsoft answered 429; and how long an activity
+	// it takes as a turn took from its own timestamp to the gateway's receipt.
+	teamsEventsReceivedName = "teams_events_received_total"
+	teamsPullsName          = "teams_pulls_total"
+	teamsAPIDurationName    = "teams_api_request_duration_seconds"
+	teamsRateLimitedName    = "teams_api_rate_limited_total"
+	teamsIngressLagName     = "teams_ingress_lag_seconds"
+	chatMessagesName        = "chat_messages_total"
+	notifyMarksDroppedName  = "notify_marks_dropped_total"
 	// messagesInboundName counts the chat messages the gateway accepted as
 	// turns, by platform: the next-mode half of status.usage's
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
@@ -147,6 +157,11 @@ const (
 	gchatCallOK          = "ok"
 	gchatCallRateLimited = "rate_limited"
 	gchatCallError       = "error"
+	// The Teams passthrough's call outcomes: the same three words, spelled
+	// on their own so a change to one backend's cannot move the other's.
+	teamsCallOK          = "ok"
+	teamsCallRateLimited = "rate_limited"
+	teamsCallError       = "error"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -184,6 +199,11 @@ const (
 	gchatPullEvents = "events"
 	gchatPullEmpty  = "empty"
 	gchatPullFailed = "failed"
+	// The Teams queue's pull outcomes, the same three words spelled on
+	// their own.
+	teamsPullEvents = "events"
+	teamsPullEmpty  = "empty"
+	teamsPullFailed = "failed"
 
 	// The chat-message outcomes (spec-a2a-payloads.md, "Chat messages"):
 	// rendered, laid out by the backend; text-only, a backend that renders
@@ -234,6 +254,7 @@ var (
 	}
 	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor, TerminalFromGateway, TerminalNeverStarted}
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
+	metricsTeamsOutcomes   = []string{teamsPullEvents, teamsPullEmpty, teamsPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformTeams, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
@@ -295,6 +316,11 @@ type Metrics struct {
 	gchatPulls          *prometheus.CounterVec
 	gchatAPIDuration    *prometheus.HistogramVec
 	gchatRateLimited    *prometheus.CounterVec
+	teamsEventsReceived prometheus.Counter
+	teamsPulls          *prometheus.CounterVec
+	teamsAPIDuration    *prometheus.HistogramVec
+	teamsRateLimited    *prometheus.CounterVec
+	teamsIngressLag     *prometheus.HistogramVec
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
@@ -425,6 +451,38 @@ func NewMetrics() *Metrics {
 			Name:      gchatRateLimitedName,
 			Help:      "Google Chat API calls answered 429 (rate limited), by the Chat API as the relay carries its status, by method (spaces.messages.create, spaces.messages.patch, spaces.members.list, ..., other).",
 		}, []string{labelMethod}),
+		teamsEventsReceived: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsEventsReceivedName,
+			Help:      "Microsoft Teams activities the gateway pulled from the credential broker's Teams queue, before parsing or classification.",
+		}),
+		teamsPulls: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsPullsName,
+			Help:      "Pulls of the credential broker's Teams queue, by outcome: events (one arrived), empty (none did), failed (the broker refused or did not answer, or the pull could not be read).",
+		}, []string{labelOutcome}),
+		teamsAPIDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsAPIDurationName,
+			Help:      "Seconds each Bot Framework call the Teams adapter made through the credential broker's passthrough took, by method (conversations.activities.create, conversations.activities.update, other) and outcome (ok, the broker returned Microsoft's response; rate_limited, a 429 from Microsoft; error, any other status or no response).",
+			Buckets:   metricsGchatAPIBuckets,
+		}, []string{labelMethod, labelOutcome}),
+		teamsRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsRateLimitedName,
+			Help:      "Bot Framework calls Microsoft answered 429 (rate limited), as the credential broker carries its status, by method (conversations.activities.create, conversations.activities.update, other).",
+		}, []string{labelMethod}),
+		teamsIngressLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsIngressLagName,
+			Help:      "Seconds from a Teams activity's own timestamp to the gateway's receipt of it, for an activity it takes as a turn: Microsoft's delivery, the receiver in front of the broker and the broker's queue together; a negative lag (clock skew) is observed as 0 and an activity with no readable timestamp is not observed. No sample until the first.",
+			Buckets:   metricsSlackIngressBuckets,
+		}, []string{}),
 		chatMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -505,7 +563,7 @@ func NewMetrics() *Metrics {
 		connected: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackConnectedName), slackConnectedHelp, nil, nil),
 		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.gchatAPIDuration, m.gchatRateLimited, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.gchatAPIDuration, m.gchatRateLimited, m.teamsEventsReceived, m.teamsPulls, m.teamsAPIDuration, m.teamsRateLimited, m.teamsIngressLag, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -520,6 +578,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, outcome := range metricsGchatOutcomes {
 		m.gchatPulls.WithLabelValues(outcome)
+	}
+	for _, outcome := range metricsTeamsOutcomes {
+		m.teamsPulls.WithLabelValues(outcome)
 	}
 	for _, platform := range metricsRatedPlatforms {
 		for _, rating := range metricsRatings {
@@ -613,6 +674,18 @@ func (m *Metrics) gchatPull(outcome string) {
 		m.gchatEventsReceived.Inc()
 	}
 	m.gchatPulls.WithLabelValues(outcome).Inc()
+}
+
+// teamsPull counts one pull of the broker's Teams queue under its outcome,
+// and the activity it carried when it carried one.
+func (m *Metrics) teamsPull(outcome string) {
+	if m == nil {
+		return
+	}
+	if outcome == teamsPullEvents {
+		m.teamsEventsReceived.Inc()
+	}
+	m.teamsPulls.WithLabelValues(outcome).Inc()
 }
 
 // chatMessage counts one chat message under its outcome, one of

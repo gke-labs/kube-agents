@@ -72,24 +72,40 @@ func TestParsePersonaIntegrity(t *testing.T) {
 }
 
 // A persona whose files don't match its build-time manifest stops the worker
-// before it takes a task, and the error names the file.
+// before it takes a task, and the error names the file, whichever harness
+// the profile runs: the check comes before anything harness-specific, so it
+// holds on the Antigravity driver as on Claude Code (a cross-driver
+// conformance case for the harness flip). Each case runs its own driver as
+// well as its own persona harness.
 func TestAPersonaThatDiffersFromItsManifestStopsTheWorker(t *testing.T) {
-	dir := personaWithManifest(t)
-	skill := filepath.Join(dir, "skills/triage/SKILL.md")
-	data, err := os.ReadFile(skill)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(skill, append(data, []byte("\nchanged after the build\n")...), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	url := startServer(t)
-	cfg := profileWorkerConfig(t, url, stub(t, "exit 0"))
-	err = RunProfileWorker(context.Background(), cfg, ProfileWorkerConfig{
-		Tier: pwTier, PersonaDir: dir, Harness: persona.ClaudeCode, ConfigRoot: t.TempDir(),
-	})
-	if err == nil || !strings.Contains(err.Error(), "skills/triage/SKILL.md") || !strings.Contains(err.Error(), persona.IntegrityManifestFile) {
-		t.Errorf("a worker whose persona differs from its manifest = %v, want refused at start naming the file", err)
+	for _, tc := range []struct {
+		harness persona.Harness
+		driver  Driver
+	}{
+		{persona.ClaudeCode, claudeDriver{}},
+		{persona.Antigravity, agyDriver{}},
+	} {
+		harness := tc.harness
+		t.Run(string(harness), func(t *testing.T) {
+			dir := personaWithManifest(t)
+			skill := filepath.Join(dir, "skills/triage/SKILL.md")
+			data, err := os.ReadFile(skill)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(skill, append(data, []byte("\nchanged after the build\n")...), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			url := startServer(t)
+			cfg := profileWorkerConfig(t, url, stub(t, "exit 0"))
+			cfg.Driver = tc.driver
+			err = RunProfileWorker(context.Background(), cfg, ProfileWorkerConfig{
+				Tier: pwTier, PersonaDir: dir, Harness: harness, ConfigRoot: t.TempDir(),
+			})
+			if err == nil || !strings.Contains(err.Error(), "skills/triage/SKILL.md") || !strings.Contains(err.Error(), persona.IntegrityManifestFile) {
+				t.Errorf("a %s worker whose persona differs from its manifest = %v, want refused at start naming the file", harness, err)
+			}
+		})
 	}
 }
 

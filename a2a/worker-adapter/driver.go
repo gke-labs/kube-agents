@@ -3,6 +3,7 @@ package workeradapter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,16 +90,18 @@ const (
 	EventProgress
 	// EventActivity is a tool invocation (Event.Tool, Event.Input).
 	EventActivity
+	// EventToolResult marks that one tool step's result is in, so the call
+	// that ran it has exited, and carries the result the harness fed back to
+	// the model (Event.ToolResult) when the driver can read it. A driver
+	// emits exactly one per tool step. Nothing of it is published: the
+	// adapter reads the write-refusal record on it (refusal.go), and feeds
+	// Event.ToolResult only into the task's seen-values set for the answer's
+	// scrub (answerscrub.Seen).
+	EventToolResult
 	// EventResult ends a turn: Event.Text is the deliverable, Event.Failed
 	// and Event.Token whether it failed and the reason token, and
 	// Event.Telemetry what the turn cost.
 	EventResult
-	// EventToolResult is one tool result the harness fed back to the model
-	// (Event.ToolResult). It is never published: the adapter reads it only
-	// into the task's seen-values set for the answer's scrub
-	// (answerscrub.Seen), so a driver must report every tool result its
-	// harness writes, one event each.
-	EventToolResult
 )
 
 // Event is one harness event in the adapter's own terms. Only the fields
@@ -163,4 +166,19 @@ func (a *adapter) turnDirs(env []string) TurnDirs {
 		}
 	}
 	return dirs
+}
+
+// DriverFor is the driver for harness h, the value of the worker's harness
+// selector. Empty means Claude Code. Antigravity is a known harness with no
+// driver yet, refused by name; anything else is refused as unknown. A worker
+// never falls back to Claude Code for a value it does not know: a typo would
+// otherwise run the wrong harness without a word.
+func DriverFor(h persona.Harness) (Driver, error) {
+	switch h {
+	case "", persona.ClaudeCode:
+		return claudeDriver{}, nil
+	case persona.Antigravity:
+		return nil, fmt.Errorf("harness %q has no worker driver yet", h)
+	}
+	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.ClaudeCode, persona.Antigravity)
 }

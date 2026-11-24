@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -739,6 +740,24 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 	}
 	if got := resetPaths(""); len(got) != 0 {
 		t.Errorf("resetPaths(\"\") = %q, want none", got)
+	}
+}
+
+// harnessConfigDir is where the session check and the settings lookup both
+// look: $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
+func TestHarnessConfigDir(t *testing.T) {
+	t.Setenv(claudeConfigDirEnv, "/cfg")
+	t.Setenv("HOME", "/home/u")
+	if got := harnessConfigDir(); got != "/cfg" {
+		t.Errorf("with %s set: %q", claudeConfigDirEnv, got)
+	}
+	t.Setenv(claudeConfigDirEnv, "")
+	if got := harnessConfigDir(); got != filepath.Join("/home/u", claudeDefaultConfigDir) {
+		t.Errorf("with HOME only: %q", got)
+	}
+	t.Setenv("HOME", "")
+	if got := harnessConfigDir(); got != "" {
+		t.Errorf("with neither: %q", got)
 	}
 }
 

@@ -214,14 +214,20 @@ type profileWorker struct {
 // no manifest. Which of verified or unverified it loaded as is logged, when
 // log is set: the delegate render of the same persona passes nil.
 func renderPersona(pw ProfileWorkerConfig, delegate persona.Delegate, log *slog.Logger) (*persona.Output, error) {
-	adapter, err := render.For(pw.Harness)
-	if err != nil {
-		return nil, err
-	}
+	// The persona loads, and its files are checked, before the harness is
+	// looked at: the check is the same for every harness, and a persona that
+	// differs from its build is refused as that, whichever driver the
+	// profile runs.
 	p, err := persona.LoadWithOptions(pw.PersonaDir, persona.Options{RequireIntegrity: pw.RequirePersonaIntegrity})
 	if err != nil {
 		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
 	}
+	adapter, err := render.For(pw.Harness)
+	if err != nil {
+		return nil, err
+	}
+	// Logged once the persona is one this harness can use, so a refused
+	// harness doesn't follow a success line.
 	if log != nil {
 		logPersonaIntegrity(log, pw.PersonaDir, p)
 	}
@@ -646,6 +652,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)
+	removeRefusals := w.makeWriteRefusalFile(&cfg)
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
 	cfg.TaskDeadline = time.Until(h.offer.Deadline) - w.pw.deadlineMargin
@@ -672,6 +679,9 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		}
 	}
 	cfg.HarnessEnv = append(cfg.HarnessEnv, taskParameterEnv(h.origin, cfg.Logger)...)
+	// After the parameters, so that even a name they could spell can't stand
+	// in for the trigger's (they can't: their prefix is PROFILE_TASK_).
+	cfg.HarnessEnv = append(withoutTriggerEnv(cfg.HarnessEnv), taskTriggerEnv(h.origin, cfg.Logger)...)
 	a := newTaskAdapter(cfg, bus)
 	a.dispatched = true
 	a.abandon = h.abandon
@@ -685,6 +695,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		// config.
 		removeConfig()
 		removeToken()
+		removeRefusals()
 		closeTaskBus()
 		h.done <- out
 	}()
@@ -777,6 +788,31 @@ func (w *profileWorker) writeTaskToken(token string) func() {
 	return func() { _ = os.Remove(path) }
 }
 
+// makeWriteRefusalFile makes the task's write-refusal record file empty
+// beside the task token, on the same tmpfs, names it to the broker client
+// (EnvWriteRefusalFile, with the task in EnvWriteRefusalTask) and to the
+// adapter (Config.WriteRefusalFile), and returns what removes it. The client
+// appends to the file and never creates it, so a stale one from an earlier
+// task is removed first. With the stop off or no token directory, or when
+// the file can't be made, there is no file: the task runs, and is never
+// stopped at a refusal (refusal.go says why that is safe).
+func (w *profileWorker) makeWriteRefusalFile(cfg *Config) func() {
+	if !cfg.StopOnWriteRefusal || w.pw.TaskTokenFile == "" {
+		return func() {}
+	}
+	path := filepath.Join(filepath.Dir(w.pw.TaskTokenFile), writeRefusalFileName)
+	_ = os.Remove(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- the worker's own per-task file
+	if err != nil {
+		w.cfg.Logger.Warn("could not make the write-refusal record; the task won't stop at a write refusal", "path", path, "err", err)
+		return func() {}
+	}
+	_ = f.Close()
+	cfg.WriteRefusalFile = path
+	cfg.HarnessEnv = append(cfg.HarnessEnv, EnvWriteRefusalFile+"="+path, EnvWriteRefusalTask+"="+cfg.TaskID)
+	return func() { _ = os.Remove(path) }
+}
+
 // finish sends the final renewal for a task whose terminal went out. A task
 // that ended without one (abandoned, or refused before any publish) gets
 // none, and its lease settles the way the dispatcher decides.
@@ -797,6 +833,58 @@ func (w *profileWorker) finish(h *held, out turnOutcome) {
 	if err := w.b.nc.Flush(); err != nil {
 		w.cfg.Logger.Warn("flushing the final renewal", "task", h.offer.TaskID, "err", err)
 	}
+}
+
+// The trigger a dispatched task came from (#4685, #5623), as the harness
+// reads it. Runtime-owned: they come from the submission's authority block,
+// never from a task parameter, whose names all take the PROFILE_TASK_ prefix
+// (taskParameterEnv), so no parameter can set or override them, and the
+// pod's own environment is stripped of them first (withoutTriggerEnv), so an
+// untriggered task never inherits one. The fleet audit's shadow run names
+// its report stream after the schedule (audit_report.py, #6956).
+const (
+	profileTriggerStreamEnv = "PROFILE_TRIGGER_STREAM"
+	profileTriggerOriginEnv = "PROFILE_TRIGGER_ORIGIN"
+)
+
+// taskTriggerEnv is the submission's trigger, PROFILE_TRIGGER_STREAM and
+// PROFILE_TRIGGER_ORIGIN, each only when the trigger names it; nothing for a
+// task no trigger started. The block's trigger is a claim the dispatcher
+// checked against the grant before it offered the task; a script that acts
+// on the stream does it through the broker, which holds every report write
+// to the stream the signed task credential names. A block that can't be read
+// passes none on.
+func taskTriggerEnv(origin *lib.Envelope, log interface{ Warn(string, ...any) }) []string {
+	trigger, err := capability.TriggerFromAuthority(origin.Authority)
+	if err != nil {
+		log.Warn("the submission's trigger can't be read; none is passed on", "task", origin.TaskID, "err", err)
+		return nil
+	}
+	if trigger == nil {
+		return nil
+	}
+	var env []string
+	if trigger.Stream != "" {
+		env = append(env, profileTriggerStreamEnv+"="+trigger.Stream)
+	}
+	if trigger.Origin != "" {
+		env = append(env, profileTriggerOriginEnv+"="+trigger.Origin)
+	}
+	return env
+}
+
+// withoutTriggerEnv is env with any PROFILE_TRIGGER_STREAM or
+// PROFILE_TRIGGER_ORIGIN entry removed: only the task's own trigger sets them.
+func withoutTriggerEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == profileTriggerStreamEnv || name == profileTriggerOriginEnv {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // taskParameterEnv is the submission's declared parameters as the harness
