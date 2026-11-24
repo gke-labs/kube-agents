@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -598,6 +600,95 @@ func TestATiersKeyGoesWithTheTierAndTheAgent(t *testing.T) {
 	r.removeInferenceKeysOnDeletion(ctx, agent)
 	if err := cl.Get(ctx, readTier, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Errorf("a tier key survived the deletion: %v", err)
+	}
+}
+
+// appliedDispatchConfigObject is an applied dispatch config ConfigMap
+// holding profiles, as the operator writes it.
+func appliedDispatchConfigObject(t *testing.T, agent *agentv1alpha1.PlatformAgent, profiles ...a2aDispatchProfile) *corev1.ConfigMap {
+	t.Helper()
+	body, err := json.Marshal(a2aDispatchConfig{Profiles: profiles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)},
+		Data:       map[string]string{a2aDispatchConfigKey: string(body)},
+	}
+}
+
+// A tier that drains keeps its key, in its Secret and in the map, until the
+// drain ends: work already running at it still sends that key. That holds
+// for a tier a live profile dropped and for every tier of a profile that
+// has left the install.
+func TestADrainingTierKeepsItsKeyUntilTheDrainEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		drained func(until time.Time) a2aDispatchProfile
+		profile func(p *agentv1alpha1.AgentProfile) bool // false: delete it
+	}{
+		{
+			name: "dropped from allowedTiers",
+			drained: func(until time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead},
+					DrainingTiers: []a2aDrainingTier{{Tier: agentv1alpha1.AgentProfileTierUnattended, Mode: "unattended", Until: until}}}
+			},
+			profile: func(p *agentv1alpha1.AgentProfile) bool {
+				p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+				return true
+			},
+		},
+		{
+			name: "profile left the install",
+			drained: func(until time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}, DrainingUntil: until}
+			},
+			profile: func(*agentv1alpha1.AgentProfile) bool { return false },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, cl, agent := inferenceKeysFixture(t)
+			ctx := context.Background()
+			r.reconcileInferenceKeys(ctx, agent)
+			unattended := tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret
+			before := readInferenceKey(t, cl, unattended).Data[inferenceKeyDataKey]
+
+			profile := &agentv1alpha1.AgentProfile{}
+			if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+				t.Fatal(err)
+			}
+			if tc.profile(profile) {
+				if err := cl.Update(ctx, profile); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := cl.Delete(ctx, profile); err != nil {
+				t.Fatal(err)
+			}
+			applied := appliedDispatchConfigObject(t, agent, tc.drained(time.Now().Add(time.Hour).UTC().Truncate(time.Second)))
+			if err := cl.Create(ctx, applied); err != nil {
+				t.Fatal(err)
+			}
+
+			r.reconcileInferenceKeys(ctx, agent)
+			if got := readInferenceKey(t, cl, unattended).Data[inferenceKeyDataKey]; string(got) != string(before) {
+				t.Error("the draining tier's key was replaced")
+			}
+			entries, _ := readCallerKeysMap(t, cl, agent)
+			if !slices.Contains(slices.Collect(maps.Values(entries)), "tier-unattended") {
+				t.Error("the map dropped the draining tier while its work still sends the key")
+			}
+
+			// The drain over, the key goes.
+			ended := appliedDispatchConfigObject(t, agent, tc.drained(time.Now().Add(-time.Minute).UTC().Truncate(time.Second)))
+			applied.Data = ended.Data
+			if err := cl.Update(ctx, applied); err != nil {
+				t.Fatal(err)
+			}
+			r.reconcileInferenceKeys(ctx, agent)
+			if err := cl.Get(ctx, unattended, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+				t.Errorf("the tier's key outlived its drain: %v", err)
+			}
+		})
 	}
 }
 

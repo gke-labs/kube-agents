@@ -59,8 +59,8 @@ import (
 // Ready gateway pod whether it has loaded the map yet, which is the
 // InferenceKeysServed condition. Callers are given their key only once a
 // pass has found the condition True for a map holding it
-// (inference_key_callers.go), so a caller never sends a key the gateway
-// would refuse.
+// (inference_key_callers.go), so no caller is given a key before every
+// Ready gateway pod has loaded it.
 //
 // The question is asked with a probe key of its own, in the reserved class
 // gateway-probe, which the hook admits on GET /v1/models alone and no
@@ -81,8 +81,9 @@ import (
 // namespace with a controller reference to the PlatformAgent. A tier's is
 // in the profile namespace, where the workers run, and can't carry an owner
 // reference across namespaces (agentprofile_namespace.go), so it carries
-// this agent's labels and is deleted when no bound profile lists the tier,
-// a draining one included, and on the PlatformAgent's deletion.
+// this agent's labels and is deleted once no bound profile lists the tier
+// and no drain keeps it (drainingInferenceKeyTiers), and on the
+// PlatformAgent's deletion.
 //
 // Whoever creates a Secret writes its labels and owner references, so
 // neither says the operator made it. The operator records the UID of every
@@ -516,13 +517,17 @@ func (r *PlatformAgentReconciler) notWrittenFor(what string, err error) inferenc
 	return notWritten(what+" could not be read or written: "+apiFailure(err), true)
 }
 
-// tiersInUse is every tier a bound profile lists, live or draining, sorted.
-func tiersInUse(profiles []agentv1alpha1.AgentProfile) []string {
+// tiersInUse is every tier a bound profile lists, and every draining tier,
+// sorted.
+func tiersInUse(profiles []agentv1alpha1.AgentProfile, draining []string) []string {
 	seen := map[string]bool{}
 	for i := range profiles {
 		for _, tier := range profiles[i].AllowedTierList() {
 			seen[tier] = true
 		}
+	}
+	for _, tier := range draining {
+		seen[tier] = true
 	}
 	out := make([]string, 0, len(seen))
 	for tier := range seen {
@@ -530,6 +535,42 @@ func tiersInUse(profiles []agentv1alpha1.AgentProfile) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// drainingInferenceKeyTiers is every tier the applied dispatch config still
+// drains: a tier a live profile dropped, and every tier of a profile that has
+// left the install (agentprofile_tier_drain.go). A task already running at
+// one still sends its tier's key until the drain ends, so the key stays, in
+// its Secret and in the map, until then. A drain whose end has passed keeps
+// nothing. No applied config drains nothing; a read that fails otherwise is
+// an error, so no tier key is deleted on a pass that can't tell.
+func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var applied a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
+		// dispatchDraining reports an undecodable config; it drains nothing
+		// there either.
+		return nil, nil
+	}
+	now := time.Now()
+	var out []string
+	for _, p := range applied.Profiles {
+		if !p.DrainingUntil.IsZero() && now.Before(p.DrainingUntil) {
+			out = append(out, p.Tiers...)
+		}
+		for _, d := range p.DrainingTiers {
+			if now.Before(d.Until) {
+				out = append(out, d.Tier)
+			}
+		}
+	}
+	return out, nil
 }
 
 // inferenceKeysCondition is a condition of the type this file writes.
@@ -669,9 +710,13 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		if err != nil {
 			return notWritten("the profile namespace could not be read: "+apiFailure(err), true)
 		}
+		draining, err := r.drainingInferenceKeyTiers(ctx, agent)
+		if err != nil {
+			return notWritten("the applied dispatch config could not be read for the draining tiers: "+apiFailure(err), true)
+		}
 		tiers, tiersKnown, profileNamespaceReady = nil, true, ready
 		if ready {
-			tiers = tiersInUse(profiles)
+			tiers = tiersInUse(profiles, draining)
 		}
 	}
 
