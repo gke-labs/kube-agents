@@ -878,6 +878,39 @@ unchanged, and a worker that predates the part ignores it.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
 
+**Scope clusters.** Beside its `delegateTargets` part, a delegating profile's own task (the same
+gate: a card that says it delegates, no `via`, a route set) carries
+`{"scopeClusters": {"count", "clusters": [{"project", "location", "cluster"}, …], "truncated", "cursor", "unknown"?, "unlistedProjects"?, "unlistedCount"?, "oldestListing"?}}`:
+one page of the clusters a `cluster` child delegation from that task would be accepted for, as far as
+the install's scope decides it. Both a task started from a turn and a scheduled run carry it. The
+source is the resolved scope document's `clusters` map, which the scope publisher writes for member
+projects (`{project: {at, clusters: [[location, name], …]}}`, `scope_publisher.py`) and the gateway
+already reads with its own ServiceAccount. Each cluster is held to the delegation's own scope check
+(exclusions, the declaration, the resolved rows) and to the parent's scope, so the page offers
+nothing the delegation refuses on scope; a profile's own checks (tiers, pins, lists) stay with
+`delegateTargets` and the delegation. A parent scoped to one cluster gets that cluster alone, when it
+is in scope, and a parent the delegation refuses outright gets an empty page.
+
+- The page is the first `min(A2A_DELEGATION_WIDTH_MAX, 16)` accepted clusters in (project, location,
+  cluster) order, so it is one batch of targets. `count` is every accepted cluster, and `truncated`
+  is `count` past the page.
+- `cursor` is reserved for a later paging contract and is always empty; a reader ignores it.
+- `unknown` is set when the document has no `clusters` map to count from: no document, one that
+  isn't `ok`, or one the publisher wrote without the map (it drops the map first when the document
+  would pass its 900 KiB budget, and writes none when it has nothing listed). `count` is then only
+  the clusters the gateway knows of, and `truncated` is always set.
+- `unlistedProjects` names the projects in scope whose clusters no map entry carries, "listed
+  elsewhere": an explicitly declared project and the management project, which the publisher never
+  probes, and a member no probe has listed yet. Without a map every project in scope is one. At most
+  16 are named, sorted; `unlistedCount` is the total. A delegation to one is checked as it arrives.
+- `oldestListing` is the oldest `at` among the projects the counted clusters came from. A probe that
+  fails keeps its previous entry and its `at`, so this is how stale the page may be.
+- Every name is a subject token and the part encodes to at most 8 KiB, so the session pod hands it to
+  its tool server in one environment variable (`A2A_SCOPE_CLUSTERS`), beside the targets; the
+  delegate tool names the page after the agents in its addressee description, as plain facts. A
+  reader that finds a part breaking these bounds ignores it (`lib.ScopeClustersOf`), and a worker
+  that predates the part ignores it too.
+
 **Reply to.** A turn that answers a card's report carries `{"replyTo": {"taskId": "<task>"}}`: the
 gateway task whose turn filed the card, which the report's console frame named as `replyTo` (the
 root of its chain when a delegated child filed it, so that card's row, keyed by the child's task, is

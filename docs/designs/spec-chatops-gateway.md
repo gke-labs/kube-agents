@@ -876,7 +876,13 @@ runs the delegation's own checks on each profile, so it never offers one the del
 not `platform`, not a profile outside a cluster-scoped parent's cluster, only profiles that run at
 `read` and list `unattended` for a parent below a scheduled run, and nobody for a parent refused
 outright, such as one at the depth cap. A scheduled run of a delegating profile carries the list too, built
-the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
+the same way when the trigger ingress submits it. Beside the list, under the same gate, rides the
+`scopeClusters` part (`spec-a2a-payloads.md`): one page of the clusters a `cluster` child would be
+accepted for, from the resolved scope's `clusters` map, each held to the delegation's own scope check
+and the parent's scope, with the count, a reserved empty cursor, the projects in scope whose clusters
+are listed elsewhere (explicit and management projects, members not yet listed), and `unknown` with
+`truncated` when the document carries no map (dropped for its 900 KiB budget, or absent). The
+delegate tool names the page after its agents. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
