@@ -2772,6 +2772,15 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         self.assertIn("reached no baseline", entry["limitations"])
         self.assertIn("`boot-disk` (4 readable value(s), commonest on 1 in 1 of 4 voting clusters, where §4.15", entry["limitations"])
 
+    def test_a_cohort_that_meets_the_span_rule_is_not_told_it_failed_it(self):
+        """Three clusters share one pool shape and differ on the other: three
+        of six pools, in three of three clusters. §3.3's majority is what is
+        missing, so the sentence does not cite §4.15."""
+        fleet = [cluster(f"c{i}", nodePools=[pool("system"), pool("data", disk_type="pd-ssd", disk_gb=gb)]) for i, gb in enumerate((200, 300, 400))]
+        entry = self.manifest(fleet)[T("c0")]
+        self.assertIn("`boot-disk` (6 readable value(s), commonest on 3)", entry["limitations"])
+        self.assertNotIn("§4.15", entry["limitations"])
+
     def test_the_finding_id_names_the_cluster_and_the_pool(self):
         import audit_report
 

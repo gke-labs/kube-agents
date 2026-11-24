@@ -1772,11 +1772,13 @@ def unvoted_facets(
                     tokens = facet_tokens(FACETS_BY_SLUG[slug], cohort)
                     top = Counter(tokens.values()).most_common(1)
                     span = ""
-                    if FACETS_BY_SLUG[slug].pool_token is not None and top:
+                    if FACETS_BY_SLUG[slug].pool_token is not None and top and not pool_baseline_spans_cohort(tokens):
                         # A pool facet can clear §3.3 on its pools and still
                         # have no baseline, so the sentence names the rule
                         # that decided: without it "commonest on 20 of 22"
-                        # reads as a majority the collector ignored.
+                        # reads as a majority the collector ignored. Only
+                        # where §4.15's condition is the one that failed: a
+                        # cohort it holds for lost its baseline to §3.3 alone.
                         holders, voters = pool_baseline_span(tokens)
                         span = (
                             f" in {holders} of {voters} voting clusters, where §4.15 needs "
