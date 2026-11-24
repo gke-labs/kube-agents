@@ -222,7 +222,7 @@ func TestEveryBuiltinHasASwitch(t *testing.T) {
 // script or path escape.
 func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 	const script = "/var/lib/agent-persona/skills/stall/scripts/stall_report.py"
-	g, err := toolgrant.Policy{ShellPrefixes: []string{"kubectl"}, Scripts: []string{script}}.CoreAgent("/scratch")
+	g, err := toolgrant.Policy{ShellPrefixes: []string{"kubectl"}, Scripts: []string{script}, ScriptRoot: "/var/lib/agent-persona/skills"}.CoreAgent("/scratch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,4 +266,86 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 			t.Errorf("CheckBash(%q) allowed=%v, want %v", cmd, got, want)
 		}
 	}
+}
+
+// TestAGrantedMCPToolPassesTheGateAndNoOtherDoes: through core-agent's real
+// gate in allow mode, as it checks an MCP call (namespace "mcp", key
+// "<server>_<tool>(<args>)"), a granted MCP tool passes and a neighbour's
+// name does not.
+func TestAGrantedMCPToolPassesTheGateAndNoOtherDoes(t *testing.T) {
+	g, err := toolgrant.Policy{MCP: []toolgrant.MCPGrant{{Server: "fake", Tools: []string{"a"}}}}.CoreAgent("/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny},
+		[]coreagentwire.MCPServer{{Name: "fake", Tools: []string{"a"}}}, "/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := permissions.New(opts)
+	for tool, want := range map[string]bool{"fake_a": true, "fake_ab": false, "fake_b": false, "other_a": false} {
+		err := gate.CheckToolCallWithArgs(context.Background(), "mcp", tool, tool+"({})", map[string]any{})
+		if got := err == nil; got != want {
+			t.Errorf("gate on %s: allowed=%v (%v), want %v", tool, got, err, want)
+		}
+	}
+}
+
+// TestTheHarnessRechecksTheEnvelopesMCPNames: names that would collide with
+// a built-in, a skill tool, each other, or break the name grammar are
+// refused by the harness itself.
+func TestTheHarnessRechecksTheEnvelopesMCPNames(t *testing.T) {
+	for name, mcp := range map[string][]coreagentwire.MCPServer{
+		"meets a built-in":   {{Name: "read", Tools: []string{"file"}}},
+		"meets a skill tool": {{Name: "load", Tools: []string{"skill"}}},
+		"two meet":           {{Name: "a", Tools: []string{"b_c"}}, {Name: "a_b", Tools: []string{"c"}}},
+		"dashed":             {{Name: "a-b", Tools: []string{"c"}}},
+		"named twice":        {{Name: "a", Tools: []string{"x"}}, {Name: "a", Tools: []string{"y"}}},
+	} {
+		if _, _, _, err := policySetup(coreagentwire.Policy{}, mcp, "/scratch"); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+// TestNoRegisteredToolIsAStreamingTool: ADK runs a streaming tool without
+// any before-tool callback, so a worker registers none.
+func TestNoRegisteredToolIsAStreamingTool(t *testing.T) {
+	g, err := toolgrant.Policy{ReadFiles: true, WriteFiles: true, ShellPrefixes: []string{"kubectl"}}.CoreAgent("/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil, "/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := tools.Build(&config.Config{}, permissions.New(opts), "", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range reg.Tools {
+		if isStreamingTool(tl) {
+			t.Errorf("registered tool %s streams, past the before-tool callbacks", tl.Name())
+		}
+	}
+	// The check itself recognises a streaming tool.
+	st, err := functiontool.NewStreaming(functiontool.Config{Name: "streamer", Description: "s"},
+		func(adkagent.Context, map[string]any) iter.Seq2[string, error] {
+			return func(func(string, error) bool) {}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isStreamingTool(st) {
+		t.Fatal("isStreamingTool doesn't recognise ADK's streaming tool")
+	}
+}
+
+// isStreamingTool reports whether ADK would run tl through RunStream, the
+// path that skips every before-tool callback (ADK's StreamingFunctionTool).
+func isStreamingTool(tl adktool.Tool) bool {
+	_, ok := tl.(interface {
+		RunStream(adkagent.Context, any) iter.Seq2[string, error]
+	})
+	return ok
 }

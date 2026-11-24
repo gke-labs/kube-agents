@@ -44,9 +44,21 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 		}
 		permitted[name] = true
 	}
+	servers := map[string][]string{}
 	for _, s := range mcp {
-		for _, t := range s.Tools {
-			permitted[s.Name+"_"+t] = true
+		if _, dup := servers[s.Name]; dup {
+			return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("MCP server %q named twice", s.Name)
+		}
+		servers[s.Name] = s.Tools
+	}
+	// Checked again here, on what the envelope carries, so the plugin's set
+	// doesn't rest on the adapter having checked it.
+	if err := toolgrant.CheckMCPNames(servers); err != nil {
+		return tools.BuiltinTools{}, permissions.Options{}, nil, err
+	}
+	for server, ts := range servers {
+		for _, t := range ts {
+			permitted[server+"_"+t] = true
 		}
 	}
 	for _, t := range toolgrant.CoreAgentSkillTools {

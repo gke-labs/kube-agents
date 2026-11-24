@@ -5,13 +5,15 @@
 // server-side search is on.
 //
 // The grant is enforced at three layers, each fail-closed on its own:
-//   - registration: a tool the grant doesn't name is never registered, so
-//     the model is never told it exists (CoreAgentGrant.Builtins, MCP);
+//   - registration: a built-in or MCP tool the grant doesn't name is never
+//     registered, so the model is never told it exists (Builtins, MCP); a
+//     persona's three read-only skill tools are the one fixed addition;
 //   - the gate, in allow mode: a call no allow rule matches is refused, and
 //     deny rules win (CoreAgentGrant.Allow, Deny);
-//   - the before-tool check: every call is re-checked against the grant as
-//     it happens (CoreAgentGrant.Permits), so a tool that reaches the model
-//     by some other path is still refused.
+//   - the before-tool check: the harness's plugin re-checks every call
+//     against the grant's tools as it happens (plus the read-only skill
+//     tools), so a tool that reaches the model by some other path is still
+//     refused. Permits is the same check, for code outside the harness.
 //
 // The shell's boundary stays the sandbox, the credential broker and the
 // verb allowlist; the gate narrows it. core-agent auto-allows a bash prefix
@@ -41,10 +43,14 @@ type Policy struct {
 	// with optional subcommands ("kubectl", "gh pr list"). Empty: no shell.
 	ShellPrefixes []string
 	// Scripts are persona skill scripts the shell may run, each an
-	// absolute path to an executable (shebang, read-only) under a skill's
-	// directory, run directly, never through an interpreter word (which
-	// would also allow `python3 -c …`). Granting one registers the shell.
+	// absolute path under ScriptRoot, run directly, never through an
+	// interpreter word (which would also allow `python3 -c …`). Granting
+	// one registers the shell. That each is an executable in a skill's
+	// directory is the persona renderer's check (coreagent.ScriptPaths).
 	Scripts []string
+	// ScriptRoot is the directory every script must sit under (the
+	// persona's skills directory); required when Scripts is set.
+	ScriptRoot string
 	// MCP grants tools of named MCP servers.
 	MCP []MCPGrant
 }
@@ -72,7 +78,7 @@ const (
 )
 
 // coreAgentBuiltins classifies every core-agent built-in tool (pkg/tools
-// BuiltinToolNames, v3 @ 37bc9f7). The harness seam's test fails when
+// BuiltinToolNames, v3.2.0 as go.mod pins it). The harness seam's test fails when
 // core-agent has a built-in this table doesn't name, so a new tool is never
 // registered by default.
 var coreAgentBuiltins = map[string]coreAgentClass{
@@ -96,10 +102,14 @@ var coreAgentBuiltins = map[string]coreAgentClass{
 	"sciontool_status":  classNever,
 }
 
-// coreAgentSpawnTools are the background-agent tools core-agent registers
-// when its background manager is built. A worker never builds one, and no
-// MCP tool may take their names.
-var coreAgentSpawnTools = []string{"spawn_agent", "stop_agent"}
+// coreAgentModelTools are the tools core-agent itself may register beyond
+// the built-ins (background agents, remote agents, task completion, alerts,
+// memory, agent transfer). A worker registers none of them, and no MCP tool
+// may take their names.
+var coreAgentModelTools = []string{
+	"spawn_agent", "stop_agent", "spawn_remote_agent", "mark_task_done", "finish_task",
+	"return_result", "report_alert", "transfer_to_agent", "load_memory", "preload_memory",
+}
 
 // CoreAgentSkillTools are the tools a persona's skills toolset offers
 // (ADK's skilltoolset). They only read the persona's skills snapshot; a
@@ -136,19 +146,26 @@ type CoreAgentGrant struct {
 	Allow, Deny []string
 	// MCP maps a server to the tools it may expose (its tool allowlist).
 	MCP map[string][]string
-	// GeminiGoogleSearch turns on Gemini's server-side search. Its URL
-	// context and code execution stay off whatever the grant.
+	// GeminiGoogleSearch is whether the grant asks for Gemini's server-side
+	// search. Nothing turns it on yet: the harness's model has every Gemini
+	// built-in off, and the session grant refuses web search.
 	GeminiGoogleSearch bool
 }
 
 var (
 	shellPrefix = regexp.MustCompile(`^[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)*$`)
+	// unrestrictedShellWords run another command or arbitrary code from
+	// their arguments, so a prefix grant of one is an unrestricted shell
+	// (python* is matched by prefix as well).
+	unrestrictedShellWords = []string{".", "source", "sh", "bash", "zsh", "dash", "ksh", "fish", "env", "exec", "eval",
+		"command", "builtin", "nohup", "nice", "timeout", "xargs", "sudo", "su", "doas", "perl", "ruby", "node",
+		"php", "lua", "awk", "gawk", "busybox", "script", "watch", "time", "stdbuf", "setsid", "chroot"}
 	// scriptPath is an absolute path of plain segments: no spaces, quotes,
 	// globs or shell syntax.
 	scriptPath = regexp.MustCompile(`^(/[A-Za-z0-9._-]+)+$`)
 	// mcpName keeps server and tool names inside the characters a model
 	// function name allows, so core-agent's namespacing (<server>_<tool>)
-	// never has to rewrite one and two tools can't collide.
+	// never has to rewrite one; CheckMCPNames refuses collisions.
 	mcpName = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
 )
 
@@ -171,7 +188,10 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		case c == classShell && (len(p.ShellPrefixes) > 0 || len(p.Scripts) > 0):
 			g.Builtins = append(g.Builtins, name)
 		case c == classRead, c == classWrite, c == classShell:
-			// Not registered, and denied should it reach the gate anyway.
+			// Not registered. The deny is defence in depth for the write
+			// and shell classes; core-agent's read check consults only the
+			// path scope, so for reads registration and the scope are what
+			// hold.
 			g.Deny = append(g.Deny, name+":*")
 		}
 	}
@@ -184,14 +204,26 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		if !shellPrefix.MatchString(prefix) {
 			return CoreAgentGrant{}, fmt.Errorf("shell prefix %q is not a binary and its subcommands", prefix)
 		}
+		if first, _, _ := strings.Cut(prefix, " "); slices.Contains(unrestrictedShellWords, first) || strings.HasPrefix(first, "python") {
+			return CoreAgentGrant{}, fmt.Errorf("shell prefix %q runs anything: it is an unrestricted shell", prefix)
+		}
 		g.Allow = append(g.Allow, "bash:"+prefix, "bash:"+prefix+" *")
+	}
+	if len(p.Scripts) > 0 && (!scriptPath.MatchString(p.ScriptRoot) || path.Clean(p.ScriptRoot) != p.ScriptRoot) {
+		return CoreAgentGrant{}, fmt.Errorf("script root %q is not a clean absolute path", p.ScriptRoot)
 	}
 	for _, script := range p.Scripts {
 		if !scriptPath.MatchString(script) || path.Clean(script) != script {
 			return CoreAgentGrant{}, fmt.Errorf("script %q is not a clean absolute path", script)
 		}
+		if !strings.HasPrefix(script, p.ScriptRoot+"/") {
+			return CoreAgentGrant{}, fmt.Errorf("script %q is not under %s", script, p.ScriptRoot)
+		}
 		g.Allow = append(g.Allow, "bash:"+script, "bash:"+script+" *")
 	}
+	// The gate checks an MCP call as namespace "mcp" with the key
+	// "<server>_<tool>(<args>)": "mcp:<server>_<tool>(*" allows that tool
+	// and no other (the "(" keeps srv_a from matching srv_ab).
 	for _, m := range p.MCP {
 		if !mcpName.MatchString(m.Server) {
 			return CoreAgentGrant{}, fmt.Errorf("MCP server name %q", m.Server)
@@ -210,6 +242,9 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		tools := slices.Clone(m.Tools)
 		slices.Sort(tools)
 		g.MCP[m.Server] = slices.Compact(tools)
+		for _, t := range g.MCP[m.Server] {
+			g.Allow = append(g.Allow, "mcp:"+m.Server+"_"+t+"(*")
+		}
 	}
 	// core-agent registers an MCP tool as <server>_<tool> (its server part
 	// sanitized to [A-Za-z0-9_], which mcpName already guarantees, and the
@@ -218,26 +253,52 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 	// refused where two names meet, where one meets any core-agent built-in
 	// or spawn tool (granted or not: the gate's rules are keyed by name), or
 	// where one is longer than a model function name may be.
+	if err := CheckMCPNames(g.MCP); err != nil {
+		return CoreAgentGrant{}, err
+	}
+	return g, nil
+}
+
+// CheckMCPNames refuses a set of MCP grants, server to tools, whose names
+// core-agent would register ambiguously: a server or tool name outside
+// [A-Za-z0-9_]{1,64}, a <server>_<tool> name two grants share, one equal to
+// any name core-agent itself may register (its built-ins, skill tools and
+// model tools, granted or not: the gate's rules are keyed by name), or one
+// longer than a model function name may be. The harness runs it again on
+// what the envelope carries, so its before-tool check doesn't rest on the
+// adapter's.
+func CheckMCPNames(servers map[string][]string) error {
 	seen := map[string]bool{}
 	for _, b := range CoreAgentBuiltinNames() {
 		seen[b] = true
 	}
-	for _, s := range slices.Concat(coreAgentSpawnTools, CoreAgentSkillTools) {
+	for _, s := range slices.Concat(coreAgentModelTools, CoreAgentSkillTools) {
 		seen[s] = true
 	}
-	for server, tools := range g.MCP {
-		for _, t := range tools {
+	names := make([]string, 0, len(servers))
+	for server := range servers {
+		names = append(names, server)
+	}
+	slices.Sort(names)
+	for _, server := range names {
+		if !mcpName.MatchString(server) {
+			return fmt.Errorf("MCP server name %q", server)
+		}
+		for _, t := range servers[server] {
+			if !mcpName.MatchString(t) {
+				return fmt.Errorf("MCP server %q: tool name %q", server, t)
+			}
 			name := server + "_" + t
 			if seen[name] {
-				return CoreAgentGrant{}, fmt.Errorf("MCP tool name %q is ambiguous in this grant", name)
+				return fmt.Errorf("MCP tool name %q is ambiguous", name)
 			}
 			if len(name) > maxToolNameLen {
-				return CoreAgentGrant{}, fmt.Errorf("MCP tool name %q is longer than %d", name, maxToolNameLen)
+				return fmt.Errorf("MCP tool name %q is longer than %d", name, maxToolNameLen)
 			}
 			seen[name] = true
 		}
 	}
-	return g, nil
+	return nil
 }
 
 // Permits reports whether a call to the named tool is within the grant:

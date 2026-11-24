@@ -83,9 +83,11 @@ func sessionToolPolicy(allowed, disallowed string) (toolgrant.Policy, error) {
 	return p, nil
 }
 
-// splitTools is a tool list's entries, separated as the harness takes them
-// (allowsBash): by commas or whitespace, except inside a scoped entry's
-// parentheses, where a space belongs to the argument (Bash(gh pr list:*)).
+// splitTools is a tool list's entries, separated by commas or any
+// whitespace, except inside a scoped entry's parentheses, where a space
+// belongs to the argument (Bash(gh pr list:*)). allowsBash splits on commas
+// and spaces only, inside parentheses too; the lists this reads hold no
+// entry where the two differ.
 func splitTools(list string) []string {
 	var out []string
 	var cur strings.Builder

@@ -116,6 +116,7 @@ func TestAnAmbiguousMCPToolNameIsRefused(t *testing.T) {
 		"meets an ungranted built-in": {MCP: []MCPGrant{{Server: "fetch", Tools: []string{"url"}}}},
 		"meets a spawn tool":          {MCP: []MCPGrant{{Server: "spawn", Tools: []string{"agent"}}}},
 		"meets a skill tool":          {MCP: []MCPGrant{{Server: "load", Tools: []string{"skill"}}}},
+		"meets a model tool":          {MCP: []MCPGrant{{Server: "mark", Tools: []string{"task_done"}}}},
 	} {
 		if _, err := p.CoreAgent(ws); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 			t.Errorf("%s: err %v", name, err)
@@ -182,7 +183,7 @@ func TestOnlyGrantableBuiltinsAreRegistrable(t *testing.T) {
 // a path with spaces, globs, quotes or ".." is refused.
 func TestASkillScriptIsRunDirectlyByItsPath(t *testing.T) {
 	const script = "/var/lib/agent-persona/skills/stall/scripts/stall_report.py"
-	g, err := Policy{Scripts: []string{script}}.CoreAgent(ws)
+	g, err := Policy{Scripts: []string{script}, ScriptRoot: "/var/lib/agent-persona/skills"}.CoreAgent(ws)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,9 +193,48 @@ func TestASkillScriptIsRunDirectlyByItsPath(t *testing.T) {
 	if !slices.Equal(g.Allow, []string{"bash:" + script, "bash:" + script + " *"}) {
 		t.Errorf("allow %q", g.Allow)
 	}
-	for _, bad := range []string{"", "stall_report.py", "/a b/x.py", "/a/*.py", "/a/../b.py", "/a/./b.py", "/a/b.py/", "/a/'b'.py", "/a/$(x).py"} {
-		if _, err := (Policy{Scripts: []string{bad}}).CoreAgent(ws); err == nil {
+	for _, bad := range []string{"", "stall_report.py", "/a b/x.py", "/a/*.py", "/a/../b.py", "/a/./b.py", "/a/b.py/", "/a/'b'.py", "/a/$(x).py",
+		"/usr/bin/env", "/bin/sh", "/var/lib/agent-persona/skillsx/a.py", "/var/lib/agent-persona/skills"} {
+		if _, err := (Policy{Scripts: []string{bad}, ScriptRoot: "/var/lib/agent-persona/skills"}).CoreAgent(ws); err == nil {
 			t.Errorf("script %q accepted", bad)
 		}
+	}
+	for _, root := range []string{"", "skills", "/a/../b", "/a/"} {
+		if _, err := (Policy{Scripts: []string{"/a/b/x.py"}, ScriptRoot: root}).CoreAgent(ws); err == nil {
+			t.Errorf("script root %q accepted", root)
+		}
+	}
+}
+
+// TestAGrantedMCPToolHasItsGateRule: the gate checks an MCP call by the key
+// "<server>_<tool>(<args>)", so each granted tool gets "mcp:<name>(*" and
+// nothing broader.
+func TestAGrantedMCPToolHasItsGateRule(t *testing.T) {
+	g, err := Policy{MCP: []MCPGrant{{Server: "srv", Tools: []string{"query", "a"}}}}.CoreAgent(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"mcp:srv_query(*", "mcp:srv_a(*"} {
+		if !slices.Contains(g.Allow, want) {
+			t.Errorf("allow %q lacks %s", g.Allow, want)
+		}
+	}
+	for _, r := range g.Allow {
+		if r == "mcp:*" || r == "mcp:srv_*" {
+			t.Errorf("allow carries the broad rule %q", r)
+		}
+	}
+}
+
+// TestAnInterpreterIsNotAShellPrefix: a prefix that runs whatever its
+// arguments say is an unrestricted shell, refused like a bare Bash.
+func TestAnInterpreterIsNotAShellPrefix(t *testing.T) {
+	for _, bad := range []string{"env", "sh", "bash", "eval", "exec", ".", "xargs", "python3", "python", "perl", "node", "awk", "sudo", "env FOO", "timeout 5"} {
+		if _, err := (Policy{ShellPrefixes: []string{bad}}).CoreAgent(ws); err == nil || !strings.Contains(err.Error(), "unrestricted") {
+			t.Errorf("prefix %q: err %v", bad, err)
+		}
+	}
+	if _, err := (Policy{ShellPrefixes: []string{"kubectl", "gh pr list"}}).CoreAgent(ws); err != nil {
+		t.Errorf("ordinary prefixes refused: %v", err)
 	}
 }
