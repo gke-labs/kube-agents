@@ -91,6 +91,14 @@ var coreAgentBuiltins = map[string]coreAgentClass{
 	"sciontool_status":  classNever,
 }
 
+// coreAgentSpawnTools are the background-agent tools core-agent registers
+// when its background manager is built. A worker never builds one, and no
+// MCP tool may take their names.
+var coreAgentSpawnTools = []string{"spawn_agent", "stop_agent"}
+
+// maxToolNameLen is the longest function name Gemini accepts.
+const maxToolNameLen = 64
+
 // CoreAgentBuiltinNames is every built-in name the table classifies,
 // sorted.
 func CoreAgentBuiltinNames() []string {
@@ -171,18 +179,28 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		slices.Sort(tools)
 		g.MCP[m.Server] = slices.Compact(tools)
 	}
-	// core-agent names an MCP tool <server>_<tool>, and both may contain
-	// "_": server a / tool b_c and server a_b / tool c are both a_b_c. A
-	// grant where two names meet, or one meets a built-in, is refused.
+	// core-agent registers an MCP tool as <server>_<tool> (its server part
+	// sanitized to [A-Za-z0-9_], which mcpName already guarantees, and the
+	// tool part as the server names it), and both may contain "_": server
+	// a / tool b_c and server a_b / tool c are both a_b_c. A grant is
+	// refused where two names meet, where one meets any core-agent built-in
+	// or spawn tool (granted or not: the gate's rules are keyed by name), or
+	// where one is longer than a model function name may be.
 	seen := map[string]bool{}
-	for _, b := range g.Builtins {
+	for _, b := range CoreAgentBuiltinNames() {
 		seen[b] = true
+	}
+	for _, s := range coreAgentSpawnTools {
+		seen[s] = true
 	}
 	for server, tools := range g.MCP {
 		for _, t := range tools {
 			name := server + "_" + t
 			if seen[name] {
 				return CoreAgentGrant{}, fmt.Errorf("MCP tool name %q is ambiguous in this grant", name)
+			}
+			if len(name) > maxToolNameLen {
+				return CoreAgentGrant{}, fmt.Errorf("MCP tool name %q is longer than %d", name, maxToolNameLen)
 			}
 			seen[name] = true
 		}

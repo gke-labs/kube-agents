@@ -111,8 +111,10 @@ func TestPermitsIsTheGrantAndNothingElse(t *testing.T) {
 // can make two grants one name; such a grant is refused.
 func TestAnAmbiguousMCPToolNameIsRefused(t *testing.T) {
 	for name, p := range map[string]Policy{
-		"two servers meet": {MCP: []MCPGrant{{Server: "a", Tools: []string{"b_c"}}, {Server: "a_b", Tools: []string{"c"}}}},
-		"meets a built-in": {ReadFiles: true, MCP: []MCPGrant{{Server: "read", Tools: []string{"file"}}}},
+		"two servers meet":            {MCP: []MCPGrant{{Server: "a", Tools: []string{"b_c"}}, {Server: "a_b", Tools: []string{"c"}}}},
+		"meets a built-in":            {ReadFiles: true, MCP: []MCPGrant{{Server: "read", Tools: []string{"file"}}}},
+		"meets an ungranted built-in": {MCP: []MCPGrant{{Server: "fetch", Tools: []string{"url"}}}},
+		"meets a spawn tool":          {MCP: []MCPGrant{{Server: "spawn", Tools: []string{"agent"}}}},
 	} {
 		if _, err := p.CoreAgent(ws); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 			t.Errorf("%s: err %v", name, err)
@@ -143,6 +145,9 @@ func TestBadInputsAreRefused(t *testing.T) {
 		if _, err := (Policy{MCP: []MCPGrant{m}}).CoreAgent(ws); err == nil {
 			t.Errorf("%s accepted", name)
 		}
+	}
+	if _, err := (Policy{MCP: []MCPGrant{{Server: strings.Repeat("s", 40), Tools: []string{strings.Repeat("t", 30)}}}}).CoreAgent(ws); err == nil {
+		t.Error("an MCP tool name over 64 characters accepted")
 	}
 	if _, err := (Policy{MCP: []MCPGrant{{Server: "a", Tools: []string{"t"}}, {Server: "a", Tools: []string{"u"}}}}).CoreAgent(ws); err == nil {
 		t.Error("a server granted twice accepted")
