@@ -16017,9 +16017,6 @@ class TestWebhookCaBundleExpired(unittest.TestCase):
         self.assertEqual(collect._COMPLIANCE_CHECK_SOURCES["webhook-ca-bundle-expired"], ("webhooks",))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestOnlyCluster(unittest.TestCase):
     """`--cluster <location>/<name>` (#5623): one cluster of --project, the rest
@@ -16036,6 +16033,8 @@ class TestOnlyCluster(unittest.TestCase):
 
     def setUp(self):
         self.addCleanup(setattr, collect, "only_cluster", None)
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.calls = []
 
     def run_fake(self, argv, **kwargs):
@@ -16049,8 +16048,7 @@ class TestOnlyCluster(unittest.TestCase):
         return collect.Run(argv, 0, "", "", 0.01)
 
     def manifest(self, audit):
-        kubeconfigs = Path("/tmp/kc-golden")
-        kubeconfigs.mkdir(exist_ok=True)
+        kubeconfigs = Path(self.tmp.name)
         # The real paged read, which the platform job runs: this module swaps in
         # a shared double for its other tests (setUpModule).
         with patch.object(collect, "KUBECONFIG_DIR", kubeconfigs), patch.object(
@@ -16072,18 +16070,22 @@ class TestOnlyCluster(unittest.TestCase):
             with self.subTest(audit=audit):
                 self.assertEqual(self.manifest(audit), (self.GOLDEN / f"{audit}.json").read_text())
 
-    def test_the_flag_reads_only_its_cluster(self):
+    def test_the_flag_reads_only_its_cluster_and_records_the_others_as_not_read(self):
         collect.only_cluster = ("us-east1", "c2")
         clusters, not_running, error = collect.enumerate_clusters("acme", run=self.run_fake)
         self.assertEqual([c["target"] for c in clusters], ["acme/us-east1/c2"])
-        self.assertEqual((not_running, error), ([], None))
+        self.assertIsNone(error)
+        # c1 and c3 aren't read here, and the manifest says so: never a fix.
+        self.assertEqual(sorted(e["name"] for e in not_running), ["acme/us-central1/c1", "acme/us-west1/c3"])
+        self.assertTrue(all(e["outcome"] == collect.OUTCOME_UNREACHABLE for e in not_running))
+        self.assertTrue(any("--cluster" in e["error"] for e in not_running))
 
     def test_a_cluster_the_project_doesnt_list_is_refused_and_nothing_is_read(self):
         for wanted in (("us-east1", "nope"), ("europe-west1", "c2")):
             with self.subTest(wanted=wanted):
                 collect.only_cluster = wanted
                 self.calls.clear()
-                with patch.object(collect, "KUBECONFIG_DIR", Path("/tmp/kc-golden")):
+                with patch.object(collect, "KUBECONFIG_DIR", Path(self.tmp.name)):
                     m = collect.collect_fleet("compliance-audit", "acme", run=self.run_fake, max_workers=1)
                 self.assertIn("--cluster", m.get("error") or "")
                 self.assertFalse(any("get-credentials" in c or c[:2] == ["kubectl", "get"] for c in self.calls), self.calls)
@@ -16105,3 +16107,8 @@ class TestOnlyCluster(unittest.TestCase):
         self.assertEqual(collect.cluster_arg("us-east1/c2"), ("us-east1", "c2"))
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
             collect.main(["compliance-audit", "--cluster", "us-east1/c2"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

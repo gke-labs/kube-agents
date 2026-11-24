@@ -41,7 +41,10 @@ What this file does for the checks it covers:
      refuses and names the tool. Then enumerates each project's clusters
      (`gcloud container clusters list`), naming every cluster
      `<project>/<location>/<name>` because a bare name is unique only inside
-     one project and location.
+     one project and location. With `--cluster <location>/<name>` (and
+     `--project`), only that cluster is read: the project's others are
+     recorded as not read here, and a cluster the listing doesn't return is
+     refused with nothing read (#5623: one fan-out child per cluster).
   2. Fetches per-cluster credentials into an isolated kubeconfig — the same
      path convention every SOP already uses (`AGENTS.md`, "Cluster
      Credentials") — then runs the stream's context builder: one workload dump
@@ -867,6 +870,19 @@ def not_running_entry(c: dict, project: str) -> dict:
     }
 
 
+def only_cluster_unread_entry(c: dict, project: str) -> dict:
+    """A manifest target for a cluster of --project that --cluster left unread.
+
+    Not `collected`, so `finish` treats it as a coverage gap, as for any
+    cluster this run couldn't read: a run that read one cluster says nothing
+    about the others, and a finding on one must not read as resolved.
+    """
+    return {
+        **not_running_entry(c, project),
+        "error": f"--cluster names another cluster of {project}; this run read only that one, and no check was evaluated here",
+    }
+
+
 def target_name(project: str, location: str, name: str) -> str:
     """What the manifest calls a cluster: `<project>/<location>/<name>`.
 
@@ -1019,12 +1035,15 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
     if not isinstance(clusters, list):
         return [], [], "clusters list returned JSON that is not a list"
     clusters = declared_scope.drop_excluded(project, clusters)
+    others: list[dict] = []
     if only_cluster is not None:
         location, name = only_cluster
-        clusters = [
-            c for c in clusters
-            if isinstance(c, dict) and c.get("name") == name and (c.get("location") or c.get("zone") or "") == location
-        ]
+
+        def named(c) -> bool:
+            return isinstance(c, dict) and c.get("name") == name and (c.get("location") or c.get("zone") or "") == location
+
+        others = [c for c in clusters if isinstance(c, dict) and not named(c)]
+        clusters = [c for c in clusters if named(c)]
         if not clusters:
             # Refused, not widened: a cluster the listing doesn't return (or the
             # scope excludes) reads nothing at all.
@@ -1047,6 +1066,10 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
             }
         )
     not_running = [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
+    # The project's other clusters, which --cluster left unread: recorded, not
+    # dropped, so `finish` places them as not audited by this run and never
+    # resolves a finding on one as fixed (each is another task's to read).
+    not_running += [only_cluster_unread_entry(c, project) for c in others]
     incomplete = [line.strip() for line in result.stderr.splitlines() if ZONE_TIMEOUT_MARKER in line]
     if incomplete:
         detail = " ".join(incomplete)[:ERROR_EXCERPT_CHARS]

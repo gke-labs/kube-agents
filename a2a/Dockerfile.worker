@@ -166,7 +166,8 @@ COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
      agents/platform/scripts/broker_admission.py \
      /opt/kube-agents/scripts/fleet-audit/
 # The compliance audit's collector (collect.py and its closure, #5623): each
-# fan-out child runs it for its own project, read-only, on its confined
+# fan-out child runs it for its one cluster (--project with --cluster),
+# read-only, on its confined
 # credential, so the canary is collected the way the platform job collects.
 # Its webhook check imports the fleet-upgrade-verification readiness modules
 # from parents[2]/fleet-upgrade-verification/scripts, relative to collect.py,
@@ -177,8 +178,8 @@ COPY --chmod=0644 agents/platform/skills/fleet-upgrade-verification/scripts/upgr
      agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json \
      /opt/kube-agents/fleet-upgrade-verification/scripts/
 # A directory copy takes no --chmod (it would set the directories' mode too,
-# and a 0644 directory can't be entered); the RUN gives it files 0644 and
-# directories 0755, and the last check imports it as the worker's own user.
+# and a 0644 directory can't be entered); the RUN makes it readable by all
+# and enterable (directories 0755), writable by root alone, and the last check imports it as the worker's own user.
 COPY agents/platform/skills/fleet-upgrade-verification/scripts/readiness_rules/ \
      /opt/kube-agents/fleet-upgrade-verification/scripts/readiness_rules/
 RUN chmod -R u=rwX,go=rX /opt/kube-agents/fleet-upgrade-verification \
