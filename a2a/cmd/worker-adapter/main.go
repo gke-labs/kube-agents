@@ -468,6 +468,7 @@ func harnessCommand() []string {
 		prompts:    prompts,
 		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
 		turnBudget: harnessTurnBudget(),
+		workdir:    envOrDefault("A2A_WORKDIR", defaultWorkdir),
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
@@ -507,6 +508,7 @@ func profileHarnessCommand() []string {
 		maxTurns:   maxTurns,
 		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
 		turnBudget: harnessTurnBudget(),
+		workdir:    envOrDefault("A2A_WORKDIR", defaultWorkdir),
 	})
 }
 
@@ -728,6 +730,16 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	builder, err := builderFor(driver.Harness())
 	if err != nil {
 		return "", nil, nil, err
+	}
+	// agy's grant comes from the same allowlist, and an override is the one
+	// input that can name a tool agy has no grant for (agyPolicy). Refused
+	// at startup rather than rendered as nothing granted.
+	if driver.Harness() == persona.Antigravity {
+		if override := getenv("A2A_ALLOWED_TOOLS"); override != "" {
+			if _, err := agyPolicy(override, ""); err != nil {
+				return "", nil, nil, fmt.Errorf("A2A_ALLOWED_TOOLS for harness %q: %w", driver.Harness(), err)
+			}
+		}
 	}
 	// A harness with no default path in the image needs one named, unless a
 	// test replaces the whole argv. Refused here, at startup, rather than at

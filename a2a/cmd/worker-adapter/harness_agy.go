@@ -1,7 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"slices"
+	"strings"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/persona/antigravity"
 )
 
 // agyBuilder is the Antigravity CLI's (`agy`) argv and env: the binary
@@ -9,8 +14,11 @@ import (
 //
 // What it leaves to the other #6707 sub-issues, rather than inventing a
 // mapping here:
-//   - the tool allowlist and denylist, the delegate server and the system
-//     prompts (harnessSpec.tools and what goes with it): #6711 and #6712;
+//   - the delegate server and the system prompts: #6712. The tool grant is
+//     here (#6711): agyPolicy reads the same Claude Code allowlist a session
+//     pod's harnessCommand builds, and the builder renders it as agy's
+//     --settings permissions. The model proxy (#6714) enforces the offered
+//     tools; these rules are defence in depth;
 //   - the model and the gateway (AGY_LLM_GATEWAY_*): #6714. The pod's
 //     values reach agy unchanged, and the builder adds none;
 //   - HOME: a session pod's agy uses the pod's own HOME, shared by every
@@ -38,6 +46,9 @@ const (
 	// plus the floor (120s), as in tests with a short deadline, gets 60s,
 	// and there the adapter's own deadline may end the turn first.
 	agyMinPrintTimeout = 60 * time.Second
+	// agySettingsFlag carries the grant's permission rules, for this run
+	// only (agy never saves them).
+	agySettingsFlag = "--settings"
 )
 
 func (agyBuilder) defaultPath() string { return "" }
@@ -51,8 +62,77 @@ func (agyBuilder) command(spec harnessSpec) []string {
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		agyPrintTimeoutFlag, agyPrintTimeout(spec.turnBudget).String(),
+		agySettingsFlag, agyGrant(spec).Settings(),
 	}
 	return append(argv, spec.extra...)
+}
+
+// agyGrant is spec's tool grant as agy's. A grant that doesn't map renders
+// as nothing granted: selectHarness has already refused the one input that
+// can carry an unknown name (A2A_ALLOWED_TOOLS), so this is the fail-closed
+// floor, not a path a pod takes.
+func agyGrant(spec harnessSpec) antigravity.Grant {
+	workdir := spec.workdir
+	if workdir == "" {
+		workdir = defaultWorkdir
+	}
+	var p antigravity.Policy
+	if spec.tools {
+		var err error
+		if p, err = agyPolicy(spec.allowed, spec.disallowed); err != nil {
+			p = antigravity.Policy{}
+		}
+	}
+	g, err := p.Render(workdir)
+	if err != nil {
+		g, _ = antigravity.Policy{}.Render(defaultWorkdir)
+	}
+	return g
+}
+
+// agyPolicy reads a Claude Code --allowedTools/--disallowedTools pair as a
+// harness-neutral grant. A name the disallowed list carries grants nothing,
+// as in Claude Code. TodoWrite has no agy equivalent and is dropped (agy's
+// manage_task tracks background commands, not a to-do list); the delegate
+// tool is dropped until #6712 gives agy its MCP server. Anything else this
+// doesn't know, and an unrestricted Bash, is an error: no guess at a grant.
+func agyPolicy(allowed, disallowed string) (antigravity.Policy, error) {
+	deny := splitTools(disallowed)
+	var p antigravity.Policy
+	for _, t := range splitTools(allowed) {
+		base, arg, scoped := strings.Cut(t, "(")
+		if slices.Contains(deny, base) {
+			continue
+		}
+		switch {
+		case !scoped && slices.Contains([]string{"Read", "Glob", "Grep", "LS"}, t):
+			p.ReadFiles = true
+		case t == "Write":
+			p.WriteFiles = true
+		case t == "WebSearch":
+			p.WebSearch = true
+		case t == "TodoWrite", t == delegateToolID:
+		case base == "Bash" && scoped && strings.HasSuffix(arg, ":*)"):
+			p.ShellPrefixes = append(p.ShellPrefixes, strings.TrimSuffix(arg, ":*)"))
+		case t == "Bash":
+			return antigravity.Policy{}, fmt.Errorf("an unrestricted Bash has no agy grant yet")
+		default:
+			return antigravity.Policy{}, fmt.Errorf("tool %q has no agy grant", t)
+		}
+	}
+	return p, nil
+}
+
+// splitTools is a comma-separated tool list's entries, trimmed, empties
+// dropped.
+func splitTools(list string) []string {
+	var out []string
+	for _, t := range strings.Split(list, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // agyPrintTimeout is the turn budget less agyPrintTimeoutMargin, and never

@@ -31,6 +31,10 @@ type harnessSpec struct {
 	// must come from the time left on the task deadline, not this budget
 	// fixed once at startup.
 	turnBudget time.Duration
+	// workdir is the harness's working directory, A2A_WORKDIR or
+	// defaultWorkdir: a harness that scopes file rules to its workspace
+	// names it (agyBuilder).
+	workdir string
 }
 
 // delegateServer is the delegate tool's MCP server: this binary run as
