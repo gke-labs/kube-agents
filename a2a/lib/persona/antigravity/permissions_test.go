@@ -45,7 +45,7 @@ func TestEachGrantMapsToItsToolsAndRules(t *testing.T) {
 // ask_question (which can't be answered headless).
 func TestNoGrantOffersAnUngatedTool(t *testing.T) {
 	never := []string{ToolDefineSubagent, ToolInvokeSubagent, ToolManageSubagents, ToolSchedule, ToolSwarm,
-		ToolSendMessage, ToolManageTask, ToolRunWorkflow, ToolEditFile, ToolAskQuestion}
+		ToolSendMessage, ToolManageTask, ToolRunWorkflow, ToolEditFile, ToolAskQuestion, ToolGenerateImage}
 	all := Policy{ReadFiles: true, WriteFiles: true, WebSearch: true, ShellPrefixes: []string{"kubectl"}}
 	g, err := all.Render(ws)
 	if err != nil {

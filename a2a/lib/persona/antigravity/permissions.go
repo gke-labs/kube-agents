@@ -29,10 +29,12 @@ import (
 	"strings"
 )
 
-// The tools agy 1.5.13 offers its model. A model request naming any other
-// tool means agy changed under us, and the proxy refuses it.
+// The tools agy 1.5.13 offers its model: these 14 in every main-agent
+// request (in each --mode too), and in a subagent's own requests 12 of them
+// plus generate_image. A model request naming any other tool means agy
+// changed under us, and the proxy refuses it.
 var KnownTools = []string{
-	ToolAskQuestion, ToolDefineSubagent, ToolEditFile, ToolInvokeSubagent,
+	ToolAskQuestion, ToolDefineSubagent, ToolEditFile, ToolGenerateImage, ToolInvokeSubagent,
 	ToolManageSubagents, ToolManageTask, ToolReadFile, ToolRunCommand,
 	ToolRunWorkflow, ToolSchedule, ToolSearchWeb, ToolSendMessage, ToolSwarm,
 	ToolWriteFile,
@@ -42,6 +44,7 @@ const (
 	ToolAskQuestion     = "ask_question"
 	ToolDefineSubagent  = "define_subagent"
 	ToolEditFile        = "edit_file"
+	ToolGenerateImage   = "generate_image"
 	ToolInvokeSubagent  = "invoke_subagent"
 	ToolManageSubagents = "manage_subagents"
 	ToolManageTask      = "manage_task"
@@ -82,6 +85,12 @@ type Grant struct {
 
 // shellPrefix is a binary with optional subcommands: words of letters,
 // digits, dot, dash and underscore. No path, glob, quote or shell syntax.
+//
+// agy 1.5.13 matches `command(<prefix>)` by whole words, not as a string
+// prefix: `command(touch /a)` doesn't allow `touch /ab`. It refuses a
+// compound command (`;`, `&&`, a pipe, `$(…)`) even when its first word is
+// allowed (probes P2-P4, P10). Even so, the rule only narrows: the shell's
+// boundary is the sandbox, the credential broker and the verb allowlist.
 var shellPrefix = regexp.MustCompile(`^[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)*$`)
 
 // ruleGrammar is the rule shape agy documents. Anything else agy ignores
