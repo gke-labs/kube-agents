@@ -724,6 +724,10 @@ type PlatformAgentReconciler struct {
 	// the compiled-in tiers, rather than listing a kind whose informer would
 	// never sync and stall every next-mode reconcile.
 	tiersUnreadable bool
+	// schedulesUnreadable is set when the AgentSchedule CRD is missing or the
+	// role can't read schedules (SetupWithManager): the built-in renderer
+	// then does nothing, rather than fail every pass.
+	schedulesUnreadable bool
 
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
@@ -742,6 +746,10 @@ type PlatformAgentReconciler struct {
 	// in the namespaced Role (the Event lands in the agent's namespace),
 	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
+	// BuiltinSchedules, when set, replaces the built-in schedule table the
+	// reconciler renders (builtinSchedules), whatever A2A_AGENT_SCHEDULES
+	// says. Tests set it.
+	BuiltinSchedules func(*agentv1alpha1.PlatformAgent) []builtinSchedule
 
 	// busConfigLoadTime stands in for reading a bus server's config_load_time
 	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
@@ -810,6 +818,17 @@ type PlatformAgentReconciler struct {
 	// calloutStatus reads an auth callout pod's /status for the
 	// A2AIdentityMapApplied condition (#4487); nil is the HTTP reader.
 	calloutStatus calloutStatusReader
+
+	// inferenceKeyProbe asks an inference gateway pod what it answers to a
+	// caller key, for the InferenceKeysServed condition (inference_keys.go);
+	// nil is the HTTP prober. inferenceKeysServedFor holds, per agent, the
+	// map and pods the last Served verdict probed, so a pass with nothing
+	// new sends no probe.
+	inferenceKeyProbe      inferenceKeyProber
+	inferenceKeysServedFor sync.Map
+	// inferenceKeysCRD caches whether the served PlatformAgent CRD has
+	// status.inferenceKeys, per CRD resourceVersion.
+	inferenceKeysCRD inferenceKeysCRDCache
 
 	// UniverseDomainDetector probes the GKE metadata server for the host
 	// cluster's Google Cloud API universe domain; nil in offline unit and
@@ -989,7 +1008,9 @@ type PlatformAgentReconciler struct {
 // `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
 // confers none of its permissions on the operator itself.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
-// Escalation prevention: buildMinimalPlatformRole grants CRD reads to the agent.
+// Escalation prevention: buildMinimalPlatformRole grants CRD reads to the agent. The operator
+// also reads the PlatformAgent CRD itself, by name and uncached, to check its schema has
+// status.inferenceKeys before writing any inference gateway key (servedCRDHasInferenceKeys).
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // The GitOps reconcilers' objects, read-only, for the same escalation-prevention reason
 // as `nodes` above: buildMinimalPlatformRole grants them to the agent, so the operator
@@ -1018,16 +1039,20 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 //
 // Secrets, write, namespaced. The operator writes a Secret only in the namespace of the
-// PlatformAgent it reconciles (every call site builds its key from agent.Namespace), so the
-// write verbs are a Role in the install namespace: `namespace=` makes controller-gen render a
-// Role beside the ClusterRole in role.yaml, the kustomize overlay rewrites the literal to the
-// deployed namespace, and the chart renders the same rules as a Role in the release namespace
-// and in the profile namespace. A PlatformAgent in any other namespace needs that Role and a
-// RoleBinding there. The writers:
+// PlatformAgent it reconciles and in that namespace's profile namespace (every call site
+// builds its key from agent.Namespace or profileNamespaceName(agent)), so the write verbs are
+// a Role: `namespace=` makes controller-gen render a Role beside the ClusterRole in role.yaml,
+// the kustomize overlay rewrites the literal to the deployed namespace and config/profiles
+// carries the copy for the profile namespace, and the chart renders the same rules as a Role
+// in the release namespace and in the profile namespace. A PlatformAgent in any other
+// namespace needs that Role and a RoleBinding there. The writers:
 // ensureKubeProxyTLSSecret creates and renews the kube-proxy TLS Secret on every install; the
 // mode-next A2A stack creates, repairs, patches and deletes the NATS credentials, config, TLS,
-// callout-key, inject-token, door-token and MCP-access Secrets it generates. Because the Role
-// grants the four verbs in one namespace, the operator can write a Secret nowhere else.
+// callout-key, inject-token, door-token and MCP-access Secrets it generates; and
+// reconcileInferenceKeys creates and repairs the inference gateway caller-key Secrets and their
+// map in the install namespace, and creates, repairs and deletes the profile tiers' key Secrets
+// in the profile namespace. Because the Role is bound in those two namespaces alone, the
+// operator can write a Secret nowhere else.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;update;patch;delete,namespace=kubeagents-system
 
 // isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
@@ -1138,6 +1163,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.handleDeletion(ctx, instance)
 	}
 
+	// 1a. spec.hold, for kube-proxy and the broker, before any step that can
+	// fail or park the reconcile: an operator's kill switch must not wait on an
+	// unrelated fault. In no pod-template hash: both re-read the mounted file,
+	// so a hold rolls nothing.
+	if err := r.reconcileHoldConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 1b. Move a stored spec.mode "today" to "next" (mode_migration.go). The
 	// render below does not read the field; this keeps the object truthful.
 	if migrated, err := r.migrateRetiredMode(ctx, instance); err != nil || migrated {
@@ -1185,7 +1218,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// the dispatcher step's verdict (syncDispatcherJobMode). A pass that did
 	// not reach it leaves it as it was.
 	busCredsMapVersion := ""
-	var dispatcherJobMode, dispatcherCeiling *metav1.Condition
+	var dispatcherJobMode, dispatcherCeiling, inferenceKeysServed *metav1.Condition
 	exitWrite := func(condition string, err error) {
 		if err == nil {
 			return
@@ -1207,6 +1240,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	defer func() {
 		exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, true, busCredsMapVersion))
 		exitWrite(dispatcherCeilingCondition, r.syncDispatcherCeiling(ctx, instance, dispatcherCeiling))
+		exitWrite(inferenceKeysServedCondition, r.syncInferenceKeysServed(ctx, instance, inferenceKeysServed))
 		// Last, so it outlives every status writer of its pass
 		// (TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass).
 		exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
@@ -1500,6 +1534,23 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// agent container's A2A_DEFAULT_ADDRESSEE reads it, as the gateway's
 	// does in the A2A stack below, so both render from the one reading.
 	r.resolveA2ASessionCap(ctx, renderAgent, instance)
+	// 12a. The inference gateway's caller keys and their map, and whether
+	// every gateway pod has loaded the map yet (inference_keys.go), before the
+	// workloads that will carry the keys. It never fails the pass; the
+	// condition is written on the way out (2d).
+	inferenceKeys := r.reconcileInferenceKeys(ctx, renderAgent)
+	inferenceKeysServed = inferenceKeys.condition
+	// A gateway pod that hasn't admitted a caller key yet: the kubelet's
+	// refresh of the mounted map moves nothing the operator watches, so
+	// every return from here looks again by then, as for a bus migration.
+	defer func() {
+		if retErr != nil || result.Requeue {
+			return
+		}
+		if d := inferenceKeys.requeue; d > 0 && (result.RequeueAfter == 0 || result.RequeueAfter > d) {
+			result.RequeueAfter = d
+		}
+	}()
 	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1666,6 +1717,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.profileHoldRequeue > 0 {
 			requeue = min(requeue, a2aState.profileHoldRequeue)
 		}
+		// And the built-in schedule renderer's next look (a replaced
+		// schedule's deletion, a write that raced), which nothing watched
+		// marks.
+		if a2aState.builtinSchedulesRequeue > 0 {
+			requeue = min(requeue, a2aState.builtinSchedulesRequeue)
+		}
 		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
@@ -1690,6 +1747,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// And a profile held for the bus's config (a2aDispatchableProfiles).
 		if a2aState.profileHoldRequeue > 0 {
 			requeue = min(requeue, a2aState.profileHoldRequeue)
+		}
+		// And the built-in schedule renderer's next look (a replaced
+		// schedule's deletion, a write that raced), which nothing watched
+		// marks.
+		if a2aState.builtinSchedulesRequeue > 0 {
+			requeue = min(requeue, a2aState.builtinSchedulesRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1745,6 +1808,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that turns ScopeResolved False have to be asked for.
 	if a2aState.scopeRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.scopeRequeue)
+	}
+	// A replaced built-in schedule whose deletion is still in flight: the
+	// pass that creates the built-in is asked for.
+	if a2aState.builtinSchedulesRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.builtinSchedulesRequeue)
 	}
 	// A deleted gateway Lease whose recreate is being held back: nothing
 	// else wakes the pass that creates it.
@@ -1870,6 +1938,10 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
 			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
+		// The profile tiers' inference gateway keys there go too: nothing
+		// else reclaims them. The ones in the agent's namespace go with
+		// their owner reference.
+		r.removeInferenceKeysOnDeletion(ctx, agent)
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
 		// is absent or terminating. litellm-policy is owned by Deployment/litellm (via OwnerReference)
@@ -4939,6 +5011,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		a2aBusMetaConditionCurrent(agent, a2a.busMeta) &&
 		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
+		builtinSchedulesConditionCurrent(agent, a2a.builtinSchedulesCondition) &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
@@ -4957,6 +5030,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			a2aBusMetaConditionCurrent(live, a2a.busMeta) &&
 			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
+			builtinSchedulesConditionCurrent(live, a2a.builtinSchedulesCondition) &&
 			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas) &&
 			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
@@ -4977,6 +5051,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setBuiltinSchedulesCondition(agent, a2a.builtinSchedulesCondition, now)
 	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
 	writtenBusReplicas, wroteBusMigration := agent.Status.BusReplicas, agent.Status.BusMigration != nil
 	if err := r.Status().Update(ctx, agent); err != nil {
@@ -5463,6 +5538,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aBusMetaUnchanged := a2aBusMetaConditionCurrent(agent, a2a.busMeta)
 	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
+	builtinSchedulesUnchanged := builtinSchedulesConditionCurrent(agent, a2a.builtinSchedulesCondition)
 	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
 	gatewayElectedUnchanged := gatewayElectedConditionCurrent(agent, gatewayElected)
 
@@ -5550,7 +5626,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged && profileSupervisorFormUnchanged &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && a2aBusMetaUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && a2aBusMetaUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged && builtinSchedulesUnchanged &&
 		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
@@ -5644,6 +5720,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setBuiltinSchedulesCondition(agent, a2a.builtinSchedulesCondition, now)
 	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	setExternalModelEgressCondition(agent, externalEgressMsg, now)
@@ -7025,6 +7102,29 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				// creates and deletes change the file.
 				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			)
+		}
+	}
+
+	// The built-in AgentSchedules (reconcileBuiltinSchedules), so an edit to
+	// one, or its deletion, is put back. Spec and deletion only: a schedule's
+	// status moves at every slot, and the PlatformAgent pass needn't follow
+	// it. Registered only when the CRD is installed and the role reads
+	// schedules: an operator image ahead of its CRD or ClusterRole would
+	// otherwise never sync the informer, and the manager would stop. Without
+	// it the renderer does nothing (schedulesUnreadable).
+	scheduleGVK := agentv1alpha1.GroupVersion.WithKind("AgentSchedule")
+	if denied := AgentScheduleAccessDenied(r.RBAC); len(denied) > 0 {
+		r.schedulesUnreadable = true
+		logf.Log.WithName("platformagent-controller").Info(
+			"The operator's role cannot read AgentSchedules; rendering no built-in schedules. Restart the operator after applying the current ClusterRole.",
+			"denied", denied)
+	} else if mgr != nil && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(scheduleGVK.GroupKind(), scheduleGVK.Version); err == nil {
+			bld = bld.Owns(&agentv1alpha1.AgentSchedule{}, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+		} else {
+			r.schedulesUnreadable = true
+			logf.Log.WithName("platformagent-controller").Info(
+				"The AgentSchedule CRD isn't installed; rendering no built-in schedules. Restart the operator after applying the chart's CRDs.")
 		}
 	}
 

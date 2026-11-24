@@ -384,6 +384,16 @@ litellm:
   # same name here. envFrom does not roll the pods on a Secret change:
   # `kubectl rollout restart deployment/litellm` after rotating it.
   envFromSecret: ""
+  masterKey:
+    # The gateway's admin key, in the litellm-master-key Secret (key
+    # LITELLM_MASTER_KEY). true: the chart generates it on first install and
+    # keeps it across upgrades with lookup. false: the chart renders no Secret
+    # and reads litellm-master-key only if you created it; without it the
+    # gateway runs with no admin key, and the caller-auth hook still checks
+    # every caller. Set false where the chart is rendered offline (Argo CD and
+    # other helm template pipelines), where lookup finds nothing and a
+    # generated key would change on every render.
+    generate: true
   # Empty selects the per-provider default (mirrors common.sh).
   # A Claude model (anthropic, vertex_ai with a claude-* name, or sap with an
   # anthropic--* name) gets
@@ -1906,6 +1916,9 @@ platformAgent:
   # The credential broker and kube-proxy refuse every route to an excluded
   # cluster's Kubernetes API; the project's cluster list and a cluster's
   # describe stay readable. Spell the project by its ID.
+  # spec.hold, an operator's pause on clusters, is not a chart value: set it on
+  # the PlatformAgent with kubectl patch; the chart never renders it, so an
+  # upgrade leaves it in place.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
@@ -2119,6 +2132,17 @@ platformAgent:
       homeChannel: ""
       # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
       adaptiveCards: true
+      # The receiver for the messages Microsoft delivers to the bot. Off, the
+      # bot can post to Teams but a message typed in Teams does not reach the
+      # agent: Bot Framework delivers by an HTTPS request to the address
+      # registered for the bot, and nothing in the install listens for it. On,
+      # the operator runs a small pod that verifies Microsoft's signed token on
+      # each request, pins tenantId (required), and hands the message to the
+      # broker's Teams queue; expose its Service (<agent>-teams-inbound, port
+      # 8100, path /api/v1/teams/events) with your own Ingress and TLS
+      # certificate and register that address as the bot's messaging endpoint.
+      inbound:
+        enabled: false
 
 # AgentPlugins deployed into the cluster.
 plugins:

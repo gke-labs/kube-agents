@@ -175,16 +175,18 @@ the point at which authority is established rather than passed on.
 ## 5. Shared services detail
 
 - **Inference (C5):** LiteLLM proxy for hosted models (Gemini/OpenAI), vLLM for local GPU models;
-  exposes a unified Completions API; **per-tier/per-tenant virtual keys** provide budget, rate-limit,
-  and log isolation on the shared proxy; Prometheus metrics + OTel traces exported.
+  exposes a unified Completions API; each **caller class** authenticates with its own key, checked by
+  a gateway auth hook against a map of key digests ([03](03-security-model.md) §10), which attributes
+  spend and tokens per class; per-tenant budgets need LiteLLM virtual keys and a database, a later
+  decision; Prometheus metrics + OTel traces exported.
 - **Minty (C6):** the _only_ credential path for repo writes; issues short-lived GitHub App tokens
   via KMS + Workload Identity. No static git creds anywhere.
 - **Cross-cluster connectivity (spoke → hub):** spokes consume the hub's Inference (C5) and Minty (C6)
   **remotely**. v1 exposes each as a **VPC-internal endpoint** (an internal LoadBalancer / private
   `Service` on the shared VPC — never public); spoke agents reach them over private networking, and each
   spoke's default-deny egress NetworkPolicy ([03](03-security-model.md) §10) allowlists exactly those two
-  hub endpoints (alongside cloud APIs, GitHub-via-Minty, and MCP grounding). Authn is the **LiteLLM
-  per-tier/per-tenant virtual key** for inference and **Workload Identity** for Minty — **no
+  hub endpoints (alongside cloud APIs, GitHub-via-Minty, and MCP grounding). Authn is the **caller
+  class's gateway key** for inference and **Workload Identity** for Minty — **no
   cross-cluster Kubernetes credentials** (§7).
 - **mem0/Qdrant (C10) — deferred post-v1:** cross-tier `mem0/Qdrant` recall is **not in v1** ([02](02-agent-personas.md)
   §2.3; [`docs/designs/memory.md`](../designs/memory.md) proposes single-install Hindsight indexing into `kube-agents-decisions`). If a cross-tier vector store is introduced later, default to a single shared hub store with **server-side** scope

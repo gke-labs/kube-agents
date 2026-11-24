@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _shell_argvs_and_unread, _shell_argvs_first_read, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2605,6 +2605,35 @@ _SHELL_READ_LIMIT_REASON = (
 )
 #: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
 _UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
+#: A worker command with a part that the shell reader refuses (quotes that do not balance, a
+#: redirect with no target, a substitution that does not close) has no argvs for that part and
+#: what follows it (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). The reader
+#: cannot tell if bash refuses the part too. When the part holds the words of a run that decides
+#: a check (:func:`_refused_part_can_hold`), the check cannot be evaluated: not a pass and not
+#: a fail.
+_SHELL_UNREAD_PART_REASON = (
+    "the shell reader refuses a part of worker command {shown!r} (quotes that do not balance, a "
+    "redirect with no target, or a substitution that does not close), and that part holds the "
+    "words of a run of {script}, so its runs cannot be read and this check could not be evaluated"
+)
+#: The shell's escape character, and a line continuation: bash removes the pair before it reads
+#: a word.
+_SHELL_QUOTING_ESCAPE = "\\"
+_SHELL_LINE_CONTINUATION = "\\\n"
+#: The characters a shell word loses when its quotes come off: the words of a part that was not
+#: read are looked for with these removed.
+_SHELL_QUOTING_CHARS_OFF = str.maketrans("", "", "'\"\\")
+#: What splits the text of a refused part into words: blanks, and the characters of the shell's
+#: operators and substitutions.
+_SHELL_BARE_WORD_SPLIT_RE = re.compile(r"[\s;&|()<>`]+")
+#: What joins the parts of one line that the reader refuses, for the search of a run's words.
+_SHELL_PARTS_JOIN = "\n"
+#: The interpreter flag that runs a module by its stem (``python3 -m <stem>``).
+_INTERPRETER_MODULE_FLAG = "-m"
+#: What parts a script's stem from its suffix.
+_SCRIPT_SUFFIX_SEPARATOR = "."
+#: The quotes that the pod's clip can leave open in a command that it cut, in the order tried.
+_CUT_COMMAND_QUOTES = ('"', "'")
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2665,18 +2694,85 @@ class WorkerRun(BaseModel):
         return flags
 
 
-def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
-    """The argvs of each line that the shell reader reads, and the first line that is past its
-    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
-    Each line is read by itself, so one unread line does not take the others' argvs."""
+def _argvs_and_first_unread(
+    lines: list[str], cut: frozenset[str] = frozenset(), programs: frozenset[str] = frozenset()
+) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None, list[tuple[str, str]]]:
+    """The argvs of each line that the shell reader reads; the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None;
+    and each line with parts that the reader refuses, with those parts
+    (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). Each line is read by
+    itself, so one unread line does not take the others' argvs.
+
+    A line of ``cut`` is a command that the pod's clip cut (:func:`_cut_command_texts`). It is
+    read as if the quote that the cut left open closed at the cut (:func:`_cut_command_read`).
+    What the clip removed is not in the text, and this verifier does not report it: the cut
+    tail of a clipped command is a limit of the capture. So a forbidden run in the cut tail
+    still passes, while ``tool_called`` with an ``arguments`` pattern on the cut argument gives
+    ``error`` for the same call.
+
+    A line of ``programs``, the text of an ``execute_code`` program (:func:`_program_texts`),
+    is not a shell call. It is read as shell lines with the reader's first read alone, as
+    before the second read, and it is not in the third value."""
     argvs: list[list[str]] = []
     first_unread = None
+    refused: list[tuple[str, str]] = []
     for line in lines:
         try:
-            argvs.extend(_shell_argvs(line))
+            line_argvs, parts = (_shell_argvs_first_read(line), []) if line in programs else _shell_argvs_and_unread(line)
+            if parts and line in cut:
+                line_argvs, parts = _cut_command_read(line, line_argvs, parts)
         except ShellReadLimitError as limit:
             first_unread = first_unread or (line, limit)
-    return argvs, first_unread
+            continue
+        argvs.extend(line_argvs)
+        if parts:
+            refused.append((line, _SHELL_PARTS_JOIN.join(parts)))
+    return argvs, first_unread, refused
+
+
+def _cut_command_read(line: str, argvs: list[list[str]], parts: list[str]) -> tuple[list[list[str]], list[str]]:
+    """The argvs and the refused parts of a command that the pod's clip cut, of which the reader
+    gave ``argvs`` and refused ``parts``. The clip often falls inside a quoted value, so the
+    command is read again as if that quote closed at the cut, as the write attribution reads it
+    (:func:`kube_agents_bench.github_writes.writing_segments`): the first closing quote that
+    gives an argv more, or leaves fewer refused parts, gives the result. A part that is still
+    refused is text that the capture holds, so it follows the rule of each refused part
+    (:func:`_refused_part_can_hold`), also when the cut is its cause: a cut inside a
+    substitution, or inside two quotes."""
+    for quote in _CUT_COMMAND_QUOTES:
+        # A trailing backslash would escape the quote that closes the value.
+        closed_argvs, closed_parts = _shell_argvs_and_unread(line.rstrip(_SHELL_QUOTING_ESCAPE) + quote)
+        added = [argv for argv in closed_argvs if argv not in argvs]
+        if added or len(closed_parts) < len(parts):
+            return argvs + added, closed_parts
+    return argvs, parts
+
+
+def _refused_part_can_hold(part: str, run: WorkerRun) -> bool:
+    """Whether a part that the reader refuses can hold ``run``. A run is an argv with the script
+    as a word (by its basename, or its module stem after ``-m``), each flag as a word, and for
+    each word pattern a word that matches it. So the part can hold the run only when its text,
+    with the line continuations and the quoting characters off, has all of those words. The
+    limit of this test: a run that reaches the script by another spelling (through a variable,
+    or with a word that holds a blank or an operator character inside quotes) is not found,
+    and the check is graded on what was read."""
+    bare = part.replace(_SHELL_LINE_CONTINUATION, "").translate(_SHELL_QUOTING_CHARS_OFF)
+    words = [word for word in _SHELL_BARE_WORD_SPLIT_RE.split(bare) if word]
+    stem = run.script.rsplit(_SCRIPT_SUFFIX_SEPARATOR, 1)[0]
+    named = any(os.path.basename(word) == run.script for word in words) or any(
+        flag == _INTERPRETER_MODULE_FLAG and module == stem for flag, module in zip(words, words[1:])
+    )
+    return named and _words_after_carry(words, run)
+
+
+def _refused_part_naming(refused: list[tuple[str, str]], runs: list[WorkerRun]) -> tuple[str, str] | None:
+    """The first line of ``refused`` whose refused parts can hold one of ``runs``
+    (:func:`_refused_part_can_hold`), with that run's script, or None."""
+    for line, part in refused:
+        for run in runs:
+            if _refused_part_can_hold(part, run):
+                return line, run.script
+    return None
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -2810,6 +2906,30 @@ def _clipped_cards(trajectory: list[Any]) -> set[str]:
         and isinstance(entry.get("args"), dict)
         and set(entry["args"]) == {_CLIPPED_ARGS_KEY}
     }
+
+
+def _program_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged ``execute_code`` program, as :func:`_code_call_text` reads it."""
+    texts = (_code_call_text(entry) for entry in trajectory if isinstance(entry, dict) and entry.get("agent") and entry.get("name") != _TERMINAL_TOOL)
+    return frozenset(text for text in texts if text is not None)
+
+
+def _cut_command_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged code-tool call whose command the pod's clip cut: the head that
+    :func:`_code_call_text` reads when the clipped arguments hold no whole command."""
+    cut: set[str] = set()
+    for entry in trajectory:
+        if not (isinstance(entry, dict) and entry.get("agent") and entry.get("name") in _CODE_TOOLS):
+            continue
+        args = entry.get("args")
+        if not (isinstance(args, dict) and set(args) == {_CLIPPED_ARGS_KEY} and isinstance(args[_CLIPPED_ARGS_KEY], str)):
+            continue
+        if _clipped_string_args(args[_CLIPPED_ARGS_KEY], {_COMMAND_ARG: "", _CODE_ARG: ""}):
+            continue
+        command = _code_call_text(entry)
+        if command is not None:
+            cut.add(command)
+    return frozenset(cut)
 
 
 def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
@@ -2969,7 +3089,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     row of such a call is read, and so is each row of a capture whose rows
     name no card. A result that only quotes the refusal words matches too.
 
-    ``after_result_pattern`` makes the forbidden set order-aware, for a
+    ``after_result_pattern`` makes the forbidden patterns order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
     refused one, and a pattern over write verbs alone flags the honest attempt
     that met the refusal. The commands then come from the workers' tagged
@@ -3005,9 +3125,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     closes the chain gap, and the split stays. ``required_runs``
     reads each flag as the exact word, so a script a case names this way is
     built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
-    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a line bash refuses
-    (an unclosed quote) yields no words, so no run is credited from it
-    (``forbidden_patterns`` read the text and still match it); and no shell
+    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a command that the
+    reader refuses (an unclosed quote) has no argv, so no run is credited from
+    it or from the commands after it, while the commands before it are read
+    (the last paragraph has the error rule; ``forbidden_patterns`` read the
+    text and still match it); and no shell
     expansion is resolved, so a run spelled through a variable that holds the
     whole path (``python3 "$SCRIPT" ...``) is not read as one -- the dictated
     command spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or
@@ -3062,6 +3184,23 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``status="error"`` when a line of the commands was not read, and a clean read of the
     forbidden runs is when a typed line was not read. A check with patterns alone reads no
     argv and is graded as before the limit.
+
+    A call is read a command at a time, as bash reads it
+    (:func:`kube_agents_bench.shell_words._shell_argvs`): a quote in a heredoc body opens
+    nothing (a body line that reads as a command is still an argv), and the commands before
+    one that the reader refuses (quotes that do not balance, a redirect with no target, a
+    substitution that does not close) are read. The refused command and what follows it have
+    no argvs, and the reader cannot tell if bash refuses that part too. So the part follows
+    the rule above for the runs that it can hold (:func:`_refused_part_can_hold`): a required
+    run that is still missing, or a clean read of the forbidden runs, is ``status="error"``
+    when the part has the run's words, which are the script as a word, each flag, and a word
+    for each word pattern. A refused part that reaches the script by another spelling is not
+    found, and the check is graded on what was read. A command that the pod clipped is read as
+    if the quote that the cut left open closed at the cut. What the clip removed is not
+    reported: a forbidden run in the cut tail still passes, while ``tool_called`` with an
+    ``arguments`` pattern on the cut argument gives ``error`` for the same call. An
+    ``execute_code`` program is not a shell call: it is read as shell lines with the reader's
+    first read alone, as before.
     """
 
     type: Literal["worker_commands"]
@@ -3352,9 +3491,11 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         # The argvs serve the runs only: the commands' for the required runs, the typed calls'
         # for the forbidden runs. A check with patterns alone reads none. Each line is read by
-        # itself; a line past the reader's limit has no argvs.
-        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
-        typed_argvs, typed_unread = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [])
+        # itself; a line past the reader's limit has no argvs, and a part that the reader
+        # refuses has none either.
+        cut, programs = _cut_command_texts(snap.trajectory), _program_texts(snap.trajectory)
+        argvs, unread, refused = _argvs_and_first_unread(commands if self.required_runs else [], cut, programs)
+        typed_argvs, typed_unread, typed_refused = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [], cut, programs)
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
@@ -3374,6 +3515,20 @@ class WorkerCommandsVerifier(BaseVerifier):
                 status="error",
                 elapsed_time=time.monotonic() - start,
                 reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
+        # A part that the reader refuses follows the same rule, for the runs that it can hold:
+        # a required run that is still missing, when a refused part of the commands has its
+        # words; a clean read of the forbidden runs, when a refused part of a typed line has
+        # the words of one of them.
+        not_read = None
+        if not (hits or ran or missing):
+            not_read = _refused_part_naming(refused, unrun) if unrun else _refused_part_naming(typed_refused, self.forbidden_runs)
+        if not_read is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_UNREAD_PART_REASON.format(shown=not_read[0][:_SHOWN_COMMAND_CHARS], script=not_read[1]),
             )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
@@ -3664,11 +3819,14 @@ class WorkerBudgetVerifier(BaseVerifier):
     and no completed attempt either (the harness archived the card at its
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
-    A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches; a capture in which every result was
-    withheld or never recorded is unreadable, and with nothing named it is
-    ``status="error"`` too, while a single missing result among readable ones
-    does not turn a plain failure into one.
+    A notice in the part of a result that the capture's clip dropped is not
+    read: the clip keeps a result's head and its last
+    ``worker_trajectory.RESULT_TAIL_CHARS`` characters, where an appended
+    notice is, and a card of short tool outputs never reaches the clip; a
+    capture in which every result was withheld or never recorded is
+    unreadable, and with nothing named it is ``status="error"`` too, while a
+    single missing result among readable ones does not turn a plain failure
+    into one.
     """
 
     type: Literal["worker_budget"]
@@ -9760,21 +9918,32 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_state_file(shell: Callable[[str, float], str], path: str, timeout: float) -> dict[str, Any] | None:
+    """The JSON object a stack recorded at ``path`` in the pod ``shell`` reaches, or None when there is none."""
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def fired_at_of(state: dict[str, Any] | None) -> datetime | None:
+    """A stack state's ``fired_at``, or None when it has none that is an aware ISO-8601 stamp."""
+    try:
+        fired = datetime.fromisoformat(str((state or {})["fired_at"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+    return fired if fired.tzinfo is not None else None
+
+
 def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
     """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
 
     Missing file, not JSON, no ``fired_at``, or one that is not an aware
     ISO-8601 stamp all read as None: the stack did not fire the run.
     """
-    reply = shell(f"cat {shlex.quote(path)}", timeout)
-    try:
-        state = json.loads(reply.strip().splitlines()[-1])
-        fired = datetime.fromisoformat(str(state["fired_at"]))
-    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if fired.tzinfo is None:
-        return None
-    return fired
+    return fired_at_of(read_state_file(shell, path, timeout))
 
 
 def read_report_store(
@@ -9792,8 +9961,180 @@ def read_report_store(
     return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
 
 
+class _StoredReportVerifier(_OnboardingPollVerifier):
+    """What ``audit_report_stored`` and ``shadow_report_stored`` share: one stream's store read and its grading.
+
+    A subclass names the stream (``_stream``), the pods whose report store it
+    reads (``_store_shells``, with ``_store_where`` naming them for a reason),
+    the pod holding ``since_state_file`` (``_state_shell``), and any envelope
+    keys it holds every envelope to beyond ``required_envelope``
+    (``_forced_envelope``). The window, the start bound and the finding and
+    evidence rules are the same for both; :class:`AuditReportStoredVerifier`
+    documents them.
+    """
+
+    status: AuditStatus | None = None
+    required_finding_phrases: list[str] = Field(default_factory=list)
+    forbidden_finding_phrases: list[str] = Field(default_factory=list)
+    required_evidence_phrases: list[str] = Field(default_factory=list)
+    # Top-level envelope keys and the value each must hold on this run's envelope.
+    required_envelope: dict[str, Any] = Field(default_factory=dict)
+    # A JSON file whose ``fired_at`` (ISO-8601, as the audit-chat-report,
+    # unchanged-manifest-digest and builtin-schedule-run-now stacks write it)
+    # replaces the run's start as the lower bound, with no skew allowance: the
+    # fire and the envelope are stamped by the same install. Unreadable is an error.
+    since_state_file: str | None = None
+    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
+    # the agent pod are two clocks.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @model_validator(mode="after")
+    def _evidence_names_its_findings(self) -> "_StoredReportVerifier":
+        if self.required_evidence_phrases and not self.required_finding_phrases:
+            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
+        return self
+
+    def _stream(self) -> str:
+        raise NotImplementedError
+
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        raise NotImplementedError
+
+    def _store_where(self) -> str:
+        raise NotImplementedError
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        raise NotImplementedError
+
+    def _forced_envelope(self) -> dict[str, Any]:
+        return {}
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """One pod's envelopes of ``stream``, or None and why not: the store tree, read directly.
+
+        ``state`` is the stack's state file, read once for the poll (None without one).
+        """
+        return read_report_store(shell, stream, timeout, keys, excerpts), None
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        snap = transcript.get()
+        if snap is None:
+            return "error", _NO_TRANSCRIPT_REASON, None
+        if not snap.started_at:
+            return "error", _NO_RUN_CLOCK_REASON, None
+        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
+            seconds=self.max_clock_skew_sec
+        )
+        state = None
+        if self.since_state_file:
+            # Read once per poll; _read_listing gets the same object.
+            state = read_state_file(self._state_shell(), self.since_state_file, read_timeout)
+            fired = fired_at_of(state)
+            if fired is None:
+                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
+            # No skew: the fire and the envelope are stamped by the same install.
+            since = fired
+        stream = self._stream()
+        expected = {**self.required_envelope, **self._forced_envelope()}
+        envelopes: list[dict[str, Any]] = []
+        read_any = False
+        unread: list[str] = []
+        for shell in self._store_shells():
+            listing, why = self._read_listing(
+                shell, stream, read_timeout, tuple(expected), bool(self.required_evidence_phrases), state
+            )
+            if listing is not None:
+                read_any = True
+                envelopes.extend(listing)
+            elif why:
+                unread.append(why)
+        if not read_any:
+            detail = f": {'; '.join(unread)}" if unread else ""
+            return "error", f"{self._store_where()} could not be read{detail}", None
+        fresh = []
+        started_early = 0
+        for envelope in envelopes:
+            try:
+                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
+            except ValueError:
+                continue
+            if finished.tzinfo is None or finished < since:
+                continue
+            # An envelope that names its run's start counts only when that run
+            # opened inside the window: a run from an earlier repetition can
+            # finish inside this one. One with the key and no start is such a
+            # late finish too, and so is one whose start is after its finish (a
+            # later run's stamp); an older image writes no key and is read by
+            # `finished_at` alone. The start is stamped in whole seconds, so the
+            # bound is floored to the second for it.
+            if _ENVELOPE_STARTED_KEY in envelope:
+                try:
+                    began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
+                except ValueError:
+                    began = None
+                if (
+                    began is None
+                    or began.tzinfo is None
+                    or began < since.replace(microsecond=0)
+                    or began > finished
+                ):
+                    started_early += 1
+                    continue
+            fresh.append(envelope)
+        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *expected)
+        raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
+        if not fresh:
+            window = "the stack fired the audit" if self.since_state_file else "the run started"
+            early = (
+                f"; {started_early} finished since but came from a run that opened before then or named no start"
+                if started_early
+                else ""
+            )
+            errors = [str(e["error"]) for e in envelopes if e.get("error")]
+            said = f"; unread: {'; '.join(errors)}" if errors else ""
+            return (
+                "fail",
+                f"no {stream} report in {REPORT_STORE_ROOT} finished since {window} "
+                f"({len(envelopes) - started_early} older or unreadable{early}){said}",
+                raw,
+            )
+        failures = []
+        for envelope in fresh:
+            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
+            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
+            excerpts = envelope.get("finding_excerpts") or {}
+            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
+            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
+            wrong = {key: envelope.get(key) for key, value in expected.items() if envelope.get(key) != value}
+            if self.status is not None and envelope.get("status") != self.status:
+                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif wrong:
+                failures.append(
+                    f"{envelope.get('repo')}: "
+                    + ", ".join(f"{key} is {actual!r}, not {expected[key]!r}" for key, actual in wrong.items())
+                )
+            elif missing:
+                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            elif present:
+                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
+            elif unevidenced:
+                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
+            else:
+                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
+        return "fail", "; ".join(failures), raw
+
+
 @VERIFIERS.register("audit_report_stored")
-class AuditReportStoredVerifier(_OnboardingPollVerifier):
+class AuditReportStoredVerifier(_StoredReportVerifier):
     """Checks that a fleet audit kept this run's report in the on-pod report store.
 
     Reads ``latest.json`` under every repository directory of ``audit`` in the
@@ -9827,120 +10168,16 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
 
     type: Literal["audit_report_stored"]
     audit: AuditId
-    status: AuditStatus | None = None
-    required_finding_phrases: list[str] = Field(default_factory=list)
-    forbidden_finding_phrases: list[str] = Field(default_factory=list)
-    required_evidence_phrases: list[str] = Field(default_factory=list)
-    # Top-level envelope keys and the value each must hold on this run's envelope.
-    required_envelope: dict[str, Any] = Field(default_factory=dict)
-    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
-    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
-    # replaces the run's start as the lower bound, with no skew allowance: the
-    # fire and the envelope are stamped by the same pod. Unreadable is an error.
-    since_state_file: str | None = None
-    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
-    # the agent pod are two clocks.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
-    @model_validator(mode="after")
-    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
-        if self.required_evidence_phrases and not self.required_finding_phrases:
-            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
-        return self
+    def _stream(self) -> str:
+        return self.audit
 
-    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        snap = transcript.get()
-        if snap is None:
-            return "error", _NO_TRANSCRIPT_REASON, None
-        if not snap.started_at:
-            return "error", _NO_RUN_CLOCK_REASON, None
-        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
-            seconds=self.max_clock_skew_sec
-        )
-        if self.since_state_file:
-            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
-            if fired is None:
-                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
-            # No skew: the fire and the envelope are stamped by the same pod.
-            since = fired
-        envelopes: list[dict[str, Any]] = []
-        read_any = False
-        for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(
-                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
-            )
-            if listing is not None:
-                read_any = True
-                envelopes.extend(listing)
-        if not read_any:
-            return "error", "neither the sandbox nor the agent container could be read", None
-        fresh = []
-        started_early = 0
-        for envelope in envelopes:
-            try:
-                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
-            except ValueError:
-                continue
-            if finished.tzinfo is None or finished < since:
-                continue
-            # An envelope that names its run's start counts only when that run
-            # opened inside the window: a run from an earlier repetition can
-            # finish inside this one. One with the key and no start is such a
-            # late finish too, and so is one whose start is after its finish (a
-            # later run's stamp); an older image writes no key and is read by
-            # `finished_at` alone. The start is stamped in whole seconds, so the
-            # bound is floored to the second for it.
-            if _ENVELOPE_STARTED_KEY in envelope:
-                try:
-                    began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
-                except ValueError:
-                    began = None
-                if (
-                    began is None
-                    or began.tzinfo is None
-                    or began < since.replace(microsecond=0)
-                    or began > finished
-                ):
-                    started_early += 1
-                    continue
-            fresh.append(envelope)
-        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *self.required_envelope)
-        raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
-        if not fresh:
-            window = "the stack fired the audit" if self.since_state_file else "the run started"
-            early = (
-                f"; {started_early} finished since but came from a run that opened before then or named no start"
-                if started_early
-                else ""
-            )
-            return (
-                "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since {window} "
-                f"({len(envelopes) - started_early} older or unreadable{early})",
-                raw,
-            )
-        failures = []
-        for envelope in fresh:
-            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
-            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
-            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
-            excerpts = envelope.get("finding_excerpts") or {}
-            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
-            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
-            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
-            if self.status is not None and envelope.get("status") != self.status:
-                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
-            elif wrong:
-                failures.append(
-                    f"{envelope.get('repo')}: "
-                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
-                )
-            elif missing:
-                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
-            elif present:
-                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
-            elif unevidenced:
-                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
-            else:
-                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
-        return "fail", "; ".join(failures), raw
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        # Looked up on each read, so a test's swap of either shell is seen.
+        return (onboarding.sandbox_shell, onboarding.agent_shell)
+
+    def _store_where(self) -> str:
+        return "the sandbox and the agent container"
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        return onboarding.agent_shell

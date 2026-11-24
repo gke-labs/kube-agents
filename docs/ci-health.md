@@ -1576,7 +1576,8 @@ observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gatew
 status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
 warning that the fixture is not there (never planted, or no cluster for its
 slot), a rollout the next reconcile finishes; for one not ready (the orphaned-snapshot
-roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours` line
+roles, which the GCE compute audit ignores for 91 days, and the finished-Job family, which the
+waste audit ignores for 7), the `ready_after_hours` line
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
@@ -1589,7 +1590,7 @@ which this document does not carry; the note is judged at lease time by the
 presubmit and the nightly, never here, and a stale note surfaces as
 `fixture-drift:<role>` on their runs, with the replace command's printer in
 the drift line. The digest's fixture line and `health.json`'s `fixture_state` block carry
-drifted, absent and unread roles only, so a project whose two snapshots are young reads
+drifted, absent and unread roles only, so a project whose two snapshots or three finished Jobs are young reads
 there as every fixture in its designed state; the document's `summary` and each project's
 carry `not_ready` beside the other counts. `summary` counts projects, projects checked (at least one role
 read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
