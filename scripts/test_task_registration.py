@@ -1053,6 +1053,20 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(value=value):
                 self._only("must be {slots:", scope_exclude=value)
 
+    # -- scope_hold --
+
+    def test_a_declared_hold_passes(self):
+        self.assertEqual(self._validate(scope_hold={"agent_cluster": True, "reason": "paused"}), [])
+        self.assertEqual(self._validate(scope_hold={"all": True, "agent_cluster": True, "reason": "paused"}), [])
+
+    def test_a_hold_the_runner_cannot_apply_is_rejected(self):
+        for value in (None, True, {"all": True}, {"all": False, "reason": "r"}, {"all": "true", "reason": "r"}, {"agent_cluster": True, "reason": "r", "clusters": []}):
+            with self.subTest(value=value):
+                self._only("'scope_hold:' must be", scope_hold=value)
+
+    def test_a_hold_beside_a_scope_exclusion_is_rejected(self):
+        self._only("declare one", scope_hold={"all": True, "reason": "r"}, scope_exclude={"slots": ["b"]})
+
     def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
         # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
         for text in ("{trailing,}", "null", '{"jobs": {"compliance-audit": {}}}'):

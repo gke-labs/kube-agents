@@ -438,6 +438,29 @@ func (s *sideDoorAdapter) TurnFinished(conversation string) {
 	}
 }
 
+// TurnQueued, ClaimRedelivery and ClaimReplay reach the owning door when it is a
+// CapLineObserver (the inject door). A chat conversation's queued turn is
+// told in its thread, and its redelivery needs nobody's leave, so the
+// primary is asked nothing.
+func (s *sideDoorAdapter) TurnQueued(conversation string) {
+	if observer, ok := s.doorFor(conversation).(CapLineObserver); ok {
+		observer.TurnQueued(conversation)
+	}
+}
+
+func (s *sideDoorAdapter) ClaimRedelivery(conversation string, n int) bool {
+	if observer, ok := s.doorFor(conversation).(CapLineObserver); ok {
+		return observer.ClaimRedelivery(conversation, n)
+	}
+	return true
+}
+
+func (s *sideDoorAdapter) ClaimReplay(conversation string, n int) {
+	if observer, ok := s.doorFor(conversation).(CapLineObserver); ok {
+		observer.ClaimReplay(conversation, n)
+	}
+}
+
 // SetProbe hands the gateway's probe to every door, which are the halves
 // whose callers are programs (ProbeSink). The composite implements it
 // unconditionally for the same reason it implements TaskObserver: the

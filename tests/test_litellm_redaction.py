@@ -40,7 +40,12 @@ _CONFIGMAP_KEYS = ("redaction.yaml", "redactor.py", "litellm_redaction_callback.
 # What every render carries whether redaction is on or off: the config, the
 # thinking-replay hook (tests/test_litellm_thinking_replay.py) and the
 # cache-marker hook (tests/test_litellm_cache_control_strip.py).
-_ALWAYS_KEYS = ("config.yaml", "litellm_thinking_replay_callback.py", "litellm_cache_control_strip_callback.py")
+_ALWAYS_KEYS = (
+    "config.yaml",
+    "litellm_thinking_replay_callback.py",
+    "litellm_cache_control_strip_callback.py",
+    "litellm_caller_auth.py",
+)
 _ALWAYS_CALLBACKS = [
     "prometheus",
     "litellm_thinking_replay_callback.proxy_handler_instance",

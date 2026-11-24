@@ -1,0 +1,107 @@
+name: Skill Upstream Tracking
+
+# Keep one tracking issue for each overlay patch on main that holds a general
+# fix, a fix that google/skills must carry. `scripts/reconcile_skill_upstream.py`
+# holds the rule and the issue text; this file is the triggers and the guards.
+#
+# Nothing writes until a maintainer starts it. The push run and the daily run
+# start only if the repository variable SKILL_UPSTREAM_TRACKING is `on`. A
+# maintainer does a dry run by dispatch, then the first real run by dispatch
+# with `dry_run` off, then sets the variable.
+#
+# The script writes with the workflow's own GITHUB_TOKEN. An issue that
+# GITHUB_TOKEN opens starts no other workflow, so this cannot start a loop.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agents/platform/skill-overlays/**"
+  # The daily run opens the issue of a patch when its soak window ends: no push
+  # happens on that day. It also corrects an issue that a person closed by hand.
+  schedule:
+    - cron: "17 7 * * *"
+  #checkov:skip=CKV_GHA_7:One boolean, dry_run, which selects the job; no input goes into a shell line
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the actions and write nothing
+        type: boolean
+        default: true
+
+# The runs that write share one group, so two runs never read the same state
+# and open the same issue two times. GitHub holds one pending run for a group
+# and cancels an older pending run. That is safe: the last run of the group
+# reads the full state of main. A dry run has a group of its own, so it cannot
+# replace a pending run that writes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && github.run_id || 'write' }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  dry-run:
+    name: Dry run
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      github.event_name == 'workflow_dispatch' && inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # check out the script and the patches
+      issues: read # read the tracking issues
+    steps:
+      # A dispatch checks out the ref that it started from. That is the way to
+      # try the script of a branch; the script itself refuses each request that
+      # is not a GET in a dry run.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Print the actions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/reconcile_skill_upstream.py --dry-run
+
+  reconcile:
+    name: Reconcile
+    # The repository guard: a fork gets the triggers and not the purpose. The
+    # gate: a push run and a daily run need the repository variable; a dispatch
+    # with `dry_run` off is the maintainer's own decision.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      ((github.event_name == 'workflow_dispatch' && !inputs.dry_run) ||
+        (github.event_name != 'workflow_dispatch' && vars.SKILL_UPSTREAM_TRACKING == 'on'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # check out the script and the patches
+      issues: write # open, comment on and close the tracking issues, and create their label
+    steps:
+      # A run that writes reads the tip of main, and not the commit that started
+      # it: a second attempt of an old run would read an old tree as main, and a
+      # dispatch from a branch would run the script of that branch. The script
+      # also refuses to write when the ref of the run is not main, so a dispatch
+      # from a branch with `dry_run` off fails and writes nothing.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Make the tracking issues agree with the patches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/reconcile_skill_upstream.py

@@ -994,6 +994,14 @@ SHAPE_READS_BY_ENTRY = {
 POD_HASH_SUFFIX_RE = re.compile(r"^[a-z0-9]{5}$")
 POD_ORDINAL_SUFFIX_RE = re.compile(r"^\d+$")
 PREFIX_RESOLVED_KINDS = ("ReplicaSet", "Job", "DaemonSet", "StatefulSet")
+# Kubernetes cuts a generated pod name at 63 characters: the generator keeps at
+# most 58 of `<controller>-` and appends its five with no separator. So the pod
+# of a controller named in 58 characters or more has a name of exactly 63
+# characters that does not hold the controller's whole name. A StatefulSet
+# names its pods by ordinal, with no generator, and has no cut form.
+K8S_GENERATED_NAME_MAX = 63
+K8S_GENERATED_BASE_MAX = 58
+ORDINAL_NAMED_KIND = "StatefulSet"
 # An unreadable or foreign-version state file is moved here, never overwritten.
 UNREADABLE_SUFFIX = ".unreadable-{ts}"
 # A re-check asks whether a finding is still present, not when it began, so
@@ -1394,7 +1402,9 @@ GATE_REREAD_LINE_FORMAT = "- {cluster}: {verdict} ({reasons})"
 LEDGER_GATE_KEY = "gate"
 # The manifest's stand-in for the argv of the Monitoring read, as `fleet_waste.py`
 # labels its usage read: `finish` accepts a `checks_run` command only if it names an
-# inspection binary, so the label is the `curl` that issues the same two requests.
+# inspection binary, so the label is the `curl` that issues the same two requests on
+# the commercial domain. When the environment names a custom universe domain, the
+# relay client sends the read to that domain's host, and the label does not.
 MONITORING_PAGE_SIZE_KEY = "pageSize"
 COMMAND_CHAIN = " && "
 LOG_VOLUME_NOT_MADE_REASON = f"{LOG_VOLUME_READ} read not made"
@@ -2183,19 +2193,47 @@ class Resolver:
             suffix = pod_name[len(name) + 1:]
             if (kind == "StatefulSet" and POD_ORDINAL_SUFFIX_RE.match(suffix)) or (kind != "StatefulSet" and POD_HASH_SUFFIX_RE.match(suffix)):
                 return kind, name
-        return None
+        return self._controller_by_cut_name(namespace, pod_name)
 
-    def resolve(self, namespace: str, kind: str, name: str) -> tuple[str, str]:
-        if kind == "Pod" and (namespace, kind, name) not in self.parent and (namespace, name) not in self.listed:
-            by_prefix = self._controller_by_prefix(namespace, name)
-            if by_prefix:
-                kind, name = by_prefix
+    def _controller_by_cut_name(self, namespace: str, pod_name: str) -> tuple[str, str] | None:
+        """The controller of a gone pod whose name Kubernetes cut, or None.
+
+        Asked only when no controller's whole name starts the pod's name.
+        Controllers whose names agree in their first 58 characters leave pods
+        of the same shape. Here the pod is charged only when each controller
+        that fits leads to the same top owner, as the ReplicaSets of one
+        Deployment do; nothing in the name says which of two owners it was. A
+        controller that is gone is not in the list, so its pod can be charged
+        to a live controller that shares those 58 characters.
+        """
+        if len(pod_name) != K8S_GENERATED_NAME_MAX:
+            return None
+        fits = [
+            (kind, name)
+            for kind, name in self.controllers.get(namespace) or []
+            if kind != ORDINAL_NAMED_KIND
+            and len(name) >= K8S_GENERATED_BASE_MAX
+            and pod_name.startswith(f"{name}-"[:K8S_GENERATED_BASE_MAX])
+            and POD_HASH_SUFFIX_RE.match(pod_name[K8S_GENERATED_BASE_MAX:])
+        ]
+        if len({self._top_owner(namespace, kind, name) for kind, name in fits}) != 1:
+            return None
+        return fits[0]
+
+    def _top_owner(self, namespace: str, kind: str, name: str) -> tuple[str, str]:
         for _ in range(OWNER_MAX_HOPS):
             parent = self.parent.get((namespace, kind, name))
             if parent is None:
                 break
             kind, name = parent
         return kind, name
+
+    def resolve(self, namespace: str, kind: str, name: str) -> tuple[str, str]:
+        if kind == "Pod" and (namespace, kind, name) not in self.parent and (namespace, name) not in self.listed:
+            by_prefix = self._controller_by_prefix(namespace, name)
+            if by_prefix:
+                kind, name = by_prefix
+        return self._top_owner(namespace, kind, name)
 
     def pod_total(self, owner_object: str) -> int:
         return len(self.pods_of.get(owner_object) or [])
@@ -4746,8 +4784,11 @@ def fetch_log_volume(session: SessionFn | None, project: str, cluster_name: str,
 
 
 def log_volume_command(project: str, requests: list[dict]) -> str:
-    """The two Monitoring requests as the `curl` lines that issue them, for
-    `checks_run`: every parameter the collector sent but the page size."""
+    """The two Monitoring requests as the `curl` lines that issue them on the
+    commercial domain, for `checks_run`: every parameter the collector sent
+    but the page size. The URL is the commercial one: when the environment
+    names a custom universe domain, the relay client sends the read to that
+    domain's host, and the label does not."""
     url = MONITORING_TIMESERIES_URL.format(project=project)
     curls = []
     for params in requests:

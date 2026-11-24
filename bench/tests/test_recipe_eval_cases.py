@@ -83,3 +83,16 @@ def test_every_post_merge_case_grades_a_recipe_that_exists():
         for check in checks:
             kind = check.get("recipe")
             assert kind in recipes, f"{case} grades recipe {kind!r}, which has no fix_recipes/{kind}/recipe.yaml"
+
+
+def test_recipe_check_nests_checks_under_the_case_format_keys():
+    # scripts/check_recipes.py keeps its own copy, because it runs without
+    # devops-bench; this holds it to the case format's.
+    import sys
+
+    from kube_agents_bench import cases
+
+    sys.path.insert(0, str(REPO / "scripts"))
+    import check_recipes
+
+    assert set(check_recipes.CHECK_CHILD_KEYS) == set(cases._CHECK_CHILD_KEYS)
