@@ -122,6 +122,45 @@ class RecordTest(unittest.TestCase):
                 self.assertEqual("other", skills.skill_label(name))
 
 
+class RootTest(unittest.TestCase):
+    """Where the audit files are, for a gateway run at the root and for one run under a named profile."""
+
+    def root_for(self, hermes_home):
+        env = {} if hermes_home is None else {audit_sink.HERMES_HOME_ENV: hermes_home}
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.dict(sys.modules, {"hermes_constants": None}):
+            if hermes_home is None:
+                os.environ.pop(audit_sink.HERMES_HOME_ENV, None)
+            return skills.hermes_root()
+
+    def test_the_home_is_the_root_for_the_default_profile(self):
+        self.assertEqual(Path("/opt/data"), self.root_for("/opt/data"))
+        self.assertEqual(Path(audit_sink.DEFAULT_HERMES_HOME), self.root_for(None))
+
+    def test_a_named_profiles_home_is_mapped_back_to_the_root(self):
+        self.assertEqual(Path("/opt/data"), self.root_for("/opt/data/profiles/platform"))
+
+    def test_hermes_own_resolution_is_used_when_the_process_is_hermes(self):
+        module = type(sys)("hermes_constants")
+        module.get_default_hermes_root = lambda: "/srv/hermes"
+        with mock.patch.dict(sys.modules, {"hermes_constants": module}):
+            self.assertEqual(Path("/srv/hermes"), skills.hermes_root())
+
+    def test_a_gateway_under_a_named_profile_counts_every_profile(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        homes = {"front": root, "platform": root / "profiles" / "platform", "cluster": root / "profiles" / "cluster-a"}
+        for home in homes.values():
+            (home / "logs").mkdir(parents=True)
+        with mock.patch.dict(os.environ, {audit_sink.HERMES_HOME_ENV: str(homes["platform"])}), \
+                mock.patch.dict(sys.modules, {"hermes_constants": None}):
+            counter = skills.SkillInvocationsCounter()
+            counter.counts()
+            for name, home in homes.items():
+                with open(audit_sink.audit_file_path(home), "a", encoding="utf-8") as handle:
+                    handle.write(_start(name=f"from-{name}"))
+            self.assertEqual({"from-front": 1, "from-platform": 1, "from-cluster": 1}, counter.counts())
+
+
 class CounterTest(_VolumeTest):
     def test_what_the_files_held_before_the_first_read_is_the_baseline(self):
         self.append(_start(name="fleet-audit"))
@@ -285,10 +324,28 @@ class CounterTest(_VolumeTest):
         self.counter.counts()
         self.append(_start(name="fleet-audit"), profile="platform")
         self.assertEqual({"fleet-audit": 1}, self.counter.counts())
-        with mock.patch.object(Path, "iterdir", side_effect=OSError("EIO")):
-            self.assertEqual({"fleet-audit": 1}, self.counter.counts())
-        with mock.patch.object(Path, "is_dir", return_value=False):
-            self.assertEqual({"fleet-audit": 1}, self.counter.counts())
+        with mock.patch.object(skills.os, "scandir", side_effect=OSError("EIO")):
+            with self.assertLogs(skills.logger, level="WARNING"):
+                self.assertEqual({"fleet-audit": 1}, self.counter.counts())
+        self.assertEqual({"fleet-audit": 1}, self.counter.counts())
+
+    def test_the_files_already_followed_are_still_read_while_the_listing_fails(self):
+        self.counter.counts()
+        self.append(_start(name="fleet-audit"), profile="platform")
+        self.counter.counts()
+        self.append(_start(name="version-control"), profile="platform")
+        with mock.patch.object(skills.os, "scandir", side_effect=OSError("EIO")):
+            with self.assertLogs(skills.logger, level="WARNING"):
+                self.assertEqual({"fleet-audit": 1, "version-control": 1}, self.counter.counts())
+
+    def test_a_listing_that_fails_at_the_baseline_does_not_count_history_later(self):
+        self.append(_start(name="old-history") * 5, profile="platform")
+        self.append(_start(name="old-front-door"))
+        with mock.patch.object(skills.os, "scandir", side_effect=OSError("EIO")):
+            with self.assertLogs(skills.logger, level="WARNING"):
+                self.assertEqual({}, self.counter.counts())
+        self.assertEqual({}, self.counter.counts())
+        self.append(_start(name="fleet-audit"), profile="platform")
         self.assertEqual({"fleet-audit": 1}, self.counter.counts())
 
     def test_a_file_unreadable_at_the_baseline_does_not_count_its_history_later(self):
@@ -332,6 +389,12 @@ class CounterTest(_VolumeTest):
         counter.counts()
         self.append(_start(name="one") + _start(name="two") + _start(name="three") + _start(name="one") + _start(name="four"))
         self.assertEqual({"one": 2, "two": 1, "other": 2}, counter.counts())
+
+    def test_the_other_series_does_not_take_a_place_under_the_cap(self):
+        counter = skills.SkillInvocationsCounter(root=lambda: self.root, max_series=2)
+        counter.counts()
+        self.append(_start(name="Not A Name") + _start(name="one") + _start(name="two") + _start(name="three"))
+        self.assertEqual({"other": 2, "one": 1, "two": 1}, counter.counts())
 
     def test_a_name_that_is_not_a_skill_name_counts_as_other(self):
         self.counter.counts()
