@@ -159,6 +159,9 @@ func (a *TeamsAdapter) feedbackPress(act *teamsActivity, press teamsPress, conve
 	if press.Task == "" {
 		return "rating press names no task"
 	}
+	if postKindOf(press.Task) != "" {
+		return "rating press names a post, which Teams does not rate"
+	}
 	if press.Rating != FeedbackUp && press.Rating != FeedbackDown {
 		return "rating press carries no rating this adapter draws"
 	}

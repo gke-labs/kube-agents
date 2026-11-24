@@ -284,3 +284,19 @@ func TestTeamsDoesNotRedrawARatedCardTheRecordedLineWouldOverflow(t *testing.T) 
 		t.Fatalf("api calls = %d, want the post alone: the card must not be redrawn", calls)
 	}
 }
+
+// Teams draws no controls on an alert or a report, so a press that names
+// one is no press this adapter drew: it records nothing.
+func TestTeamsRecordsNoRatingForAPressThatNamesAPost(t *testing.T) {
+	a, _, recorder, id := ratedTeamsAdapter(t)
+	data := map[string]any{teamsPressActionKey: teamsPressActionRate, teamsPressTaskKey: feedbackPostAlertPrefix + "drift-1", teamsPressRatingKey: FeedbackUp}
+	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:70", id, data))); reason == "" {
+		t.Fatal("a rating press was a turn")
+	}
+	a.rating.Wait()
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.ratings) != 0 {
+		t.Fatalf("ratings %+v, want none for a press that names a post", recorder.ratings)
+	}
+}
