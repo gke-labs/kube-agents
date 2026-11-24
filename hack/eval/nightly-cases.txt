@@ -1103,6 +1103,10 @@
 # dispatched; `kanban_create` refuses it and lists the profiles, and this case
 # is where the model reads that refusal. The fixture and four checks of
 # cluster-agent-delegation-profile-lookup, and its prompt plus that line.
+# Blocker: the agent, not the case (#6916). The worker can search the
+# clusters itself and file no card; such a run fails worker_agents with no
+# refusal read. Until #6916 is fixed a run can be red from that cause, and
+# the case takes a new three-run loop when #6916 closes.
 # deployer: noop, read-only; `validated: false`; 200s default until it has a
 # record.
 ./tasks/cluster-agent-delegation-wrong-profile-name/task.yaml
