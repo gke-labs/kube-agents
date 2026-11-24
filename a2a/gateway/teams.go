@@ -249,8 +249,9 @@ type TeamsAdapter struct {
 	recorder   FeedbackRecorder
 	rated      map[string]teamsRated
 	ratedOrder []string
-	// rateMu orders the ratings, which run off the pull loop: one at a
-	// time, so a 👍 after a 👎 on the same answer is recorded after it.
+	// rateMu runs the ratings, which are off the pull loop, one at a time,
+	// so a rating and the redraw it causes are never interleaved with
+	// another's. It does not order two presses pulled back to back.
 	rateMu sync.Mutex
 	// rating counts the ratings in flight, for a test to wait on.
 	rating sync.WaitGroup

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"strings"
 )
 
@@ -44,6 +45,8 @@ const (
 	// first, and a press on a message no longer held is still recorded,
 	// without the answer's text and without the redraw.
 	teamsRatedCap = 512
+	// teamsNoteKeptSize is the text size of the form's kept-for line.
+	teamsNoteKeptSize = "Small"
 )
 
 // teamsRated is a message posted with rating controls: the task it is
@@ -98,7 +101,7 @@ func teamsRatingActions(task string, days int) []map[string]any {
 						"type": teamsInputText, "id": teamsPressNoteKey, "isMultiline": true,
 						"maxLength": feedbackNoteChars, "placeholder": feedbackNoteTitleFor(task) + teamsNoteOptional,
 					},
-					{"type": "TextBlock", "wrap": true, "isSubtle": true, "size": "Small", "text": feedbackKeptTextFor(task, days, true)},
+					{"type": teamsCardTextBlock, "wrap": true, "isSubtle": true, "size": teamsNoteKeptSize, "text": feedbackKeptTextFor(task, days, true)},
 				},
 				teamsCardActionsKey: []map[string]any{
 					{"type": teamsActionSubmit, "title": feedbackNoteSend, "data": rate(FeedbackDown)},
@@ -186,7 +189,9 @@ func (a *TeamsAdapter) feedbackPress(act *teamsActivity, press teamsPress, conve
 // rate records one rating, adds a 👎's note when one was typed, and redraws
 // the rated card the first time a rating on it is recorded. A press on a
 // message the adapter no longer holds is recorded without the answer's
-// text, and the card is left as it is.
+// text, and the card is left as it is. So is a card the added line would
+// push past the activity budget: redrawn, it would go out as plain text
+// and lose its controls for everyone.
 func (a *TeamsAdapter) rate(recorder FeedbackRecorder, r FeedbackRating, note string) {
 	a.rateMu.Lock()
 	defer a.rateMu.Unlock()
@@ -209,9 +214,12 @@ func (a *TeamsAdapter) rate(recorder FeedbackRecorder, r FeedbackRating, note st
 		return
 	}
 	text := rated.text + "\n\n" + teamsRatingRecordedLine
-	if err := a.edit(r.Conversation, r.MessageID, text, teamsRatingActions(rated.task, recorder.KeptDays())); err != nil {
-		a.log.Warn("teams rated card was not redrawn", "conversation", r.Conversation, "err", err)
-		return
+	actions := teamsRatingActions(rated.task, recorder.KeptDays())
+	if teamsFitsCard(text, actions) {
+		if err := a.edit(r.Conversation, r.MessageID, text, actions); err != nil {
+			a.log.Warn("teams rated card was not redrawn", "conversation", r.Conversation, "err", err)
+			return
+		}
 	}
 	a.mu.Lock()
 	if now, still := a.rated[r.MessageID]; still && now.task == rated.task {
@@ -219,4 +227,12 @@ func (a *TeamsAdapter) rate(recorder FeedbackRecorder, r FeedbackRating, note st
 		a.rated[r.MessageID] = now
 	}
 	a.mu.Unlock()
+}
+
+// teamsFitsCard reports whether text with actions goes out as a card: the
+// card is within the activity budget (teamsFitActivityWith posts plain
+// text, without the actions, when it is not).
+func teamsFitsCard(text string, actions []map[string]any) bool {
+	b, err := json.Marshal(teamsCardActivityWith(text, actions))
+	return err == nil && len(b) <= teamsMaxActivityBytes
 }

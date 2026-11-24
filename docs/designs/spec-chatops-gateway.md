@@ -3015,7 +3015,7 @@ one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the 
 block, inside its side bar when it has one (an attachment draws after every top-level block, and
 Slack draws the block there too, seen live). The block's id carries the task id
 (`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
-escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat adapter draws it too (below); Discord and the console ignore it. A tap is never a turn,
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat and Teams adapters draw it too (below, and "The Teams adapter"); Discord and the console ignore it. A tap is never a turn,
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
@@ -3264,12 +3264,14 @@ An answer the relay marked for feedback carries its rating controls on the same 
 `answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. 👍 is an `Action.Submit`
 like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
 alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
-the note as an input beside the rating. Teams has neither Slack's modal nor Google Chat's private
-card, since both need an answer to the press the queue cannot give; so a 👎 is recorded when it
+the note as an input beside the rating. Teams has neither Slack's modal, which needs an answer to the press that the queue cannot
+give, nor Google Chat's private card; so a 👎 is recorded when it
 is sent, with a note or without one, and has no Cancel. The adapter checks the presser as the
 gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the pull loop, and
 redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
-rating because the card is the conversation's. It remembers the last 512 rated messages
+rating because the card is the conversation's; a card the line would push past the activity
+budget is not redrawn (`teamsFitsCard`), since it would go out as text without its controls.
+The form's kept-for line is drawn before any press, so it always names the question. It remembers a bounded number of rated messages
 (`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
 recorded without the answer's text and without the redraw, and a re-rating that carries no
 answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that

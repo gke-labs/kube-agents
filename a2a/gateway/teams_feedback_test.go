@@ -239,3 +239,48 @@ func TestTeamsDrawsNoRatingOnAnAlertItsTriageEdits(t *testing.T) {
 		t.Fatalf("a post marked as a report carries actions: %v", actions)
 	}
 }
+
+// A rated card that only just fits the activity budget is not redrawn: with
+// the recorded line added it would go out as plain text and lose its
+// controls for everyone. The rating is still recorded.
+func TestTeamsDoesNotRedrawARatedCardTheRecordedLineWouldOverflow(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	recorder := &fakeRecorder{admit: map[string]bool{testTeamsUser: true}}
+	a.SetFeedbackRecorder(recorder)
+	actions := teamsRatingActions("task-1", recorder.KeptDays())
+	// The longest answer of short lines whose card with the controls fits.
+	low, high := 1, teamsMaxActivityBytes
+	for low < high {
+		mid := (low + high + 1) / 2
+		if teamsFitsCard(strings.Repeat("x\n", mid), actions) {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	answer := strings.Repeat("x\n", low)
+	if !teamsFitsCard(answer, actions) || teamsFitsCard(answer+"\n\n"+teamsRatingRecordedLine, actions) {
+		t.Fatalf("no answer of %d lines sits at the budget's edge", low)
+	}
+	id, err := a.PostMessage("teams:"+testTeamsChannel, OutMessage{Text: answer, Feedback: "task-1"})
+	if err != nil || id == "" {
+		t.Fatalf("post: %v %q", err, id)
+	}
+	if len(teamsLineActions(t, relay, 0)) == 0 {
+		t.Fatal("the answer at the budget's edge was posted without its controls")
+	}
+	if _, reason := a.classify(decodeTeamsActivity(t, teamsRatePress("f:60", id, FeedbackUp, ""))); reason == "" {
+		t.Fatal("a rating press was a turn")
+	}
+	a.rating.Wait()
+	recorder.mu.Lock()
+	kept := len(recorder.ratings)
+	recorder.mu.Unlock()
+	if kept != 1 {
+		t.Fatalf("ratings kept = %d, want 1", kept)
+	}
+	if calls := teamsCallCount(relay); calls != 1 {
+		t.Fatalf("api calls = %d, want the post alone: the card must not be redrawn", calls)
+	}
+}
