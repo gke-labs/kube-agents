@@ -959,6 +959,28 @@ func (a *adapter) dispatchedOr(check func(context.Context, *nats.Conn, *lib.Enve
 	return check(ctx, a.nc, origin)
 }
 
+// supervisorStop is one way supervise ends a task's turns: once any is
+// recorded, no further harness process starts for the task (respawn mode).
+// Every place supervise stops a task records its stop through halt, and
+// supervisorStops lists them all, so a test can walk every one.
+type supervisorStop string
+
+const (
+	// stopDecided: the task's outcome is decided, by its final result, a
+	// failed result, or a turn that could not be prepared or started.
+	stopDecided      supervisorStop = "decided"
+	stopCanceled     supervisorStop = "canceled"
+	stopDeadline     supervisorStop = "deadline"
+	stopAbandoned    supervisorStop = "abandoned"
+	stopWriteRefused supervisorStop = "write-refused"
+	stopDelegated    supervisorStop = "delegated"
+	// stopEvicted: SIGTERM; supervise returns from that arm at once.
+	stopEvicted supervisorStop = "evicted"
+)
+
+// supervisorStops is every supervisorStop, for the test that walks them.
+var supervisorStops = []supervisorStop{stopDecided, stopCanceled, stopDeadline, stopAbandoned, stopWriteRefused, stopDelegated, stopEvicted}
+
 // supervise is the main loop: harness stdout events out, steering in, cancel
 // and eviction and the deadline racing all of it. The terminal decision
 // waits until the harness has exited AND its stdout is fully drained - a
@@ -1035,7 +1057,13 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// respawn mode: taken at a turn boundary, sent once the current
 		// process is gone.
 		nextPrompt string
+		// halted is every stop recorded for the task (halt). A respawn
+		// needs it empty.
+		halted []supervisorStop
 	)
+
+	// halt records a stop. Every place below that stops the task calls it.
+	halt := func(s supervisorStop) { halted = append(halted, s) }
 
 	// refuseHeld refuses, on the stream and before the terminal, every steer
 	// still held when the task ends with no turn left for it: after the
@@ -1061,6 +1089,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		if !abandonKilled {
 			abandonKilled = true
+			halt(stopAbandoned)
 			log.Info("the dispatcher abandoned the task; stopping the harness", "task", a.taskID, "reason", a.abandonReason)
 			proc.kill(0)
 		}
@@ -1104,6 +1133,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
 						}
 						if refused = r; refused != nil {
+							halt(stopWriteRefused)
 							// Stopped the way cancel stops it: closed stdin,
 							// SIGTERM to the process group, SIGKILL after
 							// KillGrace. The loop still drains its stdout and
@@ -1176,6 +1206,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
 								log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
 								sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+								halt(stopDecided)
 								proc.closeStdin()
 								continue
 							}
@@ -1192,10 +1223,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							}
 						}
 						if ev.Failed {
+							halt(stopDecided)
 							sawResult = true
 							resultErr = ev.Token
 							resultText = ev.Text
 						} else if pendingTurns <= 0 {
+							halt(stopDecided)
 							sawResult = true
 							resultText = ev.Text
 						} else {
@@ -1267,6 +1300,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					continue
 				}
 				delegated = true
+				halt(stopDelegated)
 				line := delegatedTo(ask.req)
 				next := "; this turn ends now and the result arrives as your next turn"
 				if ask.req.IsBatch() {
@@ -1298,16 +1332,19 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					continue
 				}
 				canceled = true
+				halt(stopCanceled)
 				log.Info("cancel received; killing harness", "task", a.taskID)
 				proc.kill(a.cfg.KillGrace)
 
 			case <-deadline.C:
 				deadlineHit = true
+				halt(stopDeadline)
 				proc.kill(a.cfg.KillGrace)
 
 			case <-ctx.Done():
 				// Eviction: kubelet SIGTERM landed. Flush what the harness
 				// already produced, state the reason honestly, exit 143.
+				halt(stopEvicted)
 				proc.kill(0)
 				// The dispatcher already wrote an abandoned task's terminal,
 				// whether its abandon was taken first or is waiting beside the
@@ -1349,10 +1386,13 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		prompt := nextPrompt
 		nextPrompt = ""
-		if sawResult || canceled || deadlineHit || refused != nil || a.abandoned() {
-			// The task ended while the last process wound down (a result
-			// decided it, cancel, the deadline, a write refusal, an abandon);
-			// the steer it took never ran.
+		// Fail closed: the next process starts only when no stop was
+		// recorded (halt) and the last process exited cleanly after its stdin
+		// closed. A stop that kills the process leaves an exit error, so one
+		// that forgot to record itself still starts nothing.
+		if len(halted) > 0 || a.abandoned() || waitErr != nil {
+			log.Info("no further harness process for the held steer; refusing it",
+				"task", a.taskID, "stops", halted, "exitErr", waitErr)
 			a.publishSteerRefusal(prompt, "")
 			break
 		}
