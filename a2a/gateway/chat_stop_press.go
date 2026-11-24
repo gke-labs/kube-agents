@@ -113,7 +113,7 @@ func isChatTypedStop(msg InboundMessage, backend string) bool {
 	return lineStopBackends[backend] && msg.TaskID == "" && !msg.Click
 }
 
-// chatTypedStop answers a stop typed on Google Chat on rec's active task,
+// chatTypedStop answers a stop typed on Google Chat or Teams on rec's active task,
 // which has a line, as a press is answered (stopOnLine). A second stop
 // while the cancel is pending closes the line on cancelAlreadySentNotice,
 // which also lands the close a first edit missed. No message of the

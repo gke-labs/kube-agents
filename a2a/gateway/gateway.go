@@ -1604,7 +1604,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
-		// Google Chat's Stop button names its task (gchat_stop.go): a
+		// Google Chat's Stop button and Teams's name their task
+		// (gchat_stop.go, teams_press.go): a
 		// press on a task that is not the running one is a stale button,
 		// answered on its own line, and cancels nothing. Read before the
 		// requester gate below: it cancels nothing, so anyone may heal a
@@ -1634,8 +1635,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// press was made a typed stop above, and takes that path below.
 		g.chatStopPress(ctx, rec, msg, authority)
 	case stopping && isChatTypedStop(msg, backend) && active != nil && active.StatusMsgID != "" && !g.cardStopWanted(rec, msg):
-		// A stop typed on Google Chat with a line to answer on answers as a
-		// press does, on the line, and posts nothing (chat_stop_press.go):
+		// A stop typed on Google Chat or Teams with a line to answer on answers
+		// as a press does, on the line, and posts nothing (chat_stop_press.go):
 		// the cancel, or "cancel already sent" while its terminal is
 		// pending. With the card stop armed, or no line, it takes the typed
 		// stop's path below, posts and all.

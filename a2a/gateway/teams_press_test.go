@@ -83,6 +83,26 @@ func TestTeamsPlainTextLineCarriesNoStopButton(t *testing.T) {
 	}
 }
 
+// A line whose card with its button would pass the activity budget goes out
+// as plain text, which carries no button: the line itself never fails for
+// the control.
+func TestTeamsALineTooLargeForItsCardDropsTheStopButton(t *testing.T) {
+	lines := strings.Repeat("x\n", 200)
+	fitted := teamsFitActivityWith(lines, true, 1500, teamsStopActions("task-1"))
+	if fitted["attachments"] != nil || fitted["text"] != lines {
+		t.Fatalf("a card over the cap should post as text with no actions: %v", fitted)
+	}
+	carded := teamsFitActivityWith("⚙️ **working**", true, teamsMaxActivityBytes, teamsStopActions("task-1"))
+	attachments, _ := carded["attachments"].([]map[string]any)
+	if len(attachments) != 1 {
+		t.Fatalf("a short line should keep its card: %v", carded)
+	}
+	content, _ := attachments[0]["content"].(map[string]any)
+	if actions, _ := content[teamsCardActionsKey].([]map[string]any); len(actions) != 1 {
+		t.Fatalf("a short line's card lost its Stop button: %v", content)
+	}
+}
+
 // testTeamsPress is the activity Teams sends for a press of a button on the
 // card of message: a message with no text, the button's data as its value.
 func testTeamsPress(id, message string, data map[string]any) map[string]any {
