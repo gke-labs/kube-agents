@@ -11,12 +11,14 @@ import (
 )
 
 // The defaults for CreateEphemeralConsumer. A healthy create answers in
-// milliseconds, so an attempt that takes AttemptTimeout is one the server
-// can't answer yet, not a slow one. Three attempts bound the consumers a
-// timed-out create may leave behind (see CreateEphemeralConsumer).
+// milliseconds, so an attempt that takes this long is one the server can't
+// answer yet, not a slow one. Three attempts bound the consumers a timed-out
+// create may leave behind (see CreateEphemeralConsumer). No attempt is given
+// less than EphemeralCreateMinAttempt unless less than that is left.
 const (
 	EphemeralCreateAttemptTimeout = 10 * time.Second
 	EphemeralCreateMaxAttempts    = 3
+	EphemeralCreateMinAttempt     = time.Second
 )
 
 // ConsumerCreator is what CreateEphemeralConsumer creates a consumer on.
@@ -33,17 +35,19 @@ type EphemeralCreateOptions struct {
 	Logger         *slog.Logger
 	// Slot, when set, is taken before every attempt and handed the attempt's
 	// outcome when the attempt no longer needs it: release(false) when the
-	// server refused the create, so nothing was made; release(true) when an
-	// attempt timed out, so a consumer may still be made later. The winning
-	// attempt's release is returned to the caller, who holds it for the
-	// consumer's life. An error from Slot ends the create with that error.
+	// server refused the create, so nothing was made; release(true) when the
+	// attempt failed any other way (a timeout, a dropped connection), so a
+	// consumer may still be made later. The winning attempt's release is
+	// returned to the caller, who holds it for the consumer's life. An error
+	// from Slot ends the create with that error.
 	Slot func() (release func(created bool), err error)
-	// Stream names the stream in log lines.
+	// Stream names the stream in log lines and errors.
 	Stream string
 }
 
 // ErrEphemeralCreateTimedOut is wrapped by the error CreateEphemeralConsumer
-// returns when every attempt timed out.
+// returns when every attempt timed out. The error also wraps the last
+// attempt's own error, context.DeadlineExceeded for a timeout.
 var ErrEphemeralCreateTimedOut = errors.New("every attempt to create the consumer timed out")
 
 // CreateEphemeralConsumer creates an ephemeral consumer on s, giving each
@@ -54,8 +58,16 @@ var ErrEphemeralCreateTimedOut = errors.New("every attempt to create the consume
 // peers, and it can pick a peer that is offline. A create placed there gets
 // no answer until that peer returns, so a create bounded only by the
 // caller's deadline hangs for all of it (#7082). Each retry is a new
-// placement. A refusal from the server (a JetStream API error) is returned at
-// once and not retried.
+// placement.
+//
+// Each attempt gets AttemptTimeout, or an even share of what is left of ctx's
+// deadline across the attempts still to come when that is shorter, so a
+// caller with a short deadline still gets its retries; never less than
+// EphemeralCreateMinAttempt unless less than that is left.
+//
+// A refusal from the server (a JetStream API error) is returned at once and
+// not retried. Any other error that isn't the attempt's own timeout (a
+// closed connection, say) is returned at once too.
 //
 // A timed-out attempt may still leave a consumer, made when its peer returns
 // and reaped once idle. MaxAttempts bounds how many one call can leave.
@@ -75,11 +87,15 @@ func CreateEphemeralConsumer(ctx context.Context, s ConsumerCreator, cfg jetstre
 	}
 	timedOut := 0
 	var lastErr error
+	ended := func(err error) error {
+		return fmt.Errorf("create a consumer on %s: %d attempt(s) timed out before the caller's context ended: %w",
+			o.Stream, timedOut, err)
+	}
 	for attempt := 1; attempt <= o.MaxAttempts; attempt++ {
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
-				return nil, nil, fmt.Errorf("create a consumer on %s: %d attempts timed out before the deadline: %w", o.Stream, timedOut, ctx.Err())
+				return nil, nil, ended(ctx.Err())
 			case <-time.After(fullJitterBackoff(attempt - 1)):
 			}
 		}
@@ -87,11 +103,14 @@ func CreateEphemeralConsumer(ctx context.Context, s ConsumerCreator, cfg jetstre
 		if o.Slot != nil {
 			r, err := o.Slot()
 			if err != nil {
+				if timedOut > 0 {
+					return nil, nil, fmt.Errorf("create a consumer on %s after %d timed-out attempt(s): %w", o.Stream, timedOut, err)
+				}
 				return nil, nil, err
 			}
 			release = r
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, o.AttemptTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout(ctx, o.AttemptTimeout, o.MaxAttempts-attempt+1))
 		cons, err := s.CreateConsumer(attemptCtx, cfg)
 		attemptExpired := attemptCtx.Err() != nil
 		cancel()
@@ -109,21 +128,37 @@ func CreateEphemeralConsumer(ctx context.Context, s ConsumerCreator, cfg jetstre
 		}
 		// Anything else may have been answered after we stopped waiting.
 		release(true)
+		if attemptExpired {
+			timedOut++
+		}
 		if ctx.Err() != nil {
-			return nil, nil, fmt.Errorf("create a consumer on %s: %d attempts timed out before the deadline: %w", o.Stream, timedOut, err)
+			return nil, nil, ended(err)
 		}
 		if !attemptExpired {
 			// Not this attempt's timeout (a closed connection, say): the
 			// caller's error, not a placement to retry.
 			return nil, nil, err
 		}
-		timedOut++
 		lastErr = err
 		log.Info("consumer create timed out; it may be placed on a bus server that is down", "stream", o.Stream,
-			"attempt", attempt, "of", o.MaxAttempts, "timeout", o.AttemptTimeout, "err", err)
+			"attempt", attempt, "of", o.MaxAttempts, "err", err)
 	}
-	return nil, nil, fmt.Errorf("create a consumer on %s: %w (%d of %d, %s each; each may leave a consumer the server reaps once idle): %v",
-		o.Stream, ErrEphemeralCreateTimedOut, timedOut, o.MaxAttempts, o.AttemptTimeout, lastErr)
+	return nil, nil, fmt.Errorf("create a consumer on %s: %w (%d of %d; each may leave a consumer the server reaps once idle): %w",
+		o.Stream, ErrEphemeralCreateTimedOut, timedOut, o.MaxAttempts, lastErr)
+}
+
+// attemptTimeout is one attempt's share: limit, or what is left of ctx's
+// deadline split across the attempts still to come when that is shorter, but
+// not under EphemeralCreateMinAttempt unless less than that is left.
+func attemptTimeout(ctx context.Context, limit time.Duration, left int) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return limit
+	}
+	remaining := time.Until(deadline)
+	share := remaining / time.Duration(max(1, left))
+	share = max(share, min(EphemeralCreateMinAttempt, remaining))
+	return min(limit, share)
 }
 
 // consumerLeader is the consumer's cluster leader as the create's answer

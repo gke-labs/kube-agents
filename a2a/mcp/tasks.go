@@ -29,7 +29,8 @@ const (
 
 	// maxTaskReaders bounds the consumers this server holds at once, across
 	// every caller and every reader (tasks, topics). A slot is held for a
-	// read or watch and then for taskConsumerIdle after it, which is how
+	// read or watch, or for a create attempt that timed out
+	// (createReadConsumer), and then for taskConsumerIdle after it, which is how
 	// long the server keeps the consumer before reaping it: the console
 	// grant cannot delete one, so a slot freed at the end of the read would
 	// let rapid reads pile consumers up against the stream's cap, which the
@@ -49,7 +50,8 @@ const (
 // out of the stream's retention.
 var ErrTaskNotFound = errors.New("no such task on the bus")
 
-// errReadersBusy is every task reader slot in use.
+// errReadersBusy is every task reader slot in use, by reads or by create
+// attempts that timed out.
 var errReadersBusy = fmt.Errorf("this server already holds its %d bus readers; try again in a few seconds", maxTaskReaders)
 
 // TaskRef names a task as the bus does: by the addressee it was submitted to
@@ -150,9 +152,10 @@ func ParseTaskRef(ref, addressee string) (TaskRef, error) {
 }
 
 // readerSlot takes one of the server's reader slots, or reports them all busy
-// without waiting. Release hands the slot back: once the consumer the read
-// created has had time to be reaped (taskConsumerIdle) when created says the
-// read may have left one, and at once when it cannot have.
+// without waiting. Release hands the slot back: once the consumer the read (or
+// one create attempt of it) created has had time to be reaped
+// (taskConsumerIdle) when created says it may have left one, and at once when
+// it cannot have.
 func (b *NATSBus) readerSlot() (release func(created bool), err error) {
 	select {
 	case b.readers <- struct{}{}:
@@ -172,10 +175,12 @@ func (b *NATSBus) readerSlot() (release func(created bool), err error) {
 }
 
 // createReadConsumer creates one of this server's read consumers on s, which
-// the log lines call stream. Each attempt takes a reader slot
-// (lib.CreateEphemeralConsumer): one whose create timed out stays taken until
-// the consumer it may have left would be reaped, and one the server refused
-// goes back at once. The returned release is the consumer's slot.
+// the log lines call stream, bounding and retrying each attempt
+// (lib.CreateEphemeralConsumer), which splits a short deadline across its
+// attempts. Each attempt takes a reader slot: one whose create timed out stays
+// taken until the consumer it may have left would be reaped, and one the
+// server refused goes back at once. The returned release is the consumer's
+// slot.
 func (b *NATSBus) createReadConsumer(ctx context.Context, s lib.ConsumerCreator, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, func(created bool), error) {
 	return lib.CreateEphemeralConsumer(ctx, s, cfg, lib.EphemeralCreateOptions{
 		Slot: b.readerSlot, Logger: b.logger(), Stream: stream, AttemptTimeout: b.createAttemptTimeout,

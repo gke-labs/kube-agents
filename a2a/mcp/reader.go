@@ -171,9 +171,10 @@ func fetchWait(ctx context.Context, wait time.Duration) time.Duration {
 // drainConsumer reads what one plain pull consumer on s has pending when it
 // is created, and stops: no acks, in memory, reaped by the server once idle
 // (taskConsumerIdle), never an ordered consumer, whose reset deletes a
-// consumer the console grant cannot. It takes one reader slot, held until the
-// consumer it creates is reaped, or handed back at once when the server
-// refused to create one (createReadConsumer). It reads through a budgetReader,
+// consumer the console grant cannot. It takes a reader slot per create
+// attempt (createReadConsumer): the consumer's is held until it is reaped, a
+// timed-out attempt's until the consumer it may have left would be, and a
+// refused attempt's goes back at once. It reads through a budgetReader,
 // waits for each message no longer than ctx's deadline, and reads at most
 // limit messages, failing after them if more were pending. It passes at most
 // readMaxBytes to each, and stops with ErrReadByteBudget before the message
