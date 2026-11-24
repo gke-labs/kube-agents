@@ -374,6 +374,11 @@ func (n *Notifier) Backend() string {
 	return n.backend
 }
 
+// Subject is the chat.notify subject the route serves.
+func (n *Notifier) Subject() string {
+	return n.subject
+}
+
 // keepJob is one refused home post on its way to the store, with the
 // requester's answer (Kept goes back only once the store has it) and the
 // requester's deadline, as notifyJob carries it.

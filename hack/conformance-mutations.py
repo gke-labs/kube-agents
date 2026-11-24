@@ -3425,6 +3425,17 @@ Mutation(
         "conversation whose context it knows, without the agent",
     ),
     Mutation(
+        "A3-bridge-sends-an-inject-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.inject",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the inject door's notify subject, "
+        "so a task the bridge runs can put a report into an eval "
+        "conversation without the agent. The harness then scores text the "
+        "agent never sent",
+    ),
+    Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)\n",

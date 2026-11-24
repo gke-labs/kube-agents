@@ -267,6 +267,12 @@ const (
 	a2aNotifySubjectConsole = "chat.notify.console"
 	a2aNotifySubjectTeams   = "chat.notify.teams"
 	a2aNotifyReplySubjects  = "chat.notify.reply.agent.>"
+	// The inject door's route (lib.NotifySubjectInject): a card filed from
+	// an eval turn reports back into its inject conversation. Granted, to
+	// the same two principals as the console's, only under the operator's
+	// eval flag (a2aInjectNotifyGrants); with the flag off no principal
+	// holds it and the account config neither exports nor imports it.
+	a2aNotifySubjectInject = "chat.notify.inject"
 
 	// The board route (a2a/gateway/board.go, a2a/hermes-bridge/board.go,
 	// a2a/lib/board.go): the Slack Home tab's read of the agent pod's board.
@@ -677,7 +683,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		"_INBOX.gateway.>",
 	)
 
-	return a2aIdentity{
+	id := a2aIdentity{
 		user:    a2aGatewayUser,
 		account: a2aAccountControl,
 		comment: "task requester, chat-session supervisor, session-registry owner.\n" +
@@ -763,6 +769,10 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		denyPublish:   withTasksFixedDurableDeny(capDenyPublish),
 		denySubscribe: capDenySubscribe,
 	}
+	// The inject door's report route, read beside the console's, on an eval
+	// install alone (nothing otherwise; a2aInjectNotifyGrants).
+	id.subscribe = append(id.subscribe, a2aInjectNotifyGrants()...)
+	return id
 }
 
 // The `agent` principal below is the correction of a claim this file used to
@@ -1016,6 +1026,9 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	// the gateway posts it to the home channel or to a conversation it holds a
 	// live session record for, and nowhere else.
 	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)
+	// The inject door's report route, on an eval install alone (nothing
+	// otherwise; a2aInjectNotifyGrants).
+	publish = append(publish, a2aInjectNotifyGrants()...)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{

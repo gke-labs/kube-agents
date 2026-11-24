@@ -2130,6 +2130,23 @@ platform, and its notifier reads a subscription's platform through its own `Plat
 the notify patch registers one in Hermes's platform registry. That registration is kanban-era
 and goes when kanban does.
 
+The eval harness's inject door has a route of its own too, `chat.notify.inject` (added 11/24),
+on an eval install only. It is the console route's code path on the door's own subject and
+conversation prefix (`inject:`): conversation requests only, each request one entry on the
+inject conversation's transcript (a `post`, or an `edit` naming the post an `update` key made),
+carrying the whole text, `replyTo` (the chain's root, as on a console frame) and `report: true`
+on a card's report, so the harness reads a relayed report back through the door's read route; a
+report is kept for the reply under it exactly as a console report is. The gateway subscribes
+only with the inject door armed (`A2A_INJECT_LISTEN` and its token, which the operator renders
+only under `A2A_INJECT_BACKEND`), and the operator grants the subject (the agent's publish, the
+gateway's subscribe, APP's export and TRUSTED's import, each beside the console's) only under the
+same flag. On any other install nothing subscribes to the subject and no principal may publish
+it, so a card on an inject conversation is refused by the bus, which the kanban notifier counts
+as a failed send like any refused notify. The agent side reaches it as platform `inject`
+(`lib.NotifyPlatformInject`, `a2a notify --platform inject`) and the conversation prefix
+`inject:` in the kanban notifier and the session-kv route store; a card on an inject conversation
+goes out only where `A2A_NOTIFY_CONVERSATIONS` names `inject`.
+
 The gateway keeps each report the route posts into a conversation for the reply under it: a post
 the kanban notifier marks as a card's report (`report`, `a2a notify --report`, set by
 `kanban_progress_lines._with_answer` on the settled card's report post alone, never on a progress
@@ -2169,8 +2186,8 @@ or a conversation the gateway holds a session record for carrying the request's 
 thread of another space, or a conversation without that record and context, is refused before
 any post (on Slack, a home post lands in the home channel only, which the gateway sets on every
 post). Who: the agent principal alone publishes `chat.notify.gchat`, `chat.notify.slack`,
-`chat.notify.teams` and `chat.notify.console`, and reads `chat.notify.reply.agent.>`; the gateway alone reads those four
-and publishes the reply. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
+`chat.notify.teams` and `chat.notify.console` (and, on an eval install, `chat.notify.inject`), and reads
+`chat.notify.reply.agent.>`; the gateway alone reads those subjects and publishes the reply. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
 the agent reads its JetStream replies there, and a gateway able to publish into it could
 forge them; a request whose reply subject is outside the namespace is dropped unanswered.
 The agent could already post the same text to the same channel or conversation through

@@ -188,8 +188,12 @@ ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # to a gateway conversation by kanban_event_routing (the hermes-bridge records
 # the route), and its chat_id is the session that holds the route, whose
 # context id conversation_context reads back: the report is sent with
-# --conversation and --context rather than --thread.
-CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "teams:", "console:")
+# --conversation and --context rather than --thread. "inject:" is the eval
+# harness's inject door (lib.NotifyPlatformInject): its report goes to
+# chat.notify.inject, which the operator grants only on an eval install, and
+# resolve serves it only when A2A_NOTIFY_CONVERSATIONS names it; anywhere else
+# the bus refuses the publish and the send fails as any refused notify does.
+CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "teams:", "console:", "inject:")
 # The console door's platform (lib.NotifyPlatformConsole). The gateway serves
 # its chat.notify route whenever the console runs, so it counts as served
 # with no environment variable naming it. Hermes has no console platform, and

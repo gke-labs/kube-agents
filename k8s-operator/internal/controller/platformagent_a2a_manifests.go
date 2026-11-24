@@ -1593,6 +1593,42 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
+// a2aInjectNotifyGrants is the inject door's chat.notify subject, exactly,
+// when the operator was deployed with the eval flag (A2A_INJECT_BACKEND), and
+// nothing otherwise: the agent's publish grant and the gateway's subscribe
+// grant both append it beside the console's, so the subject is reachable on
+// an eval install and on no other. One subject, no wildcard. Here rather
+// than in the identities file because tests/conformance resolves an appended
+// grant helper out of this file.
+func a2aInjectNotifyGrants() []string {
+	if !a2aInjectBackendEnabled() {
+		return nil
+	}
+	return []string{
+		a2aNotifySubjectInject,
+	}
+}
+
+// a2aInjectNotifyExportLines is APP's export of the inject door's notify
+// subject to TRUSTED, where the gateway reads it, and
+// a2aInjectNotifyImportLines is TRUSTED's import of it: the console's pair,
+// under the eval flag alone, "" otherwise.
+func a2aInjectNotifyExportLines() string {
+	var b strings.Builder
+	for _, subject := range a2aInjectNotifyGrants() {
+		fmt.Fprintf(&b, "      { stream: %q, accounts: [ TRUSTED ] }\n", subject)
+	}
+	return b.String()
+}
+
+func a2aInjectNotifyImportLines() string {
+	var b strings.Builder
+	for _, subject := range a2aInjectNotifyGrants() {
+		fmt.Fprintf(&b, "      { stream: { account: APP, subject: %q } }\n", subject)
+	}
+	return b.String()
+}
+
 // a2aTargetAllowlistEnv renders the CR's Chat, Slack and, with the gateway's
 // Teams backend armed, Teams allowlists for the gateway. An absent list, or
 // the allow-all spelling allowAllUsers accepts (for Teams, the CRD's explicit
@@ -2850,7 +2886,7 @@ accounts {
       { stream: { account: APP, subject: "chat.notify.slack" } }
       { stream: { account: APP, subject: "chat.notify.teams" } }
       { stream: { account: APP, subject: "chat.notify.console" } }
-      { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+` + a2aInjectNotifyImportLines() + `      { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
     ]
     users [
 ` + renderA2AStaticUsers(agent, pw, a2aAccountControl, profiles) + `    ]
@@ -2888,7 +2924,7 @@ accounts {
       { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
       { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
       { stream: "chat.notify.console", accounts: [ TRUSTED ] }
-      { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+` + a2aInjectNotifyExportLines() + `      { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
     ]
     imports [
       { service: { account: TRUSTED, subject: "$JS.API.INFO" } }

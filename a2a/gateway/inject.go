@@ -320,7 +320,14 @@ type InjectEntry struct {
 	// reads the token to tell the executor's own failure (bridge-shutdown,
 	// spawn-failed) from the persona's (hermes-exited-nonzero).
 	Reason string `json:"reason,omitempty"`
-	TS     string `json:"ts"`
+	// ReplyTo and Report are set on a post or edit the chat.notify route
+	// made (PostNotifyFrame) only: the root of the task the post reports on,
+	// as the console's notify frame carries it, and whether the post is a
+	// card's report, the one the gateway keeps for a reply under it. A
+	// reader finds a relayed card report by them.
+	ReplyTo string `json:"replyTo,omitempty"`
+	Report  bool   `json:"report,omitempty"`
+	TS      string `json:"ts"`
 }
 
 // injectRequest is the POST /inject body.
@@ -869,6 +876,27 @@ func (a *InjectAdapter) Edit(conversation, messageID, text string) error {
 	conv := a.conversationLocked(conversation)
 	a.appendLocked(conv, InjectEntry{Kind: InjectEntryEdit, Text: text, MessageID: messageID})
 	return nil
+}
+
+// PostNotifyFrame records a chat.notify post aimed at the conversation (the
+// inject notifier's consoleFramePoster, NewInjectNotifier): a post entry, or
+// an edit entry naming messageID for a keyed post the route made before,
+// carrying the task the post reports on and its report mark, as the
+// console's notify frame does. An empty messageID mints a new one.
+func (a *InjectAdapter) PostNotifyFrame(conversation, messageID, text, replyTo string, report, edit bool) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	if messageID == "" {
+		a.nextID = a.nextID + 1
+		messageID = injectMessageIDPrefix + strconv.Itoa(a.nextID)
+	}
+	kind := InjectEntryPost
+	if edit {
+		kind = InjectEntryEdit
+	}
+	a.appendLocked(conv, InjectEntry{Kind: kind, Text: text, MessageID: messageID, ReplyTo: replyTo, Report: report})
+	return messageID, nil
 }
 
 // PostMessage and EditMessage record text only: a chat message falls back
