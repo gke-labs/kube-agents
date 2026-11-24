@@ -15,8 +15,16 @@ run manifest that design's §2 specifies, the same one `collect.py` emits, so
 document instead, which no reader joins on: `adopt_collector_evidence` never
 saw it and the model's retyped excerpts shipped in place of the observed ones.
 
-All four of the SOP's checks are implemented here:
+All five of the SOP's checks are implemented here:
 
+- `node-conntrack-saturation` reads one day of the project's serial console
+  log in Cloud Logging for the kernel's line `nf_conntrack: table full,
+  dropping packet`, and names each GKE node pool whose nodes wrote it. It reads
+  the line and no share of `nf_conntrack_max`: GKE collects no figure for the
+  table by default. A node whose serial console does not reach Cloud Logging
+  would read clean, so the check also lists the RUNNING GKE nodes whose
+  `serial-port-logging-enable` metadata value is `true` and names the rest as
+  not covered.
 - `gce-startup-script-status` enumerates with `compute instances list`, keeps
   the RUNNING instances that actually run a startup script — its own metadata
   or the project's common metadata, read with `compute project-info describe` —
@@ -55,6 +63,16 @@ Field contracts assumed of `gcloud ... --format=json` output:
 - `compute instances list` items carry `name`, `status`, a `zone` selfLink
   whose last segment is the zone, and `metadata.items[].key`. Only `RUNNING`
   instances have serial console output to read.
+- A GKE node's instance carries the labels `goog-k8s-cluster-name`,
+  `goog-k8s-cluster-location` and `goog-k8s-node-pool-name` (read on GKE
+  Standard 1.35.8 nodes, 2026-11-24); an instance without the first is not a
+  GKE node. §2.6 lists the nodes with a read of its own, filtered on that
+  label.
+- A Cloud Logging entry of the serial console log carries the resource type
+  `gce_instance` with the zone under `resource.labels.zone`, the instance's
+  name under the label `compute.googleapis.com/resource_name`, the console
+  line under `textPayload` and a `timestamp` (read on the entries of a live
+  test, 2026-11-24).
 - `compute project-info describe` carries the project's common metadata under
   `commonInstanceMetadata.items[].key`, the same shape one item deeper.
 - `compute instances get-serial-port-output` returns **text, not JSON**, so it
@@ -201,6 +219,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import logging_reads  # noqa: E402
 import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
@@ -235,6 +254,7 @@ STARTUP_SLUG = "gce-startup-script-status"
 MIG_SLUG = "mig-convergence-stalled"
 SOLE_TENANT_SLUG = "sole-tenant-headroom"
 SNAPSHOT_SLUG = "orphaned-snapshots"
+CONNTRACK_SLUG = "node-conntrack-saturation"
 
 # §2.1's fatal markers, as `google_metadata_script_runner` prints them. The
 # guest agent current images ship logs `Script "startup-script" failed with
@@ -277,6 +297,20 @@ SOLE_TENANT_UTILISATION_PCT = 90
 # so §2.1 would read no console on any project whose common metadata sets no
 # startup script.
 INSTANCES_FORMAT = "--format=json(name,status,zone,metadata.items[].key)"
+# §2.6's own read of the project's GKE nodes. The three labels are the ones GKE
+# puts on a node's instance; the check reads them to tell a node from another
+# instance and to name its cluster and node pool. They are spelled one by one
+# so that no other label, which may hold a customer's own text, is read. The
+# read is apart from §2.1's so that §2.1's command, and the error text that
+# quotes it, stay as they are.
+GKE_CLUSTER_LABEL = "goog-k8s-cluster-name"
+GKE_LOCATION_LABEL = "goog-k8s-cluster-location"
+GKE_POOL_LABEL = "goog-k8s-node-pool-name"
+GKE_NODES_FILTER = f"--filter=status={RUNNING_STATUS} AND labels.{GKE_CLUSTER_LABEL}:*"
+GKE_NODES_FORMAT = (
+    "--format=json(name,status,zone,"
+    f"labels.{GKE_CLUSTER_LABEL},labels.{GKE_LOCATION_LABEL},labels.{GKE_POOL_LABEL})"
+)
 MIGS_FORMAT = "--format=json(name,size,targetSize,status,currentActions,zone,region)"
 NODE_GROUPS_FORMAT = "--format=json(name,size,zone,region,autoscalingPolicy)"
 DISKS_FORMAT = "--format=json(name,selfLink)"
@@ -293,7 +327,78 @@ SEVERITY = {
     MIG_SLUG: "major",
     SOLE_TENANT_SLUG: "minor",
     SNAPSHOT_SLUG: "minor",
+    CONNTRACK_SLUG: "major",
 }
+
+# §2.6 reads the kernel's own words for a full connection tracking table. GKE's
+# troubleshooting page names the line as the sign of the fault ("These can be
+# logged in the serial console of the node"), and a live test on GKE Standard
+# 1.35.8 found it in Cloud Logging, under the serial console log, within 90
+# seconds (2026-11-20, one node, one run).
+CONNTRACK_FULL_TEXT = "nf_conntrack: table full, dropping packet"
+SERIAL_CONSOLE_LOG_ID = "serialconsole.googleapis.com/serial_port_1_output"
+CONNTRACK_LOG_FILTER = (
+    'resource.type="gce_instance" '
+    f'AND log_id("{SERIAL_CONSOLE_LOG_ID}") '
+    f'AND textPayload:"{CONNTRACK_FULL_TEXT}"'
+)
+# The window is the audit's own cadence (cron `45 7 * * *`): each run reads the
+# day since the one before it.
+CONNTRACK_FRESHNESS_HOURS = 24
+CONNTRACK_FRESHNESS = f"{CONNTRACK_FRESHNESS_HOURS}h"
+# One page of `entries:list`. The kernel limits how often it writes the line,
+# so the number of lines is not the number of dropped packets, and a read that
+# fills the page says "this many or more", which the excerpt then states.
+CONNTRACK_LOG_LIMIT = 1000
+# The fields of a serial console log entry that §2.6 reads.
+LOG_LABELS_KEY = "labels"
+LOG_RESOURCE_KEY = "resource"
+LOG_ZONE_KEY = "zone"
+LOG_INSTANCE_ID_KEY = "instance_id"
+LOG_INSTANCE_NAME_LABEL = "compute.googleapis.com/resource_name"
+LOG_TEXT_KEY = "textPayload"
+LOG_TIMESTAMP_KEY = "timestamp"
+# How many node names one finding's excerpt lists before it counts the rest.
+CONNTRACK_NODES_SHOWN = 5
+# The metadata key that sends an instance's serial console to Cloud Logging,
+# and the value that turns it on. GKE sets it on its nodes; a cluster can be
+# made without it, and then a full table on its nodes writes nothing that this
+# check can read. The read below asks for the RUNNING GKE nodes whose value is
+# on and returns names only: a node's other metadata values hold credentials
+# (`kube-env`), so no value is ever printed.
+SERIAL_LOGGING_KEY = "serial-port-logging-enable"
+SERIAL_LOGGING_ON = "true"
+SERIAL_LOGGING_FILTER = (
+    f"{GKE_NODES_FILTER} AND metadata.items.key['{SERIAL_LOGGING_KEY}']['value']='{SERIAL_LOGGING_ON}'"
+)
+SERIAL_LOGGING_FORMAT = "--format=json(name,zone)"
+CONNTRACK_IMPACT = (
+    "The kernel dropped new connections on these nodes because the connection tracking "
+    "table was full. Pods there kept reading Ready while requests to and from them failed."
+)
+# How a GKE node pool and a single instance are named in a finding.
+NODE_POOL_OBJECT = "NodePool/{location}/{cluster}/{pool}"
+INSTANCE_OBJECT = "ComputeInstance/{zone}/{name}"
+# The zone of a log entry that names none; the API sets one on every entry of
+# a `gce_instance`, so this is the word for a changed contract.
+UNKNOWN_ZONE = "unknown-zone"
+CONNTRACK_AT_LEAST = "At least "
+CONNTRACK_POOL_EXCERPT = (
+    "{prefix}{lines} kernel line(s) `{text}` in the serial console log between {first} and "
+    "{last}, on {nodes} node(s) of node pool {pool} in cluster {cluster} ({location}): {names}."
+)
+CONNTRACK_INSTANCE_EXCERPT = (
+    "{prefix}{lines} kernel line(s) `{text}` in the serial console log between {first} and "
+    "{last}, on instance {name} ({zone}), which the instance list does not show as a RUNNING "
+    "node of a GKE node pool."
+)
+CONNTRACK_MORE_NODES = " and {more} more"
+# RFC 3339 down to the second: what an excerpt shows of an entry's timestamp.
+STAMP_SECONDS_CHARS = 19
+STAMP_UTC_SUFFIX = "Z"
+UNKNOWN_TIME_TEXT = "an unknown time"
+# What a failed read's reason says when the command wrote nothing to stderr.
+NO_STDERR_TEXT = "no stderr"
 
 # Structural non-applicability: the enumeration ran, came back empty, and the
 # check has no object to hold its condition against. A `checks_not_applicable`
@@ -451,6 +556,59 @@ UNREAD_SERIAL_LIMITATION = (
     "`compute instances get-serial-port-output` failed for all {total} "
     "RUNNING instance(s) that run a startup script, so no serial console output was read. They were "
     "enumerated, not examined."
+)
+
+# §2.6's structural case, the counterpart of NO_INSTANCES_REASON: the read ran
+# and no RUNNING instance is a GKE node, so there is no node whose table could
+# be full.
+NO_GKE_NODES_REASON = (
+    "No RUNNING Compute Engine instance on this project is a GKE node visible to the "
+    "audit identity: `compute instances list`, asked for RUNNING instances with GKE's "
+    "cluster label, returned none, so §2.6 has no node whose connection tracking table "
+    "could be full. Structural, not a missed read. " + AUTOPILOT_INVISIBLE_NOTE
+)
+# Every GKE node on the project belongs to a cluster that the declared scope
+# leaves out. The operator's choice, so not a coverage gap.
+EXCLUDED_GKE_NODES_REASON = (
+    "Every RUNNING GKE node on this project belongs to a cluster that the install's "
+    "declared scope leaves out ({total} node(s)), so §2.6 has no node in scope whose "
+    "connection tracking table could be full. Structural, not a missed read."
+)
+# The four `checks_unevaluated` cases for §2.6. In each, nothing was read about
+# the nodes' tables, so a stale finding must not be called fixed on the
+# strength of this run.
+UNREAD_GKE_NODES_REASON = (
+    "§2.6 could not list this project's GKE nodes, so it read nothing about their "
+    "connection tracking tables: {error}"
+)
+UNREAD_SERIAL_LOGGING_REASON = (
+    "§2.6 reads a node's serial console log in Cloud Logging, and the read of which of "
+    "the {total} RUNNING GKE node(s) on this project send that log there failed: {error}"
+)
+NO_SERIAL_LOGGING_REASON = (
+    "§2.6 reads a node's serial console log in Cloud Logging, and none of the {total} "
+    "RUNNING GKE node(s) on this project sets `serial-port-logging-enable` to `true`, so "
+    "a full connection tracking table on them writes nothing that this check can read."
+)
+UNREAD_CONNTRACK_LOG_REASON = (
+    "§2.6's read of the serial console log in Cloud Logging failed, so no line of the "
+    "{total} RUNNING GKE node(s) on this project was read: {error}"
+)
+CONNTRACK_UNEVALUATED_LIMITATION = (
+    "node-conntrack-saturation could not be evaluated on this project: {reason}"
+)
+# Some nodes send their serial console to Cloud Logging and some do not. The
+# check keeps its verdict for the first; this names the rest as passed over
+# rather than cleared, as PARTIAL_SERIAL_LIMITATION does for §2.1.
+PARTIAL_SERIAL_LOGGING_LIMITATION = (
+    "node-conntrack-saturation covers {covered} of the {total} RUNNING GKE node(s) on this "
+    "project. The rest do not set `serial-port-logging-enable` to `true`, so the check "
+    "passed them over rather than cleared them: {names}."
+)
+CONNTRACK_FULL_PAGE_LIMITATION = (
+    "node-conntrack-saturation read the newest {limit} serial console entries with the "
+    "kernel's line on this project; the read returned a full page, so older entries of "
+    "the {freshness} window were not read and a node pool named only there is not reported."
 )
 
 # §2.1's Do-NOT-flag limb is a GKE-node exclusion this collector does not
@@ -1120,6 +1278,172 @@ def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, b
     )
 
 
+def gke_nodes(instances: list) -> dict[tuple[str, str], dict]:
+    """`{(zone, name): {"cluster", "location", "pool"}}` for each RUNNING
+    instance that carries GKE's cluster label. An instance name is unique per
+    zone, not per project, so the key carries both. A node whose labels name no
+    location takes its zone, which is the location of a zonal cluster."""
+    nodes: dict[tuple[str, str], dict] = {}
+    for item in instances or []:
+        if not isinstance(item, dict) or item.get("status") != RUNNING_STATUS:
+            continue
+        labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
+        cluster = str(labels.get(GKE_CLUSTER_LABEL) or "").strip()
+        name = str(item.get("name") or "").strip()
+        zone = _last_segment(str(item.get("zone") or ""))
+        if not cluster or not name or not zone:
+            continue
+        nodes[(zone, name)] = {
+            "cluster": cluster,
+            "location": str(labels.get(GKE_LOCATION_LABEL) or "").strip() or zone,
+            "pool": str(labels.get(GKE_POOL_LABEL) or "").strip(),
+        }
+    return nodes
+
+
+def instance_keys(listed: list) -> set[tuple[str, str]]:
+    """`(zone, name)` for each item of a `compute instances list` read."""
+    keys: set[tuple[str, str]] = set()
+    for item in listed or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        zone = _last_segment(str(item.get("zone") or ""))
+        if name and zone:
+            keys.add((zone, name))
+    return keys
+
+
+def _stamp(timestamp: str) -> str:
+    """An entry's timestamp cut to the second, for an excerpt."""
+    return f"{timestamp[:STAMP_SECONDS_CHARS]}{STAMP_UTC_SUFFIX}" if timestamp else UNKNOWN_TIME_TEXT
+
+
+def check_conntrack_saturation(
+    entries: list,
+    nodes: dict[tuple[str, str], dict],
+    *,
+    skip: frozenset[tuple[str, str]] = frozenset(),
+    at_least: bool = False,
+) -> list[dict]:
+    """§2.6: one hit for each GKE node pool, and one for each other instance,
+    whose serial console log carries the kernel's line for a full connection
+    tracking table.
+
+    `entries` are Cloud Logging entries, `nodes` is `gke_nodes`' answer, `skip`
+    names the instances whose lines are left out (the nodes of a cluster the
+    declared scope excludes), and `at_least` says that the read filled its page,
+    so every count is a floor. A pool is the unit because a node's name changes
+    with each repair and upgrade, and a finding per node would open a new one
+    each time. No text from inside the guest reaches the excerpt: the line it
+    quotes is this file's constant, and the names come from the entry's labels,
+    which the platform sets.
+    """
+    groups: dict[str, dict] = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get(LOG_TEXT_KEY)
+        if not isinstance(text, str) or CONNTRACK_FULL_TEXT not in text:
+            continue
+        labels = entry.get(LOG_LABELS_KEY) if isinstance(entry.get(LOG_LABELS_KEY), dict) else {}
+        resource = entry.get(LOG_RESOURCE_KEY) if isinstance(entry.get(LOG_RESOURCE_KEY), dict) else {}
+        located = resource.get(LOG_LABELS_KEY) if isinstance(resource.get(LOG_LABELS_KEY), dict) else {}
+        zone = str(located.get(LOG_ZONE_KEY) or "").strip()
+        name = str(labels.get(LOG_INSTANCE_NAME_LABEL) or located.get(LOG_INSTANCE_ID_KEY) or "").strip()
+        if not name or (zone, name) in skip:
+            continue
+        node = nodes.get((zone, name))
+        if node and node["pool"]:
+            obj = NODE_POOL_OBJECT.format(location=node["location"], cluster=node["cluster"], pool=node["pool"])
+        else:
+            node = None
+            obj = INSTANCE_OBJECT.format(zone=zone or UNKNOWN_ZONE, name=name)
+        group = groups.setdefault(obj, {"node": node, "zone": zone or UNKNOWN_ZONE, "name": name, "lines": {}, "stamps": []})
+        group["lines"][name] = group["lines"].get(name, 0) + 1
+        stamp = str(entry.get(LOG_TIMESTAMP_KEY) or "")
+        if stamp:
+            group["stamps"].append(stamp)
+    hits: list[dict] = []
+    prefix = CONNTRACK_AT_LEAST if at_least else ""
+    for obj in sorted(groups):
+        group = groups[obj]
+        total = sum(group["lines"].values())
+        first = _stamp(min(group["stamps"], default=""))
+        last = _stamp(max(group["stamps"], default=""))
+        if group["node"]:
+            # Most lines first, then by name, so the excerpt is the same on every run.
+            ranked = sorted(group["lines"].items(), key=lambda pair: (-pair[1], pair[0]))
+            names = ", ".join(f"{name} ({count})" for name, count in ranked[:CONNTRACK_NODES_SHOWN])
+            if len(ranked) > CONNTRACK_NODES_SHOWN:
+                names += CONNTRACK_MORE_NODES.format(more=len(ranked) - CONNTRACK_NODES_SHOWN)
+            excerpt = CONNTRACK_POOL_EXCERPT.format(
+                prefix=prefix, lines=total, text=CONNTRACK_FULL_TEXT, first=first, last=last,
+                nodes=len(ranked), pool=group["node"]["pool"], cluster=group["node"]["cluster"],
+                location=group["node"]["location"], names=names,
+            )
+        else:
+            excerpt = CONNTRACK_INSTANCE_EXCERPT.format(
+                prefix=prefix, lines=total, text=CONNTRACK_FULL_TEXT, first=first, last=last,
+                name=group["name"], zone=group["zone"],
+            )
+        hits.append(
+            {
+                "object": obj,
+                "excerpt": excerpt[:MAX_EXCERPT_CHARS],
+                "impact": CONNTRACK_IMPACT,
+                "needs_triage": None,
+            }
+        )
+    return hits
+
+
+def run_logging_read(
+    argv: list[str], *, run: RunFn, project: str, filter_text: str, freshness: datetime.timedelta, limit: int,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+) -> Run:
+    """One `gcloud logging read`, served by the broker's Cloud API relay when it can be.
+
+    `fleet_stockout.run_logging_read` is the same function; this script ships
+    alone, so it carries its own. `argv` is the `gcloud` command and the other
+    arguments say the same read. The relay returns the entries `gcloud` prints,
+    as a JSON list, so the `Run` parses the same either way; when the relay
+    does not give the whole answer, `argv` runs. `timeout_s` bounds the read as
+    a whole.
+    """
+    started = time.monotonic()
+    try:
+        stdout = logging_reads.read_json(
+            project, logging_reads.freshness_filter(filter_text, freshness), limit, timeout_s=timeout_s
+        )
+    except logging_reads.ReadTimedOut as timed_out:
+        return Run(argv, TIMEOUT_RC, "", str(timed_out), time.monotonic() - started)
+    if stdout is not None:
+        return Run(argv, 0, stdout, "", time.monotonic() - started)
+    spent = int(time.monotonic() - started)
+    # A relay that is not there answers at once, and `gcloud` then has the whole time.
+    return run(argv, timeout=max(timeout_s - spent, 1)) if spent else run(argv)
+
+
+def _json_list(result: Run) -> list | None:
+    """`result`'s output as a JSON list, or None when the read failed, printed
+    nothing or printed anything else: the gate of `run_and_gate`, for a `Run`
+    that is already there."""
+    if result.rc != 0 or not (result.stdout or "").strip():
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _failure_text(argv: list[str], result: Run) -> str:
+    """One clipped sentence that names a failed read, for a reason."""
+    stderr = (result.stderr or "").strip()
+    return f"{' '.join(argv)} failed (rc={result.rc}): {stderr[:ERROR_CLIP_CHARS] or NO_STDERR_TEXT}"
+
+
 def _emit(slug: str, hit: dict, command: str = "") -> dict:
     emitted = {
         "check": slug,
@@ -1405,6 +1729,88 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 hit = check_orphaned_snapshot(snapshot, active, now)
                 if hit:
                     candidates.append(_emit(SNAPSHOT_SLUG, hit))
+
+        # --- 2.6 connection tracking table full ----------------------------- #
+        # None of this check's own reads is gated to the project: a refused log
+        # read must not cost the project its four other checks. It costs this
+        # check its verdict, which `checks_unevaluated` then says.
+        nodes_argv = [
+            GCLOUD, "compute", "instances", "list", "--project", project,
+            GKE_NODES_FILTER, GKE_NODES_FORMAT,
+        ]
+        listed_nodes, nodes_result = run_and_gate(nodes_argv, run=run)
+        all_nodes = gke_nodes(listed_nodes if isinstance(listed_nodes, list) else [])
+        # The nodes of a cluster the operator left out of the declared scope:
+        # neither read nor reported, and not a coverage gap.
+        left_out = frozenset(
+            key
+            for key, node in all_nodes.items()
+            if (project, node["location"], node["cluster"]) in declared_scope.excluded_clusters
+        )
+        nodes = {key: node for key, node in all_nodes.items() if key not in left_out}
+        if not isinstance(listed_nodes, list):
+            conntrack_reason = UNREAD_GKE_NODES_REASON.format(error=_failure_text(nodes_argv, nodes_result))
+            unevaluated.append({"check": CONNTRACK_SLUG, "reason": conntrack_reason})
+            limitations.append(CONNTRACK_UNEVALUATED_LIMITATION.format(reason=conntrack_reason))
+        elif not nodes:
+            reason = EXCLUDED_GKE_NODES_REASON.format(total=len(left_out)) if left_out else NO_GKE_NODES_REASON
+            not_applicable.append({"check": CONNTRACK_SLUG, "reason": reason})
+        else:
+            reads.setdefault(CONNTRACK_SLUG, SlugReads()).add(shlex.join(nodes_argv), nodes_result)
+            logging_argv = [
+                GCLOUD, "compute", "instances", "list", "--project", project,
+                SERIAL_LOGGING_FILTER, SERIAL_LOGGING_FORMAT,
+            ]
+            logged, logged_result = run_and_gate(logging_argv, run=run)
+            covered = instance_keys(logged) & set(nodes) if isinstance(logged, list) else set()
+            uncovered = sorted(f"{name} ({zone})" for zone, name in nodes if (zone, name) not in covered)
+            conntrack_reason = ""
+            if not isinstance(logged, list):
+                conntrack_reason = UNREAD_SERIAL_LOGGING_REASON.format(
+                    total=len(nodes), error=_failure_text(logging_argv, logged_result)
+                )
+            elif not covered:
+                conntrack_reason = NO_SERIAL_LOGGING_REASON.format(total=len(nodes))
+            else:
+                reads[CONNTRACK_SLUG].add(shlex.join(logging_argv), logged_result)
+                read_argv = [
+                    GCLOUD, "logging", "read", CONNTRACK_LOG_FILTER,
+                    "--project", project, "--freshness", CONNTRACK_FRESHNESS,
+                    "--limit", str(CONNTRACK_LOG_LIMIT), "--format", "json",
+                ]
+                read_result = run_logging_read(
+                    read_argv, run=run, project=project, filter_text=CONNTRACK_LOG_FILTER,
+                    freshness=datetime.timedelta(hours=CONNTRACK_FRESHNESS_HOURS), limit=CONNTRACK_LOG_LIMIT,
+                )
+                entries = _json_list(read_result)
+                if entries is None:
+                    conntrack_reason = UNREAD_CONNTRACK_LOG_REASON.format(
+                        total=len(nodes), error=_failure_text(read_argv, read_result)
+                    )
+                else:
+                    read_command = shlex.join(read_argv)
+                    reads[CONNTRACK_SLUG].add(read_command, read_result)
+                    full_page = len(entries) >= CONNTRACK_LOG_LIMIT
+                    for hit in check_conntrack_saturation(entries, nodes, skip=left_out, at_least=full_page):
+                        candidates.append(_emit(CONNTRACK_SLUG, hit, read_command))
+                    if uncovered:
+                        shown = ", ".join(uncovered[:CONNTRACK_NODES_SHOWN])
+                        if len(uncovered) > CONNTRACK_NODES_SHOWN:
+                            shown += CONNTRACK_MORE_NODES.format(more=len(uncovered) - CONNTRACK_NODES_SHOWN)
+                        limitations.append(
+                            PARTIAL_SERIAL_LOGGING_LIMITATION.format(
+                                covered=len(covered), total=len(nodes), names=shown
+                            )
+                        )
+                    if full_page:
+                        limitations.append(
+                            CONNTRACK_FULL_PAGE_LIMITATION.format(
+                                limit=CONNTRACK_LOG_LIMIT, freshness=CONNTRACK_FRESHNESS
+                            )
+                        )
+            if conntrack_reason:
+                unevaluated.append({"check": CONNTRACK_SLUG, "reason": conntrack_reason})
+                limitations.append(CONNTRACK_UNEVALUATED_LIMITATION.format(reason=conntrack_reason))
     except ComputeApiDisabled:
         log(f"{project}: Compute Engine API is not enabled; nothing here to audit")
         return None

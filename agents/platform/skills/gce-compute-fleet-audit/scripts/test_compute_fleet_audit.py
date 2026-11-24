@@ -438,7 +438,17 @@ class CollectProjectTest(unittest.TestCase):
             return inner(argv, **kwargs)
 
         cf.collect_project("proj-1", run=run)
-        formats = {" ".join(argv[1:argv.index("list") + 1]): argv[-1] for argv in issued if argv[0] == "gcloud" and "list" in argv}
+        # §2.6 lists the project's GKE nodes with a read of its own, filtered
+        # and with its own projection; it is held apart so that the map below
+        # still names §2.1's read.
+        node_reads = [argv for argv in issued if cf.GKE_NODES_FILTER in argv]
+        self.assertEqual([argv[-1] for argv in node_reads], [cf.GKE_NODES_FORMAT])
+        self.assertRegex(cf.GKE_NODES_FORMAT, r"^--format=json\([^()]+\)$")
+        formats = {
+            " ".join(argv[1:argv.index("list") + 1]): argv[-1]
+            for argv in issued
+            if argv[0] == "gcloud" and "list" in argv and argv not in node_reads
+        }
         self.assertEqual(
             {
                 "compute instances list": cf.INSTANCES_FORMAT,
@@ -2447,6 +2457,441 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+# --------------------------------------------------------------------------- #
+# §2.6 node-conntrack-saturation
+# --------------------------------------------------------------------------- #
+
+NODE_ZONE = "us-central1-a"
+NODE_A = "gke-seeded-a-default-pool-91f4e43e-ik4g"
+NODE_B = "gke-seeded-a-default-pool-91f4e43e-ubxv"
+NODE_BATCH = "gke-seeded-a-idle-batch-pool-8719173b-v6ic"
+
+
+def gke_node(name: str = NODE_A, pool: str = "default-pool", cluster: str = "seeded-a",
+             zone: str = NODE_ZONE, status: str = "RUNNING", location: str | None = NODE_ZONE) -> dict:
+    """One item of §2.6's node read, as a GKE Standard 1.35.8 node's instance
+    answered it on 2026-11-24."""
+    labels = {cf.GKE_CLUSTER_LABEL: cluster, cf.GKE_POOL_LABEL: pool}
+    if location:
+        labels[cf.GKE_LOCATION_LABEL] = location
+    return {
+        "name": name,
+        "status": status,
+        "zone": f"https://www.googleapis.com/compute/v1/projects/proj-1/zones/{zone}",
+        "labels": labels,
+    }
+
+
+def logged(*names: str, zone: str = NODE_ZONE) -> str:
+    """The answer of the read that lists the nodes whose serial console reaches Cloud Logging."""
+    return json.dumps(
+        [{"name": name, "zone": f"https://www.googleapis.com/compute/v1/projects/proj-1/zones/{zone}"} for name in names]
+    )
+
+
+def conntrack_entry(name: str = NODE_A, stamp: str = "2026-11-20T19:59:32.454392524Z", zone: str = NODE_ZONE,
+                    text: str = "[  368.753785] nf_conntrack: nf_conntrack: table full, dropping packet\\r\\n") -> dict:
+    """One Cloud Logging entry of the serial console log, in the shape a live
+    test's entries had (GKE Standard 1.35.8, 2026-11-20; read back 2026-11-24)."""
+    return {
+        "insertId": "6391",
+        "labels": {"compute.googleapis.com/resource_name": name, "is_text_escaped": "true"},
+        "logName": "projects/proj-1/logs/serialconsole.googleapis.com%2Fserial_port_1_output",
+        "resource": {"labels": {"instance_id": "8305510573532847053", "project_id": "proj-1", "zone": zone}, "type": "gce_instance"},
+        "severity": "INFO",
+        "textPayload": text,
+        "timestamp": stamp,
+    }
+
+
+class GkeNodesTest(unittest.TestCase):
+    def test_a_running_instance_with_the_cluster_label_is_a_node(self):
+        self.assertEqual(
+            cf.gke_nodes([gke_node()]),
+            {(NODE_ZONE, NODE_A): {"cluster": "seeded-a", "location": NODE_ZONE, "pool": "default-pool"}},
+        )
+
+    def test_an_instance_without_the_cluster_label_is_not_a_node(self):
+        plain = json.loads(one_running_instance())
+        self.assertEqual(cf.gke_nodes(plain), {})
+
+    def test_a_node_that_is_not_running_is_left_out(self):
+        self.assertEqual(cf.gke_nodes([gke_node(status="TERMINATED")]), {})
+
+    def test_a_node_without_the_location_label_takes_its_zone(self):
+        self.assertEqual(cf.gke_nodes([gke_node(location=None)])[(NODE_ZONE, NODE_A)]["location"], NODE_ZONE)
+
+    def test_a_regional_clusters_node_keeps_the_region_as_its_location(self):
+        nodes = cf.gke_nodes([gke_node(location="us-central1")])
+        self.assertEqual(nodes[(NODE_ZONE, NODE_A)]["location"], "us-central1")
+
+    def test_an_item_that_is_not_an_object_is_passed_over(self):
+        self.assertEqual(cf.gke_nodes(["oops", None, gke_node()]).keys(), {(NODE_ZONE, NODE_A)})
+
+
+class ConntrackSaturationTest(unittest.TestCase):
+    NODES = cf.gke_nodes([gke_node(NODE_A), gke_node(NODE_B), gke_node(NODE_BATCH, pool="idle-batch-pool")])
+
+    def test_lines_on_one_node_name_its_pool(self):
+        entries = [
+            conntrack_entry(stamp="2026-11-20T19:59:32.454392524Z"),
+            conntrack_entry(stamp="2026-11-20T19:59:30.000000000Z"),
+        ]
+        hits = cf.check_conntrack_saturation(entries, self.NODES)
+        self.assertEqual([h["object"] for h in hits], ["NodePool/us-central1-a/seeded-a/default-pool"])
+        excerpt = hits[0]["excerpt"]
+        self.assertTrue(excerpt.startswith("2 kernel line(s) `nf_conntrack: table full, dropping packet`"), excerpt)
+        self.assertIn("between 2026-11-20T19:59:30Z and 2026-11-20T19:59:32Z", excerpt)
+        self.assertIn("on 1 node(s) of node pool default-pool in cluster seeded-a (us-central1-a)", excerpt)
+        self.assertIn(f"{NODE_A} (2)", excerpt)
+        self.assertEqual(hits[0]["impact"], cf.CONNTRACK_IMPACT)
+        self.assertIsNone(hits[0]["needs_triage"])
+
+    def test_two_nodes_of_one_pool_make_one_finding_with_the_busier_node_first(self):
+        entries = [conntrack_entry(NODE_B), conntrack_entry(NODE_A), conntrack_entry(NODE_B)]
+        hits = cf.check_conntrack_saturation(entries, self.NODES)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("3 kernel line(s)", hits[0]["excerpt"])
+        self.assertIn("on 2 node(s)", hits[0]["excerpt"])
+        self.assertIn(f"{NODE_B} (2), {NODE_A} (1)", hits[0]["excerpt"])
+
+    def test_two_pools_make_two_findings_in_a_stable_order(self):
+        entries = [conntrack_entry(NODE_BATCH), conntrack_entry(NODE_A)]
+        hits = cf.check_conntrack_saturation(entries, self.NODES)
+        self.assertEqual(
+            [h["object"] for h in hits],
+            ["NodePool/us-central1-a/seeded-a/default-pool", "NodePool/us-central1-a/seeded-a/idle-batch-pool"],
+        )
+
+    def test_a_pool_with_many_nodes_counts_the_ones_it_does_not_name(self):
+        names = [f"gke-seeded-a-default-pool-91f4e43e-n{i:03d}" for i in range(cf.CONNTRACK_NODES_SHOWN + 2)]
+        nodes = cf.gke_nodes([gke_node(name) for name in names])
+        hits = cf.check_conntrack_saturation([conntrack_entry(name) for name in names], nodes)
+        self.assertIn(f"on {len(names)} node(s)", hits[0]["excerpt"])
+        self.assertIn(names[cf.CONNTRACK_NODES_SHOWN - 1], hits[0]["excerpt"])
+        self.assertNotIn(names[cf.CONNTRACK_NODES_SHOWN], hits[0]["excerpt"])
+        self.assertTrue(hits[0]["excerpt"].endswith(" and 2 more."), hits[0]["excerpt"])
+
+    def test_an_instance_that_is_no_listed_node_gets_a_finding_of_its_own(self):
+        hits = cf.check_conntrack_saturation([conntrack_entry("gke-old-node-gone")], self.NODES)
+        self.assertEqual([h["object"] for h in hits], ["ComputeInstance/us-central1-a/gke-old-node-gone"])
+        self.assertIn("does not show as a RUNNING node of a GKE node pool", hits[0]["excerpt"])
+
+    def test_a_node_whose_pool_is_not_labelled_is_named_as_an_instance(self):
+        nodes = cf.gke_nodes([gke_node(pool="")])
+        hits = cf.check_conntrack_saturation([conntrack_entry()], nodes)
+        self.assertEqual([h["object"] for h in hits], [f"ComputeInstance/us-central1-a/{NODE_A}"])
+
+    def test_the_same_node_name_in_another_zone_is_not_that_node(self):
+        hits = cf.check_conntrack_saturation([conntrack_entry(zone="europe-west1-b")], self.NODES)
+        self.assertEqual([h["object"] for h in hits], [f"ComputeInstance/europe-west1-b/{NODE_A}"])
+
+    def test_an_entry_without_the_kernels_line_is_ignored(self):
+        entries = [conntrack_entry(text="[  1.0] nf_conntrack: default automatic helper assignment\\r\\n"), "oops", None, {"textPayload": 7}]
+        self.assertEqual(cf.check_conntrack_saturation(entries, self.NODES), [])
+
+    def test_no_entries_make_no_finding(self):
+        self.assertEqual(cf.check_conntrack_saturation([], self.NODES), [])
+
+    def test_an_entry_with_no_name_label_falls_back_to_the_instance_id(self):
+        entry = conntrack_entry()
+        del entry["labels"]["compute.googleapis.com/resource_name"]
+        hits = cf.check_conntrack_saturation([entry], self.NODES)
+        self.assertEqual([h["object"] for h in hits], ["ComputeInstance/us-central1-a/8305510573532847053"])
+
+    def test_an_entry_that_names_no_instance_at_all_is_ignored(self):
+        entry = conntrack_entry()
+        entry["labels"] = {}
+        entry["resource"] = {"type": "gce_instance"}
+        self.assertEqual(cf.check_conntrack_saturation([entry], self.NODES), [])
+
+    def test_the_lines_of_a_skipped_instance_are_left_out(self):
+        skip = frozenset({(NODE_ZONE, NODE_A)})
+        hits = cf.check_conntrack_saturation([conntrack_entry(NODE_A), conntrack_entry(NODE_BATCH)], self.NODES, skip=skip)
+        self.assertEqual([h["object"] for h in hits], ["NodePool/us-central1-a/seeded-a/idle-batch-pool"])
+
+    def test_a_full_page_makes_every_count_a_floor(self):
+        hits = cf.check_conntrack_saturation([conntrack_entry()], self.NODES, at_least=True)
+        self.assertTrue(hits[0]["excerpt"].startswith("At least 1 kernel line(s)"), hits[0]["excerpt"])
+
+    def test_no_text_from_inside_the_guest_reaches_the_excerpt(self):
+        """The console line is text from inside the guest. The excerpt quotes
+        this file's constant and the platform's labels, never the payload."""
+        entry = conntrack_entry(text="password=hunter2 nf_conntrack: table full, dropping packet token=abc\\r\\n")
+        hits = cf.check_conntrack_saturation([entry], self.NODES)
+        self.assertNotIn("hunter2", hits[0]["excerpt"])
+        self.assertNotIn("token=abc", hits[0]["excerpt"])
+
+    def test_an_entry_without_a_timestamp_still_counts(self):
+        entry = conntrack_entry()
+        del entry["timestamp"]
+        hits = cf.check_conntrack_saturation([entry], self.NODES)
+        self.assertIn("between an unknown time and an unknown time", hits[0]["excerpt"])
+
+
+class ConntrackInCollectProjectTest(unittest.TestCase):
+    """§2.6 inside `collect_project`: its three reads, and what each outcome
+    leaves in the manifest entry."""
+
+    def responses(self, *, nodes: list | None = None, logged_names: tuple = (NODE_A,), entries: list | None = None, **overrides) -> dict:
+        """The clean project of `CollectProjectTest`, with §2.6's reads first:
+        the fake answers by substring in insertion order, and both of §2.6's
+        instance reads contain `instances list`."""
+        answers = {
+            cf.SERIAL_LOGGING_KEY: run_of(0, logged(*logged_names)),
+            cf.GKE_NODES_FILTER: run_of(0, json.dumps([gke_node()] if nodes is None else nodes)),
+            "logging read": run_of(0, json.dumps(entries or [])),
+            "instances list": run_of(0, one_running_instance()),
+            "project-info describe": run_of(0, NO_PROJECT_STARTUP_SCRIPT),
+            "get-serial-port-output": run_of(0, "boot ok\n"),
+            "instance-groups managed list": run_of(0, json.dumps([mig()])),
+            "node-groups list-nodes": run_of(0, "[]"),
+            "node-groups list": run_of(0, "[]"),
+            "disks list": run_of(0, "[]"),
+            "snapshots list": run_of(0, "[]"),
+        }
+        answers.update(overrides)
+        return answers
+
+    def collect(self, answers: dict) -> tuple[dict, list[list[str]]]:
+        issued: list[list[str]] = []
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            joined = " ".join(argv)
+            for needle, result in answers.items():
+                if needle in joined:
+                    return result
+            raise Unstubbed(f"unstubbed command: {joined}")
+
+        return cf.collect_project("proj-1", run=run), issued
+
+    @staticmethod
+    def conntrack(entry: dict) -> list[dict]:
+        return [c for c in entry["candidates"] if c["check"] == cf.CONNTRACK_SLUG]
+
+    @staticmethod
+    def declared(entry: dict) -> dict:
+        return {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
+
+    def setUp(self):
+        cf.declared_scope.set(None, None)
+        self.addCleanup(cf.declared_scope.set, None, None)
+
+    def test_a_node_with_the_kernels_line_is_a_major_finding_on_its_pool(self):
+        entry, _ = self.collect(self.responses(entries=[conntrack_entry(), conntrack_entry()]))
+        self.assertEqual(entry["outcome"], "collected")
+        (finding,) = self.conntrack(entry)
+        self.assertEqual(finding["object"], "NodePool/us-central1-a/seeded-a/default-pool")
+        self.assertEqual(finding["severity"], "major")
+        self.assertEqual(finding["namespace"], "")
+        self.assertIn("2 kernel line(s)", finding["excerpt"])
+        self.assertTrue(finding["command"].startswith("gcloud logging read "), finding["command"])
+        self.assertNotIn("limitations", entry)
+        self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+        self.assertNotIn(cf.CONNTRACK_SLUG, self.declared(entry))
+
+    def test_the_log_read_asks_for_one_day_of_the_serial_console_log(self):
+        _, issued = self.collect(self.responses())
+        (read,) = [argv for argv in issued if argv[1:3] == ["logging", "read"]]
+        self.assertEqual(
+            read,
+            [
+                "gcloud", "logging", "read",
+                'resource.type="gce_instance" AND log_id("serialconsole.googleapis.com/serial_port_1_output") '
+                'AND textPayload:"nf_conntrack: table full, dropping packet"',
+                "--project", "proj-1", "--freshness", "24h", "--limit", "1000", "--format", "json",
+            ],
+        )
+
+    def test_the_two_instance_reads_print_no_metadata_value(self):
+        """A node's metadata holds credentials (`kube-env`). The switch is read
+        through a filter, and both projections name no metadata field."""
+        _, issued = self.collect(self.responses())
+        reads = [argv for argv in issued if cf.GKE_NODES_FILTER in " ".join(argv)]
+        self.assertEqual(len(reads), 2)
+        for argv in reads:
+            self.assertNotIn("metadata", argv[-1], argv)
+        self.assertEqual(
+            cf.SERIAL_LOGGING_FILTER,
+            "--filter=status=RUNNING AND labels.goog-k8s-cluster-name:* "
+            "AND metadata.items.key['serial-port-logging-enable']['value']='true'",
+        )
+        self.assertEqual(cf.SERIAL_LOGGING_FORMAT, "--format=json(name,zone)")
+
+    def test_a_clean_log_is_a_check_that_ran_and_found_nothing(self):
+        entry, _ = self.collect(self.responses())
+        self.assertEqual(self.conntrack(entry), [])
+        (record,) = [c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG]
+        self.assertEqual(record["rc"], 0)
+        self.assertIn("gcloud logging read", record["command"])
+        self.assertIn("serial-port-logging-enable", record["command"])
+        self.assertNotIn(cf.CONNTRACK_SLUG, self.declared(entry))
+        self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+        self.assertNotIn("limitations", entry)
+
+    def test_a_project_with_no_gke_node_declares_the_check_inapplicable_and_reads_no_log(self):
+        entry, issued = self.collect(self.responses(nodes=[]))
+        self.assertEqual(self.declared(entry)[cf.CONNTRACK_SLUG], cf.NO_GKE_NODES_REASON)
+        self.assertEqual([argv for argv in issued if "logging" in argv], [])
+        self.assertEqual([c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG], [])
+        self.assertNotIn("limitations", entry)
+
+    def test_a_failed_node_list_leaves_the_check_unevaluated_and_the_project_collected(self):
+        entry, issued = self.collect(self.responses(**{cf.GKE_NODES_FILTER: run_of(1, "", "ERROR: backend error")}))
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIn("could not list this project's GKE nodes", unevaluated(entry)[cf.CONNTRACK_SLUG])
+        self.assertIn("backend error", unevaluated(entry)[cf.CONNTRACK_SLUG])
+        self.assertIn("node-conntrack-saturation could not be evaluated", entry["limitations"])
+        self.assertEqual([argv for argv in issued if "logging" in argv], [])
+        self.assertEqual([c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG], [])
+        # The four other checks keep their verdicts.
+        self.assertIn(cf.MIG_SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_read_of_the_switch_leaves_the_check_unevaluated(self):
+        entry, issued = self.collect(self.responses(**{cf.SERIAL_LOGGING_KEY: run_of(1, "", "ERROR: denied")}))
+        self.assertIn("send that log there failed", unevaluated(entry)[cf.CONNTRACK_SLUG])
+        self.assertEqual([argv for argv in issued if "logging" in argv], [])
+        self.assertEqual([c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG], [])
+
+    def test_nodes_that_send_no_serial_console_leave_the_check_unevaluated(self):
+        """A quiet node writes nothing to the log, so "no entries" would read
+        as clean on nodes the check cannot see at all."""
+        entry, issued = self.collect(self.responses(logged_names=()))
+        self.assertEqual(unevaluated(entry)[cf.CONNTRACK_SLUG], cf.NO_SERIAL_LOGGING_REASON.format(total=1))
+        self.assertEqual([argv for argv in issued if "logging" in argv], [])
+        self.assertIn("node-conntrack-saturation could not be evaluated", entry["limitations"])
+
+    def test_nodes_without_the_switch_are_named_and_the_rest_keep_their_verdict(self):
+        nodes = [gke_node(NODE_A), gke_node(NODE_B)]
+        entry, _ = self.collect(self.responses(nodes=nodes, logged_names=(NODE_A,), entries=[conntrack_entry(NODE_A)]))
+        self.assertEqual(len(self.conntrack(entry)), 1)
+        self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+        self.assertIn("covers 1 of the 2 RUNNING GKE node(s)", entry["limitations"])
+        self.assertIn(f"{NODE_B} (us-central1-a)", entry["limitations"])
+        self.assertNotIn(f"{NODE_A} (us-central1-a)", entry["limitations"])
+
+    def test_a_listed_instance_that_is_no_node_of_this_project_does_not_count_as_covered(self):
+        entry, _ = self.collect(self.responses(logged_names=("some-other-vm",)))
+        self.assertEqual(unevaluated(entry)[cf.CONNTRACK_SLUG], cf.NO_SERIAL_LOGGING_REASON.format(total=1))
+
+    def test_a_failed_log_read_leaves_the_check_unevaluated_and_records_no_command(self):
+        entry, _ = self.collect(self.responses(**{"logging read": run_of(1, "", "ERROR: PERMISSION_DENIED")}))
+        self.assertIn("PERMISSION_DENIED", unevaluated(entry)[cf.CONNTRACK_SLUG])
+        self.assertEqual([c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG], [])
+        self.assertEqual(self.conntrack(entry), [])
+
+    def test_a_log_read_that_prints_no_json_list_is_a_failed_read(self):
+        for stdout in ("", "ERROR: nope", '{"error": "x"}'):
+            with self.subTest(stdout):
+                entry, _ = self.collect(self.responses(**{"logging read": run_of(0, stdout)}))
+                self.assertIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+
+    def test_a_full_page_is_a_limitation_and_every_count_a_floor(self):
+        entries = [conntrack_entry() for _ in range(cf.CONNTRACK_LOG_LIMIT)]
+        entry, _ = self.collect(self.responses(entries=entries))
+        (finding,) = self.conntrack(entry)
+        self.assertTrue(finding["excerpt"].startswith("At least 1000 kernel line(s)"), finding["excerpt"])
+        self.assertIn("read the newest 1000 serial console entries", entry["limitations"])
+        self.assertIn("24h window", entry["limitations"])
+
+    def test_the_nodes_of_an_excluded_cluster_are_neither_read_nor_reported(self):
+        cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-a")
+        nodes = [gke_node(NODE_A), gke_node("gke-other-pool-1-abcd", cluster="other", pool="pool-1")]
+        entries = [conntrack_entry(NODE_A), conntrack_entry("gke-other-pool-1-abcd")]
+        entry, _ = self.collect(self.responses(nodes=nodes, logged_names=("gke-other-pool-1-abcd",), entries=entries))
+        self.assertEqual([c["object"] for c in self.conntrack(entry)], ["NodePool/us-central1-a/other/pool-1"])
+        self.assertNotIn("limitations", entry)
+
+    def test_a_project_whose_every_node_is_excluded_declares_the_check_inapplicable(self):
+        cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-a")
+        entry, issued = self.collect(self.responses())
+        self.assertEqual(self.declared(entry)[cf.CONNTRACK_SLUG], cf.EXCLUDED_GKE_NODES_REASON.format(total=1))
+        self.assertEqual([argv for argv in issued if "logging" in argv], [])
+
+    def test_the_relay_serves_the_log_read_when_it_answers(self):
+        """With a broker the read goes through `logging_reads`, and `gcloud
+        logging read` does not run; the entry reads the same."""
+        answers = self.responses()
+        del answers["logging read"]
+        with mock.patch.object(cf.logging_reads, "read_json", return_value=json.dumps([conntrack_entry()])) as relay:
+            entry, issued = self.collect(answers)
+        self.assertEqual(len(self.conntrack(entry)), 1)
+        self.assertEqual([argv for argv in issued if "logging" in argv], [])
+        project, filter_text, limit = relay.call_args.args
+        self.assertEqual((project, limit), ("proj-1", cf.CONNTRACK_LOG_LIMIT))
+        self.assertTrue(filter_text.endswith(cf.CONNTRACK_LOG_FILTER), filter_text)
+        self.assertTrue(filter_text.startswith('timestamp>="'), filter_text)
+
+    def test_a_relay_read_that_times_out_leaves_the_check_unevaluated(self):
+        answers = self.responses()
+        del answers["logging read"]
+        with mock.patch.object(cf.logging_reads, "read_json", side_effect=cf.logging_reads.ReadTimedOut("timed out after 60 seconds")):
+            entry, _ = self.collect(answers)
+        self.assertIn("timed out after 60 seconds", unevaluated(entry)[cf.CONNTRACK_SLUG])
+
+
+class ConntrackComposesWithAuditReportTest(unittest.TestCase):
+    """A manifest with a §2.6 finding, run through `audit_report`'s own
+    cross-check and validator, as `ManifestComposesWithAuditReportTest` does
+    for §2.1."""
+
+    AUDIT = "gce-compute-fleet-audit"
+
+    def manifest(self, entries: list) -> dict:
+        answers = ConntrackInCollectProjectTest().responses(entries=entries)
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            for needle, result in answers.items():
+                if needle in joined:
+                    return result
+            raise Unstubbed(f"unstubbed command: {joined}")
+
+        cf.declared_scope.set(None, None)
+        return cf.collect_fleet("proj-1", run=run)
+
+    def document(self, manifest: dict) -> dict:
+        helper = ManifestComposesWithAuditReportTest
+        collected = [e for e in manifest["clusters"] if e["outcome"] == "collected"]
+        findings = []
+        for entry in collected:
+            for candidate in entry["candidates"]:
+                finding = helper._finding(candidate, entry["name"])
+                finding["title"] = "A node pool dropped connections on a full connection tracking table"
+                finding["evidence"]["command"] = candidate["command"]
+                findings.append(finding)
+        return {
+            "audit": self.AUDIT,
+            "scope": {"clusters": [helper._scope_entry(e) for e in collected], "skipped": helper._skipped(manifest)},
+            "findings": findings,
+        }
+
+    def test_the_slug_is_on_the_streams_roster(self):
+        import audit_report
+
+        self.assertIn(cf.CONNTRACK_SLUG, audit_report.AUDITS[self.AUDIT].checks)
+        self.assertEqual(set(cf.SEVERITY), set(audit_report.AUDITS[self.AUDIT].checks))
+
+    def test_a_node_pool_finding_passes_the_cross_check_and_the_validator(self):
+        import audit_report
+
+        manifest = self.manifest([conntrack_entry()])
+        data = self.document(manifest)
+        self.assertEqual([f["object"] for f in data["findings"]], ["NodePool/us-central1-a/seeded-a/default-pool"])
+        audit_report.cross_check_manifest(data, manifest)
+        audit_report.validate_findings(data, self.AUDIT)
+
+    def test_a_clean_run_of_the_check_passes_the_cross_check_and_the_validator(self):
+        import audit_report
+
+        manifest = self.manifest([])
+        data = self.document(manifest)
+        self.assertEqual(data["findings"], [])
+        audit_report.cross_check_manifest(data, manifest)
+        audit_report.validate_findings(data, self.AUDIT)
+
 
 if __name__ == "__main__":
     unittest.main()

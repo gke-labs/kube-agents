@@ -1,11 +1,11 @@
 ---
 name: gce-compute-fleet-audit
-description: Audits standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, and orphaned disk snapshots.
+description: Audits standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, orphaned disk snapshots, and GKE nodes whose connection tracking table was full.
 ---
 
 # Task
 
-Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, and orphaned disk snapshots, emitting findings for the `fleet-audit` reporting harness.
+Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, orphaned disk snapshots, and GKE nodes whose connection tracking table was full, emitting findings for the `fleet-audit` reporting harness.
 
 # Workflow
 
@@ -23,12 +23,13 @@ python3 /opt/data/profiles/platform/skills/gce-compute-fleet-audit/scripts/compu
 
 Read the manifest and follow `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `checks_unevaluated`, `limitations` and `candidates`:
 
-All four roster checks are collector-verified; none is yours to hand-run.
+All five roster checks are collector-verified; none is yours to hand-run.
 
 - `gce-startup-script-status`: serial console boot failures and startup script errors.
 - `mig-convergence-stalled`: MIGs creating and deleting at once (a resize loop).
 - `sole-tenant-headroom`: node group reservations at capacity with no failover host spare.
 - `orphaned-snapshots`: Persistent Disk snapshots of deleted disks older than 90 days.
+- `node-conntrack-saturation`: GKE node pools whose nodes logged `nf_conntrack: table full, dropping packet` in the last 24 hours.
 
 `ops-agent-guest-health` is not on the roster — SOP §2.3 says why, and `finish` rejects a `checks_run` or a `finding.check` naming it.
 

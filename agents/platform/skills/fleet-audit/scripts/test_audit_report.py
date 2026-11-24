@@ -8148,7 +8148,7 @@ class TestComputeDeclaredShapes(HarnessTestCase):
         # Pinned as a literal: the catalogue test only checks the set is a
         # subset of the roster, and a fault slipping in would pass it.
         self.assertEqual(audit_report.audit_declarable_checks(self.COMPUTE), frozenset({"orphaned-snapshots"}))
-        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom", "node-conntrack-saturation"):
             self.assertNotIn(fault, audit_report.audit_declarable_checks(self.COMPUTE))
 
     def test_a_declaration_moves_the_snapshot_and_leaves_the_failed_startup_script(self):
@@ -8200,7 +8200,7 @@ class TestComputeDeclaredShapes(HarnessTestCase):
         doc = self._doc([])
         doc["declared"] = [make_declared(check="orphaned-snapshots", cluster=self.PROJECT, namespace="", obj="Snapshot/legal-hold-2025", title="legal-hold-2025 is kept under a legal hold by design", repo="acme/fleet", path="knowledge/legal-hold.md", excerpt="x")]
         audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
-        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom", "node-conntrack-saturation"):
             with self.subTest(fault):
                 doc["declared"][0]["check"] = fault
                 with self.assertRaises(audit_report.ValidationError) as cm:

@@ -495,11 +495,13 @@ AUDITS: dict[str, AuditSpec] = {
             "mig-convergence-stalled",
             "sole-tenant-headroom",
             "orphaned-snapshots",
+            "node-conntrack-saturation",
         ),
-        # Every check reads Compute Engine objects that belong to a project, so
+        # Every check reads objects that belong to a project (Compute Engine
+        # objects, and for the last one the project's serial console log), so
         # the collector names one `project/<id>` entry per project and nothing
         # else. Declaring the partition is what makes a run that enumerated
-        # some other kind of target -- and so ran none of these four anywhere --
+        # some other kind of target -- and so ran none of these five anywhere --
         # report a gap instead of passing silently.
         scopes=(
             (
@@ -509,6 +511,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "mig-convergence-stalled",
                     "sole-tenant-headroom",
                     "orphaned-snapshots",
+                    "node-conntrack-saturation",
                 ),
             ),
         ),
@@ -518,9 +521,10 @@ AUDITS: dict[str, AuditSpec] = {
         # repository declaration may keep off the ledger; the waste audit
         # already lets an owner declare the same shape for a kept disk. One
         # arm, one object kind (`Snapshot/<name>`), so no arm rule. The other
-        # three are live faults no declaration excuses: a startup script that
+        # four are live faults no declaration excuses: a startup script that
         # failed on the last boot, a group creating and deleting at once, a
-        # reservation with less than one host free.
+        # reservation with less than one host free, a node whose kernel dropped
+        # connections on a full connection tracking table.
         declarable=("orphaned-snapshots",),
     ),
     "upgrade-retrospective": AuditSpec(
@@ -1367,6 +1371,7 @@ CHECK_PHRASES = {
     "mig-convergence-stalled": "{object} instance group isn't converging",
     "sole-tenant-headroom": "sole-tenant nodes are nearly full",
     "orphaned-snapshots": "{object} is a snapshot of a deleted disk",
+    "node-conntrack-saturation": "{object} dropped connections on a full connection tracking table",
     # Upgrade Retrospective
     "upgrade-operation-failed": "an upgrade operation failed",
     "upgrade-broke-workload": "{object} broke after the upgrade",
