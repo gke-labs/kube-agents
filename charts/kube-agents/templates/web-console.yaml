@@ -162,9 +162,10 @@ spec:
               value: {{ .Release.Revision | quote }}
             {{- /*
             Drafting help in the feedback form goes to the install's own
-            inference gateway; the console gets no key because the gateway
-            takes none from pods in its namespace. Unset, the route answers
-            501 and the page hides nothing but says the help is off.
+            inference gateway. The console sends no key: the gateway admits a
+            keyless caller on the inference routes (files/litellm_caller_auth.py),
+            and its NetworkPolicy decides who reaches it. Unset, the route
+            answers 501 and the page hides nothing but says the help is off.
             */}}
             {{- $assist := .Values.webConsole.assist | default dict }}
             {{- $assistURL := $assist.url | default "" }}
