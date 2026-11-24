@@ -492,7 +492,10 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 	// call. The horizon is the stream's last sequence from STREAM.INFO, read
 	// after the direct gets, so every message they found is at or under it.
 	// It is the stream's, not the subjects', so the loop below also stops at
-	// the first message past it and does not fold that one.
+	// the first message past it and does not fold that one. The cost is one
+	// STREAM.INFO round trip per replay that finds the task, on top of the
+	// direct gets; the replay already opens a consumer, so it is the cheaper
+	// of its two extra calls.
 	for _, subject := range subjects {
 		_, err := stream.GetLastMsgForSubject(ctx, subject)
 		if err != nil {
