@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -493,9 +494,22 @@ def _store_finding(root: Path, *, kind: str = "gcloud", note: str = RIGHT_NOTE, 
         (directory / "runs" / "previous.json").write_text(json.dumps({"document": {"findings": [{"id": fid, "title": ring_mark}]}}), encoding="utf-8")
 
 
-def _verify_finding(**finding):
+# One read of the store with room for a busy machine. The tests of the block's
+# logic take the verdict of that one read: `verify` polls a fail until its
+# deadline, and a deadline short enough for a fast test is one that a slow
+# start of the store's reader can miss.
+FINDING_READ_TIMEOUT_SEC = 30.0
+FindingVerdict = namedtuple("FindingVerdict", "status reason")
+
+
+def _finding_verifier(**finding):
     check = {"type": "audit_report_stored", "audit": "fleet-consistency-drift", "finding": {"id_contains": OUTLIER, **finding}}
-    return AuditReportStoredVerifier(**check).verify(1.0)
+    return AuditReportStoredVerifier(**check)
+
+
+def _verify_finding(**finding):
+    status, reason, _raw = _finding_verifier(**finding)._check(FINDING_READ_TIMEOUT_SEC)
+    return FindingVerdict(status, reason)
 
 
 FOUR_CHECKS = (
@@ -509,8 +523,9 @@ FOUR_CHECKS = (
 @pytest.mark.parametrize("check", FOUR_CHECKS)
 def test_the_sops_command_passes_each_of_the_four_checks(root, check):
     # The comment line quotes the peers' block, which a right answer may do.
+    # Through `verify`, as a run grades it: a pass returns at the first read.
     _store_finding(root)
-    assert _verify_finding(**check).status == "pass"
+    assert _finding_verifier(**check).verify(FINDING_READ_TIMEOUT_SEC).status == "pass"
 
 
 @pytest.mark.parametrize(
