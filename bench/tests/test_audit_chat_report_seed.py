@@ -68,6 +68,7 @@ class Client:
 def store(tmp_path):
     root = tmp_path / "reports" / AUDIT
     (root / "acme" / "fleet").mkdir(parents=True)
+    (root / "acme" / "fleet" / report_status.LATEST_NAME).write_text("{}", encoding="utf-8")
     return root
 
 
@@ -144,3 +145,25 @@ def test_the_broker_store_seeds_each_local_stream(store, monkeypatch):
     monkeypatch.setattr(seed, "seed_streams", lambda audit_report, report_status, audit, root: seen.append((audit, root)) or 0)
     assert seed.main() == 0
     assert seen == [(AUDIT, store)]
+
+
+@pytest.mark.parametrize("contents", [[], ["runs/"]], ids=["empty", "empty-runs"])
+def test_a_local_stream_with_no_run_and_no_latest_is_nothing_to_seed(tmp_path, monkeypatch, contents):
+    root = tmp_path / "reports" / AUDIT
+    stream = root / "acme" / "bare"
+    stream.mkdir(parents=True)
+    for name in contents:
+        (stream / name).mkdir()
+    client = Client(stream, failures=0, marks=False)
+    status, sleeps = _run(monkeypatch, root, client)
+    assert (status, client.calls, sleeps) == (0, 0, [])
+
+
+def test_a_local_stream_with_only_a_run_is_seeded(tmp_path, monkeypatch):
+    root = tmp_path / "reports" / AUDIT
+    runs = root / "acme" / "ring" / report_status.RUNS_DIR
+    runs.mkdir(parents=True)
+    (runs / "20261101T000000Z.json").write_text("{}", encoding="utf-8")
+    client = Client(runs.parent, failures=0)
+    status, _ = _run(monkeypatch, root, client)
+    assert (status, client.calls) == (0, 1)

@@ -95,12 +95,24 @@ def main() -> int:
     return seed_streams(audit_report, report_status, audit, store)
 
 
+def holds_a_run(report_status, stream):
+    """True when the local stream directory holds a latest.json or a run."""
+    if (stream / report_status.LATEST_NAME).exists():
+        return True
+    runs = stream / report_status.RUNS_DIR
+    return runs.is_dir() and any(runs.glob("*.json"))
+
+
 def seed_streams(audit_report, report_status, audit, store, sleep=time.sleep):
     """Seed every local stream under `store`, then require each one's marker. An exit status."""
     unread, missing = [], []
     for owner in sorted(p for p in store.iterdir() if p.is_dir()):
         for stream in sorted(p for p in owner.iterdir() if p.is_dir()):
             repo = f"{owner.name}/{stream.name.replace('%2F', '/')}"
+            if not holds_a_run(report_status, stream):
+                # No latest.json and no run: nothing for a seed to copy, so no
+                # marker either, and nothing for the stack to hide.
+                continue
             try:
                 force_seed(audit_report, audit, repo, sleep=sleep)
             except SeedReadFailed as exc:

@@ -353,9 +353,10 @@ def test_the_switch_is_read_from_the_shell_containers_env_in_the_pod_spec(kubect
     assert onboarding.report_store(5.0) == kind
     argv = kubectl.read_text(encoding="utf-8").splitlines()
     assert argv[:2] == ["get", f"pod/{onboarding.sandbox_pod()}"]
+    entry = '.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")]'
     assert argv[-2:] == [
         "-o",
-        'jsonpath={.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}',
+        f'jsonpath={{{entry}.value}}{{"\\n"}}{{{entry}.valueFrom}}{{.spec.containers[?(@.name=="shell")].envFrom}}',
     ]
 
 
@@ -363,6 +364,21 @@ def test_the_switch_is_read_from_the_shell_containers_env_in_the_pod_spec(kubect
 def test_any_other_switch_value_raises_naming_it(kubectl, monkeypatch, value):
     monkeypatch.setenv("STUB_VALUE", value)
     with pytest.raises(RuntimeError, match=re.escape(f"FLEET_AUDIT_REPORT_STORE={value!r}")):
+        onboarding.report_store(5.0)
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [
+        '\n{"configMapKeyRef":{"key":"store","name":"fleet-audit"}}',
+        '\n[{"configMapRef":{"name":"fleet-audit"}}]',
+        'broker\n[{"secretRef":{"name":"extra"}}]',
+    ],
+    ids=["valueFrom", "envFrom", "envFrom-beside-a-value"],
+)
+def test_a_switch_set_indirectly_raises(kubectl, monkeypatch, printed):
+    monkeypatch.setenv("STUB_VALUE", printed)
+    with pytest.raises(RuntimeError, match=r"set indirectly \(valueFrom or envFrom\)"):
         onboarding.report_store(5.0)
 
 

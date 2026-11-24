@@ -399,10 +399,9 @@ def plant_state(audit_report) -> dict:
     return state if isinstance(state, dict) else {}
 
 
-def _remove_store(audit_report, mark: str, state: dict) -> tuple[int, list[str]]:
-    """Remove from the store any envelope with the mark and every envelope of the planted repository
-    stored at or after the planted run (from `state`); then put each repository store touched back as
-    it was (`restore_store`). The count removed, and what became of each store touched."""
+def _since_planted(audit_report, state: dict):
+    """`teardown`'s rule beyond the mark: every envelope of the planted repository stored at or after
+    the planted run, from the plant's own `state` in the same container."""
     since = _parsed(state.get("finished_at"))
     repo_dir = None
     if state.get("repo") and since is not None:
@@ -410,6 +409,58 @@ def _remove_store(audit_report, mark: str, state: dict) -> tuple[int, list[str]]
             repo_dir = Path(audit_report.reports_dir_for(AUDIT, str(state["repo"]))).resolve()
         except (ValueError, OSError):
             repo_dir = None
+    return lambda path, text: _stored_since(path, repo_dir, since, text)
+
+
+def _finished(text: str) -> datetime | None:
+    try:
+        return _parsed(json.loads(text).get("finished_at"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _closed_from_planted(audit_report, state: dict):
+    """`teardown-store`'s rule beyond the mark, or None and why when `state` does not validate.
+
+    `state` comes back from the sandbox, which this container does not trust, so
+    it drives no deletion until it checks out: its `repo` must be the stream's own
+    repository as the plant resolved it, and its `finished_at` must be that of an
+    envelope stored there. Then only the envelopes at that time (the planted run)
+    and at the next time after it (the run closed from it) go.
+    """
+    since = _parsed(state.get("finished_at"))
+    if since is None or not isinstance(state.get("repo"), str):
+        return None, "it names no repository or no finished_at"
+    try:
+        repo = audit_report.resolve_repo_or_no_forge(AUDIT)
+        repo_dir = Path(audit_report.reports_dir_for(AUDIT, repo)).resolve()
+    except (RuntimeError, ValueError, OSError) as exc:
+        return None, f"the stream's repository does not resolve here: {exc}"
+    if state["repo"] != repo:
+        return None, f"it names {state['repo']!r}, not the stream's repository {repo!r}"
+    times = set()
+    for path in _store_files(audit_report):
+        if path.resolve().is_relative_to(repo_dir):
+            try:
+                finished = _finished(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            if finished is not None:
+                times.add(finished)
+    if since not in times:
+        return None, f"no envelope of {repo} finished at {state['finished_at']}"
+    closing = {since, *sorted(t for t in times if t > since)[:1]}
+
+    def rule(path: Path, text: str) -> bool:
+        return path.is_relative_to(repo_dir) and _finished(text) in closing
+
+    return rule, ""
+
+
+def _remove_store(audit_report, mark: str, rule) -> tuple[int, list[str]]:
+    """Remove from the store any envelope with the mark and any that `rule(path, text)` names; then
+    put each repository store touched back as it was (`restore_store`). The count removed, and what
+    became of each store touched."""
     removed = 0
     touched: set[Path] = set()
     for path in _store_files(audit_report):
@@ -417,7 +468,7 @@ def _remove_store(audit_report, mark: str, state: dict) -> tuple[int, list[str]]
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             continue
-        if mark in text or _stored_since(path.resolve(), repo_dir, since, text):
+        if mark in text or rule(path.resolve(), text):
             path.unlink()
             # The broker store's writer record goes with its envelope, or the
             # broker names a writer for an envelope that is gone.
@@ -444,7 +495,7 @@ def teardown(audit_report, mark: str) -> int:
     """Remove the planted run and what it led to: any envelope with the mark, every envelope of the
     planted repository stored at or after the planted run, and the scratch files; then put each
     repository store touched back as it was (`restore_store`). The file store: one volume holds both."""
-    removed, restored = _remove_store(audit_report, mark, plant_state(audit_report))
+    removed, restored = _remove_store(audit_report, mark, _since_planted(audit_report, plant_state(audit_report)))
     extra = _remove_scratch(audit_report)
     print(
         f"removed {removed} stored envelope(s) of the planted run and the runs closed from it, and {extra} scratch file(s)"
@@ -454,8 +505,20 @@ def teardown(audit_report, mark: str) -> int:
 
 
 def teardown_store(audit_report, mark: str, state: dict) -> int:
-    """The broker store's half of `teardown`, run where its files are, with the plant's `state`."""
-    removed, restored = _remove_store(audit_report, mark, state)
+    """The broker store's half of `teardown`, run where its files are, with the plant's `state`.
+
+    A `state` that does not validate (`_closed_from_planted`) removes only the
+    envelopes that carry the mark, with a WARNING.
+    """
+    rule, why = _closed_from_planted(audit_report, state)
+    if rule is None:
+        print(
+            f"WARNING: the plant's record is not one to delete by ({why}); removing only the envelopes "
+            "that carry the mark.",
+            file=sys.stderr,
+        )
+        rule = lambda path, text: False  # noqa: E731 - the mark alone
+    removed, restored = _remove_store(audit_report, mark, rule)
     print(
         f"removed {removed} stored envelope(s) of the planted run and the runs closed from it"
         + (f"; store {', '.join(restored)}." if restored else ".")

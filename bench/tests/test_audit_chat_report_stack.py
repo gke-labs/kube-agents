@@ -107,7 +107,7 @@ _TRIGGERS = {
 # fails the one whose words include $STUB_FAIL; `gcloud` succeeds.
 _KUBECTL_STUB = """#!/bin/sh
 if [ "$1" = get ]; then
-  for word in "$@"; do case "$word" in jsonpath=*) echo "$word" >> "$STUB_GETS" ;; esac; done
+  for word in "$@"; do case "$word" in jsonpath=*) printf '%s\\n' "$word" >> "$STUB_GETS" ;; esac; done
   [ "$STUB_FAIL" = get ] && exit 1
   printf '%s' "$STUB_STORE"
   exit 0
@@ -443,8 +443,10 @@ class ApplyTest(_ScriptCase):
 
 _SANDBOX = _INTERPOLATIONS["var.sandbox_pod"]
 _AGENT = "deployment/" + _INTERPOLATIONS["var.agent_deployment"]
+_SWITCH_ENTRY = '.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")]'
 _SWITCH_JSONPATH = (
-    'jsonpath={.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}'
+    f'jsonpath={{{_SWITCH_ENTRY}.value}}{{"\\n"}}{{{_SWITCH_ENTRY}.valueFrom}}'
+    '{.spec.containers[?(@.name=="shell")].envFrom}'
 )
 
 
@@ -486,6 +488,20 @@ class ReportStoreSwitchTest(_ScriptCase):
         self.assertNotEqual(status, 0)
         self.assertEqual(commands, [])
         self.assertIn("FLEET_AUDIT_REPORT_STORE='Broker'", self.done.stderr)
+
+    def test_a_switch_set_indirectly_fails_the_apply_and_the_destroy(self):
+        for printed in ('\n{"configMapKeyRef":{"key":"store"}}', 'broker\n[{"configMapRef":{"name":"env"}}]'):
+            with self.subTest(printed=printed):
+                self.log.unlink(missing_ok=True)
+                status, commands = self._apply(unfinished_is_result=False, store=printed)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(commands, [])
+                self.assertIn("set indirectly (valueFrom or envFrom)", self.done.stderr)
+                self.log.unlink(missing_ok=True)
+                status, commands = self._destroy(store=printed)
+                self.assertNotEqual(status, 0)
+                self.assertEqual([c for c in commands if c[:2] == ["sh", "-s"]], [])
+                self.assertIn("set indirectly (valueFrom or envFrom)", self.done.stderr)
 
     def test_an_unreadable_pod_spec_fails_the_apply_before_it_changes_anything(self):
         status, commands = self._apply(unfinished_is_result=False, failing_step="get")

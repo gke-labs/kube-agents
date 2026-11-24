@@ -158,9 +158,16 @@ resource "null_resource" "audit_chat_report" {
       # `file` or `broker`, from the env the operator rendered on the sandbox's
       # shell container; any other value is an error that names it.
       report_store() {
-        local value
-        value="$(kubectl get pod -n "${var.agent_namespace}" "${var.sandbox_pod}" \
-          -o jsonpath='{.spec.containers[?(@.name=="${var.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}')" || return 1
+        local out value
+        # The value on the first line; a valueFrom on the entry or any envFrom on
+        # the container after it, which the spec does not resolve.
+        out="$(kubectl get pod -n "${var.agent_namespace}" "${var.sandbox_pod}" \
+          -o jsonpath='{.spec.containers[?(@.name=="${var.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${var.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${var.sandbox_container}")].envFrom}')" || return 1
+        value="$(printf '%s\n' "$out" | sed -n 1p)"
+        if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+          echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${var.sandbox_container} container of ${var.sandbox_pod} is set indirectly (valueFrom or envFrom), so which report store to use is unknown." >&2
+          return 1
+        fi
         case "$value" in
           "" | file) echo file ;;
           broker) echo broker ;;
@@ -238,11 +245,17 @@ resource "null_resource" "audit_chat_report" {
         || echo "WARNING: could not remove the state file; the next run removes it first." >&2
 
       # As in the apply: `file` or `broker` from the shell container's env in the
-      # sandbox pod's spec. Any other value, or a spec that cannot be read, puts
-      # nothing back rather than guess where the renamed files are.
-      store_kind="$(kubectl get pod -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" \
-        -o jsonpath='{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}')" \
+      # sandbox pod's spec. Any other value, one set indirectly (a valueFrom on the
+      # entry, or any envFrom on the container), or a spec that cannot be read,
+      # puts nothing back rather than guess where the renamed files are.
+      out="$(kubectl get pod -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" \
+        -o jsonpath='{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].envFrom}')" \
         || { echo "ERROR: could not read the spec of ${self.triggers.sandbox_pod}; the renamed store files stay renamed." >&2; exit 1; }
+      store_kind="$(printf '%s\n' "$out" | sed -n 1p)"
+      if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+        echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${self.triggers.sandbox_container} container of ${self.triggers.sandbox_pod} is set indirectly (valueFrom or envFrom), so which report store to use is unknown; the renamed store files stay renamed." >&2
+        exit 1
+      fi
       case "$store_kind" in
         "" | file)
           printf '%s' '${self.triggers.store_b64}' | base64 -d \

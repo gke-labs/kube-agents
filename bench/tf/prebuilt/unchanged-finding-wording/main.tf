@@ -88,9 +88,16 @@ resource "null_resource" "previous_run" {
       # `file` or `broker`, from the env the operator rendered on the shell
       # container of pod $1; any other value is an error that names it.
       report_store() {
-        local value
-        value="$(kubectl get pod -n "${var.agent_namespace}" "$1" \
-          -o jsonpath='{.spec.containers[?(@.name=="${local.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}')" || return 1
+        local out value
+        # The value on the first line; a valueFrom on the entry or any envFrom on
+        # the container after it, which the spec does not resolve.
+        out="$(kubectl get pod -n "${var.agent_namespace}" "$1" \
+          -o jsonpath='{.spec.containers[?(@.name=="${local.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${local.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${local.sandbox_container}")].envFrom}')" || return 1
+        value="$(printf '%s\n' "$out" | sed -n 1p)"
+        if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+          echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${local.sandbox_container} container of $1 is set indirectly (valueFrom or envFrom), so which report store to use is unknown." >&2
+          return 1
+        fi
         case "$value" in
           "" | file) echo file ;;
           broker) echo broker ;;
@@ -191,9 +198,16 @@ resource "null_resource" "previous_run" {
       # As in the apply: `file` or `broker` from the shell container's env in
       # pod $1's spec, and any other value an error that names it.
       report_store() {
-        local value
-        value="$(kubectl get pod -n "${self.triggers.namespace}" "$1" \
-          -o jsonpath='{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}')" || return 1
+        local out value
+        # The value on the first line; a valueFrom on the entry or any envFrom on
+        # the container after it, which the spec does not resolve.
+        out="$(kubectl get pod -n "${self.triggers.namespace}" "$1" \
+          -o jsonpath='{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].envFrom}')" || return 1
+        value="$(printf '%s\n' "$out" | sed -n 1p)"
+        if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+          echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${self.triggers.sandbox_container} container of $1 is set indirectly (valueFrom or envFrom), so which report store to use is unknown." >&2
+          return 1
+        fi
         case "$value" in
           "" | file) echo file ;;
           broker) echo broker ;;

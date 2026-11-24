@@ -445,14 +445,16 @@ def report_store(timeout: float) -> ReportStore:
     Read from the sandbox pod's spec, the env the operator rendered on the
     shell container, not from a shell in it, so a pod that cannot be reached is
     a kubectl failure here rather than an empty answer. RuntimeError when the
-    spec cannot be read, or when the value is neither: a guess would read one
-    store and grade the run against it while the run wrote the other.
+    spec cannot be read, when the value is neither, or when it is set
+    indirectly (a ``valueFrom`` on the entry, or any ``envFrom`` on the
+    container), which the spec does not resolve: a guess would read one store
+    and grade the run against it while the run wrote the other.
     """
     pod = sandbox_pod()
-    jsonpath = (
-        f'{{.spec.containers[?(@.name=="{SANDBOX_CONTAINER}")]'
-        f'.env[?(@.name=="{REPORT_STORE_ENV}")].value}}'
-    )
+    container = f'.spec.containers[?(@.name=="{SANDBOX_CONTAINER}")]'
+    entry = f'{container}.env[?(@.name=="{REPORT_STORE_ENV}")]'
+    # The value on the first line; anything after it is an indirect setting.
+    jsonpath = f'{{{entry}.value}}{{"\\n"}}{{{entry}.valueFrom}}{{{container}.envFrom}}'
     cmd = [*_kubectl("get", f"pod/{pod}"), "-o", f"jsonpath={jsonpath}"]
     try:
         proc = subprocess.run(
@@ -463,7 +465,12 @@ def report_store(timeout: float) -> ReportStore:
     if proc.returncode != 0:
         tail = proc.stderr.strip()[:_STDERR_LOG_CHARS]
         raise RuntimeError(f"could not read the spec of the shell sandbox pod {pod}: {tail}")
-    value = proc.stdout
+    value, _, indirect = proc.stdout.partition("\n")
+    if indirect.strip():
+        raise RuntimeError(
+            f"{REPORT_STORE_ENV} on the {SANDBOX_CONTAINER} container of {pod} is set indirectly "
+            "(valueFrom or envFrom), so which report store to use is unknown"
+        )
     if value in ("", REPORT_STORE_FILE):
         return REPORT_STORE_FILE
     if value == REPORT_STORE_BROKER:

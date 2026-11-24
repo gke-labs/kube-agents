@@ -81,18 +81,24 @@ VALUES = {
     "host_cluster_location": "us-east4",
     "host_location": "us-east4",
 }
-SWITCH_JSONPATH = 'jsonpath={.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}'
+SWITCH_ENTRY = '.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")]'
+SWITCH_JSONPATH = (
+    f'jsonpath={{{SWITCH_ENTRY}.value}}{{"\\n"}}{{{SWITCH_ENTRY}.valueFrom}}'
+    '{.spec.containers[?(@.name=="shell")].envFrom}'
+)
+INDIRECT = ['\n{"configMapKeyRef":{"key":"store"}}', 'broker\n[{"configMapRef":{"name":"env"}}]']
 # `kubectl get pods` lists the gateway pod and the sandbox pod; `get pod` answers
 # each one's containers, or the sandbox shell container's switch ($STUB_STORE,
 # or a failure when $STUB_FAIL is `get`). `kubectl exec` logs one line, `<pod>
 # <container> <in-pod words>`, to $STUB_LOG and fails the one whose words
-# include $STUB_FAIL. `gcloud` succeeds.
+# include a word of $STUB_FAIL, and prints $STUB_STATE for plant.py's `state`. `gcloud`
+# succeeds.
 KUBECTL_STUB = f"""#!/bin/sh
 if [ "$1" = get ] && [ "$2" = pods ]; then echo "{GATEWAY_POD} {SANDBOX_POD}"; exit 0; fi
 if [ "$1" = get ]; then
   case "$*" in
     *FLEET_AUDIT_REPORT_STORE*)
-      echo "$*" >> "$STUB_GETS"
+      printf '%s\\n' "$*" >> "$STUB_GETS"
       [ "$STUB_FAIL" = get ] && exit 1
       printf '%s' "$STUB_STORE"
       ;;
@@ -111,7 +117,10 @@ for word in "$@"; do
 done
 cat >/dev/null
 echo "$pod $container$in_pod" >> "$STUB_LOG"
-case "$in_pod " in *" $STUB_FAIL "*) exit 1 ;; esac
+for step in $STUB_FAIL; do
+  case "$in_pod " in *" $step "*) exit 1 ;; esac
+done
+case "$in_pod " in *" state "*) printf '%s\\n' "$STUB_STATE" ;; esac
 exit 0
 """
 
@@ -138,7 +147,7 @@ def stack(tmp_path, monkeypatch):
         stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
     log, gets = tmp_path / "exec.log", tmp_path / "gets.log"
 
-    def run(stack_dir: Path, block: int, store: str = "", fail: str = "no-step-fails"):
+    def run(stack_dir: Path, block: int, store: str = "", fail: str = "no-step-fails", state: str = ""):
         script = HEREDOC_RE.findall((stack_dir / "main.tf").read_text(encoding="utf-8"))[block]
         script = INTERPOLATION_RE.sub(lambda m: VALUES[m.group(1)], script)
         assert "${" not in script.replace("$${", ""), "a Terraform interpolation is left unrendered"
@@ -151,6 +160,7 @@ def stack(tmp_path, monkeypatch):
             "STUB_GETS": str(gets),
             "STUB_STORE": store,
             "STUB_FAIL": fail,
+            "STUB_STATE": state,
         }
         done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False)
         lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
@@ -202,6 +212,16 @@ def test_wording_unknown_switch_fails_before_any_exec(stack, block):
     assert "FLEET_AUDIT_REPORT_STORE='Broker'" in err
 
 
+@pytest.mark.parametrize("stack_dir", [WORDING, DIGEST], ids=["wording", "digest"])
+@pytest.mark.parametrize("block", [APPLY, DESTROY])
+@pytest.mark.parametrize("printed", INDIRECT, ids=["valueFrom", "envFrom"])
+def test_a_switch_set_indirectly_fails_before_the_plant_or_its_teardown(stack, stack_dir, block, printed):
+    status, commands, err = stack(stack_dir, block, store=printed)
+    assert status != 0
+    assert _plant_steps(commands) == []
+    assert "set indirectly (valueFrom or envFrom)" in err
+
+
 def test_wording_unreadable_pod_spec_fails_before_the_plant(stack):
     status, commands, _ = stack(WORDING, APPLY, fail="get")
     assert status != 0
@@ -239,6 +259,25 @@ def test_digest_broker_store_tears_the_store_down_in_the_gateway_and_the_scratch
     status, commands, _ = stack(DIGEST, DESTROY, store="broker")
     assert status == 0
     assert _plant_steps(commands) == halves
+
+
+@pytest.mark.parametrize("block", [APPLY, DESTROY])
+def test_digest_broker_teardown_passes_the_plants_record_to_teardown_store(stack, block):
+    record = '{"repo":"acme/fleet","finished_at":"2026-11-02T00:00:00+00:00"}'
+    fail = "fire" if block == APPLY else "no-step-fails"
+    _, commands, err = stack(DIGEST, block, store="broker", fail=fail, state=record)
+    store_half = next(words for words in commands if words[6:7] == ["teardown-store"])
+    assert store_half[7:] == [SCRIPTS, MARK, record]
+    assert "WARNING" not in err
+
+
+@pytest.mark.parametrize("block", [APPLY, DESTROY])
+def test_digest_broker_teardown_warns_and_passes_an_empty_record_when_it_cannot_read_one(stack, block):
+    fail = "fire state" if block == APPLY else "state"
+    _, commands, err = stack(DIGEST, block, store="broker", fail=fail)
+    store_half = next(words for words in commands if words[6:7] == ["teardown-store"])
+    assert store_half[7:] == [SCRIPTS, MARK, "{}"]
+    assert "WARNING: could not read the plant's record from the scratch" in err
 
 
 @pytest.mark.parametrize("block", [APPLY, DESTROY])
@@ -447,3 +486,62 @@ def test_digest_broker_teardown_halves(tmp_path, monkeypatch, capsys):
     assert list(Path(audit_report.SCRATCH_DIR).iterdir()) == []
     out = capsys.readouterr().out
     assert "store fleet: restored." in out and "removed 3 scratch file(s)." in out
+
+
+def _closing_store(tmp_path):
+    """An older run, the planted run (no mark: `finish` kept the old wording), the run closed from
+    it, and a later run, none of which carries the mark, plus one marked ring entry."""
+    audit_report = _digest_audit_report(tmp_path)
+    repo_dir = Path(audit_report.reports_dir_for(digest.AUDIT, "acme/fleet"))
+    (repo_dir / "runs").mkdir(parents=True)
+    stamps = {"0": "2026-11-01", "1": "2026-11-02", "2": "2026-11-03", "3": "2026-11-04"}
+    for name, day in stamps.items():
+        (repo_dir / "runs" / f"{name}.json").write_text(f'{{"finished_at": "{day}T00:00:00+00:00"}}', encoding="utf-8")
+    (repo_dir / "runs" / "m.json").write_text(f'{{"finished_at": "2026-10-01T00:00:00+00:00", "t": "{MARK}"}}', encoding="utf-8")
+    (repo_dir / "latest.json").write_text('{"finished_at": "2026-11-04T00:00:00+00:00"}', encoding="utf-8")
+    return audit_report, repo_dir
+
+
+def _left(repo_dir):
+    return sorted(p.name for p in (repo_dir / "runs").glob("*.json"))
+
+
+def test_digest_teardown_store_removes_the_planted_run_and_the_one_closed_from_it(tmp_path, capsys):
+    audit_report, repo_dir = _closing_store(tmp_path)
+    state = {"repo": "acme/fleet", "finished_at": "2026-11-02T00:00:00+00:00"}
+    assert digest.teardown_store(audit_report, MARK, state) == 0
+    assert _left(repo_dir) == ["0.json", "3.json"]
+    assert "WARNING" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("state", "why"),
+    [
+        ({"repo": "acme/other", "finished_at": "2026-11-02T00:00:00+00:00"}, "not the stream's repository"),
+        ({"repo": "acme/fleet", "finished_at": "2026-11-02T12:00:00+00:00"}, "no envelope of acme/fleet finished at"),
+        ({"repo": "acme/fleet"}, "no repository or no finished_at"),
+        ({}, "no repository or no finished_at"),
+    ],
+    ids=["another-repo", "no-such-envelope", "no-time", "empty"],
+)
+def test_digest_teardown_store_with_a_record_that_does_not_validate_removes_only_the_marked(
+    tmp_path, capsys, state, why
+):
+    audit_report, repo_dir = _closing_store(tmp_path)
+    assert digest.teardown_store(audit_report, MARK, state) == 0
+    assert _left(repo_dir) == ["0.json", "1.json", "2.json", "3.json"]
+    err = capsys.readouterr().err
+    assert "WARNING: the plant's record is not one to delete by" in err and why in err
+
+
+def test_digest_teardown_store_with_an_unresolvable_stream_removes_only_the_marked(tmp_path, capsys):
+    audit_report, repo_dir = _closing_store(tmp_path)
+
+    def refuse(audit):
+        raise RuntimeError("several repositories and no gitops role")
+
+    audit_report.resolve_repo_or_no_forge = refuse
+    state = {"repo": "acme/fleet", "finished_at": "2026-11-02T00:00:00+00:00"}
+    assert digest.teardown_store(audit_report, MARK, state) == 0
+    assert _left(repo_dir) == ["0.json", "1.json", "2.json", "3.json"]
+    assert "does not resolve here" in capsys.readouterr().err
