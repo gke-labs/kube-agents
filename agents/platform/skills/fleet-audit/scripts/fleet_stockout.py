@@ -667,6 +667,17 @@ RESERVED_POOL_TRIAGE = "reserved-pool"
 # removes them: a cluster's pools bound to named reservations, and a project's
 # `{reservation name: zones}`.
 RESERVED_POOLS_KEY = "_reserved_pools"
+# §3.10(b), where the class status does not name the reservation: the affinity
+# of a ComputeClass rule that consumes only the reservations it names, the
+# sentence of the finding, and the entry key that carries a cluster's such
+# rules to `collect_fleet`, which removes it.
+CLASS_SPECIFIC_RESERVATION = "Specific"
+CLASS_RESERVATION_MISSING_IMPACT = (
+    "A rule of this ComputeClass consumes only a named reservation, and that reservation does not exist in a zone "
+    "that the rule can use, so GKE cannot use that rule: its workloads get nodes from the rules below it, and wait "
+    "if no rule is below it."
+)
+RESERVED_CLASSES_KEY = "_reserved_classes"
 RESERVATION_ZONES_KEY = "_reservation_zones"
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
@@ -2305,26 +2316,107 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
                     },
                 )
             )
+    _record_uncompared_reservations(entry, slug, unread, outside, "these node pools consume only a named reservation", "node pools")
+
+
+def _record_uncompared_reservations(entry: dict, slug: str, unread: list[str], outside: list[str], subject: str, noun: str) -> None:
+    """What the two reservation comparisons could not judge, on the entry: the
+    users of a reservation whose owner project was not read in this run
+    (`unread`), or is not a project of this run (`outside`)."""
     limitations: list[str] = []
     if unread:
         # Unevaluated, as a failed read is everywhere else here: the check
-        # recorded as run would publish these pools as compared and clean.
-        reason = (
-            f"these node pools consume only a named reservation, and the reservations of its owner "
-            f"project were not read in this run: {', '.join(unread)}"
-        )
-        entry["checks_unevaluated"] = sorted(
-            [*entry.get("checks_unevaluated", []), {"check": slug, "reason": reason}], key=lambda e: e["check"]
-        )
+        # recorded as run would publish these as compared and clean.
+        reason = f"{subject}, and the reservations of its owner project were not read in this run: {', '.join(unread)}"
+        unevaluated = entry.get("checks_unevaluated", [])
+        earlier = next((e for e in unevaluated if e["check"] == slug), None)
+        if earlier:
+            earlier["reason"] = f"{earlier['reason']}; {reason}"
+        else:
+            entry["checks_unevaluated"] = sorted([*unevaluated, {"check": slug, "reason": reason}], key=lambda e: e["check"])
         entry["commands"] = [c for c in entry["commands"] if c["check"] != slug]
         limitations.append(f"{slug} could not be judged: {reason}")
     if outside:
         limitations.append(
-            f"{slug} did not compare these node pools with the reservation they name, because its "
+            f"{slug} did not compare these {noun} with the reservation they name, because its "
             f"owner project is not a project ID of this run: {', '.join(outside)}"
         )
     if limitations:
         entry["limitations"] = "; ".join([*filter(None, [entry.get("limitations")]), *limitations])
+
+
+def reserved_class_rules(cc: dict, project: str) -> list[dict]:
+    """The priority rules of a ComputeClass that consume only named
+    reservations (§3.10(b)): for each, its 1-based place, its zones (empty when
+    the rule names none) and its `(owner project, name)` reservations. A
+    reservation with no `project` is one of the cluster's own project."""
+    rules = []
+    for place, priority in enumerate((cc.get("spec") or {}).get("priorities") or [], start=1):
+        reservations = (priority.get("reservations") or {}) if isinstance(priority, dict) else {}
+        if reservations.get("affinity") != CLASS_SPECIFIC_RESERVATION:
+            continue
+        named = sorted(
+            (item.get("project") or project, item["name"])
+            for item in reservations.get("specific") or []
+            if isinstance(item, dict) and item.get("name")
+        )
+        if named:
+            zones = sorted((priority.get("location") or {}).get("zones") or [])
+            rules.append({"class": cc["metadata"]["name"], "rule": place, "zones": zones, "reservations": named})
+    return rules
+
+
+def file_reserved_classes(entry: dict, zones_by_project: dict[str, dict[str, list[str]]], swept: frozenset[str]) -> None:
+    """§3.10(b) for one cluster entry, where GKE's status does not name the
+    reservation: a ComputeClass rule that consumes only named reservations,
+    none of which exists in a zone that the rule can use. A rule with no zones
+    can use each zone, so one zone that holds a named reservation is enough.
+
+    Run by `collect_fleet` beside `file_reserved_pools`, with the same two
+    halves. One finding for a class, with each such rule in its excerpt."""
+    slug = "reservation-mismatch-risk"
+    unread: list[str] = []
+    outside: list[str] = []
+    missing: dict[str, list[tuple[str, list[str], str]]] = {}
+    for reserved in entry.pop(RESERVED_CLASSES_KEY, []):
+        found = [(owner, name, zones_by_project.get(owner, {}).get(name, [])) for owner, name in reserved["reservations"]]
+        if any(zones and (not reserved["zones"] or set(zones) & set(reserved["zones"])) for _, _, zones in found):
+            continue
+        owners = sorted({owner for owner, _, _ in found})
+        unread_owners = [owner for owner in owners if owner in swept and owner not in zones_by_project]
+        outside_owners = [owner for owner in owners if owner not in swept]
+        target = f"ComputeClass/{reserved['class']}"
+        if unread_owners:
+            unread.append(f"{target} (project {', '.join(unread_owners)})")
+        elif outside_owners:
+            outside.append(f"{target} (project {', '.join(outside_owners)})")
+        else:
+            where = "; ".join(
+                f"reservation {name}: found {'only in ' + ', '.join(sorted(zones)) if zones else 'in no zone'} of project {owner}"
+                for owner, name, zones in found
+            )
+            rule_zones = f", rule zones {', '.join(reserved['zones'])}" if reserved["zones"] else ""
+            excerpt = f"priority {reserved['rule']}: reservations.affinity={CLASS_SPECIFIC_RESERVATION}{rule_zones}; {where}"
+            missing.setdefault(reserved["class"], []).append((excerpt, owners, reserved["command"]))
+    for name, rules in missing.items():
+        owners = sorted({owner for _, rule_owners, _ in rules for owner in rule_owners})
+        entry["candidates"].append(
+            _emit(
+                slug,
+                {
+                    "object": f"ComputeClass/{name}",
+                    "severity": MISSING_RESERVATION_SEVERITY,
+                    "excerpt": "; ".join(excerpt for excerpt, _, _ in rules),
+                    "impact": CLASS_RESERVATION_MISSING_IMPACT,
+                    "needs_triage": CLASS_STATUS_TRIAGE,
+                    # Both reads: the classes, then the reservations of each owner project.
+                    "command": "; ".join([rules[0][2], *(shlex.join(reservations_argv(owner)) for owner in owners)]),
+                },
+            )
+        )
+    _record_uncompared_reservations(
+        entry, slug, unread, outside, "these ComputeClasses have a rule that consumes only a named reservation", "ComputeClasses"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -3004,6 +3096,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     )
 
     candidates: list[dict] = []
+    # §3.10(b): the class rules that the fleet step compares with reservations.
+    reserved_classes: list[dict] = []
     commands: dict[str, dict] = {}
 
     # A claim that names no class gets the cluster's default, and most charts
@@ -3131,6 +3225,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         reservation_hit = None if non_production else check_class_reservation_status(cc)
         if reservation_hit:
             candidates.append(_emit("reservation-mismatch-risk", {**reservation_hit, "command": dump_record["command"]}))
+        elif not non_production:
+            # GKE did not name a reservation: the fleet step compares the rules
+            # with the reservations of their owner projects.
+            reserved_classes += [{**rule, "command": dump_record["command"]} for rule in reserved_class_rules(cc, project)]
         for hit in [check_compute_class_status(cc, reservation_filed=bool(reservation_hit))]:
             if hit:
                 # Stamped, as the workload arms below are: a failed pool list pops
@@ -3649,6 +3747,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     reserved_pools = [{**reserved, "command": pools_record["command"]} for pool in node_pools for reserved in [reserved_pool(pool, project)] if reserved]
     if reserved_pools:
         entry[RESERVED_POOLS_KEY] = reserved_pools
+    if reserved_classes:
+        entry[RESERVED_CLASSES_KEY] = reserved_classes
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
     if unevaluated:
@@ -3928,6 +4028,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     zones_by_project = {e["project"]: e.pop(RESERVATION_ZONES_KEY) for e in project_entries if RESERVATION_ZONES_KEY in e}
     for cluster_entry in returned_clusters:
         file_reserved_pools(cluster_entry, zones_by_project, frozenset(projects))
+        file_reserved_classes(cluster_entry, zones_by_project, frozenset(projects))
     entries = returned_clusters + project_entries + failed_entries + not_running + discovery_entries
     # An unreachable cluster evaluated no check, so it leaves `scope.clusters`
     # as empty as no cluster at all; a gate-failed one stays eligible, since
