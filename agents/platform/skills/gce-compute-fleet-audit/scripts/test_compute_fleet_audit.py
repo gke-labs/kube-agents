@@ -2720,6 +2720,18 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         )
         self.assertEqual(cf.SERIAL_LOGGING_FORMAT, "--format=json(name,zone)")
 
+    def test_every_command_the_check_issues_passes_the_command_policy(self):
+        """The sandbox refuses a command the policy does not admit, and a
+        refused read here would leave the check unevaluated on every project."""
+        import command_policy
+
+        _, issued = self.collect(self.responses())
+        own = [argv for argv in issued if cf.GKE_NODES_FILTER in " ".join(argv) or argv[1:3] == ["logging", "read"]]
+        self.assertEqual(len(own), 3)
+        for argv in own:
+            decision = command_policy.evaluate(argv)
+            self.assertTrue(decision.allowed, f"{argv}: {decision.message}")
+
     def test_a_clean_log_is_a_check_that_ran_and_found_nothing(self):
         entry, _ = self.collect(self.responses())
         self.assertEqual(self.conntrack(entry), [])
