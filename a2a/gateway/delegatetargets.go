@@ -149,6 +149,19 @@ func (g *Gateway) advertisedWidth() int {
 	return 0
 }
 
+// advertisedRounds is the delegation rounds a profile parent's
+// delegateTargets part offers: the setting its requests are refused past
+// (DelegationRoundsMax, under delegation.rounds in handleDelegateRequest). It
+// rides the part only when over one, so at one the part is the shape a worker
+// built before rounds reads. A session parent's part never carries it: the
+// rule is a profile parent's.
+func (g *Gateway) advertisedRounds() int {
+	if g.cfg != nil && g.cfg.DelegationRoundsMax > 1 {
+		return g.cfg.DelegationRoundsMax
+	}
+	return 0
+}
+
 // probeParameterValue fills a required parameter in the probe
 // profileDelegateTargets checks a profile with: the parent's worker supplies
 // the real value, and the gateway reads no value but a target's.
@@ -161,7 +174,8 @@ const probeTargetToken = "probe_target"
 
 // profileDelegateTargets is the delegateTargets part a delegating profile
 // parent's submission carries (#6789): every profile the delegation would
-// accept from parent, in name order, and the batch width it would accept.
+// accept from parent, in name order, the batch width it would accept, and
+// the delegation rounds (advertisedRounds).
 // It is not a second copy of the rules: the parent-wide refusals
 // (profileParentRefusal, the depth cap) and each profile's
 // (delegateEntryCheck) are the delegation's own, run on a probe entry
@@ -182,7 +196,7 @@ const probeTargetToken = "probe_target"
 // requester's lists are checked as they stand at submission; a steer during
 // the task is checked only when the delegation arrives.
 func (g *Gateway) profileDelegateTargets(rec *SessionRecord, parent TaskRef) lib.DelegateTargets {
-	out := lib.DelegateTargets{Targets: []lib.DelegateTarget{}, WidthMax: g.advertisedWidth()}
+	out := lib.DelegateTargets{Targets: []lib.DelegateTarget{}, WidthMax: g.advertisedWidth(), RoundsMax: g.advertisedRounds()}
 	if parent.Requester == nil || parent.Depth >= g.cfg.DelegationDepthMax {
 		return out
 	}

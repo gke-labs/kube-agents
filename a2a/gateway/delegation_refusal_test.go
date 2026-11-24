@@ -3,6 +3,9 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -62,8 +65,8 @@ func TestARefusedProfileParentIsToldOnItsIn(t *testing.T) {
 		got = refusalsOn(t, r, "prod-east", taskID)
 		return len(got) > 0
 	})
-	// A first refusal is untagged: it ends the parent's wait.
-	if len(got) != 1 || got[0].Repeat || !strings.HasPrefix(got[0].Text, noticeDelegationRefusedFor) || !strings.Contains(got[0].Text, want) {
+	// A first refusal is round one, untagged: it ends the parent's wait.
+	if len(got) != 1 || got[0].Round != 0 || !strings.HasPrefix(got[0].Text, noticeDelegationRefusedFor) || !strings.Contains(got[0].Text, want) {
 		t.Fatalf("refusals on the parent's .in = %+v, want one untagged naming %q", got, want)
 	}
 }
@@ -94,7 +97,7 @@ func TestABusyRefusedProfileParentIsToldOnItsIn(t *testing.T) {
 		got = refusalsOn(t, r, "prod-east", taskID)
 		return len(got) > 0
 	})
-	if len(got) != 1 || got[0].Repeat || !strings.Contains(got[0].Text, "a delegated task is still running (task "+live+")") {
+	if len(got) != 1 || got[0].Round != 0 || !strings.Contains(got[0].Text, "a delegated task is still running (task "+live+")") {
 		t.Fatalf("refusals on the parent's .in = %+v, want one untagged busy refusal naming %s", got, live)
 	}
 	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">")); after != before {
@@ -103,8 +106,9 @@ func TestABusyRefusedProfileParentIsToldOnItsIn(t *testing.T) {
 }
 
 // TestAProfileParentsRepeatWhileItsBatchRunsIsToldTagged: a profile parent
-// waits open on the batch its first request minted, so a second request is
-// refused to it tagged as a repeat, which ends nothing. Nothing more is
+// waits open on the batch its first request minted, so a second request, past
+// the one delegation round there is by default, is refused to it under
+// delegation.rounds, tagged round 2, which ends nothing. Nothing more is
 // minted, the first request's record is untouched, and its children's ends
 // still reach the parent.
 func TestAProfileParentsRepeatWhileItsBatchRunsIsToldTagged(t *testing.T) {
@@ -123,8 +127,8 @@ func TestAProfileParentsRepeatWhileItsBatchRunsIsToldTagged(t *testing.T) {
 		got = refusalsOn(t, r, "chat", origin.TaskID)
 		return len(got) > 0
 	})
-	if len(got) != 1 || !got[0].Repeat || got[0].Text != noticeDelegationRefusedFor+noticeDelegationRepeat {
-		t.Fatalf("refusals on the parent's .in = %+v, want one tagged repeat", got)
+	if len(got) != 1 || got[0].Round != 2 || got[0].Text != roundsRefusal(1, true) {
+		t.Fatalf("refusals on the parent's .in = %+v, want one tagged round 2", got)
 	}
 	rec, _ := r.g.reg.Get(ctx, conv)
 	if ref, _ := rec.TaskRefFor(origin.TaskID); ref.DelegationEnd != "" || len(ref.Children) != len(kids) {
@@ -176,9 +180,10 @@ func TestAProfileWhoseCardDoesNotDelegateIsRefused(t *testing.T) {
 
 // TestARefusedProfileParentsRequestAgainIsARepeat: the parent was told its
 // refusal ends its wait, so the same task's request seen again (a
-// redelivery after a restart reads the same way) is refused as a repeat,
-// tagged so it ends nothing, and is not minted late once what refused it has
-// cleared.
+// redelivery after a restart reads the same way) is refused under
+// delegation.rounds, the refused request having used the task's one round,
+// tagged round 2 so it ends nothing, and is not minted late once what refused
+// it has cleared.
 func TestARefusedProfileParentsRequestAgainIsARepeat(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
@@ -219,8 +224,8 @@ func TestARefusedProfileParentsRequestAgainIsARepeat(t *testing.T) {
 	})
 	time.Sleep(300 * time.Millisecond)
 	got = refusalsOn(t, r, "prod-east", taskID)
-	if len(got) != 2 || got[0].Repeat || !got[1].Repeat || got[1].Text != noticeDelegationRefusedFor+noticeDelegationRepeat {
-		t.Fatalf("refusals after the request came again = %+v, want the first untagged and one tagged repeat", got)
+	if len(got) != 2 || got[0].Round != 0 || got[1].Round != 2 || got[1].Text != roundsRefusal(1, false) {
+		t.Fatalf("refusals after the request came again = %+v, want the first untagged and one tagged round 2", got)
 	}
 	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">")); after != before {
 		t.Fatalf("%d submission(s) for a request already answered", after-before)
@@ -268,8 +273,8 @@ func TestACutShortBatchWhoseProfileLostDelegatesIsWithdrawn(t *testing.T) {
 
 // TestAProfileParentsRequestAfterItsBatchWasWithdrawnIsARepeat: a batch
 // withdrawn whole has had each entry ended (endWithdrawnProfileBatch), and
-// no refusal beside those ends. The task's request after that is refused as
-// a repeat, tagged, with nothing minted.
+// no refusal beside those ends. The task's request after that is refused
+// under delegation.rounds, tagged round 2, with nothing minted.
 func TestAProfileParentsRequestAfterItsBatchWasWithdrawnIsARepeat(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
@@ -314,10 +319,72 @@ func TestAProfileParentsRequestAfterItsBatchWasWithdrawnIsARepeat(t *testing.T) 
 		got = refusalsOn(t, r, "chat", origin.TaskID)
 		return len(got) > 0
 	})
-	if len(got) != 1 || !got[0].Repeat {
-		t.Fatalf("refusals after the withdrawn batch's request again = %+v, want one tagged repeat", got)
+	if len(got) != 1 || got[0].Round != 2 || got[0].Text != roundsRefusal(1, false) {
+		t.Fatalf("refusals after the withdrawn batch's request again = %+v, want one tagged round 2", got)
 	}
 	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>")); after != before {
 		t.Fatalf("%d submission(s) for a repeat", after-before)
+	}
+}
+
+// roundsRefusal is the parent's text for a request refused under
+// delegation.rounds after used rounds, children saying they minted any.
+func roundsRefusal(used int, children bool) string {
+	text := noticeDelegationRefusedFor + fmt.Sprintf(noticeDelegationRounds, used, plural(used))
+	if children {
+		text += noticeDelegationRoundsChildren
+	}
+	return text
+}
+
+// TestASecondRoundIsRefusedUnderTheRoundsRuleEvenWhenSetHigher: a gateway set
+// to more rounds than are supported (A2A_DELEGATION_ROUNDS_MAX=3) runs at one,
+// with a warning naming the variable, and a profile parent's second request
+// is refused under delegation.rounds, its refusal tagged round 2, with
+// nothing minted. The part the parent was sent advertises no rounds.
+func TestASecondRoundIsRefusedUnderTheRoundsRuleEvenWhenSetHigher(t *testing.T) {
+	t.Parallel()
+	scope := t.TempDir() + "/scope.json"
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, func(c *Config) {
+		c.ScopeFile, c.Namespace = scope, "kubeagents-system"
+		c.DelegationRoundsMax = 3
+	}, slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil)))
+	r.logs = logs
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
+	if r.g.cfg.DelegationRoundsMax != 1 {
+		t.Fatalf("DelegationRoundsMax = %d, want it clamped to 1", r.g.cfg.DelegationRoundsMax)
+	}
+	if !loggedContaining(r, "level=WARN", "A2A_DELEGATION_ROUNDS_MAX", "rounds above 1 are not supported yet", "set=3")() {
+		t.Fatalf("no clamp warning naming the variable:\n%s", logs.String())
+	}
+	ctx := context.Background()
+	conv := "console:tab-rounds-rule"
+	parent, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+	if targets, ok, err := lib.DelegateTargetsOf(messageParts(t, origin)); err != nil || !ok || targets.RoundsMax != 0 {
+		t.Fatalf("the parent's targets = %+v (%v, %v), want a list with no rounds", targets, ok, err)
+	}
+	again := delegateArtifactWithParameters(t, "cluster", "look again", targetParams("p1", "us-east1", "c"))
+	again.ArtifactID += "-again"
+	if err := parent.PublishArtifact(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the rounds refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationRounds, "roundsUsed=1", "roundsMax=1"))
+	var got []lib.DelegationRefusal
+	waitFor(t, "the refusal on the parent's .in", func() bool {
+		got = refusalsOn(t, r, "chat", origin.TaskID)
+		return len(got) > 0
+	})
+	if len(got) != 1 || got[0].Round != 2 || got[0].Text != roundsRefusal(1, true) {
+		t.Fatalf("refusals = %+v, want one round-2 refusal %q", got, roundsRefusal(1, true))
+	}
+	if loggedContaining(r, "delegation refused", "rule="+ruleDelegationBusy)() {
+		t.Fatal("the second round was refused under delegation.busy too")
+	}
+	if n := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>")); n != len(kids) {
+		t.Fatalf("%d child submissions after the second round, want %d", n, len(kids))
 	}
 }
