@@ -5050,7 +5050,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
 	setBusMigratingCondition(agent, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
-	setA2AProvisionRetryingCondition(agent, a2a.provisionRetrying, now)
+	retryingRose := setA2AProvisionRetryingCondition(agent, a2a.provisionRetrying, now)
 	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
@@ -5060,9 +5060,19 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
 	}
+	r.noteProvisionRetrying(agent, retryingRose, a2a.provisionRetrying)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	return nil
+}
+
+// noteProvisionRetrying records A2AProvisionRetrying's Warning event after
+// the status write that set a new message, so it fires once per rise the
+// operator sees, not once per pass that never saved it.
+func (r *PlatformAgentReconciler) noteProvisionRetrying(agent *agentv1alpha1.PlatformAgent, rose bool, msg string) {
+	if rose {
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aProvisionRetryingReason, msg)
+	}
 }
 
 // adoptRenderedStatus carries the render copy's status and resourceVersion
@@ -5721,7 +5731,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
-	setA2AProvisionRetryingCondition(agent, a2a.provisionRetrying, now)
+	retryingRose := setA2AProvisionRetryingCondition(agent, a2a.provisionRetrying, now)
 	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
@@ -5739,6 +5749,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, a2aTasksWaitRequeue, err
 	}
+	r.noteProvisionRetrying(agent, retryingRose, a2a.provisionRetrying)
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteBusMigrationEcho(agent, wroteBusMigration)

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -27,14 +28,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // A provision Job whose pods keep failing is retried up to its backoffLimit
 // before JobFailed (and A2AProvisionFailed) appears, which can take over an
-// hour. Meanwhile A2AProvisionRetrying says so, with one Warning event per
-// newly failed pod, and leaves BusProvisioned and the phase alone (#7100).
+// hour. Meanwhile A2AProvisionRetrying says so, with a Warning event each
+// time a pass sees the failed-pod count rise, and leaves BusProvisioned and
+// the phase alone (#7100).
 func TestAFailingProvisionJobRerunIsReportedWithoutUnprovisioningTheBus(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
@@ -188,5 +193,101 @@ func TestProvisionRetryingIsOnlyForAJobStillRetrying(t *testing.T) {
 				t.Errorf("provisionRetrying = %q, want set=%v", state.provisionRetrying, tc.want)
 			}
 		})
+	}
+}
+
+// The Warning event follows the status write that set the new message. A
+// pass whose write fails records nothing, so a write that keeps failing
+// doesn't repeat the event for one failed pod; the pass that saves it
+// records it once.
+func TestProvisionRetryingEventFollowsTheStatusWrite(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	failWrites, attempted := false, false
+	funcs := assigningUIDsOnCreate(fakeServerSideApplyInterceptors())
+	funcs.SubResourceUpdate = func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && failWrites {
+			if meta.FindStatusCondition(pa.Status.Conditions, a2aProvisionRetryingConditionType) != nil {
+				attempted = true
+			}
+			return errors.New("injected status write failure")
+		}
+		return c.SubResource(sub).Update(ctx, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent), discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	recorder := record.NewFakeRecorder(64)
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: recorder}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		busGatePass(t, ctx, r, req, "install")
+	}
+	theCalloutIsRolledOut(t, ctx, cl, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "provisioned")
+
+	job := &batchv1.Job{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: buildA2AProvisionJob(agent).Name, Namespace: agent.Namespace}, job); err != nil {
+		t.Fatalf("get provision Job: %v", err)
+	}
+	job.Status.Succeeded, job.Status.CompletionTime, job.Status.Conditions, job.Status.Failed = 0, nil, nil, 1
+	if err := cl.Status().Update(ctx, job); err != nil {
+		t.Fatalf("update provision Job status: %v", err)
+	}
+	warnings := func() int {
+		n := 0
+		for len(recorder.Events) > 0 {
+			if e := <-recorder.Events; strings.HasPrefix(e, corev1.EventTypeWarning+" "+a2aProvisionRetryingReason+" ") {
+				n++
+			}
+		}
+		return n
+	}
+	_ = warnings()
+
+	failWrites = true
+	for i := 0; i < 2; i++ {
+		_, _ = r.Reconcile(ctx, req) // fails at the status write, by design
+	}
+	if !attempted {
+		t.Fatal("no failing pass reached a status write carrying the condition; the assertion below would be inert")
+	}
+	if n := warnings(); n != 0 {
+		t.Errorf("%d %s Warning events from passes whose status write failed, want 0", n, a2aProvisionRetryingReason)
+	}
+	failWrites = false
+	busGatePass(t, ctx, r, req, "write lands")
+	if n := warnings(); n != 1 {
+		t.Errorf("%d %s Warning events from the pass that saved the condition, want 1", n, a2aProvisionRetryingReason)
+	}
+}
+
+// The setter reports a rise only when it stores a message the CR lacked, so
+// a status write made for another condition while the count holds records
+// no second event.
+func TestSetProvisionRetryingReportsOnlyANewMessage(t *testing.T) {
+	agent := a2aTestAgent()
+	now := metav1.Now()
+	one := a2aProvisionRetryingMessage("job", "ns", 1)
+	two := a2aProvisionRetryingMessage("job", "ns", 2)
+	for _, step := range []struct {
+		msg  string
+		want bool
+	}{
+		{one, true},
+		{one, false},
+		{two, true},
+		{"", false},
+		{"", false},
+		{one, true},
+	} {
+		if got := setA2AProvisionRetryingCondition(agent, step.msg, now); got != step.want {
+			t.Errorf("set(%q) = %v, want %v", step.msg, got, step.want)
+		}
 	}
 }

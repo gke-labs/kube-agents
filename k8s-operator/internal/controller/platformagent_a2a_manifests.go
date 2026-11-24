@@ -8504,18 +8504,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// check (or on an unknown verdict), and a pass that created it but
 		// failed later never wrote the clear.
 		state.busMeta = a2aBusMetaState{checked: true}
-		terminal := false
-		for _, cond := range existing.Status.Conditions {
-			if cond.Status == corev1.ConditionTrue && (cond.Type == batchv1.JobComplete || cond.Type == batchv1.JobFailed) {
-				terminal = true
-			}
-		}
-		if !terminal && existing.Status.Failed > 0 {
-			state.provisionRetrying = a2aProvisionRetryingMessage(existing.Name, existing.Namespace, existing.Status.Failed)
-			if !a2aProvisionRetryingConditionCurrent(agent, state.provisionRetrying) {
-				r.recordEvent(agent, corev1.EventTypeWarning, a2aProvisionRetryingReason, state.provisionRetrying)
-			}
-		}
 		for _, cond := range existing.Status.Conditions {
 			if cond.Status != corev1.ConditionTrue {
 				continue
@@ -8611,6 +8599,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 				}
 			}
 		}
+	}
+
+	// Neither complete nor failed, with failed pods: the Job is retrying.
+	// The status writers carry it, and record its Warning event once the
+	// write lands, so a pass that errors before them doesn't repeat it.
+	if existing != nil && existing.DeletionTimestamp == nil && !state.done && !state.failed && existing.Status.Failed > 0 {
+		state.provisionRetrying = a2aProvisionRetryingMessage(existing.Name, existing.Namespace, existing.Status.Failed)
 	}
 
 	// Superseded generations go now, not by TTL. A Job whose name the render
@@ -9388,8 +9383,9 @@ const (
 	// a2aProvisionRetryingConditionType is present, True, while the current
 	// provision Job has failed pods and is still retrying, and absent
 	// otherwise. Informational: it changes neither BusProvisioned, Ready nor
-	// the phase, so a routine retry (an upgrade waiting on the auth callout)
-	// does not flip a Ready install or fail `helm upgrade --wait`.
+	// the phase, so a retry that clears by itself (NATS briefly unreachable)
+	// does not flip a Ready install or fail `helm upgrade --wait`, which
+	// waits on this CR's status.
 	a2aProvisionRetryingConditionType = "A2AProvisionRetrying"
 	a2aProvisionRetryingReason        = "ProvisionJobPodsFailing"
 )
@@ -9412,10 +9408,16 @@ func a2aProvisionRetryingConditionCurrent(agent *agentv1alpha1.PlatformAgent, ms
 		existing.Reason == a2aProvisionRetryingReason && existing.Message == msg
 }
 
-func setA2AProvisionRetryingCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+// setA2AProvisionRetryingCondition reports whether it set a message the CR
+// did not already carry: the failed-pod count rose, or a Job began retrying.
+// The caller records the Warning event after its status write succeeds.
+func setA2AProvisionRetryingCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) bool {
 	if msg == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aProvisionRetryingConditionType)
-		return
+		return false
+	}
+	if a2aProvisionRetryingConditionCurrent(agent, msg) {
+		return false
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type:               a2aProvisionRetryingConditionType,
@@ -9425,6 +9427,7 @@ func setA2AProvisionRetryingCondition(agent *agentv1alpha1.PlatformAgent, msg st
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	})
+	return true
 }
 
 // a2aBusHoldSkippedReason is the Warning event's reason when the bus moves to
