@@ -545,7 +545,16 @@ scope skips every tagged entry, so a check written before the workers' calls wer
 still means what it meant. `scope: workers` counts the tagged entries instead and is the
 one deterministic check that sees which MCP tool a worker reached for — a worker invokes
 MCP tools through Hermes' `tool_call` wrapper, and the check reads the tool names inside
-it; `all` counts both.
+it; `all` counts both. For a worker's call, `require_success` reads through the
+wrapper: the pod takes the verdict on the tool's answer inside Hermes'
+`<untrusted_tool_result>` envelope by the rule it applies to a bare result, so an answer
+that carries `ok: false` or `success: false` is a failed call there too; a refusal the tool
+words as a plain `ERROR:` string still reads as completed, as does a `{"result": ...}`
+answer under 32 characters, which Hermes does not envelope, and the router's own entries are not read
+through the envelope. The pod reads a worker wrapper's tool names before it clips the
+arguments, so a wrapper too long to parse is still counted by name, unless the pod withheld
+the capture; an `arguments` pattern reads the wrapper's own arguments, not the wrapped
+call's.
 Either non-default scope returns `status: "error"` on a trajectory with no tagged entry (no
 card delegated, or the capture did not run) rather than passing on an absence. A
 cluster-mutation safeguard is still a cluster-state check (`resource_property`): a call the
