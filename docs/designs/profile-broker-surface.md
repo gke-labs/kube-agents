@@ -6,25 +6,25 @@ approver, and no code follows before that decision.
 ## Summary
 
 A profile worker reaches the credential broker under one role, `profile`. That role reaches four
-routes, 11 of the 27 version-control verbs and two MCP tools. The platform agent's shell role
-reaches more, and the platform's work uses the difference:
+routes, 11 of the 27 version-control verbs and two MCP tools. The platform agent's shell role, and
+for the MCP relay its chat role, reach more, and the platform's work uses the difference:
 [the platform-as-profile inventory](platform-as-profile-inventory.md), blocker 7.
 
-This document gives one row for each route and verb that the profile role does not reach. Each row
-says what work uses it, how a grant would be held, which check changes, and when. It also lists
-what stays out.
+This document gives one row for each verb that the profile role does not reach and for each route
+in the tables below. Each row says what work uses it, who would get it, how a grant would be held,
+which check changes, and when. It also lists what stays out.
 
 The recommendation in short:
 
 - Grant one verb or one route in each pull request, each with a conformance row and its mutation.
 - Hold each grant with a fact of the task credential: the target, the permit, the trigger, or the
-  profile's name. A read verb is the exception: as the eight reads of today, it reads each managed
-  repository for each task of each profile.
-- Reads first. Writes wait for the unattended write permit, which has its own design.
-- Four designs of the same work are named here and are not written yet: the unattended write
-  permit, the hooks, the dial and post-merge state, and reads with no cluster.
-- Three things stay out: the forge token routes, a credential that leaves the broker, and each
-  command that waits or follows.
+  profile's name.
+- Give a verb to each profile only when the model's work in a profile calls it. Three reads that
+  only scripts call get no grant here.
+- Writes wait for the unattended write permit.
+- Four other designs own parts of this work: the unattended write permit, the hooks, the dial and
+  post-merge state, and reads with no cluster.
+- [What Stays Out](#what-stays-out) lists five things that get no grant.
 
 ## What a Profile Reaches Today
 
@@ -80,19 +80,22 @@ work has a reason to pass. D where the work does not need the model. Not B.
 ## Version-Control Verbs
 
 Sixteen verbs are outside the profile set. "Work" names the main platform code that calls the verb
-today. `vcs.py`, the model's version-control tool, offers each verb, and a copy of it ships in the
-`cluster` persona.
+today. `vcs.py`, the model's version-control tool, offers 10 of the 16 (`capabilities`, the four
+issue writes, `label-ensure`, `proposal-comment`, `proposal-close`, `proposal-acknowledge`,
+`branch-delete`), and a copy of it ships in the `cluster` persona. The other six (`snapshot`,
+`proposal-reviews`, `proposal-closer`, `revision-contains`, `proposal-claim`,
+`proposal-practice-label`) are library verbs that only scripts call.
 
 ### Reads
 
-| Verb                | Work today                                                                                         | Proposal                                                                                                                                                                                                                                      | Check that changes                                                                                      |
-| ------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `proposal-reviews`  | The post-merge check reads change requests                                                         | Grant. Held as the eight reads: a task credential and the managed list                                                                                                                                                                        | `ROLE_VCS_VERBS`; a row that holds the exact verb set, which does not exist today                       |
-| `proposal-closer`   | The decision-memory sweep reads who closed a proposal                                              | Grant, same hold                                                                                                                                                                                                                              | Same                                                                                                    |
-| `revision-contains` | The post-merge check asks if a revision contains a commit                                          | Grant, same hold. It fetches into a scratch repository on the broker, with the size ceiling of `clone`                                                                                                                                        | Same                                                                                                    |
-| `capabilities`      | `submit-suggestion` reads the install's write mode before a publish                                | Grant only with a new hold: for the profile role the dispatcher resolves the repository and asks the managed list, as for each other verb                                                                                                     | The import check; a new row: a profile's `capabilities` for a repository that is not managed is refused |
-| `snapshot`          | `inspect-repository`, the audit collectors and the API deprecation scan read one revision as a tar | Grant for a managed repository only, the rule that the `curator` role has today. That serves the collectors. It does not serve `inspect-repository`, which exists to read a context repository or one that nobody registered. Open question 1 | The import check; a new row (the `curator` rule has a unit test only)                                   |
-| `proposal-claim`    | The `pr_opened` plugin claims a proposal with the token of its `proposal-create` answer            | No grant in this document. A profile's `proposal-create` answer carries the token today, but the caller of the claim is the replacement of that plugin, which the hooks design owns                                                           | None now                                                                                                |
+| Verb                | Work today                                                                                         | Who gets it  | Proposal                                                                                                                                                                                                                                                                                                                                                   | Check that changes                                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `proposal-reviews`  | The post-merge check reads change requests                                                         | None         | No grant in this document. The caller is a script with no model, and `vcs.py` has no command for the verb. Option D: the work stays with the script run. Decide again with the dial and post-merge state design                                                                                                                                            | None                                                                                                                                           |
+| `revision-contains` | The post-merge check asks if a revision contains a commit                                          | None         | Same                                                                                                                                                                                                                                                                                                                                                       | None                                                                                                                                           |
+| `proposal-closer`   | The decision-memory sweep reads who closed a proposal                                              | None         | No grant in this document, for the same reason. Decide with the move of the watcher script                                                                                                                                                                                                                                                                 | None                                                                                                                                           |
+| `capabilities`      | `submit-suggestion` reads the install's write mode before a publish                                | Each profile | Grant only with a new hold: for the profile role the broker's dispatch (`_dispatch_vcs_post`) resolves the repository and asks the managed list, as for each other verb. Open question 1                                                                                                                                                                   | The import check; the row that holds the exact verb set; a new row: a profile's `capabilities` for a repository that is not managed is refused |
+| `snapshot`          | `inspect-repository`, the audit collectors and the API deprecation scan read one revision as a tar | Each profile | Grant for a managed repository only, the rule that the `curator` role has today. That serves the collectors' reads of the GitOps repository. It does not serve the audit's declared-intent search, which reads each context repository through `inspect_repository.py clone`, and it does not serve the `inspect-repository` skill. Open questions 2 and 3 | The import check; the row that holds the exact verb set; a new row (the `curator` rule has a unit test only)                                   |
+| `proposal-claim`    | The `pr_opened` plugin claims a proposal with the token of its `proposal-create` answer            | None         | No grant in this document. A profile's `proposal-create` answer carries the token today, but the caller of the claim is the replacement of that plugin, which the hooks design owns                                                                                                                                                                        | None                                                                                                                                           |
 
 ### Writes
 
@@ -104,34 +107,37 @@ unattended run can hold, and a permit check for each verb (the broker checks one
 each gated verb now). The permit is the subject of the unattended write permit design.
 
 Most of the work below is on an object of an earlier run: a ledger issue, a stale proposal, a
-review reply, a spent branch. The task bar of today cannot hold that work. Each row names the bar
-that can, and open question 3 asks what replaces the task bar.
+review reply, a spent branch. The task bar of today cannot hold that work. The ownership bar alone
+is wider than the task: it passes each proposal and branch of the install. Each row names the bar
+that the work needs, and open questions 5 and 6 ask what replaces the task bar.
 
-| Verb                                           | Work today                                                                                                                                   | Bars that the grant needs                                                                                                                                                                                                                                                                                         | When                  |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
-| `issue-create`                                 | The audit ledger opens one issue for each stream. Two scripts with no model open one too: the chat-delivery watch and the first-run delivery | Only in the repository that the install publishes to, the rule of the report store for the same trigger. The labels are those of the stream that the trigger names; the broker writes them, not the caller. The two scripts name no stream: they are script runs, and this bar does not fit them                  | After the permit      |
-| `issue-comment`, `issue-update`, `issue-close` | The audit ledger; the chat-delivery watch; the issue resolver                                                                                | For the ledger: the issue is the install's own, opened by the credential's login, with the stream label of the trigger, in the publish repository. The issue resolver is not covered: it works on issues that people open and must not touch the install's own, so it needs a different bar and its own row later | After the permit      |
-| `label-ensure`                                 | The audit ledger, the resolver, the chat-delivery watch and the first-run delivery make their labels                                         | Only in the publish repository. The label name is in a closed set for the stream. A profile cannot make the auto-merge label                                                                                                                                                                                      | With the issue verbs  |
-| `proposal-comment`                             | Replies on a proposal; the post-merge follow-ups                                                                                             | The ownership bar: the install's own proposal (`is_agent_pull_request`). The task bar passes only a proposal of the same task, so a reply or a follow-up in a later run needs what open question 3 decides                                                                                                        | After the issue verbs |
-| `proposal-close`, `proposal-acknowledge`       | The audit closes a stale proposal; a reply marks a review as seen                                                                            | Same                                                                                                                                                                                                                                                                                                              | After the issue verbs |
-| `branch-delete`                                | `submit-suggestion` uses a branch name again; the audit and the auto-merge switch delete a spent branch                                      | The broker's rule of today: under the install's branch prefix, and the proposal is done. A spent branch is from an earlier run, so the task bar cannot hold it. Open question 3                                                                                                                                   | After the issue verbs |
-| `proposal-practice-label`                      | The audit labels an auto-merge candidate                                                                                                     | No grant in this document. It belongs to the dial and auto-merge state                                                                                                                                                                                                                                            | With the dial design  |
+The install's write mode (`PROPOSE_VERBS`) refuses branch and proposal writes for each caller
+before these bars. It does not refuse the issue verbs or `label-ensure`.
+
+Each grant in this table changes the row
+`test_A3_a_profile_caller_publishes_a_change_only_under_the_permit`, the row that holds the exact
+verb set, and the two gated sets that the import check reads.
+
+| Verb                                           | Work today                                                                                                                                   | Who gets it                      | Bars that the grant needs                                                                                                                                                                                                                                                                                                                                                                  | When                  |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
+| `issue-create`                                 | The audit ledger opens one issue for each stream. Two scripts with no model open one too: the chat-delivery watch and the first-run delivery | A profile on the operator's list | The four conditions of the report store's write rule: the profile is on the operator's list; the trigger has origin `builtin`; its name is `schedule/<stream>`; the repository is the one that the install publishes to. The labels are those of that stream; the broker writes them, not the caller. The two scripts name no stream: they are script runs, and this bar does not fit them | After the permit      |
+| `issue-comment`, `issue-update`, `issue-close` | The audit ledger; the chat-delivery watch; the issue resolver                                                                                | A profile on the operator's list | For the ledger: the same four conditions, and the issue is the install's own, opened by the credential's login, with the stream label of the trigger. The issue resolver is not covered: it works on issues that people open and must not touch the install's own, so it needs a different bar and its own row later                                                                       | After the permit      |
+| `label-ensure`                                 | The audit ledger, the resolver, the chat-delivery watch and the first-run delivery make their labels                                         | A profile on the operator's list | The same four conditions. The label name is in a closed set for the stream. A profile cannot make the auto-merge label                                                                                                                                                                                                                                                                     | With the issue verbs  |
+| `proposal-comment`                             | Replies on a proposal; the post-merge follow-ups                                                                                             | None until open question 6       | The ownership bar: the install's own proposal (`is_agent_pull_request`). The task bar passes only a proposal of the same task, so a reply or a follow-up in a later run needs what open question 6 decides                                                                                                                                                                                 | After the issue verbs |
+| `proposal-close`, `proposal-acknowledge`       | The audit closes a stale proposal; a reply marks a review as seen                                                                            | None until open question 6       | Same                                                                                                                                                                                                                                                                                                                                                                                       | After the issue verbs |
+| `branch-delete`                                | `submit-suggestion` uses a branch name again; the audit and the auto-merge switch delete a spent branch                                      | None until open question 6       | The broker's rule of today: under the install's branch prefix, and the proposal is done. A spent branch is from an earlier run, so the task bar cannot hold it                                                                                                                                                                                                                             | After the issue verbs |
+| `proposal-practice-label`                      | The audit labels an auto-merge candidate                                                                                                     | None                             | No grant in this document. It belongs to the dial and auto-merge state                                                                                                                                                                                                                                                                                                                     | With the dial design  |
 
 ## Routes
 
-| Route                          | Work today                                                                                                     | Proposal                                                                                                                                                                                                                                                                                                                                                                                                            | Check that changes                                                                                         |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `gke` MCP server on `/v1/mcp/` | Control-plane reads in the cluster audits                                                                      | Grant the control-plane tools only (cluster, node pool and operation reads), with a per-task target check: each resource argument must resolve to the task's target; a wildcard, a missing argument or an unknown shape is refused; a tool with no argument map is refused. The in-cluster tools stay out: they read any kind, and kubectl on `/v1/exec` is the profile's read of the cluster with its own refusals | `PROFILE_SERVER_TOOLS`; a per-tool argument table; rows for each argument shape and for an in-cluster tool |
-| `/v1/gcp/` (Cloud API relay)   | Monitoring, Trace, GKE cluster and Logging reads for the cost audit, the health sweep, the observability skill | Grant with a per-task target check: the project in the path or the body is the task's project, and a cluster in the path is the task's cluster. A credential with no target is refused                                                                                                                                                                                                                              | `ROUTE_ROLES`; the relay handler; rows: other project, other cluster, no task                              |
-| `/v1/exec/admission`           | A fleet sweep sizes its pool                                                                                   | No grant now. A task reads one cluster, so it has no pool to size. Decide again with the design for reads with no cluster                                                                                                                                                                                                                                                                                           | None                                                                                                       |
-| `/v1/feedback/`                | The feedback skill files one confirmed report                                                                  | No grant now. It is a write to a form outside the install on a person's confirm. It needs its own permit, minted for a confirmed request. Open question 2                                                                                                                                                                                                                                                           | None                                                                                                       |
-| `/v1/forge/`, `/v1/github/`    | The sandbox makes its forge credential current before `git` and `gh` use it                                    | Stays out. A profile's version control runs in the broker, so a profile has no credential to refresh                                                                                                                                                                                                                                                                                                                | None                                                                                                       |
-
-A task with no cluster carries a report credential or none. The broker refuses a report credential
-on each route outside a fixed list, and `/v1/vcs/` is not on that list. So a run that a schedule
-starts with no cluster reaches no version-control verb today, whatever the verb set says. A grant
-that the trigger holds, such as the issue verbs for an audit, also needs an entry in that list for
-the one verb, with its own row.
+| Route                              | Work today                                                                                                                                         | Who gets it                      | Proposal                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Check that changes                                                                                                                                                        |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gke` MCP server on `/v1/mcp/`     | Control-plane settings in the cluster inventory audit                                                                                              | Each profile, if granted         | The six control-plane tools only: `get_cluster`, `get_node_pool`, `get_operation`, `list_clusters`, `list_node_pools`, `list_operations`. Each resource argument must resolve to the task's target; for the two list tools that take no cluster, the project and the location equal the target's; `-`, a missing argument or an unknown shape is refused; a tool with no argument map is refused. The nine in-cluster tools stay out: two of them (`get_k8s_resource`, `describe_k8s_resource`) read any kind, Secrets included, and kubectl on `/v1/exec` is the profile's read of the cluster with its own refusals. The gain is small: `gcloud container clusters describe` and `node-pools describe` give a profile the settings that the audit reads, and only `get_operation` has no confined gcloud command. Open question 11 | `PROFILE_SERVER_TOOLS`; a per-tool argument table; `test_A3_a_profile_worker_reaches_no_cluster_through_mcp`; new rows for each argument shape and for an in-cluster tool |
+| `/v1/gcp/` (Cloud API relay)       | Monitoring, Trace and Logging reads for the cost audit, the health sweep, the observability skill, the stockout collector and the readiness report | Each profile                     | Grant the six Monitoring, Trace and Logging entries with a per-task target check: the project in the path or the body equals the task's project id; a project number is refused; a credential with no target is refused. These reads are held to the task's project and not to its cluster, the limit that `gcloud logging read` has on `/v1/exec` today. Open question 9. The two GKE cluster entries stay out: their callers are the Cluster Agent reconcile, the get-credentials check and the stall watch, and `gcloud container clusters describe` and `list` give a profile that read, held to the target's location                                                                                                                                                                                                           | `ROUTE_ROLES`; the relay handler; `test_A3_the_profile_role_reaches_exec_mcp_vcs_and_the_audit_reports_alone`; new rows: other project, a project number, no task         |
+| `/v1/vcs/` for a report credential | An audit with no cluster writes its ledger issue                                                                                                   | A profile on the operator's list | A task with no cluster carries a report credential or none. The broker refuses a report credential on each route outside a fixed list, and `/v1/vcs/` is not on that list. A report credential also carries no permit today, because the permit needs a cluster target. So a ledger write from a run with no cluster needs two changes: one entry in the route list for the one verb, and a permit on a credential with no target. Open question 8                                                                                                                                                                                                                                                                                                                                                                                   | `REPORT_CREDENTIAL_ROUTES`; `test_A3_a_report_credential_reaches_the_audit_report_routes_alone`                                                                           |
+| `/v1/exec/admission`               | A fleet sweep sizes its pool                                                                                                                       | None                             | No grant now. A task reads one cluster, so it has no pool to size. Decide again with the design for reads with no cluster                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | None                                                                                                                                                                      |
+| `/v1/feedback/`                    | The feedback skill files one confirmed report                                                                                                      | None                             | No grant now. It is a write to a form outside the install on a person's confirm. It needs its own permit, minted for a confirmed request. Open question 10                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | None                                                                                                                                                                      |
+| `/v1/forge/`, `/v1/github/`        | The sandbox makes its forge credential current before `git` and `gh` use it                                                                        | None                             | Stays out. A profile's version control runs in the broker, so a profile has no credential to refresh                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | None                                                                                                                                                                      |
 
 The watcher, Pub/Sub, chat, Teams and dial routes are not in this document. Each belongs to the
 work that moves its caller.
@@ -141,14 +147,14 @@ work that moves its caller.
 The text of the group issue names routes and verbs only. The inventory also lists what `/v1/exec`
 refuses to a profile and the platform's skills use. These rows keep that list in one place.
 
-| Refused today                                                   | Used by                                             | Proposal                                                                                                           |
-| --------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `kubectl wait`, `rollout status`, watch and follow flags        | App onboarding, upgrades, inference skills          | Stays refused. Each holds a broker slot for an unknown time. A skill for a profile reads the state again           |
-| Server-side dry-run                                             | Config Connector and manifest checks                | Stays refused. The command policy counts it as a write                                                             |
-| `gcloud auth`, `gcloud config` writes                           | The PromQL check scripts of three skills            | Stays refused. A token must not leave the broker. The Cloud API relay row gives those scripts their read           |
-| A `gcloud` read that is not in the confined list                | Backup, Workload Identity, recommender reads        | One list entry in each pull request, with how the command names its project. No entry is planned here              |
-| A read with no project (`projects list`, billing, organization) | Fleet and cost work                                 | Not here. It is the subject of the design for reads with no cluster                                                |
-| `bq`, `helm`, `tofu`, `leeway`                                  | Cost analysis, chart and Terraform skills, topology | Not here. No role runs them through the broker. They need a tools image or a relay entry, and no design holds that |
+| Refused today                                                         | Used by                                             | Proposal                                                                                                                                                      |
+| --------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubectl wait`, `rollout status`, the watch, follow and timeout flags | App onboarding, upgrades, inference skills          | Stays refused. Each holds a broker slot for an unknown time. A skill for a profile reads the state again                                                      |
+| Server-side dry-run                                                   | Config Connector and manifest checks                | Stays refused. The command policy counts it as a write                                                                                                        |
+| `gcloud auth` and `gcloud config`, reads included                     | The PromQL check scripts of three skills            | Stays refused. A token must not leave the broker. The Cloud API relay row gives those scripts their read, and the scripts must take the project from the task |
+| A `gcloud` read that is not in the confined list                      | Backup, Workload Identity, recommender reads        | One list entry in each pull request, with how the command names its project. No entry is planned here                                                         |
+| A read with no project (`projects list`, billing, organization)       | Fleet and cost work                                 | Not here. It is the subject of the design for reads with no cluster                                                                                           |
+| `bq`, `helm`, `tofu`, `leeway`                                        | Cost analysis, chart and Terraform skills, topology | Not here. No role runs them through the broker. They need a tools image or a relay entry, and no design holds that                                            |
 
 ## Conformance: Refusals With No Row
 
@@ -162,81 +168,101 @@ Four gaps touch the grants of this document:
 
 1. No row holds the exact verb set of the profile role. The row of today asserts the three writes
    and that the set has no other write. A read verb added to the set turns no row red.
-2. Three checks have a row that does not go through the handler. The route row reads
-   `ROUTE_ROLES`. The permit row calls `profile_vcs_refusal`, and the rows that drive the
-   version-control dispatch use a permitted verb and a credential with the permit. The target rows
-   call `task_confinement.confine`. If the handler stops its call to one of these checks, the
-   suite stays green.
+2. Four checks have a row that does not go through the handler. The route row reads
+   `ROUTE_ROLES`. The verb allowlist has no row at the dispatch: no row calls
+   `vcs_verb_permitted`, and no row sends a verb outside the set through `_dispatch_vcs_post`.
+   The permit row calls `profile_vcs_refusal`, and the rows that drive the dispatch use a
+   credential with the permit. The target rows call `task_confinement.confine`. If the handler
+   stops its call to one of these checks, the suite stays green.
 3. The two import checks have unit tests only: no row and no mutation.
 4. The checks on the task credential (signature, expiry, and the binding to the pod, the profile
    and the tier) have unit tests only. The conformance suite does not import that module, because
    the module needs `cryptography`.
 
-Proposal: one pull request with tests only adds the rows and mutations for gaps 1 to 3 before the
-first grant. It adds no authority. Gap 4 gives the suite a new dependency, which is open
-question 5.
+Proposal: one pull request with tests only adds rows and mutations for gaps 1 to 3 before the
+first grant: the exact verb set, a handler row for the route table and the task gate, a handler row
+with a refused verb and with no permit, and the import checks. It adds no authority. The handler
+row for the confinement call and gap 4 need a verified credential in the suite, which is open
+question 12.
 
 ## What Stays Out
 
 - The forge token routes. A profile never holds or refreshes a forge credential.
 - A command or route that returns a credential to the caller.
 - A command that waits, watches or follows.
-- A read of a repository that nobody registered (`snapshot` outside the managed list).
+- A read of a repository that nobody registered (`snapshot` of an unregistered repository). The
+  context repository is open question 3.
 - A grant by request field. Each hold reads the verified task credential.
 
 ## Order of the Work
 
 1. The conformance rows for gaps 1 to 3, with tests only.
-2. The three read verbs, one pull request for each verb.
-3. The `gke` MCP server with its target check.
-4. The Cloud API relay with its target check.
-5. `capabilities` and `snapshot`, only if the approver accepts the changed import check.
-6. The issue verbs and `label-ensure`, after the unattended write permit.
-7. The proposal verbs and `branch-delete`.
+2. The six Monitoring, Trace and Logging entries of the Cloud API relay, with the target check.
+3. `capabilities` and `snapshot`, only if the approver accepts the changed import check.
+4. The issue verbs and `label-ensure`, after the unattended write permit.
+5. The proposal verbs and `branch-delete`, after open question 6.
 
-The work goes one pull request at a time on `credential_proxy.py`.
+The work goes one pull request at a time on `credential_proxy.py`. The tests-only change, the
+permit gate and the findings route take turns in the same queue.
 
 ## Done When
 
 The group issue for blocker 7 is done when:
 
-- [ ] Each route and verb in the tables of this document has a decision: a grant with its hold, or
-      "stays out" with a reason.
-- [ ] Each grant is merged as its own pull request, with a conformance row and a mutation.
+- [ ] Each row in the tables of this document has one of three results, recorded here by the
+      approver: a grant with its hold; "stays out" with a reason; or "moved" to a named design.
+- [ ] Each grant is merged as its own pull request, with a conformance row and a mutation. A write
+      verb that waits for the permit of another issue is "moved" to that issue's design until the
+      permit exists.
 - [ ] Each of the four conformance gaps has a row and a mutation, or a written decision.
-- [ ] The site page for what the agent is permitted to do names each grant.
-- [ ] For each verb family, a paired eval case passes on the profile side.
+- [ ] The site page `reference/credential-isolation.md` names each grant.
+- [ ] Each grant has its proof. For a verb that the model's tool calls: a paired eval case that
+      passes three times on the profile side. For a route, and for a verb that no model tool
+      calls: the conformance row and its mutation.
 
 ## What Was Checked, and What Was Not
 
 Checked in the code at `b5f4f11f2`: the role table, the verb sets, the two gated sets, the import
 checks, the task bar, the report credential's route list, the tools of the `gke` server, the
 `curator` rule for `snapshot`, the claim token of `proposal-claim`, the MCP profile set, the
-audit-report rules, the entries of the Cloud API relay, and the callers of each verb under
-`agents/`.
+audit-report rules, the entries of the Cloud API relay and their callers, the commands of `vcs.py`,
+and the callers of each verb under `agents/`.
 
 Not checked:
 
-- If a Monitoring read for a cluster must name a project other than the cluster's project.
+- If a Monitoring read on a project that is a metrics scope returns series of other projects.
 - How the audit ledger's labels map to a trigger's stream in each case.
 - What the in-cluster `gke` tools return under the broker's IAM roles.
-- Which scheduled runs carry a cluster target.
+- Which scheduled runs carry a cluster target, and which audit streams read a context repository.
 - The Hermes side of the callers, and each caller outside `agents/`.
 - Each refusal of the profile role against the suite. The four gaps above were read in the
   tests; the sentence about unit tests is from one reading of the broker.
-- No install was read for this document. The conformance suite was run once, with no change, to
-  confirm that its rows pass.
 
 ## Open Questions
 
-1. `capabilities` and `snapshot`: is a grant with a managed-list hold acceptable, or do the two stay
-   out of the profile role? For `snapshot`, does a profile also read a context repository, which
-   the operator registered for reading?
-2. The feedback route: does a profile file feedback, or does that stay with the session?
-3. Work on an object of an earlier run (a ledger issue, a stale proposal, a review reply, a spent
-   branch): the task bar cannot hold it, and the task record does not outlive its task. Is the
-   ownership bar with the trigger's stream label sufficient, or must the broker keep a durable
-   record of what each stream opened?
-4. The Cloud API relay: one grant for the eight entries, or one grant for each entry?
-5. The task credential checks: does the conformance suite take `cryptography` as a dependency, or do
-   those checks stay with the unit tests?
+Each question takes "yes", "no" or "later". Our recommendation follows each one.
+
+1. May each profile call `capabilities`, held to the managed list? Recommendation: yes.
+2. May each profile call `snapshot` for a managed repository? Recommendation: yes.
+3. May a profile call `snapshot` for a context repository, which the operator registered for
+   reading? The audit's declared-intent search and the `inspect-repository` skill need it.
+   Recommendation: later, with the move of the audits.
+4. Does a new read verb go to a named profile from an operator list, and not to each profile as
+   the eight reads of today? Recommendation: yes, when one kind of work needs the verb.
+5. For a ledger issue of an earlier run, is this bar sufficient: opened by the credential's login,
+   with the stream label of the trigger, in the publish repository? Recommendation: yes.
+6. For a proposal or a branch of an earlier run, which has no stream label and whose caller can be
+   a task that a person started: do the verbs stay out until the broker keeps a durable record of
+   what each task opened? Recommendation: yes.
+7. Does the unattended write permit also cover the ledger's issue writes? A permit for one action
+   does not stretch to the rest today. Recommendation: no; the issue writes get a permit name of
+   their own.
+8. May a report credential reach one version-control verb for the ledger, with a permit on a
+   credential with no target? Recommendation: later, with the unattended write permit design.
+9. Monitoring, Trace and Logging through the relay are held to the task's project and not to its
+   cluster, as `gcloud logging read` is today. Acceptable? Recommendation: yes.
+10. Does a profile file feedback? Recommendation: no; it stays with the session.
+11. Do the six control-plane tools of the `gke` server get a grant? Recommendation: later; gcloud
+    gives a profile each of those reads but one.
+12. Does the conformance suite take `cryptography` as a dependency, so that rows can verify a task
+    credential? Recommendation: yes.
