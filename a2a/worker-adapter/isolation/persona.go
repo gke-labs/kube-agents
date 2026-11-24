@@ -27,7 +27,7 @@ func CheckPersonaDir(dir string, uid, gid int) error {
 	}
 	// The path to it first: a writable ancestor could swap the directory
 	// for another after this check.
-	if last, err := walkChecked(filepath.Clean(dir), uid, gid); err != nil {
+	if last, err := walkChecked(dir, uid, gid); err != nil { // raw: ".." resolves against the real path
 		return fmt.Errorf("isolation: persona dir %s: %w", dir, err)
 	} else if last == nil {
 		return fmt.Errorf("isolation: persona dir %s does not exist", dir)
@@ -49,6 +49,11 @@ func CheckPersonaDir(dir string, uid, gid int) error {
 	for _, e := range ents {
 		if !slices.Contains(PersonaNames, e.Name()) {
 			return fmt.Errorf("isolation: persona dir %s holds %q, which is not a persona entry", dir, e.Name())
+		}
+		// skills is a directory of skills; the rules files are files.
+		wantDir := e.Name() == "skills"
+		if e.Type().IsDir() != wantDir || (!wantDir && !e.Type().IsRegular()) {
+			return fmt.Errorf("isolation: persona entry %s/%s is not a %s", dir, e.Name(), map[bool]string{true: "directory", false: "regular file"}[wantDir])
 		}
 	}
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {

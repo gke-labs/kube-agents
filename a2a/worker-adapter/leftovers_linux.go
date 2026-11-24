@@ -14,9 +14,12 @@ import (
 const procFS = "/proc"
 
 // listOtherProcesses returns every live process in this pid namespace
-// other than this one: zombies are already dead and are left out. Every
-// process is listed whatever its user, since /proc shows a namespace's
-// processes to all of them.
+// other than this one: zombies are already dead and are left out. It relies
+// on /proc showing the namespace's processes to the adapter's user: a /proc
+// mounted with hidepid hides other users' processes from a non-root reader,
+// and the adapter's kill could not reach them either. The worker pod runs
+// every process a turn can start as the adapter's user, with the default
+// /proc mount, so the listing is complete there.
 func listOtherProcesses() ([]int, error) {
 	ents, err := os.ReadDir(procFS)
 	if err != nil {

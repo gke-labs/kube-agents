@@ -19,16 +19,19 @@ const TrustedPathDir = "/usr/local/bin"
 // TrustedPathDir: the directories the harness prepends itself (prepended,
 // in order), then each entry of path ahead of TrustedPathDir. Relative and
 // empty entries (the working directory) are kept, as the shell would search
-// them.
-func SearchedFirst(prepended []string, path string) []string {
-	dirs := append([]string(nil), prepended...)
+// them. TrustedPathDir is matched literally (with or without a trailing
+// slash), never by cleaning the text: "/x/link/../usr/local/bin" is not it,
+// since the kernel resolves link first. found is false if path never names
+// it, and then every entry is searched before the tools it should hold.
+func SearchedFirst(prepended []string, path string) (dirs []string, found bool) {
+	dirs = append([]string(nil), prepended...)
 	for _, d := range strings.Split(path, ":") {
-		if filepath.Clean(d) == TrustedPathDir {
-			break
+		if d == TrustedPathDir || d == TrustedPathDir+"/" {
+			return dirs, true
 		}
 		dirs = append(dirs, d)
 	}
-	return dirs
+	return dirs, false
 }
 
 // CheckSearchPath fails closed if a turn's commands could put a program
@@ -47,7 +50,9 @@ func CheckSearchPath(dirs []string, uid, gid int) error {
 		if d == "" || !filepath.IsAbs(d) {
 			return fmt.Errorf("isolation: PATH searches %q before %s, a directory relative to the turn's working directory", d, TrustedPathDir)
 		}
-		if err := checkChain(filepath.Clean(d), uid, gid, 0); err != nil {
+		// The raw path, not a cleaned one: the walk resolves ".." against
+		// the real path, as the kernel does.
+		if err := checkChain(d, uid, gid); err != nil {
 			return fmt.Errorf("isolation: PATH entry %s, searched before %s: %w", d, TrustedPathDir, err)
 		}
 		ents, err := os.ReadDir(d)
@@ -58,8 +63,8 @@ func CheckSearchPath(dirs []string, uid, gid int) error {
 			return fmt.Errorf("isolation: PATH entry %s: %w", d, err)
 		}
 		for _, e := range ents {
-			p := filepath.Join(d, e.Name())
-			if err := checkEntry(p, uid, gid, 0); err != nil {
+			p := strings.TrimSuffix(d, "/") + "/" + e.Name() // no textual cleaning
+			if err := checkEntry(p, uid, gid); err != nil {
 				return fmt.Errorf("isolation: PATH entry %s, searched before %s: %w", d, TrustedPathDir, err)
 			}
 		}
@@ -70,7 +75,13 @@ func CheckSearchPath(dirs []string, uid, gid int) error {
 // maxLinkDepth bounds how many symlink hops a walk follows.
 const maxLinkDepth = 16
 
-// checkChain walks the absolute path p one component at a time, following
+// checkChain is walkChecked for a caller that needs only the verdict.
+func checkChain(p string, uid, gid int) error {
+	_, err := walkChecked(p, uid, gid)
+	return err
+}
+
+// walkChecked walks the absolute path p one component at a time, following
 // each symlink one hop at a time (os.Readlink, resolved against the
 // directory that holds the link), and requires every existing directory and
 // file it passes through to be beyond uid's reach (writableBy, with the
@@ -78,11 +89,6 @@ const maxLinkDepth = 16
 // them, so no hop of a chain can be retargeted. It returns the final
 // component's Lstat, or nil if the path ends in a missing component that
 // uid could not create.
-func checkChain(p string, uid, gid, _ int) error {
-	_, err := walkChecked(p, uid, gid)
-	return err
-}
-
 func walkChecked(p string, uid, gid int) (fs.FileInfo, error) {
 	if !filepath.IsAbs(p) {
 		return nil, fmt.Errorf("%s is not absolute", p)
@@ -191,7 +197,7 @@ func splitPath(p string) []string {
 // checkEntry checks one entry of a searched-first directory: the walk to
 // it, every symlink hop included, passes checkChain's rule, and what it
 // finally names is a regular file or a directory.
-func checkEntry(p string, uid, gid, _ int) error {
+func checkEntry(p string, uid, gid int) error {
 	fi, err := walkChecked(p, uid, gid)
 	if err != nil {
 		return err

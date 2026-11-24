@@ -156,3 +156,19 @@ func TestLoadPersonaReadsTheCheckedTreeOnce(t *testing.T) {
 		t.Fatal("a writable persona dir loaded")
 	}
 }
+
+func TestCheckPersonaDirRequiresTheRightKinds(t *testing.T) {
+	d := tempDir(t)
+	must(t, os.Mkdir(filepath.Join(d, "AGENTS.md"), 0o755)) // a dir where a file belongs
+	write(t, filepath.Join(d, "AGENTS.md", "hooks.json"), "{}")
+	lockDown(t, d)
+	if err := CheckPersonaDir(d, otherUID, otherGID); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Errorf("AGENTS.md as a directory: %v", err)
+	}
+	d2 := tempDir(t)
+	write(t, filepath.Join(d2, "skills"), "not a dir")
+	lockDown(t, d2)
+	if err := CheckPersonaDir(d2, otherUID, otherGID); err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Errorf("skills as a file: %v", err)
+	}
+}

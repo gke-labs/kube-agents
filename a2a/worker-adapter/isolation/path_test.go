@@ -9,16 +9,23 @@ import (
 )
 
 func TestSearchedFirstStopsAtTheTrustedDir(t *testing.T) {
-	got := SearchedFirst([]string{"/opt/h/bin"}, "/opt/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin")
+	got, found := SearchedFirst([]string{"/opt/h/bin"}, "/opt/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin")
 	want := []string{"/opt/h/bin", "/opt/tools/bin", "/usr/local/sbin"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("got %q, want %q", got, want)
+	if !found || !slices.Equal(got, want) {
+		t.Fatalf("got %q (found %v), want %q", got, found, want)
 	}
-	if got := SearchedFirst(nil, "/usr/local/bin/:/usr/bin"); len(got) != 0 {
-		t.Errorf("a trailing slash on the trusted dir: %q", got)
+	if got, found := SearchedFirst(nil, "/usr/local/bin/:/usr/bin"); !found || len(got) != 0 {
+		t.Errorf("a trailing slash on the trusted dir: %q %v", got, found)
 	}
-	if got := SearchedFirst(nil, "::/usr/local/bin"); len(got) != 2 {
+	if got, _ := SearchedFirst(nil, "::/usr/local/bin"); len(got) != 2 {
 		t.Errorf("empty entries dropped: %q", got)
+	}
+	// Spelled through a link and "..", it is not the trusted dir.
+	if got, found := SearchedFirst(nil, "/opt/link/../usr/local/bin:/usr/local/bin"); !found || len(got) != 1 {
+		t.Errorf("a spelled-out path matched the trusted dir: %q %v", got, found)
+	}
+	if _, found := SearchedFirst(nil, "/usr/bin:/bin"); found {
+		t.Error("a PATH without the trusted dir reported it found")
 	}
 }
 
@@ -190,5 +197,26 @@ func TestCheckSearchPathRelativeLinksInAStickyDir(t *testing.T) {
 		if (err == nil) != c.ok {
 			t.Errorf("%s: err = %v, want ok=%v", c.entry, err, c.ok)
 		}
+	}
+}
+
+// TestCheckSearchPathResolvesDotDotAfterALink: "safe/link/../x" is read by
+// the kernel as the parent of link's target plus x, not safe/x; the check
+// must follow the same path.
+func TestCheckSearchPathResolvesDotDotAfterALink(t *testing.T) {
+	evil := tempDir(t)
+	must(t, os.Mkdir(filepath.Join(evil, "sub"), 0o555))
+	must(t, os.Mkdir(filepath.Join(evil, "x"), 0o555))
+	must(t, os.Chmod(evil, 0o777)) // others could swap evil/x
+	safe := tempDir(t)
+	must(t, os.Mkdir(filepath.Join(safe, "x"), 0o555))
+	must(t, os.Symlink(filepath.Join(evil, "sub"), filepath.Join(safe, "link")))
+	must(t, os.Chmod(safe, 0o555))
+	spelled := safe + "/link/../x"
+	if err := CheckSearchPath([]string{spelled}, otherUID, otherGID); err == nil {
+		t.Fatalf("%s passed; the kernel reads %s/x, under a writable dir", spelled, evil)
+	}
+	if err := CheckSearchPath([]string{safe + "/x"}, otherUID, otherGID); err != nil {
+		t.Fatalf("the plain safe path: %v", err)
 	}
 }
