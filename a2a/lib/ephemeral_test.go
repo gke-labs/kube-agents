@@ -24,15 +24,17 @@ func (c fakeConsumer) CachedInfo() *jetstream.ConsumerInfo { return c.info }
 // attempt's context ends, as a create placed on an offline peer does; "ok"
 // answers with a consumer; "refuse" answers with the server's API error.
 type placedCreator struct {
-	mu    sync.Mutex
-	plan  []string
-	calls int
+	mu      sync.Mutex
+	plan    []string
+	calls   int
+	configs []jetstream.ConsumerConfig
 }
 
-func (p *placedCreator) CreateConsumer(ctx context.Context, _ jetstream.ConsumerConfig) (jetstream.Consumer, error) {
+func (p *placedCreator) CreateConsumer(ctx context.Context, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
 	p.mu.Lock()
 	step := p.plan[min(p.calls, len(p.plan)-1)]
 	p.calls++
+	p.configs = append(p.configs, cfg)
 	p.mu.Unlock()
 	switch step {
 	case "ok":
@@ -207,6 +209,30 @@ func TestACreateHangingPastTheCallersDeadlineEndsAtTheDeadline(t *testing.T) {
 	}
 }
 
+// On nats-server 2.10 an ephemeral consumer with no replica count can be
+// placed on a stream peer that is down, and its create hangs; one created as
+// R1 is placed only on live peers (#7104). The embedded server these tests run
+// is newer and doesn't show the hang, so this is the guard: every attempt asks
+// for R1 unless the caller set a count.
+func TestEveryAttemptAsksForOneReplicaUnlessTheCallerSetACount(t *testing.T) {
+	p := &placedCreator{plan: []string{"hang", "hang", "ok"}}
+	if _, _, err := CreateEphemeralConsumer(context.Background(), p, jetstream.ConsumerConfig{}, fastOpts(&slots{})); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for i, cfg := range p.configs {
+		if cfg.Replicas != 1 {
+			t.Errorf("attempt %d asked for %d replicas, want 1", i+1, cfg.Replicas)
+		}
+	}
+	set := &placedCreator{plan: []string{"ok"}}
+	if _, _, err := CreateEphemeralConsumer(context.Background(), set, jetstream.ConsumerConfig{Replicas: 3}, EphemeralCreateOptions{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got := set.configs[0].Replicas; got != 3 {
+		t.Errorf("a caller's own count became %d, want 3", got)
+	}
+}
+
 func TestARefusedCreateIsNotRetried(t *testing.T) {
 	p := &placedCreator{plan: []string{"refuse", "ok"}}
 	s := &slots{}
@@ -229,5 +255,53 @@ func TestASlotErrorEndsTheCreate(t *testing.T) {
 	}
 	if p.calls != 0 {
 		t.Fatalf("created %d times without a slot", p.calls)
+	}
+}
+
+// With one of three servers down, every create through the helper answers
+// at once on the embedded server. (That server is newer than the one an
+// install runs and places even unset-replica ephemerals on live peers, so
+// this pins the helper end to end; TestEveryAttemptAsksForOneReplicaUnlessTheCallerSetACount is
+// the guard for the older server's placement.)
+func TestEphemeralCreatesAnswerWithAServerDown(t *testing.T) {
+	servers := startCluster(t)
+	ctx := testCtx(t)
+	nc, err := nats.Connect(clientURL(servers[0]), nats.MaxReconnects(-1))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	var s jetstream.Stream
+	waitFor(t, 20e9, "a JetStream meta leader", func() bool {
+		sctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		s, err = js.CreateOrUpdateStream(sctx, jetstream.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Replicas: clusterSize})
+		return err == nil
+	})
+	for _, srv := range servers[1:] {
+		if !srv.JetStreamIsLeader() {
+			srv.Shutdown()
+			break
+		}
+	}
+	for i := 0; i < 10; i++ {
+		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		start := time.Now()
+		cons, _, err := CreateEphemeralConsumer(cctx, s, jetstream.ConsumerConfig{AckPolicy: jetstream.AckNonePolicy, MemoryStorage: true, InactiveThreshold: 5 * time.Second},
+			EphemeralCreateOptions{AttemptTimeout: 3 * time.Second, Stream: "TASKS"})
+		cancel()
+		if err != nil {
+			t.Fatalf("create %d with a server down: %v", i, err)
+		}
+		if took := time.Since(start); took > 2*time.Second {
+			t.Errorf("create %d took %s, want an answer at once", i, took)
+		}
+		if got := cons.CachedInfo().Config.Replicas; got > 1 {
+			t.Errorf("create %d made %d replicas, want 1", i, got)
+		}
 	}
 }

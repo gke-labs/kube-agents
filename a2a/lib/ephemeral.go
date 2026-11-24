@@ -54,11 +54,16 @@ var ErrEphemeralCreateTimedOut = errors.New("every attempt to create the consume
 // attempt its own bounded timeout and retrying a timed-out attempt with
 // jittered backoff, all within ctx's deadline.
 //
-// Why: the server places an R1 ephemeral consumer on one of the stream's
-// peers, and it can pick a peer that is offline. A create placed there gets
-// no answer until that peer returns, so a create bounded only by the
-// caller's deadline hangs for all of it (#7082). Each retry is a new
-// placement.
+// Why: on nats-server 2.10, the version the operator ships, an ephemeral
+// consumer created with no replica count can be placed on a stream peer that
+// is offline. A create placed there gets no answer until that peer returns,
+// so a create bounded only by the caller's deadline hangs for all of it
+// (#7082, #7104). With one of three servers down, about a third of such
+// creates hung; with the replica count set to 1, none did. So a config with
+// no replica count is created as R1, which is what the server made of it
+// anyway, and placed only on live peers. The bounded, retried attempts stay
+// as a guard against any other create that gets no answer; each retry is a
+// new placement.
 //
 // Each attempt gets AttemptTimeout, or an even share of what is left of ctx's
 // deadline across the attempts still to come when that is shorter, so a
@@ -84,6 +89,9 @@ func CreateEphemeralConsumer(ctx context.Context, s ConsumerCreator, cfg jetstre
 	log := o.Logger
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.Replicas == 0 {
+		cfg.Replicas = 1
 	}
 	timedOut := 0
 	var lastErr error
