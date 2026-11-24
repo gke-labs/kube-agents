@@ -3840,9 +3840,9 @@ def validate_audit_id(audit_id: str) -> str:
 # even with no runtime word (`run_is_shadow`). A run with neither is live.
 STORE_ONLY_FLAG = "--store-only"
 SHADOW_TASK_ENV = "PROFILE_TASK_DRY_RUN"
-# The schedule a dispatched task came from. The worker adapter will export it
-# when the task carries a trigger (a follow-up to #5623); until then it is
-# unset and a shadow run takes the fallback stream. It is outside the
+# The schedule a dispatched task came from. The worker adapter exports it
+# when the task carries a trigger (#6959); a task with none, or a run
+# started by hand, leaves it unset and takes the fallback stream. It is outside the
 # PROFILE_TASK_ prefix the task's parameters use, so no parameter can set it.
 # It names the shadow stream (`shadow_stream`), which the broker requires to
 # be the trigger's stream for a profile's write.
@@ -3892,6 +3892,20 @@ def run_is_shadow(audit_id: str) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(record, dict) and record.get("audit") == audit_id and record.get(RUN_RECORD_SHADOW_KEY) is True
+
+
+def run_shadow(audit_id: str) -> bool:
+    """Whether this run is a shadow run: the runtime's word when it gives one, else this stream's last `start`.
+
+    An explicit runtime word wins both ways, as in `shadow_mode`: a task the
+    runtime marks live is live whatever record a shadow run left, and one it
+    marks shadow is shadow. Only a silent runtime (a run started by hand)
+    reads the record (`run_is_shadow`), which fails closed.
+    """
+    runtime = task_is_shadow()
+    if runtime is not None:
+        return runtime
+    return run_is_shadow(audit_id)
 
 
 def shadow_store_repo(audit_id: str) -> str:
@@ -3976,7 +3990,7 @@ def shadow_stream(audit_id: str) -> str:
 
 def refuse_remediate_in_shadow(args: argparse.Namespace, audit_id: str) -> None:
     """`remediate` drafts nothing in a shadow run: ValidationError when the flag, the runtime or this run's `start` says it is one."""
-    if getattr(args, "store_only", False) or task_is_shadow() or run_is_shadow(audit_id):
+    if getattr(args, "store_only", False) or run_shadow(audit_id):
         raise ValidationError(
             f"remediate: this is a shadow run ({STORE_ONLY_FLAG}, {SHADOW_TASK_ENV}, or this run's `start`), "
             "which writes its report to the store and nothing else; it opens no remediation."
@@ -4217,14 +4231,20 @@ def skill_path(*parts: str) -> str:
     return "/".join([gitops_workspace.agent_home(), PLATFORM_PROFILE_SUBDIR, SKILL_SUBDIR, *parts])
 
 
-def next_steps(audit_id: str, findings_path: str) -> list[str]:
-    """What `start` tells the worker to do after it, each step with the file it needs."""
+def next_steps(audit_id: str, findings_path: str, store_only: bool = False) -> list[str]:
+    """What `start` tells the worker to do after it, each step with the file it needs.
+
+    A shadow run's `finish` must pass --store-only (`shadow_mode`), so its
+    command carries it.
+    """
     finish = (
         f"{skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} finish --audit {audit_id} "
         f"--findings-file {findings_path}"
     )
     if audit_id in COLLECTOR_AUDITS:
         finish += f" --manifest-file {manifest_path_for(audit_id)}"
+    if store_only:
+        finish += " --store-only"
     return [
         f"Read the SOP at {sop_path(audit_id)} in full, then run every check in `checks` "
         "the way it says, recording each check and its command in checks_run as it completes.",
@@ -22804,9 +22824,17 @@ def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> 
         # shadow run has no ledger repository, so that repository joins the
         # search as a context repository (read, never written), and the two
         # runs owe the same declared-intent search.
+        # As in a live run, a `ref` or a refused `ref` on a context entry
+        # naming that repository isn't honoured: the run reads its default
+        # branch. So any entry naming it, in any spelling, gives way to one
+        # with no pin (the search keys its pins on the lowercased slug).
         gitops = shadow_store_repo(audit_id)
-        if gitops != NO_FORGE_REPO and gitops not in {entry["repo"] for entry in context_entries}:
-            context_entries = [{"repo": gitops, "ref": None, REFUSED_REF_KEY: None}, *context_entries]
+        if gitops != NO_FORGE_REPO:
+            key = gitops.strip().lower()
+            context_entries = [
+                {"repo": gitops, "ref": None, REFUSED_REF_KEY: None},
+                *[entry for entry in context_entries if entry["repo"].strip().lower() != key],
+            ]
     context = [entry["repo"] for entry in context_entries]
     # The harness's half of the declared-intent step, before the record is
     # written so the record carries what it read: every repository the step
@@ -22941,7 +22969,7 @@ def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> 
                     "reasons. A check you could have run and did not is not one "
                     "of those; it is a limitations note and a real gap."
                 ),
-                NEXT_STEPS_KEY: next_steps(audit_id, findings_path),
+                NEXT_STEPS_KEY: next_steps(audit_id, findings_path, store_only=shadow),
             }
         )
     )
@@ -26052,7 +26080,7 @@ def handle_precheck(args: argparse.Namespace) -> None:
         line[PRECHECK_REASON_KEY] = PRECHECK_NOT_SCHEDULED_REASON
     elif run_llm:
         line[PRECHECK_REASON_KEY] = reasons.get(verdict, verdict)
-    elif task_is_shadow() or run_is_shadow(audit_id):
+    elif run_shadow(audit_id):
         # The stored document is the live stream's; a shadow run publishes
         # only through its own `finish --store-only`.
         line[PRECHECK_REASON_KEY] = PRECHECK_SHADOW_REASON + PRECHECK_CONTINUES_SUFFIX
@@ -26140,7 +26168,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # The shadow gate, here and not only in `handle_finish`: `precheck`'s
     # close calls this directly, and a shadow task must not publish live by
     # any path.
-    if (task_is_shadow() or run_is_shadow(audit_id)) and not args.dry_run and not getattr(args, "store_only", False):
+    if run_shadow(audit_id) and not args.dry_run and not getattr(args, "store_only", False):
         raise ValidationError(
             f"this task is a shadow run ({SHADOW_TASK_ENV}=true): it publishes only with "
             f"{STORE_ONLY_FLAG}, which keeps the report in the store and nothing else."
@@ -26267,7 +26295,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # wording never comes from the live stream's record or a forge lookup.
     # The preview of a shadow run (`--dry-run` in a shadow task) reads what
     # the shadow run will, so the two publish the same words.
-    is_shadow = store_only or bool(task_is_shadow() or run_is_shadow(audit_id))
+    is_shadow = store_only or run_shadow(audit_id)
     shadow_repo = shadow_store_repo(audit_id) if is_shadow else None
     previous_document = (
         previous_run_document(shadow_stream(audit_id), shadow_repo)

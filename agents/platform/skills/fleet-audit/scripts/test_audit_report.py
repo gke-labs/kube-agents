@@ -35386,6 +35386,47 @@ class TestShadowRun(BaseTestCase):
         self.assertIn("shadow run", self.err)
         self.assertEqual(self.only_search_clones(), [])
 
+    def test_a_shadow_start_doesnt_honour_a_pin_on_the_gitops_repository(self):
+        # As a live run reads the GitOps repository at its default branch,
+        # whatever `ref` a context entry naming it carries, so does a shadow
+        # run, under any spelling of the entry.
+        for pinned in ({"repo": "ACME/GitOps", "ref": "curated", audit_report.REFUSED_REF_KEY: None},
+                       {"repo": "acme/gitops", "ref": None, audit_report.REFUSED_REF_KEY: "bad ref"}):
+            with self.subTest(pinned=pinned):
+                seen = []
+
+                def capture(audit_id, repo, root, entries):
+                    seen.append(list(entries))
+                    return [], [], []
+
+                with patch.object(audit_report, "context_repo_entries", return_value=[pinned]), patch.object(
+                    audit_report, "discover_declarations", side_effect=capture
+                ):
+                    self.start(audit_report.STORE_ONLY_FLAG)
+                audit_report.release_in_flight(AUDIT)  # the next subtest's start
+                gitops = [e for e in seen[-1] if e["repo"].lower() == "acme/gitops"]
+                self.assertEqual(gitops, [{"repo": "acme/gitops", "ref": None, audit_report.REFUSED_REF_KEY: None}])
+
+    def test_an_explicit_live_runtime_outranks_a_leftover_shadow_record(self):
+        # A run record a shadow run left blocks a live publish only while the
+        # runtime is silent: a task the runtime marks live is live.
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        self.assertTrue(audit_report.run_shadow(AUDIT))
+        os.environ[audit_report.SHADOW_TASK_ENV] = "false"
+        self.assertFalse(audit_report.run_shadow(AUDIT))
+        args = argparse.Namespace(store_only=False)
+        audit_report.refuse_remediate_in_shadow(args, AUDIT)  # raises nothing
+        os.environ[audit_report.SHADOW_TASK_ENV] = "true"
+        self.assertTrue(audit_report.run_shadow(AUDIT))
+
+    def test_a_shadow_starts_next_steps_finish_with_the_flag(self):
+        out = self.start(audit_report.STORE_ONLY_FLAG)
+        finish_step = out[audit_report.NEXT_STEPS_KEY][-1]
+        self.assertIn(" finish ", finish_step)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, finish_step)
+        self.assertNotIn(audit_report.STORE_ONLY_FLAG, audit_report.next_steps(AUDIT, "/tmp/f.json")[-1])
+
     def test_an_unreadable_repository_list_fails_the_run_instead_of_writing_under_no_forge(self):
         with patch("gitops_workspace.get_managed_repos", side_effect=RuntimeError("ConfigMap unreadable")), patch(
             "gitops_workspace._read_state_text", side_effect=RuntimeError("ConfigMap unreadable")
