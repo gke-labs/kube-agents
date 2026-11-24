@@ -2182,8 +2182,9 @@ def test_an_any_of_pattern_that_does_not_compile_is_rejected():
 )
 def test_a_pattern_with_an_uppercase_literal_is_rejected(field, pattern):
     """The report is lowercased before a pattern runs, so an uppercase letter
-    outside a character class and outside ``(?i)`` matches no report: the
-    required pattern misses on every run and the forbid never fires."""
+    outside a character class and outside ``(?i)`` is text no report carries:
+    where the pattern needs it, the required pattern misses on every run and
+    the forbid never fires, and in one branch or a lookahead it is dead text."""
     with pytest.raises(ValueError, match="in upper case"):
         ReportContainsVerifier(type="report_contains", **{field: [pattern]})
 

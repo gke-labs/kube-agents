@@ -302,12 +302,13 @@ _NO_RECORDED_SLOT_REASON = (
 )
 _PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
 # `pattern_surface` lowercases the report, so a letter a pattern spells in upper
-# case outside a character class and outside `(?i)` is text no report carries:
-# a required pattern that misses on every run, a forbid that never fires.
+# case outside a character class and outside `(?i)` is text no report carries.
+# Where the pattern needs that letter, a required pattern misses on every run
+# and a forbid never fires; in an optional part or one branch it is dead text.
 _UPPERCASE_PATTERN_REASON = (
-    "the report is lowercased before the pattern runs, so no report carries them: a required "
-    "pattern misses on every run and a forbidden one never fires; spell the letters in lower "
-    "case, or open the pattern with (?i)"
+    "the report is lowercased before the pattern runs, so no report carries them and the part "
+    "of the pattern that spells them never matches; spell the letters in lower case, or open "
+    "the pattern with (?i)"
 )
 
 
@@ -540,8 +541,8 @@ class ReportContainsVerifier(BaseVerifier):
     space in a pattern therefore does not cross a line break; a phrase that
     may wrap says ``\\s+`` where it may. The text is lowercased before the
     regex runs, so a pattern spells its letters in lower case; one with an
-    uppercase letter outside a character class and ``(?i)`` matches no report
-    and is refused at spec load.
+    uppercase letter outside a character class and ``(?i)`` spells text no
+    report carries and is refused at spec load.
     ``required_patterns`` must each match somewhere; ``any_of_patterns``
     and ``any_of_phrases`` are one pool of alternatives: at least one of
     either has to match.
