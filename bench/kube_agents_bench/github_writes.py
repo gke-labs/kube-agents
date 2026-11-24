@@ -98,13 +98,14 @@ from kube_agents_bench.forges import (
     token_source,
 )
 from kube_agents_bench.shell_words import (
+    _HEREDOC_SHELL_PROGRAMS,
     _INTERPRETER_RE,
     _OPERATOR_MARK,
     _SHELL_FLAG_PREFIX,
-    _SHELL_PROGRAMS_WITH_COMMAND_STRING,
     _command_word_index,
     _read_shell_line,
     _shell_argvs,
+    _shell_argvs_and_unread,
     _with_literal_marks,
 )
 
@@ -262,7 +263,7 @@ WRITING_TOOL_NAME = re.compile(r"(?i)(?:create|open)_?(?:pull|merge|branch|propo
 #: the shell reads ``<<`` as an operator (:func:`_opens_heredoc`), not inside
 #: quotes, a comment or ``$((1<<2))``.
 HEREDOC_OPENER = re.compile(r"(?<!<)<<(?!<)-?[ \t]*\\?(['\"]?)([A-Za-z0-9_.-]+)\1")
-HEREDOC_RUNNERS = frozenset((*_SHELL_PROGRAMS_WITH_COMMAND_STRING, "ssh"))
+HEREDOC_RUNNERS = _HEREDOC_SHELL_PROGRAMS
 #: The operator that opens a heredoc, as the shell reader cuts it.
 HEREDOC_OPERATOR = "<<"
 #: The openers of a command substitution a line may leave open across a
@@ -835,14 +836,19 @@ def writing_segments(command: str) -> list[str]:
     beside it. The line is read as ``worker_commands`` reads it
     (:func:`kube_agents_bench.shell_words._shell_argvs`): a ``;``, ``|`` or
     newline inside a quoted ``--title`` is text, and a verb counts only as an
-    argv's command word (:func:`_creates`). A line whose quotes do not
-    balance, a value cut short, is read as if the open quote closed at the
-    end."""
+    argv's command word (:func:`_creates`). A part of a line that the
+    reader does not read for an open quote (quotes that do not balance, a
+    value cut short) is read as if the quote closed at the end. A part that
+    it refuses for another cause stays not read."""
     command = _without_heredoc_bodies(command)
-    argvs = _shell_argvs(command)
-    for quote in UNCLOSED_QUOTES:
-        # A trailing backslash would escape the quote that closes the value.
-        argvs = argvs or _shell_argvs(command.rstrip("\\") + quote)
+    argvs, unread = _shell_argvs_and_unread(command)
+    for part in unread:
+        for quote in UNCLOSED_QUOTES:
+            # A trailing backslash would escape the quote that closes the value.
+            closed = _shell_argvs(part.rstrip("\\") + quote)
+            if closed:
+                argvs = argvs + closed
+                break
     return [" ".join(argv) for argv in argvs if _creates(argv)]
 
 
@@ -905,15 +911,17 @@ def _opens_heredoc(head: str) -> bool:
 
 
 def _without_heredoc_bodies(command: str) -> str:
-    """``command`` without the bodies of its heredocs (:data:`HEREDOC_OPENER`)
-    and their delimiter lines, except a body the line hands to a shell
-    (:data:`HEREDOC_RUNNERS`), which is read as commands."""
+    """``command`` without the bodies of its heredocs (:data:`HEREDOC_OPENER`),
+    except a body the line hands to a shell (:data:`HEREDOC_RUNNERS`), which
+    is read as commands. Each delimiter line stays, as the bare delimiter, so
+    the shell reader sees a heredoc with an empty body and takes the lines
+    after it as commands, not as the body."""
     kept: list[str] = []
     pending: list[str] = []
     for line in command.split("\n"):
         if pending:
             if line.strip() == pending[0]:
-                pending.pop(0)
+                kept.append(pending.pop(0))
             continue
         kept.append(line)
         delimiters = [m.group(2) for m in HEREDOC_OPENER.finditer(line) if _opens_heredoc(line[: m.start()])]

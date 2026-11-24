@@ -49,8 +49,12 @@ WORKDIR /app
 # The agent SDK's platform package carries the harness as a native binary at
 # node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude, the path
 # DefaultHarnessPath in worker-adapter/harness.go names. Pinned to the
-# version these stream-json shapes were proved against.
-RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
+# version these stream-json shapes were proved against, and installed from the
+# committed lockfile in a2a/worker-harness with `npm ci`, so the SDK's own
+# dependencies are the reviewed set rather than whatever the registry serves at
+# build time (#6948). Dependabot proposes bumps to that directory.
+COPY a2a/worker-harness/package.json a2a/worker-harness/package-lock.json ./
+RUN npm ci \
     && npm cache clean --force
 
 # The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
@@ -238,6 +242,9 @@ RUN mkdir -p /home/node/.claude /scratch \
 # from being changed by accident, and is not a boundary against the harness.
 COPY --from=build /out/claude/CLAUDE.md /home/node/.claude/CLAUDE.md
 COPY --from=build /out/claude/skills/ /home/node/.claude/skills/
+# The build-time content manifest of the two above; the worker checks them
+# against it at start (worker-adapter CheckSessionHome).
+COPY --from=build /out/claude/skills_manifest.sha256 /home/node/.claude/skills_manifest.sha256
 USER node
 # vcs_client's git and working copies: the image's git, and the worker's
 # scratch volume, which the worker empties after every task (the root

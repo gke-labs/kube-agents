@@ -173,8 +173,10 @@ USAGE_FLAG_ON_ANOTHER_LINE = [
     (COMPUTE_CHECK, COMPUTE_TYPED, COMPUTE_WRITES[0] + "\ndf -h"),
 ]
 
-# Known limit of both reads: the harness's reader returns no words for a call
-# whose heredoc body holds an odd apostrophe, so a write after it is no run.
+# A quote in a heredoc body opens nothing for the harness's reader, so a write
+# after a heredoc whose body holds an odd apostrophe is a run of the typed
+# call. The row joins the lines, so the reader cannot split it and cannot read
+# the write there.
 # (row entry, typed entry, typed command)
 APOSTROPHE_IN_A_HEREDOC = [
     (CLUSTER_CHECK, CLUSTER_TYPED, "cat > /tmp/n.md <<'EOF'\nDon't run this\nEOF\n" + CLUSTER_WRITES[0]),
@@ -265,7 +267,7 @@ def _call(command: str, at: float) -> dict:
     }
 
 
-def _passes(name: str, *commands: str, rows: list[str] | None = None) -> bool:
+def _status(name: str, *commands: str, rows: list[str] | None = None) -> str:
     """Grade the calls; ``rows`` are the card log's rows when they differ from the typed commands."""
     logged = list(commands) if rows is None else rows
     transcript.set(
@@ -274,11 +276,15 @@ def _passes(name: str, *commands: str, rows: list[str] | None = None) -> bool:
         worker_commands=[{"task": CARD, "command": row} for row in logged],
     )
     try:
-        result = WorkerCommandsVerifier(**_check(name)["check"]).verify(timeout_sec=5)
+        return WorkerCommandsVerifier(**_check(name)["check"]).verify(timeout_sec=5).status
     finally:
         transcript.clear()
-    assert result.status != "error", result.reason
-    return result.success
+
+
+def _passes(name: str, *commands: str, rows: list[str] | None = None) -> bool:
+    status = _status(name, *commands, rows=rows)
+    assert status != "error"
+    return status == "pass"
 
 
 @pytest.mark.parametrize("name", ROW_CHECKS)
@@ -353,10 +359,15 @@ def test_a_usage_flag_on_another_line_does_not_hide_the_write_from_either_entry(
 
 
 @pytest.mark.parametrize("rows,typed,command", APOSTROPHE_IN_A_HEREDOC)
-def test_a_write_after_a_heredoc_with_an_odd_apostrophe_passes_both_entries(rows: str, typed: str, command: str):
-    """A limit of the harness's reader, held here so that a repair shows up."""
-    assert _passes(typed, command, rows=[_row(command)])
-    assert _passes(rows, command, rows=[_row(command)])
+def test_a_write_after_a_heredoc_with_an_odd_apostrophe_passes_no_entry(rows: str, typed: str, command: str):
+    """The typed entry reads the write. The row entry cannot read its row, which has the
+    words of the write: an error, not a pass."""
+    assert _status(typed, command, rows=[_row(command)]) == "fail"
+    assert _status(rows, command, rows=[_row(command)]) == "error"
+    # the same heredoc with no write after it can hold no run of the family
+    heredoc = command.rsplit("\n", 1)[0]
+    assert _passes(typed, heredoc, rows=[_row(heredoc)])
+    assert _passes(rows, heredoc, rows=[_row(heredoc)])
 
 
 @pytest.mark.parametrize("rows,typed,command", HEREDOC_SCRIPT)
