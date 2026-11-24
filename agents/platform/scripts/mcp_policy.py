@@ -507,7 +507,9 @@ def filter_listing_reply(tool: str, body: bytes, excluded) -> bytes | None:
     `structuredContent`, each holding the list, whose items are JSON objects or
     JSON strings encoding one. Each is filtered and written back in the form it
     came in. Every item has to name its cluster through its link; one that
-    doesn't makes the whole reply unreadable.
+    doesn't makes the whole reply unreadable. So does a reply with neither
+    carrier, or a carrier without the list: that fails closed, including an empty
+    listing whose server leaves the empty list out.
     """
     key = GKE_LISTING_TOOLS.get(tool)
     if key is None:
@@ -539,6 +541,7 @@ def filter_listing_reply(tool: str, body: bytes, excluded) -> bytes | None:
                 kept.append(item)
         return kept
 
+    carriers = 0
     for entry in result.get("content") or []:
         if not isinstance(entry, dict) or entry.get("type") != "text":
             return None
@@ -546,18 +549,22 @@ def filter_listing_reply(tool: str, body: bytes, excluded) -> bytes | None:
             document = json.loads(entry.get("text", ""))
         except ValueError:
             return None
-        if not isinstance(document, dict):
+        if not isinstance(document, dict) or key not in document:
             return None
-        kept = keep(document.get(key, []))
+        kept = keep(document[key])
         if kept is None:
             return None
         entry["text"] = json.dumps({**document, key: kept}, separators=(",", ":"))
+        carriers += 1
     structured = result.get("structuredContent")
     if structured is not None:
-        if not isinstance(structured, dict):
+        if not isinstance(structured, dict) or key not in structured:
             return None
-        kept = keep(structured.get(key, []))
+        kept = keep(structured[key])
         if kept is None:
             return None
         result["structuredContent"] = {**structured, key: kept}
+        carriers += 1
+    if not carriers:
+        return None
     return json.dumps(message, separators=(",", ":")).encode()

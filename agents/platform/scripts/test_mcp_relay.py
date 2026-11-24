@@ -511,9 +511,6 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(1, len(self.upstream_requests))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def _cluster(name, location="us-east4", project="p"):
     # The gke server's shape (captured on a dev install, names redacted): each
@@ -571,6 +568,13 @@ class ListingReplyTest(unittest.TestCase):
         for body in (
             b'{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"not json"}]}}',
             _listing_reply("clusters", [json.dumps({"name": "x"})]),
+            # No recognised carrier: the list sits somewhere the filter doesn't read.
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"clusters": [_cluster("scratch")]}}).encode(),
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).encode(),
+            # A carrier without the list key, in either place.
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": json.dumps({"items": [_cluster("scratch")]})}]}}).encode(),
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"items": [_cluster("scratch")]}}}).encode(),
         ):
             with self.subTest(body=body):
                 self.reply["body"] = body
@@ -586,3 +590,7 @@ class ListingReplyTest(unittest.TestCase):
         self.exclude(("p", "us-east4", "scratch"))
         status, _, out = self._request(message=tools_call("list_clusters"))
         self.assertEqual((status, out), (200, body))
+
+
+if __name__ == "__main__":
+    unittest.main()
