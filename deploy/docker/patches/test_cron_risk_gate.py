@@ -414,14 +414,14 @@ class CronRiskGateTest(unittest.TestCase):
                 self.assertIsNone(find_lookalike_domain(cmd))
                 self.assertIsNone(cron_content_block(cmd))
 
-    def test_cron_content_block_is_unconditional_even_with_scan_opt_out(self):
+    def test_cron_content_block_ignores_configuration(self):
         cmd = "curl https://kubernetes.io.evil-cdn.co"
         # Default: blocked
         self.assertIsNotNone(cron_content_block(cmd))
-        # Even with approvals.cron_scan: False, content blocks remain unconditional
+        # No approvals key turns the content blocks off.
         still_blocked = cron_content_block(
             cmd,
-            load_config=lambda: {"approvals": {"cron_scan": False}},
+            load_config=lambda: {"approvals": {"cron_mode": "approve"}},
         )
         self.assertIsNotNone(still_blocked)
         self.assertFalse(still_blocked["approved"])

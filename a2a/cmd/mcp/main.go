@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/mcp"
 )
 
@@ -179,6 +180,9 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	s.bus.Logger = log
+	// Unset until the operator renders it from the latched profile
+	// supervisor form (#5301); a malformed value reads as unset.
+	s.bus.ProfileSupervisorCutoff = lib.ProfileSupervisorCutoffFromEnv(getenv, log)
 	bus, err := dialWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*mcp.NATSBus, error) {
 		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 		defer cancel()

@@ -148,6 +148,10 @@ _INCOMING = "refs/vcs/incoming"
 DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
 DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
 DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_MEMORY_VERDICT_ALLOW = "allow"
+DECISION_MEMORY_VERDICT_WARN = "warn"
+DECISION_MEMORY_VERDICT_BLOCK = "block"
+DECISION_MEMORY_VERDICT_ERROR = "error"
 DECISION_OVERRIDE_PREFIX = "decision-override:"
 FORBIDDEN_LABEL = "FORBIDDEN_LABEL"
 DM_MAX_GUARD_FILE_BYTES = 4 << 20  # 4 MiB ceiling per inspected text/YAML file
@@ -893,8 +897,12 @@ class VcsBroker:
         bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
         cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
         automerge_switch: Callable[[], str] | None = None,
+        on_decision_memory_check: Callable[[str], None] | None = None,
+        allowed_commit_emails: Callable[[str, str], frozenset[str]] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        self.on_decision_memory_check = on_decision_memory_check
+        self._allowed_commit_emails = allowed_commit_emails
         # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
         # or kubectl read the broker runs on its own behalf, through the same
         # executor and cluster selection a caller's read takes. Only
@@ -1903,12 +1911,17 @@ class VcsBroker:
                     status=409,
                     code="BRANCH_DIVERGED",
                 )
+            if self._allowed_commit_emails is not None:
+                self._require_install_commit_identities(
+                    git, root, bound, remote_target, existing_head
+                )
             policy_branch = (
                 self._pinned_base(bound.forge, bound.repo)
                 or self._default_branch_of_remote(git, root, self._tls_refusal)
             )
             policy_branch = _short_ref(policy_branch) if policy_branch else ""
             if not policy_branch:
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                 raise WorkspaceError(
                     f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                     status=502,
@@ -1927,6 +1940,7 @@ class VcsBroker:
                 )
                 policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
                 if not policy_base_rev:
+                    self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                     raise WorkspaceError(
                         f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                         status=502,
@@ -1948,6 +1962,63 @@ class VcsBroker:
         if dm_markdown:
             result["decisionMemoryMarkdown"] = dm_markdown
         return bound.stamp(result)
+
+    def _require_install_commit_identities(
+        self,
+        git: Callable,
+        root: Path,
+        bound: Binding,
+        remote_target: str,
+        existing_head: str,
+    ) -> None:
+        """Refuse any newly pushed commit whose author or committer email is not the install's."""
+        bases = [remote_target] + ([existing_head] if existing_head else [])
+        commits_res = git(
+            root,
+            "log",
+            "--format=%ae%x00%ce",
+            _INCOMING,
+            "--not",
+            *bases,
+            check=False,
+        )
+        if commits_res.returncode != 0:
+            detail = (commits_res.stderr or commits_res.stdout or "git log failed").strip()
+            raise WorkspaceError(
+                f"could not verify commit identities before pushing: {detail}",
+                status=403,
+                code="FORBIDDEN_COMMIT_IDENTITY",
+            )
+        try:
+            viewer = self._viewer(bound)
+        except Exception:  # noqa: BLE001 — best-effort viewer lookup for app noreply address
+            viewer = ""
+        host = bound.forge.hosts[0] if bound.forge.hosts else ""
+        allowed = {
+            str(addr).strip().casefold()
+            for addr in self._allowed_commit_emails(host, viewer)
+            if str(addr).strip()
+        }
+        for line in (commits_res.stdout or "").splitlines():
+            if "\x00" not in line:
+                continue
+            ae, ce = line.split("\x00", 1)
+            author_email = ae.strip().casefold()
+            committer_email = ce.strip().casefold()
+            if (
+                not author_email
+                or author_email not in allowed
+                or not committer_email
+                or committer_email not in allowed
+            ):
+                bad = sorted(
+                    {addr or "<empty>" for addr in (author_email, committer_email) if not addr or addr not in allowed}
+                )
+                raise WorkspaceError(
+                    f"bundle contains commit identity {', '.join(bad)} outside install commit addresses",
+                    status=403,
+                    code="FORBIDDEN_COMMIT_IDENTITY",
+                )
 
     @staticmethod
     def _extract_revision_paths_to_dir(
@@ -2023,6 +2094,10 @@ class VcsBroker:
                 tar_path.unlink(missing_ok=True)
         return extracted
 
+    def _record_decision_memory_check(self, verdict: str) -> None:
+        if self.on_decision_memory_check is not None:
+            self.on_decision_memory_check(verdict)
+
     def _check_decision_memory_on_publish(
         self,
         git: Callable,
@@ -2043,6 +2118,7 @@ class VcsBroker:
             "knowledge", ".kube-agents/intent.yaml", check=False,
         )
         if getattr(tree_ls, "truncated", False):
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: base tree listing was truncated",
                 status=409,
@@ -2066,6 +2142,7 @@ class VcsBroker:
             root, "diff-tree", "-r", "--no-renames", "--name-status", "-z", diff_base, tip, check=False,
         )
         if diff_ns.returncode != 0 or getattr(diff_ns, "truncated", False):
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: diff-tree failed or was truncated",
                 status=409,
@@ -2083,6 +2160,7 @@ class VcsBroker:
                 changed_paths.append((status, tokens[idx + 1]))
                 idx += 2
         if not changed_paths:
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ALLOW)
             return ""
 
         check_dir = self._scratch("dmcheck")
@@ -2118,6 +2196,7 @@ class VcsBroker:
                             policy_base_rev, "--", safe_prefix, check=False,
                         )
                         if getattr(extra_ls, "truncated", False):
+                            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                             raise WorkspaceError(
                                 "Decision Memory guard check failed against base branch: extra path listing was truncated",
                                 status=409,
@@ -2165,6 +2244,7 @@ class VcsBroker:
                     k_root, changed_map, oversize_files=oversize_files
                 )
             except ValueError as exc:
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                 raise WorkspaceError(
                     f"Decision Memory guard check failed against base branch: {exc}",
                     status=409,
@@ -2173,6 +2253,7 @@ class VcsBroker:
 
             markdown = str(out.get("markdown") or "") if out.get("findings") else ""
             if out.get("verdict") == "block":
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_BLOCK)
                 msg = (
                     "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
                     f"{markdown}\n\n"
@@ -2186,6 +2267,9 @@ class VcsBroker:
                     code=DECISION_MEMORY_BLOCKED,
                     detail=markdown,
                 )
+            self._record_decision_memory_check(
+                DECISION_MEMORY_VERDICT_WARN if markdown else DECISION_MEMORY_VERDICT_ALLOW
+            )
             return markdown
         finally:
             self._discard_scratch(check_dir)
@@ -3082,6 +3166,11 @@ class VcsBroker:
         # `vcs.py` command runs it.
         return self._forge_verb("proposal-reviews", payload)
 
+    def proposal_closer(self, payload):
+        # Who closed an unmerged proposal, for the Decision Memory sweep's
+        # closer authority check. A library verb: no `vcs.py` command runs it.
+        return self._forge_verb("proposal-closer", payload)
+
     def proposal_acknowledge(self, payload):
         return self._forge_verb("proposal-acknowledge", payload)
 
@@ -3705,6 +3794,7 @@ VCS_VERBS = frozenset(
         "proposal-close",
         "proposal-commits",
         "proposal-reviews",
+        "proposal-closer",
         "proposal-acknowledge",
         "proposal-claim",
         "issue-update",
@@ -3743,6 +3833,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
         "proposal-reviews": broker.proposal_reviews,
+        "proposal-closer": broker.proposal_closer,
         "proposal-acknowledge": broker.proposal_acknowledge,
         "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,

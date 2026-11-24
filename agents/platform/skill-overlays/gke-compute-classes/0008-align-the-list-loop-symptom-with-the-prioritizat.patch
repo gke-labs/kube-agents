@@ -3,8 +3,7 @@ Subject: Align the list-loop symptom with the prioritization reference
 Why: Debug Symptom 11 still blamed any list over 10 rules for an infinite loop, while the synced prioritization reference says declarative rules prolong each other's cooldown and move forward, the loop comes from manual node-pool rules, and the cap is 6-8; an agent diagnosing a long `machineFamily` ladder got two opposite answers.
 Local-Issue: #2692
 Eval-Case: compute-class-canary-active-migration-pdb-probe
-Upstream-Issue: none filed yet
-Retire-When: when upstream rewrites Symptom 11 to match the prioritization reference
+Retire-When: upstream rewrites Symptom 11 to match the prioritization reference
 
 diff --git a/references/compute-class-debug.md b/references/compute-class-debug.md
 --- a/references/compute-class-debug.md

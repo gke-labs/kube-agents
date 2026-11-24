@@ -10,23 +10,18 @@ import tempfile
 import unittest
 
 import apply_cron_risk_gate
-import apply_cron_tirith_scan
 
 # The v2026.9.14 shape of tools/approval.py's two guard entry points, reduced
 # to something that parses and runs on its own. Byte-identical to upstream for
 # the anchored lines: the ``if not is_cli ...`` / ``for ctx in
 # _unattended_contexts():`` / ``result = _unattended_deny(command, ctx)`` triple
-# that apply_cron_tirith_scan.py inserts ahead of, and the ``for ctx`` /
+# that the applier inserts ahead of, and the ``for ctx`` /
 # ``if ctx.mode() == "deny":`` / ``return _denied(`` triple in
 # check_execute_code_guard. ``_Unattended.mode()`` resolves the getter on the
 # approval_context module at call time, as upstream's does, because that is
 # what the verifier pins.
 UPSTREAM = """\
 from tools import approval_context
-
-
-def _format_tirith_description(result):
-    return "tirith finding"
 
 
 def _approved():
@@ -120,9 +115,6 @@ class ApplyCronRiskGateTest(unittest.TestCase):
 
     def test_applier_patches_cleanly_and_parses(self):
         root, target = self.write_tree(UPSTREAM)
-        # Apply tirith scan first
-        apply_cron_tirith_scan.apply(root)
-        # Then apply risk gate
         apply_cron_risk_gate.apply(root)
 
         patched = target.read_text()
@@ -138,16 +130,24 @@ class ApplyCronRiskGateTest(unittest.TestCase):
             patched.index('        if ctx.mode() == "deny":\n            return _denied('),
         )
 
-    def test_the_risk_gate_needs_the_tirith_scan_first(self):
-        """Its first anchor is text apply_cron_tirith_scan.py inserts."""
-        root, _ = self.write_tree(UPSTREAM)
+    def test_the_content_gate_lands_ahead_of_the_unattended_loop(self):
+        """Under cron_mode: approve that loop approves, so the gate must come first."""
+        root, target = self.write_tree(UPSTREAM)
+        apply_cron_risk_gate.apply(root)
+        patched = target.read_text()
+        self.assertLess(
+            patched.index("cron_content_block(command)"),
+            patched.index("result = _unattended_deny(command, ctx)"),
+        )
+
+    def test_a_moved_anchor_fails_the_build(self):
+        root, _ = self.write_tree(UPSTREAM.replace("result = _unattended_deny(command, ctx)", "result = None"))
         with self.assertRaises(SystemExit) as caught:
             apply_cron_risk_gate.apply(root)
         self.assertIn("found 0", str(caught.exception))
 
     def test_the_patch_is_not_applied_twice(self):
         root, _ = self.write_tree(UPSTREAM)
-        apply_cron_tirith_scan.apply(root)
         apply_cron_risk_gate.apply(root)
         with self.assertRaises(SystemExit) as caught:
             apply_cron_risk_gate.apply(root)
@@ -155,14 +155,13 @@ class ApplyCronRiskGateTest(unittest.TestCase):
 
     def test_verification_script_passes_against_patched_module(self):
         root, target = self.write_tree(UPSTREAM)
-        apply_cron_tirith_scan.apply(root)
         apply_cron_risk_gate.apply(root)
 
         patches_dir = pathlib.Path(__file__).parent.resolve()
         tools_dir = root / "tools"
         (tools_dir / "__init__.py").write_text("")
         (tools_dir / "approval_context.py").write_text(APPROVAL_CONTEXT_STUB)
-        for mod_name in ("cron_risk_gate.py", "cron_run_scope.py", "cron_tirith_scan.py"):
+        for mod_name in ("cron_risk_gate.py", "cron_run_scope.py"):
             (tools_dir / mod_name).write_text((patches_dir / mod_name).read_text())
         cmd_policy = patches_dir.parents[2] / "agents" / "platform" / "scripts" / "command_policy.py"
         if cmd_policy.exists():

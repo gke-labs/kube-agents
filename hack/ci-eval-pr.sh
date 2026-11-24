@@ -240,6 +240,17 @@ readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The agent's own Secret and the key of its API token.
+readonly EVAL_AGENT_TOKEN_SECRET="platform-agent-secrets"
+readonly EVAL_AGENT_TOKEN_SECRET_KEY="API_SERVER_KEY"
+# How many times section 4 tries the read of a Secret, and the wait between two
+# tries. A connection error to the API server is a failure of the read, not a
+# state of the install, and the run has built and deployed the install by then.
+# Four tries with five seconds between them outlast an API server that does not
+# answer for fifteen seconds and the time of the failed calls; a longer loss
+# is not a blip, and the run ends.
+readonly EVAL_SECRET_READ_ATTEMPTS=4
+readonly EVAL_SECRET_READ_RETRY_SECONDS=5
 # The A2A door's token Secret (k8s-operator platformagent_a2a_manifests.go),
 # rendered because hack/ci-deploy.sh turns the door on for every eval install. Only
 # the card-wait stopped ask (#5407) goes through the door.
@@ -393,6 +404,10 @@ readonly EVAL_SCOPE_RECONCILE_TIMEOUT_SECONDS=600
 readonly EVAL_SCOPE_RECONCILE_ATTEMPTS=5
 readonly EVAL_SCOPE_RECONCILE_BUSY_EXIT=4
 readonly EVAL_SCOPE_READ_ATTEMPTS=3
+# scope_hold_apply (the per-case cluster hold): the exit of
+# kube_agents_bench.scope_hold apply (EXIT_UNSUPPORTED there) for an install
+# whose PlatformAgent API has no spec.hold, which patched nothing.
+readonly EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED=3
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run: 600 s, plus the
 # GitHub rate-limit waits the unit may spend while it holds the lock (#6105),
@@ -967,6 +982,7 @@ profile_and_dump_on_exit() {
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
   declare -F scope_exclude_restore >/dev/null && scope_exclude_restore "exit"
+  declare -F scope_hold_restore >/dev/null && scope_hold_restore "exit"
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -1108,11 +1124,7 @@ echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR
 profile_begin "cluster-auth: gcloud get-credentials"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gke_dns_endpoint_flag "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG
+get_cluster_credentials "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # 2b. Seeded-fleet credentials, one kubeconfig per fixture ROLE.
@@ -1498,8 +1510,8 @@ LEDGER_RESET_MINT_RETRY_DELAY=2
 # (start_ledger_token_renewal): well inside the hour an installation token
 # lasts, with room for the mint's own retry ladder.
 LEDGER_TOKEN_RENEW_SECONDS=2400
-# The renewer's sleep step. Short, so the sleep a stopped renewer leaves
-# behind ends within seconds rather than holding the unit's output open.
+# The renewer's sleep step. Short, so a renewer whose unit was killed before
+# its stop notices within seconds rather than holding the job's output open.
 LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
@@ -1664,8 +1676,15 @@ start_ledger_token_renewal() { # <label> <file>
   (
     waited=0
     failures=0
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
+    # a TERM to arrive ahead of.
+    napping=""
+    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
@@ -1692,6 +1711,15 @@ start_ledger_token_renewal() { # <label> <file>
   LEDGER_TOKEN_RENEWER=$!
 }
 
+# Ends the renewer and removes the file. The renewer traps TERM, and bash runs a
+# trap only once the foreground command returns, so the wait below outlasts the
+# one command under way and the renewer runs nothing after it: the rm is final.
+# Killed outright, the renewer would leave that command running to write a live
+# token after the rm. A mint under way here is abandoned after its current
+# command (a mint call or a retry sleep), which leaves mint_ledger_token's
+# diagnostics file behind. The GitOps write token's mint is one command
+# substitution, so its whole retry ladder finishes first and its token is
+# dropped unwritten.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
@@ -1771,8 +1799,15 @@ start_gitops_write_token() { # <label> <file>
   (
     waited=0
     failures=0
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
+    # a TERM to arrive ahead of.
+    napping=""
+    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
@@ -1797,7 +1832,8 @@ start_gitops_write_token() { # <label> <file>
   echo "GitOps write token (${label}): minted from App ${EVAL_LEDGER_APP_ID}, narrowed to ${EVAL_LEDGER_REPO} and contents, pull_requests and issues write, in ${file}"
 }
 
-# Ends the renewer and removes the file. A developer's own
+# Ends the renewer, as stop_ledger_token_renewal does and for its reason, and
+# removes the file. A developer's own
 # TF_VAR_bench_gitops_write_token_file (start_gitops_write_token minted nothing) stays as
 # the environment set it.
 stop_gitops_write_token() { # <file>
@@ -2930,6 +2966,56 @@ scope_exclude_restore() { # <label> [settle|repair]
   done
 }
 
+# The per-case cluster hold. A case that declares `scope_hold:` grades an install
+# whose spec.hold holds the agent's own cluster or every cluster, which
+# refuses every Kubernetes API request to it, so the fan-out runs its repetitions
+# alone, after every other unit (unit_phase 2). bench/kube_agents_bench/scope_hold.py
+# does the work: it patches the CR, saving the hold it replaced on the CR for
+# the EXIT trap's and the next lease's restore, and waits until the operator's
+# <agent>-hold ConfigMap carries the hold and the kubelet has had time to
+# refresh the pods' copies. A hold restarts nothing, so no settle runs. It
+# exits EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED, having patched nothing, on an install
+# whose CRD has no spec.hold; the case then runs on the install as it is
+# and goes red for the behaviour it lacks rather than being recorded as
+# infrastructure. Pinned to AGENT_CLUSTER_CONTEXT as the scope exclusion is.
+
+# A bare python3, as scope_exclude_helper: apply and restore need only the
+# standard library.
+scope_hold_helper() { # <subcommand> [args]
+  PYTHONPATH="${SCRIPT_DIR}/../bench" python3 -m kube_agents_bench.scope_hold "$@" \
+    --context "${AGENT_CLUSTER_CONTEXT}" --namespace "${TARGET_NAMESPACE}" --name "${AGENT_SERVICE_NAME}"
+}
+
+# Hold what the case declares (one line of JSON, from `scope_hold.py cases`)
+# and wait until the hold is in effect. Non-zero means the case must not run.
+scope_hold_apply() { # <case> <hold-json>
+  local name="$1" hold="$2" rc=0
+  scope_exclude_target "${name}" || return 1
+  scope_hold_helper apply --hold "${hold}" || rc=$?
+  case "${rc}" in
+    0) return 0 ;;
+    "${EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED}")
+      echo "Scope hold (${name}): the install's PlatformAgent API has no spec.hold; the case runs on the install as it is and is graded"
+      return 0 ;;
+  esac
+  echo "WARNING: Scope hold (${name}): the hold ${hold} did not take effect on platformagent/${AGENT_SERVICE_NAME}" >&2
+  return 1
+}
+
+# Put back the hold a patch saved, when one is saved. With `wait` (the lease
+# preflight) it also waits for the lifted hold to reach the pods, so no case
+# that reads the held cluster starts under it. A CR that cannot be read or
+# patched is a warning: the next lease's preflight tries again.
+scope_hold_restore() { # <label> [wait]
+  local label="$1" args=()
+  scope_exclude_target "${label}" 2>/dev/null || return 0
+  [ "${2:-}" != wait ] || args=(--wait)
+  if ! scope_hold_helper restore ${args[@]+"${args[@]}"}; then
+    echo "WARNING: Scope hold (${label}): could not restore the hold on platformagent/${AGENT_SERVICE_NAME}; the next lease's preflight tries again" >&2
+    return 1
+  fi
+}
+
 if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 else
@@ -2954,6 +3040,12 @@ probe_gitlab_ledger_path "lease" || exit 1
 # case on the excluded slots would grade an install without their Cluster Agent.
 scope_exclude_restore "lease" repair || {
   echo "ERROR: Scope exclusion (lease): an earlier run's exclusion could not be undone; stopping the run (infrastructure, not a case result)" >&2
+  exit 1
+}
+# A hold a killed run left on (scope_hold_restore, above), lifted and waited
+# out first: under it every case that reads the held cluster would be refused.
+scope_hold_restore "lease" wait || {
+  echo "ERROR: Scope hold (lease): an earlier run's hold could not be lifted; stopping the run (infrastructure, not a case result)" >&2
   exit 1
 }
 scheduled_audits pause "lease"
@@ -3107,7 +3199,41 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down the agent model
-PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+
+# read_secret_data SECRET KEY [KUBECTL_FLAG...]: the encoded .data.KEY of SECRET
+# in TARGET_NAMESPACE, on stdout. A read that fails is tried again, with the
+# error of kubectl on stderr each time. Returns 1 when each try failed.
+read_secret_data() {
+  local secret="$1" key="$2" attempt data
+  shift 2
+  for attempt in $(seq 1 "${EVAL_SECRET_READ_ATTEMPTS}"); do
+    # Captured for each try, so that output of a failed try is not joined to a later one.
+    if data="$(kubectl get secret "${secret}" -n "${TARGET_NAMESPACE}" "$@" -o jsonpath="{.data.${key}}")"; then
+      printf '%s' "${data}"
+      return 0
+    fi
+    echo "WARNING: the read of Secret ${secret} in ${TARGET_NAMESPACE} failed (try ${attempt} of ${EVAL_SECRET_READ_ATTEMPTS})." >&2
+    if [ "${attempt}" -lt "${EVAL_SECRET_READ_ATTEMPTS}" ]; then
+      sleep "${EVAL_SECRET_READ_RETRY_SECONDS}"
+    fi
+  done
+  return 1
+}
+
+# secret_read_failed SECRET KEY: ends the run when each try of a read failed. The
+# message names no cause of its own: the error of kubectl has it.
+secret_read_failed() {
+  echo "ERROR: the read of Secret $1 (key $2) in ${TARGET_NAMESPACE} failed ${EVAL_SECRET_READ_ATTEMPTS} times." >&2
+  echo "       The error of kubectl above gives the cause." >&2
+  exit 1
+}
+
+# No --ignore-not-found here: an absent Secret must stay the end of the run, and
+# with the flag it is a read with no value, which goes on with an empty token.
+
+PLATFORM_AGENT_TOKEN_DATA="$(read_secret_data "${EVAL_AGENT_TOKEN_SECRET}" "${EVAL_AGENT_TOKEN_SECRET_KEY}")" \
+  || secret_read_failed "${EVAL_AGENT_TOKEN_SECRET}" "${EVAL_AGENT_TOKEN_SECRET_KEY}"
+PLATFORM_AGENT_TOKEN="$(printf '%s' "${PLATFORM_AGENT_TOKEN_DATA}" | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
 # The deploy armed the inject door and declared the bridge; the matrix goes
 # through the door. The agent token above is still fetched: the transport
@@ -3115,7 +3241,11 @@ export PLATFORM_AGENT_TOKEN
 # the install. Everything about the door the harness needs beyond these two
 # it derives from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
 EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
-if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
+# --ignore-not-found: an absent Secret is then a read that succeeded with no
+# value, so "missing or empty" below is never the message for a failed read.
+AGENT_INJECT_TOKEN_DATA="$(read_secret_data "${EVAL_INJECT_TOKEN_SECRET}" "${EVAL_INJECT_TOKEN_SECRET_KEY}" --ignore-not-found)" \
+  || secret_read_failed "${EVAL_INJECT_TOKEN_SECRET}" "${EVAL_INJECT_TOKEN_SECRET_KEY}"
+if ! AGENT_INJECT_TOKEN="$(printf '%s' "${AGENT_INJECT_TOKEN_DATA}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
   echo "ERROR: the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
   echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does on every install." >&2
   exit 1
@@ -4847,6 +4977,10 @@ unit_cost_hint() {
     fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
+    # The same full audit after a plant that waits eleven minutes, so that
+    # the failed pulls it plants are older than the check's ten (3.28).
+    # Unmeasured: the audit band plus the wait.
+    obtainability-image-pull-failing) echo 1600 ;;
     # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
     # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
     # kustomize case runs in the second phase (writes_alone), so its hint
@@ -5103,7 +5237,7 @@ unit_delegation_timeout() {
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
-    obtainability-planted-orphan-service) echo 3000 ;;
+    obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
     fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
@@ -5147,6 +5281,17 @@ if ! SCOPE_EXCLUDE_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_be
 fi
 SCOPE_EXCLUDE_NAMES="$(printf '%s\n' "${SCOPE_EXCLUDE_CASES}" | awk 'NF { printf "%s%s", sep, $1; sep = "," }')"
 [ -z "${SCOPE_EXCLUDE_NAMES}" ] || echo "cases that exclude seeded slots from the install's scope, run alone after every other unit: ${SCOPE_EXCLUDE_NAMES}"
+# The cases that hold a cluster (scope_hold_apply), one `<case> <hold-json>` line
+# each, in the same phase after the scope-excluding ones. Read with this
+# checkout's reader by path, under the grader's environment for PyYAML: a grader
+# pinned to a base without the module would otherwise stop every run, and -I
+# keeps the reader's own directory off the import path.
+if ! SCOPE_HOLD_CASES="$(cd "${BENCH_DIR}" && uv run python -I "${SCRIPT_DIR}/../bench/kube_agents_bench/scope_hold.py" cases "${TASKS[@]}")"; then
+  echo "ERROR: could not read the matrix's scope_hold (kube_agents_bench.scope_hold, above); the fan-out cannot tell which cases hold a cluster, so the run does not start." >&2
+  exit 1
+fi
+SCOPE_HOLD_NAMES="$(printf '%s\n' "${SCOPE_HOLD_CASES}" | awk 'NF { printf "%s%s", sep, $1; sep = "," }')"
+[ -z "${SCOPE_HOLD_NAMES}" ] || echo "cases that hold a cluster, run alone after every other unit: ${SCOPE_HOLD_NAMES}"
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   TASK_NAMES+=("${TASK_NAME}")
@@ -6015,9 +6160,11 @@ start_chain_audits_watch
 # is phase 2, run after both and alone, each case between its own scope edit and
 # restore (scope_exclude_apply); it takes 2 even when it also writes, and then
 # keeps the writer pause but not run_one_unit's per-repetition repository reset,
-# which no scope-excluding case needs today: each of them is read-only.
-unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that requests a pull request, a stopped ask or a writes_alone case, 0 otherwise
-  case ",${SCOPE_EXCLUDE_NAMES:-}," in
+# which no scope-excluding case needs today: each of them is read-only. A case
+# that holds a cluster (SCOPE_HOLD_NAMES) is phase 2 the same way, between its
+# hold and the restore (scope_hold_apply), after the scope-excluding cases.
+unit_phase() { # <task-name> -> 2 for a scope-excluding or cluster-holding case, 1 for a case that requests a pull request, a stopped ask or a writes_alone case, 0 otherwise
+  case ",${SCOPE_EXCLUDE_NAMES:-},${SCOPE_HOLD_NAMES:-}," in
     *",$1,"*) echo 2; return ;;
   esac
   case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
@@ -6195,7 +6342,11 @@ SCOPE_EXCLUDE_LINES=()
 while IFS= read -r SCOPE_LINE; do
   [ -z "${SCOPE_LINE}" ] || SCOPE_EXCLUDE_LINES+=("${SCOPE_LINE}")
 done <<<"${SCOPE_EXCLUDE_CASES:-}"
-SCOPE_TOTAL=$(( ${#SCOPE_EXCLUDE_LINES[@]} * EVAL_REPETITIONS ))
+SCOPE_HOLD_LINES=()
+while IFS= read -r SCOPE_LINE; do
+  [ -z "${SCOPE_LINE}" ] || SCOPE_HOLD_LINES+=("${SCOPE_LINE}")
+done <<<"${SCOPE_HOLD_CASES:-}"
+SCOPE_TOTAL=$(( (${#SCOPE_EXCLUDE_LINES[@]} + ${#SCOPE_HOLD_LINES[@]}) * EVAL_REPETITIONS ))
 
 profile_begin "task fan-out: $((LIVE_TOTAL + UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
 # The cards fence_live_cards may archive are the ones filed from here on (the
@@ -6245,6 +6396,35 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   fi
   scope_exclude_restore "${SCOPE_CASE}" settle \
     || echo "WARNING: Scope exclusion (${SCOPE_CASE}): the restore did not settle; the next lease's preflight repeats it" >&2
+done
+# The cluster-holding cases, each alone between its hold and the restore. A hold
+# that does not take effect records the repetitions as infrastructure; one the
+# install's API cannot express runs them on the install as it is
+# (scope_hold_apply). A hold replaces no pod, so the gateway log is the EXIT
+# trap's as usual.
+for SCOPE_LINE in ${SCOPE_HOLD_LINES[@]+"${SCOPE_HOLD_LINES[@]}"}; do
+  read -r SCOPE_CASE SCOPE_HOLD <<<"${SCOPE_LINE}"
+  SCOPE_IDX=""
+  for i in "${!TASK_NAMES[@]}"; do
+    [ "${TASK_NAMES[i]}" = "${SCOPE_CASE}" ] && SCOPE_IDX="${i}" && break
+  done
+  [ -n "${SCOPE_IDX}" ] || continue
+  SCOPE_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
+    *",${SCOPE_CASE},"*) SCOPE_PAUSE="${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" ;;
+  esac
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${EVAL_REPETITIONS} repetition(s) of ${SCOPE_CASE} alone, under the hold ${SCOPE_HOLD}"
+  if scope_hold_apply "${SCOPE_CASE}" "${SCOPE_HOLD}"; then
+    launch_units "$(for REP in $(seq 1 "${EVAL_REPETITIONS}"); do printf '%s 0 %s\n' "${REP}" "${SCOPE_IDX}"; done)" 1 "${SCOPE_PAUSE}"
+    wait
+  else
+    for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
+      skip_unit "${TASKS[SCOPE_IDX]}" "${SCOPE_CASE}" "${REP}" "" "" "not run: its cluster hold did not take effect" \
+        "scope-hold: the hold ${SCOPE_HOLD} could not be put on the install"
+    done
+  fi
+  scope_hold_restore "${SCOPE_CASE}" \
+    || echo "WARNING: Scope hold (${SCOPE_CASE}): the restore failed; the next lease's preflight repeats it" >&2
 done
 stop_chain_audits_watch
 

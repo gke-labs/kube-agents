@@ -748,20 +748,20 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod (plus its exec tier on port 8766 while `platformAgent.deployment.credentialProxy.exec.replicas` is above 0), so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod, so it scrapes the gateway's inbound-message,
-task terminal and Google Chat pull counters from its metrics-only port 9096.
-The operator's policies on all three pods admit the
+task terminal and Google Chat pull counters from its metrics-only port 9096, and the kube-proxy pod on port 8444, and `<name>-curator-monitoring`, so it scrapes the OKF memory curator (`<name>-curator`) `kubeagents_curator_*` series from port 8080 when operator env `A2A_CURATOR=true` renders the curator pod (matching no pod while `A2A_CURATOR` is off), and `<name>-a2a-nats-monitoring` on port 7777 when the A2A NATS exporter renders.
+The operator's policies on those pods admit the
 collector's namespace, `gke-gmp-system`, and the operator's own pods on those ports
 either way; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
 
-Non-GMP clusters scrape these metrics through the corresponding alternative knobs:
+Non-GMP clusters scrape the gateway, credential-proxy (including exec tier when `credentialProxy.exec.replicas > 0`), A2A gateway, and kube-proxy pods (ports 9095, 9097, 8766, 9096, and 8444) through the corresponding alternative knobs (`<name>-a2a-nats-monitoring` on port 7777 and `<name>-curator-monitoring` on port 8080 are `PodMonitoring`-only):
 
-- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the three pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
-- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the three pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
+- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the gateway, credential-proxy, A2A gateway, and kube-proxy pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
+- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the gateway, credential-proxy, A2A gateway, and kube-proxy pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
 
 Each monitoring knob (`podMonitoring`, `serviceMonitor`, `vmPodScrape`) is an independent tri-state:
 `null`, the default, renders them when the cluster serves the corresponding API and
@@ -885,7 +885,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `appIdSecretRef` and `appPasswordSecretRef` (`name` and `key`). Optional
   single-tenant lock-down is set via `tenantId`, and user authorization is
   configured via `allowedUsers` (or `allowAllUsers: true`). Supports Microsoft
-  Adaptive Cards v1.5 with markdown fallback. Custom refs can likewise be
+  Adaptive Cards v1.5 with markdown fallback. `inbound.enabled: true` (with
+  `tenantId`) runs the receiver that accepts the messages Microsoft delivers for
+  the bot; expose its Service with your own Ingress. Custom refs can likewise be
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
@@ -1013,6 +1015,16 @@ It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it t
 when the gateway runs the Slack adapter. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
 user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
 off a real install, and a listed member's posts through any app in the workspace read as theirs.
+
+### Microsoft Teams on the A2A gateway (`A2A_TEAMS_BACKEND`)
+
+An `operator.extraEnv` entry `A2A_TEAMS_BACKEND=true` (no value key yet) has the A2A gateway's
+`teams` backend consume the credential broker's Teams queue for every `PlatformAgent` whose
+`integration.teams` is enabled, in place of the Planning Agent's Teams adapter: replies render as
+Adaptive Cards, the gateway's `chat.notify` route posts proactive alerts and reports into
+`integration.teams.homeChannel`, the agent's delivery resolver names Teams for the roster's scheduled reports (a Hermes cron job that names `deliver: teams` or `deliver: chat` by hand does not reach Teams there: the Hermes scheduler has no Teams platform on an armed install), and the broker admits the gateway on its Teams routes only on this switch. Off by default,
+so an operator upgrade moves no Teams install on its own. `docs/chatops/microsoft-teams.md` in the
+repository has the details.
 
 ### Data volume size (`platformAgent.storage.size`)
 
@@ -1496,6 +1508,9 @@ all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
 `platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
+The Teams inbound receiver is counted as one pod (`operatorRenderedPerReplica.teamsInboundReceiver`)
+while `platformAgent.integration.teams.inbound.enabled` is set beside `teams.enabled`; its cpu and
+memory are fixed in the operator.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
@@ -1680,7 +1695,7 @@ also raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, the manager r
 and the admitted pod differs from the rendered manifest. Either way the manager reads the admitted
 limit. A cluster with bursting admits the manifest as rendered.
 
-### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
+### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`, `profiles.fleetAudit`)
 
 `profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
 (GKE Support Agent — Customer-Side Technical Solutions Engineer)
@@ -1708,6 +1723,18 @@ unattended Jobs. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
 The chart sets `yieldToPinned: true` on `cluster`, so that second profile receives
 the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
+
+`profiles.fleetAudit.enabled` (default `false`) renders `AgentProfile/fleet-audit`,
+the parent of the install's fleet-wide scheduled audits and of onboarding's first
+inventory. It takes no target: it reads no cluster itself, and each cluster's
+checks run as a delegated `cluster` task. Its one parameter, `dry_run`, marks a
+shadow run. Its persona is the `persona-fleet-audit`
+image, built from `agents/fleet-audit/persona`, and its report scripts are in the
+`a2a-worker` image under `/opt/kube-agents/scripts/fleet-audit`. `profiles.fleetAudit.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
+control its spec. Its one tier is `unattended`, the tier a scheduled audit runs
+at. It has no `read` tier until its persona can do an on-demand run, since a
+`read` tier would make it a delegate target of every chat session. No schedule
+runs on it yet.
 
 ## Uninstalling
 

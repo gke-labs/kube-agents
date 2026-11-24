@@ -46,7 +46,9 @@ where `bench/kube_agents_bench/fixture_drift.py` turns each `drifted` role
 into a `fixture-drift:<role>` infrastructure record for the cases that need
 it. Detection is this script's whole job: it repairs nothing. The reconcile's
 re-apply (hack/fleet_reconcile.py) repairs drift, and only the reconcile's
-reset of the VM repairs a rotated serial console (`serial_contains`).
+reset of the startup-fail VM repairs that VM's rotated serial console
+(`serial_contains`); the serial-flood VM's own flood pass repairs its missing
+filler, and a one-off hand reset is the repair when that flood breaks.
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline
@@ -57,21 +59,25 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-world-open firewall rule and its VM, the peered jumbo-frame network, the two
-orphaned snapshots) is published as `<role>.confirmed` alone, and its subjects
+serial-flood VM, the world-open firewall rule and its VM, the peered
+jumbo-frame network, the two orphaned snapshots) is published as
+`<role>.confirmed` alone, and its subjects
 are read with `gcloud compute instances list`, `gcloud compute firewall-rules
 list`, `gcloud compute networks list` or `gcloud compute snapshots list` in the
 project. A cluster role can carry one such subject too, `reservation/<prefix>*`,
 read with `gcloud compute reservations list`. `serial_contains` reads an instance subject's serial port 1 output as
 well, with `gcloud compute instances get-serial-port-output`: the startup-fail
 VM's failure line is printed at boot only, and the buffer that holds it rotates
-within weeks. `source_disk_gone` reads the project's disks for the name a
+within weeks; the serial-flood VM's flood filler is the opposite designed
+state, the console whose boot lines have rotated out, which the VM itself
+renews daily. `source_disk_gone` reads the project's disks for the name a
 snapshot's `sourceDisk` ends in.
 
 One kind of assertion is a clock rather than a shape: `ready_after_hours`,
 on the orphaned-snapshot roles, whose snapshots the GCE compute audit ignores
 until they are more than 90 full days old, and `creationTimestamp` cannot be
-backdated. A role failing that and nothing else is NOT READY, reported with
+backdated; and on the finished-Job family, whose Jobs the cost audit ignores
+until they finished 7 days ago. A role failing that and nothing else is NOT READY, reported with
 the time its clock passes, never drifted: a project applied today is
 registrable, the hourly scan shows the date, and no re-apply is asked for.
 
@@ -294,7 +300,9 @@ OP_AS_SEEDED = "as_seeded"
 # gate the stack cannot shortcut: the orphaned-snapshot roles' snapshots are
 # invisible to the GCE compute audit's orphaned-snapshots check until they are
 # more than 90 full days old (`(now - creationTimestamp).days > 90`, its
-# collector's ORPHAN_AGE_DAYS), and creationTimestamp is server-set. Failing
+# collector's ORPHAN_AGE_DAYS), and creationTimestamp is server-set. The
+# finished-Job family is the second user: the cost audit files a finished Job
+# once its `status.completionTime` is 7 days old. Failing
 # it is not drift: the role is NOT READY, reported with the time the clock
 # passes, so a project applied today is registrable and the hourly scan shows
 # a date rather than a fixture out of shape. An unparseable timestamp is a
@@ -314,8 +322,11 @@ READY_AT = "ready at"
 # Ops a `--wait` cannot see converge, so their drift does not hold the pass:
 # the clock clears an age, in hours (and the one drift `ready_after_hours`
 # writes, a timestamp that is not one, is a second snapshot under the prefix
-# or a broken one, which a hand deletion clears), only a reboot of the VM
-# (the next reconcile's reset) puts a rotated line back on a serial console,
+# or a broken one, which a hand deletion clears, or a Job with no
+# `completionTime`, which failed or has not finished); a `serial_contains` drift
+# clears per role on a clock no scan should wait on (only a reboot puts the
+# startup-fail VM's failure line back, and the serial-flood VM's flood pass
+# restores its filler a few minutes after a boot, longer than a pass waits);
 # only the next reconcile's re-run of the planter deletes a re-created source
 # disk, and only an operator's replace puts the seeded file back.
 OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_READY_AFTER_HOURS, OP_SERIAL_CONTAINS, OP_SOURCE_DISK_GONE, OP_AS_SEEDED})

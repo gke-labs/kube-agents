@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // statusShowingAdapter is the fake as a backend that shows a task's status
@@ -215,6 +216,45 @@ func TestAProfileChildKeepsItsLineOnAStatusShowingBackend(t *testing.T) {
 			t.Fatalf("edits = %q, want the line closed to %q", r.adapter.editTexts(), closed)
 		}
 	}
+}
+
+// A profile child's progress carries the ask's kind as a mark-only chat
+// message (the worker adapter's shape, #6536): its line still shows the
+// progress text with the delegation note. (TestMarkOnlyProgressLaysNothingOut
+// pins that the message lays nothing out.)
+func TestAProfileChildsMarkOnlyProgressKeepsItsLineText(t *testing.T) {
+	t.Parallel()
+	r, spawn := statusShowingProfileRig(t)
+	ctx := context.Background()
+	exec, _, _ := sessionTurn(t, r, spawn, "discord:g1/t-profile-mark", "why is prod unhappy?")
+	if err := exec.PublishArtifact(ctx, delegateArtifactWithParameters(t, "prod-east", "diagnose prod", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child's line", postedContaining(r, "(delegated to prod-east)"))
+	var child *lib.Envelope
+	waitFor(t, "the child's submission", func() bool {
+		if got := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>"); len(got) == 1 {
+			child = got[0].env
+			return true
+		}
+		return false
+	})
+	cexec := r.execFor(t, child, "prod-east")
+	if err := cexec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	markOnly := chatmsg.Message{Schema: chatmsg.Schema, Mark: &chatmsg.Mark{Ask: "investigate"}}
+	if err := cexec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "checking the pods"}, chatPart(t, markOnly)}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child's line showing the progress text", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "checking the pods") && strings.Contains(e, "(delegated to prod-east)") {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // Only a single child a session turn delegates to a profile keeps a line

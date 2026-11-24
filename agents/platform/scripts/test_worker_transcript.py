@@ -79,18 +79,73 @@ class TestScrubStepText(unittest.TestCase):
             if not self._parses(nested):
                 self.skipTest("the JSON parser refuses %d levels here, so no document of this depth parses" % depth)
             self.assertEqual(_scrub("tool_result", nested), WITHHELD)
-        # A document too deep to parse is scrubbed as text rather than dropped.
-        # The parser's depth limit is the interpreter's: some thousands of
-        # levels on Python 3.12 and 3.13, and on 3.14 as many as the stack
-        # holds (more than 100,000 with a 16 MB stack). So the test finds a
-        # depth above it and holds no fixed one.
-        deep = nested
+
+    def _too_deep_to_parse(self):
+        """A document the JSON parser of this Python refuses for its depth.
+
+        The parser's depth limit is the interpreter's: some thousands of
+        levels on Python 3.12 and 3.13, and on 3.14 as many as the stack holds
+        (more than 100,000 with a 16 MB stack). So the search finds a depth
+        above it and holds no fixed one.
+        """
+        depth = 2 * sys.getrecursionlimit()
+        deep = "[" * depth + "]" * depth
         while self._parses(deep):
             if 2 * depth > self.DEEPEST_DOCUMENT_TRIED:
                 self.skipTest("the JSON parser of this Python parses %d levels; the search stops there" % depth)
             depth *= 2
             deep = "[" * depth + "]" * depth
-        self.assertEqual(_scrub("tool_result", deep), deep)
+        return deep
+
+    def test_withheld_when_the_document_is_too_deep_to_parse(self):
+        """More depth never gets a weaker rule: a document the parser refuses
+        is withheld as one too deep to walk is, not served under the text rules."""
+        deep = self._too_deep_to_parse()
+        for kind in ("thinking", "tool_call", "tool_result", "reply"):
+            with self.subTest(kind=kind):
+                self.assertEqual(_scrub(kind, deep), WITHHELD)
+
+    def test_withheld_when_a_string_inside_the_step_is_too_deep_to_parse(self):
+        deep = self._too_deep_to_parse()
+        for name, step in (
+            ("a value of a structure", json.dumps({"output": deep})),
+            ("a value of a nested structure", json.dumps({"result": [{"stdout": deep}]})),
+        ):
+            for kind in ("tool_call", "tool_result"):
+                with self.subTest(step=name, kind=kind):
+                    self.assertEqual(_scrub(kind, step), WITHHELD)
+        # The inline-object rule is a tool result's, and parses each `{...}` in a line of text.
+        inline = 'the call returned {"items": %s} and exited' % deep
+        self.assertEqual(_scrub("tool_result", inline), WITHHELD)
+
+    def test_withheld_when_the_parser_gives_up_on_text_that_is_no_document(self):
+        """Brackets that never close: no JSON document, but the parser stops
+        for the depth before it can say so, and that is all this module sees."""
+        deep = self._too_deep_to_parse()
+        unclosed = deep[: len(deep) // 2]
+        self.assertFalse(self._parses(unclosed))
+        self.assertEqual(_scrub("tool_result", unclosed), WITHHELD)
+
+    def test_text_the_parser_refuses_for_its_form_is_still_scrubbed_as_text(self):
+        for step in ('{"a": 1', "[1, 2,", "{not json}", "[" * 50):
+            with self.subTest(step=step):
+                self.assertEqual(_scrub("tool_result", step), step)
+        # Scrubbed, not only served: the text rules still mask a value in it.
+        out = _scrub("tool_result", '{"password": "hunter2hunter2", "a": 1')
+        self.assertNotIn("hunter2hunter2", out)
+        self.assertIn(MARKER, out)
+        self.assertNotEqual(out, WITHHELD)
+
+    def test_arguments_too_deep_to_parse_count_as_a_secret_read(self):
+        """They cannot be shown not to print a secret, so the call's result is
+        withheld with them."""
+        deep = self._too_deep_to_parse()
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(deep))
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(deep[: len(deep) // 2]))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": "ls -la"})))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call("ls -la"))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call('{"command": "ls'))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call("[" * 50))
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
         for cmd, cred, kept in (
@@ -692,36 +747,89 @@ class TestScrubStepText(unittest.TestCase):
         # A command without an escaped space has no value to read.
         self.assertEqual(worker_transcript.at_fold_flag_secrets(REDACTOR, "mysql DB_PASSWORD=x -p S3cretValue9"), [])
 
+    # The linear-time test below scrubs each input at its full length and
+    # with every run this many times shorter, and compares the two CPU times.
+    # A scrub that is linear in the input takes this many times longer on the
+    # full input; one whose cost is all quadratic takes the square of it.
+    LINEAR_TIME_SHRINK = 4
+    # The full scrub may take this many times the short one: the geometric
+    # mean of the linear growth (4) and the quadratic (16). A quadratic part
+    # beside a linear one passes until it is about twice the linear cost at
+    # the full length.
+    LINEAR_TIME_GROWTH_MAX = 8
+    # A length is read up to this many times and the fastest reading counts.
+    # The readings are CPU time, which a busy machine raises less than the
+    # clock but still raises, through the cache and a shared core.
+    LINEAR_TIME_READINGS = 2
+    # One reading scrubs its input again until this much CPU time has passed,
+    # and counts the mean: a scrub of a few milliseconds is otherwise at the
+    # mercy of one collector pass.
+    LINEAR_TIME_READING_MIN_SECONDS = 0.05
+
+    @staticmethod
+    def _long_lead_and_marker_run_commands(shrink):
+        """The linear-time test's commands, with every run `shrink` times shorter."""
+        marker = worker_transcript.REDACTED_SECRET_MARKER
+
+        def n(count):
+            return count // shrink
+
+        return (
+            "curl TOKEN=x\\\\ -u " + "a" * n(8000) + ':"S3cretValue9" https://x',
+            "curl TOKEN=x\\\\ -u " + "," * n(8000) + ':"S3cretValue9" https://x',
+            "DB_PASSWORD=x\\\\ --password" + "=" * n(8000) + '"S3cretValue9"',
+            'mysql DB_PASSWORD=x\\\\ -p="S3cretValue9" ' + marker * n(16000),
+            "curl h\\ -u=a" + ("," + marker) * n(8000) + ':"S3cretValue9"',
+            "curl h\\ " + "-u," * n(50000) + 'a:"S3cretValue9"',
+            "curl h\\ -u" + marker * n(8000) + ":S3cretValue9",
+            "curl TOKEN=x\\\\ -u" + marker * n(8000) + ':"S3cretValue9" ; echo ' + marker * (n(8000) + 2),
+            "curl TOKEN=x\\ -ua:" + "S-ua:" * n(40000) + "S ; echo " + "-ua:S" * n(60000) + "-",
+            "curl TOKEN=x\\ -ua:" + "S)-ua:" * n(32000) + "S ; echo " + "-ua:S)" * n(64000),
+            "TOKEN=x\\ mysql\\ --password= abc\\ -p S3cretValue9 ; mysql\\ -p"
+            + ":-p" * n(24600)
+            + ": ; echo -p"
+            + ":-p" * n(75300)
+            + ": y",
+        )
+
+    def _scrub_cpu_seconds(self, cmd):
+        """One reading: the mean CPU time of a scrub of `cmd`, each of which hides the value."""
+        import time
+
+        scrubs = 0
+        start = time.process_time()
+        while True:
+            out = _scrub("tool_call", cmd)
+            scrubs += 1
+            self.assertNotIn("S3cretValue9", out)
+            spent = time.process_time() - start
+            if spent >= self.LINEAR_TIME_READING_MIN_SECONDS:
+                return spent / scrubs
+
     def test_a_long_lead_or_a_run_of_markers_scrubs_in_linear_time(self):
         # A value has at most three leads, whatever the lead's length, and
         # each spelling is searched for as plain text: a lead that repeats
         # itself or the marker, and a spelling found again inside its own
         # last place, do not cost quadratic time.
-        import time
-
-        marker = worker_transcript.REDACTED_SECRET_MARKER
-        for cmd in (
-            "curl TOKEN=x\\\\ -u " + "a" * 8000 + ':"S3cretValue9" https://x',
-            "curl TOKEN=x\\\\ -u " + "," * 8000 + ':"S3cretValue9" https://x',
-            "DB_PASSWORD=x\\\\ --password" + "=" * 8000 + '"S3cretValue9"',
-            'mysql DB_PASSWORD=x\\\\ -p="S3cretValue9" ' + marker * 16000,
-            "curl h\\ -u=a" + ("," + marker) * 8000 + ':"S3cretValue9"',
-            "curl h\\ " + "-u," * 50000 + 'a:"S3cretValue9"',
-            "curl h\\ -u" + marker * 8000 + ":S3cretValue9",
-            "curl TOKEN=x\\\\ -u" + marker * 8000 + ':"S3cretValue9" ; echo ' + marker * 8002,
-            "curl TOKEN=x\\ -ua:" + "S-ua:" * 40000 + "S ; echo " + "-ua:S" * 60000 + "-",
-            "curl TOKEN=x\\ -ua:" + "S)-ua:" * 32000 + "S ; echo " + "-ua:S)" * 64000,
-            "TOKEN=x\\ mysql\\ --password= abc\\ -p S3cretValue9 ; mysql\\ -p"
-            + ":-p" * 24600
-            + ": ; echo -p"
-            + ":-p" * 75300
-            + ": y",
-        ):
+        #
+        # The bound is on how the CPU time grows with the input, not on the
+        # time itself. The longest input is 576 KB and its scrub takes about
+        # 0.8 s of CPU time on a developer's machine, so a 1 s bound failed
+        # on a slower or busier one (#6112). Both readings of a growth come
+        # from the same machine, one after the other. The full length is read
+        # again only when its first reading is over the bound.
+        full = self._long_lead_and_marker_run_commands(1)
+        short = self._long_lead_and_marker_run_commands(self.LINEAR_TIME_SHRINK)
+        for cmd, short_cmd in zip(full, short):
             with self.subTest(cmd=cmd[:40]):
-                start = time.process_time()
-                out = _scrub("tool_call", cmd)
-                self.assertLess(time.process_time() - start, 1.0)
-                self.assertNotIn("S3cretValue9", out)
+                short_seconds = min(self._scrub_cpu_seconds(short_cmd) for _ in range(self.LINEAR_TIME_READINGS))
+                bound = self.LINEAR_TIME_GROWTH_MAX * short_seconds
+                full_seconds = self._scrub_cpu_seconds(cmd)
+                for _ in range(self.LINEAR_TIME_READINGS - 1):
+                    if full_seconds < bound:
+                        break
+                    full_seconds = min(full_seconds, self._scrub_cpu_seconds(cmd))
+                self.assertLess(full_seconds, bound)
 
     def test_key_headers_with_no_end_line_scrub_in_linear_time(self):
         # 170 KB of private key headers with no END line. The redactor's

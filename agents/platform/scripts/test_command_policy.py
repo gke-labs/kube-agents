@@ -26,7 +26,7 @@ CONFIG_CONNECTOR_SKILL_DIR = (
     Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
 )
 # A fence may be indented, as one inside a numbered list is. The languages
-# are deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+# are the info strings a2a/cmd/session-persona/transform.go calls shellLangs.
 FENCED_SHELL_BLOCK = re.compile(
     r"^(?P<indent>[ \t]*)```(?:bash|sh|shell|zsh)[ \t]*\n(?P<body>.*?)^(?P=indent)```[ \t]*$",
     re.MULTILINE | re.DOTALL,
@@ -2999,3 +2999,18 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KubectlDefinitiveWriteTest(unittest.TestCase):
+    """command_policy.kubectl_definitive_write: which argvs the broker marks as a write."""
+
+    def test_a_help_letter_in_a_short_cluster_is_not_a_write(self):
+        self.assertIsNone(command_policy.kubectl_definitive_write(shlex.split("kubectl delete pod x -hv=9")))
+        self.assertEqual(("delete",), command_policy.kubectl_definitive_write(shlex.split("kubectl delete pod x -v=9")))
+
+    def test_a_long_hostile_flag_is_read_in_linear_time(self):
+        import time
+        token = "-" + "h" * 200_000 + "!"
+        start = time.monotonic()
+        command_policy.kubectl_definitive_write(["kubectl", "delete", "pod", "x", token])
+        self.assertLess(time.monotonic() - start, 1.0)

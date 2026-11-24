@@ -648,6 +648,7 @@ var knownPlatformSkills = []string{
 	"fleet-audit-reports",
 	"first-run-report",
 	"alert-history",
+	"chat-delivery",
 	"fleet-upgrade-verification",
 	"gce-compute-fleet-audit",
 	"gcp-networking-fabric-audit",

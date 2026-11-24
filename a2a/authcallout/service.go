@@ -233,6 +233,10 @@ type Service struct {
 	log             *slog.Logger
 	// slots bounds the decisions in flight at once; see calloutWorkers.
 	slots chan struct{}
+	// decisionBudget is authDecisionBudget. It is a field so the suite's
+	// harness, which lifts the server's own two-second ceilings, can lift
+	// this one with them.
+	decisionBudget time.Duration
 }
 
 // NewService builds the callout.
@@ -290,6 +294,8 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		now:       cfg.Now,
 		log:       log,
 		slots:     make(chan struct{}, calloutWorkers),
+
+		decisionBudget: authDecisionBudget,
 	}
 	if svc.grantTTL <= 0 {
 		svc.grantTTL = defaultGrantTTL
@@ -353,7 +359,7 @@ func (s *Service) handle(m *nats.Msg) {
 	// starts here, on receipt, so time spent waiting for a slot counts
 	// against it: a request that waited past the point the client has
 	// already given up is not worth a TokenReview.
-	ctx, cancel := context.WithTimeout(context.Background(), authDecisionBudget)
+	ctx, cancel := context.WithTimeout(context.Background(), s.decisionBudget)
 
 	// nats.go delivers this subscription's messages from one goroutine, so
 	// the callback itself does nothing slow: it hands the request on and

@@ -54,6 +54,15 @@ describe("durablesFor", () => {
     ]);
   });
 
+  it("gives an Antigravity worker the same per-task durable as a Claude Code one", () => {
+    expect(
+      durablesFor([
+        agent({ session: "w-agy1", agentType: "antigravity" }),
+        agent({ session: "w-agy-old", agentType: "antigravity", status: "closed" }),
+      ]),
+    ).toEqual([{ session: "w-agy1", name: "w-agy1-in", stream: "TASKS", perTask: true }]);
+  });
+
   it("skips retired workers, a bridge with no profile, and unknown types", () => {
     expect(
       durablesFor([

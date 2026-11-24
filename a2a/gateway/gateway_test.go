@@ -1216,8 +1216,9 @@ func TestTasklessActiveTaskInsideGraceStillSteers(t *testing.T) {
 }
 
 // TestTasklessHealPersistsAcrossCapRefusal: the release is written when the
-// heal fires, not at the end of the turn — a Delegate refused at the session
-// cap returns before the end-of-turn write, and the conversation must not be
+// heal fires, not at the end of the turn — a Delegate parked at the session
+// cap returns before the end-of-turn write, as a refused one does, and the
+// conversation must not be
 // told it is released while the record still says otherwise.
 func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
@@ -1227,14 +1228,7 @@ func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 		AuthorID: "1001", MessageID: "t-3", Text: "Delegate: write a haiku about otters"}
-	waitFor(t, "cap refusal posted", func() bool {
-		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "cap 1") {
-				return true
-			}
-		}
-		return false
-	})
+	waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 	rec, err := r.g.reg.Get(context.Background(), conv)
 	if err != nil || rec == nil {
 		t.Fatal(err)
@@ -1380,6 +1374,11 @@ type fakeSpawner struct {
 	// started is each pod's start time for PodStarted; startedErr fails it.
 	started    map[string]time.Time
 	startedErr error
+	// liveSpawns makes each spawn count in live, as the pod it creates
+	// would in the cluster, and maxLive the most live has been since; the
+	// session-cap line's tests free a slot by lowering live.
+	liveSpawns bool
+	maxLive    int
 }
 
 func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
@@ -1454,6 +1453,10 @@ func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ str
 		return "", s.spawnErr
 	}
 	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID, OriginSeq: originSeq})
+	if s.liveSpawns {
+		s.live++
+		s.maxLive = max(s.maxLive, s.live)
+	}
 	return rec.BusSession, nil
 }
 
@@ -2380,8 +2383,8 @@ func TestSessionCommandOnSessionDefaultChangesNothing(t *testing.T) {
 	}
 }
 
-// TestSessionCommandWithTextHonoursTheCap: a refused first turn leaves no
-// half-written record - the cap post is the only reply.
+// TestSessionCommandWithTextHonoursTheCap: a first turn parked at the cap
+// leaves no half-written record - the queued notice is the only reply.
 func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	spawn.mu.Lock()
@@ -2389,7 +2392,7 @@ func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
 	spawn.mu.Unlock()
 	conv := "discord:g1/thread-s8"
 	sessionRigTurn(r, conv, "s-170", "/session first task")
-	waitFor(t, "cap refusal", postedContaining(r, "not started: 1 session worker is already running (cap 1)"))
+	waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 	if got := len(spawn.calls()); got != 0 {
 		t.Fatalf("spawned %d past the cap", got)
 	}
@@ -2787,6 +2790,10 @@ func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
 		{slackBackend, "slack:dm/D1", false},
 		{slackBackend, "not-a-key", false},
 		{discordBackend, "discord:g1/thread-s1", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2;messageid=1794603936403", true},
+		{teamsBackend, "teams:a:1UxxASmI", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2", false},
+		{teamsBackend, "teams:19:group@thread.v2", false},
 	} {
 		if got := conversationIsOwnThread(c.backend, c.key); got != c.want {
 			t.Errorf("conversationIsOwnThread(%s, %s) = %v, want %v", c.backend, c.key, got, c.want)
