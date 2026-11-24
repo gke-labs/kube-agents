@@ -561,9 +561,17 @@ func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
 // at ScopeClustersUnlistedMax, with UnlistedCount the total; their clusters
 // are listed elsewhere, and a delegation to one is still checked as it
 // arrives. OldestListing is when the oldest listing the counted clusters
-// came from was read (RFC 3339), so a reader can tell a stale one. All
-// three are left out when unset, so a part without them is the shape first
-// written.
+// came from was read (RFC 3339), so a reader can tell a stale one; it is
+// left out when that age is unknown (a stamp ahead of the gateway's clock),
+// so clusters counted with no OldestListing have an unknown age.
+//
+// ParentScoped says the parent is scoped to one cluster, so the page is that
+// cluster or nothing and Count is 0 or 1. Unbounded says the install's scope
+// declares no boundary, so any project not excluded is in scope: Unknown is
+// set and no project is named as listed elsewhere.
+//
+// Every one of these is left out when unset, so a part without them is the
+// shape first written.
 type ScopeClusters struct {
 	Count            int            `json:"count"`
 	Clusters         []ScopeCluster `json:"clusters"`
@@ -573,6 +581,8 @@ type ScopeClusters struct {
 	UnlistedProjects []string       `json:"unlistedProjects,omitempty"`
 	UnlistedCount    int            `json:"unlistedCount,omitempty"`
 	OldestListing    string         `json:"oldestListing,omitempty"`
+	ParentScoped     bool           `json:"parentScoped,omitempty"`
+	Unbounded        bool           `json:"unbounded,omitempty"`
 }
 
 // ScopeCluster is one cluster on a scopeClusters page: the target a
@@ -607,6 +617,12 @@ func validateScopeClusters(s ScopeClusters) error {
 	}
 	if s.Unknown && !s.Truncated {
 		return errors.New("scope clusters: an unknown count is always truncated")
+	}
+	if s.Unbounded && (!s.Unknown || len(s.UnlistedProjects) > 0 || s.UnlistedCount > 0) {
+		return errors.New("scope clusters: an unbounded scope is unknown and names no unlisted projects")
+	}
+	if s.ParentScoped && (s.Count > 1 || s.Unknown || s.Unbounded || s.UnlistedCount > 0) {
+		return errors.New("scope clusters: a parent scoped to one cluster has a known count of at most one and nothing unlisted")
 	}
 	if !s.Unknown && s.Truncated != (s.Count > len(s.Clusters)) {
 		return fmt.Errorf("scope clusters: truncated is %t with count %d and a page of %d", s.Truncated, s.Count, len(s.Clusters))

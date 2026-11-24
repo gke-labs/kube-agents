@@ -429,6 +429,10 @@ func TestScopeClustersBounds(t *testing.T) {
 		"unlisted count under":   {UnlistedProjects: []string{"p", "q"}, UnlistedCount: 1},
 		"unlisted not a label":   {UnlistedProjects: []string{"P_1"}, UnlistedCount: 1},
 		"oldest not a time":      {Count: 1, Clusters: []ScopeCluster{one}, OldestListing: "yesterday"},
+		"unbounded, known":       {Unbounded: true},
+		"unbounded, unlisted":    {Unbounded: true, Unknown: true, Truncated: true, UnlistedProjects: []string{"p"}, UnlistedCount: 1},
+		"parent-scoped, two":     {ParentScoped: true, Count: 2, Truncated: true, Clusters: []ScopeCluster{one}},
+		"parent-scoped, unknown": {ParentScoped: true, Unknown: true, Truncated: true},
 	} {
 		if _, err := ScopeClustersPart(s); err == nil {
 			t.Errorf("%s: ScopeClustersPart accepted %+v", name, s)
@@ -459,6 +463,20 @@ func TestScopeClustersUnknownAndUnlisted(t *testing.T) {
 	if err != nil || !ok || !reflect.DeepEqual(got, want) {
 		t.Fatalf("ScopeClustersOf = %+v %v %v, want %+v", got, ok, err, want)
 	}
+	for name, s := range map[string]ScopeClusters{
+		"parent-scoped":               {ParentScoped: true, Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}},
+		"parent-scoped, out of scope": {ParentScoped: true, Clusters: []ScopeCluster{}},
+		"unbounded":                   {Unbounded: true, Unknown: true, Truncated: true, Clusters: []ScopeCluster{}},
+	} {
+		part, err := ScopeClustersPart(s)
+		if err != nil {
+			t.Errorf("%s refused: %v", name, err)
+			continue
+		}
+		if got, _, err := ScopeClustersOf([]Part{part}); err != nil || !reflect.DeepEqual(got, s) {
+			t.Errorf("%s: round trip %+v %v", name, got, err)
+		}
+	}
 	// Unknown with nothing known: an empty page, still truncated.
 	if _, err := ScopeClustersPart(ScopeClusters{Unknown: true, Truncated: true}); err != nil {
 		t.Errorf("unknown empty page refused: %v", err)
@@ -472,7 +490,7 @@ func TestScopeClustersUnknownAndUnlisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"unknown", "unlistedProjects", "unlistedCount", "oldestListing"} {
+	for _, key := range []string{"unknown", "unlistedProjects", "unlistedCount", "oldestListing", "parentScoped", "unbounded"} {
 		if strings.Contains(string(plain.Data), key) {
 			t.Errorf("a part without %s carries it: %s", key, plain.Data)
 		}
