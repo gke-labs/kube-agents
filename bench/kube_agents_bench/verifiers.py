@@ -5204,6 +5204,17 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
+    # The regex forms, for a claim no one substring binds: a findings row is
+    # `| [<id>](#anchor) | <severity> | <cluster> | <state> |` and the id
+    # carries the project and location between the check slug and the cluster
+    # name, so only a pattern ties a check, a cluster and a severity to one
+    # row. Each is ``re.search``ed, as ``report_contains`` does, over the text
+    # the phrases are read from under the same ``scope``: lowercased, so a
+    # pattern spells its letters in lower case, with the line breaks kept, so
+    # a `.` stays on one row or one id. Every required pattern must match;
+    # no forbidden pattern may. No ``{cluster:<slot>}`` is expanded here.
+    required_patterns: list[str] = Field(default_factory=list)
+    forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids", "finding"] = "body"
     # The check whose findings ``scope: finding`` reads: the first segment of
     # the finding id, ``no-memory-limit`` in
@@ -5227,6 +5238,18 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         raw = self.finding_check
         names = [raw] if isinstance(raw, str) else list(raw or [])
         return [n.strip() for n in names if n and n.strip()]
+
+    @field_validator("required_patterns", "forbidden_patterns")
+    @classmethod
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                # The same type ``report_contains`` raises for a pattern that
+                # does not compile, with the pattern named.
+                raise re.error(f"pattern {pattern!r} does not compile: {exc}") from exc
+        return patterns
 
     @model_validator(mode="after")
     def _finding_scope_names_its_check(self) -> "LedgerIssueContainsVerifier":
@@ -5544,6 +5567,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 return (
                     sum(1 for p in self.required_phrases if p.lower() not in block)
                     + sum(1 for p in self.forbidden_phrases if p.lower() in block)
+                    + sum(1 for p in self.required_patterns if not re.search(p, block))
+                    + sum(1 for p in self.forbidden_patterns if re.search(p, block))
                     + (1 if self.any_of_phrases and not any(p.lower() in block for p in self.any_of_phrases) else 0)
                 )
 
@@ -5596,13 +5621,15 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         any_of_miss = bool(self.any_of_phrases) and not any(
             p.lower() in text for p in self.any_of_phrases
         )
+        pattern_missing = [p for p in self.required_patterns if not re.search(p, text)]
+        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, text)]
         raw = {
             "issue": ledger["slug"],
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
             "finding_check": self.finding_check,
         }
-        if missing or present or any_of_miss or unnamed or omitted_unlisted:
+        if missing or present or any_of_miss or pattern_missing or pattern_hits or unnamed or omitted_unlisted:
             parts = []
             if omitted_unlisted:
                 parts.append(
@@ -5625,6 +5652,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     f"none of the alternative phrasings present in {surface}: "
                     f"{self.any_of_phrases}"
                 )
+            if pattern_missing:
+                parts.append(f"required patterns absent from {surface}: {pattern_missing}")
+            if pattern_hits:
+                parts.append(f"forbidden patterns matched in {surface}: {pattern_hits}")
             return done(False, "; ".join(parts), raw=raw)
         # Names every clause that ran, for the reason ReportContainsVerifier's
         # success branch does: an any_of-only check that reported "all 0
@@ -5637,6 +5668,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
             )
+        if self.required_patterns:
+            satisfied.append(f"all {len(self.required_patterns)} required pattern(s)")
+        if self.forbidden_patterns:
+            satisfied.append(f"none of {len(self.forbidden_patterns)} forbidden pattern(s)")
         if self.every_finding_named:
             satisfied.append("a visible name for every filed finding")
         return done(
