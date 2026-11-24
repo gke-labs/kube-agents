@@ -302,7 +302,7 @@ _NO_RECORDED_SLOT_REASON = (
 )
 _PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
 # `pattern_surface` lowercases the report, so a letter a pattern spells in upper
-# case outside a character class and outside `(?i)` is text no report carries.
+# case outside `(?i)`, alone or in a class of such letters, is text no report carries.
 # Where the pattern needs that letter, a required pattern misses on every run
 # and a forbid never fires; in an optional part or one branch it is dead text.
 _UPPERCASE_PATTERN_REASON = (
@@ -541,8 +541,9 @@ class ReportContainsVerifier(BaseVerifier):
     space in a pattern therefore does not cross a line break; a phrase that
     may wrap says ``\\s+`` where it may. The text is lowercased before the
     regex runs, so a pattern spells its letters in lower case; one with an
-    uppercase letter outside a character class and ``(?i)`` spells text no
-    report carries and is refused at spec load.
+    uppercase letter outside ``(?i)``, alone or in a character class of
+    nothing but such letters, spells text no report carries and is refused
+    at spec load.
     ``required_patterns`` must each match somewhere; ``any_of_patterns``
     and ``any_of_phrases`` are one pool of alternatives: at least one of
     either has to match.
@@ -666,8 +667,10 @@ class ReportContainsVerifier(BaseVerifier):
 
         Read from the parsed pattern, not its text, so an escape (``\\A``,
         ``\\S``), a group name and a ``(?x)`` comment are not letters. A
-        character class is passed over (it may list both cases), and so is
-        anything under ``(?i)`` or ``(?i:...)``.
+        character class counts only when nothing in it is text a lowercased
+        report carries (``[A-Z]``; the parser also reads ``(?:A|B)`` as one),
+        since a class may list both cases. Anything under ``(?i)`` or
+        ``(?i:...)`` is passed over.
         """
         # `re` exposes its parser only as private modules (`sre_parse` is their
         # deprecated alias). A Python that moves them fails this module's
@@ -675,14 +678,33 @@ class ReportContainsVerifier(BaseVerifier):
         parsed = _regex_parser.parse(pattern)
         found: list[str] = []
 
+        def uppercase_only(code: int) -> bool:
+            return chr(code) != chr(code).lower()
+
+        def class_members(items: list[tuple[Any, Any]]) -> list[str]:
+            """The members of a class no lowercased text matches, or none when
+            any member (or a negation) lets the class match such text."""
+            members = []
+            for op, av in items:
+                if op is _regex_constants.LITERAL and uppercase_only(av):
+                    members.append(chr(av))
+                elif op is _regex_constants.RANGE and all(uppercase_only(code) for code in range(av[0], av[1] + 1)):
+                    members.append(f"{chr(av[0])}-{chr(av[1])}")
+                else:
+                    return []
+            return members
+
         def walk(node: Any, ignorecase: bool) -> None:
             if isinstance(node, _regex_parser.SubPattern):
                 for op, av in node:
                     if op is _regex_constants.LITERAL:
-                        letter = chr(av)
-                        if not ignorecase and letter != letter.lower() and letter not in found:
-                            found.append(letter)
-                    elif op is _regex_constants.SUBPATTERN:
+                        letters = [chr(av)] if uppercase_only(av) else []
+                    elif op is _regex_constants.IN:
+                        letters = class_members(av)
+                    else:
+                        letters = []
+                    found.extend(letter for letter in letters if not ignorecase and letter not in found)
+                    if op is _regex_constants.SUBPATTERN:
                         _group, add_flags, del_flags, inner = av
                         scoped = (ignorecase or bool(add_flags & re.IGNORECASE)) and not del_flags & re.IGNORECASE
                         walk(inner, scoped)
