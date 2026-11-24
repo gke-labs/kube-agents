@@ -219,7 +219,7 @@ A chat message ends the hold within about ten minutes: the operator reads the co
 
 Two environment variables on the agent container tune it: `CRON_IDLE_THROTTLE_DAYS` (default 7) and `CRON_IDLE_HIBERNATE_DAYS` (default 14). `0` disables that stage, `0` on the throttle disables both, and an unparsable value means the default. The two are independent: raising the throttle alone leaves hibernation at its own threshold. Turning the policy off releases whatever it held.
 
-Set the two through the chart value `platformAgent.deployment.env`. On an `install.sh` install that is a `TF_VAR_extra_helm_values` line in `install.env`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows; on a hand-driven Terraform apply, `extra_helm_values` in `terraform.tfvars`. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply.
+Set the two through the chart value `platformAgent.deployment.env`. On an `install.sh` install that is a `TF_VAR_extra_helm_values` line in `install.env`: [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the line for `KAGE_SLACK_UX`, which run applies it, and how to merge it into a line that is already there. On a hand-driven Terraform apply, it is `extra_helm_values` in `terraform.tfvars`. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply.
 
 The field counts every chat message the gateway accepts, the agent API's included. Turns through the A2A inject door do not count, so an install driven only through that door, an evaluation install for instance, idles like one nobody uses; set `CRON_IDLE_THROTTLE_DAYS=0` there.
 
