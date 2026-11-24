@@ -535,6 +535,11 @@ leave open:
   home-channel record and cannot write its own Deployment, and the MCP server has no API
   access. A reader whose names file has never been read takes every addressee as a profile;
   the file is re-read every 30 seconds, and a later read that fails keeps the names last read.
+  The gateway's relay doesn't settle a refusal it made before the names were read, since the
+  names may take it: it gives the event back to the stream for 30 seconds, up to 20 times, then
+  settles it with an Error and counts the drop once. A held event the names then take renders
+  when it comes back, so it can render after later events of the same task; that ordering
+  effect is known and accepted.
   The stored time is the server's, and only where the server alone writes it: a consumer
   delivery's metadata, or the API's JSON reply to a message get on a stream without
   `allow_direct`. Never a direct get's headers: the server appends its `Nats-Time-Stamp` after
@@ -542,7 +547,9 @@ leave open:
   client's parse, hiding the server's stamp behind a forged one. A direct get therefore gives
   no time; the gateway's busy count and empty read re-read a profile task's five-token subject
   on a short `DeliverLastPerSubject` consumer for its time, and a time that can't be read is
-  unknown and refused where it would decide. A cutoff that doesn't parse is taken as the Unix
+  unknown and refused where it would decide. The replay's horizon is the stream's last
+  sequence from `STREAM.INFO`, never a direct get's `Nats-Sequence`, which sits in the same
+  header block. A cutoff that doesn't parse is taken as the Unix
   epoch, so every five-token terminal on a profile task is refused; it is logged at Error and
   shown on the gateway's `profile_supervisor_cutoff_timestamp_seconds` series and the MCP
   server's `/healthz`. The terminal never goes on `.events`, which stays
