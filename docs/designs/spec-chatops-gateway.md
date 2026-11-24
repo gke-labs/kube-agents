@@ -908,12 +908,16 @@ declares a server named `a2a` is refused at render. The delegate call publishes 
 artifact and doesn't end the task: no deliverable, no final status, and the harness keeps running.
 The tool's reply tells the model its children's results arrive as its next turn. A result the
 harness writes meanwhile isn't the deliverable; the worker publishes a non-final `working` status
-saying how many delegated tasks it waits on. A second delegate call in the task is refused at the
-tool. The worker reads each `childResult` on the task's `.in`, deduping on `entry` when it's set and
-on `childTaskId` otherwise (an older gateway's ends carry no `entry` and read as a single
+saying how many delegated tasks it waits on. A delegate call past the rounds the submission's
+`delegateTargets` part advertises (`roundsMax`, one when absent) is refused at the tool, so at one
+a second call is refused, and a call with rounds left while the last round's children run is refused
+too, since a next round after their delivery isn't built yet. The worker reads each `childResult` on
+the task's `.in`, deduping on `round` and `entry` when `entry` is set and on `childTaskId` otherwise
+(an absent `round` reads as one, and an older gateway's ends carry no `entry` and read as a single
 delegation's), and counts them to the entries it asked for. When every entry has its end, or a
-first `delegationRefused` arrives, it writes them to the same harness as one user turn. A refusal
-with `repeat` set is logged and dropped: the wait goes on for the children already running. At the task's
+`delegationRefused` for the round the wait is on arrives, it writes them to the same harness as one
+user turn. A refusal for a lower round (stale) or a higher one (a later request's) is logged and
+dropped: the wait goes on for the children already running. At the task's
 deadline less a reserve, the larger of two minutes and 15% of the task's budget but at most half of
 it, it delivers what has arrived and names the entries that sent nothing, so the parent still
 writes its report. The turn opens with a fixed wrapper saying these are reports from delegated

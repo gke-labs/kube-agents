@@ -408,6 +408,10 @@ type adapter struct {
 	// delegateTargets part (delegateWidthOf); zero or one is the single
 	// shape only.
 	delegateWidth int
+	// delegateRounds is how many delegate calls a profile task may make, as
+	// the gateway advertised it on the submission's delegateTargets part
+	// (delegateRoundsOf); zero or one is one.
+	delegateRounds int
 
 	// dispatched is a task a profile worker took from the dispatcher
 	// (profile.go). The dispatcher checked the grant at admission
@@ -888,6 +892,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		// keeps up with profiles added and removed.
 		argv, _ = withDelegateTargetsFor(drv, argv, origin)
 		a.delegateWidth = delegateWidthOf(origin)
+		a.delegateRounds = delegateRoundsOf(origin)
 	}
 
 	if cfg.SessionReuse {
@@ -1002,6 +1007,9 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// a session's turn, so a profile parent's answer is held to the
 		// same checks as any other.
 		wait *childWait
+		// roundsUsed counts a dispatched task's published delegate
+		// requests, each a delegation round (delegateRounds bounds it).
+		roundsUsed int
 		// reserve fires the wait's delivery ahead of the deadline
 		// (childWaitReserve); nil until the task delegates.
 		reserve  *time.Timer
@@ -1317,8 +1325,22 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				ask.reply <- delegateReply{Message: "a task is already delegated this turn"}
 				continue
 			}
+			// A profile task makes at most the rounds the gateway
+			// advertised (delegateRounds; one when it advertised none),
+			// so at one a second call is refused as it always was. A
+			// call with rounds left while the last round's children run
+			// is refused too: a next round, after their delivery, isn't
+			// built yet.
+			if a.dispatched && roundsUsed >= max(a.delegateRounds, 1) {
+				msg := refuseSecondDelegation
+				if a.delegateRounds > 1 {
+					msg = fmt.Sprintf(refuseRoundsUsed, a.delegateRounds)
+				}
+				ask.reply <- delegateReply{Message: msg}
+				continue
+			}
 			if wait != nil {
-				ask.reply <- delegateReply{Message: refuseSecondDelegation}
+				ask.reply <- delegateReply{Message: refuseWhileWaiting}
 				continue
 			}
 			// Cancel and the deadline end the turn when they fire, not when
@@ -1342,7 +1364,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				// A profile task stays open: no deliverable, no kill, no
 				// final. Its children's ends arrive on its .in, and the
 				// reserve delivers what has arrived ahead of the deadline.
-				wait = newChildWait(ask.req)
+				roundsUsed++
+				wait = newChildWait(ask.req, roundsUsed)
 				next := profileDelegatedOne
 				if len(wait.asked) > 1 {
 					next = profileDelegatedMany
@@ -1375,6 +1398,16 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			}
 			if wait == nil || wait.delivered || sawResult || exited || canceled || deadlineHit || refused != nil {
 				log.Warn("child result with no open wait dropped", "task", a.taskID)
+				continue
+			}
+			if end.refusal != nil && !wait.refusalEnds(*end.refusal) {
+				// A refusal for another round (lib.DelegationRefusal.Round):
+				// a lower one is stale, and a higher one refused a request
+				// made after the one the wait is on, whose children are
+				// still running or have reported. It ends nothing.
+				log.Info("delegation refusal for another round dropped; the wait goes on",
+					"task", a.taskID, "round", roundOf(end.refusal.Round), "waitRound", wait.round,
+					"notice", truncate(end.refusal.Text, otherRoundRefusalLogCap))
 				continue
 			}
 			if end.refusal != nil {
@@ -2376,18 +2409,8 @@ func (a *adapter) handleInMsg(msg jetstream.Msg, subject string, seen map[string
 			// A child's end, or the refusal of the task's delegation, is the
 			// gateway's word to a dispatched task that waits on its
 			// children (childwait.go); supervise decides whether a wait is
-			// open for it.
+			// open for it, and whether a refusal is for its round.
 			if end, ok := childEndOf(m.Parts); ok {
-				// A repeat refusal is of a request made after the one
-				// the wait is on (lib.DelegationRefusal.Repeat): that
-				// one's children are still running or have reported, so
-				// it ends nothing and is only logged. Only an untagged
-				// refusal ends the whole wait (supervise).
-				if end.refusal != nil && end.refusal.Round > 1 {
-					a.log.Info("repeat delegation refused by the gateway; the wait on the first request's children goes on",
-						"task", a.cfg.TaskID, "notice", truncate(end.refusal.Text, repeatRefusalLogCap))
-					return
-				}
 				if a.childCh == nil {
 					a.log.Warn("child result on a task that waits on no children dropped", "task", a.cfg.TaskID)
 					return

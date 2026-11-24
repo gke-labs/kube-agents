@@ -36,9 +36,10 @@ const (
 	childWaitReservePercent = 15
 	childWaitReserveMaxDiv  = 2
 
-	// repeatRefusalLogCap bounds, in bytes, the notice a repeat refusal's
-	// log line quotes: the gateway's fixed line, never a model's input.
-	repeatRefusalLogCap = 256
+	// otherRoundRefusalLogCap bounds, in bytes, the notice the log line for a
+	// refusal of another round quotes: the gateway's fixed line, never a
+	// model's input.
+	otherRoundRefusalLogCap = 256
 )
 
 // The model-facing text of the wait.
@@ -48,9 +49,18 @@ const (
 	// as the next turn.
 	profileDelegatedOne  = "; its result arrives as your next turn once the task ends. End this turn now: don't wait, poll or delegate again."
 	profileDelegatedMany = "; their results arrive together as your next turn once they end. End this turn now: don't wait, poll or delegate again."
-	// refuseSecondDelegation is the tool's answer to a second call in one
-	// task (the gateway accepts one request per task anyway).
+	// refuseSecondDelegation is the tool's answer to a call once the task
+	// has used its one delegation round (the gateway refuses such a request
+	// anyway, under delegation.rounds).
 	refuseSecondDelegation = "this task has already delegated, and a task delegates once; its results arrive as your next turn"
+	// refuseRoundsUsed is that answer when the gateway advertised more than
+	// one round: %d is how many.
+	refuseRoundsUsed = "this task has used its %d delegation rounds; its results arrive as your next turn"
+	// refuseWhileWaiting is the tool's answer to a call with rounds left
+	// while the task still waits on the children of its last one: the next
+	// round starts only after their results are delivered, which this
+	// worker doesn't do yet.
+	refuseWhileWaiting = "this task is still waiting on the tasks it delegated; their results arrive as your next turn"
 	// waitingNote is the non-final working status a turn that ends during
 	// the wait publishes; %d and %s are the count still out and its noun.
 	waitingNote = "waiting on %d delegated %s"
@@ -106,39 +116,60 @@ type childWait struct {
 	asked []lib.DelegateTask
 	// got is the counted ends, in arrival order.
 	got []lib.ChildResult
+	// round is the 1-based delegation round the wait is on. A refusal ends
+	// it only when it is for this round (refusalEnds).
+	round int
 	// entries and children are the dedupe keys: a batch entry (Entry >= 1)
-	// and a child task id. A duplicate end, which the gateway can send, is
-	// one already keyed under either.
-	entries  map[int]bool
+	// keyed on its round and entry, and a single delegation's end (Entry 0)
+	// on its child task id. A duplicate end, which the gateway can send, is
+	// one already keyed.
+	entries  map[roundEntry]bool
 	children map[string]bool
-	// refusal ends the whole wait: the gateway minted nothing. Only a first
-	// refusal is one; a repeat (lib.DelegationRefusal.Repeat) is dropped at
-	// the in consumer and never reaches the wait.
+	// refusal ends the whole wait: the gateway minted nothing for the
+	// wait's round. A refusal for another round never reaches it
+	// (refusalEnds).
 	refusal *lib.DelegationRefusal
 	// delivered is set once the delivery turn is written: the next result
 	// is the deliverable, and nothing more is taken into the wait.
 	delivered bool
 }
 
-func newChildWait(req lib.DelegateRequest) *childWait {
-	return &childWait{asked: req.Entries(), entries: map[int]bool{}, children: map[string]bool{}}
+// roundEntry keys a batch entry's end: the same entry in two rounds is two
+// ends.
+type roundEntry struct{ round, entry int }
+
+// roundOf reads a part's round: absent (0) is round one.
+func roundOf(r int) int { return max(r, 1) }
+
+// newChildWait is the wait on round's request req; round 0 reads as one.
+func newChildWait(req lib.DelegateRequest, round int) *childWait {
+	return &childWait{asked: req.Entries(), round: roundOf(round), entries: map[roundEntry]bool{}, children: map[string]bool{}}
+}
+
+// refusalEnds reports whether r ends the wait: only a refusal for the round
+// the wait is on. A lower round's is stale, and a higher round's refused a
+// request made after this one, whose children are still the wait's.
+func (w *childWait) refusalEnds(r lib.DelegationRefusal) bool {
+	return roundOf(r.Round) == w.round
 }
 
 // add counts c, reporting false for an end it doesn't count: a duplicate, or
-// an entry the request never asked for. An end with no entry (a single
-// delegation, or an older gateway's) is keyed on its child alone and so
-// reads as a single delegation's.
+// an entry the request never asked for. A batch entry's end is keyed on its
+// round and entry, 0 reading as round one. An end with no entry (a single
+// delegation, or an older gateway's) is keyed on its child and so reads as a
+// single delegation's.
 func (w *childWait) add(c lib.ChildResult) bool {
+	key := roundEntry{roundOf(c.Round), c.Entry}
 	switch {
 	case c.Entry > len(w.asked):
 		return false
-	case c.Entry >= 1 && w.entries[c.Entry]:
+	case c.Entry >= 1 && w.entries[key]:
 		return false
-	case c.ChildTaskID != "" && w.children[c.ChildTaskID]:
+	case c.Entry == 0 && w.children[c.ChildTaskID]:
 		return false
 	}
 	if c.Entry >= 1 {
-		w.entries[c.Entry] = true
+		w.entries[key] = true
 	}
 	if c.ChildTaskID != "" {
 		w.children[c.ChildTaskID] = true
@@ -232,7 +263,8 @@ func (w *childWait) provenance(c lib.ChildResult) string {
 
 // missing names the entries with no end, or "" when none is missing. A
 // batch's ends that carry entries name the entries; a single delegation
-// names its addressee; ends with no entries can only be counted.
+// names its addressee; ends with no entries can only be counted. The
+// entries named are the wait's own round's.
 func (w *childWait) missing() string {
 	n := w.outstanding()
 	if n == 0 {
@@ -246,7 +278,7 @@ func (w *childWait) missing() string {
 	}
 	var names []string
 	for i, e := range w.asked {
-		if !w.entries[i+1] {
+		if !w.entries[roundEntry{w.round, i + 1}] {
 			names = append(names, fmt.Sprintf("entry %d (to %s)", i+1, plainName(e.Addressee)))
 		}
 	}

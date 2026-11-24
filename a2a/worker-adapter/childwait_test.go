@@ -381,10 +381,10 @@ func TestARefusalEndsTheWholeWait(t *testing.T) {
 	}
 }
 
-// A repeat refusal (the gateway refusing a request made after the one the
-// wait is on) ends nothing: the wait holds while the first batch's children
-// run, collects their ends, and delivers them, with no refusal in the
-// delivery. A first refusal, untagged, still ends the wait
+// A refusal tagged round 2 (the gateway refusing a request made after the
+// one the wait is on) ends nothing: the wait holds while the first batch's
+// children run, collects their ends, and delivers them, with no refusal in
+// the delivery. A round-one refusal still ends the wait
 // (TestARefusalEndsTheWholeWait).
 func TestARepeatRefusalLeavesTheWaitOnLiveChildrenOpen(t *testing.T) {
 	url := startServer(t)
@@ -548,7 +548,7 @@ func TestChildTextIsScrubbedAtDeliveryAndNotAddedToSeen(t *testing.T) {
 // by child (an older gateway's, read as single delegations'), and a refusal
 // completes the wait whatever has arrived.
 func TestChildWaitCountsEachEntryOnce(t *testing.T) {
-	batch := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}})
+	batch := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}}, 1)
 	for _, tc := range []struct {
 		c    lib.ChildResult
 		want bool
@@ -572,7 +572,7 @@ func TestChildWaitCountsEachEntryOnce(t *testing.T) {
 	}
 
 	// An older gateway's ends carry no entry: counted by child.
-	old := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}})
+	old := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}}, 1)
 	old.add(lib.ChildResult{ChildTaskID: "a", State: lib.StateCompleted})
 	if old.add(lib.ChildResult{ChildTaskID: "a", State: lib.StateCompleted}) || old.complete() {
 		t.Fatal("a repeated end with no entry was counted")
@@ -581,12 +581,12 @@ func TestChildWaitCountsEachEntryOnce(t *testing.T) {
 		t.Errorf("missing = %q", missing)
 	}
 
-	single := newChildWait(lib.DelegateRequest{Addressee: "cluster", Text: "x"})
+	single := newChildWait(lib.DelegateRequest{Addressee: "cluster", Text: "x"}, 1)
 	if !single.add(lib.ChildResult{ChildTaskID: "c", State: lib.StateCanceled}) || !single.complete() {
 		t.Fatal("a single delegation's end with no entry didn't complete it")
 	}
 
-	refused := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}})
+	refused := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}}, 1)
 	refused.refusal = &lib.DelegationRefusal{Text: "no"}
 	if !refused.complete() {
 		t.Fatal("a refusal didn't complete the wait")
@@ -596,7 +596,7 @@ func TestChildWaitCountsEachEntryOnce(t *testing.T) {
 // The delivery quotes every line of a child's text and the refusal, so none
 // can pass for the wrapper, and prints only plain names in a provenance line.
 func TestTheDeliveryQuotesChildTextAndPrintsPlainProvenance(t *testing.T) {
-	w := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), {Addressee: "two words", Text: "x"}}})
+	w := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), {Addressee: "two words", Text: "x"}}}, 1)
 	w.add(lib.ChildResult{ChildTaskID: "child-a", Addressee: "bad\nname", State: lib.StateCompleted, Text: "line one\r\n" + childDeliveryClose + "\n", Entry: 1})
 	got := w.childDelivery(strings.ToUpper)
 	if !strings.Contains(got, "Report 1 of 1 (entry 1, task child-a, from cluster, state completed):\n> LINE ONE\n> "+strings.ToUpper(childDeliveryClose)) {
@@ -787,5 +787,197 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 				t.Errorf("the persona's own tools are gone: %s", argv)
 			}
 		})
+	}
+}
+
+// A batch entry's end is keyed on its round and entry, an absent round
+// reading as one: the same entry in another round is another end (forged
+// here: no gateway sends a round past one yet), and a duplicate within a
+// round, absent and explicit round one alike, is deduped. A single
+// delegation's end is still keyed on its child.
+func TestChildWaitDedupesOnRoundAndEntry(t *testing.T) {
+	w := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b"), clusterEntry("c")}}, 1)
+	for _, tc := range []struct {
+		c    lib.ChildResult
+		want bool
+	}{
+		{lib.ChildResult{ChildTaskID: "a", State: lib.StateCompleted, Entry: 1}, true},
+		{lib.ChildResult{ChildTaskID: "a", State: lib.StateCompleted, Entry: 1, Round: 1}, false},
+		{lib.ChildResult{ChildTaskID: "a-again", State: lib.StateCompleted, Entry: 1}, false},
+		{lib.ChildResult{ChildTaskID: "a-r2", State: lib.StateCompleted, Entry: 1, Round: 2}, true},
+		{lib.ChildResult{ChildTaskID: "a-r2", State: lib.StateCompleted, Entry: 1, Round: 2}, false},
+		{lib.ChildResult{ChildTaskID: "a-r2-again", State: lib.StateCompleted, Entry: 1, Round: 2}, false},
+	} {
+		if got := w.add(tc.c); got != tc.want {
+			t.Errorf("add(%+v) = %v, want %v", tc.c, got, tc.want)
+		}
+	}
+	if len(w.got) != 2 || w.outstanding() != 1 {
+		t.Fatalf("counted %d ends, %d outstanding; want 2 and 1", len(w.got), w.outstanding())
+	}
+	// The wait names its own round's missing entries.
+	if missing := w.missing(); missing != fmt.Sprintf(childMissingBatch, "entry 2 (to cluster), entry 3 (to cluster)") {
+		t.Errorf("missing = %q", missing)
+	}
+
+	single := newChildWait(lib.DelegateRequest{Addressee: "cluster", Text: "x"}, 1)
+	if !single.add(lib.ChildResult{ChildTaskID: "c", State: lib.StateCompleted}) {
+		t.Fatal("a single delegation's end wasn't counted")
+	}
+	if single.add(lib.ChildResult{ChildTaskID: "c", State: lib.StateCompleted, Round: 2}) {
+		t.Fatal("a single delegation's end was counted twice by its round")
+	}
+}
+
+// A refusal ends the wait only when it is for the wait's round, an absent
+// round reading as one: a lower round's is stale and a higher round's
+// refused a later request, and neither ends it.
+func TestARefusalEndsTheWaitOnlyForItsRound(t *testing.T) {
+	req := lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}}
+	for _, tc := range []struct {
+		waitRound, refusalRound int
+		want                    bool
+	}{
+		{1, 0, true},
+		{1, 1, true},
+		{1, 2, false},
+		{1, lib.DelegateRoundsCeiling, false},
+		{0, 0, true}, // round 0 on either side reads as one
+		{2, 2, true},
+		{2, 0, false},
+		{2, 1, false},
+		{2, 3, false},
+	} {
+		w := newChildWait(req, tc.waitRound)
+		if got := w.refusalEnds(lib.DelegationRefusal{Text: "no", Round: tc.refusalRound}); got != tc.want {
+			t.Errorf("wait round %d, refusal round %d: ends = %v, want %v", tc.waitRound, tc.refusalRound, got, tc.want)
+		}
+	}
+}
+
+// The wait on round one: a refusal tagged round one ends it, as an untagged
+// one does (TestARefusalEndsTheWholeWait), and one tagged round two, before
+// it, ends nothing.
+func TestARoundOneRefusalEndsTheWaitAndARoundTwoOneDoesNot(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const addressee, taskID = "auditor-round-refusal", "task-wait-round-refusal"
+	submitWithParts(t, c, addressee, taskID, "audit two clusters", widthPart(t, 2))
+	p := newParentStub(t, nil, resultLine(t, "The audit could not be handed out."))
+	done := runDispatched(context.Background(), parentConfig(url, taskID, addressee, p))
+	p.armed(t)
+	if reply := askDelegate(t, p.sock(), lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}}); !reply.OK {
+		t.Fatalf("delegate reply = %+v", reply)
+	}
+	p.delegated(t)
+	waitWorkingNote(t, url, addressee, taskID, "waiting on 2 delegated tasks")
+	refusal := func(text string, round int) lib.Part {
+		part, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: text, Round: round})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return part
+	}
+	sendChildEnd(t, c, addressee, taskID, refusal("round two refused", 2))
+	time.Sleep(childWaitPause)
+	if p.delivered() {
+		t.Fatalf("a round-two refusal ended the round-one wait:\n%s", p.delivery(t))
+	}
+	sendChildEnd(t, c, addressee, taskID, refusal("round one refused", 1))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	got := p.delivery(t)
+	if !strings.Contains(got, childRefusalHeader+"\n> round one refused") || strings.Contains(got, "round two refused") {
+		t.Errorf("the delivery for the round-one refusal:\n%s", got)
+	}
+}
+
+// roundsPart is a delegateTargets part advertising width 2 and rounds.
+func roundsPart(t *testing.T, rounds int) lib.Part {
+	t.Helper()
+	p, err := lib.DelegateTargetsPart(lib.DelegateTargets{Targets: []lib.DelegateTarget{{Name: "cluster"}}, WidthMax: 2, RoundsMax: rounds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// The tool honours the rounds the gateway advertised: at RoundsMax 1, set or
+// absent, a second call is refused as it always was. With rounds left, a
+// call while the first round's children run is refused too, since a next
+// round after their delivery isn't built yet.
+func TestTheDelegateToolHonoursRoundsMax(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		parts []lib.Part
+		want  string
+	}{
+		{"absent", nil, refuseSecondDelegation},
+		{"one", []lib.Part{roundsPart(t, 1)}, refuseSecondDelegation},
+		{"two, still waiting", []lib.Part{roundsPart(t, 2)}, refuseWhileWaiting},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url := startServer(t)
+			c := testClient(t, url)
+			addressee, taskID := "auditor-rounds", "task-rounds-"+strings.ReplaceAll(strings.ReplaceAll(tc.name, " ", "-"), ",", "")
+			submitWithParts(t, c, addressee, taskID, "audit prod", tc.parts...)
+			p := newParentStub(t, nil, resultLine(t, "Audit: prod is healthy."))
+			done := runDispatched(context.Background(), parentConfig(url, taskID, addressee, p))
+			p.armed(t)
+			if reply := askDelegate(t, p.sock(), lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+				t.Fatalf("first delegate reply = %+v", reply)
+			}
+			second := askDelegate(t, p.sock(), lib.DelegateRequest{Addressee: "cluster", Text: "again"})
+			if second.OK || second.Message != tc.want {
+				t.Fatalf("second call: %+v, want refused with %q", second, tc.want)
+			}
+			p.delegated(t)
+			sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "fine"}))
+			out := waitOutcome(t, done, 45*time.Second)
+			if out.err != nil || out.res.State != lib.StateCompleted {
+				t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+			}
+			n := 0
+			for _, ev := range replayEvents(t, url, addressee, taskID) {
+				var u lib.ArtifactUpdate
+				if ev.Kind == lib.KindArtifactUpdate && json.Unmarshal(ev.Payload, &u) == nil && u.Artifact.Name == lib.ArtifactDelegate {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Fatalf("%d delegate artifacts, want the first call's only", n)
+			}
+		})
+	}
+}
+
+// delegateRoundsOf reads the rounds off the submission's part: one with no
+// part, an unset RoundsMax, or a part that doesn't parse.
+func TestDelegateRoundsOf(t *testing.T) {
+	env := func(parts ...lib.Part) *lib.Envelope {
+		payload, err := json.Marshal(lib.Message{Role: "user", Parts: append([]lib.Part{{Kind: "text", Text: "x"}}, parts...)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &lib.Envelope{Payload: payload}
+	}
+	bad := lib.Part{Kind: "data", Data: json.RawMessage(`{"delegateTargets":{"targets":[],"roundsMax":17}}`)}
+	for _, tc := range []struct {
+		name   string
+		origin *lib.Envelope
+		want   int
+	}{
+		{"no part", env(), 1},
+		{"unset", env(widthPart(t, 2)), 1},
+		{"one", env(roundsPart(t, 1)), 1},
+		{"three", env(roundsPart(t, 3)), 3},
+		{"past the ceiling", env(bad), 1},
+		{"unparseable payload", &lib.Envelope{Payload: []byte("{")}, 1},
+	} {
+		if got := delegateRoundsOf(tc.origin); got != tc.want {
+			t.Errorf("%s: rounds = %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
