@@ -211,6 +211,39 @@ func TestATeamsStopPressFromTheRequesterClosesTheLine(t *testing.T) {
 	}
 }
 
+// A stop typed on Teams with a line to answer on is answered as the press
+// is: the line closes on "cancel sent", its button gone, and nothing is
+// posted, so the line never keeps a live Stop button beside a posted
+// "cancel sent".
+func TestATeamsTypedStopClosesTheLine(t *testing.T) {
+	t.Parallel()
+	r, origin, line := teamsGateRig(t, teamsGateChannel, sessionKindGroup)
+	posts := len(r.adapter.postTexts())
+
+	r.adapter.inbox <- InboundMessage{Conversation: teamsGateChannel, Kind: sessionKindGroup, AuthorID: teamsGateRequester, MessageID: "1794603936005", Text: "stop"}
+	waitFor(t, "the typed stop to close the line", func() bool { return lineClosedOnCancelSent(r) })
+	waitForRecord(t, r, teamsGateChannel, "the task stopping", func(rec *SessionRecord) bool {
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && ref.Canceled
+	})
+	for _, p := range r.adapter.postTexts()[posts:] {
+		if strings.Contains(p, "cancel") {
+			t.Errorf("the typed stop posted %q; want the answer on the line alone", p)
+		}
+	}
+	r.adapter.mu.Lock()
+	defer r.adapter.mu.Unlock()
+	last := r.adapter.edits[len(r.adapter.edits)-1]
+	if last.MessageID != line || !strings.Contains(last.Text, "cancel sent") {
+		t.Errorf("last edit %+v, want the line closed on cancel sent", last)
+	}
+	for _, s := range r.adapter.stopLines {
+		if strings.Contains(s.Text, "cancel sent") {
+			t.Errorf("the closed line kept its Stop button: %+v", s)
+		}
+	}
+}
+
 // Another member's press on Teams cancels nothing and is answered on the
 // pressed line, button kept, since Teams has no post only the presser sees;
 // nothing is posted. The requester's press after it still stops the task.

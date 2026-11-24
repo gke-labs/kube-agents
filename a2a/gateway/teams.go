@@ -163,8 +163,8 @@ type teamsActivity struct {
 	// ReplyToID and Value are a card press's: the message whose card was
 	// pressed, and the pressed action's data (teams_press.go). Value is kept
 	// raw, since a message may carry one of any shape.
-	ReplyToID string          `json:"replyToId"`
-	Value     json.RawMessage `json:"value"`
+	ReplyToID    string          `json:"replyToId"`
+	Value        json.RawMessage `json:"value"`
 	Conversation struct {
 		ID               string `json:"id"`
 		ConversationType string `json:"conversationType"`

@@ -157,12 +157,11 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   live claim about the executor. It never reaches the executor.
 - **Stop.** "stop" / "cancel" / "abort", exact after normalization - the text form of
   the cancel affordance above; the backend gestures above land on the same path as
-  `IntentCancel` (amended 11/5). On Google Chat, the word with a task running and a
+  `IntentCancel` (amended 11/5). On Google Chat and on Teams, the word with a task running and a
   status line is answered as the Stop button's press is: on the line, with no post (The
   Stop button, in the Google Chat adapter section; amended 11/6). Every other backend keeps
   the posted replies: the console and Discord draw no button, and the posts are their
-  contract; Slack's typed `stop` keeps its rule beside the native Stop, and Teams's typed `stop`
-  keeps the posts beside its drawn button.
+  contract; Slack's typed `stop` keeps its rule beside the native Stop.
   A stopped task whose terminal event has not yet arrived DETACHES: it stops
   serializing the conversation - new turns start new tasks. "Detached" and
   "non-detached" below mean exactly this state and its absence.
@@ -1677,7 +1676,7 @@ the conversation's record holds may press it: a task's requester or steer author
 author. Anyone else's press cancels nothing, and the gateway logs it; what the presser sees is
 below (added 11/11) (`mayStop` in `stopgate.go`, which holds the set of gated backends, `stopGatedBackends`). The
 presser is the message's author as the record stores a requester (`requesterSubject`: a Slack
-member id, a lowercased Google Chat email, pseudonymized under the install salt), so a Chat
+member id, a lowercased Google Chat email or a lowercased Teams sender id, pseudonymized under the install salt), so a Chat
 press compares against the record the same way a Chat ask was written to it. The gate reads the
 presser of a live task's button. A press on a task that is not the running one cancels nothing
 whoever presses it, so it is answered before the gate is read (`chatStopStale`), and anyone may
@@ -3154,8 +3153,9 @@ queues "accepted" before the gateway has read it. The adapter turns the press in
 is, `IntentCancel` marked a click, naming the task and the pressed message, so the requester gate
 and the answer on the line are the ones "Who may press Stop" and "The Stop button" describe
 (`stopGatedBackends`, `lineStopBackends`). The button rides the card: a line that goes out as
-plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`,
-which keeps its posted replies on Teams, is the way to stop there.
+plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`
+is the way to stop there. A typed `stop` on a task with a line is answered on the line as a
+press is (`isChatTypedStop`), so a line never keeps a live button beside a posted "cancel sent".
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object

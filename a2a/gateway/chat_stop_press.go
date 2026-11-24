@@ -15,8 +15,8 @@ import (
 // line to cancelSentNotice with the Stop control gone, so the line a person
 // pressed is the one that answers. The relay leaves the line so
 // (ActiveTask.LineClosed) until its terminal edit makes it "canceled". A
-// stop typed on Google Chat with a line to answer on takes the same answer
-// (chatTypedStop): the word and the button read alike, one line and no
+// stop typed on Google Chat or on Teams with a line to answer on takes the
+// same answer (chatTypedStop): the word and the button read alike, one line and no
 // posts, where a DM's thread-less key would otherwise put the line, the
 // "cancel sent" post and the relay's "canceled" each in a message of its
 // own. A second typed stop while the cancel is pending moves "cancel
@@ -104,11 +104,13 @@ func (g *Gateway) stopOnLine(ctx context.Context, rec *SessionRecord, authority 
 	return true
 }
 
-// isChatTypedStop reports a stop typed on Google Chat: the word, from the
-// backend's own ingress, naming no task (a press names one, and so does a
-// program's cancel) and not a click.
+// isChatTypedStop reports a stop typed on a backend whose Stop button is on
+// the task's line (lineStopBackends): the word, from the backend's own
+// ingress, naming no task (a press names one, and so does a program's
+// cancel) and not a click. It is answered on the line as a press is, so the
+// line and its button never outlive a stop the word already sent.
 func isChatTypedStop(msg InboundMessage, backend string) bool {
-	return backend == gchatBackend && msg.TaskID == "" && !msg.Click
+	return lineStopBackends[backend] && msg.TaskID == "" && !msg.Click
 }
 
 // chatTypedStop answers a stop typed on Google Chat on rec's active task,
