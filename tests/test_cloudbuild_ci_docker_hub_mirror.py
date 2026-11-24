@@ -27,15 +27,21 @@ _MIRROR_SUBSTITUTION = "_DOCKER_HUB_MIRROR"
 _A2A_TEMPLATE = "a2a/Dockerfile.$1"
 
 # `ARG GOLANG_IMAGE=golang`: an image ARG and its default.
-_IMAGE_ARG = re.compile(r"^ARG ([A-Z_]+_IMAGE)=(\S+)$", re.MULTILINE)
-_BUILD_ARG = re.compile(r"--build-arg\s+\"?([A-Z_]+)=\"?([^\"\s]+)")
+_IMAGE_ARG = re.compile(r"^ARG ([A-Z0-9_]+_IMAGE)=(\S+)$", re.MULTILINE)
+_BUILD_ARG = re.compile(r"--build-arg\s+\"?([A-Z0-9_]+)=\"?([^\"\s]+)")
 _DASH_F = re.compile(r"-f\s+\"?([^\"\s]+)\"?")
 _A2A_CALL = re.compile(r"^\s*build_and_push ([\w-]+) ", re.MULTILINE)
 
 
+# Hostnames that name Docker Hub itself rather than another registry.
+_DOCKER_HUB_HOSTS = {"docker.io", "index.docker.io", "registry-1.docker.io"}
+
+
 def _is_docker_hub(default):
     first = default.split("/", 1)[0]
-    return "." not in first and ":" not in first
+    if first in _DOCKER_HUB_HOSTS:
+        return True
+    return "." not in first and ":" not in first and first != "localhost"
 
 
 def _docker_hub_args(dockerfile):
@@ -73,6 +79,16 @@ def _builds():
 
 
 class CloudBuildDockerHubMirrorTest(unittest.TestCase):
+    def test_docker_hub_spellings_are_recognised(self):
+        for default in ("golang", "library/golang", "envoyproxy/envoy", "docker.io/library/golang", "index.docker.io/pgvector/pgvector"):
+            self.assertTrue(_is_docker_hub(default), default)
+        for default in ("mirror.gcr.io/library/golang", "us-docker.pkg.dev/p/r/i", "localhost:5000/x", "localhost/x"):
+            self.assertFalse(_is_docker_hub(default), default)
+
+    def test_image_arg_names_may_hold_digits(self):
+        self.assertEqual(_IMAGE_ARG.findall("ARG PYTHON3_IMAGE=python\n"), [("PYTHON3_IMAGE", "python")])
+        self.assertEqual(_BUILD_ARG.findall('--build-arg "PYTHON3_IMAGE=$_DOCKER_HUB_MIRROR/library/python"'), [("PYTHON3_IMAGE", "$_DOCKER_HUB_MIRROR/library/python")])
+
     def test_the_substitution_points_at_the_mirror(self):
         substitutions = yaml.safe_load(_CLOUDBUILD.read_text())["substitutions"]
         self.assertEqual(substitutions[_MIRROR_SUBSTITUTION], _MIRROR)
