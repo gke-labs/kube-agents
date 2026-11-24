@@ -13,6 +13,7 @@ over. The plan is driven through the runtime module with a stub adapter.
 import asyncio
 import importlib
 import os
+import selectors
 import shutil
 import sys
 import tempfile
@@ -99,7 +100,8 @@ TEAM = "T1"
 PLAN_TS = "222.000"
 PHRASE = "is thinking..."
 FLAG_OFF_VALUES = ("", "0", "false")
-# How far past a timer's due time the stepped clock lands. A real clock reads
+# How far the stepped clock moves on each turn of the loop, on top of the wait
+# for the next timer, so it lands past that timer's due time. A real clock reads
 # late, never early; a float sum that lands just short of the due time reads
 # early, and the runtime takes that for a hold that has not run out.
 STEP_LATENESS_SECONDS = 1e-9
@@ -109,30 +111,42 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-class _SteppedClockLoop(asyncio.SelectorEventLoop):
-    """An event loop that jumps its clock to the next timer instead of waiting for it.
+class _SteppingSelector(selectors.DefaultSelector):
+    """A selector that takes the loop's wait for its next timer at once, on :attr:`now`.
 
-    The loop runs timers in the order of their due times, each
-    :data:`STEP_LATENESS_SECONDS` after its due time on the loop's own clock,
-    however long the process stalls between them.
+    Every turn of the loop also moves the clock by :data:`STEP_LATENESS_SECONDS`,
+    so a timer due exactly now is past due on the next turn.
     """
 
     def __init__(self):
         super().__init__()
-        self._clock = 0.0
-        wait = self._selector.select
+        self.now = 0.0
 
-        def step(timeout=None):
-            # A timeout is the loop's wait for its next timer: take it at once.
-            if timeout:
-                self._clock += timeout + STEP_LATENESS_SECONDS
-                timeout = 0
-            return wait(timeout)
+    def select(self, timeout=None):
+        # A timeout is the loop's wait for its next timer; None is a loop with no timer.
+        if timeout is not None:
+            self.now += timeout + STEP_LATENESS_SECONDS
+            timeout = 0
+        return super().select(timeout)
 
-        self._selector.select = step
+
+class _SteppedClockLoop(asyncio.SelectorEventLoop):
+    """An event loop that jumps its clock to the next timer instead of waiting for it.
+
+    The loop runs timers in the order of their due times, each after its due
+    time on the loop's own clock and never before it, however long the process
+    stalls between them.
+    """
+
+    def __init__(self):
+        self._stepping = _SteppingSelector()
+        super().__init__(self._stepping)
+        # A turn runs only the timers already past due. With the default
+        # resolution it also runs one due a nanosecond later, before its time.
+        self._clock_resolution = 0
 
     def time(self):
-        return self._clock
+        return self._stepping.now
 
 
 def _run_on_stepped_clock(coro):
