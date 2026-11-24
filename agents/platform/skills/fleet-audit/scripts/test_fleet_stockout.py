@@ -4545,6 +4545,24 @@ class ReservedClassTest(unittest.TestCase):
             "reservation r1: found only in us-central1-f of project acme",
         )
 
+    def test_the_procedure_does_not_send_the_class_arm_to_a_by_hand_read(self):
+        """The collector files 3.10(b), so the procedure's by-hand list and the
+        sentence after it must not name the arm."""
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        by_hand = text.split("These sub-conditions are not in the collector")[1].split("**A cluster the collector covered")[0]
+        self.assertNotIn("3.10(b)", by_hand)
+        after = text.split("**A cluster the collector covered")[1].split("\n")[0]
+        self.assertNotIn("3.10(b)", after)
+
+    def test_the_procedure_says_how_the_collector_files_the_class_arm(self):
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        section = text.split(f"(`{self.SLUG}`)")[1].split("\n#### ")[0]
+        lines = {line.split(":**")[0]: line for line in section.splitlines() if line.startswith("- **")}
+        self.assertIn(f"the reason `{fs.CCC_RESERVATION_NOT_FOUND_REASON}`", lines["- **Flag when"])
+        self.assertIn(f"`reservations.affinity: {fs.CLASS_SPECIFIC_RESERVATION}`", lines["- **Flag when"])
+        self.assertIn("For (b) and (d) the collector writes the arm's own Impact", lines["- **Impact"])
+        self.assertIn(f"`needs_triage: {fs.CLASS_STATUS_TRIAGE}`", lines["- **Remediation"])
+
     def test_collect_cluster_gives_the_cluster_s_zones_to_a_rule_with_none(self):
         cluster = {**self.CLUSTER, "locations": ["us-central1-c"], "autoprovisioning_locations": ["us-central1-a"]}
         entry = CollectClusterTest.run_with(self, dump_items=[self.reserved_class(self.rule("no-such-reservation"))], cluster=cluster)

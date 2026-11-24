@@ -45,24 +45,21 @@ pinned by `test_fleet_stockout.py` against captured responses:
   node-auto-provisioning side, which never gets as far as an attempt. Healthy
   ticks carry neither and write `jsonPayload.status` instead.
 
+§3.10 has four arms. `check_reservation_affinity` covers 3.10(a) and
+`check_reservation` covers 3.10(c). 3.10(b), a `ComputeClass` targeting a
+reservation that does not exist or sits in an unreachable zone, has two
+parts: `check_class_reservation_status` covers what GKE reports in the
+class's own status (`ReservationNotFound`, read from a class with node pool
+auto-creation on), and `file_reserved_classes` compares the rules of a class
+whose status does not name the reservation with the reservations of their
+owner projects. The node pool form is 3.10(d), `file_reserved_pools`. The
+pool, class and reservation shapes are pinned by `test_fleet_stockout.py`
+against responses read from throwaway clusters (GKE 1.35.8) on 2026-11-18
+and 2026-11-24.
+
 Some sub-conditions are still uncovered, and governance/stockout_prevention_sop.md
-§3 lists every one for the model to check by hand. One is uncovered for the
-reason the two checks above used to be — this repository has not exercised
-the shape anywhere, and a guess encoded as tested code looks like a fact:
-
-- **3.10(b)**, a `ComputeClass` targeting a reservation that does not exist or
-  sits in an unreachable zone. `check_reservation_affinity` covers 3.10(a) and
-  `check_reservation` covers 3.10(c). `check_class_reservation_status` covers
-  the part of 3.10(b) that GKE reports in the class's own status
-  (`ReservationNotFound`, read from a class with node pool auto-creation on).
-  Where the status does not name the reservation, resolving a ComputeClass's
-  named reservation against the zones a cluster can actually reach is the part
-  nothing here does. The node pool form is 3.10(d), `file_reserved_pools`: its
-  pool and reservation shapes
-  are pinned by `test_fleet_stockout.py` against responses read from a
-  throwaway cluster (GKE 1.35.8) on 2026-11-18.
-
-The rest need a read this collector does not make: namespaces for 3.12(a)'s
+§3 lists every one for the model to check by hand. They need a read this
+collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
 and workload shapes for 3.3, the region's unreserved production workloads
 for 3.10(c)'s qualifier, and the cluster's default-class setting for 3.13's
