@@ -137,7 +137,7 @@ func TestNoSupervisorStopStartsAnotherAgyProcess(t *testing.T) {
 			want: lib.StateFailed,
 		},
 		stopAbandoned: {unreachable: "an abandon reaches only a dispatched profile task's adapter (profile_test drives that arm); the respawn checks a.abandoned() itself, and the abandon arm kills the process, which the clean-exit check refuses"},
-		stopDelegated: {unreachable: "agy configures no delegate tool until #6712; a delegation also records stopDecided-equivalent sawResult, and its kill leaves an exit error"},
+		stopDelegated: {unreachable: agyDelegateUnreachable()},
 		stopEvicted:   {unreachable: "supervise returns from the SIGTERM arm at once, so no respawn code runs after it"},
 	}
 	for _, s := range supervisorStops {
@@ -149,6 +149,9 @@ func TestNoSupervisorStopStartsAnotherAgyProcess(t *testing.T) {
 		t.Run(string(s), func(t *testing.T) {
 			if c.unreachable != "" {
 				t.Skip(c.unreachable)
+			}
+			if c.run == nil {
+				t.Fatalf("supervisorStop %q is reachable on agy now but has no case: add one that stops a task that way and asserts no further process", s)
 			}
 			out, runs := c.run(t)
 			if runs != "1" {
@@ -176,4 +179,14 @@ func TestAnAgyProcessThatExitsUncleanlyIsNotRespawned(t *testing.T) {
 	if out.res.State == lib.StateCompleted {
 		t.Errorf("state=%q; the held steer never ran, so the task did not complete its turns", out.res.State)
 	}
+}
+
+// agyDelegateUnreachable is the delegated case's skip reason while agy
+// configures no delegate tool, and "" once it does (#6712), so the stop
+// test then demands a real case instead of skipping.
+func agyDelegateUnreachable() string {
+	if _, configured := (agyDriver{}).WithDelegateServerEnv([]string{"agy"}, "/self", "/run/delegate.sock"); configured {
+		return ""
+	}
+	return "agy configures no delegate tool yet (WithDelegateServerEnv reports none; #6712); this case turns into a demand for a real one when it does"
 }
