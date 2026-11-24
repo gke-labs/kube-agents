@@ -93,7 +93,8 @@ DIRECTIVE = "[bench:reply-under-pushed-report]"
 _FIELDS = ("opening", "report", "reply")
 # A field is one line of the prompt, and a stored report can be many (a
 # scheduled report with rows and a block under them). ``report`` writes each of
-# its line breaks as these two characters; the stored row gets real ones.
+# its line breaks as these two characters; the stored row gets real ones. The
+# swap is plain, so a report cannot hold a backslash followed by an n.
 REPORT_LINE_BREAK = "\\n"
 # The trajectory entry the plant writes, and the message-id suffix of the
 # reply turn: the door dedupes on the id, so the reply cannot share the
@@ -182,10 +183,13 @@ def parse(prompt: str) -> Replay | None:
         if key in fields:
             raise ValueError(f"{DIRECTIVE} prompt repeats {key}")
         fields[key] = value.strip()
-    missing = [name for name in _FIELDS if not fields.get(name)]
+    if "report" in fields:
+        fields["report"] = fields["report"].replace(REPORT_LINE_BREAK, "\n")
+    # After the line breaks are real: a report of nothing but line breaks is as empty as a blank one.
+    missing = [name for name in _FIELDS if not fields.get(name, "").strip()]
     if missing:
         raise ValueError(f"{DIRECTIVE} prompt is missing {', '.join(missing)}")
-    return Replay(fields["opening"], fields["report"].replace(REPORT_LINE_BREAK, "\n"), fields["reply"])
+    return Replay(fields["opening"], fields["report"], fields["reply"])
 
 
 def plant_command(session_id: str, conversation: str, report: str) -> str:
@@ -247,7 +251,9 @@ def plant_entry(session_id: str, conversation: str, payload: dict) -> dict:
     }
 
 
-def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
+def merge(
+    opening: AgentResult, reply: AgentResult, entry: dict, *, reply_wait_covered_session: bool = False
+) -> AgentResult:
     """One result for the two turns, graded on the reply turn's answer.
 
     ``output`` and ``final_message`` are the reply turn's; the opening turn's
@@ -259,6 +265,11 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
     into the nested ones, as the card-wake merge sums two turns (an inject
     record's tokens are the chain's usage as the door reported it, null
     where it reported none, and a null bucket adds nothing).
+
+    ``reply_wait_covered_session`` says that the reply turn's card wait ran
+    and read the cards of the conversation's session, the opening turn's
+    with them. The reply turn's no-worker-calls entry then speaks for both
+    turns and is kept.
     """
     from kube_agents_bench import worker_trajectory  # devops_bench-bound, like the import below
     from kube_agents_bench.card_wake import _add_tokens  # devops_bench-bound; imported where a result exists
@@ -275,9 +286,14 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
         "plant": entry["args"],
     }
     # A no-worker-calls entry speaks for the cards of the turn that wrote it;
-    # beside a turn without one it would grade that turn's cards too.
+    # beside a turn without one it would grade that turn's cards too. The reply
+    # turn's wait reads the whole session's cards, so when it ran its entry
+    # speaks for the opening turn as well.
     trajectory = [*opening.trajectory, entry, *reply.trajectory]
-    if not (_no_worker_calls(opening.trajectory) and _no_worker_calls(reply.trajectory)):
+    both_vouched = _no_worker_calls(reply.trajectory) and (
+        reply_wait_covered_session or _no_worker_calls(opening.trajectory)
+    )
+    if not both_vouched:
         trajectory = [e for e in trajectory if not (isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY)]
     # The result's own class, so this module never imports devops_bench.
     return type(reply)(

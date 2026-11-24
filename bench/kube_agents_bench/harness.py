@@ -4528,9 +4528,12 @@ class KubeAgentsHarness(AgentHarness):
             # marker), not a merged record that reads as a completed task
             # beside an infrastructure failure.
             return reply
+        # True once the wait found the session's cards and settled them: its
+        # no-worker-calls entry then speaks for the opening turn's cards too.
+        covered_session = False
         if delegation_timeout > _NO_DELEGATION_WAIT:
             try:
-                self._await_delegated_cards(
+                covered_session = self._await_delegated_cards(
                     reply,
                     session_id,
                     delegation_timeout=delegation_timeout,
@@ -4538,7 +4541,7 @@ class KubeAgentsHarness(AgentHarness):
                 )
             except _DelegationTransportExhausted as exc:
                 return _infra_failure(str(exc))
-        return pushed_report.merge(opening, reply, entry)
+        return pushed_report.merge(opening, reply, entry, reply_wait_covered_session=covered_session)
 
     def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:
         """Send a planted card's wake and the user's answer, or only the wake for a block replay.
