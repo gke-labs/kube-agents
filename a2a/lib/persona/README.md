@@ -133,16 +133,31 @@ yet.
 
 - **`core-agent`** (`coreagent`): renders `instructions.md` and `skills/`,
   each skill in the Agent Skills layout (`<name>/SKILL.md` and its files),
-  for a directory the worker's render step writes before the harness runs.
-  The harness takes the instructions as a layer above its own system prompt
-  and lists the skills to the model. `coreagent.Snapshot` reads that
-  directory into memory once, refusing any other top-level name, a symlink
-  or a special file, so a later change on disk doesn't reach the harness.
-  Tools pass through as the manifest names them, for the harness's tool
-  registry to map. Refused rather than dropped: an `mcp.yaml` server (no MCP
-  path yet), a skill frontmatter key other than `name`, `description`,
-  `license`, `compatibility` and `metadata`, a skill's `allowed-tools`, and
-  an executable skill file. No worker selects it yet.
+  for a directory a user other than the harness's writes before the harness
+  runs. The harness takes the instructions as a layer above its own system
+  prompt and lists the skills to the model. When the model loads a skill,
+  its instructions open with the skill's directory on disk and its scripts
+  by absolute path, which is how the shell may run them.
+  `coreagent.Snapshot` reads the directory into memory once, beside its
+  integrity manifest, refusing any other top-level name, a symlink or a
+  special file, so a later change on disk doesn't reach the harness.
+  - Each `mcp.yaml` server the manifest grants runs as the worker's relay to
+    the credential broker, the same command and environment as for Claude
+    Code, with its granted tools listed (`Output.MCPServers`); a whole-server
+    grant takes the server's `include` list.
+  - Tools pass through as the manifest names them, for the harness's tool
+    grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
+  - Each `SKILL.md` frontmatter is written back with only the keys the
+    harness reads, read as exactly one YAML document between exact `---`
+    lines.
+  - Refused rather than dropped: a granted server with no relay or no
+    `include` list, a server or tool name the harness would rename, a skill
+    frontmatter key other than `name`, `description`, `license`,
+    `compatibility` and `metadata`, a skill's `allowed-tools`, non-string
+    `metadata` values, a script whose path isn't letters, digits, `.`, `_`,
+    `-` and `/`, and a script when the persona doesn't grant `shell`.
+  - The server name `a2a` is reserved, for every harness, for the worker's
+    own delegate server.
 
 ## An example
 
