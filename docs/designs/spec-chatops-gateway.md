@@ -905,7 +905,8 @@ saying how many delegated tasks it waits on. A second delegate call in the task 
 tool. The worker reads each `childResult` on the task's `.in`, deduping on `entry` when it's set and
 on `childTaskId` otherwise (an older gateway's ends carry no `entry` and read as a single
 delegation's), and counts them to the entries it asked for. When every entry has its end, or a
-`delegationRefused` arrives, it writes them to the same harness as one user turn. At the task's
+first `delegationRefused` arrives, it writes them to the same harness as one user turn. A refusal
+with `repeat` set is logged and dropped: the wait goes on for the children already running. At the task's
 deadline less a reserve, the larger of two minutes and 15% of the task's budget but at most half of
 it, it delivers what has arrived and names the entries that sent nothing, so the parent still
 writes its report. The turn opens with a fixed wrapper saying these are reports from delegated
