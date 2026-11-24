@@ -1,0 +1,90 @@
+// Package coreagentwire is the wire between the worker adapter and
+// core-agent-harness, the worker's core-agent runner (a2a/cmd/core-agent-harness):
+// one Envelope in on stdin per turn, Event lines out on stdout.
+//
+// Everything that decides what a turn may do (its tool policy and its MCP
+// servers) travels in the Envelope, never in a file: the harness's commands
+// run as the same UID, and a file they can reach could be rewritten during
+// one turn to widen the next.
+package coreagentwire
+
+import "encoding/json"
+
+// Envelope is one turn's input, a single JSON object on stdin.
+type Envelope struct {
+	// Message is the user message for the turn.
+	Message string `json:"message"`
+	// Session resumes the conversation stored under this id in the session
+	// log, when the harness's --session flag doesn't name one; empty starts
+	// a new one, whose id the init event reports.
+	Session string `json:"session,omitempty"`
+	// Policy is the turn's tool policy.
+	Policy Policy `json:"policy"`
+	// MCP lists the MCP servers the turn may use, built at the start of the
+	// process and closed at its exit.
+	MCP []MCPServer `json:"mcp,omitempty"`
+}
+
+// Policy is a turn's tool policy: the tools the model is offered and the
+// rules a call is checked against before it runs. Its contents are filled
+// from the persona grant (SEAM: tigerteam-dev-1).
+type Policy struct {
+	// Tools names the built-in tools the model is offered; nothing else is.
+	Tools []string `json:"tools,omitempty"`
+	// Allow and Deny are core-agent permission patterns (`tool:key` globs).
+	// A call no Allow pattern matches is refused, never prompted.
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+// MCPServer is one MCP server a turn may use (SEAM: tigerteam-dev-3 for the
+// lifecycle, tigerteam-dev-1 for which tools it offers).
+type MCPServer struct {
+	Name    string            `json:"name"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Tools   []string          `json:"tools,omitempty"`
+}
+
+// Event types, one JSON object per stdout line.
+const (
+	TypeInit       = "init"
+	TypeThinking   = "thinking"
+	TypeText       = "text"
+	TypeToolCall   = "tool_call"
+	TypeToolResult = "tool_result"
+	TypeResult     = "result"
+)
+
+// Event is one line of the harness's output.
+type Event struct {
+	Type string `json:"type"`
+	// Session and Model are set on init.
+	Session string `json:"session,omitempty"`
+	Model   string `json:"model,omitempty"`
+	// Text is a thinking or text delta, a tool result's output, or the
+	// result's final text.
+	Text string `json:"text,omitempty"`
+	// ID, Tool and Input identify a tool call; a tool result carries the
+	// call's ID and Tool. Every tool call gets exactly one tool result, an
+	// erroring step included.
+	ID    string          `json:"id,omitempty"`
+	Tool  string          `json:"tool,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+	// Failed marks a tool result that errored or was refused, or a result
+	// whose turn failed; Error says why.
+	Failed bool   `json:"failed,omitempty"`
+	Error  string `json:"error,omitempty"`
+	// Usage is set on the result: the turn's token counts.
+	Usage *Usage `json:"usage,omitempty"`
+}
+
+// Usage is one turn's token counts.
+type Usage struct {
+	Input    int32 `json:"input"`
+	Output   int32 `json:"output"`
+	Cached   int32 `json:"cached,omitempty"`
+	Thoughts int32 `json:"thoughts,omitempty"`
+}

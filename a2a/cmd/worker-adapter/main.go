@@ -737,7 +737,8 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	// (#6832), and later on session pods (#6716). Elsewhere only the pod
 	// spec or the image's ENV can set it; a profile with no type gets
 	// neither variable, by design, since its image is already trusted code.
-	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
+	// core-agent likewise, until its end-of-turn sweep lands (#6710).
+	if (driver.Harness() == persona.Antigravity || driver.Harness() == persona.CoreAgent) && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
 		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
 			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
 	}
@@ -763,6 +764,8 @@ func builderFor(h persona.Harness) (harnessBuilder, error) {
 		return claudeBuilder{}, nil
 	case persona.Antigravity:
 		return agyBuilder{}, nil
+	case persona.CoreAgent:
+		return coreAgentBuilder{}, nil
 	}
 	return nil, fmt.Errorf("harness %q has no argv builder", h)
 }
