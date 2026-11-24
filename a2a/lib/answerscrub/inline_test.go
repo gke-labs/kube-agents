@@ -1013,6 +1013,11 @@ func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
 		// A code span holding only part of the value, text running on
 		// after it: the whole cell is tested and redacted.
 		{"| Key | Value |\n|---|---|\n| password | `sy`nthpass0001x |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// An auth-scheme word, then a code span holding part of the value:
+		// the scheme word stays out of the value, under a bare noun and
+		// under a strong key alike.
+		{"| Name | Token |\n|---|---|\n| ci | Bearer `sy`nthtoken0001abcd |\n", "| Name | Token |\n|---|---|\n| ci | Bearer `[redacted] |\n"},
+		{"| Key | Value |\n|---|---|\n| api_token | Bearer `sy`nthtoken0001abcd |\n", "| Key | Value |\n|---|---|\n| api_token | Bearer `[redacted] |\n"},
 	}
 	for _, tc := range cases {
 		if got := ScrubInline(tc.in); got != tc.want {

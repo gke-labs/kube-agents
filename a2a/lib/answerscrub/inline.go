@@ -1462,10 +1462,12 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 		span := [2]int{valueLo, end}
 		// Another code span after it in the cell: the value is not the
 		// first span alone.
+		// The whole cell is read past the scheme word first, and with it
+		// only as a last resort, so a scheme word never joins the value.
 		if len(code) == 1 && (end >= cellHi || n[end] == ' ' || n[end] == '\t') {
-			cands = [][2]int{span, {cellLo, cellHi}}
+			cands = [][2]int{span, {valueLo, cellHi}, {cellLo, cellHi}}
 		} else {
-			cands = [][2]int{{cellLo, cellHi}, span}
+			cands = [][2]int{{valueLo, cellHi}, span, {cellLo, cellHi}}
 		}
 	}
 	lo, hi := 0, 0
@@ -1478,11 +1480,17 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 	if hi <= lo {
 		return nil
 	}
+	value := n[lo:hi]
 	if idx != nil {
 		lo, hi = idx[lo], idx[hi-1]+1
 	}
 	if named {
+		// As written, and with its markdown taken out when that differs
+		// (a code span inside the value): an answer may echo either.
 		sink.emit(text[lo:hi])
+		if value != text[lo:hi] {
+			sink.emit(value)
+		}
 	}
 	return [][2]int{{cell[0] + lo, cell[0] + hi}}
 }

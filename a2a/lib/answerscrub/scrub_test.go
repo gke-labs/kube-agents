@@ -904,3 +904,16 @@ func TestSeenSecrets_AnExactJSONValueAlsoTracksItsTrimmedForm(t *testing.T) {
 		}
 	}
 }
+
+// A table cell under a strong key whose value follows an auth-scheme word
+// and opens with a partial code span is tracked without the scheme word
+// (the seen set keeps no value with a blank in it, so a value taken with
+// "Bearer " in front would never be tracked), and with its markdown taken
+// out as well as written.
+func TestSeenSecrets_ATableValueAfterASchemeWordIsTrackedWithoutIt(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, "| Key | Value |\n|---|---|\n| api_token | Bearer `sy`nthtoken0001abcd |\n"))
+	if !s.Has("synthtoken0001abcd") || !s.Has("sy`nthtoken0001abcd") {
+		t.Fatalf("the value was not tracked; tracked: %q", s.Values())
+	}
+}
