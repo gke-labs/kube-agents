@@ -58,8 +58,10 @@ Consolidating did take something away: an operator could previously stop one
 poller by disabling its roster entry. ``GITHUB_WATCHER_SWEEPS`` gives that back.
 """
 
+import base64
 from collections import defaultdict
 from contextlib import closing
+import io
 import json
 import os
 import re
@@ -68,9 +70,11 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
 import textwrap
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -275,6 +279,88 @@ _SITUATIONAL_CLOSE_RE = re.compile(
     re.I,
 )
 _WRITE_ACCESS_INDETERMINATE = "indeterminate"
+
+# Repository memory scan and incremental history backfill constants (#5741).
+DECISION_MEMORY_REPO_SCAN_ENV = "DECISION_MEMORY_REPO_SCAN"
+DECISION_MEMORY_BOOTSTRAP_SINCE_ENV = "DECISION_MEMORY_BOOTSTRAP_SINCE"
+PLATFORM_AGENT_HOME_ENV = "PLATFORM_AGENT_HOME"
+HINDSIGHT_URL_ENV_VARS = ("DECISION_MEMORY_HINDSIGHT_URL", "HINDSIGHT_API_URL")
+DEFAULT_AGENT_HOME = "/opt/data"
+HINDSIGHT_CONFIG_REL = Path("hindsight") / "config.json"
+_FALSY_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
+DEFAULT_BOOTSTRAP_SINCE = "90d"
+DEFAULT_BOOTSTRAP_SINCE_DAYS = 90
+SINCE_DAYS_PER_UNIT = {"d": 1, "w": 7, "m": 30, "y": 365}
+MAX_REPO_SCANS_PER_TICK = 3
+MAX_BACKFILL_REPOS_PER_TICK = 1
+MAX_BACKFILL_PRS_INSPECTED_PER_TICK = 30
+MAX_BACKFILL_SYNTHESES_PER_TICK = 3
+MAX_BACKFILL_PAGES = 20
+MAX_BACKFILL_RECORD_PATHS = 10
+BACKFILL_ISSUE_LIST_LIMIT = 100
+BACKFILL_PROCESSED_PRS_CAP = 500
+BACKFILL_SUMMARY_MAX_CHARS = 600
+SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024
+SNAPSHOT_MAX_MEMBER_BYTES = 4 * 1024 * 1024
+SNAPSHOT_MAX_EXTRACTED_BYTES = 16 * 1024 * 1024
+SNAPSHOT_MAX_EXTRACTED_FILES = 500
+CURATOR_INDEX_TIMEOUT_S = 60
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+SNAPSHOT_STAGE_PREFIX = "ka-repo-index-"
+INTENT_MANIFEST_REL = ".kube-agents/intent.yaml"
+REPO_SCAN_STATE_REL = Path("memory") / "repo_scan_state.json"
+SNAPSHOT_DOC_ROOTS = frozenset(
+    {
+        "knowledge",
+        ".kube-agents",
+        "docs",
+        "adr",
+        "decisions",
+        "rfcs",
+        "runbooks",
+        "playbooks",
+    }
+)
+SNAPSHOT_DOC_DIR_PREFIXES = (
+    "docs/adr/",
+    "docs/adrs/",
+    "docs/decisions/",
+    "docs/rfcs/",
+    "docs/runbooks/",
+    "docs/playbooks/",
+    "adr/",
+    "decisions/",
+    "rfcs/",
+    "runbooks/",
+    "playbooks/",
+)
+_EVAL_NOISE_RE = re.compile(r"eval-spend|probe:|\[withdrawn-eval-probe\]", re.I)
+_REVERT_PR_RE = re.compile(
+    r"Reverts\s+(?:PR|MR|pull\s+request|merge\s+request)?\s*"
+    r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?[#!]\s*(\d+)"
+    r"|^Revert\s+(?:PR|MR)\s+[#!]\s*(\d+)"
+    r"|^Revert\s+[\"“].+[\"”]",
+    re.I | re.M,
+)
+_FIXES_ISSUE_RE = re.compile(
+    r"\b(?:fixes|resolves|mitigates|closes)\s+"
+    r"(?:SEV-\d+\s+Incident\s+|Incident\s+|issue\s+)?"
+    r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?[#!]\s*(\d+)",
+    re.I,
+)
+_HIGH_SIGNAL_FIX_TITLE_RE = re.compile(r"^(?:fix|perf)\([^)]+\):", re.I)
+_TECHNICAL_REJECTION_RE = re.compile(
+    r"\b(?:reject\w*|violat\w*|do\s+not|must\s+not|cannot|blocked)\b",
+    re.I,
+)
+_BACKFILL_SITUATIONAL_RE = re.compile(
+    r"\b(?:stale|duplicate|superseded|freeze|conflict|rebase|wrong\s+branch)\b",
+    re.I,
+)
+_DIFF_PLUS_FILE_RE = re.compile(r"^\+\+\+\s+b/(.+)$", re.M)
+_SINCE_SPEC_RE = re.compile(r"^(\d+)\s*([hdwmy])$", re.I)
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @dataclass
@@ -1602,7 +1688,12 @@ def sweep_memory_proposals(
         sys.stderr.write(f"github_scan_gate: curator pending failed: {exc}\n")
         return SweepResult()
 
-    records = payload.get("records") or []
+    records = [
+        r
+        for r in (payload.get("records") or [])
+        if isinstance(r, dict)
+        and str(r.get("outcome") or "").strip().lower() != "backfill"
+    ]
     if not records:
         return SweepResult()
 
@@ -1642,6 +1733,8 @@ def sweep_memory_proposals(
 
     for rec in records:
         if not isinstance(rec, dict):
+            continue
+        if str(rec.get("outcome") or "").strip().lower() == "backfill":
             continue
         rec_id = str(rec.get("id") or "").strip()
         if not rec_id:
@@ -2121,10 +2214,1268 @@ def sweep_memory_proposals(
     return SweepResult()
 
 
+# --------------------------------------------------------------------------
+# Sweep: Repository document index updates and incremental history backfill
+# --------------------------------------------------------------------------
+
+
+class _SnapshotArchiveError(ValueError):
+    """Raise when a snapshot archive violates extraction safety bounds."""
+
+
+def _repo_scan_enabled() -> bool:
+    """Return False only when the operator explicitly disables repository scans."""
+    raw = os.environ.get(DECISION_MEMORY_REPO_SCAN_ENV, "").strip().lower()
+    return raw not in _FALSY_ENV_VALUES
+
+
+def _agent_home_path() -> Path:
+    """Resolve the agent data directory, or fall back to `/opt/data`."""
+    try:
+        home = gitops_workspace.agent_home()
+    except Exception:  # noqa: BLE001
+        home = (os.environ.get(PLATFORM_AGENT_HOME_ENV) or DEFAULT_AGENT_HOME).rstrip("/") or "/"
+    return Path(home)
+
+
+def _resolve_hindsight_url() -> str:
+    """Resolve the Hindsight API URL from the environment or the local config file."""
+    for var in HINDSIGHT_URL_ENV_VARS:
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    cfg_path = _agent_home_path() / HINDSIGHT_CONFIG_REL
+    if cfg_path.is_file():
+        try:
+            parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                for key in ("api_url", "url"):
+                    val = str(parsed.get(key) or "").strip()
+                    if val:
+                        return val
+        except (OSError, ValueError):
+            pass
+    return ""
+
+
+def _repo_scan_state_path() -> Path:
+    """Return the file path for per-repository scan and backfill cursors."""
+    return _agent_home_path() / REPO_SCAN_STATE_REL
+
+
+def _load_repo_scan_state() -> dict:
+    """Load the repository scan state file, or return an empty state structure."""
+    path = _repo_scan_state_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"repos": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("repos"), dict):
+        return {"repos": {}}
+    return data
+
+
+def _save_repo_scan_state(state: dict, *, dry_run: bool = False) -> None:
+    """Write the repository scan state atomically with 0600 permissions."""
+    if dry_run:
+        return
+    path = _repo_scan_state_path()
+    tmp_name = ""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=str(path.parent),
+            prefix=".repo_scan_state.",
+            suffix=".tmp",
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+        os.chmod(tmp_name, PRIVATE_FILE_MODE)
+        os.replace(tmp_name, path)
+    except OSError as exc:
+        sys.stderr.write(f"github_scan_gate: could not write repo_scan_state.json: {exc}\n")
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def _default_repo_scan_entry(role: str, ref: str | None, since_spec: str) -> dict:
+    """Build the initial cursor record for one repository."""
+    return {
+        "role": role,
+        "ref": ref,
+        "indexed_revision": "",
+        "indexed_at": "",
+        "history": {
+            "completed_initial": False,
+            "next_page": 1,
+            "max_pr_number": 0,
+            "high_water_pr_seen": 0,
+            "cursor_updated_at": "",
+            "last_checked_at": "",
+            "processed_prs": [],
+            "window_since": since_spec,
+        },
+    }
+
+
+def _ensure_repo_scan_entry(
+    repos_map: dict, repo: str, role: str, ref: str | None, since_spec: str
+) -> dict:
+    """Return a normalized per-repository state dictionary."""
+    raw = repos_map.get(repo)
+    if not isinstance(raw, dict):
+        entry = _default_repo_scan_entry(role, ref, since_spec)
+        repos_map[repo] = entry
+        return entry
+    hist = raw.get("history")
+    if not isinstance(hist, dict):
+        raw["history"] = _default_repo_scan_entry(role, ref, since_spec)["history"]
+    else:
+        hist.setdefault("completed_initial", False)
+        hist.setdefault("next_page", 1)
+        hist.setdefault("max_pr_number", 0)
+        hist.setdefault("high_water_pr_seen", 0)
+        hist.setdefault("cursor_updated_at", "")
+        hist.setdefault("last_checked_at", "")
+        if not isinstance(hist.get("processed_prs"), list):
+            hist["processed_prs"] = []
+        hist.setdefault("window_since", since_spec)
+    return raw
+
+
+def _is_indexable_doc_path(rel_path: str) -> bool:
+    """Return True when a relative repository path holds OKF or architecture docs."""
+    if rel_path == INTENT_MANIFEST_REL:
+        return True
+    lower = rel_path.lower()
+    if rel_path.startswith("knowledge/"):
+        return lower.endswith((".md", ".yaml", ".yml"))
+    if any(rel_path.startswith(prefix) for prefix in SNAPSHOT_DOC_DIR_PREFIXES):
+        return lower.endswith(".md")
+    return False
+
+
+def _extract_snapshot_docs(
+    archive_b64: str | tuple[str, ...] | list[str], dest_dir: Path
+) -> tuple[int, set[str]]:
+    """Validate uncompressed tar archives in memory and write matching docs into `dest_dir`.
+
+    Returns `(extracted_file_count, tracked_regular_files)`. Raises
+    `_SnapshotArchiveError` on compressed streams, path traversal, `.git`
+    segments, doc symlinks, non-regular members, or size violations.
+    """
+    archive_list = (archive_b64,) if isinstance(archive_b64, str) else tuple(archive_b64)
+    raw_tars: list[bytes] = []
+    for item_b64 in archive_list:
+        if not item_b64:
+            continue
+        try:
+            decoded = base64.b64decode(item_b64)
+        except (ValueError, TypeError) as exc:
+            raise _SnapshotArchiveError(f"invalid base64 archive: {exc}") from exc
+        if decoded:
+            raw_tars.append(decoded)
+    if not raw_tars:
+        return 0, set()
+
+    dest_real = dest_dir.resolve()
+    tracked_files: set[str] = set()
+    seen_symlinks: set[str] = set()
+    staged_docs: list[tuple[str, bytes]] = []
+    extracted_bytes = 0
+
+    try:
+        for raw_tar in raw_tars:
+            with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as tf:
+                for member in tf:
+                    raw_name = member.name
+                    if not raw_name or raw_name.startswith("/") or "\\" in raw_name:
+                        raise _SnapshotArchiveError(f"unsafe member path: {raw_name!r}")
+                    raw_parts = raw_name.split("/")
+                    if ".." in raw_parts:
+                        raise _SnapshotArchiveError(f"path traversal member: {raw_name!r}")
+                    parts = [p for p in raw_parts if p and p != "."]
+                    if any(p.rstrip(". ").lower() == ".git" for p in parts):
+                        raise _SnapshotArchiveError(f"forbidden .git member: {raw_name!r}")
+                    if member.isdir():
+                        continue
+                    if not parts:
+                        raise _SnapshotArchiveError("empty member path in archive")
+
+                    rel_path = "/".join(parts)
+                    if member.issym():
+                        if _is_indexable_doc_path(rel_path):
+                            raise _SnapshotArchiveError(
+                                f"symlink doc member refused: {raw_name!r}"
+                            )
+                        seen_symlinks.add(rel_path)
+                        continue
+
+                    if (
+                        not member.isfile()
+                        or not member.isreg()
+                        or member.islnk()
+                    ):
+                        raise _SnapshotArchiveError(
+                            f"non-regular member refused: {raw_name!r}"
+                        )
+                    if member.size < 0:
+                        raise _SnapshotArchiveError(
+                            f"negative member size for {raw_name!r}: {member.size}"
+                        )
+
+                    tracked_files.add(rel_path)
+                    if not _is_indexable_doc_path(rel_path):
+                        continue
+
+                    if member.size > SNAPSHOT_MAX_MEMBER_BYTES:
+                        raise _SnapshotArchiveError(
+                            f"member {raw_name!r} size {member.size} exceeds {SNAPSHOT_MAX_MEMBER_BYTES}"
+                        )
+                    if len(staged_docs) + 1 > SNAPSHOT_MAX_EXTRACTED_FILES:
+                        raise _SnapshotArchiveError(
+                            f"archive exceeds {SNAPSHOT_MAX_EXTRACTED_FILES} extracted doc files"
+                        )
+                    fobj = tf.extractfile(member)
+                    data = fobj.read(SNAPSHOT_MAX_MEMBER_BYTES + 1) if fobj is not None else b""
+                    if len(data) > SNAPSHOT_MAX_MEMBER_BYTES:
+                        raise _SnapshotArchiveError(
+                            f"member stream {raw_name!r} exceeds {SNAPSHOT_MAX_MEMBER_BYTES} bytes"
+                        )
+                    extracted_bytes += len(data)
+                    if extracted_bytes > SNAPSHOT_MAX_EXTRACTED_BYTES:
+                        raise _SnapshotArchiveError(
+                            f"archive exceeds {SNAPSHOT_MAX_EXTRACTED_BYTES} total extracted bytes"
+                        )
+                    staged_docs.append((rel_path, data))
+    except tarfile.TarError as exc:
+        raise _SnapshotArchiveError(f"corrupt or compressed tar archive: {exc}") from exc
+
+    for rel_path, _ in staged_docs:
+        rel_parts = rel_path.split("/")
+        for depth in range(1, len(rel_parts) + 1):
+            prefix = "/".join(rel_parts[:depth])
+            if prefix in seen_symlinks:
+                raise _SnapshotArchiveError(
+                    f"doc path {rel_path!r} traverses symlink {prefix!r}"
+                )
+
+    for rel_path, data in staged_docs:
+        out_path = dest_dir / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.is_symlink() or not out_path.resolve().is_relative_to(dest_real):
+            raise _SnapshotArchiveError(f"destination path escapes staging root: {rel_path!r}")
+        out_path.write_bytes(data)
+        os.chmod(out_path, PRIVATE_FILE_MODE)
+
+    return len(staged_docs), tracked_files
+
+
+def _matched_snapshot_doc_roots(entries: list | None) -> list[str]:
+    """Intersect top-level `SNAPSHOT_TOO_LARGE` entries with candidate doc roots."""
+    roots: set[str] = set()
+    for item in entries or []:
+        raw_path = item.get("path") if isinstance(item, dict) else item
+        clean = str(raw_path or "").strip().strip("/")
+        if not clean:
+            continue
+        top = clean.split("/", 1)[0]
+        if top in SNAPSHOT_DOC_ROOTS:
+            roots.add(top)
+    return sorted(roots)
+
+
+def _fetch_per_root_snapshots(
+    repo: str,
+    role: str,
+    payload: dict,
+    roots: list[str],
+    fallback_rev: str,
+) -> tuple[str, tuple[str, ...], bool] | None:
+    """Fetch each doc root separately after a multi-root `PATH_NOT_FOUND` race."""
+    agreed_rev = ""
+    missing_rev = fallback_rev
+    archives: list[str] = []
+    for root in roots:
+        try:
+            ans = forge.call(
+                "snapshot",
+                {**payload, "paths": [root]},
+                repo,
+                retry_transient=True,
+            )
+        except forge.ForgeError as root_err:
+            if root_err.reason == "PATH_NOT_FOUND":
+                if root_err.revision:
+                    missing_rev = str(root_err.revision).strip()
+                continue
+            sys.stderr.write(
+                f"github_scan_gate: narrowed snapshot of {repo} ({role}) root {root!r} failed: {root_err}\n"
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"github_scan_gate: narrowed snapshot of {repo} ({role}) root {root!r} failed: {exc}\n"
+            )
+            return None
+
+        root_rev = str((ans or {}).get("revision") or "").strip()
+        if root_rev and agreed_rev and root_rev != agreed_rev:
+            sys.stderr.write(
+                f"github_scan_gate: revision changed across narrowed roots on {repo} ({role}); skipping tick\n"
+            )
+            return None
+        if root_rev:
+            agreed_rev = root_rev
+        b64 = str((ans or {}).get("archiveBase64") or "")
+        if b64:
+            archives.append(b64)
+
+    return agreed_rev or missing_rev, tuple(archives), True
+
+
+def _fetch_repo_snapshot(
+    repo: str, role: str, ref: str | None
+) -> tuple[str, tuple[str, ...], bool] | None:
+    """Fetch a repository snapshot via `forge.call("snapshot", ...)`.
+
+    Returns `(revision, archive_base64_tuple, narrowed_to_paths)`, or `None`
+    when the snapshot call fails with an unrecoverable error.
+    """
+    payload: dict = {"maxBytes": SNAPSHOT_MAX_BYTES}
+    if role == "context" and ref:
+        payload["ref"] = ref
+    try:
+        ans = forge.call("snapshot", payload, repo, retry_transient=True)
+        b64 = str((ans or {}).get("archiveBase64") or "")
+        return (
+            str((ans or {}).get("revision") or "").strip(),
+            (b64,) if b64 else (),
+            False,
+        )
+    except forge.ForgeError as err:
+        if err.reason == "PATH_NOT_FOUND":
+            return str(err.revision or "").strip(), (), True
+        if err.reason != "SNAPSHOT_TOO_LARGE":
+            sys.stderr.write(
+                f"github_scan_gate: snapshot of {repo} ({role}) failed: {err}\n"
+            )
+            return None
+        if err.entries is None:
+            sys.stderr.write(
+                f"github_scan_gate: snapshot of {repo} ({role}) omitted entry listing on 413; skipping index: {err}\n"
+            )
+            return None
+        matched_roots = _matched_snapshot_doc_roots(err.entries)
+        if not matched_roots:
+            return str(err.revision or "").strip(), (), True
+        try:
+            ans2 = forge.call(
+                "snapshot",
+                {**payload, "paths": matched_roots},
+                repo,
+                retry_transient=True,
+            )
+            b64_2 = str((ans2 or {}).get("archiveBase64") or "")
+            return (
+                str((ans2 or {}).get("revision") or err.revision or "").strip(),
+                (b64_2,) if b64_2 else (),
+                True,
+            )
+        except forge.ForgeError as err2:
+            if err2.reason == "PATH_NOT_FOUND":
+                rev_fallback = str(err2.revision or err.revision or "").strip()
+                if len(matched_roots) == 1:
+                    return rev_fallback, (), True
+                return _fetch_per_root_snapshots(
+                    repo, role, payload, matched_roots, rev_fallback
+                )
+            sys.stderr.write(
+                f"github_scan_gate: narrowed snapshot of {repo} ({role}) failed: {err2}\n"
+            )
+            return None
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"github_scan_gate: snapshot of {repo} ({role}) failed: {exc}\n")
+        return None
+
+
+def _parse_bootstrap_since(since_spec: str, cur_now: datetime) -> datetime:
+    """Parse a relative window (such as `90d` or `2y`) or ISO date into a UTC cutoff."""
+    text = str(since_spec or "").strip()
+    m = _SINCE_SPEC_RE.match(text)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit == "h":
+            return cur_now - timedelta(hours=amount)
+        return cur_now - timedelta(days=amount * SINCE_DAYS_PER_UNIT[unit])
+    if _ISO_DATE_RE.match(text):
+        parsed = clean_merges._parse_time(f"{text}T00:00:00Z")
+        if parsed is not None:
+            return parsed
+    return cur_now - timedelta(days=DEFAULT_BOOTSTRAP_SINCE_DAYS)
+
+
+def _parse_any_timestamp(raw: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp or `YYYY-MM-DD` date string into UTC."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    parsed = clean_merges._parse_time(text)
+    if parsed is not None:
+        return parsed
+    if _ISO_DATE_RE.match(text):
+        return clean_merges._parse_time(f"{text}T00:00:00Z")
+    return None
+
+
+def _proposal_activity_dt(prop: dict) -> tuple[datetime | None, str]:
+    """Return the latest parsed timestamp and raw string on a proposal record."""
+    best_dt: datetime | None = None
+    best_raw = ""
+    for key in (
+        "updated",
+        "updatedAt",
+        "updated_at",
+        "mergedAt",
+        "merged_at",
+        "closed",
+        "closedAt",
+        "closed_at",
+        "created",
+        "createdAt",
+        "created_at",
+    ):
+        raw_val = str(prop.get(key) or "").strip()
+        dt_val = _parse_any_timestamp(raw_val)
+        if dt_val is not None and (best_dt is None or dt_val > best_dt):
+            best_dt = dt_val
+            best_raw = raw_val
+    return best_dt, best_raw
+
+
+def _files_from_diff_text(diff_text: str) -> list[str]:
+    """Extract changed destination file paths from a unified diff."""
+    files: list[str] = []
+    for match in _DIFF_PLUS_FILE_RE.finditer(str(diff_text or "")):
+        rel = match.group(1).strip()
+        if rel and rel != "/dev/null" and rel not in files:
+            files.append(rel)
+    return files
+
+
+def _format_backfill_pr_ref(prop: dict, num: int, repo: str) -> str:
+    """Format a proposal citation with its URL and number."""
+    url = str(prop.get("url") or prop.get("html_url") or "").strip()
+    if url:
+        sigil = "!" if "/-/merge_requests/" in url else "#"
+        return f"{url} ({sigil}{num})"
+    if "/" in repo and "." not in repo.split("/", 1)[0]:
+        return f"https://github.com/{repo}/pull/{num} (#{num})"
+    return f"{repo}#{num}"
+
+
+def _format_backfill_issue_ref(issue: dict | None, num: int) -> str:
+    """Format an issue citation with its URL, number, and optional title."""
+    if isinstance(issue, dict):
+        url = str(issue.get("url") or issue.get("html_url") or "").strip()
+        title = str(issue.get("title") or "").strip()
+        base = f"{url} (#{num})" if url else f"#{num}"
+        return f"{base} ({title})" if title else base
+    return f"#{num}"
+
+
+def _append_processed_pr(processed: list, pr_num: int) -> list[int]:
+    """Append `pr_num` to the bounded ring buffer of processed proposal numbers."""
+    out = [int(x) for x in processed if isinstance(x, int) and not isinstance(x, bool)]
+    if pr_num not in out:
+        out.append(pr_num)
+    if len(out) > BACKFILL_PROCESSED_PRS_CAP:
+        out = out[-BACKFILL_PROCESSED_PRS_CAP:]
+    return out
+
+
+def _is_backfill_situational_close(text: str | None) -> bool:
+    """Return True when a close comment is empty or describes a non-policy close."""
+    if _is_situational_close_reason(text):
+        return True
+    return bool(_BACKFILL_SITUATIONAL_RE.search(str(text or "")))
+
+
+def _run_curator_emit_ok(curator_bin: str, args: list[str], label: str) -> bool:
+    """Run `curator emit` and return True when it exits 0."""
+    cmd = [curator_bin, "emit", *args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=CURATOR_EMIT_TIMEOUT_S,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[
+            :MAX_REASON_CHARS
+        ]
+        sys.stderr.write(f"github_scan_gate: curator emit for {label} failed: {detail}\n")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        sys.stderr.write(
+            f"github_scan_gate: curator emit for {label} did not complete: {exc}\n"
+        )
+    return False
+
+
+def _extract_backfill_rejection_reason(
+    comments: list,
+    viewer: str,
+    pr_author: str,
+    *,
+    provider: object,
+    repo: str,
+) -> tuple[str, str | None]:
+    """Find a write-access maintainer technical rejection comment on a closed PR.
+
+    Returns `("indeterminate", None)` when collaborator write access cannot be
+    verified, `("ok", reason)` when a maintainer technical rejection is found,
+    or `("none", None)` otherwise.
+    """
+    viewer_key = forge.normalise_login(viewer) if viewer else ""
+    author_key = forge.normalise_login(pr_author) if pr_author else ""
+    maintainer_bodies: list[str] = []
+    chosen_reason: str | None = None
+
+    for comment in reversed(comments or []):
+        if not isinstance(comment, dict):
+            continue
+        c_author = str(comment.get("author") or comment.get("user") or "").strip()
+        if not c_author:
+            continue
+        c_key = forge.normalise_login(c_author)
+        if (viewer_key and c_key == viewer_key) or (author_key and c_key == author_key):
+            continue
+        body = str(comment.get("body") or "").strip()
+        if not body:
+            continue
+        write_state = _comment_author_write_state(comment, provider=provider, repo=repo)
+        if write_state is None:
+            return _WRITE_ACCESS_INDETERMINATE, None
+        if write_state is not True:
+            continue
+        maintainer_bodies.append(body)
+        if (
+            chosen_reason is None
+            and _TECHNICAL_REJECTION_RE.search(body)
+            and not _is_backfill_situational_close(body)
+        ):
+            chosen_reason = body[:MAX_REASON_CHARS]
+
+    if chosen_reason is None:
+        return "none", None
+    if _is_backfill_situational_close("\n".join(maintainer_bodies)):
+        return "none", None
+    return "ok", chosen_reason
+
+
+def _backfill_one_managed_repo(
+    repo: str,
+    history: dict,
+    *,
+    curator_bin: str,
+    tracked_files: set[str] | None,
+    cutoff_dt: datetime,
+    since_spec: str,
+    cur_now: datetime,
+    dry_run: bool,
+) -> bool:
+    """Run one bounded read-only history backfill pass on `repo`.
+
+    Returns True when `history` changed and should be saved.
+    """
+    provider = forge.BrokerProvider()
+    try:
+        viewer = provider.viewer_login(repo)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(
+            f"github_scan_gate: backfill viewer_login on {repo} failed: {exc}\n"
+        )
+        return False
+
+    completed_initial = bool(history.get("completed_initial"))
+    page = 1 if completed_initial else max(1, int(history.get("next_page") or 1))
+
+    try:
+        ans = forge.call(
+            "proposal-list",
+            {
+                "state": "closed",
+                "limit": MAX_BACKFILL_PRS_INSPECTED_PER_TICK,
+                "page": page,
+            },
+            repo,
+            retry_transient=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(
+            f"github_scan_gate: backfill proposal-list on {repo} page {page} failed: {exc}\n"
+        )
+        return False
+
+    issues_by_num: dict[int, dict] = {}
+    try:
+        issues_ans = forge.call(
+            "issue-list",
+            {"state": "all", "limit": BACKFILL_ISSUE_LIST_LIMIT},
+            repo,
+            retry_transient=True,
+        )
+        for raw_issue in (issues_ans or {}).get("issues") or []:
+            if isinstance(raw_issue, dict) and raw_issue.get("number"):
+                issues_by_num[int(raw_issue["number"])] = raw_issue
+    except Exception:  # noqa: BLE001 - issues may be disabled on the repository
+        issues_by_num = {}
+
+    raw_proposals = [p for p in ((ans or {}).get("proposals") or []) if isinstance(p, dict)]
+    is_truncated = bool((ans or {}).get("truncated"))
+    processed_prs = [
+        int(x)
+        for x in (history.get("processed_prs") or [])
+        if isinstance(x, int) and not isinstance(x, bool)
+    ]
+    processed_set = set(processed_prs)
+    max_pr_number = int(history.get("max_pr_number") or 0)
+    high_water_pr = max(max_pr_number, int(history.get("high_water_pr_seen") or 0))
+    cursor_updated_raw = str(history.get("cursor_updated_at") or "").strip()
+    cursor_updated_dt = _parse_any_timestamp(cursor_updated_raw)
+    newest_updated_dt = cursor_updated_dt
+    newest_updated_raw = cursor_updated_raw
+
+    inspected = 0
+    syntheses = 0
+    stopped_for_cap = False
+    held_unresolved = False
+    saw_within_cutoff = False
+
+    for raw_pr in raw_proposals:
+        if inspected >= MAX_BACKFILL_PRS_INSPECTED_PER_TICK:
+            stopped_for_cap = True
+            break
+        if syntheses >= MAX_BACKFILL_SYNTHESES_PER_TICK:
+            stopped_for_cap = True
+            break
+
+        pr_num = int(raw_pr.get("number") or 0)
+        if pr_num <= 0:
+            continue
+
+        state = str(raw_pr.get("state") or "").strip().lower()
+        is_merged = state == "merged" or bool(
+            raw_pr.get("mergedAt") or raw_pr.get("merged_at")
+        )
+        is_closed_unmerged = state == "closed" and not is_merged
+        if not is_merged and not is_closed_unmerged:
+            continue
+
+        high_water_pr = max(high_water_pr, pr_num)
+        act_dt, act_raw = _proposal_activity_dt(raw_pr)
+        if (
+            page == 1
+            and act_dt is not None
+            and (newest_updated_dt is None or act_dt > newest_updated_dt)
+        ):
+            newest_updated_dt = act_dt
+            newest_updated_raw = act_raw
+
+        if act_dt is not None and act_dt < cutoff_dt:
+            continue
+        saw_within_cutoff = True
+
+        if pr_num in processed_set:
+            continue
+
+        if completed_initial:
+            newer_than_cursor = (
+                pr_num > max_pr_number
+                or cursor_updated_dt is None
+                or (act_dt is not None and act_dt > cursor_updated_dt)
+            )
+            if not newer_than_cursor:
+                continue
+
+        inspected += 1
+        title = str(raw_pr.get("title") or "").strip()
+        body = str(raw_pr.get("body") or "").strip()
+        source = str(raw_pr.get("source") or raw_pr.get("headRefName") or "").strip()
+        source_repo = str(raw_pr.get("sourceRepo") or "").strip()
+        pr_author = str(raw_pr.get("author") or "").strip()
+        pr_url = str(raw_pr.get("url") or "").strip()
+
+        pr_obj = forge.PullRequest(
+            number=pr_num,
+            head_ref=source,
+            author=pr_author,
+            head_repo=source_repo,
+            url=pr_url,
+        )
+        if source.startswith(forge.AGENT_BRANCH_PREFIX) or (
+            viewer and forge.is_agent_pull_request(pr_obj, repo, viewer)
+        ):
+            processed_prs = _append_processed_pr(processed_prs, pr_num)
+            processed_set.add(pr_num)
+            continue
+
+        if _EVAL_NOISE_RE.search(f"{title} {body}"):
+            processed_prs = _append_processed_pr(processed_prs, pr_num)
+            processed_set.add(pr_num)
+            continue
+
+        pr_ref = _format_backfill_pr_ref(raw_pr, pr_num, repo)
+        rev_match = _REVERT_PR_RE.search(f"{title}\n{body}") if is_merged else None
+        fix_match = _FIXES_ISSUE_RE.search(f"{body} {title}") if is_merged else None
+        is_fix_title = bool(is_merged and _HIGH_SIGNAL_FIX_TITLE_RE.search(title))
+
+        if is_merged and rev_match is not None:
+            try:
+                view_ans = forge.call(
+                    "proposal-view",
+                    {"number": pr_num, "diff": True, "comments": False},
+                    repo,
+                    retry_transient=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(
+                    f"github_scan_gate: backfill proposal-view {repo}#{pr_num} failed: {exc}\n"
+                )
+                held_unresolved = True
+                continue
+            prop_detail = (view_ans or {}).get("proposal") or raw_pr
+            pr_ref = _format_backfill_pr_ref(prop_detail, pr_num, repo)
+            diff_files = _files_from_diff_text(str((view_ans or {}).get("diff") or ""))
+            non_knowledge = [f for f in diff_files if not f.startswith("knowledge/")]
+            live_paths = [
+                f for f in non_knowledge if tracked_files is None or f in tracked_files
+            ] or non_knowledge
+            brk_str = rev_match.group(1) or rev_match.group(2) or ""
+            inc_num = int(fix_match.group(1)) if fix_match else 0
+            inc_obj = issues_by_num.get(inc_num) if inc_num else None
+            rec_title = (
+                str((inc_obj or {}).get("title") or "").strip()
+                or title
+                or f"Lesson from revert proposal #{pr_num}"
+            )
+            summary_parts = [
+                f"Reverted breaking proposal #{brk_str} in {pr_ref}."
+                if brk_str
+                else f"Reverted prior change in {pr_ref}."
+            ]
+            if inc_num:
+                summary_parts.append(
+                    f"Linked issue: {_format_backfill_issue_ref(inc_obj, inc_num)}."
+                )
+            if body:
+                summary_parts.append(body[:BACKFILL_SUMMARY_MAX_CHARS])
+            emit_args = [
+                "--kind",
+                "proposed",
+                "--type",
+                "lesson",
+                "--outcome",
+                "backfill",
+                "--guard-severity",
+                "warn",
+                "--repo",
+                repo,
+                "--pr",
+                pr_ref,
+                "--title",
+                rec_title,
+                "--summary",
+                " ".join(summary_parts)[:BACKFILL_SUMMARY_MAX_CHARS],
+            ]
+            if live_paths:
+                emit_args.extend(["--paths", ",".join(live_paths[:MAX_BACKFILL_RECORD_PATHS])])
+            if dry_run:
+                sys.stderr.write(
+                    f"github_scan_gate: would backfill revert lesson from {pr_ref}\n"
+                )
+                syntheses += 1
+                continue
+            if _run_curator_emit_ok(curator_bin, emit_args, f"{repo}#{pr_num}"):
+                syntheses += 1
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+            else:
+                held_unresolved = True
+            continue
+
+        if is_merged and (fix_match is not None or is_fix_title):
+            try:
+                view_ans = forge.call(
+                    "proposal-view",
+                    {"number": pr_num, "diff": True, "comments": False},
+                    repo,
+                    retry_transient=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(
+                    f"github_scan_gate: backfill proposal-view {repo}#{pr_num} failed: {exc}\n"
+                )
+                held_unresolved = True
+                continue
+            prop_detail = (view_ans or {}).get("proposal") or raw_pr
+            pr_ref = _format_backfill_pr_ref(prop_detail, pr_num, repo)
+            diff_files = _files_from_diff_text(str((view_ans or {}).get("diff") or ""))
+            live_files = [
+                f
+                for f in diff_files
+                if not f.startswith("knowledge/")
+                and (tracked_files is None or f in tracked_files)
+            ]
+            if not live_files:
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+                continue
+            inc_num = int(fix_match.group(1)) if fix_match else 0
+            inc_obj = issues_by_num.get(inc_num) if inc_num else None
+            rec_title = (
+                str((inc_obj or {}).get("title") or "").strip()
+                or title
+                or f"Lesson from fix proposal #{pr_num}"
+            )
+            summary_parts = [f"Resolved in {pr_ref} ({title})."]
+            if inc_num:
+                summary_parts.append(
+                    f"Linked issue: {_format_backfill_issue_ref(inc_obj, inc_num)}."
+                )
+            if body:
+                summary_parts.append(body[:BACKFILL_SUMMARY_MAX_CHARS])
+            emit_args = [
+                "--kind",
+                "proposed",
+                "--type",
+                "lesson",
+                "--outcome",
+                "backfill",
+                "--guard-severity",
+                "warn",
+                "--repo",
+                repo,
+                "--pr",
+                pr_ref,
+                "--title",
+                rec_title,
+                "--summary",
+                " ".join(summary_parts)[:BACKFILL_SUMMARY_MAX_CHARS],
+                "--paths",
+                ",".join(live_files[:MAX_BACKFILL_RECORD_PATHS]),
+            ]
+            if dry_run:
+                sys.stderr.write(
+                    f"github_scan_gate: would backfill fix lesson from {pr_ref}\n"
+                )
+                syntheses += 1
+                continue
+            if _run_curator_emit_ok(curator_bin, emit_args, f"{repo}#{pr_num}"):
+                syntheses += 1
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+            else:
+                held_unresolved = True
+            continue
+
+        if is_closed_unmerged:
+            if not viewer:
+                held_unresolved = True
+                continue
+            try:
+                closer_ans = forge.call(
+                    "proposal-closer",
+                    {"number": pr_num},
+                    repo,
+                    retry_transient=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(
+                    f"github_scan_gate: backfill proposal-closer {repo}#{pr_num} failed: {exc}\n"
+                )
+                held_unresolved = True
+                continue
+            closer_actor = str((closer_ans or {}).get("actor") or "").strip()
+            closer_bot = bool((closer_ans or {}).get("bot"))
+            closer_key = forge.normalise_login(closer_actor) if closer_actor else ""
+            if (
+                not closer_actor
+                or closer_bot
+                or closer_key == forge.normalise_login(viewer)
+                or (pr_author and closer_key == forge.normalise_login(pr_author))
+            ):
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+                continue
+
+            try:
+                closer_write = provider._has_write(repo, closer_actor, closer_bot)
+            except Exception:  # noqa: BLE001
+                closer_write = None
+            if closer_write is None:
+                held_unresolved = True
+                continue
+            if closer_write is not True:
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+                continue
+
+            try:
+                view_ans = forge.call(
+                    "proposal-view",
+                    {"number": pr_num, "comments": True, "diff": True},
+                    repo,
+                    retry_transient=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(
+                    f"github_scan_gate: backfill proposal-view {repo}#{pr_num} failed: {exc}\n"
+                )
+                held_unresolved = True
+                continue
+            if (view_ans or {}).get("commentsTruncated"):
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+                continue
+            prop_detail = (view_ans or {}).get("proposal") or raw_pr
+            detail_author = str(prop_detail.get("author") or pr_author or "").strip()
+            if detail_author and closer_key == forge.normalise_login(detail_author):
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+                continue
+
+            comments = (view_ans or {}).get("comments")
+            if not isinstance(comments, list):
+                comments = prop_detail.get("comments") or []
+            rej_status, rej_reason = _extract_backfill_rejection_reason(
+                comments,
+                viewer,
+                detail_author,
+                provider=provider,
+                repo=repo,
+            )
+            if rej_status == _WRITE_ACCESS_INDETERMINATE:
+                held_unresolved = True
+                continue
+            if rej_status != "ok" or not rej_reason:
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+                continue
+
+            pr_ref = _format_backfill_pr_ref(prop_detail, pr_num, repo)
+            diff_files = _files_from_diff_text(str((view_ans or {}).get("diff") or ""))
+            target_paths = [f for f in diff_files if not f.startswith("knowledge/")]
+            rec_title = (
+                f"Rejected proposal #{pr_num}: {title}"
+                if title
+                else f"Rejected proposal #{pr_num}"
+            )
+            emit_args = [
+                "--kind",
+                "refused",
+                "--type",
+                "lesson",
+                "--outcome",
+                "backfill",
+                "--guard-severity",
+                "warn",
+                "--repo",
+                repo,
+                "--pr",
+                pr_ref,
+                "--title",
+                rec_title,
+                "--reason",
+                rej_reason,
+            ]
+            if target_paths:
+                emit_args.extend(["--paths", ",".join(target_paths[:MAX_BACKFILL_RECORD_PATHS])])
+            if dry_run:
+                sys.stderr.write(
+                    f"github_scan_gate: would backfill refused lesson from {pr_ref}\n"
+                )
+                syntheses += 1
+                continue
+            if _run_curator_emit_ok(curator_bin, emit_args, f"{repo}#{pr_num}"):
+                syntheses += 1
+                processed_prs = _append_processed_pr(processed_prs, pr_num)
+                processed_set.add(pr_num)
+            else:
+                held_unresolved = True
+            continue
+
+        processed_prs = _append_processed_pr(processed_prs, pr_num)
+        processed_set.add(pr_num)
+
+    if dry_run:
+        return False
+
+    now_iso = cur_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    history["processed_prs"] = processed_prs
+    history["high_water_pr_seen"] = high_water_pr
+    history["window_since"] = since_spec
+    history["last_checked_at"] = now_iso
+
+    if not completed_initial:
+        if held_unresolved or (
+            stopped_for_cap and syntheses >= MAX_BACKFILL_SYNTHESES_PER_TICK
+        ):
+            # Stay on the current page when a transient error or synthesis cap
+            # stopped mid-page; `processed_prs` skips handled proposals.
+            history["next_page"] = page
+        elif (
+            is_truncated
+            and (saw_within_cutoff or not raw_proposals)
+            and page < MAX_BACKFILL_PAGES
+        ):
+            history["next_page"] = page + 1
+            if page == 1 and newest_updated_raw:
+                history["cursor_updated_at"] = newest_updated_raw
+        else:
+            history["completed_initial"] = True
+            history["next_page"] = 1
+            history["max_pr_number"] = max(max_pr_number, high_water_pr)
+            if newest_updated_raw:
+                history["cursor_updated_at"] = newest_updated_raw
+    elif not stopped_for_cap and not held_unresolved:
+        history["max_pr_number"] = max(max_pr_number, high_water_pr)
+        if newest_updated_raw:
+            history["cursor_updated_at"] = newest_updated_raw
+
+    return True
+
+
+def sweep_repo_memory(
+    dry_run: bool = False, *, now: datetime | None = None
+) -> SweepResult:
+    """Index repository documents and backfill high-signal proposal history.
+
+    Step A snapshots up to `MAX_REPO_SCANS_PER_TICK` repositories across
+    `managed_repos` and `context_repos`. It skips unchanged revisions and
+    indexes OKF and architecture documents into Hindsight via Curator.
+    Step B runs a bounded, read-only history backfill on `managed_repos`
+    when NATS is configured, and opens zero Git pull requests.
+    """
+    if not _repo_scan_enabled():
+        return SweepResult()
+    curator_bin = _resolve_curator_bin()
+    nats_url = os.environ.get("NATS_URL", "").strip()
+    hindsight_url = _resolve_hindsight_url()
+    if not curator_bin or (not nats_url and not hindsight_url):
+        return SweepResult()
+
+    try:
+        managed_repos = gitops_workspace.get_managed_repos()
+    except Exception as error:  # noqa: BLE001
+        return SweepResult(
+            warnings=[
+                _forge_warning(
+                    error
+                    if isinstance(error, forge.ForgeError)
+                    else forge.ForgeError("DISCOVERY_FAILED", str(error))
+                )
+            ]
+        )
+
+    try:
+        context_specs = gitops_workspace.get_context_repo_specs()
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"github_scan_gate: context_repos discovery failed: {exc}\n")
+        context_specs = []
+
+    managed_set = {
+        gitops_workspace._canonical_repo_id(r)  # noqa: SLF001
+        if hasattr(gitops_workspace, "_canonical_repo_id")
+        else r.lower()
+        for r in managed_repos
+    }
+    candidates: list[dict[str, str | None]] = [
+        {"repo": r, "role": "managed", "ref": None} for r in managed_repos
+    ]
+    for spec in context_specs:
+        if not isinstance(spec, dict):
+            continue
+        c_repo = str(spec.get("repo") or "").strip()
+        if not c_repo:
+            continue
+        canon = (
+            gitops_workspace._canonical_repo_id(c_repo)  # noqa: SLF001
+            if hasattr(gitops_workspace, "_canonical_repo_id")
+            else c_repo.lower()
+        )
+        if canon in managed_set:
+            continue
+        candidates.append(
+            {"repo": c_repo, "role": "context", "ref": spec.get("ref")}
+        )
+
+    if not candidates:
+        return SweepResult()
+
+    cur_now = now or datetime.now(timezone.utc)
+    now_iso = cur_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    since_spec = (
+        os.environ.get(DECISION_MEMORY_BOOTSTRAP_SINCE_ENV, "").strip()
+        or DEFAULT_BOOTSTRAP_SINCE
+    )
+    cutoff_dt = _parse_bootstrap_since(since_spec, cur_now)
+
+    state = _load_repo_scan_state()
+    repos_state: dict = state.setdefault("repos", {})
+    state_dirty = False
+
+    for item in candidates:
+        _ensure_repo_scan_entry(
+            repos_state,
+            str(item["repo"]),
+            str(item["role"]),
+            item.get("ref"),
+            since_spec,
+        )
+
+    def _scan_sort_key(idx_and_item: tuple[int, dict[str, str | None]]) -> tuple[int, str, int]:
+        idx, item = idx_and_item
+        entry = repos_state.get(str(item["repo"])) or {}
+        needs_initial = (
+            not str(entry.get("indexed_revision") or "").strip()
+            or entry.get("role") != item["role"]
+            or entry.get("ref") != item.get("ref")
+        )
+        return (0 if needs_initial else 1, str(entry.get("indexed_at") or ""), idx)
+
+    ordered_candidates = [
+        item for _, item in sorted(enumerate(candidates), key=_scan_sort_key)
+    ]
+    tracked_files_by_repo: dict[str, set[str]] = {}
+
+    for item in ordered_candidates[:MAX_REPO_SCANS_PER_TICK]:
+        repo = str(item["repo"])
+        role = str(item["role"])
+        ref = item.get("ref")
+        repo_entry = repos_state[repo]
+
+        fetched = _fetch_repo_snapshot(repo, role, ref)
+        if fetched is None:
+            continue
+        revision, archive_b64_tuple, narrowed = fetched
+        if (
+            revision
+            and revision == str(repo_entry.get("indexed_revision") or "").strip()
+            and role == repo_entry.get("role")
+            and ref == repo_entry.get("ref")
+        ):
+            continue
+
+        tmpdir = tempfile.mkdtemp(prefix=SNAPSHOT_STAGE_PREFIX)
+        try:
+            os.chmod(tmpdir, PRIVATE_DIR_MODE)
+            if archive_b64_tuple:
+                try:
+                    _, tracked = _extract_snapshot_docs(archive_b64_tuple, Path(tmpdir))
+                    if not narrowed:
+                        tracked_files_by_repo[repo] = tracked
+                except _SnapshotArchiveError as err:
+                    sys.stderr.write(
+                        f"github_scan_gate: unsafe snapshot for {repo} ({role}): {err}\n"
+                    )
+                    continue
+            elif not narrowed:
+                tracked_files_by_repo[repo] = set()
+
+            if dry_run:
+                sys.stderr.write(
+                    f"github_scan_gate: would index {repo} ({role}) at {revision or 'HEAD'}\n"
+                )
+                continue
+
+            idx_cmd = [
+                curator_bin,
+                "index",
+                "--repo",
+                tmpdir,
+                "--repo-id",
+                repo,
+                "--role",
+                role,
+            ]
+            if hindsight_url:
+                idx_cmd.extend(["--hindsight-url", hindsight_url])
+            proc = subprocess.run(
+                idx_cmd,
+                capture_output=True,
+                text=True,
+                timeout=CURATOR_INDEX_TIMEOUT_S,
+                check=False,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[
+                    :MAX_REASON_CHARS
+                ]
+                sys.stderr.write(
+                    f"github_scan_gate: curator index for {repo} ({role}) failed: {detail}\n"
+                )
+                continue
+
+            repo_entry["role"] = role
+            repo_entry["ref"] = ref
+            repo_entry["indexed_revision"] = revision
+            repo_entry["indexed_at"] = now_iso
+            state_dirty = True
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            sys.stderr.write(
+                f"github_scan_gate: curator index for {repo} ({role}) did not complete: {exc}\n"
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if nats_url and managed_repos:
+        def _backfill_sort_key(idx_and_repo: tuple[int, str]) -> tuple[int, str, int]:
+            idx, r_name = idx_and_repo
+            hist = (repos_state.get(r_name) or {}).get("history") or {}
+            needs_initial = not bool(hist.get("completed_initial"))
+            return (0 if needs_initial else 1, str(hist.get("last_checked_at") or ""), idx)
+
+        ordered_managed = [
+            r_name for _, r_name in sorted(enumerate(managed_repos), key=_backfill_sort_key)
+        ]
+        for m_repo in ordered_managed[:MAX_BACKFILL_REPOS_PER_TICK]:
+            hist = repos_state[m_repo]["history"]
+            if _backfill_one_managed_repo(
+                m_repo,
+                hist,
+                curator_bin=curator_bin,
+                tracked_files=tracked_files_by_repo.get(m_repo),
+                cutoff_dt=cutoff_dt,
+                since_spec=since_spec,
+                cur_now=cur_now,
+                dry_run=dry_run,
+            ):
+                state_dirty = True
+
+    if state_dirty and not dry_run:
+        _save_repo_scan_state(state, dry_run=dry_run)
+
+    return SweepResult()
+
+
 SWEEPS = {
     "issues": sweep_issues,
     "pr_comments": sweep_pr_comments,
     "memory_proposals": sweep_memory_proposals,
+    "repo_memory": sweep_repo_memory,
 }
 
 # Insertion order is run order, so this is the registry read one way rather

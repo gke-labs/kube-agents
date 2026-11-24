@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -436,5 +437,408 @@ func TestRunCheckOverseerCapsLLMFindingsAtWarnAndDreamSubcommand(t *testing.T) {
 	}
 	if len(dreamRep.DemotedDrifted) != 1 || dreamRep.DemotedDrifted[0] != "DEC-2026-041" {
 		t.Fatalf("expected DEC-2026-041 in demoted_drifted, got %+v", dreamRep)
+	}
+}
+
+func TestEmitBackfillPendingAndIndexRoleViaDaemonAndConfigFallback(t *testing.T) {
+	natsURL := startCLIJetStream(t)
+	t.Setenv("NATS_URL", natsURL)
+	t.Setenv(lib.EnvBusUser, "curator")
+	t.Setenv("HINDSIGHT_API_URL", "")
+	t.Setenv("DECISION_MEMORY_HINDSIGHT_URL", "")
+
+	// Configure Hindsight URL via <PLATFORM_AGENT_HOME>/hindsight/config.json fallback.
+	var hsMu sync.Mutex
+	retainedDocs := map[string][]string{}
+	hsMux := http.NewServeMux()
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions/config", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions/memories", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Items []struct {
+				DocumentID string   `json:"document_id"`
+				Tags       []string `json:"tags"`
+			} `json:"items"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		hsMu.Lock()
+		for _, it := range body.Items {
+			retainedDocs[it.DocumentID] = it.Tags
+		}
+		hsMu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions/documents", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	})
+	hsSrv := httptest.NewServer(hsMux)
+	defer hsSrv.Close()
+
+	agentHome := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(agentHome, "hindsight"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentHome, "hindsight", "config.json"), []byte(`{"api_url":"`+hsSrv.URL+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PLATFORM_AGENT_HOME", agentHome)
+
+	if gotURL := defaultHindsightURL(); gotURL != hsSrv.URL {
+		t.Fatalf("defaultHindsightURL() = %q, want %q from config.json", gotURL, hsSrv.URL)
+	}
+
+	daemonStore := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonContext(ctx, []string{"--repo", daemonStore, "--repo-id", "acme/gitops", "--status-listen", addr})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, rErr := httpClient.Get("http://" + addr + "/readyz"); rErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1. curator emit --outcome backfill stamps outcome="backfill" and surfaces it in curator pending.
+	emitOut, err := captureStdout(t, func() error {
+		return run([]string{
+			"emit",
+			"--kind", "proposed",
+			"--type", "lesson",
+			"--outcome", "backfill",
+			"--repo", "acme/gitops",
+			"--pr", "https://github.com/acme/gitops/pull/42 (#42)",
+			"--title", "Backfilled revert lesson",
+			"--rule", "Pin image digest before rollout",
+			"--paths", "clusters/**",
+		})
+	})
+	if err != nil {
+		t.Fatalf("curator emit --outcome backfill failed: %v", err)
+	}
+	var emitJSON struct {
+		RecordID string `json:"record_id"`
+	}
+	if err := json.Unmarshal([]byte(emitOut), &emitJSON); err != nil || emitJSON.RecordID == "" {
+		t.Fatalf("decode emit output %q: %v", emitOut, err)
+	}
+
+	pendingOut, err := captureStdout(t, func() error {
+		return run([]string{"pending", "--repo", daemonStore, "--repo-id", "acme/gitops"})
+	})
+	if err != nil {
+		t.Fatalf("curator pending failed: %v", err)
+	}
+	var pendingJSON struct {
+		Records []memory.BlueprintRecordDigest `json:"records"`
+	}
+	if err := json.Unmarshal([]byte(pendingOut), &pendingJSON); err != nil {
+		t.Fatalf("decode pending output %q: %v", pendingOut, err)
+	}
+	if len(pendingJSON.Records) != 1 || pendingJSON.Records[0].ID != emitJSON.RecordID || pendingJSON.Records[0].Outcome != "backfill" {
+		t.Fatalf("expected pending record %s with outcome=backfill, got %+v", emitJSON.RecordID, pendingJSON.Records)
+	}
+
+	// Also verify local fallback (with NATS_URL temporarily cleared) surfaces outcome="backfill".
+	t.Setenv("NATS_URL", "")
+	localPendingOut, err := captureStdout(t, func() error {
+		return run([]string{"pending", "--repo", daemonStore, "--repo-id", "acme/gitops"})
+	})
+	if err != nil {
+		t.Fatalf("local curator pending failed: %v", err)
+	}
+	var localPendingJSON struct {
+		Records []memory.BlueprintRecordDigest `json:"records"`
+	}
+	if err := json.Unmarshal([]byte(localPendingOut), &localPendingJSON); err != nil {
+		t.Fatalf("decode local pending output: %v", err)
+	}
+	if len(localPendingJSON.Records) != 1 || localPendingJSON.Records[0].Outcome != "backfill" {
+		t.Fatalf("expected local pending fallback to preserve outcome=backfill, got %+v", localPendingJSON.Records)
+	}
+	t.Setenv("NATS_URL", natsURL)
+
+	// 2. curator index --role context routes over NATS to daemon and strips blocking guards.
+	ctxSnapDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ctxSnapDir, "docs", "runbooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ctxSnapDir, "docs", "runbooks", "0005-node-drain.md"), []byte("# Node drain runbook\n\nCheck PDB status before cordoning nodes.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(ctxSnapDir, "knowledge", "decision"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctxGuardMD := "---\ntype: decision\nid: DEC-2026-009\ntitle: Context guard\nstatus: active\ndate: \"2026-11-20\"\nscope:\n  paths:\n    - apps/**\nguard:\n  rule: Block rule from context repo\n  severity: block\n  expect:\n    file: apps/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 5\n---\n\nContext decision.\n"
+	if err := os.WriteFile(filepath.Join(ctxSnapDir, "knowledge", "decision", "DEC-2026-009.md"), []byte(ctxGuardMD), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	idxOut, err := captureStdout(t, func() error {
+		return run([]string{"index", "--repo", ctxSnapDir, "--repo-id", "acme/handbook", "--role", "context"})
+	})
+	if err != nil {
+		t.Fatalf("curator index --role context failed: %v", err)
+	}
+	var idxReceipt map[string]any
+	if err := json.Unmarshal([]byte(idxOut), &idxReceipt); err != nil {
+		t.Fatalf("decode index receipt %q: %v", idxOut, err)
+	}
+	if idxReceipt["repo_id"] != "acme/handbook" || idxReceipt["role"] != "context" || int(idxReceipt["indexed"].(float64)) != 2 {
+		t.Fatalf("unexpected index receipt: %+v", idxReceipt)
+	}
+
+	hsMu.Lock()
+	ctxTags := retainedDocs["okf:acme/handbook:DEC-2026-009"]
+	runTags := retainedDocs["okf:acme/handbook:RUN-0005"]
+	hsMu.Unlock()
+	if len(ctxTags) == 0 || len(runTags) == 0 {
+		t.Fatalf("expected both DEC-2026-009 and RUN-0005 in Hindsight, got %+v", retainedDocs)
+	}
+	for _, tag := range ctxTags {
+		if tag == "guard:block" || tag == "status:active" {
+			t.Fatalf("context record retained forbidden tag %q in %v", tag, ctxTags)
+		}
+	}
+}
+
+func TestExtractRepoSlugAndDefaultRepoIDNonGitHubHosts(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"https://github.com/acme/infra.git", "acme/infra"},
+		{"https://www.github.com/acme/infra", "acme/infra"},
+		{"ssh://git@ssh.github.com:443/acme/infra.git", "acme/infra"},
+		{"git@github.com:acme/infra.git", "acme/infra"},
+		{"github.com/acme/infra", "acme/infra"},
+		{"acme/infra", "acme/infra"},
+		{"my.org/infra", "my.org/infra"},
+		{"https://gitlab.com/org/repo.git", "gitlab.com/org/repo"},
+		{"https://gitlab.com/org/sub/repo.git", "gitlab.com/org/sub/repo"},
+		{"git@gitlab.com:org/repo.git", "gitlab.com/org/repo"},
+		{"gitlab.com/org/repo", "gitlab.com/org/repo"},
+		{"https://gitea.internal:8443/platform/gitops.git", "gitea.internal/platform/gitops"},
+		{"ssh://git@gitlab.corp.example:2222/team/sub/cluster.git", "gitlab.corp.example/team/sub/cluster"},
+	}
+	for _, tc := range cases {
+		if got := extractRepoSlug(tc.in); got != tc.want {
+			t.Errorf("extractRepoSlug(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	t.Setenv("CURATOR_REPO_ID", "")
+	stateDir := t.TempDir()
+	stateFile := filepath.Join(stateDir, "managed_repos")
+	if err := os.WriteFile(stateFile, []byte(`[{"type":"gitlab","role":"gitops","url":"https://gitlab.com/org/gitops-fleet.git"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GITOPS_STATE_PATH", stateFile)
+	if got := defaultRepoID(); got != "gitlab.com/org/gitops-fleet" {
+		t.Fatalf("defaultRepoID() = %q, want %q", got, "gitlab.com/org/gitops-fleet")
+	}
+}
+
+func TestRunEmitCommitFlagGuardSeverityCapAndRunIndexContextRepoIsolation(t *testing.T) {
+	natsURL := startCLIJetStream(t)
+	t.Setenv("NATS_URL", natsURL)
+	t.Setenv(lib.EnvBusUser, "curator")
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"title\":\"LLM block guard\",\"context\":\"OOM exit 137\",\"decision\":\"Replicas >= 2\",\"guard\":{\"rule\":\"Replicas >= 2\",\"severity\":\"block\",\"expect\":{\"file\":\"apps/*.yaml\",\"path\":\"spec.replicas\",\"op\":\">=\",\"value\":2}}}"}}]}`))
+	}))
+	defer llmSrv.Close()
+	t.Setenv("DECISION_MEMORY_LLM_URL", llmSrv.URL)
+	t.Setenv("DECISION_MEMORY_LLM_MODEL", "test-model")
+
+	var hsMu sync.Mutex
+	retainedDocs := map[string][]string{}
+	hsMux := http.NewServeMux()
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions/config", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions/memories", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Items []struct {
+				DocumentID string   `json:"document_id"`
+				Tags       []string `json:"tags"`
+			} `json:"items"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		hsMu.Lock()
+		for _, it := range body.Items {
+			retainedDocs[it.DocumentID] = it.Tags
+		}
+		hsMu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hsMux.HandleFunc("/v1/default/banks/kube-agents-decisions/documents", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	})
+	hsSrv := httptest.NewServer(hsMux)
+	defer hsSrv.Close()
+	t.Setenv("HINDSIGHT_API_URL", hsSrv.URL)
+
+	// Configure a broker URL that fails if called so we verify local `curator index` sets FromLocal=true even on 0 docs.
+	var brokerCalled atomic.Bool
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		brokerCalled.Store(true)
+		http.Error(w, "broker should not be called when FromLocal=true", http.StatusInternalServerError)
+	}))
+	defer brokerSrv.Close()
+	t.Setenv("CREDENTIAL_PROXY_URL", brokerSrv.URL)
+
+	// Set up context_repos state + clone under <PLATFORM_AGENT_HOME>/gitops/lease-1/acme__ctx-handbook.
+	agentHome := t.TempDir()
+	ctxClone := filepath.Join(agentHome, "gitops", "lease-1", "acme__ctx-handbook")
+	if err := os.MkdirAll(filepath.Join(ctxClone, "docs", "adr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ctxClone, "docs", "adr", "0099-context-only.md"), []byte("# ADR 99: Context handbook ADR\n\nMust never leak into managed index.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateDir, "context_repos"), []byte(`[{"type":"github","url":"https://github.com/acme/ctx-handbook.git"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PLATFORM_AGENT_HOME", agentHome)
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(stateDir, "managed_repos"))
+
+	daemonStore := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(daemonStore, "apps"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(daemonStore, "apps", "web.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonContext(ctx, []string{"--repo", daemonStore, "--repo-id", "acme/gitops", "--status-listen", addr})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, rErr := httpClient.Get("http://" + addr + "/readyz"); rErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1. Verify `curator emit` accepts `--commit` and `--guard-severity warn` (capping LLM block synthesis).
+	emitOut, err := captureStdout(t, func() error {
+		return run([]string{
+			"emit",
+			"--kind", "proposed",
+			"--repo", "acme/gitops",
+			"--pr", "https://github.com/acme/gitops/pull/77 (#77)",
+			"--commit", "deadbeef1234567890",
+			"--guard-severity", "warn",
+			"--title", "OOM exit 137 guard proposal",
+			"--summary", "Pod hit OOM exit 137",
+			"--paths", "apps/**",
+		})
+	})
+	if err != nil {
+		t.Fatalf("curator emit --commit failed: %v", err)
+	}
+	var emitResp struct {
+		RecordID   string              `json:"record_id"`
+		PRMarkdown string              `json:"pr_markdown"`
+		Event      memory.OutcomeEvent `json:"event"`
+	}
+	if err := json.Unmarshal([]byte(emitOut), &emitResp); err != nil {
+		t.Fatalf("decode emit output %q: %v", emitOut, err)
+	}
+	if emitResp.Event.Commit != "deadbeef1234567890" || !strings.Contains(emitResp.PRMarkdown, "commit: deadbeef1234567890") {
+		t.Fatalf("expected commit deadbeef1234567890 in event and PRMarkdown, got event=%+v md=\n%s", emitResp.Event, emitResp.PRMarkdown)
+	}
+	if strings.Contains(emitResp.PRMarkdown, "severity: block") || !strings.Contains(emitResp.PRMarkdown, "severity: warn") {
+		t.Fatalf("expected --guard-severity warn to cap LLM block synthesis in PRMarkdown:\n%s", emitResp.PRMarkdown)
+	}
+
+	// 2. Verify `curator index --role managed` ignores context_repos clones on disk.
+	managedSnap := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(managedSnap, "docs", "adr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(managedSnap, "docs", "adr", "0001-managed.md"), []byte("# ADR 1: Managed repo ADR\n\nManaged content.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idxOut, err := captureStdout(t, func() error {
+		return run([]string{"index", "--repo", managedSnap, "--repo-id", "acme/secondary-managed", "--role", "managed"})
+	})
+	if err != nil {
+		t.Fatalf("curator index --role managed failed: %v", err)
+	}
+	var idxReceipt map[string]any
+	if err := json.Unmarshal([]byte(idxOut), &idxReceipt); err != nil {
+		t.Fatal(err)
+	}
+	if int(idxReceipt["indexed"].(float64)) != 1 {
+		t.Fatalf("expected exactly 1 managed doc indexed (no context_repos leak), got %+v", idxReceipt)
+	}
+	hsMu.Lock()
+	_, leaked := retainedDocs["okf:acme/secondary-managed:ADR-0099"]
+	_, hasManaged := retainedDocs["okf:acme/secondary-managed:ADR-0001"]
+	hsMu.Unlock()
+	if leaked || !hasManaged {
+		t.Fatalf("expected ADR-0001 only (hasManaged=%v) and zero ADR-0099 context_repos leak (leaked=%v)", hasManaged, leaked)
+	}
+
+	// 3. Verify `curator index` on an empty local repo passes FromLocal=true and never calls BrokerURL.
+	emptySnap := t.TempDir()
+	if _, err := captureStdout(t, func() error {
+		return run([]string{"index", "--repo", emptySnap, "--repo-id", "acme/empty-managed", "--role", "managed"})
+	}); err != nil {
+		t.Fatalf("curator index on empty local dir failed: %v", err)
+	}
+	if brokerCalled.Load() {
+		t.Fatal("expected FromLocal=true on local `curator index` to skip broker snapshot HTTP call")
 	}
 }

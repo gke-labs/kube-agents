@@ -188,12 +188,8 @@ the point at which authority is established rather than passed on.
   hub endpoints (alongside cloud APIs, GitHub-via-Minty, and MCP grounding). Authn is the **caller
   class's gateway key** for inference and **Workload Identity** for Minty — **no
   cross-cluster Kubernetes credentials** (§7).
-- **mem0/Qdrant (C10) — deferred post-v1:** cross-tier `mem0/Qdrant` recall is **not in v1** ([02](02-agent-personas.md)
-  §2.3; [`docs/designs/memory.md`](../designs/memory.md) indexes OKF records into single-install Hindsight `kube-agents-decisions`). If a cross-tier vector store is introduced later, default to a single shared hub store with **server-side** scope
-  isolation (per-scope collections / access-controlled keys) and treat recall as best-effort.
-- **OKF base (C9):** curated knowledge as markdown-in-git; lives in the GitOps repo under the
-  **`knowledge/` root** (decided — outside the paths the pipeline deploys, so it is never applied to a
-  cluster; a dedicated repo stays optional for later, `06` §5).
+- **mem0/Qdrant (C10) — deferred post-v1:** cross-tier `mem0/Qdrant` recall is **not in v1** ([02](02-agent-personas.md) §2.3). Under `--memory=hindsight`, [`docs/designs/memory.md`](../designs/memory.md) automatically indexes per-repository `/v1/vcs/snapshot` archives (`managed_repos` and read-only `context_repos`) into single-install Hindsight (`kube-agents-decisions`). Any future cross-tier vector store must use one shared hub store with **server-side** scope isolation and best-effort recall.
+- **OKF base (C9):** curated knowledge stays as markdown-in-git in the GitOps repository under the **`knowledge/` root**, which remains the curated source of truth. That path sits outside deployed manifest directories, so pipelines never apply it to a cluster, while read-only `context_repos` index as advisory `role:context` chunks (`06` §5).
 - **Observability (C12):** OTel → `gke-managed-otel` → Cloud Trace/Logging + Managed Prometheus;
   carries requester/trace/session for attribution (`docs/designs/audit-logging-user-attribution.md`).
 - **v1 security SLIs (audit-log-derived):** two continuous alerts off Cloud Logging / Managed
@@ -235,13 +231,8 @@ These are **defaults for a builder**, not commitments; revisit under load testin
   controller + all three agent tiers + shared services (inference, Minty) run in it, shared services
   **once**, and a single deploy pipeline covers both `fleet/` and `clusters/<self>/`. All three personas
   still run; the persona model and isolation proof are identical to a multi-cluster install.
-- **OKF location — `knowledge/` root in the GitOps repo.** Reuses the same PR/review flow + Minty
-  token; it lives outside the paths the pipeline deploys (`clusters/<cluster>/`, `fleet/`), so it is
-  never applied to a cluster. A dedicated knowledge repo stays optional if volume/governance later
-  requires it ([06](06-api-and-data-contracts.md) §5).
-- **Cross-tier semantic recall (mem0/Qdrant) — deferred post-v1.** v1 coordinates across tiers on GitOps + OKF
-  ([02](02-agent-personas.md) §2.3), while [`docs/designs/memory.md`](../designs/memory.md) and [06](06-api-and-data-contracts.md) §6 index OKF records into single-install Hindsight (`kube-agents-decisions`) under `--memory=hindsight`. If cross-tier Qdrant is later added: a single shared store in the hub with
-  **server-side** scope isolation; recall best-effort.
+- **OKF location — `knowledge/` root in the GitOps repo.** Git `knowledge/` remains the curated source of truth and reuses the same PR review flow and Minty token. It sits outside deployed paths (`clusters/<cluster>/`, `fleet/`). Separate read-only `context_repos` index automatically across `github-repo-watcher` ticks via `/v1/vcs/snapshot` without enforcement privileges ([06](06-api-and-data-contracts.md) §5).
+- **Cross-tier semantic recall (mem0/Qdrant) — deferred post-v1.** v1 coordinates across tiers on GitOps and OKF ([02](02-agent-personas.md) §2.3). Under `--memory=hindsight`, [`docs/designs/memory.md`](../designs/memory.md) and [06](06-api-and-data-contracts.md) §6 automatically sync per-repository `/v1/vcs/snapshot` archives (`knowledge/`, ADRs/RFCs, and runbooks) into single-install Hindsight (`kube-agents-decisions`). Any future cross-tier Qdrant deployment uses one shared hub store with **server-side** scope isolation and best-effort recall.
 
 ## 8. Verification
 

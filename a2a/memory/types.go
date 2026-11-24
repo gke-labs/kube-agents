@@ -115,6 +115,13 @@ const (
 	StatusRejected   RecordStatus = "rejected"
 	StatusSuperseded RecordStatus = "superseded"
 	StatusRetired    RecordStatus = "retired"
+
+	SeverityBlock = "block"
+	SeverityWarn  = "warn"
+	SeverityInfo  = "info"
+
+	RoleManaged = "managed"
+	RoleContext = "context"
 )
 
 // OutcomeEvent is the structured payload carried inside the DataPart of an
@@ -122,6 +129,7 @@ const (
 type OutcomeEvent struct {
 	Schema          string       `json:"schema,omitempty"`
 	Kind            OutcomeKind  `json:"kind"`
+	Outcome         string       `json:"outcome,omitempty"`
 	RecordID        string       `json:"record_id,omitempty"`
 	RecordType      RecordType   `json:"record_type,omitempty"`
 	Repo            string       `json:"repo,omitempty"`
@@ -147,6 +155,7 @@ type OutcomeEvent struct {
 	MergedAt        string       `json:"merged_at,omitempty"`
 	SoakWindow      string       `json:"soak_window,omitempty"`
 	Date            string       `json:"date,omitempty"`
+	GuardSeverity   string       `json:"guard_severity,omitempty"`
 	Scope           *RecordScope `json:"scope,omitempty"`
 	Guard           *RecordGuard `json:"guard,omitempty"`
 	Supersedes      []string     `json:"supersedes,omitempty"`
@@ -215,6 +224,8 @@ type RecordMeta struct {
 	Title        string         `json:"title" yaml:"title"`
 	Status       RecordStatus   `json:"status" yaml:"status"`
 	Date         string         `json:"date,omitempty" yaml:"date,omitempty"`
+	Repo         string         `json:"repo,omitempty" yaml:"repo,omitempty"`
+	Role         string         `json:"role,omitempty" yaml:"role,omitempty"`
 	Declares     []DeclareItem  `json:"declares,omitempty" yaml:"declares,omitempty"`
 	Scope        RecordScope    `json:"scope,omitempty" yaml:"scope,omitempty"`
 	Guard        *RecordGuard   `json:"guard,omitempty" yaml:"guard,omitempty"`
@@ -245,6 +256,7 @@ type BlueprintRecordDigest struct {
 	Type           RecordType   `json:"type"`
 	Status         RecordStatus `json:"status"`
 	Title          string       `json:"title"`
+	Repo           string       `json:"repo,omitempty"`
 	Path           string       `json:"path"`
 	Branch         string       `json:"branch,omitempty"`
 	PRMarkdown     string       `json:"pr_markdown,omitempty"`
@@ -290,22 +302,31 @@ type MemoryQueryRequest struct {
 	Path          string        `json:"path,omitempty"`
 	Cluster       string        `json:"cluster,omitempty"`
 	MaxResults    int           `json:"max_results,omitempty"`
+	Repo          string        `json:"repo,omitempty"`
+	Role          string        `json:"role,omitempty"`
+	FromLocal     bool          `json:"from_local,omitempty"`
+	Records       []Record      `json:"records,omitempty"`
 	Outcome       *OutcomeEvent `json:"outcome,omitempty"`
 }
 
 // MemoryQueryResponse is the NATS reply payload returned by the Curator's
 // memory query responder.
 type MemoryQueryResponse struct {
-	Schema  string                  `json:"schema"`
-	Backend string                  `json:"backend"`
-	Bank    string                  `json:"bank"`
-	Query   string                  `json:"query"`
-	Tags    []string                `json:"tags,omitempty"`
-	Cached  bool                    `json:"cached"`
-	Results []HindsightRecallResult `json:"results"`
-	Records []BlueprintRecordDigest `json:"records,omitempty"`
-	Outcome *OutcomeProcessResult   `json:"outcome,omitempty"`
-	Error   string                  `json:"error,omitempty"`
+	Schema   string                  `json:"schema"`
+	OK       bool                    `json:"ok,omitempty"`
+	Backend  string                  `json:"backend"`
+	Bank     string                  `json:"bank"`
+	Query    string                  `json:"query"`
+	Repo     string                  `json:"repo,omitempty"`
+	Revision string                  `json:"revision,omitempty"`
+	Upserted []string                `json:"upserted,omitempty"`
+	Deleted  []string                `json:"deleted,omitempty"`
+	Tags     []string                `json:"tags,omitempty"`
+	Cached   bool                    `json:"cached"`
+	Results  []HindsightRecallResult `json:"results"`
+	Records  []BlueprintRecordDigest `json:"records,omitempty"`
+	Outcome  *OutcomeProcessResult   `json:"outcome,omitempty"`
+	Error    string                  `json:"error,omitempty"`
 }
 
 var (
@@ -331,10 +352,12 @@ var (
 		"knowledge/observations",
 		"docs/adr",
 		"docs/adrs",
+		"docs/decisions",
 		"docs/rfcs",
 		"docs/runbooks",
 		"docs/playbooks",
 		"adr",
+		"decisions",
 		"rfcs",
 		"runbooks",
 		"playbooks",
@@ -399,11 +422,107 @@ func (r Record) Tags() []string {
 	if r.Meta.Evidence.PullRequest != "" {
 		seen["pr:"+r.Meta.Evidence.PullRequest] = struct{}{}
 	}
+	if repo := strings.TrimSpace(r.Meta.Repo); repo != "" {
+		hasRepoTag := false
+		for existing := range seen {
+			if strings.HasPrefix(existing, "repo:") {
+				hasRepoTag = true
+				break
+			}
+		}
+		if !hasRepoTag {
+			seen["repo:"+repo] = struct{}{}
+		}
+	}
+	if role := strings.TrimSpace(r.Meta.Role); role != "" {
+		seen["role:"+role] = struct{}{}
+	}
 	out := make([]string, 0, len(seen))
 	for t := range seen {
 		out = append(out, t)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func cloneRecord(r Record) Record {
+	cp := r
+	if r.Meta.Declares != nil {
+		cp.Meta.Declares = append([]DeclareItem(nil), r.Meta.Declares...)
+	}
+	if r.Meta.Scope.Paths != nil {
+		cp.Meta.Scope.Paths = append([]string(nil), r.Meta.Scope.Paths...)
+	}
+	if r.Meta.Scope.Resources != nil {
+		cp.Meta.Scope.Resources = append([]string(nil), r.Meta.Scope.Resources...)
+	}
+	if r.Meta.Scope.Clusters != nil {
+		cp.Meta.Scope.Clusters = append([]string(nil), r.Meta.Scope.Clusters...)
+	}
+	if r.Meta.Scope.Checks != nil {
+		cp.Meta.Scope.Checks = append([]string(nil), r.Meta.Scope.Checks...)
+	}
+	if r.Meta.Guard != nil {
+		g := *r.Meta.Guard
+		if r.Meta.Guard.Expect != nil {
+			exp := *r.Meta.Guard.Expect
+			g.Expect = &exp
+		}
+		cp.Meta.Guard = &g
+	}
+	if r.Meta.Evidence.RejectedProposals != nil {
+		cp.Meta.Evidence.RejectedProposals = append([]string(nil), r.Meta.Evidence.RejectedProposals...)
+	}
+	if r.Meta.Supersedes != nil {
+		cp.Meta.Supersedes = append([]string(nil), r.Meta.Supersedes...)
+	}
+	return cp
+}
+
+// NormalizeRepoRecords returns a deep copy of recs stamped with repository and role metadata.
+// When role is "context", it strips machine guard assertions and downgrades blocking guards.
+func NormalizeRepoRecords(repoID, role string, recs []Record) []Record {
+	if len(recs) == 0 {
+		return []Record{}
+	}
+	cleanRepo := strings.TrimSpace(repoID)
+	normRole := strings.ToLower(strings.TrimSpace(role))
+	if normRole != RoleManaged && normRole != RoleContext {
+		normRole = ""
+	}
+	out := make([]Record, 0, len(recs))
+	for _, r := range recs {
+		cp := cloneRecord(r)
+		if cleanRepo != "" {
+			cp.Meta.Repo = cleanRepo
+		}
+		if normRole != "" {
+			cp.Meta.Role = normRole
+		}
+		if normRole == RoleContext {
+			for i := range cp.Meta.Declares {
+				cp.Meta.Declares[i].File = ""
+				cp.Meta.Declares[i].Path = ""
+				cp.Meta.Declares[i].Op = ""
+				cp.Meta.Declares[i].Value = nil
+				if strings.EqualFold(strings.TrimSpace(cp.Meta.Declares[i].Severity), SeverityBlock) {
+					cp.Meta.Declares[i].Severity = SeverityWarn
+				}
+			}
+			if cp.Meta.Guard != nil {
+				cp.Meta.Guard.Expect = nil
+				if strings.EqualFold(strings.TrimSpace(cp.Meta.Guard.Severity), SeverityBlock) {
+					cp.Meta.Guard.Severity = SeverityWarn
+				}
+				if strings.TrimSpace(cp.Meta.Guard.Rule) == "" && strings.TrimSpace(cp.Meta.Guard.Severity) == "" {
+					cp.Meta.Guard = nil
+				} else {
+					cp.Meta.Status = StatusProposed
+				}
+			}
+		}
+		out = append(out, cp)
+	}
 	return out
 }
 
@@ -774,7 +893,16 @@ func inferExternalDocTypeAndPrefix(fm map[string]any, relPath string) (RecordTyp
 		}
 	}
 	lower := strings.ToLower(innerPath)
+	dirSlash := strings.ToLower(filepath.ToSlash(filepath.Dir(innerPath)))
 	switch {
+	case dirSlash == "docs/decisions" || strings.HasPrefix(dirSlash, "docs/decisions/") ||
+		dirSlash == "decisions" || strings.HasPrefix(dirSlash, "decisions/"):
+		return RecordTypeDecision, "ADR"
+	case dirSlash == "docs/runbooks" || strings.HasPrefix(dirSlash, "docs/runbooks/") ||
+		dirSlash == "runbooks" || strings.HasPrefix(dirSlash, "runbooks/") ||
+		dirSlash == "docs/playbooks" || strings.HasPrefix(dirSlash, "docs/playbooks/") ||
+		dirSlash == "playbooks" || strings.HasPrefix(dirSlash, "playbooks/"):
+		return RecordTypeRunbook, "RUN"
 	case strings.Contains(lower, "runbook") || strings.Contains(lower, "playbook"):
 		return RecordTypeRunbook, "RUN"
 	case strings.Contains(lower, "blueprint"):
@@ -1121,18 +1249,26 @@ func configuredExtraRepos(primaryRepo string, extraRepos []string) []string {
 	return out
 }
 
+type externalDocRoot struct {
+	dir    string
+	prefix string
+}
+
+// LoadSingleRepoExternalDocRecords scans external documentation directories inside repoDir only.
+func LoadSingleRepoExternalDocRecords(repoDir string) ([]Record, error) {
+	return loadExternalDocRecordsFromRoots(repoDir, []externalDocRoot{{dir: repoDir, prefix: ""}})
+}
+
 // LoadExternalDocRecords scans ADR and RFC directories in repoDir and any configured extra repos.
 func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, error) {
-	roots := []struct {
-		dir    string
-		prefix string
-	}{{dir: repoDir, prefix: ""}}
+	roots := []externalDocRoot{{dir: repoDir, prefix: ""}}
 	for _, extra := range configuredExtraRepos(repoDir, extraRepos) {
-		roots = append(roots, struct {
-			dir    string
-			prefix string
-		}{dir: extra, prefix: filepath.Base(extra)})
+		roots = append(roots, externalDocRoot{dir: extra, prefix: filepath.Base(extra)})
 	}
+	return loadExternalDocRecordsFromRoots(repoDir, roots)
+}
+
+func loadExternalDocRecordsFromRoots(repoDir string, roots []externalDocRoot) ([]Record, error) {
 	seenIDs := map[string]bool{}
 	if existing, err := LoadRecords(repoDir); err == nil {
 		for _, r := range existing {
@@ -1142,6 +1278,7 @@ func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, err
 	var out []Record
 	seenFiles := map[string]bool{}
 	for _, root := range roots {
+		var rootRecs []Record
 		if root.prefix != "" {
 			if extraRecs, err := LoadRecords(root.dir); err == nil {
 				for _, r := range extraRecs {
@@ -1157,12 +1294,16 @@ func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, err
 					}
 					seenIDs[r.Meta.ID] = true
 					r.Path = rel
-					out = append(out, r)
+					rootRecs = append(rootRecs, r)
 				}
 			}
 		}
 		rRoot, err := os.OpenRoot(root.dir)
 		if err != nil {
+			if root.prefix != "" && len(rootRecs) > 0 {
+				rootRecs = NormalizeRepoRecords(root.prefix, RoleContext, rootRecs)
+			}
+			out = append(out, rootRecs...)
 			continue
 		}
 		for _, sub := range externalDocDirs {
@@ -1201,10 +1342,14 @@ func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, err
 					rec.Meta.ID = fmt.Sprintf("%s-%s", rec.Meta.ID, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
 				}
 				seenIDs[rec.Meta.ID] = true
-				out = append(out, rec)
+				rootRecs = append(rootRecs, rec)
 			}
 		}
 		_ = rRoot.Close()
+		if root.prefix != "" && len(rootRecs) > 0 {
+			rootRecs = NormalizeRepoRecords(root.prefix, RoleContext, rootRecs)
+		}
+		out = append(out, rootRecs...)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Meta.ID < out[j].Meta.ID })
 	return out, nil
@@ -1354,6 +1499,7 @@ func BuildBlueprintDigest(repoID string, records []Record, lastEvent string, gra
 			Type:           r.Meta.Type,
 			Status:         r.Meta.Status,
 			Title:          r.Meta.Title,
+			Repo:           r.Meta.Repo,
 			Path:           r.Path,
 			Branch:         branch,
 			PRMarkdown:     prMarkdown,

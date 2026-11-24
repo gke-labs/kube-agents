@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2650,5 +2651,822 @@ func TestGitopsPRsDefaultDisabledAndRemediationPRInProposed(t *testing.T) {
 	}
 	if soakRes.Status != StatusProposed {
 		t.Fatalf("expected StatusProposed with DECISION_MEMORY_GITOPS_PRS unset, got %s", soakRes.Status)
+	}
+}
+
+func makeSnapshotTarBase64(t *testing.T, files map[string]string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	for _, name := range names {
+		content := files[name]
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o600,
+			Size: int64(len(content)),
+		}); err != nil {
+			t.Fatalf("tar header %s: %v", name, err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatalf("tar write %s: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func TestExternalDocDecisionsRunbooksAndNormalizeContextRecords(t *testing.T) {
+	repoDir := t.TempDir()
+	for _, entry := range []struct {
+		rel     string
+		content string
+	}{
+		{
+			rel:     "docs/decisions/0001-runbook-layout.md",
+			content: "# Decision 1: Standardize runbook layout\n\nKeep operational documents concise.\n",
+		},
+		{
+			rel:     "decisions/0002-network-policy.md",
+			content: "# Decision 2: Default network isolation\n\nRequire explicit ingress rules.\n",
+		},
+		{
+			rel:     "docs/runbooks/0001-decision-service-drain.md",
+			content: "# Drain procedure\n\nCordon nodes one zone at a time.\n",
+		},
+		{
+			rel:     "runbooks/0002-etcd-compaction.md",
+			content: "# Etcd compaction guide\n\nCompact revisions during low traffic.\n",
+		},
+		{
+			rel:     "playbooks/0003-dns-saturation.md",
+			content: "# DNS saturation playbook\n\nScale CoreDNS replicas.\n",
+		},
+	} {
+		full := filepath.Join(repoDir, filepath.FromSlash(entry.rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(entry.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recs, err := LoadSingleRepoExternalDocRecords(repoDir)
+	if err != nil {
+		t.Fatalf("LoadSingleRepoExternalDocRecords: %v", err)
+	}
+	if len(recs) != 5 {
+		t.Fatalf("expected 5 external doc records, got %d: %+v", len(recs), recs)
+	}
+	byID := map[string]Record{}
+	for _, r := range recs {
+		byID[r.Meta.ID] = r
+	}
+	if r, ok := byID["ADR-0001"]; !ok || r.Meta.Type != RecordTypeDecision {
+		t.Fatalf("expected docs/decisions/0001-runbook-layout.md -> (decision, ADR-0001), got %+v", byID["ADR-0001"])
+	}
+	if r, ok := byID["ADR-0002"]; !ok || r.Meta.Type != RecordTypeDecision {
+		t.Fatalf("expected decisions/0002-network-policy.md -> (decision, ADR-0002), got %+v", byID["ADR-0002"])
+	}
+	for _, id := range []string{"RUN-0001", "RUN-0002", "RUN-0003"} {
+		if r, ok := byID[id]; !ok || r.Meta.Type != RecordTypeRunbook {
+			t.Fatalf("expected %s to load as RecordTypeRunbook, got %+v", id, byID[id])
+		}
+	}
+
+	origPaths := []string{"apps/*.yaml"}
+	origExpect := &GuardExpect{File: "apps/*.yaml", Path: "spec.replicas", Op: ">=", Value: 3}
+	input := []Record{
+		{
+			Path: "knowledge/decision/DEC-2026-001.md",
+			Meta: RecordMeta{
+				ID:     "DEC-2026-001",
+				Type:   RecordTypeDecision,
+				Status: StatusActive,
+				Title:  "Context repo guard rule",
+				Scope:  RecordScope{Paths: origPaths, Clusters: []string{"*"}},
+				Declares: []DeclareItem{{
+					File:     "apps/*.yaml",
+					Path:     "spec.replicas",
+					Op:       ">=",
+					Value:    3,
+					Severity: SeverityBlock,
+				}},
+				Guard: &RecordGuard{
+					Rule:     "Keep replicas >= 3",
+					Severity: SeverityBlock,
+					Expect:   origExpect,
+				},
+			},
+			Body: "Context rule body.",
+		},
+		byID["RUN-0001"],
+	}
+
+	norm := NormalizeRepoRecords("acme/shared-docs", RoleContext, input)
+	if len(norm) != 2 {
+		t.Fatalf("expected 2 normalized records, got %d", len(norm))
+	}
+	// Verify caller structs were deep-copied and not mutated.
+	if input[0].Meta.Guard.Expect == nil || input[0].Meta.Guard.Severity != SeverityBlock || input[0].Meta.Status != StatusActive {
+		t.Fatalf("NormalizeRepoRecords mutated caller input slice: %+v", input[0].Meta)
+	}
+	normGuardRec := norm[0]
+	if normGuardRec.Meta.Repo != "acme/shared-docs" || normGuardRec.Meta.Role != RoleContext {
+		t.Fatalf("unexpected repo/role on normalized guard record: %+v", normGuardRec.Meta)
+	}
+	if normGuardRec.Meta.Status != StatusProposed {
+		t.Fatalf("expected context guard record status=proposed, got %s", normGuardRec.Meta.Status)
+	}
+	if normGuardRec.Meta.Guard == nil || normGuardRec.Meta.Guard.Expect != nil || normGuardRec.Meta.Guard.Severity != SeverityWarn {
+		t.Fatalf("expected context guard Expect=nil and Severity=warn, got %+v", normGuardRec.Meta.Guard)
+	}
+	if normGuardRec.Meta.Declares[0].File != "" || normGuardRec.Meta.Declares[0].Severity != SeverityWarn {
+		t.Fatalf("expected context Declares assertion stripped and downgraded, got %+v", normGuardRec.Meta.Declares[0])
+	}
+	guardTags := normGuardRec.Tags()
+	if !matchesTags(guardTags, []string{"repo:acme/shared-docs", "role:context", "guard:warn", "status:proposed"}, "all_strict") {
+		t.Fatalf("unexpected tags on normalized context guard record: %v", guardTags)
+	}
+	repoTagCount := 0
+	for _, tag := range guardTags {
+		if strings.HasPrefix(tag, "repo:") {
+			repoTagCount++
+		}
+	}
+	if repoTagCount != 1 {
+		t.Fatalf("expected exactly 1 repo: tag, got %d in %v", repoTagCount, guardTags)
+	}
+
+	// Verify a normalized context guard record never triggers a block verdict in CheckChangedFiles.
+	badYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  replicas: 1\n"
+	rep := CheckChangedFiles(norm, map[string]*string{"apps/deploy.yaml": &badYAML})
+	if rep.Verdict == SeverityBlock {
+		t.Fatalf("context repo record must never produce Verdict=block, got %+v", rep)
+	}
+
+	// Advisory runbook keeps Guard == nil, StatusActive, and role:context.
+	normRunbook := norm[1]
+	if normRunbook.Meta.Guard != nil || normRunbook.Meta.Status != StatusActive || normRunbook.Meta.Role != RoleContext {
+		t.Fatalf("unexpected advisory runbook normalization: %+v", normRunbook.Meta)
+	}
+}
+
+func TestMultiRepoSnapshotIsolation413FallbackAndNATSIndexBoundary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	natsURL := startEmbeddedJetStream(t)
+	mockHS, hsSrv := newMockHindsightServer(t)
+
+	client, err := lib.Connect(ctx, natsURL, lib.WithName("curator-multirepo-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var brokerMu sync.Mutex
+	var brokerRequests []map[string]any
+
+	repoATar := makeSnapshotTarBase64(t, map[string]string{
+		"docs/decisions/ADR-001-gateway.md": "# ADR-001: Gateway controller in repo-a\n\nUse Envoy gateway for edge traffic.\n",
+	})
+	repoBTar := makeSnapshotTarBase64(t, map[string]string{
+		"decisions/ADR-001-gateway.md":       "# ADR-001: Gateway controller in repo-b\n\nUse internal load balancer for mesh traffic.\n",
+		"runbooks/0001-mesh- failover.md":    "# Mesh drain runbook\n\nShift weight to zero before restart.\n",
+		"knowledge/decision/DEC-2026-001.md": "---\ntype: decision\nid: DEC-2026-001\ntitle: Repo B replica policy\nstatus: active\ndate: \"2026-11-20\"\nscope:\n  paths:\n    - services/**\n---\n\nKeep two replicas in repo-b.\n",
+	})
+
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/vcs/snapshot" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		brokerMu.Lock()
+		brokerRequests = append(brokerRequests, body)
+		brokerMu.Unlock()
+
+		repo, _ := body["repository"].(string)
+		_, hasPaths := body["paths"]
+		w.Header().Set("Content-Type", "application/json")
+
+		switch repo {
+		case "acme/repo-a":
+			if hasPaths {
+				t.Errorf("expected initial snapshot request for acme/repo-a without paths, got %+v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"revision":      "1111111111111111111111111111111111111111",
+				"archiveBase64": repoATar,
+			})
+		case "acme/repo-b":
+			// Simulate HTTP 413 SNAPSHOT_TOO_LARGE on whole-tree request, then 200 on narrowed paths.
+			if !hasPaths {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code":     "SNAPSHOT_TOO_LARGE",
+					"revision": "2222222222222222222222222222222222222222",
+					"entries": []map[string]any{
+						{"path": "vendor", "type": "tree"},
+						{"path": "knowledge", "type": "tree"},
+						{"path": "decisions", "type": "tree"},
+						{"path": "runbooks", "type": "tree"},
+					},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"revision":      "2222222222222222222222222222222222222222",
+				"archiveBase64": repoBTar,
+			})
+		case "acme/no-docs":
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":     "SNAPSHOT_TOO_LARGE",
+				"revision": "3333333333333333333333333333333333333333",
+				"entries": []map[string]any{
+					{"path": "cmd", "type": "tree"},
+					{"path": "pkg", "type": "tree"},
+				},
+			})
+		default:
+			http.Error(w, "unknown repo", http.StatusNotFound)
+		}
+	}))
+	defer brokerSrv.Close()
+
+	storeDir := t.TempDir()
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   storeDir,
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/repo-a",
+		Client:    client,
+		Hindsight: NewHindsightClient(hsSrv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cur.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer cur.Stop()
+
+	// 1. Action: "index" MUST be rejected on SubjectMemoryQuery (read-only query channel).
+	if _, qErr := QueryViaNATS(ctx, client, MemoryQueryRequest{
+		Action: "index",
+		Repo:   "acme/repo-a",
+	}); qErr == nil || !strings.Contains(qErr.Error(), SubjectCuratorOutcomes) {
+		t.Fatalf("expected Action=index on SubjectMemoryQuery to be rejected, got err=%v", qErr)
+	}
+
+	// 2. IndexViaNATS on SubjectCuratorOutcomes for acme/repo-a and acme/repo-b (413 fallback) and acme/no-docs.
+	respA, err := IndexViaNATS(ctx, client, MemoryQueryRequest{
+		Repo: "acme/repo-a",
+		Role: RoleManaged,
+	})
+	if err != nil {
+		t.Fatalf("IndexViaNATS(acme/repo-a): %v", err)
+	}
+	if !respA.OK || respA.Revision != "1111111111111111111111111111111111111111" || len(respA.Upserted) != 1 {
+		t.Fatalf("unexpected respA: %+v", respA)
+	}
+
+	respB, err := IndexViaNATS(ctx, client, MemoryQueryRequest{
+		Repo: "acme/repo-b",
+		Role: RoleManaged,
+	})
+	if err != nil {
+		t.Fatalf("IndexViaNATS(acme/repo-b): %v", err)
+	}
+	if !respB.OK || respB.Revision != "2222222222222222222222222222222222222222" || len(respB.Upserted) != 3 {
+		t.Fatalf("unexpected respB: %+v", respB)
+	}
+
+	respNoDocs, err := IndexViaNATS(ctx, client, MemoryQueryRequest{
+		Repo: "acme/no-docs",
+		Role: RoleManaged,
+	})
+	if err != nil {
+		t.Fatalf("IndexViaNATS(acme/no-docs): %v", err)
+	}
+	if !respNoDocs.OK || respNoDocs.Revision != "3333333333333333333333333333333333333333" || len(respNoDocs.Upserted) != 0 {
+		t.Fatalf("unexpected respNoDocs: %+v", respNoDocs)
+	}
+
+	// Verify narrowed 413 retry requested only matching doc roots ["knowledge", "decisions", "runbooks"].
+	brokerMu.Lock()
+	var narrowedPaths []string
+	for _, reqMap := range brokerRequests {
+		if reqMap["repository"] == "acme/repo-b" {
+			if rawPaths, ok := reqMap["paths"].([]any); ok {
+				for _, p := range rawPaths {
+					if s, ok := p.(string); ok {
+						narrowedPaths = append(narrowedPaths, s)
+					}
+				}
+			}
+		}
+	}
+	brokerMu.Unlock()
+	if !reflect.DeepEqual(narrowedPaths, []string{"knowledge", "decisions", "runbooks"}) {
+		t.Fatalf("expected 413 fallback paths [knowledge decisions runbooks], got %v", narrowedPaths)
+	}
+
+	// Verify per-repo .git-verified/<slug> isolation kept BOTH acme__repo-a and acme__repo-b intact.
+	if _, err := os.Stat(filepath.Join(storeDir, verifiedGitSubdir, "acme__repo-a", "docs", "decisions", "ADR-001-gateway.md")); err != nil {
+		t.Fatalf("expected acme__repo-a snapshot to survive syncing acme/repo-b: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, verifiedGitSubdir, "acme__repo-b", "decisions", "ADR-001-gateway.md")); err != nil {
+		t.Fatalf("expected acme__repo-b snapshot on disk: %v", err)
+	}
+
+	// 3. Index a context repository via IndexViaNATS and verify zero disk writes + guard stripping.
+	ctxRec := Record{
+		Path: "docs/decisions/ADR-001-context.md",
+		Meta: RecordMeta{
+			ID:     "ADR-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Gateway controller reference architecture",
+			Scope:  RecordScope{Clusters: []string{"*"}, Paths: []string{"**"}},
+			Guard: &RecordGuard{
+				Rule:     "Never allow hostPort in gateway pods",
+				Severity: SeverityBlock,
+				Expect:   &GuardExpect{File: "gateway.yaml", Path: "spec.hostPort", Op: "absent"},
+			},
+		},
+		Body: "Shared platform reference architecture for gateway controllers.",
+	}
+	respCtx, err := IndexViaNATS(ctx, client, MemoryQueryRequest{
+		Repo:    "acme/platform-handbook",
+		Role:    RoleContext,
+		Records: []Record{ctxRec},
+	})
+	if err != nil {
+		t.Fatalf("IndexViaNATS(context): %v", err)
+	}
+	if !respCtx.OK || len(respCtx.Upserted) != 1 {
+		t.Fatalf("unexpected context index response: %+v", respCtx)
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, verifiedGitSubdir, "acme__platform-handbook")); !os.IsNotExist(err) {
+		t.Fatalf("context repo must never write to .git-verified, stat err=%v", err)
+	}
+
+	mockHS.mu.Lock()
+	ctxDoc, hasCtxDoc := mockHS.docs["okf:acme/platform-handbook:ADR-001"]
+	docA, hasDocA := mockHS.docs["okf:acme/repo-a:ADR-001"]
+	docB, hasDocB := mockHS.docs["okf:acme/repo-b:ADR-001"]
+	mockHS.mu.Unlock()
+	if !hasCtxDoc || !hasDocA || !hasDocB {
+		t.Fatalf("expected ADR-001 retained separately for repo-a (%v), repo-b (%v), and platform-handbook (%v)", hasDocA, hasDocB, hasCtxDoc)
+	}
+	if !matchesTags(docA.Tags, []string{"repo:acme/repo-a", "role:managed"}, "all_strict") {
+		t.Fatalf("expected repo-a tags on docA, got %v", docA.Tags)
+	}
+	if !matchesTags(docB.Tags, []string{"repo:acme/repo-b", "role:managed"}, "all_strict") {
+		t.Fatalf("expected repo-b tags on docB, got %v", docB.Tags)
+	}
+	if !matchesTags(ctxDoc.Tags, []string{"repo:acme/platform-handbook", "role:context", "guard:warn", "status:proposed"}, "all_strict") {
+		t.Fatalf("expected context doc in Hindsight to be downgraded to guard:warn and status:proposed, got %v", ctxDoc.Tags)
+	}
+
+	// 4. Verify HandleQuery returns ADR-001 from repo-a, repo-b, and platform-handbook without collision (including local fallback without Hindsight).
+	curNoHS, err := NewCurator(CuratorConfig{
+		RepoDir:   storeDir,
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/repo-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	curNoHS.IndexRepo(ctx, MemoryQueryRequest{
+		Repo:    "acme/platform-handbook",
+		Role:    RoleContext,
+		Records: []Record{ctxRec},
+	})
+	localQuery := curNoHS.HandleQuery(ctx, MemoryQueryRequest{
+		Query: "gateway controller",
+	})
+	seenDocIDs := map[string]bool{}
+	for _, hit := range localQuery.Results {
+		seenDocIDs[hit.DocumentID] = true
+	}
+	for _, wantDocID := range []string{
+		"okf:acme/repo-a:ADR-001",
+		"okf:acme/repo-b:ADR-001",
+		"okf:acme/platform-handbook:ADR-001",
+	} {
+		if !seenDocIDs[wantDocID] {
+			t.Fatalf("HandleQuery local fallback missing %s; got %+v", wantDocID, localQuery.Results)
+		}
+	}
+}
+
+func TestExtraRepoDocsNormalizedAsContextAndPrimaryContextRoleRejected(t *testing.T) {
+	primaryDir := t.TempDir()
+	extraDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(extraDir, "knowledge", "decision"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	extraBlockMD := "---\ntype: decision\nid: DEC-2026-077\ntitle: Extra repo active block guard\nstatus: active\ndate: \"2026-11-24\"\ndeclares:\n  - file: apps/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 4\n    severity: block\n    rule: Require at least 4 replicas.\nscope:\n  paths:\n    - apps/**\nguard:\n  rule: Require at least 4 replicas.\n  severity: block\n  expect:\n    file: apps/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 4\n---\n\nExtra repo rule.\n"
+	if err := os.WriteFile(filepath.Join(extraDir, "knowledge", "decision", "DEC-2026-077.md"), []byte(extraBlockMD), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, err := LoadExternalDocRecords(primaryDir, extraDir)
+	if err != nil {
+		t.Fatalf("LoadExternalDocRecords: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 extra repo record, got %+v", recs)
+	}
+	got := recs[0]
+	if got.Meta.Role != RoleContext || got.Meta.Status != StatusProposed {
+		t.Fatalf("expected extra repo guard record to be downgraded to role=context status=proposed, got role=%q status=%q", got.Meta.Role, got.Meta.Status)
+	}
+	if got.Meta.Guard == nil || got.Meta.Guard.Expect != nil || got.Meta.Guard.Severity != SeverityWarn {
+		t.Fatalf("expected extra repo guard expect stripped and severity capped at warn, got %+v", got.Meta.Guard)
+	}
+	if len(got.Meta.Declares) != 1 || got.Meta.Declares[0].File != "" || got.Meta.Declares[0].Severity != SeverityWarn {
+		t.Fatalf("expected extra repo declares assertion stripped and downgraded, got %+v", got.Meta.Declares)
+	}
+	badYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 1\n"
+	rep := CheckChangedFiles(recs, map[string]*string{"apps/web.yaml": &badYAML})
+	if rep.Verdict == SeverityBlock {
+		t.Fatalf("extra/context repo record must never produce block verdict, got %+v", rep)
+	}
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir: t.TempDir(),
+		RepoID:  "acme/primary-gitops",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rej := cur.IndexRepo(context.Background(), MemoryQueryRequest{
+		Action:  "index",
+		Repo:    "ACME/PRIMARY-GITOPS",
+		Role:    RoleContext,
+		Records: recs,
+	})
+	if rej.OK || !strings.Contains(rej.Error, "cannot index primary managed repository") {
+		t.Fatalf("expected IndexRepo to reject role=context for primary managed repo, got %+v", rej)
+	}
+}
+
+func TestSnapshotTooLargeNullEntriesAndMultiPathNotFoundFailClosed(t *testing.T) {
+	ctx := context.Background()
+	mockHS, hsSrv := newMockHindsightServer(t)
+	hsClient := NewHindsightClient(hsSrv.URL, DefaultBankID)
+	if err := hsClient.EnsureBank(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	seedActive := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Preserve Git-governed record on 413 failure",
+			Date:   "2026-11-24",
+			Repo:   "acme/oversized",
+			Role:   RoleManaged,
+			Scope:  RecordScope{Paths: []string{"clusters/**"}},
+		},
+		Body: "Must not be deleted when broker omits entries on 413.",
+	}
+	for _, repo := range []string{"acme/oversized", "acme/omitted-entries", "acme/proxy-413", "acme/toctou", "acme/single-gone"} {
+		cp := seedActive
+		cp.Meta.Repo = repo
+		if err := hsClient.RetainRecord(ctx, repo, cp); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		repo, _ := body["repository"].(string)
+		_, hasPaths := body["paths"]
+		w.Header().Set("Content-Type", "application/json")
+
+		switch repo {
+		case "acme/oversized":
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"code":"SNAPSHOT_TOO_LARGE","revision":"aaaa","entries":null}`))
+		case "acme/omitted-entries":
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"code":"SNAPSHOT_TOO_LARGE","error":"clone exceeds max_clone_bytes"}`))
+		case "acme/proxy-413":
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":"Request Entity Too Large"}`))
+		case "acme/toctou":
+			if !hasPaths {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_, _ = w.Write([]byte(`{"code":"SNAPSHOT_TOO_LARGE","revision":"bbbb","entries":[{"path":"knowledge","type":"tree"},{"path":"runbooks","type":"tree"}]}`))
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":"PATH_NOT_FOUND","error":"PATH_NOT_FOUND: runbooks"}`))
+		case "acme/single-gone":
+			if !hasPaths {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_, _ = w.Write([]byte(`{"code":"SNAPSHOT_TOO_LARGE","revision":"cccc","entries":[{"path":"runbooks","type":"tree"}]}`))
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":"PATH_NOT_FOUND","error":"PATH_NOT_FOUND: runbooks"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer brokerSrv.Close()
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   t.TempDir(),
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/primary",
+		Hindsight: hsClient,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, failRepo := range []string{"acme/oversized", "acme/omitted-entries", "acme/proxy-413", "acme/toctou"} {
+		resp := cur.IndexRepo(ctx, MemoryQueryRequest{
+			Action: "index",
+			Repo:   failRepo,
+			Role:   RoleManaged,
+		})
+		if resp.OK || resp.Error == "" {
+			t.Fatalf("expected IndexRepo(%s) to fail closed, got %+v", failRepo, resp)
+		}
+		mockHS.mu.Lock()
+		_, stillPresent := mockHS.docs["okf:"+failRepo+":DEC-2026-001"]
+		mockHS.mu.Unlock()
+		if !stillPresent {
+			t.Fatalf("fail-closed violation: Hindsight record for %s was deleted on error!", failRepo)
+		}
+	}
+
+	// Single matched root disappearing on narrowed retry is unambiguously empty and removes stale doc.
+	okResp := cur.IndexRepo(ctx, MemoryQueryRequest{
+		Action: "index",
+		Repo:   "acme/single-gone",
+		Role:   RoleManaged,
+	})
+	if !okResp.OK || okResp.Error != "" || len(okResp.Deleted) != 1 {
+		t.Fatalf("expected single-root PATH_NOT_FOUND to succeed and prune stale doc, got %+v", okResp)
+	}
+}
+
+func TestConcurrentHandleQueryNotBlockedBySlowIndexRepo(t *testing.T) {
+	enteredBroker := make(chan struct{})
+	releaseBroker := make(chan struct{})
+	var once sync.Once
+
+	slowTar := makeSnapshotTarBase64(t, map[string]string{
+		"docs/decisions/ADR-009-slow.md": "# ADR-009: Slow broker indexed architecture\n\nIndexed without blocking readers.\n",
+	})
+
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(enteredBroker) })
+		<-releaseBroker
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"revision":      "9999999999999999999999999999999999999999",
+			"archiveBase64": slowTar,
+		})
+	}))
+	defer brokerSrv.Close()
+
+	storeDir := t.TempDir()
+	seed := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Fast local query baseline policy",
+			Date:   "2026-11-24",
+			Scope:  RecordScope{Clusters: []string{"*"}, Paths: []string{"clusters/**"}},
+		},
+		Body: "Readers must not block while IndexRepo waits on HTTP.",
+	}
+	if err := SaveRecord(storeDir, &seed); err != nil {
+		t.Fatal(err)
+	}
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   storeDir,
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/primary",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	indexDone := make(chan MemoryQueryResponse, 1)
+	go func() {
+		indexDone <- cur.IndexRepo(context.Background(), MemoryQueryRequest{
+			Action: "index",
+			Repo:   "acme/slow-secondary",
+			Role:   RoleManaged,
+		})
+	}()
+
+	select {
+	case <-enteredBroker:
+	case <-time.After(5 * time.Second):
+		t.Fatal("IndexRepo did not enter broker HTTP handler")
+	}
+
+	// Execute concurrent HandleQuery calls while IndexRepo is blocked inside the HTTP handler.
+	var wg sync.WaitGroup
+	errCh := make(chan string, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			qCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			doneCh := make(chan MemoryQueryResponse, 1)
+			go func() {
+				doneCh <- cur.HandleQuery(qCtx, MemoryQueryRequest{Query: "baseline policy"})
+			}()
+			select {
+			case qResp := <-doneCh:
+				if qResp.Error != "" || len(qResp.Results) == 0 {
+					errCh <- "unexpected query response: " + qResp.Error
+				}
+			case <-qCtx.Done():
+				errCh <- "HandleQuery blocked on IndexRepo mutex!"
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		t.Fatal(e)
+	}
+
+	close(releaseBroker)
+	idxResp := <-indexDone
+	if !idxResp.OK || len(idxResp.Upserted) != 1 {
+		t.Fatalf("unexpected IndexRepo response after unblock: %+v", idxResp)
+	}
+
+	afterQuery := cur.HandleQuery(context.Background(), MemoryQueryRequest{Query: "Slow broker indexed"})
+	if len(afterQuery.Results) == 0 || afterQuery.Results[0].DocumentID != "okf:acme/slow-secondary:ADR-009" {
+		t.Fatalf("expected newly indexed ADR-009 in HandleQuery after IndexRepo finished, got %+v", afterQuery.Results)
+	}
+}
+
+func TestGuardSeverityCapMultiRepoDreamAndExplicitVerifiedRepoDir(t *testing.T) {
+	ctx := context.Background()
+	mockHS, hsSrv := newMockHindsightServer(t)
+	hsClient := NewHindsightClient(hsSrv.URL, DefaultBankID)
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"title\":\"Synthesized OOM guard\",\"context\":\"OOM exit 137\",\"decision\":\"Keep replicas >= 2\",\"guard\":{\"rule\":\"Keep replicas >= 2\",\"severity\":\"block\",\"expect\":{\"file\":\"apps/*.yaml\",\"path\":\"spec.replicas\",\"op\":\">=\",\"value\":2}}}"}}]}`))
+	}))
+	defer llmSrv.Close()
+
+	storeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(storeDir, "apps"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(storeDir, "apps", "web.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	explicitVDir := t.TempDir()
+	primaryTar := makeSnapshotTarBase64(t, map[string]string{
+		"docs/adr/0001-primary.md": "# ADR 1: Primary architecture\n\nPrimary repo doc.\n",
+	})
+	secondaryTar := makeSnapshotTarBase64(t, map[string]string{
+		"docs/adr/0002-secondary.md": "# ADR 2: Secondary architecture\n\nSecondary repo doc.\n",
+	})
+	var brokerHits atomic.Int32
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		brokerHits.Add(1)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		repo, _ := body["repository"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		switch repo {
+		case "acme/gitops":
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": "rev-pri", "archiveBase64": primaryTar})
+		case "acme/payments":
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": "rev-sec", "archiveBase64": secondaryTar})
+		default:
+			http.Error(w, "unexpected broker call for "+repo, http.StatusInternalServerError)
+		}
+	}))
+	defer brokerSrv.Close()
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:         storeDir,
+		VerifiedRepoDir: explicitVDir,
+		BrokerURL:       brokerSrv.URL,
+		RepoID:          "acme/gitops",
+		Hindsight:       hsClient,
+		LLM: LLMConfig{
+			BaseURL: llmSrv.URL,
+			Model:   "test-model",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. GuardSeverity: "warn" MUST cap LLM-synthesized "block" guard to "warn" even on crash OOM resolved-merged.
+	resWarn, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:          OutcomeResolvedMerged,
+		Repo:          "acme/gitops",
+		Title:         "Checkout OOM exit 137 fix",
+		Summary:       "Container hit OOM exit 137 under spike.",
+		PullRequest:   "#88",
+		GuardSeverity: SeverityWarn,
+	}, "corr-warn")
+	if err != nil {
+		t.Fatalf("ProcessOutcome(GuardSeverity=warn): %v", err)
+	}
+	if strings.Contains(resWarn.PRMarkdown, "severity: block") || !strings.Contains(resWarn.PRMarkdown, "severity: warn") {
+		t.Fatalf("expected GuardSeverity=warn to cap synthesized LLM block guard in PRMarkdown:\n%s", resWarn.PRMarkdown)
+	}
+
+	// 2. Outcome: "backfill" on secondary repo "acme/payments" MUST cap severity to warn, stamp Meta.Repo, and survive RunDream under okf:acme/payments:*.
+	resSec, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:        OutcomeProposed,
+		Outcome:     "backfill",
+		RecordType:  RecordTypeLesson,
+		Repo:        "acme/payments",
+		Title:       "Payments OOM exit 137 revert",
+		Summary:     "Reverted memory drop after OOM exit 137.",
+		PullRequest: "https://github.com/acme/payments/pull/19 (#19)",
+	}, "corr-sec")
+	if err != nil {
+		t.Fatalf("ProcessOutcome(acme/payments backfill): %v", err)
+	}
+	if strings.Contains(resSec.PRMarkdown, "severity: block") || !strings.Contains(resSec.PRMarkdown, "repo: acme/payments") {
+		t.Fatalf("expected secondary backfill PRMarkdown to have repo: acme/payments and capped warn guard:\n%s", resSec.PRMarkdown)
+	}
+
+	dreamRep, err := cur.RunDream(ctx)
+	if err != nil {
+		t.Fatalf("RunDream: %v", err)
+	}
+	if len(dreamRep.Upserted) < 2 {
+		t.Fatalf("expected both primary and secondary records upserted in RunDream, got %+v", dreamRep)
+	}
+	mockHS.mu.Lock()
+	secDoc, hasSecDoc := mockHS.docs["okf:acme/payments:"+resSec.RecordID]
+	_, misattributed := mockHS.docs["okf:acme/gitops:"+resSec.RecordID]
+	mockHS.mu.Unlock()
+	if !hasSecDoc || misattributed {
+		t.Fatalf("expected %s under okf:acme/payments: (has=%v) and never okf:acme/gitops: (misattributed=%v)", resSec.RecordID, hasSecDoc, misattributed)
+	}
+	if !matchesTags(secDoc.Tags, []string{"repo:acme/payments", "guard:warn"}, "all_strict") {
+		t.Fatalf("expected repo:acme/payments and guard:warn tags on secondary doc, got %v", secDoc.Tags)
+	}
+
+	// 3. FromLocal: true with 0 records must NOT trigger broker snapshot pull.
+	hitsBefore := brokerHits.Load()
+	emptyLocalResp := cur.IndexRepo(ctx, MemoryQueryRequest{
+		Action:    "index",
+		Repo:      "acme/empty-local",
+		Role:      RoleManaged,
+		FromLocal: true,
+		Records:   nil,
+	})
+	if !emptyLocalResp.OK || brokerHits.Load() != hitsBefore {
+		t.Fatalf("expected FromLocal=true with 0 records to skip broker (hits %d -> %d), resp=%+v", hitsBefore, brokerHits.Load(), emptyLocalResp)
+	}
+
+	// 4. Explicit VerifiedRepoDir isolates secondary repo under <VerifiedRepoDir>/<slug> in both sync orders.
+	if rSec := cur.IndexRepo(ctx, MemoryQueryRequest{Action: "index", Repo: "acme/payments", Role: RoleManaged}); !rSec.OK {
+		t.Fatalf("IndexRepo(acme/payments): %+v", rSec)
+	}
+	if rPri := cur.IndexRepo(ctx, MemoryQueryRequest{Action: "index", Repo: "acme/gitops", Role: RoleManaged}); !rPri.OK {
+		t.Fatalf("IndexRepo(acme/gitops): %+v", rPri)
+	}
+	if _, err := os.Stat(filepath.Join(explicitVDir, "docs", "adr", "0001-primary.md")); err != nil {
+		t.Fatalf("expected primary ADR in explicit VerifiedRepoDir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(explicitVDir, "acme__payments", "docs", "adr", "0002-secondary.md")); err != nil {
+		t.Fatalf("expected secondary ADR isolated under explicit VerifiedRepoDir/acme__payments: %v", err)
 	}
 }
