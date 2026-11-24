@@ -241,6 +241,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
             "gce-startup-script-failure",
+            "gce-rotated-console-notes",
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
             "fleet-audit-manifest-fix-names-stalled-config-connector",

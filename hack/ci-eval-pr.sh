@@ -4928,7 +4928,7 @@ unit_cost_hint() {
     # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
     # kustomize case runs in the second phase (writes_alone), so its hint
     # orders it only among that phase's units.
-    gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
+    gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
     # The stockout audit of stockout-pinned-pool, registered 2026-11-10
     # unmeasured, plus a stack that plants one Config Connector object and
@@ -5181,7 +5181,7 @@ unit_delegation_timeout() {
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
-    gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
+    gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
     fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took

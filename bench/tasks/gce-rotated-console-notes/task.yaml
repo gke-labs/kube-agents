@@ -1,4 +1,9 @@
-# FIXTURE_NOT_READY: the rotated-console-vm role is not on the pool yet.
+# NIGHTLY-TIER: a full audit, the same cost band as the other fleet-audit
+# cases, registered in hack/eval/nightly-cases.txt. The VM below is on every
+# pool project: the fixture-state scan of 2026-11-24 reads the
+# rotated-console-vm role healthy on all 50, after the daily reconcile of
+# 2026-11-24 converged 50 of 50.
+#
 # The role (bench/tf/fleet/fixtures.json, #5389) plants
 # `serial-flood-<cluster_prefix>`, a standalone VM whose
 # startup script fails at boot ("eval fixture: planted rotated-console
@@ -34,11 +39,11 @@
 #   discriminator gce-startup-script-failure documents. The ledger exists on
 #   every repetition because the startup-fail VM's finding is always filed.
 #
-# Registered in scripts/validate_bench_cases.py FIXTURE_NOT_READY, citing
-# #5389, until the fleet re-apply plants the role on every pool project.
-# Red/green runs for the eval-driven loop come on a dev install whose fleet
-# carries the fixture (apply bench/tf/fleet), not on
-# the pool.
+# Eval-driven development (.agents/rules/eval_driven_development.md): the
+# red and the three green runs of the eval-driven loop ran on a dev install
+# whose fleet carried the fixture before the pool did; the pool plant
+# landed with the fleet re-apply above, and the case moved here from
+# FIXTURE_NOT_READY in the pull request that added it to the nightly.
 #
 # Isolation class: read-only on the project; writes the ledger issue to the
 # eval GitOps repo, as every fleet-audit stream does.
