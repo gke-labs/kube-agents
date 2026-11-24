@@ -612,6 +612,22 @@ func TestAProfileParentThatEndsCancelsItsSingleLiveChild(t *testing.T) {
 		_, stop := dispatchStopFor(t, r.url, "cluster", child.TaskID)
 		return cancelled && stop
 	})
+	// The cancelled child no longer holds the conversation: it's detached,
+	// as a stop detaches it, so the next turn is a new task, not a steer.
+	waitForRecord(t, r, conv, "the cancelled child detached", func(rec *SessionRecord) bool {
+		return rec.ActiveTask == nil || (rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached)
+	})
+	next := profileTurn(conv, "chat", nil)
+	next.Backend, next.AuthorID, next.MessageID, next.Text = consoleBackend, consoleAuthor, "after-cancel", "look again"
+	r.adapter.inbox <- next
+	waitFor(t, "a new task for the next turn, not a steer into the cancelled child", func() bool {
+		for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"chat.>") {
+			if e.env.TaskID != origin.TaskID && e.env.TaskID != child.TaskID {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // TestABatchChildUnderAConfirmedParentCarriesItsChangeRequest: each batch
