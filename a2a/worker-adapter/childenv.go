@@ -7,9 +7,10 @@ import "strings"
 // command or an MCP stdio server, from the adapter's own environment. Those
 // children need the broker-routed tools' variables (CREDENTIAL_PROXY_*,
 // which carry only the task's own token) but never the adapter's model,
-// provider or bus credentials. withheldFromToolChildren names what must not
-// reach them; an in-process harness passes the result to its own withhold
-// list, and toolChildEnv strips the same from an environment it builds.
+// provider or bus credentials. WithheldFromToolChildren names what must not
+// reach them; a harness passes the result to its own withhold list, and
+// toolChildEnv strips the same from an environment it builds. Withheld is
+// matched by prefix (withheldPrefixes) or exact name (withheldNames).
 
 // withheldPrefixes are variable name prefixes whose every variable is a
 // model, provider or bus credential or endpoint.
@@ -30,9 +31,9 @@ var withheldNames = []string{
 	"A2A_LIVE_GATEWAY_PASSWORD",
 }
 
-// withheld reports whether a turn's tool children must not see the
+// Withheld reports whether a turn's tool children must not see the
 // variable name.
-func withheld(name string) bool {
+func Withheld(name string) bool {
 	for _, p := range withheldPrefixes {
 		if strings.HasPrefix(name, p) {
 			return true
@@ -46,14 +47,14 @@ func withheld(name string) bool {
 	return false
 }
 
-// withheldFromToolChildren is the names in env (KEY=value entries) that a
+// WithheldFromToolChildren is the names in env (KEY=value entries) that a
 // turn's tool children must not see, for an in-process harness's withhold
 // list.
-func withheldFromToolChildren(env []string) []string {
+func WithheldFromToolChildren(env []string) []string {
 	var out []string
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
-		if withheld(name) {
+		if Withheld(name) {
 			out = append(out, name)
 		}
 	}
@@ -66,7 +67,7 @@ func toolChildEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
-		if !withheld(name) {
+		if !Withheld(name) {
 			out = append(out, kv)
 		}
 	}

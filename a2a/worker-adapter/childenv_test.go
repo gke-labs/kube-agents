@@ -42,7 +42,7 @@ func TestToolChildrenNeverSeeModelOrBusCredentials(t *testing.T) {
 			t.Errorf("%s was withheld from a tool child, which needs it", n)
 		}
 	}
-	names := withheldFromToolChildren(env)
+	names := WithheldFromToolChildren(env)
 	slices.Sort(names)
 	want := slices.Clone(never)
 	slices.Sort(want)
@@ -105,6 +105,9 @@ func TestNoCredentialishNameReachesToolChildrenUnnoticed(t *testing.T) {
 		}
 		files = append(files, m...)
 	}
+	if len(files) == 0 {
+		t.Skip("the adapter's source is not beside this test binary (run outside the module)")
+	}
 	seen := 0
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
@@ -120,7 +123,7 @@ func TestNoCredentialishNameReachesToolChildrenUnnoticed(t *testing.T) {
 				continue
 			}
 			seen++
-			if withheld(name) {
+			if Withheld(name) {
 				continue
 			}
 			allowed := false
