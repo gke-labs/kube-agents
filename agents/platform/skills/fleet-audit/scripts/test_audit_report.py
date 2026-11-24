@@ -17349,6 +17349,18 @@ class TestFindExistingIssue(HarnessTestCase):
         self.err = err.getvalue()
         return result
 
+    def test_a_ledger_body_that_is_not_a_text_is_a_body_that_did_not_arrive(self):
+        """The broker's GitHub translation gives None for a body that is not a text. The read
+        gives None for it too, which is "the body did not arrive": a run leaves that ledger's
+        body alone. The empty text is a real empty body, which a run can write over."""
+        url = "https://github.com/acme/fleet/issues/42"
+        for body in (None, [["nested"]], {"a": 1}, 7):
+            with self.subTest(body=body):
+                self.harness.replies = {"issue-list": issues_view([{"number": 42, "url": url, "body": body}])}
+                self.assertIsNone(self.find()[2])
+        self.harness.replies = {"issue-list": issues_view([{"number": 42, "url": url, "body": ""}])}
+        self.assertEqual("", self.find()[2])
+
     def test_the_highest_number_wins_so_the_choice_converges(self):
         # Duplicates exist because some run created one — and that run wrote
         # this stream's state into the higher number and linked it from every
