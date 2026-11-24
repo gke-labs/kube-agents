@@ -103,15 +103,22 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 // passing the original bytes leaves no line the harness's own parser could
 // read differently.
 func canonicalSkill(skill string, data []byte) ([]byte, error) {
-	lines := strings.SplitAfter(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if strings.HasPrefix(text, "\ufeff") || strings.Contains(text, "\r") {
+		return nil, fmt.Errorf("skills/%s/SKILL.md: a byte-order mark or a carriage return outside a CRLF line ending", skill)
+	}
+	lines := strings.SplitAfter(text, "\n")
 	if len(lines) == 0 || strings.TrimRight(lines[0], "\n") != "---" {
 		return nil, fmt.Errorf("skills/%s/SKILL.md: no frontmatter", skill)
 	}
 	end := -1
-	for i := 1; i < len(lines); i++ {
-		if strings.TrimRight(lines[i], " \t\n") == "---" {
+	for i := 1; i < len(lines) && end < 0; i++ {
+		line := strings.TrimRight(lines[i], "\n")
+		switch {
+		case line == "---":
 			end = i
-			break
+		case strings.HasPrefix(line, "---"), strings.HasPrefix(line, "..."), strings.HasPrefix(line, "%"):
+			return nil, fmt.Errorf("skills/%s/SKILL.md: frontmatter line %q is an ambiguous YAML delimiter or directive", skill, line)
 		}
 	}
 	if end < 0 {

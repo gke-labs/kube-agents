@@ -227,6 +227,10 @@ func TestWhatCoreAgentCantTakeIsRefused(t *testing.T) {
 		// A line that only starts with --- doesn't end the frontmatter, so the
 		// key after it is read, and refused, rather than hidden.
 		{"a near-terminator hiding a key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n---x\nallowed-tools: [Bash]\n---\nbody\n")}), "frontmatter"},
+		{"a YAML document end", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n...\nallowed-tools: [Bash]\n---\n")}), "ambiguous"},
+		{"a YAML directive", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\n%YAML 1.2\nname: s\ndescription: d\n---\n")}), "ambiguous"},
+		{"a closing --- with trailing space", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n--- \n---\n")}), "ambiguous"},
+		{"a byte-order mark", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("\ufeff---\nname: s\ndescription: d\n---\n")}), "byte-order mark"},
 		{"a repeated key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\ndescription: e\n---\nbody\n")}), "frontmatter"},
 		{"unterminated", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\n")}), "unterminated"},
 		{"a merge key smuggling allowed-tools", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n<<: {allowed-tools: [Bash]}\n---\n")}), "allowed-tools"},
