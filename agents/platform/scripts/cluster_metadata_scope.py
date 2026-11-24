@@ -33,9 +33,13 @@ import os
 import command_policy
 import scope_exclude
 
-# The flags that name a gcloud command's location and project, the way
-# credential_proxy's get-credentials target reads them.
-LOCATION_FLAGS = frozenset({"--location", "--region", "--zone", "-z"})
+# The flags that name a gcloud command's location and project. A repeated flag
+# keeps its last value, as gcloud's own parser does.
+LOCATION_FLAGS = frozenset({"--location", "--region", "--zone"})
+# gcloud's short aliases, read as the flag they stand for (task_confinement's
+# GCLOUD_LONG_NAMES), so `--zone a -z b` is one flag whose last value wins, as
+# gcloud reads it.
+FLAG_ALIASES = {"-z": "--zone", "-h": "--help"}
 PROJECT_FLAG = "--project"
 CLUSTER_FLAG = "--cluster"
 # The bootstrap sets gcloud's default project to this, so it is the project a
@@ -55,7 +59,7 @@ _RESOURCE_LOCATION_KEYS = frozenset({"locations", "zones"})
 _RESOURCE_CLUSTERS = "clusters"
 _RESOURCE_NODE_POOLS = "nodePools"
 # `--help` (and `-h`) prints gcloud's own synopsis and reads nothing.
-HELP_FLAGS = frozenset({"--help", "-h"})
+HELP_FLAGS = frozenset({"--help"})
 _RESOURCE_PARTS = 6
 GCLOUD = "gcloud"
 # The words that mark an argv this module would act on, for an argv whose flags
@@ -93,15 +97,16 @@ def _walk(argv: list[str]) -> tuple[dict[str, str], list[tuple[int, str]]] | Non
         token = argv[index]
         if token.startswith("-") and len(token) > 1:
             name, separator, value = token.partition("=")
+            canonical = FLAG_ALIASES.get(name, name)
             if name in command_policy._GCLOUD_BOOLEAN_FLAGS:
-                flags[name] = ""
+                flags[canonical] = ""
                 index += 1
                 continue
             if name in command_policy._GCLOUD_FLAGS_WITH_VALUE:
                 if not separator:
                     value = argv[index + 1] if index + 1 < len(argv) else ""
                     index += 1
-                flags[name] = value
+                flags[canonical] = value
                 index += 1
                 continue
             return None
@@ -154,7 +159,13 @@ def _check_cluster(exclusions: scope_exclude.Exclusions, named: str, flags: dict
         exclusions.check_unnamed(include_holds=False)
         return
     project = _flag(flags, (PROJECT_FLAG,)) or os.environ.get(DEFAULT_PROJECT_ENV, "")
-    location = _flag(flags, tuple(sorted(LOCATION_FLAGS)))
+    given = [name for name in LOCATION_FLAGS if flags.get(name)]
+    if len(given) > 1:
+        # gcloud takes one of these per command; with two, which it reads isn't
+        # something to guess at while a cluster is excluded.
+        exclusions.check_unnamed(include_holds=False)
+        return
+    location = flags[given[0]] if given else ""
     if location:
         exclusions.check(project, location, named, include_holds=False)
     else:

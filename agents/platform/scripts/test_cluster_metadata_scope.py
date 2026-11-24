@@ -146,6 +146,23 @@ class MetadataScopeTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(self.refused(argv, exclusions).rule, RULE_EXCLUDED_CLUSTER)
 
+    def test_a_repeated_or_aliased_location_reads_as_gcloud_reads_it(self):
+        exclusions = self.exclusions(EXCLUDED)
+        for argv in (
+            # -z is --zone: the last value wins, as in gcloud.
+            ["gcloud", "container", "clusters", "describe", "scratch", "--zone=us-east4", "-z=us-central1"],
+            ["gcloud", "container", "clusters", "describe", "scratch", "--zone", "us-east4", "-z", "us-central1"],
+            ["gcloud", "container", "clusters", "describe", "scratch", "-z", "us-east4", "--zone", "us-central1"],
+            ["gcloud", "container", "node-pools", "list", "--cluster", "scratch", "--zone=us-east4", "-z=us-central1"],
+            # Two different location flags: refused rather than guessed at.
+            ["gcloud", "container", "clusters", "describe", "scratch", "--region=us-east4", "--zone=us-central1"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.refused(argv, exclusions).rule, RULE_EXCLUDED_CLUSTER)
+        # The last value naming an in-scope location runs.
+        argv = ["gcloud", "container", "clusters", "describe", "scratch", "-z", "us-central1", "--zone", "us-east4"]
+        self.assertIs(scoped_argv(argv, exclusions), argv)
+
     def test_a_node_pool_named_in_full_for_an_in_scope_cluster_runs(self):
         exclusions = self.exclusions(EXCLUDED)
         argv = ["gcloud", "container", "node-pools", "describe",
