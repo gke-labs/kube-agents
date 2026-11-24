@@ -209,7 +209,13 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 			end.Unsent = true
 		}
 		rec.setBatchEnd(child.ID, &end)
-		log.Info("fan-out child ended", "state", end.State, "left", rec.batchLeft(parent), "parent", "profile")
+		left := rec.batchLeft(parent)
+		log.Info("fan-out child ended", "state", end.State, "left", left, "parent", "profile")
+		if left == 0 {
+			// Every child has ended, so the heal's place in the batch goes
+			// (nextFanOutSpotCheck), as a session batch's does.
+			g.forgetFanOutSpotCheck(child.ParentTaskID)
+		}
 		return
 	}
 	end.Text = cutBatchText(end.Text, max(parent.BatchSize, len(parent.Children)), end.State == lib.StateInputRequired)
@@ -436,17 +442,46 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 // writes the record when anything changed.
 func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, parent TaskRef) {
 	changed := false
+	// One stream handle for the pass's probes, as healFanOut opens it. A
+	// stream that can't be read still lets the Unsent resends below run.
+	stream, streamErr := g.tasksStream(ctx)
+	if streamErr != nil {
+		g.log.Warn("heal: the tasks stream could not be read", "conversation", rec.Key, "err", streamErr)
+	}
+	var running []TaskRef
 	for _, kid := range rec.batchChildren(parent.ID) {
 		fresh, _ := rec.TaskRefFor(kid.ID)
 		switch {
 		case fresh.BatchEnd == nil:
-			changed = g.healBatchChild(ctx, rec, fresh) || changed
+			if streamErr != nil {
+				continue
+			}
+			probe, err := g.probeTask(ctx, stream, fresh.Addressee, fresh.ID, g.profileRead(rec, fresh.ID, fresh.Addressee))
+			if err != nil {
+				g.log.Warn("heal: a fan-out child's state could not be read", "conversation", rec.Key, "taskId", fresh.ID, "err", err)
+				continue
+			}
+			healed := g.healBatchChild(ctx, rec, fresh, probe, false)
+			changed = healed || changed
+			if !healed && !probe.empty && !probe.final {
+				running = append(running, fresh)
+			}
 		case fresh.BatchEnd.Unsent:
 			end := *fresh.BatchEnd
 			if g.profileBatchChildEnded(ctx, rec, parent, fresh, end, end.Text) {
 				end.Unsent, end.Text = false, ""
 				rec.setBatchEnd(fresh.ID, &end)
 				changed = true
+			}
+		}
+	}
+	// The probe can read an ended child as running (healFanOut, #6646):
+	// one such child is replayed in full each pass, in turn. A pass that
+	// couldn't probe leaves the place where it was.
+	if streamErr == nil {
+		if kid, ok := g.nextFanOutSpotCheck(parent.ID, running); ok {
+			if fresh, _ := rec.TaskRefFor(kid.ID); fresh.BatchEnd == nil {
+				changed = g.healBatchChild(ctx, rec, fresh, taskProbe{}, true) || changed
 			}
 		}
 	}
