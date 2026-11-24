@@ -22,7 +22,7 @@ Adding deterministic verifiers moves scenarios rightward; adding canary waves, d
 Domain experts often have high-value operational scenarios to share without spare bandwidth to build benchmark fixtures or monitor evaluation runs. Choose the entry point that matches your available time:
 
 1. **Share scenarios as GitHub issues (lightweight handoff).** Open an issue at <https://github.com/gke-labs/kube-agents/issues> (or submit via the [feedback form](https://gke-labs.github.io/kube-agents/feedback/) if your enterprise-managed GitHub account cannot open issues directly) and note the matching `domain` slug from [`docs/designs/domains.yaml`](designs/domains.yaml) in the issue body (applying the `domain:<slug>` label if you have triage access). Describe the operational problem, which quadrant of the 2x2 matrix it sits in, what customer-visible signals prove the fix worked, and which blast-radius guardrails apply. Maintainers and contributor agents take the scenario through benchmark authoring, implementation, and validation from there.
-2. **Implement end to end in a pull request.** Point your coding agent at a local clone of `gke-labs/kube-agents` and follow the three-step GitHub workflow below. Once a scenario proves out in nightly runs, maintainers handle roster admission and upstreaming reusable `gke-*` skill overlays to [`google/skills`](https://github.com/google/skills).
+2. **Implement end to end in a pull request.** Point your coding agent at a local clone of `gke-labs/kube-agents` and follow the three-step GitHub workflow below. Once a scenario proves out in nightly runs, maintainers handle roster admission. For a reusable `gke-*` overlay patch, a tracking issue holds the report to [`google/skills`](https://github.com/google/skills) (Step 3).
 
 ```mermaid
 flowchart LR
@@ -32,7 +32,7 @@ flowchart LR
         S2 --> S3["3. 3x Green Runs (nightly-cases.txt)"]
     end
     subgraph Maintainers["Handled by Maintainers"]
-        S4["Roster Admission & google/skills Upstream"]
+        S4["Roster Admission"]
     end
     S3 -.->|"nightly record"| S4
 ```
@@ -62,7 +62,7 @@ Only the first pull request introducing a new specialist agent profile (such as 
 
 Deploy your branch to your dev install and pass three consecutive `devops-bench` runs (`"status": "pass"` on every `objective` and `safeguard` check across all three `bench/results/run_*/results.json` files; judged prose scores do not override deterministic checks). Under **Testing → Live validation**, record all fields required by [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md#what-the-pull-request-records) while keeping check reason text, counts, transcripts, and `results.json` excerpts out of public posts and committed files per [`.agents/rules/public_surfaces.md`](../.agents/rules/public_surfaces.md).
 
-Once merged, nightly runs build the case's record. Maintainers (`eval-crew`) later promote qualifying fast cases from `hack/eval/nightly-cases.txt` to [`hack/eval/presubmit-cases.txt`](../hack/eval/presubmit-cases.txt) and [`hack/eval/blocking-roster.txt`](../hack/eval/blocking-roster.txt) under the seat rules in [`docs/eval-gate-roster.md`](eval-gate-roster.md), and upstream reusable `gke-*` overlay patches to `google/skills`.
+Once merged, nightly runs build the case's record. Maintainers (`eval-crew`) later promote qualifying fast cases from `hack/eval/nightly-cases.txt` to [`hack/eval/presubmit-cases.txt`](../hack/eval/presubmit-cases.txt) and [`hack/eval/blocking-roster.txt`](../hack/eval/blocking-roster.txt) under the seat rules in [`docs/eval-gate-roster.md`](eval-gate-roster.md). For each reusable `gke-*` overlay patch, a tracking issue holds the report to `google/skills`: a workflow opens it after a soak window and assigns the author of the commit that added the patch ([`edit-mirrored-skill`](../.agents/skills/edit-mirrored-skill/SKILL.md), "Report a general fix to google/skills").
 
 ## Example domain mapping: GKE security
 
