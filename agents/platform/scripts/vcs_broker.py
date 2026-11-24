@@ -79,6 +79,7 @@ from typing import Any, Callable, Mapping
 import yaml
 
 import automation_rules
+import automerge_edit
 import automerge_eligibility
 import okf_guard
 from fix_recipes import registry as fix_recipes_registry
@@ -3346,6 +3347,8 @@ class VcsBroker:
             return "the proposal is not open"
         if not viewer or _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
             return "the proposal is not this credential's own"
+        if automerge_edit.modified_file_from_diff(diff) is not None:
+            return self._edit_manifest_refusal(bound, payload, proposal, diff)
         fix = automerge_eligibility.verify_added_manifest(automerge_eligibility.FIX_TYPE, diff, check_path=False)
         if fix is None:
             return "the proposal does not add exactly one file that is the audit's generated PodDisruptionBudget"
@@ -3419,6 +3422,79 @@ class VcsBroker:
         checks += recipe_checks.checks(fix, dump)
         failed = [check["name"] for check in checks if not check["passed"]]
         return f"safety checks failed: {', '.join(failed)}" if failed else None
+
+    def _edit_manifest_refusal(
+        self, bound: Binding, payload: dict[str, Any], proposal: dict[str, Any], diff: Any
+    ) -> str:
+        """Why a proposal that edits one existing file is not labelled.
+
+        Verified with the edit-manifest verb (`automerge_edit`), for each
+        recipe that opts in with `verify: edit-manifest`, against the file as
+        this broker reads it on the repository's own base and at the
+        proposal's own revision (the snapshot's commit must be the proposal's
+        `sourceRevision`). A verified edit is
+        still not labelled: the cluster behind a manifest's path is not yet
+        resolved to the project and location the rules and the safety checks
+        read, so the answer names the verified recipe and stops there.
+        """
+        recipes = [r for r in fix_recipes_registry.recipes() if r.verify == "edit-manifest"]
+        if not recipes:
+            return "the proposal edits an existing file, and no fix recipe verifies edits"
+        path = automerge_edit.modified_file_from_diff(diff)[0]
+        if automerge_edit.cluster_of(path) is None:
+            return f"{path} is not a manifest inside a cluster's own tree"
+        base = self._practice_base(bound)
+        if not base or proposal.get("target") != base:
+            return f"the proposal does not target the repository's base branch ({base or 'unknown'})"
+        text, why, _ = self._base_file(payload, base, path)
+        if text is None:
+            return f"{path} on {base} could not be read as the edit's base ({why})"
+        # The head, read here too, at the proposal's own revision: the verb
+        # requires the diff applied to the base to be exactly this file.
+        source, revision = str(proposal.get("source") or ""), str(proposal.get("sourceRevision") or "")
+        if not source or not revision:
+            return "the proposal names no source branch and revision to read its head at"
+        head, why, read_at = self._base_file(payload, source, path)
+        if head is None:
+            return f"{path} on {source} could not be read as the edit's head ({why})"
+        if read_at != revision:
+            return "the proposal's branch moved while its head was read"
+        verified, refusals = [], []
+        for recipe in recipes:
+            try:
+                fix = fix_recipes_registry.generator(recipe.kind)
+                verified.append(automerge_edit.verify_edited_manifest(recipe, fix, diff, path, text, head))
+            except (automerge_edit.EditRefused, fix_recipes_registry.RecipeError) as exc:
+                refusals.append(f"{recipe.kind}: {exc}")
+        if len(verified) != 1:
+            LOGGER.info("practice label: edit not verified path=%s: %s", path, "; ".join(refusals) or "several recipes")
+            return "the proposal's edit is not exactly one recipe's declared edit"
+        edit = verified[0]
+        LOGGER.info("practice label: edit verified kind=%s path=%s changes=%s", edit.kind, path, edit.changes)
+        return f"the edit is the {edit.kind} recipe's, but edited manifests are not labelled yet"
+
+    def _base_file(self, payload: dict[str, Any], ref: str, path: str) -> tuple[str | None, str, str]:
+        """`(text, "", revision)` for `path` on `ref`, or `(None, why, "")`: one
+        regular, non-executable file of at most `automerge_edit.MAX_FILE_BYTES`
+        UTF-8 bytes. `revision` is the commit the snapshot read."""
+        try:
+            snap = self.snapshot({"repository": payload.get("repository"), "ref": ref, "paths": [path]})
+            with tarfile.open(fileobj=io.BytesIO(base64.b64decode(snap["archiveBase64"]))) as tar:
+                members = [m for m in tar.getmembers() if not m.isdir()]
+                if len(members) != 1 or not members[0].isreg() or members[0].name != path:
+                    return None, "not one regular file", ""
+                if members[0].mode & 0o111:
+                    return None, "executable", ""
+                raw = tar.extractfile(members[0]).read(automerge_edit.MAX_FILE_BYTES + 1)
+        except (WorkspaceError, subprocess.CalledProcessError, OSError, tarfile.TarError, KeyError, ValueError) as exc:
+            # A clone that failed (a deleted branch, a fork's head) is a refusal too.
+            return None, f"not read ({type(exc).__name__})", ""
+        if len(raw) > automerge_edit.MAX_FILE_BYTES:
+            return None, f"larger than {automerge_edit.MAX_FILE_BYTES} bytes", ""
+        try:
+            return raw.decode("utf-8"), "", str(snap.get("revision") or "")
+        except UnicodeDecodeError:
+            return None, "not UTF-8", ""
 
     def _practice_base(self, bound: Binding) -> str:
         """The branch a labelled proposal must target: the repository's pinned

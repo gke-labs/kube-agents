@@ -1900,6 +1900,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "A2A_KUBE_PROXY_URL",
             "A2A_KUBE_PROXY_CA_CONFIGMAP",
             "A2A_KUBE_PROXY_HOST_CONTEXT",
+            "A2A_KUBE_PROXY_MODE",
         ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
@@ -1925,6 +1926,15 @@ class C1IsolationIsStructural(unittest.TestCase):
                     re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
                     "the shim no longer reads %s by that name" % name,
                 )
+
+        # KUBE_PROXY_MODE gates the session kubectl wrapper's write-attempt
+        # record: the spawner sets it, the wrapper and the client read it. A
+        # rename on either side records nothing, and no session turn stops.
+        with self.subTest(env="KUBE_PROXY_MODE"):
+            self._one_match(r'Name:\s*"KUBE_PROXY_MODE"', spawner, "the spawner's render of KUBE_PROXY_MODE")
+            self.assertRegex(shim, r'KUBE_PROXY_MODE_ENV\s*=\s*"KUBE_PROXY_MODE"', "the client no longer reads KUBE_PROXY_MODE")
+            wrapper = (h.REPO_ROOT / "deploy" / "sandbox" / "session-kubectl.sh").read_text(encoding="utf-8")
+            self.assertIn("${KUBE_PROXY_MODE:-}", wrapper, "the kubectl wrapper no longer reads KUBE_PROXY_MODE")
 
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.
@@ -2907,6 +2917,41 @@ class C2FailClosed(unittest.TestCase):
                     check(configured, (reported, True))
         check("universe.example.test", ("universe.example.test", True))
         check("universe.example.test", (None, True))
+
+    def test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts(self) -> None:
+        """A start with no answer from the metadata server does not leave the value unchecked.
+
+        With no answer at its start the broker serves with the environment's
+        value. It asks the metadata server again until it answers, and an
+        answer that differs stops the broker with the error of the start check:
+        the credential must not go on to that domain's hosts. An answer that
+        agrees, and a host with no universe route, stop nothing.
+        """
+        proxy = h.credential_proxy
+
+        def recheck(configured, later):
+            stopped: list[str] = []
+            answers = [(None, False), later]
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answers.pop(0)
+            try:
+                proxy.recheck_universe_domain(configured, sleep=lambda _s: None, stop=stopped.append)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+            return stopped
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                stopped = recheck(configured, (reported, True))
+                self.assertEqual(1, len(stopped))
+                self.assertIn(repr(configured), stopped[0])
+                self.assertIn(repr(reported), stopped[0])
+        self.assertEqual([], recheck("universe.example.test", ("universe.example.test", True)))
+        self.assertEqual([], recheck("universe.example.test", (None, True)))
 
 
 class C3UntrustedByDefault(unittest.TestCase):

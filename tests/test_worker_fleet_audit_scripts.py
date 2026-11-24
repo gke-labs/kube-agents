@@ -90,6 +90,16 @@ class WorkerFleetAuditScriptsTest(unittest.TestCase):
             self.assertTrue(root.endswith("/"), f"{name} = {root!r}")
             self.assertTrue(DEST.startswith(root), f"{DEST} is not under {name} = {root!r}")
 
+    def test_the_directories_exist_before_the_moded_copy(self):
+        # A COPY --chmod creates each missing directory on its destination
+        # path with the files' mode, 0644, which the worker's user can't
+        # enter (buildx; Cloud Build's docker build doesn't). A mkdir -p of
+        # the destination before it makes them 0755 instead.
+        lines = [line.strip() for line in re.sub(r"\\\n\s*", " ", WORKER_DOCKERFILE.read_text()).splitlines()]
+        copy_at = next(i for i, line in enumerate(lines) if line.split()[:1] == ["COPY"] and line.split()[-1] == DEST)
+        mkdir_at = [i for i, line in enumerate(lines[:copy_at]) if line == "RUN mkdir -p " + DEST.rstrip("/")]
+        self.assertTrue(mkdir_at, f"no `RUN mkdir -p {DEST.rstrip('/')}` before the COPY into it")
+
     def test_the_copy_names_exactly_the_closure(self):
         self.assertEqual(sorted(copy_sources(WORKER_DOCKERFILE.read_text())), sorted(SOURCES))
 

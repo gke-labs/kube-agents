@@ -306,7 +306,7 @@ shim always takes the fallback and nothing reports it.
   longer kept on the pod. A sweep reaches every cluster on every replica, and nothing else frees
   kubectl's cache, so the resource watermark gate's soft mark reclaims it on an exec pod: the
   cache is renamed and removed, and the next command rebuilds it. Decided (#4536). The stateful
-  broker keeps gcloud's default file logging and its own figures.
+  broker turns gcloud's file logging off for its commands as well, and keeps its own figures.
 - A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods only under the session pods' cluster view (the condition the stateful broker has), and the metrics
   port from GMP. The egress rules that select the broker's pod labels also need the exec tier as a
   peer: the sandbox (`shell_sandbox_manifests.go`) and session pods

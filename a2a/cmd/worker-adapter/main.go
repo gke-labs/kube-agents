@@ -65,6 +65,9 @@ const (
 	// defaultWorkdir is the pod's scratch emptyDir. A local run falls back to
 	// the current directory, which is why this is a default and not a require.
 	defaultWorkdir = "/scratch"
+	// writeRefusalSubdir holds a session pod's per-turn write-refusal record
+	// under the workdir (sessionWriteRefusalDir).
+	writeRefusalSubdir = ".kube-agents"
 
 	// defaultModel is the profile-neutral alias LiteLLM routes; naming the
 	// concrete model belongs in the install, not here.
@@ -182,6 +185,7 @@ func run() int {
 	if err := os.Chdir(workdir); err != nil {
 		log.Warn("workdir unavailable; staying put", "workdir", workdir, "err", err)
 	}
+	cfg.WriteRefusalDir = sessionWriteRefusalDir(cfg.Session, workdir)
 
 	// SIGTERM is the eviction path: context cancellation tells the adapter
 	// to flush, publish terminal failed reason worker-evicted, and exit 143 -
@@ -334,7 +338,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 
 	harness, driver, builder, err := selectHarness(os.Getenv)
 	if err != nil {
-		log.Error("the worker's harness is not one it can run; set "+lib.EnvHarness+" to "+string(persona.ClaudeCode)+" or leave it unset",
+		log.Error("the worker's harness is not one it can run",
 			lib.EnvHarness, os.Getenv(lib.EnvHarness), lib.EnvProfileHarness, os.Getenv(lib.EnvProfileHarness), "err", err)
 		return workeradapter.Config{}, false
 	}
@@ -392,6 +396,18 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		// serves a second task, and validate refuses the pair.
 		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
 	}, true
+}
+
+// sessionWriteRefusalDir is where a session pod with the cluster view keeps
+// each turn's write-refusal record (Config.WriteRefusalDir): under the workdir,
+// the pod's scratch emptyDir, which the harness's own kubectl wrapper can
+// append to. Any other pod gets none: a profile pod's worker makes its own
+// file, and a session pod with no cluster view runs no kubectl.
+func sessionWriteRefusalDir(session, workdir string) string {
+	if session == "" || os.Getenv(lib.EnvClusterView) != "true" {
+		return ""
+	}
+	return filepath.Join(workdir, writeRefusalSubdir)
 }
 
 // harnessCommand builds the harness argv: the native binary driven over the
@@ -467,6 +483,7 @@ func harnessCommand() []string {
 		disallowed: disallowed,
 		prompts:    prompts,
 		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		turnBudget: harnessTurnBudget(),
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
@@ -501,11 +518,22 @@ func profileHarnessCommand() []string {
 		maxTurns = defaultMaxTurns
 	}
 	return activeHarness.command(harnessSpec{
-		path:     path,
-		model:    model,
-		maxTurns: maxTurns,
-		extra:    strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		path:       path,
+		model:      model,
+		maxTurns:   maxTurns,
+		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		turnBudget: harnessTurnBudget(),
 	})
+}
+
+// harnessTurnBudget is harnessSpec.turnBudget from the same variables
+// Config.TaskDeadline and Config.KillGrace read. A profile worker's task
+// deadline comes from its offer and can be shorter; the adapter's own
+// deadline still bounds that task, and only the harness's clean ending is
+// lost.
+func harnessTurnBudget() time.Duration {
+	return envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds) -
+		envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds)
 }
 
 // delegateToolEnabled is the delegate tool's single switch: everything that
@@ -700,9 +728,28 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	if err != nil {
 		return "", nil, nil, err
 	}
+	// Antigravity runs without the per-task HOME locking and workspace scrub
+	// it needs (#6710), so only a pod that says it accepts that may select
+	// it: a test, or a deliberate dev run. Nothing in the operator or chart
+	// sets it to allow. Where the operator renders A2A_HARNESS, it renders
+	// this one empty beside it, so the worker image's own ENV can't set it
+	// there: on a profile worker whose profile names spec.harness.type
+	// (#6832), and later on session pods (#6716). Elsewhere only the pod
+	// spec or the image's ENV can set it; a profile with no type gets
+	// neither variable, by design, since its image is already trusted code.
+	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
+		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
+			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
+	}
 	builder, err := builderFor(driver.Harness())
 	if err != nil {
 		return "", nil, nil, err
+	}
+	// A harness with no default path in the image needs one named, unless a
+	// test replaces the whole argv. Refused here, at startup, rather than at
+	// the first task's exec.
+	if builder.defaultPath() == "" && getenv("A2A_HARNESS_PATH") == "" && getenv("A2A_HARNESS_CMD") == "" {
+		return "", nil, nil, fmt.Errorf("harness %q has no default path in this image; set A2A_HARNESS_PATH", driver.Harness())
 	}
 	return driver.Harness(), driver, builder, nil
 }
@@ -714,6 +761,8 @@ func builderFor(h persona.Harness) (harnessBuilder, error) {
 	switch h {
 	case persona.ClaudeCode:
 		return claudeBuilder{}, nil
+	case persona.Antigravity:
+		return agyBuilder{}, nil
 	}
 	return nil, fmt.Errorf("harness %q has no argv builder", h)
 }

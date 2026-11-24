@@ -1750,6 +1750,8 @@ class AnswerFirstVerifier(BaseVerifier):
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
 _TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
 _wrapped_tool_names = worker_trajectory.wrapped_tool_names
+# The wrapper's own top-level arguments, as Hermes reads them.
+_WRAPPER_OWN_ARGS = frozenset({"name", "arguments", "calls"})
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -1898,7 +1900,11 @@ class ToolCalledVerifier(BaseVerifier):
     A name in ``tool_names`` therefore also matches a ``tool_call`` entry
     whose wrapped name or ``calls`` list names it, else a worker's MCP calls
     would be invisible to this check by name. One wrapper entry counts once
-    however many of its calls match; ``require_success`` reads the wrapper's status.
+    however many of its calls match; ``require_success`` reads the wrapper's status,
+    which the pod takes on the tool's answer inside Hermes' ``<untrusted_tool_result>``
+    envelope (``worker_trajectory``'s ``failed``). The pod reads a worker wrapper's
+    names before it clips the arguments and records them on the entry, so a wrapper
+    too long to parse is still counted by name.
 
     ``agent``: optional Python regular expression. When set, only trajectory
     entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful
@@ -2016,7 +2022,13 @@ class ToolCalledVerifier(BaseVerifier):
                 if re.fullmatch(pattern, str(args[name])) is None:
                     return False
                 continue
-            if not clipped:
+            # A wrapper the pod named (`wrapped`) is counted by name though its
+            # arguments were clipped. Its own arguments are the wrapped call's
+            # name and arguments, which this filter does not read through, so
+            # an argument that is not one of the wrapper's own rules the call
+            # out as it does for a wrapper that fits, and as it did before the
+            # pod named it. One of its own that the clip cut is undecided.
+            if not clipped or (worker_trajectory.WRAPPED_NAMES_KEY in entry and name not in _WRAPPER_OWN_ARGS):
                 return False
             undecided = True
         return None if undecided else True
@@ -2314,6 +2326,11 @@ _MAX_UNNAMED_IN_REASON = 5
 # once; anything past a handful is a report to look at by hand, not a set of
 # candidates to shotgun the API with.
 _MAX_LEDGER_CANDIDATES = 8
+
+# How ``ledger_issue_contains`` searches its ``*_patterns``. The text is
+# lowercased before the search, so without this a capital in a pattern could
+# never match: an inert forbid, with nothing to say why.
+_LEDGER_PATTERN_FLAGS = re.IGNORECASE
 
 # A report that retired the ledger rather than filing on it, in the words the
 # harness and the audit's closing line use for that: `render_clean_comment`'s
@@ -5207,6 +5224,21 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
+    # The regex forms, for a claim no one substring binds: a findings row is
+    # ``| [`<id>`](#user-content-finding-<id>) | <severity> | `<cluster>` | <state> |``
+    # and the id carries the project and location between the check slug and
+    # the cluster name, so only a pattern ties a check, a cluster and a
+    # severity to one row (through the id in the anchor, which the severity
+    # cell follows). Each is ``re.search``ed, as ``report_contains`` does, over
+    # the text the phrases are read from under the same ``scope``, lowercased
+    # and matched without regard to case, as the phrases are. The line breaks
+    # are kept, so a `.` stays on one table row, or on one id under
+    # ``finding_ids``; a body's hidden id block holds every id on ONE line, so
+    # a body pattern bounds its gaps with a class and not `.*`. Every required
+    # pattern must match; no forbidden pattern may. No ``{cluster:<slot>}`` is
+    # expanded here; one is refused at load.
+    required_patterns: list[str] = Field(default_factory=list)
+    forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids", "finding"] = "body"
     # The check whose findings ``scope: finding`` reads: the first segment of
     # the finding id, ``no-memory-limit`` in
@@ -5230,6 +5262,25 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         raw = self.finding_check
         names = [raw] if isinstance(raw, str) else list(raw or [])
         return [n.strip() for n in names if n and n.strip()]
+
+    @field_validator("required_patterns", "forbidden_patterns")
+    @classmethod
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            # Not expanded by this check: it would compile as literal text and
+            # never match, an inert forbid or a miss on every run.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a cluster placeholder, which only report_contains "
+                    "expands; here it is literal text that never matches"
+                )
+            try:
+                re.compile(pattern, _LEDGER_PATTERN_FLAGS)
+            except re.error as exc:
+                # The same type ``report_contains`` raises for a pattern that
+                # does not compile, with the pattern named.
+                raise re.error(f"pattern {pattern!r} does not compile: {exc}") from exc
+        return patterns
 
     @model_validator(mode="after")
     def _finding_scope_names_its_check(self) -> "LedgerIssueContainsVerifier":
@@ -5547,6 +5598,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 return (
                     sum(1 for p in self.required_phrases if p.lower() not in block)
                     + sum(1 for p in self.forbidden_phrases if p.lower() in block)
+                    + sum(1 for p in self.required_patterns if not re.search(p, block, _LEDGER_PATTERN_FLAGS))
+                    + sum(1 for p in self.forbidden_patterns if re.search(p, block, _LEDGER_PATTERN_FLAGS))
                     + (1 if self.any_of_phrases and not any(p.lower() in block for p in self.any_of_phrases) else 0)
                 )
 
@@ -5599,13 +5652,15 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         any_of_miss = bool(self.any_of_phrases) and not any(
             p.lower() in text for p in self.any_of_phrases
         )
+        pattern_missing = [p for p in self.required_patterns if not re.search(p, text, _LEDGER_PATTERN_FLAGS)]
+        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, text, _LEDGER_PATTERN_FLAGS)]
         raw = {
             "issue": ledger["slug"],
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
             "finding_check": self.finding_check,
         }
-        if missing or present or any_of_miss or unnamed or omitted_unlisted:
+        if missing or present or any_of_miss or pattern_missing or pattern_hits or unnamed or omitted_unlisted:
             parts = []
             if omitted_unlisted:
                 parts.append(
@@ -5628,6 +5683,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     f"none of the alternative phrasings present in {surface}: "
                     f"{self.any_of_phrases}"
                 )
+            if pattern_missing:
+                parts.append(f"required patterns absent from {surface}: {pattern_missing}")
+            if pattern_hits:
+                parts.append(f"forbidden patterns matched in {surface}: {pattern_hits}")
             return done(False, "; ".join(parts), raw=raw)
         # Names every clause that ran, for the reason ReportContainsVerifier's
         # success branch does: an any_of-only check that reported "all 0
@@ -5640,6 +5699,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
             )
+        if self.required_patterns:
+            satisfied.append(f"all {len(self.required_patterns)} required pattern(s)")
+        if self.forbidden_patterns:
+            satisfied.append(f"none of {len(self.forbidden_patterns)} forbidden pattern(s)")
         if self.every_finding_named:
             satisfied.append("a visible name for every filed finding")
         return done(
@@ -10150,8 +10213,9 @@ class AuditReportStoredVerifier(_StoredReportVerifier):
     from an older image, with no key, is read by ``finished_at`` alone -- has
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
-    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``,
+    which fails any other value and meets a required ``null``), has, for each
+    ``required_finding_phrases`` entry, a finding
     in its ``document`` whose id contains it, and has no finding whose id
     contains a ``forbidden_finding_phrases`` entry (the silent half of a case
     that plants a look-alike the check must leave alone), and, for each

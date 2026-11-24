@@ -833,8 +833,8 @@ argv, and a profile task's call go to the broker as above. The read carries the
 `X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
 cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
 `get-credentials`, which refuses that cluster itself. The header only narrows:
-without it the read is unchanged, so other control-plane reads of an excluded
-cluster stay allowed.
+without it the read is unchanged, so the reconcile's existence check of an
+excluded cluster stays allowed.
 
 Consequences:
 
@@ -916,7 +916,10 @@ Consequences:
   back and lands it at
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
-  cluster from later commands.
+  cluster from later commands. It writes the file and the pin only when its
+  caller owns `.kubeconfigs`; another caller gets neither, and is told to name
+  a file of its own
+  ([`kube-proxy.md`](designs/kube-proxy.md#4-sandbox-kubectl-and-kubeconfig-setup)).
 - A `kubectl` read that names no cluster that way and comes back empty or with
   a server NotFound says where it looked. For `get`, `describe`, `events`,
   `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr
