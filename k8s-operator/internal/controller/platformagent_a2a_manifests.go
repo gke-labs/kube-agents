@@ -5486,10 +5486,12 @@ func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
 // (which the hermes-bridge sidecar copies) all come from here, so the two
 // cannot disagree.
 func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
-	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't hold
-	// the route off: since 2026-11-20 the view is on by default for the
-	// session route (gke-labs/kube-agents#6538), so an explicit `session`
-	// routes to session with the view on or off.
+	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't
+	// change the route: an explicit `session` routes to session with the
+	// view on or off. The view is on only where that flag is `true`
+	// (a2aSessionClusterViewEnabled); nothing sets it from defaultRoute, and
+	// making it the session route's default is a later step of
+	// gke-labs/kube-agents#6538.
 	// A CRD that prunes status.effectiveSessionCap can't keep the cap the
 	// session route renders from, so that install stays on platform.
 	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession ||
@@ -7281,6 +7283,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
+			{Name: "A2A_KUBE_PROXY_MODE", Value: kubeProxyMode},
 		}
 		// The kubectl admission's tier, normalised as for the shell sandbox;
 		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
@@ -7814,6 +7817,13 @@ type a2aProvisionState struct {
 	// the document goes stale, whichever is first; zero for no deadline.
 	scopeCondition *metav1.Condition
 	scopeRequeue   time.Duration
+	// builtinSchedulesCondition is the BuiltinSchedules condition
+	// reconcileBuiltinSchedules computed, nil when there's nothing to say;
+	// builtinSchedulesRequeue is how soon the renderer wants to look again
+	// (a replaced schedule's deletion in flight, a write that raced), zero
+	// for no need.
+	builtinSchedulesCondition *metav1.Condition
+	builtinSchedulesRequeue   time.Duration
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
@@ -8310,6 +8320,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	state.scopeCondition = scopeOutcome.condition
 	state.scopeRequeue = scopeOutcome.requeue
+
+	// The built-in AgentSchedules (platformagent_builtin_schedules.go).
+	builtinCondition, builtinRequeue, err := r.reconcileBuiltinSchedules(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	state.builtinSchedulesCondition = builtinCondition
+	state.builtinSchedulesRequeue = builtinRequeue
 
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for

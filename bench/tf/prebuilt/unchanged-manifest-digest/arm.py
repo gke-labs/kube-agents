@@ -15,8 +15,8 @@
 """Fire one scheduled fleet-audit run on the install and wait for it to end.
 
 Runs in the agent container, streamed in by main.tf, after plant.py left the
-previous scheduled run in the store. The shape is bench/tf/prebuilt/audit-chat-report/arm.py's,
-with one more step: an eval run pauses the clock-started audits
+previous scheduled run in the store. bench/tf/prebuilt/audit-chat-report/arm.py is the
+script it grew from. An eval run pauses the clock-started audits
 (hack/ci_pause_scheduled_audits.py), and Hermes' ``trigger_job`` re-enables a
 paused job, so ``wait`` and ``clean`` pause it again when ``fire`` found it
 paused. Four commands:

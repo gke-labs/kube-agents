@@ -198,6 +198,11 @@ def restore_answer(saved: Dict[str, Any], mapping: normalizer.Mapping) -> Tuple[
     return _walk(saved, restore), missing
 
 
+
+def weights_text(weights: Dict[str, int]) -> str:
+    """A weights file's content as save_weights writes it (fetch_cache.py costs it the same way)."""
+    return json.dumps(weights, sort_keys=True)
+
 class AnswerCache:
     """One directory of saved answers. Writes are atomic and every file is written once."""
 
@@ -298,7 +303,7 @@ class AnswerCache:
         """Write a fingerprint's weights file once (the lane's download); True when this call wrote it."""
         if not CACHE_HEX_RE.match(fingerprint):
             raise ValueError("a weights file is named by a hex digest")
-        return self._write_once(self._path(WEIGHTS_DIR, fingerprint), json.dumps(weights, sort_keys=True))
+        return self._write_once(self._path(WEIGHTS_DIR, fingerprint), weights_text(weights))
 
     def has_answer(self, fingerprint: str) -> bool:
         """Whether a readable answer to the fingerprint is saved, in either layout."""

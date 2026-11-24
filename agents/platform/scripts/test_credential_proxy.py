@@ -2866,10 +2866,12 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual("kubernetes.read-only", body["rule"])
         self.assertEqual(["scale"], body["verb"], "the positional after the verb is the caller's and stays out of the body")
         self.assertFalse(body["local_render"])
+        self.assertIs(True, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
         self.assertEqual(403, status)
         self.assertEqual(["create"], body["verb"])
         self.assertTrue(body["local_render"])
+        self.assertIs(False, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "rollout", "restart", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
         self.assertEqual(["rollout", "restart"], body["verb"])
         status, body = self.post({"argv": ["kubectl", "certificate", "approve", "csr-tenant-b"], "cwd": "/tmp"})
@@ -10973,6 +10975,30 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertEqual("kubernetes.read-only", refusal["rule"])
         self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
 
+    def test_only_a_refused_kubectl_write_is_marked_a_write_refusal(self):
+        # The mark the in-pod client records for a profile worker's stop
+        # (credential_proxy_client.record_write_refusal).
+        writes = (
+            ["kubectl", "delete", "ns", "prod"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3"],
+            ["kubectl", "rollout", "restart", "deploy/x"],
+            ["kubectl", "certificate", "approve", "csr-1"],
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=server"],
+        )
+        for argv in writes:
+            with self.subTest(argv=argv):
+                self.assertIs(True, self._decide(argv)[credential_proxy.WRITE_REFUSAL_KEY])
+        not_writes = (
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"],  # a local render
+            ["kubectl", "exec", "web-0", "--", "sh"],  # refused, but not a state change the runtime stops on
+            ["kubectl", "rollout", "csr-tenant-b", "deploy/x"],  # a positional, not a subverb
+            ["kubectl", "--as=admin", "get", "pods"],  # a flag rule
+            ["gcloud", "container", "clusters", "delete", "prod"],  # gcp.read-only: also refuses unlisted reads
+        )
+        for argv in not_writes:
+            with self.subTest(argv=argv):
+                self.assertIs(False, self._decide(argv).get(credential_proxy.WRITE_REFUSAL_KEY, False))
+
     def test_the_gate_can_be_switched_off(self):
         CredentialProxyHandler.enforce_read_only = False
         self.assertIsNone(self._decide(["kubectl", "delete", "ns", "prod"]))
@@ -11196,25 +11222,19 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
 
-    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
-        # An exec pod's state volume is sized for no gcloud log files; the
-        # broker and the sidecar roles keep gcloud's default.
-        for role, off in (
-            (credential_proxy_client.EXEC_ROLE, True),
-            ("broker", False),
-            ("combined", False),
-        ):
+    def test_serve_turns_gcloud_file_logging_off_in_every_role(self):
+        # No role's state volume is sized for gcloud's log files: each command
+        # leaves one, and gcloud keeps them for 30 days.
+        for role in (credential_proxy_client.EXEC_ROLE, "broker", "combined"):
             with self.subTest(role=role):
                 self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
                 env = CredentialProxyHandler.executor.environment
-                self.assertEqual(
-                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
-                )
+                self.assertEqual("1", env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV))
 
     def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_commands(self):
         # The proxy gives the commands it runs a fixed list of names from its
         # own environment. These two, which an operator can set on the pod
-        # (`platformAgent.deployment.env`), are not on it, and the exec role
+        # (`platformAgent.deployment.env`), are not on it, and every role
         # sets the gcloud name itself, to its own value. This keeps both in the
         # proxy's environment from the start of `serve` to the end of each
         # command, and reads what a gcloud and a kubectl command were given.
@@ -11239,8 +11259,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             stand_ins[argv[0]] = str(stand_in)
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role, **pod_environment})
             executor = CredentialProxyHandler.executor
@@ -11264,7 +11284,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         # bootstrap command does not reach that list. This starts `serve` with
         # one, for each role, with both names in the proxy's environment, and
         # reads what the command was given. On GKE the operator's bootstrap
-        # command runs gcloud. The exec role sets the gcloud name itself, to
+        # command runs gcloud. Every role sets the gcloud name itself, to
         # its own value; the pod's value must not replace it.
         pod_environment = {
             "MALLOC_ARENA_MAX": "2",
@@ -11280,8 +11300,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         )
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             with self.subTest(role=role):
                 self._serve_with(
@@ -13699,6 +13719,45 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
                 with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=answer):
                     with self.assertRaises(credential_proxy.AuthenticationError):
                         self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_body_that_the_parser_refuses_for_its_depth_is_a_rejection(self):
+        # The depth that the JSON parser refuses is the interpreter's and differs
+        # between Python versions, so the parser's refusal is given directly.
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(urllib.request.OpenerDirector, "open", return_value=Response(b"[]")), \
+                mock.patch.object(credential_proxy.json, "load", side_effect=RecursionError("too deep")):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_status_with_a_value_of_the_wrong_type_is_a_rejection(self):
+        for label, overrides in (
+            ("the user is a string", {"user": "system:serviceaccount:kubeagents-system:agent"}),
+            ("the user is a list", {"user": [self.CALLER]}),
+            ("the username is a list", {"user": {"username": [self.CALLER]}}),
+            ("the audiences are a number", {"audiences": 1}),
+            ("the audiences are a mapping", {"audiences": {self.AUDIENCE: True}}),
+            ("the groups are a number", {"user": {"username": self.CALLER, "groups": 1}}),
+            ("the groups are a mapping", {"user": {"username": self.CALLER, "groups": {"system:serviceaccounts": True}}}),
+            ("the groups are text", {"user": {"username": self.CALLER, "groups": "system:serviceaccounts"}}),
+            ("the uid is a list", {"user": {"username": self.CALLER, "uid": ["sa-uid"]}}),
+        ):
+            with self.subTest(label):
+                authenticator = self._with_review(self._authenticator(), self._ok_status(**overrides))
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_an_own_token_file_that_is_not_utf8_is_a_rejection(self):
+        self.own_token.write_bytes(b"\xff\xfe not text")
+        with mock.patch.object(urllib.request.OpenerDirector, "open") as opened:
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+        opened.assert_not_called()
 
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
@@ -20213,6 +20272,36 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
             path or self.ENTRIES_LIST, token=token, method="POST", body=raw,
             headers={"Content-Type": "application/json", **(headers or {})},
         )
+
+    def test_an_entries_list_filter_drops_an_excluded_clusters_entries(self):
+        # The same clause `gcloud logging read` gets (cluster_metadata_scope):
+        # ANDed onto the caller's filter, never parsed, so whatever it says the
+        # excluded cluster's entries don't come back.
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        clause = 'NOT resource.labels.cluster_name=~"^(scratch)$"'
+        for caller_filter, sent_filter in (
+            (self.ENTRIES_BODY["filter"], f'(\n{self.ENTRIES_BODY["filter"]}\n) AND {clause}'),
+            ('resource.labels.cluster_name="scratch"', f'(\nresource.labels.cluster_name="scratch"\n) AND {clause}'),
+            (None, clause),
+        ):
+            with self.subTest(filter=caller_filter):
+                self.upstream_bodies.clear()
+                body = dict(self.ENTRIES_BODY)
+                if caller_filter is None:
+                    body.pop("filter")
+                else:
+                    body["filter"] = caller_filter
+                status, _, _ = self._entries_list(body)
+                self.assertEqual(200, status)
+                [sent] = self.upstream_bodies
+                self.assertEqual(sent_filter, json.loads(sent)["filter"])
+
+    def test_an_entries_list_filter_that_could_swallow_the_clause_is_refused(self):
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        status, _, payload = self._entries_list({**self.ENTRIES_BODY, "filter": 'x="open'})
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, payload["rule"])
+        self.assertEqual([], self.upstream_bodies)
 
     def test_an_entries_list_reaches_the_upstream_as_the_brokers_own_post(self):
         self.reply.update(body=b'{"entries":[{"insertId":"a"}],"nextPageToken":"t"}')

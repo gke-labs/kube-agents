@@ -1401,3 +1401,27 @@ func TestAgentScheduleAControllerOfAnotherKindIsNotThePlatformAgent(t *testing.T
 		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
 	}
 }
+
+// run-now runs a suspended schedule. A run-now-only built-in (the onboarding
+// row, builtinSchedule.RunNowOnly) renders suspended on a nominal schedule
+// and relies on this: the reconciler handles a run-now token before it skips
+// a suspended slot. Reordering those two turns onboarding off with nothing to
+// show for it, so this pins the order.
+func TestARunNowRunsASuspendedSchedule(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Suspend = true })
+	f.at(t, hourAt(0, 45))
+	s := f.get(t)
+	s.Annotations = map[string]string{agentv1alpha1.AgentScheduleRunNowAnnotation: "once"}
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(0, 50))
+	if s = f.get(t); len(f.gw.sends) != 1 || s.Status.LastHandledRunNow != "once" {
+		t.Fatalf("a run-now on a suspended schedule ran nothing: sends = %v, status = %+v", f.gw.sends, s.Status)
+	}
+	// Its slots stay skipped.
+	f.at(t, hourAt(2, 0))
+	if s = f.get(t); s.Status.SkipCounts.Suspended == 0 {
+		t.Fatalf("a suspended schedule's slot wasn't skipped: %+v", s.Status)
+	}
+}

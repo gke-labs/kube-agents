@@ -25,6 +25,9 @@ persona and the `a2a-topics` skill) is a different thing and lives in
 its tools (`gke.get_cluster`). `parameters` are values each task supplies,
 such as the target cluster: the dispatcher states them in the task, and the
 profile worker also exports each as `PROFILE_TASK_<NAME>` in the environment.
+A task a schedule's trigger started also gets the trigger's stream and origin
+as `PROFILE_TRIGGER_STREAM` and `PROFILE_TRIGGER_ORIGIN`, from the
+submission's authority block, never from a parameter.
 Nothing cluster-specific is stamped into the image.
 
 A persona holds no image references, no credentials and no secrets. Every
@@ -97,9 +100,13 @@ An adapter maps a loaded persona to a harness and reads nothing else: no
 network, no credentials, no environment. Whatever the pod knows, such as
 the relay's address, the worker passes in as a `Target`. What a harness
 cannot express comes back as a warning, never an error.
-`render.For(harness)` picks the adapter by the harness value the worker is
-started with (`claude-code` or `antigravity`): `A2A_HARNESS`, which the
-operator sets from the AgentProfile's `spec.harness.type`.
+`render.For(harness)` picks the adapter by the harness the worker is started
+with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
+`spec.harness.type`, or on a profile worker `PROFILE_HARNESS` when that is
+unset (`claude-code` or `antigravity`). A session pod refuses `antigravity`
+unless `A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, until
+#6710 lands; a profile worker refuses it because it has no persona adapter
+yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;

@@ -12,7 +12,7 @@
 
 | Question   | Answer                                                                                                                                                                                                                     |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| What       | The 29 `gke-*` skills under `agents/platform/skills/` are copies of `skills/cloud/gke-*` in [`google/skills`](https://github.com/google/skills), the repository the removed `scripts/sync-upstream-skills.py` synced from. |
+| What       | The 31 `gke-*` skills under `agents/platform/skills/` are copies of `skills/cloud/gke-*` in [`google/skills`](https://github.com/google/skills), the repository the removed `scripts/sync-upstream-skills.py` synced from. |
 | Constraint | Another team maintains `google/skills`; it accepts issues but no external pull requests. Our changes (credential proxy, `$HERMES_HOME`, routing to our own skills, persona rules) live here for as long as the skills do.  |
 
 ## What happened before this design
@@ -269,7 +269,7 @@ flowchart LR
 - Any automatic rule would pick a side and silently drop either our correction or upstream's improvement, so the decision stays with a person and everything around it is automated.
 - An AI assistant can propose the resolution: it reads the stopped patch's `Why:` header, upstream's change and the conflicting lines, and suggests the merged text, which a person reviews and commits as the patch's new content. The patch stays a plain diff; AI helps only at conflict time.
 - Every sync PR comes with an eval-driven development record (`.agents/rules/eval_driven_development.md`): a case that fails on `main` for the reason the sync addresses, then passes three times with the sync, registered in the nightly roster. See [Eval evidence for syncs and patches](#eval-evidence-for-syncs-and-patches).
-- Upstreaming shrinks the work: a general fix (the NetworkPolicy two-step, the `answer_query` quota) has `Retire-When: upstream <change>` and is filed as a `google/skills` issue; once upstream carries it, the next sync reports it retired.
+- Upstreaming shrinks the work: a general fix (the NetworkPolicy two-step, the `answer_query` quota) has `Retire-When: upstream <change>` and is filed as a `google/skills` issue by the assignee of its tracking issue ([Tracking the report of a general fix](#tracking-the-report-of-a-general-fix)); once upstream carries it, the next sync reports it retired.
 
 ### The presubmit check
 
@@ -353,6 +353,37 @@ What `make skills-check` reports when a step is skipped:
 | A patch's `Retire-When:` line is missing, was not filled in, or has a different first word     | no line, two lines, or none of the three forms    | write one line in one of the three forms                                 |
 | A patch has an `Upstream-Issue:` line                                                          | the line that `Retire-When:` replaced             | delete the line                                                          |
 
+### Tracking the report of a general fix
+
+`google/skills` must also carry a general fix, and it takes issues and no outside pull requests, so a person files an issue there. One tracking issue in this repository holds that task for each general patch. `scripts/reconcile_skill_upstream.py` opens and closes the tracking issues. `.github/workflows/skill-upstream-tracking.yml` runs it on each push to `main` that changes `agents/platform/skill-overlays/`, one time each day, and by hand.
+
+| Patch on `main`            | Tracking issue | Action                              |
+| -------------------------- | -------------- | ----------------------------------- |
+| general, soak window ended | none           | Open the issue.                     |
+| general                    | closed         | Comment, then open the issue again. |
+| specific                   | open           | Comment, then close as not planned. |
+| gone                       | open           | Comment, then close as completed.   |
+
+- A patch is general when the first word of its `Retire-When:` line is `upstream` or `upstream's`. A patch whose `Retire-When:` line fails `make skills-check` gets no action: the script opens no issue and does not change an issue that exists.
+- The identity of a tracking issue is the full path of the patch file, in a hidden marker on the last line of the issue body. The script finds its issues by the label `skills:upstream` and the marker. A patch number is not an identity, because a folder can have two patches with the same number. A `Subject:` line is not an identity, because its author can edit it.
+- The soak window is 14 days from the commit that added the patch file. It does not start again when the file changes.
+- The assignee is the author of that commit. For a robot author, or a commit with no GitHub account, the assignee is the primary owner of "Upstream skill intake (google/skills)" in [`docs/ownership.md`](../ownership.md). If GitHub refuses the login, the issue has no assignee.
+- The script writes the title and the body one time, when it opens the issue. After that it only comments and changes the open or closed state, so a person can change the assignee and the other labels. Each issue also has the label `needs-human`, so that agents skip it, and `priority:p3`, so that the triage sweep adds no `needs-triage`.
+- The close comment for a patch that is gone links the commit that removed the file. It does not say that upstream carries the fix: a conflict in a sync, a deletion by hand and a rename also remove the file, and `main` does not record the cause.
+- One run opens 40 issues at most. Above that count the run stops and writes nothing, because such a count shows a wrong read of the tree or of the API.
+- A dry run prints the actions and sends only reads; it is the default of a run by hand. A run that writes refuses a ref that is not `main`, and its job checks out the tip of `main`, so a second attempt of an old run does not read an old tree.
+- The push run and the daily run start only if the repository variable `SKILL_UPSTREAM_TRACKING` is `on`. A maintainer sets it after a dry run and the first real run, both by hand.
+- After a rename by hand, the script closes the issue of the old path. The new path has a soak window of its own, from the rename commit, so its issue opens 14 days later, with the author of the rename commit as assignee. That person then copies the `google/skills` link to the new issue.
+- If a person removes the label or the marker of an issue, the script opens a second issue for the patch. If a person deletes the label in the repository settings, GitHub removes it from each issue, and the next run opens a new issue for each general patch.
+- The script sends the request that opens an issue one time only. After a server error or a lost answer, GitHub possibly made the issue, so the run stops, and the next run reads the issues.
+- If a general patch has two open issues, the run does its other work, names the two issues and fails until a person closes one. The script closes no issue that it did not plan to close; a later step can let it close the newer issue with a comment. A patch that is specific or gone keeps no issue, so each open issue with its marker closes.
+- A closed issue of a general patch opens again at once, with no soak window, also when a new patch gets the path of a patch that is gone.
+- If GitHub refuses one action on an issue that exists, for example a comment on a locked issue, the run does the other actions and then fails. A refusal to open an issue stops the run.
+- The script reads each folder under `agents/platform/skill-overlays/`, also a folder with no lock file, so a patch is gone only when its file is gone. A patch whose path cannot be the marker of an issue, for example a file name with a space, gets no issue.
+- An `append.md` has no header, so a general fix in it gets no tracking issue.
+
+The issue text gives the steps for the assignee; the [`edit-mirrored-skill`](../../.agents/skills/edit-mirrored-skill/SKILL.md) skill has the same steps under "Report a general fix to google/skills".
+
 ### Skills this repository writes
 
 - Added as today: a directory under `agents/platform/skills/`, with no upstream copy, overlay or lock.
@@ -409,7 +440,7 @@ Optional, not part of this design: an `OWNERS` file on `third_party/google-skill
 
 ## Costs
 
-- Two copies of each mirrored skill (about 440 KiB for 29 skills).
+- Two copies of each mirrored skill (the upstream copies are about 570 KiB for 31 skills).
 - A new script with eight subcommands (`sync`, `continue`, `import`, `refresh`, `generate`, `check`, `status`, `verify-upstream`) and its tests.
 - Patch files are awkward to edit by hand, hence `make skills-refresh`; a sync PR carries refreshed patches alongside the upstream and generated diffs.
 - Migration rewrites the script the open skill-sync PRs edit, so it lands after them.
@@ -498,7 +529,7 @@ sequenceDiagram
 
 Open before this is built:
 
-- The eval policy for automated sync PRs: each needs eval evidence, and per-skill coverage is thin today (one of the 29 mirrored skills is named by any case), so a bot PR would wait on a person writing a case.
+- The eval policy for automated sync PRs: each needs eval evidence, and per-skill coverage is thin today (12 of the 31 mirrored skills are named by a case), so a bot PR would wait on a person writing a case.
 - The token the job opens PRs with, which needs a repository admin and the robot's operator.
 - How `kube-agents-robot` is pointed at `skill-sync-conflict` issues, and review load in weeks when upstream changes many skills at once.
 
