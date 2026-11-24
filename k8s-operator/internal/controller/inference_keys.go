@@ -538,8 +538,8 @@ func tiersInUse(profiles []agentv1alpha1.AgentProfile, draining []string) []stri
 }
 
 // drainingInferenceKeyTiers is every tier the applied dispatch config still
-// drains: a tier a live profile dropped, and every tier of a profile that has
-// left the install (agentprofile_tier_drain.go). A task already running at
+// lists: live, or draining (a tier a live profile dropped, and every tier of
+// a profile that has left the install, agentprofile_tier_drain.go). A task already running at
 // one still sends its tier's key until the drain ends, so the key stays, in
 // its Secret and in the map, until then. No applied config drains nothing; a
 // read that fails otherwise is an error, so no tier key is deleted on a pass
@@ -578,7 +578,14 @@ func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context,
 		}
 	}
 	for _, p := range applied.Profiles {
-		if draining(p.DrainingUntil) {
+		// A tier the config still lists for a profile is kept whether it is
+		// live there or draining. The config is the one the A2A step wrote
+		// on an earlier pass, and this step runs before that one: on the
+		// first pass after a profile leaves or drops a tier, the config
+		// still lists it as live, with no drain written yet, and its tasks
+		// are still running. A zero end is the drain about to start, as
+		// drainingDispatchProfiles reads it.
+		if p.DrainingUntil.IsZero() || draining(p.DrainingUntil) {
 			for _, tier := range p.Tiers {
 				keep(tier)
 			}

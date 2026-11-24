@@ -628,6 +628,9 @@ func TestADrainingTierKeepsItsKeyUntilTheDrainEnds(t *testing.T) {
 		name    string
 		drained func(until time.Time) a2aDispatchProfile
 		profile func(p *agentv1alpha1.AgentProfile) bool // false: delete it
+		// firstPass: the applied entry carries no drain yet; the drain-ends
+		// leg then writes an ended drain for the tier.
+		firstPass bool
 	}{
 		{
 			name: "dropped from allowedTiers",
@@ -644,6 +647,27 @@ func TestADrainingTierKeepsItsKeyUntilTheDrainEnds(t *testing.T) {
 			name: "profile left the install",
 			drained: func(until time.Time) a2aDispatchProfile {
 				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}, DrainingUntil: until}
+			},
+			profile: func(*agentv1alpha1.AgentProfile) bool { return false },
+		},
+		// The first pass after the change, before the A2A step has written
+		// the drain: the applied config still lists the tier as live.
+		{
+			name:      "dropped from allowedTiers, drain not written yet",
+			firstPass: true,
+			drained: func(time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}}
+			},
+			profile: func(p *agentv1alpha1.AgentProfile) bool {
+				p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+				return true
+			},
+		},
+		{
+			name:      "profile left the install, drain not written yet",
+			firstPass: true,
+			drained: func(time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}}
 			},
 			profile: func(*agentv1alpha1.AgentProfile) bool { return false },
 		},
@@ -681,7 +705,16 @@ func TestADrainingTierKeepsItsKeyUntilTheDrainEnds(t *testing.T) {
 			}
 
 			// The drain over, the key goes.
-			ended := appliedDispatchConfigObject(t, agent, tc.drained(time.Now().Add(-time.Minute).UTC().Truncate(time.Second)))
+			past := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+			endedEntry := tc.drained(past)
+			if tc.firstPass {
+				endedEntry = a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead},
+					DrainingTiers: []a2aDrainingTier{{Tier: agentv1alpha1.AgentProfileTierUnattended, Mode: "unattended", Until: past}}}
+				if !tc.profile(&agentv1alpha1.AgentProfile{}) {
+					endedEntry = a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}, DrainingUntil: past}
+				}
+			}
+			ended := appliedDispatchConfigObject(t, agent, endedEntry)
 			applied.Data = ended.Data
 			if err := cl.Update(ctx, applied); err != nil {
 				t.Fatal(err)
