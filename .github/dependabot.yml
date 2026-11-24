@@ -103,9 +103,9 @@ updates:
         patterns:
           - "*"
 
-  # The docs site holds the only package.json with dependencies to update. The
-  # gke-app-onboarding scaffold's declares none, so the old glob covered it
-  # without ever having anything to propose.
+  # The docs site's dependencies. The gke-app-onboarding scaffold's package.json
+  # declares none, so the old glob covered it without ever having anything to
+  # propose. The worker harness SDK has its own entry below.
   - package-ecosystem: "npm"
     directory: "/docs/site"
     schedule:
@@ -120,6 +120,27 @@ updates:
       prefix: "ci"
     groups:
       npm:
+        patterns:
+          - "*"
+
+  # The worker image's harness SDK, installed from this directory's lockfile with
+  # `npm ci` (#6948). Its own entry and group, so an SDK bump arrives alone: the
+  # worker's stream-json handling is proved against one SDK version
+  # (a2a/Dockerfile.worker), and that bump needs its own review.
+  - package-ecosystem: "npm"
+    directory: "/a2a/worker-harness"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "build"
+    groups:
+      worker-harness:
         patterns:
           - "*"
 

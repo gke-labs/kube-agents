@@ -72,6 +72,9 @@ PROFILE_HOOK_MODULE_NAME = "bench_profile_hook"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
+# The runner's reader of `scope_hold:` (hack/ci-eval-pr.sh), loaded the same way.
+SCOPE_HOLD_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_hold.py"
+SCOPE_HOLD_MODULE_NAME = "bench_scope_hold"
 # The top-level key a case declares its total of requested pull requests under
 # (bench/kube_agents_bench/lane.py's REQUESTED_KEY); the check types that request a
 # pull request, as lane.py's REQUESTING_CHECK_TYPES names them; and the keys a check
@@ -953,6 +956,15 @@ def scope_exclude_reader() -> Any:
     return module
 
 
+def scope_hold_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(SCOPE_HOLD_MODULE_NAME, SCOPE_HOLD_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{SCOPE_HOLD_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def platform_job_ids() -> set[str]:
     """The Platform Agent's cron job ids, the audit streams among them."""
     try:
@@ -1735,6 +1747,18 @@ def validate_case(
                 )
             elif set(slots) >= catalog:
                 problems.append("'scope_exclude:' excludes every seeded slot; leave at least one in scope")
+
+    # The hold a case puts on the install (agent_cluster, all, a reason). The
+    # runner runs a holding case alone after every other unit, in a loop of its
+    # own; a case that also excluded scope would run twice, once in each loop.
+    if "scope_hold" in spec:
+        reader = scope_hold_reader()
+        try:
+            reader.declared_hold(path)
+        except reader.ScopeHoldError as exc:
+            problems.append(f"{exc}")
+        if "scope_exclude" in spec:
+            problems.append("'scope_hold:' and 'scope_exclude:' in one case: the runner runs each in a phase of its own; declare one")
 
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses

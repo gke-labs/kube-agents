@@ -63,6 +63,27 @@ type PlatformAgentSpec struct {
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
 
+	// Hold pauses the agents' access to clusters' Kubernetes APIs without taking
+	// them out of scope: an operator's lever for an incident, set with kubectl
+	// patch and lifted by removing it. The credential broker and kube-proxy
+	// refuse a held cluster's API to every caller, on the routes
+	// spec.scope.exclude.clusters is refused on, and the refusal names the hold
+	// and its reason so the agent reports it and stops rather than working
+	// around it. A Cluster Agent task that targets a held cluster is refused for
+	// every command, metadata reads included; the Platform Agent's own reads of
+	// the GKE control plane for it (the project's cluster list, a describe) stay
+	// allowed. Unlike an exclusion, a held cluster keeps its Cluster Agent
+	// profile and its place in fleet answers and audits, and nothing restarts:
+	// the operator renders the hold into the <name>-hold ConfigMap, which no
+	// pod-template hash covers, the kubelet syncs the mounted file (usually
+	// within a minute or two), and both components re-read it on the next
+	// request. Like an exclusion it is checked when a request starts: a watch, a
+	// followed log, or an exec, attach, port-forward or proxy stream opened before the
+	// hold reached them keeps running until it ends. The installer does not
+	// carry it: an upgrade keeps the live value.
+	// +optional
+	Hold *HoldSpec `json:"hold,omitempty"`
+
 	// Storage sizes the agent's /opt/data volume and the shell sandbox's data
 	// volume.
 	// +optional
@@ -118,6 +139,30 @@ type TierMember struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +required
 	Tier string `json:"tier"`
+}
+
+// HoldSpec names the clusters whose Kubernetes API the agents must not reach
+// until an operator lifts the hold.
+type HoldSpec struct {
+	// All holds every cluster, the one the harness runs in included.
+	// +optional
+	All bool `json:"all,omitempty"`
+
+	// Clusters holds single clusters by the full triple, matched as
+	// spec.scope.exclude.clusters entries are.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
+	// +optional
+	Clusters []ScopeClusterRef `json:"clusters,omitempty"`
+
+	// Reason is shown in every refusal, so the agent can tell its user why
+	// the cluster is paused (an incident link, a change window).
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // PlatformAgentStorageSpec sizes the agent's persistent data volumes.
@@ -467,6 +512,7 @@ type SlackSpec struct {
 
 // TeamsSpec contains the configuration for the Microsoft Teams integration.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef) && has(self.appPasswordSecretRef))",message="appIdSecretRef and appPasswordSecretRef are required when Teams integration is enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.inbound) || !has(self.inbound.enabled) || self.inbound.enabled == false || (has(self.enabled) && self.enabled == true && has(self.tenantId) && self.tenantId.matches('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'))",message="integration.teams.enabled and a tenantId in GUID form are required when integration.teams.inbound is enabled: the receiver serves one tenant of one enabled integration"
 type TeamsSpec struct {
 	// Enabled toggles the Microsoft Teams integration.
 	// +kubebuilder:default=false
@@ -517,6 +563,29 @@ type TeamsSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	AdaptiveCards *bool `json:"adaptiveCards,omitempty"`
+
+	// Inbound is the receiver for the messages Microsoft delivers to the
+	// bot. Without it the bot can post to Teams, but a message typed in
+	// Teams does not reach the agent: Bot Framework delivers each message
+	// by an HTTPS request to the address registered for the bot, and no
+	// component of the install listens for it. With it the operator runs a
+	// small pod that verifies Microsoft's signed token on each request,
+	// pins the tenant, and hands the message to the credential broker's
+	// Teams queue; the admin exposes its Service with their own Ingress and
+	// TLS certificate and registers that address with the bot. It needs
+	// tenantId. The receiver holds no credential of the install's own.
+	// +optional
+	Inbound *TeamsInboundSpec `json:"inbound,omitempty"`
+}
+
+// TeamsInboundSpec configures the Teams inbound receiver.
+type TeamsInboundSpec struct {
+	// Enabled runs the receiver. Off by default: the install then accepts
+	// no connection from the internet, as it did before the receiver
+	// existed.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // +kubebuilder:object:root=true
