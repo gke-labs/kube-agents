@@ -57,6 +57,7 @@ type Harness string
 const (
 	ClaudeCode  Harness = "claude-code"
 	Antigravity Harness = "antigravity"
+	CoreAgent   Harness = "core-agent"
 )
 
 // Persona is a loaded, validated persona directory.
@@ -149,6 +150,23 @@ type Relay struct {
 	Env     map[string]string
 }
 
+// ReservedServer is the MCP server name the worker keeps for its own
+// per-task delegate server; a persona's mcp.yaml can't declare it.
+const ReservedServer = "a2a"
+
+// MCPServer is one MCP server a harness starts for a turn, in harness-neutral
+// terms: a stdio command (the worker's relay to the credential broker, or the
+// worker's own delegate server) and the tools the harness may use from it,
+// by the names the server gives them. Every tool the harness registers from
+// the server is in Tools, and no other.
+type MCPServer struct {
+	Name    string
+	Command string
+	Args    []string
+	Env     map[string]string
+	Tools   []string
+}
+
 // Target is what an adapter needs from the pod it renders for.
 type Target struct {
 	Relay Relay
@@ -168,6 +186,10 @@ type Output struct {
 	Disallowed []string
 	// Model is the manifest's model hint, for the worker to honour or not.
 	Model string
+	// MCPServers are the MCP servers a harness that takes them in-process
+	// starts, for an adapter that renders them so rather than as Args or
+	// Files.
+	MCPServers []MCPServer
 	// Warnings name each part of the persona the harness cannot express.
 	// Dropping something is never an error.
 	Warnings []string

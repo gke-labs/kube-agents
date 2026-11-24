@@ -34,13 +34,13 @@ func writeSessionHome(t *testing.T, withManifest bool) string {
 }
 
 // Another harness's persona is checked against that harness's scope: here
-// one whose persona is GEMINI.md and skills. A changed file in the scope is
+// one whose persona is instructions.md and skills. A changed file in the scope is
 // refused.
 func TestCheckSessionHomeUsesTheHarnessScope(t *testing.T) {
-	agyCovers := func(rel string) bool {
-		return rel == "GEMINI.md" || rel == "skills" || strings.HasPrefix(rel, "skills/")
+	scope := func(rel string) bool {
+		return rel == "instructions.md" || rel == "skills" || strings.HasPrefix(rel, "skills/")
 	}
-	files := map[string][]byte{"GEMINI.md": []byte("persona\n"), "skills/triage/SKILL.md": []byte("---\nname: triage\n---\n")}
+	files := map[string][]byte{"instructions.md": []byte("persona\n"), "skills/triage/SKILL.md": []byte("---\nname: triage\n---\n")}
 	dir := t.TempDir()
 	for rel, data := range files {
 		p := filepath.Join(dir, rel)
@@ -55,14 +55,14 @@ func TestCheckSessionHomeUsesTheHarnessScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
-	if err := CheckSessionHome(dir, agyCovers, log); err != nil {
+	if err := CheckSessionHome(dir, scope, log); err != nil {
 		t.Fatalf("an unchanged persona: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "GEMINI.md"), []byte("changed\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "instructions.md"), []byte("changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckSessionHome(dir, agyCovers, log); err == nil || !strings.Contains(err.Error(), "GEMINI.md") {
-		t.Errorf("a changed GEMINI.md: err = %v, want it named", err)
+	if err := CheckSessionHome(dir, scope, log); err == nil || !strings.Contains(err.Error(), "instructions.md") {
+		t.Errorf("a changed instructions.md: err = %v, want it named", err)
 	}
 }
 

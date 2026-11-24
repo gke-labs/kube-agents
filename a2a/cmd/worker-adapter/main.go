@@ -65,6 +65,9 @@ const (
 	// defaultWorkdir is the pod's scratch emptyDir. A local run falls back to
 	// the current directory, which is why this is a default and not a require.
 	defaultWorkdir = "/scratch"
+	// writeRefusalSubdir holds a session pod's per-turn write-refusal record
+	// under the workdir (sessionWriteRefusalDir).
+	writeRefusalSubdir = ".kube-agents"
 
 	// defaultModel is the profile-neutral alias LiteLLM routes; naming the
 	// concrete model belongs in the install, not here.
@@ -182,6 +185,7 @@ func run() int {
 	if err := os.Chdir(workdir); err != nil {
 		log.Warn("workdir unavailable; staying put", "workdir", workdir, "err", err)
 	}
+	cfg.WriteRefusalDir = sessionWriteRefusalDir(cfg.Session, workdir)
 
 	// SIGTERM is the eviction path: context cancellation tells the adapter
 	// to flush, publish terminal failed reason worker-evicted, and exit 143 -
@@ -392,6 +396,18 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		// serves a second task, and validate refuses the pair.
 		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
 	}, true
+}
+
+// sessionWriteRefusalDir is where a session pod with the cluster view keeps
+// each turn's write-refusal record (Config.WriteRefusalDir): under the workdir,
+// the pod's scratch emptyDir, which the harness's own kubectl wrapper can
+// append to. Any other pod gets none: a profile pod's worker makes its own
+// file, and a session pod with no cluster view runs no kubectl.
+func sessionWriteRefusalDir(session, workdir string) string {
+	if session == "" || os.Getenv(lib.EnvClusterView) != "true" {
+		return ""
+	}
+	return filepath.Join(workdir, writeRefusalSubdir)
 }
 
 // harnessCommand builds the harness argv: the native binary driven over the
@@ -727,7 +743,8 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	// (#6832), and later on session pods (#6716). Elsewhere only the pod
 	// spec or the image's ENV can set it; a profile with no type gets
 	// neither variable, by design, since its image is already trusted code.
-	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
+	// core-agent likewise, until its end-of-turn sweep lands (#6710).
+	if (driver.Harness() == persona.Antigravity || driver.Harness() == persona.CoreAgent) && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
 		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
 			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
 	}
@@ -753,6 +770,8 @@ func builderFor(h persona.Harness) (harnessBuilder, error) {
 		return claudeBuilder{}, nil
 	case persona.Antigravity:
 		return agyBuilder{}, nil
+	case persona.CoreAgent:
+		return coreAgentBuilder{}, nil
 	}
 	return nil, fmt.Errorf("harness %q has no argv builder", h)
 }

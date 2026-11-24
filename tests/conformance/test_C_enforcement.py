@@ -1900,6 +1900,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "A2A_KUBE_PROXY_URL",
             "A2A_KUBE_PROXY_CA_CONFIGMAP",
             "A2A_KUBE_PROXY_HOST_CONTEXT",
+            "A2A_KUBE_PROXY_MODE",
         ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
@@ -1925,6 +1926,15 @@ class C1IsolationIsStructural(unittest.TestCase):
                     re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
                     "the shim no longer reads %s by that name" % name,
                 )
+
+        # KUBE_PROXY_MODE gates the session kubectl wrapper's write-attempt
+        # record: the spawner sets it, the wrapper and the client read it. A
+        # rename on either side records nothing, and no session turn stops.
+        with self.subTest(env="KUBE_PROXY_MODE"):
+            self._one_match(r'Name:\s*"KUBE_PROXY_MODE"', spawner, "the spawner's render of KUBE_PROXY_MODE")
+            self.assertRegex(shim, r'KUBE_PROXY_MODE_ENV\s*=\s*"KUBE_PROXY_MODE"', "the client no longer reads KUBE_PROXY_MODE")
+            wrapper = (h.REPO_ROOT / "deploy" / "sandbox" / "session-kubectl.sh").read_text(encoding="utf-8")
+            self.assertIn("${KUBE_PROXY_MODE:-}", wrapper, "the kubectl wrapper no longer reads KUBE_PROXY_MODE")
 
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.

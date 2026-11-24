@@ -718,21 +718,41 @@ func TestHarnessConfigDir(t *testing.T) {
 	}
 }
 
-// On an Antigravity worker the session check reads agy's rendered persona,
-// never Claude Code's config directory, whatever the Claude variables say,
-// and it checks only the names an agy persona holds.
-func TestAnAgyWorkerChecksItsOwnPersonaTree(t *testing.T) {
+// TestSessionWriteRefusalDir: only a session pod with the cluster view keeps a
+// per-turn write-refusal record, under its workdir.
+func TestSessionWriteRefusalDir(t *testing.T) {
+	for _, tc := range []struct {
+		name, session, clusterView, want string
+	}{
+		{"session with the cluster view", "chat-a", "true", "/scratch/.kube-agents"},
+		{"session without the cluster view", "chat-a", "", ""},
+		{"cluster view spelled otherwise", "chat-a", "TRUE", ""},
+		{"no session (a profile pod)", "", "true", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(lib.EnvClusterView, tc.clusterView)
+			if got := sessionWriteRefusalDir(tc.session, "/scratch"); got != tc.want {
+				t.Fatalf("sessionWriteRefusalDir(%q) = %q, want %q", tc.session, got, tc.want)
+			}
+		})
+	}
+}
+
+// On a core-agent worker the session check reads the rendered persona the
+// harness reads, never Claude Code's config directory, whatever the Claude
+// variables say, and it checks only the names a rendering holds.
+func TestACoreAgentWorkerChecksItsOwnPersonaTree(t *testing.T) {
 	prev := activeHarness
 	t.Cleanup(func() { activeHarness = prev })
-	activeHarness = agyBuilder{}
+	activeHarness = coreAgentBuilder{}
 	t.Setenv(claudeConfigDirEnv, "/cfg")
 	t.Setenv("HOME", "/home/u")
-	if got := harnessConfigDir(); got != agyPersonaDir {
-		t.Errorf("harnessConfigDir() = %q, want %q", got, agyPersonaDir)
+	if got := harnessConfigDir(); got != coreAgentPersonaDir {
+		t.Errorf("harnessConfigDir() = %q, want %q", got, coreAgentPersonaDir)
 	}
 	for rel, want := range map[string]bool{
-		"GEMINI.md": true, "AGENTS.md": true, "skills/triage/SKILL.md": true,
-		"CLAUDE.md": false, "hooks.json": false, "mcp_config.json": false,
+		"instructions.md": true, "skills/triage/SKILL.md": true,
+		"CLAUDE.md": false, "GEMINI.md": false, "hooks.json": false,
 	} {
 		if got := activeHarness.personaCovers(rel); got != want {
 			t.Errorf("personaCovers(%q) = %v, want %v", rel, got, want)
@@ -740,24 +760,24 @@ func TestAnAgyWorkerChecksItsOwnPersonaTree(t *testing.T) {
 	}
 }
 
-// The session check takes its scope from the active harness: an agy persona
-// with a manifest over GEMINI.md passes, where Claude Code's scope would
-// refuse GEMINI.md as outside the files it covers.
+// The session check takes its scope from the active harness: a core-agent
+// rendering with a manifest over instructions.md passes, where Claude Code's
+// scope would refuse instructions.md as outside the files it covers.
 func TestTheSessionCheckUsesTheActiveHarnessScope(t *testing.T) {
-	files := map[string][]byte{"GEMINI.md": []byte("persona\n")}
+	files := map[string][]byte{"instructions.md": []byte("persona\n")}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "GEMINI.md"), files["GEMINI.md"], 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "instructions.md"), files["instructions.md"], 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, persona.IntegrityManifestFile), persona.FormatIntegrityManifest(files), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if err := checkSessionPersona(agyBuilder{}, dir, log); err != nil {
-		t.Errorf("agy's scope: %v", err)
+	if err := checkSessionPersona(coreAgentBuilder{}, dir, log); err != nil {
+		t.Errorf("core-agent's scope: %v", err)
 	}
 	if err := checkSessionPersona(claudeBuilder{}, dir, log); err == nil {
-		t.Error("Claude Code's scope passed a manifest naming GEMINI.md")
+		t.Error("Claude Code's scope passed a manifest naming instructions.md")
 	}
 }
 
