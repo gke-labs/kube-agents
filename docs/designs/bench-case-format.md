@@ -389,8 +389,8 @@ lead), `report_times_in_window` (every date and time on a report line one of its
 the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published; its `required_patterns` and `forbidden_patterns` are regular expressions searched over
-the text its phrases read under the same `scope`, lowercased with its line breaks kept, for a
-claim no substring binds, such as a check, a cluster and a severity on one findings row;
+the text its phrases read under the same `scope`, without regard to case and with its line breaks
+kept, for a claim no substring binds, such as a check, a cluster and a severity on one findings row;
 `{cluster:<slot>}` is not expanded there), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
 names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier

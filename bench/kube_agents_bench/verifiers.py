@@ -2315,6 +2315,11 @@ _MAX_UNNAMED_IN_REASON = 5
 # candidates to shotgun the API with.
 _MAX_LEDGER_CANDIDATES = 8
 
+# How ``ledger_issue_contains`` searches its ``*_patterns``. The text is
+# lowercased before the search, so without this a capital in a pattern could
+# never match: an inert forbid, with nothing to say why.
+_LEDGER_PATTERN_FLAGS = re.IGNORECASE
+
 # A report that retired the ledger rather than filing on it, in the words the
 # harness and the audit's closing line use for that: `render_clean_comment`'s
 # "found **0 findings**" and "is now clean", and the roll-up a parent writes
@@ -5205,14 +5210,18 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
     # The regex forms, for a claim no one substring binds: a findings row is
-    # `| [<id>](#anchor) | <severity> | <cluster> | <state> |` and the id
-    # carries the project and location between the check slug and the cluster
-    # name, so only a pattern ties a check, a cluster and a severity to one
-    # row. Each is ``re.search``ed, as ``report_contains`` does, over the text
-    # the phrases are read from under the same ``scope``: lowercased, so a
-    # pattern spells its letters in lower case, with the line breaks kept, so
-    # a `.` stays on one row or one id. Every required pattern must match;
-    # no forbidden pattern may. No ``{cluster:<slot>}`` is expanded here.
+    # ``| [`<id>`](#user-content-finding-<id>) | <severity> | `<cluster>` | <state> |``
+    # and the id carries the project and location between the check slug and
+    # the cluster name, so only a pattern ties a check, a cluster and a
+    # severity to one row (through the id in the anchor, which the severity
+    # cell follows). Each is ``re.search``ed, as ``report_contains`` does, over
+    # the text the phrases are read from under the same ``scope``, lowercased
+    # and matched without regard to case, as the phrases are. The line breaks
+    # are kept, so a `.` stays on one table row, or on one id under
+    # ``finding_ids``; a body's hidden id block holds every id on ONE line, so
+    # a body pattern bounds its gaps with a class and not `.*`. Every required
+    # pattern must match; no forbidden pattern may. No ``{cluster:<slot>}`` is
+    # expanded here.
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids", "finding"] = "body"
@@ -5244,7 +5253,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
             try:
-                re.compile(pattern)
+                re.compile(pattern, _LEDGER_PATTERN_FLAGS)
             except re.error as exc:
                 # The same type ``report_contains`` raises for a pattern that
                 # does not compile, with the pattern named.
@@ -5567,8 +5576,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 return (
                     sum(1 for p in self.required_phrases if p.lower() not in block)
                     + sum(1 for p in self.forbidden_phrases if p.lower() in block)
-                    + sum(1 for p in self.required_patterns if not re.search(p, block))
-                    + sum(1 for p in self.forbidden_patterns if re.search(p, block))
+                    + sum(1 for p in self.required_patterns if not re.search(p, block, _LEDGER_PATTERN_FLAGS))
+                    + sum(1 for p in self.forbidden_patterns if re.search(p, block, _LEDGER_PATTERN_FLAGS))
                     + (1 if self.any_of_phrases and not any(p.lower() in block for p in self.any_of_phrases) else 0)
                 )
 
@@ -5621,8 +5630,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         any_of_miss = bool(self.any_of_phrases) and not any(
             p.lower() in text for p in self.any_of_phrases
         )
-        pattern_missing = [p for p in self.required_patterns if not re.search(p, text)]
-        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, text)]
+        pattern_missing = [p for p in self.required_patterns if not re.search(p, text, _LEDGER_PATTERN_FLAGS)]
+        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, text, _LEDGER_PATTERN_FLAGS)]
         raw = {
             "issue": ledger["slug"],
             "generated_at": generated_at.isoformat(),

@@ -510,16 +510,22 @@ ledgers for a stream that owns one, and that is a fail.
 
 **Patterns.** `required_patterns` and `forbidden_patterns` are regular expressions, for a claim
 one substring cannot bind. The findings table renders a row as
-`| [<id>](#anchor) | <severity> | <cluster> | <state> |`, and the id carries the project and
-location between the check slug and the cluster name. A phrase such as `seeded-b) | critical`
-therefore matches every critical row on that cluster, whichever check filed it; a pattern such as
-`master-behind\.[a-z0-9-]+-seeded-b\._\.cluster-seeded-b\) \| major` binds the check, the cluster
-and the severity to one row. The check searches each pattern (`re.search`, no flags) over the text
-the phrases read under the same `scope`: lowercased, so a pattern spells its letters in lower case,
-with its line breaks kept, so `.` stays on one row or one id. Every required pattern must match and
-no forbidden pattern may. Under `scope: finding` the patterns join the phrases: one finding of the
-check has to satisfy them all, on its object. A pattern that does not compile fails when the case
-loads. `{cluster:<slot>}` is not expanded here; `make bench-case-check` refuses it.
+``| [`<id>`](#user-content-finding-<id>) | <severity> | `<cluster>` | <state> |``, and the id
+carries the project and location between the check slug and the cluster name. A phrase such as
+`seeded-b) | critical` therefore matches every critical row on that cluster, whichever check filed
+it; a pattern such as `master-behind\.[a-z0-9-]+-seeded-b\._\.cluster-seeded-b\) \| major` binds
+the check, the cluster and the severity to one row. That pattern reads the id in the link's anchor,
+which the severity cell follows; the id in the link text and the cluster cell are in code spans.
+The renderer shortens an id over its length cap (`_shorten_id` in `audit_report.py`), and a pattern
+that spells a trimmed segment fails a correct run, so bind only an id that stays under the cap.
+The check searches each pattern (`re.search`) over the text the phrases read under the same
+`scope`, without regard to case, as it reads the phrases. The line breaks are kept, so `.` stays on
+one table row, or on one id under `scope: finding_ids`. The body's hidden id block holds every id
+on one line, so a body pattern bounds its gaps with a class, as the example does, and not `.*`.
+Every required pattern must match and no forbidden pattern may.
+Under `scope: finding` the patterns join the phrases: one finding of the check has to satisfy them
+all, on its object. A pattern that does not compile fails when the case loads. `{cluster:<slot>}`
+is not expanded here; `make bench-case-check` refuses it.
 
 **Cut findings.** A ledger whose findings overflow GitHub's body limit names the cut ones on one
 line each while they fit and, when it omits any, lists every filed id in a hidden

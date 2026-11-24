@@ -4028,20 +4028,29 @@ def test_ledger_any_of_only_pass_says_so_instead_of_all_0_required(token, github
 
 # --- required_patterns and forbidden_patterns ------------------------------
 
-# Two findings rows on one cluster, as audit_report.py renders the table: the
-# id carries the project and location between the check slug and the cluster.
+# Two findings rows on one cluster, as audit_report.py's _index_row renders
+# them: the id carries the project and location between the check slug and the
+# cluster, and stands in a code span in the link text and bare in the anchor.
 _MASTER_BEHIND_ID = "master-behind.evals-1-us-east1-seeded-b._.cluster-seeded-b"
 _UPGRADE_BLOCKED_ID = "upgrade-blocked.evals-1-us-east1-seeded-b._.cluster-seeded-b"
 _MASTER_BEHIND_MAJOR = r"master-behind\.[a-z0-9-]+-seeded-b\._\.cluster-seeded-b\) \| major"
 _MASTER_BEHIND_CRITICAL = r"master-behind\.[a-z0-9-]+-seeded-b\._\.cluster-seeded-b\) \| critical"
 
 
-def _findings_rows(master_behind_severity: str = "Major") -> str:
+# The row _index_row writes, loosely: held against the captured ledger too,
+# so the hand-built rows cannot drift from a real one unseen.
+_INDEX_ROW_SHAPE = re.compile(
+    r"(?m)^\| \[`([a-z0-9._-]+)`\]\(#user-content-finding-\1\) \| [a-z]+ \| `[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+` \| open \|$"
+)
+_CAPTURED_LEDGER = Path(__file__).parent / "fixtures" / "ledgers" / "updating_run_waste_audit.txt"
+
+
+def _findings_rows(master_behind_severity: str = "major") -> str:
     return (
         "| Finding | Severity | Cluster | State |\n"
         "| --- | --- | --- | --- |\n"
-        f"| [{_MASTER_BEHIND_ID}](#finding-{_MASTER_BEHIND_ID}) | {master_behind_severity} | seeded-b | open |\n"
-        f"| [{_UPGRADE_BLOCKED_ID}](#finding-{_UPGRADE_BLOCKED_ID}) | Critical | seeded-b | open |\n"
+        f"| [`{_MASTER_BEHIND_ID}`](#user-content-finding-{_MASTER_BEHIND_ID}) | {master_behind_severity} | `evals-1/us-east1/seeded-b` | open |\n"
+        f"| [`{_UPGRADE_BLOCKED_ID}`](#user-content-finding-{_UPGRADE_BLOCKED_ID}) | critical | `evals-1/us-east1/seeded-b` | open |\n"
     )
 
 
@@ -4052,6 +4061,8 @@ def test_ledger_pattern_binds_check_cluster_and_severity_in_one_row(token, githu
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(findings=_findings_rows())))
     assert _ledger_check(forbidden_phrases=["seeded-b) | critical"]).verify(5.0).status == "fail"  # the hole
+    assert _INDEX_ROW_SHAPE.search(_findings_rows()), "the fixture row is not the shape the captured ledger's rows have"
+    assert _INDEX_ROW_SHAPE.search(_CAPTURED_LEDGER.read_text(encoding="utf-8"))
     res = _ledger_check(required_patterns=[_MASTER_BEHIND_MAJOR], forbidden_patterns=[_MASTER_BEHIND_CRITICAL]).verify(5.0)
     assert res.status == "pass", res.reason
     assert "all 1 required pattern(s)" in res.reason
@@ -4060,7 +4071,7 @@ def test_ledger_pattern_binds_check_cluster_and_severity_in_one_row(token, githu
 
 def test_ledger_patterns_fail_on_the_row_with_the_wrong_severity(token, github):
     _stash_report()
-    github.routes[_api()] = (200, _issue(_ledger_body(findings=_findings_rows("Critical"))))
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=_findings_rows("critical"))))
     required = _ledger_check(required_patterns=[_MASTER_BEHIND_MAJOR]).verify(5.0)
     assert required.status == "fail" and not required.success
     assert "required patterns absent from the body of" in required.reason
@@ -4080,11 +4091,24 @@ def test_ledger_pattern_does_not_cross_a_row(token, github):
     assert res.status == "pass", res.reason
 
 
-def test_ledger_pattern_is_searched_over_lowercased_text(token, github):
+def test_ledger_pattern_matches_without_regard_to_case(token, github):
+    """The text is lowercased, as it is for the phrases, so a capital in a
+    pattern would otherwise never match: a forbid that can only pass."""
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(findings="`Debug-Binding` grants Cluster-Admin.\n")))
     assert _ledger_check(required_patterns=[r"debug-binding\W+grants cluster-admin"]).verify(5.0).status == "pass"
-    assert _ledger_check(required_patterns=[r"Debug-Binding"]).verify(5.0).status == "fail"
+    assert _ledger_check(required_patterns=[r"Debug-Binding"]).verify(5.0).status == "pass"
+    assert _ledger_check(forbidden_patterns=[r"Cluster-Admin"]).verify(5.0).status == "fail"
+
+
+def test_ledger_body_pattern_with_an_open_gap_crosses_ids_in_the_hidden_block(token, github):
+    """Why a body pattern bounds its gaps: the hidden id block is one line
+    holding every id, so `.*` runs from one id into the next there."""
+    _stash_report()
+    body = _ledger_body(finding_ids=["master-behind.evals-1-us-east1-seeded-a._.cluster-seeded-a", _UPGRADE_BLOCKED_ID])
+    github.routes[_api()] = (200, _issue(body))
+    assert _ledger_check(forbidden_patterns=[r"master-behind\..*seeded-b"]).verify(5.0).status == "fail"
+    assert _ledger_check(forbidden_patterns=[r"master-behind\.[a-z0-9-]+seeded-b"]).verify(5.0).status == "pass"
 
 
 def test_ledger_patterns_under_finding_ids_read_one_id_per_line(token, github):
