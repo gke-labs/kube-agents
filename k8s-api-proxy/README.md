@@ -65,8 +65,9 @@ the binary nor an embedder needs Google credentials to start, so a proxy on any 
 serves `in-cluster` with its ServiceAccount alone and only a `gke_` request fails, naming the
 missing credentials. The binary passes `Config.TokenSource` a source of its own that looks them up
 on first use; an embedder that passes no `Config.TokenSource` gets Application Default Credentials
-looked up when a `gke_` cluster is first requested. A failed lookup is tried again on the next
-`gke_` request, which finds a credentials file written since; a metadata server is probed once per
+looked up when a `gke_` cluster is first requested. A failed lookup is tried again, and
+finds a credentials file written since, once the failure cached for that cluster expires after ten
+seconds; a metadata server is probed once per
 process.
 
 The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) when the request
