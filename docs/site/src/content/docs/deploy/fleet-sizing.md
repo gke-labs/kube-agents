@@ -279,9 +279,9 @@ caveat beside it:
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
-the shell sandbox, where the audits run, sends `KUBEAGENTS_KUBECTL_COST_TIER` to the A2A gateway for
-its session Pods and to the credential broker's stateful and exec tiers too, and passes every name it does not reserve to the
-credential proxy and `agent-api-auth` containers. The name in the example reaches the container
+the shell sandbox, where the audits run. `KUBEAGENTS_KUBECTL_COST_TIER` also goes to the A2A gateway
+for its session Pods and to the credential broker's stateful and exec tiers. Every name the operator
+does not reserve passes to the credential proxy and `agent-api-auth` containers. The name in the example reaches the container
 that reads it.
 
 A process tunable such as `MALLOC_ARENA_MAX` is not on the agent container's allowlist. A values
