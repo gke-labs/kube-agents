@@ -6456,6 +6456,11 @@ report_github_leftovers() {
     echo "WARNING: ${forge} leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
+  # A unit's token file is exported for that unit alone and unset at its stop
+  # (stop_ledger_token_renewal), so a BENCH_GITHUB_TOKEN_FILE set here is the
+  # caller's shell's, and the listing would read it in preference to the token
+  # minted above.
+  unset BENCH_GITHUB_TOKEN_FILE
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
     echo "WARNING: ${forge} leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."
