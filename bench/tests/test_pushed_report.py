@@ -219,6 +219,28 @@ def test_merge_keeps_a_no_worker_calls_entry_only_when_both_turns_carry_one(open
     assert len(kept) == (2 if opening_marked and reply_marked else 0)
 
 
+def test_merge_leads_with_a_reply_the_card_wait_marked_as_infrastructure():
+    """The card wait runs on the reply before the merge and can mark it in place (a
+    worker's card that died on a rate limit). Behind the opening turn's warning the
+    marker would not be the first error."""
+    entry = pushed_report.plant_entry("a2a-ctx-1", "inject:c", {"stored": True, "status": 200})
+
+    def turns():
+        opening = AgentResult(output="OK", trajectory=[], tokens={}, errors=["skipped an item"], metadata={})
+        reply = AgentResult(output="x", trajectory=[], tokens={}, errors=["a reply warning"], metadata={"final_message": "x"})
+        return opening, reply
+
+    opening, reply = turns()
+    harness._mark_result_infra_failure(reply, "a worker's card ended on a rate limit")
+    marked = pushed_report.merge(opening, reply, entry, reply_wait_covered_session=True)
+    assert marked.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert marked.errors[1:] == ["a reply warning", "skipped an item"]
+    assert reply.metadata[pushed_report.INFRA_FAILURE_KEY] == "a worker's card ended on a rate limit"
+    # A reply with no such mark keeps the opening's errors first.
+    opening, reply = turns()
+    assert pushed_report.merge(opening, reply, entry).errors == ["skipped an item", "a reply warning"]
+
+
 def test_merge_keeps_the_replys_no_worker_calls_entry_when_its_wait_covered_the_session():
     """The reply turn's card wait reads the whole session's cards, the opening
     turn's with them, and the opening turn never waits. So the reply's entry

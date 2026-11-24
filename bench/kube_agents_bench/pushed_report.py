@@ -96,6 +96,9 @@ _FIELDS = ("opening", "report", "reply")
 # its line breaks as these two characters; the stored row gets real ones. The
 # swap is plain, so a report cannot hold a backslash followed by an n.
 REPORT_LINE_BREAK = "\\n"
+# The metadata key the harness sets on a result it marks as an infrastructure failure
+# (harness._mark_result_infra_failure); spelled here because this module does not import the harness.
+INFRA_FAILURE_KEY = "infra_failure"
 # The trajectory entry the plant writes, and the message-id suffix of the
 # reply turn: the door dedupes on the id, so the reply cannot share the
 # opening's.
@@ -260,7 +263,10 @@ def merge(
     answer is kept in metadata. The trajectory is the opening turn's, the
     plant's entry, then the reply turn's, so a ``tool_called`` on
     :data:`PLANT_ENTRY` reads it and the lane's safeguards read both turns.
-    Errors are both turns', the opening's first. Tokens are both turns' too:
+    Errors are both turns', the opening's first; a reply that the card wait
+    marked as an infrastructure failure leads instead, so its marker is the
+    first error, as :func:`card_wake.merge` leads with a failed answer turn.
+    Tokens are both turns' too:
     the reply's buckets with the opening's added in, bucket by bucket and
     into the nested ones, as the card-wake merge sums two turns (an inject
     record's tokens are the chain's usage as the door reported it, null
@@ -295,11 +301,14 @@ def merge(
     )
     if not both_vouched:
         trajectory = [e for e in trajectory if not (isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY)]
+    # The card wait can mark the reply as an infrastructure failure in place. Its marker
+    # then leads the errors: behind an opening turn's warning it would not be the first.
+    reply_is_infra = reply.metadata.get(INFRA_FAILURE_KEY) is not None
     # The result's own class, so this module never imports devops_bench.
     return type(reply)(
         output=reply.output,
         trajectory=trajectory,
         tokens=tokens,
-        errors=[*opening.errors, *reply.errors],
+        errors=[*reply.errors, *opening.errors] if reply_is_infra else [*opening.errors, *reply.errors],
         metadata=metadata,
     )
