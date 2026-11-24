@@ -57,13 +57,12 @@ suites:
   # 3. Fleet SRE Audit E2E Environment
   # ----------------------------------------------------------------------------
   - name: "audit"
-    description: "Fleet SRE Audit, Token isolation, and Dry-run ledger suites across all streams"
+    description: "Fleet SRE Audit GitHub access: token minting, token isolation, and repository configuration"
     region: "us-central1"
     namespace: "kubeagents-system"
     env_vars:
       GITHUB_ORG: "test-org-kube-agent"
       GITHUB_REPO: "test-org-kube-agent/agents-repo"
-      FLEET_AUDIT_STREAMS: "all"
     tests:
       - "tests/e2e/test_agent_api_health.py"
       - "tests/e2e/test_agent_fleet_audit.py"
@@ -82,7 +81,7 @@ suites:
   # 5. Release Candidate (RC) Promotion Gate Environment
   # ----------------------------------------------------------------------------
   - name: "rc"
-    description: "Release Candidate promotion gate: Agent API health, Fleet SRE Audit ledger validation, and fast stockout RCA (Scenario 04)"
+    description: "Release Candidate promotion gate: Agent API health, Fleet SRE Audit GitHub access, and fast stockout RCA (Scenario 04)"
     region: "us-central1"
     namespace: "kubeagents-system"
     # No GITHUB_ORG/GITHUB_REPO here, deliberately. They used to name
@@ -99,7 +98,6 @@ suites:
     # unset the conftest github_repo fixture reads the repository the cluster was
     # actually installed with out of platform-agent-settings.
     env_vars:
-      FLEET_AUDIT_STREAMS: "all"
       # See `investigations` above for why this is the slug and not "04".
       STOCKOUT_SCENARIOS: "04-missing-zone-fallback"
     tests:
@@ -119,7 +117,7 @@ suites:
   # that has never passed decide whether staging moves. Fold one back into the
   # gate as it earns it.
   - name: "nightly"
-    description: "Full Nightly E2E Matrix: all audit streams, all stockout scenarios, operator plugin lifecycle, and chat integration"
+    description: "Full Nightly E2E Matrix: Fleet SRE Audit GitHub access, all stockout scenarios, operator plugin lifecycle, and chat integration"
     region: "us-central1"
     namespace: "kubeagents-system"
     # No GITHUB_ORG/GITHUB_REPO here, for the reason spelled out under `rc`
@@ -141,7 +139,6 @@ suites:
     # `os.environ.get(..., default)` only fires when the key is absent and the
     # workflow always defines it.
     env_vars:
-      FLEET_AUDIT_STREAMS: "all"
       STOCKOUT_SCENARIOS: "all"
     tests:
       - "tests/e2e/test_agent_api_health.py"

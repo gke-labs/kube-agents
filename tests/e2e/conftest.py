@@ -178,19 +178,6 @@ def agent_namespace() -> str:
 
 
 
-
-
-@pytest.fixture(scope="session")
-def fleet_audit_streams() -> str:
-    """Resolves FLEET_AUDIT_STREAMS filter ('all' or specific stream name like 'stockout-prevention')."""
-    val = os.environ.get("FLEET_AUDIT_STREAMS")
-    if val:
-        return str(val).strip().lower()
-    cfg = _get_default_config_env()
-    env_vars = cfg.get("env_vars", {})
-    return str(env_vars.get("FLEET_AUDIT_STREAMS") or "all").strip().lower()
-
-
 def _clean(value: Optional[str]) -> Optional[str]:
     """Trims surrounding whitespace, returning None when no name is left."""
     text = str(value).strip() if value else ""

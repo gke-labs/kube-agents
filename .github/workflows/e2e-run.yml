@@ -9,7 +9,7 @@ name: "Shared: Run E2E Suites"
 # have passed on a real cluster while still running the ones that have not. It is
 # comma-separated because `workflow_call` has no list input type.
 #
-# Per-suite filters (STOCKOUT_SCENARIOS, FLEET_AUDIT_STREAMS) are not inputs here
+# The per-suite filter (STOCKOUT_SCENARIOS) is not an input here
 # — a single input could only apply one value across the whole list, so `rc` and
 # `stockout-full` would share a scenario filter. Each suite declares its own in
 # e2e_config.yaml's `env_vars`.
