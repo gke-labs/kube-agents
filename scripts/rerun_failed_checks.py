@@ -170,13 +170,18 @@ LOST = "lost"
 # What a lost run's pull request is told. Only a new event on the pull request
 # starts fresh runs at the same head, and one this job's token causes starts
 # none, so the author has to make it. A reopen is not free, so the advice says
-# what it re-runs. Only a lost run that is still the newest of its workflow is
-# advised on: a superseded one carries no check, and after the reopen every
-# lost run is superseded, so a later /retest does not repeat the advice.
+# what it re-runs: on #5606 it re-triggered the Prow smoke test, which reported
+# green again within a minute on the head it had passed, and the automated
+# review runs on every reopen. Only a lost run that is still the newest of its
+# workflow is advised on: a superseded one carries no check, and the reopen
+# supersedes every lost run of a workflow that runs on a reopen, so a later
+# /retest does not repeat the advice. A workflow that runs only on labels gets
+# no new run from a reopen, so its lost run is advised on each time.
 LOST_RUN_ADVICE = (
     "GitHub lost these runs before queueing them, so they can be neither cancelled nor re-run. "
-    "Close and reopen this pull request to start fresh runs: that keeps its approvals and needs no push, "
-    "but it re-runs every check that runs on a reopen and starts a fresh automated review."
+    "Close and reopen this pull request to start fresh runs: that keeps its approvals and needs "
+    "no push, but it re-runs every check that runs on a reopen, the smoke test included, and "
+    "starts a fresh automated review."
 )
 # GitHub's timestamps end in `Z`, which `fromisoformat` reads only from 3.11.
 UTC_SUFFIX, UTC_OFFSET = "Z", "+00:00"
@@ -325,12 +330,17 @@ def waiting_reason(run: dict) -> str:
     return f"its workflow run {run['id']} is still running"
 
 
-def plan_reruns(check_runs, runs, head: dict, required=frozenset()) -> Plan:
+def plan_reruns(check_runs, runs, head: dict, required=frozenset(), superseded=frozenset()) -> Plan:
     """Which workflow runs to re-run and how, and which red names to leave alone and why.
 
     `head` is the pull request's `head` object (`ref`, `repo.full_name`); a
     run at the commit that is not the pull request's is never re-run.
     `required` is the check names the base branch requires (`red_check_runs`).
+    `superseded` is the ids of stuck runs a newer run of their workflow
+    superseded (`plan_stuck`). They do not count as still going: the same
+    command cancels them, and one GitHub lost before queueing it is in no
+    concurrency group and never finishes, so counting it would hold a red
+    newer run of its workflow back from every `/retest`.
     """
     red, pending = red_check_runs(check_runs, required)
     by_suite = {run.get("check_suite_id"): run for run in runs}
@@ -339,7 +349,11 @@ def plan_reruns(check_runs, runs, head: dict, required=frozenset()) -> Plan:
     by_workflow = {}  # workflow id -> the one run of it this command re-runs
     # Workflow id -> a run of it on this pull request that is still going, check runs or not:
     # a re-run of the same workflow would join its concurrency group and could cancel it.
-    running = {run.get("workflow_id", run["id"]): run["id"] for run in runs if belongs_to(run, head) and run.get("status") != COMPLETED_STATUS}
+    running = {
+        run.get("workflow_id", run["id"]): run["id"]
+        for run in runs
+        if belongs_to(run, head) and run.get("status") != COMPLETED_STATUS and run["id"] not in superseded
+    }
     for name, check_run in ((name, check_run) for name in sorted(red) for check_run in red[name]):
         app = (check_run.get("app") or {}).get("slug")
         if app != ACTIONS_APP_SLUG:
@@ -399,7 +413,8 @@ def plan_stuck(runs, head: dict, now) -> tuple:
     the pull request. An older stuck run beside it, which a newer run
     superseded and which made no check run, is cancelled and not re-run:
     left queued, it would read as still going to `plan_reruns` and hold a red
-    newer run of its workflow back from every later `/retest`.
+    newer run of its workflow back from every later `/retest`, so the caller
+    hands these to `plan_reruns` as not going.
     """
     mine = [run for run in runs if belongs_to(run, head)]
     newest = {}
@@ -595,8 +610,8 @@ def main(argv=None):
 
     required = required_check_names(api, args.repo, pull_request["base"]["ref"])
     runs = list_runs(api, args.repo, head_sha)
-    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), runs, pull_request["head"], required)
     stuck, superseded, stuck_skipped = plan_stuck(runs, pull_request["head"], datetime.datetime.now(datetime.timezone.utc))
+    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), runs, pull_request["head"], required, frozenset(run["id"] for run in superseded))
     skipped_lines = [f"Left alone: {entry.name}: {entry.reason}" for entry in plan.skipped + stuck_skipped]
     if not plan.rerun and not stuck and not superseded:
         reason = "no red or stuck GitHub Actions run at the head commit"

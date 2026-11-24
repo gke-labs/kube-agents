@@ -895,8 +895,10 @@ and not re-run. That clears the checks without the push that would restart the s
 GitHub lost before queueing it refuses every cancel ("has not been queued yet"), so it can be
 neither cancelled nor re-run: the command stops on that answer, and when the run is still the
 newest of its workflow it comments on the pull request that closing and reopening it starts fresh
-runs. A reopen keeps the approvals and needs no push, but it re-runs every check that runs on a
-reopen and starts a fresh automated review. GitHub's own re-run button needs Write access, which most
+runs, and the `Retest Actions Checks` run goes red unless something else was re-run. A reopen keeps
+the approvals and needs no push, but it re-runs every check that runs on a reopen, the smoke test
+included (on a head it has already passed, it has reported green again within a minute), and starts
+a fresh automated review. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot

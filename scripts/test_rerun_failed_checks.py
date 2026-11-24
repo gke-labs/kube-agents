@@ -677,20 +677,16 @@ class MainTest(unittest.TestCase):
         self.assertIn("Cancelled and re-ran stuck Python Unit Tests (run 1", summary)
         self.assertIn("Cleared superseded stuck Merge Gate (run 2", summary)
 
-    def test_a_superseded_stuck_run_is_cancelled_so_it_stops_holding_a_red_newer_run(self):
-        """Left queued, the older run reads as still going and every /retest declines the red one."""
+    def test_a_superseded_stuck_run_is_cancelled_and_does_not_hold_back_a_red_newer_run(self):
+        """Counted as still going, the older run would decline the red one; one /retest handles both."""
         api = FakeAPI(
             runs=[run(1, None, 10, status="queued", created=LONG_AGO), run(2, "failure", 20)],
             checks=[check(2, "Python Unit Tests", "failure", 20)],
         )
         code, out, err = self.run_stuck(api)
         self.assertEqual(0, code, err)
-        self.assertEqual(["runs/1/cancel"], [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path])
-        self.assertIn("run 1 of the same workflow is still going", out)
-        api.posts.clear()
-        code, out, err = self.run_stuck(api)
-        self.assertEqual(0, code, err)
-        self.assertEqual(["runs/2/rerun-failed-jobs"], [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path])
+        self.assertEqual(["runs/2/rerun-failed-jobs", "runs/1/cancel"], [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path])
+        self.assertNotIn("still going", out)
 
     def test_a_stuck_run_that_ignores_cancel_is_force_cancelled(self):
         api = self.stuck_api(finishes_on=("force-cancel",))
@@ -770,6 +766,20 @@ class MainTest(unittest.TestCase):
         self.assertEqual(0, code, err)
         self.assertEqual([], [path for path, _ in api.posts if path == self.COMMENTS_PATH])
         self.assertIn("GitHub lost Python Unit Tests (run 1", out)
+
+    def test_a_red_run_beside_a_lost_superseded_run_is_still_rerun(self):
+        """After the advised reopen: the old lost run never finishes, and the reopen's run then flaked."""
+        api = FakeAPI(
+            runs=[run(1, None, 10, status="queued", created=LONG_AGO), run(2, "failure", 20)],
+            checks=[check(2, "Python Unit Tests", "failure", 20)],
+            refusing=self.cancel_paths(1),
+            refusal_body=self.NOT_YET_QUEUED,
+        )
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual(["runs/2/rerun-failed-jobs"], [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path])
+        self.assertEqual([], [path for path, _ in api.posts if path == self.COMMENTS_PATH])
+        self.assertEqual(rfc.REACTION_ACKNOWLEDGED, api.posts[-1][1]["content"])
 
     def test_a_force_cancel_refused_as_not_queued_after_another_cancel_refusal_is_still_lost(self):
         cancel, force = "/repos/gke-labs/kube-agents/actions/runs/1/cancel", "/repos/gke-labs/kube-agents/actions/runs/1/force-cancel"
