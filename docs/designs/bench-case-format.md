@@ -120,6 +120,13 @@ later reports on a UTC day reply inside its first report's thread (one thread pe
 mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
 own. Slack transport only: the other transports refuse it, so
 such a case runs on the Slack lane alone and keeps no inject record.
+A first line of `[bench:reply-after-idle]`, with `opening:`, `idle_seconds:` (60 to 1800) and
+`reply:` lines under it, sends the opening as turn one, waits that long with the conversation
+idle, then sends the reply as a second message on it
+([`bench/kube_agents_bench/idle_reply.py`](../../bench/kube_agents_bench/idle_reply.py)). The
+reply turn's answer is the deliverable. The harness writes `harness_idle_wait`, which completes
+only when the reply ran on a different session pod from the opening's, so a case can grade
+that the reply was rehydrated. Inject transport only.
 A first line of `[bench:session-cap-queue]`, optionally with `max-cap=<n>` (default 2) and
 `hold=<seconds>`, with a `/session` ask under it, grades the gateway's session-cap line (#6882):
 the harness reads the install's session cap off the gateway Deployment, fills it with busy
@@ -175,7 +182,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `gateway_plugins_as_shipped`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `gateway_plugins_as_shipped`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `shadow_report_stored`, `findings_queue_untouched`, `schedule_report_not_posted`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -501,7 +508,26 @@ the run started (or, with `since_state_file`, since the `fired_at` a case's stac
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
 value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
-`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `report_store_reply`, in its own module
+`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `shadow_report_stored`, in its own module
+(`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, on the run's shadow
+stream (`stream`, required: the AgentSchedule's name for a scheduled canary, or `<audit>-shadow` for a run
+started by hand; never a live audit's stream), read on the gateway pod, where the broker's report-store
+listener writes, with the install's own `report_query.py --include-shadow` (readers refuse a shadow
+envelope without it) and `--repo` naming the install's own store key, the one key the broker lets a
+profile write under, and holds the envelope to `shadow: true`, `shadow_stream` naming the stream and
+`audit_id` naming `audit`; `required_finding_phrases` is required. With `since_state_file` it grades the
+fired run's own ring entry, the one whose writer sidecar the broker stamped with the task the stack
+recorded, so a later run of the schedule cannot mask it. Beside it, `findings_queue_untouched` diffs the
+findings queue against the snapshot the stack took before the fire (each row's hash over every column)
+and fails on any row of the audit's (`source`, and `check_prefix` when given) added, removed or changed, so
+a registration, a verification, an absence downgrade, a patch or a surfacing mark all count while other
+writers' rows are not read; and `schedule_report_not_posted` reads an AgentSchedule's `status.recentRuns`
+and fails when the fired run's delivery posted or tried to (`posted`, `post_failed`, `post_unknown`) or
+was chat that only the outcome kept quiet (`stored_no_home`, `silent`); a delivery not reported yet is an
+error. `since_state_file`, which the `builtin-schedule-run-now` stack writes with the fire time, the fired
+run's task and the queue snapshot, is required on `findings_queue_untouched` and optional on the other two.
+`shadow_report_stored` needs the image's `report_query.py` to take `--include-shadow` (#6958) and a
+store-only finish (#6956); until then it reports error. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
@@ -545,7 +571,16 @@ scope skips every tagged entry, so a check written before the workers' calls wer
 still means what it meant. `scope: workers` counts the tagged entries instead and is the
 one deterministic check that sees which MCP tool a worker reached for — a worker invokes
 MCP tools through Hermes' `tool_call` wrapper, and the check reads the tool names inside
-it; `all` counts both.
+it; `all` counts both. For a worker's call, `require_success` reads through the
+wrapper: the pod takes the verdict on the tool's answer inside Hermes'
+`<untrusted_tool_result>` envelope by the rule it applies to a bare result, so an answer
+that carries `ok: false` or `success: false` is a failed call there too; a refusal the tool
+words as a plain `ERROR:` string still reads as completed, as does a `{"result": ...}`
+answer under 32 characters, which Hermes does not envelope, and the router's own entries are not read
+through the envelope. The pod reads a worker wrapper's tool names before it clips the
+arguments, so a wrapper too long to parse is still counted by name, unless the pod withheld
+the capture; an `arguments` pattern reads the wrapper's own arguments, not the wrapped
+call's.
 Either non-default scope returns `status: "error"` on a trajectory with no tagged entry (no
 card delegated, or the capture did not run) rather than passing on an absence. A
 cluster-mutation safeguard is still a cluster-state check (`resource_property`): a call the

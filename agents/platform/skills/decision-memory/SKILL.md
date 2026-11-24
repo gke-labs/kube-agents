@@ -5,13 +5,10 @@ description: Check, recall, and explain infrastructure decisions and lessons in 
 
 # Task
 
-The GitOps repository stores decisions (`DEC-YYYY-NNN`) and lessons (`LES-YYYY-NNN`) as reviewed Operational Knowledge Framework (OKF) records.
-Records live under `knowledge/` (`decision/`, `lesson/`, `decisions/`, `lessons/`) or paths listed in `.kube-agents/intent.yaml`.
-The `index` subcommand and `curator index` ingest ADRs (`docs/adr/`, `docs/adrs/`, `docs/decisions/`, `adr/`, `decisions/`), RFCs (`docs/rfcs/`, `rfcs/`), and runbooks (`docs/runbooks/`, `docs/playbooks/`, `runbooks/`, `playbooks/`, `knowledge/runbook*/`).
-When Hindsight or Curator is enabled, `github-repo-watcher` (`repo_memory`) indexes `managed_repos` and `context_repos` (`--role context`).
-When `A2A_CURATOR=true`, `repo_memory` also backfills `managed_repos` history.
-Use this skill to check recorded guards before you modify or review files.
-Every active record update requires a pull request that a human merges.
+The GitOps repository stores infrastructure decisions and operational lessons as reviewed Operational Knowledge Framework (OKF) records (`DEC-YYYY-NNN` and `LES-YYYY-NNN`) under `knowledge/` (`decision/`, `lesson/`, `decisions/`, `lessons/`, or paths declared in `.kube-agents/intent.yaml`).
+The `index` subcommand also ingests external ADRs (`docs/adr/`), RFCs (`docs/rfcs/`), and runbooks (`docs/runbooks/` or `knowledge/runbooks/`) into the Hindsight `kube-agents-decisions` bank for `--semantic` recall.
+Use this skill to check recorded guards before you modify a file or review a change.
+Every record update requires a pull request that a human merges.
 
 All commands output JSON (`check` also accepts `--markdown`) and run against a local GitOps repository checkout.
 The helper script does not import any agent harness packages.
@@ -85,10 +82,7 @@ python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo 
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> dream
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> bootstrap --since 2y --write [--strict-block] [--extra-repo <read-only-adr-clone>]
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> index [--extra-repo <read-only-adr-clone>]
-curator index --repo <clone> --repo-id <owner/repo> [--role managed|context]
 ```
 
 Pass `--hindsight-url` (or set `HINDSIGHT_API_URL`) to query or update the `kube-agents-decisions` Hindsight bank over HTTP.
-Pass `--role context` on `curator index` for read-only `context_repos` so `Curator` clears `guard.expect` and caps `severity: block` at `warn`.
-Use `bootstrap --since 2y` or `index` for manual local or full-window runs when `repo_memory` has not covered older history.
-Without Hindsight, `check`, `why`, and `dream` operate from Git alone.
+Without Hindsight, `check`, `why`, and `dream` operate from git alone.

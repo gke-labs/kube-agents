@@ -707,6 +707,7 @@ GCLOUD_TOKEN_PRINTER_GROUPS = {
     "config-helper": GCLOUD_CONFIG_GROUP,
 }
 GCLOUD_TOKEN_PRINTERS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS)
+GCLOUD_TOKEN_PRINTER_GROUP_WORDS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS.values())
 # `gcloud compute ssh`: the remote command is behind `--`, or is the value of `--command`.
 GCLOUD_SSH_COMMAND = "ssh"
 SCRIPT_LONG_FLAG = "--command"
@@ -2227,6 +2228,22 @@ def _first_operands(words: Sequence[str], start: int) -> List[int]:
     return found
 
 
+def _token_printer_behind_its_group(words: Sequence[str]) -> bool:
+    """Whether a gcloud token printer stands behind its group word.
+
+    One pass: it keeps the group words met so far. A copy of the words
+    ahead of each printer made the read quadratic on a command that repeats
+    a printer word.
+    """
+    groups_ahead = set()
+    for word in words:
+        if word in GCLOUD_TOKEN_PRINTERS and GCLOUD_TOKEN_PRINTER_GROUPS[word] in groups_ahead:
+            return True
+        if word in GCLOUD_TOKEN_PRINTER_GROUP_WORDS:
+            groups_ahead.add(word)
+    return False
+
+
 def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: List[int]) -> bool:
     """Whether one command's words print a token or the environment."""
     words = list(words)
@@ -2236,7 +2253,7 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
         return False
     if any(word.endswith(ENVIRON_PATH_SUFFIX) for word in words):
         return True
-    if any(GCLOUD_TOKEN_PRINTER_GROUPS[word] in words[:index] for index, word in enumerate(words) if word in GCLOUD_TOKEN_PRINTERS):
+    if _token_printer_behind_its_group(words):
         return True
     steps = 0
     starts, read = [(0, False)], set()
