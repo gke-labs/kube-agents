@@ -20261,8 +20261,8 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         clause = ('NOT ((resource.labels.project_id="kagents-dev" AND resource.labels.location="us-east4"'
                   ' AND resource.labels.cluster_name="scratch"))')
         for caller_filter, sent_filter in (
-            (self.ENTRIES_BODY["filter"], f'({self.ENTRIES_BODY["filter"]}) AND {clause}'),
-            ('resource.labels.cluster_name="scratch"', f'(resource.labels.cluster_name="scratch") AND {clause}'),
+            (self.ENTRIES_BODY["filter"], f'(\n{self.ENTRIES_BODY["filter"]}\n) AND {clause}'),
+            ('resource.labels.cluster_name="scratch"', f'(\nresource.labels.cluster_name="scratch"\n) AND {clause}'),
             (None, clause),
         ):
             with self.subTest(filter=caller_filter):

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import cluster_metadata_scope
 import codecs
 import collections
 import contextlib
@@ -54,7 +55,6 @@ import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
-import cluster_metadata_scope
 import scope_exclude
 import scope_policy
 import scoped_sa_pool
@@ -859,9 +859,9 @@ WATCHER_K8S_UNRELAYABLE_ERROR = "the upstream answer could not be relayed"
 # It only narrows: with it, a clusters-get for a cluster that
 # spec.scope.exclude.clusters names is refused, so the shim sends the command
 # on to /v1/exec and that route's excluded-cluster refusal answers (#5305).
-# Without it the read is unchanged, so the reconcile's existence check and
-# every other control-plane read stay allowed. A caller that sets it can only
-# be refused more, never reach more.
+# Without it the read is unchanged, so the reconcile's existence check stays
+# allowed (it is projected to name, location, status and id). A caller that
+# sets it can only be refused more, never reach more.
 GET_CREDENTIALS_CHECK_HEADER = "X-Kube-Agents-Get-Credentials-Check"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
@@ -15992,10 +15992,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return
         # A GCP metadata read about a cluster is held to the install's
-        # exclusions and holds for every caller, before confinement and policy
-        # read it, so each judges the command that will run: a describe of an
-        # excluded or held cluster is refused, and a `logging read` filter gets
-        # the clause that drops those clusters' entries (cluster_metadata_scope).
+        # exclusions for every caller, before confinement and policy read it,
+        # so each judges the command that will run: a describe of an excluded
+        # cluster is refused, and a `logging read` filter gets the clause that
+        # drops those clusters' entries (cluster_metadata_scope).
         exclusions = getattr(self, "exclusions", None)
         if exclusions is not None:
             try:
@@ -16849,7 +16849,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         exclusions = getattr(self, "exclusions", None)
         if rule_id == api_policy.LOGGING_ENTRIES_LIST_RULE and exclusions is not None:
             # The same clause `gcloud logging read` gets (cluster_metadata_scope):
-            # an excluded or held cluster's entries never come back.
+            # an excluded cluster's entries never come back.
             try:
                 caller_filter = parsed.get(api_policy.LOGGING_FILTER, "")
                 scoped_filter = cluster_metadata_scope.filter_with_exclusion(caller_filter, exclusions)
@@ -18811,24 +18811,27 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _mcp_exclusion_decision(
         self, server_name: str, message: dict[str, Any] | None,
     ) -> "command_policy.Decision | None":
-        """A refusal for a gke tool call on an excluded or held cluster, or None:
-        an in-cluster tool, or a control-plane tool that reads one named cluster
-        or its node pools.
+        """A refusal for a gke tool call on an excluded cluster, or None: an
+        in-cluster tool (on a held cluster too), or a control-plane tool that
+        reads one named cluster or its node pools.
 
         The tool names its cluster in its arguments (mcp_policy.k8s_tool_clusters,
         mcp_policy.metadata_tool_clusters). One the broker can't tie to a cluster
-        is refused while any is excluded or held.
+        is refused while any is excluded (or, for an in-cluster tool, held).
         """
         clusters = mcp_policy.k8s_tool_clusters(server_name, message)
+        # An in-cluster tool reaches the cluster, so a hold refuses it too; a
+        # metadata tool is held to the exclusions alone (cluster_metadata_scope).
+        include_holds = clusters is not None
         if clusters is None:
             clusters = mcp_policy.metadata_tool_clusters(server_name, message)
         if clusters is None:
             return None
         try:
             if not clusters:
-                self.exclusions.check_unnamed()
+                self.exclusions.check_unnamed(include_holds=include_holds)
             for project, location, cluster in clusters:
-                self.exclusions.check(project, location, cluster)
+                self.exclusions.check(project, location, cluster, include_holds=include_holds)
         except scope_exclude.ExcludedCluster as exc:
             return command_policy.Decision(allowed=False, rule_id=exc.rule, message=str(exc))
         return None

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """cluster_metadata_scope: GCP metadata reads about a cluster held to the install's
-exclusions and holds, for every caller."""
+exclusions, for every caller; a hold leaves them alone."""
 from __future__ import annotations
 
 import json
@@ -15,7 +15,6 @@ from cluster_metadata_scope import filter_is_appendable, scoped_argv
 from scope_exclude import (
     RULE_EXCLUDE_UNREADABLE,
     RULE_EXCLUDED_CLUSTER,
-    RULE_HELD_CLUSTER,
     ExcludedCluster,
     Exclusions,
     Holds,
@@ -105,10 +104,18 @@ class MetadataScopeTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIs(scoped_argv(argv, exclusions), argv)
 
-    def test_a_held_cluster_is_refused_as_held(self):
-        exclusions = self.exclusions(held=[HELD])
-        argv = ["gcloud", "container", "clusters", "describe", "paused", "--location", "us-east1"]
-        self.assertEqual(self.refused(argv, exclusions).rule, RULE_HELD_CLUSTER)
+    def test_a_hold_leaves_metadata_reads_alone(self):
+        # A hold pauses the agents' reach into a cluster; its metadata stays
+        # readable, as the hold's own docs say, even while every cluster is held.
+        for exclusions in (self.exclusions(held=[HELD]), self.exclusions(held_all=True)):
+            for argv in (
+                ["gcloud", "container", "clusters", "describe", "paused", "--location", "us-east1"],
+                ["gcloud", "container", "clusters", "describe", "paused"],
+                ["gcloud", "container", "node-pools", "list"],
+                ["gcloud", "logging", "read", "severity>=ERROR"],
+            ):
+                with self.subTest(argv=argv):
+                    self.assertIs(scoped_argv(argv, exclusions), argv)
 
     def test_an_entry_spelled_by_project_number_matches_the_name_in_any_project(self):
         exclusions = self.exclusions(NUMBERED)
@@ -147,7 +154,7 @@ class MetadataScopeTest(unittest.TestCase):
         argv = ["gcloud", "logging", "read", 'resource.type="k8s_container"', "--limit", "10"]
         self.assertEqual(
             scoped_argv(argv, exclusions),
-            ["gcloud", "logging", "read", f'(resource.type="k8s_container") AND {EXCLUDED_CLAUSE}', "--limit", "10"],
+            ["gcloud", "logging", "read", f'(\nresource.type="k8s_container"\n) AND {EXCLUDED_CLAUSE}', "--limit", "10"],
         )
 
     def test_a_logging_read_with_no_filter_gets_the_clause_as_its_filter(self):
@@ -184,7 +191,7 @@ class MetadataScopeTest(unittest.TestCase):
                 self.assertEqual(len(out), 4)
                 self.assertTrue(out[3].endswith(f" AND {EXCLUDED_CLAUSE}") or out[3] == EXCLUDED_CLAUSE, out[3])
                 if text.strip():
-                    self.assertEqual(out[3], f"({text}) AND {EXCLUDED_CLAUSE}")
+                    self.assertEqual(out[3], f"(\n{text}\n) AND {EXCLUDED_CLAUSE}")
 
     def test_filters_that_could_swallow_the_clause_are_refused(self):
         # An open string or a stray parenthesis could turn the appended clause
@@ -197,6 +204,13 @@ class MetadataScopeTest(unittest.TestCase):
             '(severity>=ERROR',
             "resource.labels.cluster_name='scratch'",
             'jsonPayload.message="ends in an escape\\"',
+            # A comment would swallow the closing parenthesis and the clause.
+            'severity>=ERROR -- the rest is a comment',
+            'severity>=ERROR --',
+            # The reviewer's payload: a comment hides a closing parenthesis, so
+            # without the check the clause lands in a comment and every entry
+            # comes back.
+            'resource.type:* -- (\nresource.type:* ) --',
         ):
             with self.subTest(filter=text):
                 self.assertEqual(self.refused(["gcloud", "logging", "read", text], exclusions).rule,
@@ -206,23 +220,16 @@ class MetadataScopeTest(unittest.TestCase):
         exclusions = self.exclusions(EXCLUDED)
         self.refused(["gcloud", "logging", "read", "severity>=ERROR", "extra"], exclusions)
 
-    def test_held_and_numbered_clusters_join_the_clause(self):
+    def test_numbered_clusters_join_the_clause_and_held_ones_do_not(self):
         exclusions = self.exclusions(EXCLUDED, NUMBERED, held=[HELD])
         out = scoped_argv(["gcloud", "logging", "read", "severity>=ERROR"], exclusions)
         clause = out[3]
         self.assertIn('resource.labels.cluster_name="scratch"', clause)
-        self.assertIn('resource.labels.cluster_name="paused"', clause)
+        self.assertNotIn('"paused"', clause)
         # A number-spelled entry matches its location and name in any project:
         # entries carry the project's ID, never its number.
         self.assertIn('(resource.labels.location="europe-west1" AND resource.labels.cluster_name="legacy")', clause)
         self.assertNotIn("123456789012", clause)
-
-    def test_holding_every_cluster_drops_every_cluster_entry(self):
-        exclusions = self.exclusions(held_all=True)
-        self.assertEqual(
-            scoped_argv(["gcloud", "logging", "read", "severity>=ERROR"], exclusions),
-            ["gcloud", "logging", "read", "(severity>=ERROR) AND NOT resource.labels.cluster_name:*"],
-        )
 
     def test_filter_is_appendable(self):
         for text, want in (
@@ -234,6 +241,9 @@ class MetadataScopeTest(unittest.TestCase):
             ('a) OR (b', False),
             ('(a', False),
             ("a='b'", False),
+            ('a="b -- c"', True),
+            ('a="b" -- c', False),
+            ('a>-1', True),
         ):
             with self.subTest(text=text):
                 self.assertEqual(filter_is_appendable(text), want)

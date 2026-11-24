@@ -1317,9 +1317,15 @@ spec:
   name in every project. A broker or `kube-proxy` that can't read the scope it was given reaches no
   cluster until it can (`scope.exclude-unreadable`).
 
-  Reads of the GKE control plane stay allowed: the project's cluster list and a cluster's
-  describe. Exclusion keeps the agents out of a cluster's API and workloads, not out of the
-  project's cluster list. These still cover an excluded cluster, through those reads only:
+  A GCP metadata read that names an excluded cluster is refused too, as `scope.excluded-cluster`:
+  `gcloud container clusters describe`, `gcloud container node-pools list` and `describe`, and the
+  `gke` MCP server's `get_cluster`, `get_node_pool` and `list_node_pools`. A logging read, through
+  `gcloud logging read` or the broker's Logging relay, leaves out the cluster's entries: the broker
+  adds a clause to the filter that matches the cluster's project, location and name, and refuses a
+  filter it can't add one to safely. The project-wide reads stay allowed, such as the project's
+  cluster list. Exclusion keeps the agents out of a cluster's API, workloads, metadata and logs, not
+  out of the project's cluster list. These still cover an excluded cluster, through project-wide
+  reads only:
   - the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, which
     grade its versions and skip their in-cluster readiness rules;
   - the networking audit's subnet usage, since its pods still hold their IPs;

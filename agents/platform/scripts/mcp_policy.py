@@ -104,8 +104,8 @@ GKE_READ_TOOLS = frozenset(
 # control plane (`k8s_tool_clusters`).
 GKE_K8S_TOOLS = frozenset(tool for tool in GKE_READ_TOOLS if "_k8s_" in tool)
 # The gke control-plane tools that read one named cluster or its node pools
-# (`metadata_tool_clusters`). spec.scope.exclude.clusters and spec.hold hold
-# these too. The project-wide ones (list_clusters, the operations) name no
+# (`metadata_tool_clusters`). spec.scope.exclude.clusters holds these too; a
+# spec.hold, which pauses the agents' reach into a cluster, doesn't. The project-wide ones (list_clusters, the operations) name no
 # cluster and are left as they were.
 GKE_CLUSTER_METADATA_TOOLS = frozenset({"get_cluster", "get_node_pool", "list_node_pools"})
 
@@ -114,12 +114,14 @@ GKE_CLUSTER_METADATA_TOOLS = frozenset({"get_cluster", "get_node_pool", "list_no
 # one cluster. RESOURCE_LIKE is what makes a string argument one that has to
 # match it: any spelling of a resource path segment, or a percent escape.
 RESOURCE_LIKE = re.compile(r"(?i)projects|locations|zones|clusters|%")
-# A cluster's resource name at the start of a longer one (a node pool's), or
-# whole: projects/P/locations/L/clusters/C, then the end or a `/`.
-CLUSTER_RESOURCE_PREFIX = re.compile(
+# A node pool's resource name, matched whole: a cluster's, then
+# /nodePools/<pool>. get_node_pool takes this; the other cluster-metadata tools
+# take a cluster's (CLUSTER_RESOURCE).
+NODE_POOL_RESOURCE = re.compile(
     r"projects/(?P<project>(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
-    r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)(?:/|\Z)"
+    r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)/nodePools/[a-z0-9][a-z0-9-]*"
 )
+NODE_POOL_TOOL = "get_node_pool"
 CLUSTER_RESOURCE = re.compile(
     r"projects/(?P<project>(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
     r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)"
@@ -458,10 +460,10 @@ def metadata_tool_clusters(server_name: str, message: dict[str, Any] | None) -> 
     """The clusters a gke cluster-metadata tool call names, or None when it isn't one.
 
     As strict as `k8s_tool_clusters`: every string argument that looks like a
-    resource name has to start with exactly one cluster's resource name (a
-    node pool's name does), and at least one has to. Otherwise the list is
-    empty, a call the broker can't tie to a cluster, which the caller refuses
-    while any cluster is excluded or held. So is a `-` location.
+    resource name has to be, whole, exactly one cluster's resource name (a
+    node pool's, for get_node_pool), and at least one has to. Otherwise the
+    list is empty, a call the broker can't tie to a cluster, which the caller
+    refuses while any cluster is excluded. So is a `-` location.
     """
     if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
         return None
@@ -478,7 +480,8 @@ def metadata_tool_clusters(server_name: str, message: dict[str, Any] | None) -> 
         elif isinstance(value, list):
             values.extend(value)
         elif isinstance(value, str) and RESOURCE_LIKE.search(value):
-            match = CLUSTER_RESOURCE_PREFIX.match(value)
+            grammar = NODE_POOL_RESOURCE if params.get("name") == NODE_POOL_TOOL else CLUSTER_RESOURCE
+            match = grammar.fullmatch(value)
             if match is None or match["location"] == "-":
                 return []
             clusters.append((match["project"], match["location"], match["cluster"]))

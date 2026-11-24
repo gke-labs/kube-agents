@@ -89,7 +89,7 @@ class MetadataScopeRouteTest(_RouteHarness):
         self.assertEqual(200, status, body)
         (ran, _), = self.executor.calls
         self.assertEqual(
-            ["gcloud", "logging", "read", f'(resource.type="k8s_container") AND {CLAUSE}', "--limit=5",
+            ["gcloud", "logging", "read", f'(\nresource.type="k8s_container"\n) AND {CLAUSE}', "--limit=5",
              f"--project={TARGET.project}"],
             ran,
         )
@@ -123,7 +123,7 @@ class ProfileMetadataScopeRouteTest(_RouteHarness):
         status, body = self.post({"argv": ["gcloud", "logging", "read", "severity>=ERROR"]})
         self.assertEqual(200, status, body)
         (ran, kwargs), = self.executor.calls
-        self.assertIn(f"(severity>=ERROR) AND {CLAUSE}", ran)
+        self.assertIn(f"(\nseverity>=ERROR\n) AND {CLAUSE}", ran)
         self.assertEqual(ran, kwargs["confined"].argv)
 
 

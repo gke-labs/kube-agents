@@ -1,24 +1,27 @@
-"""Hold GCP metadata reads about a cluster to spec.scope.exclude.clusters and spec.hold.
+"""Hold GCP metadata reads about a cluster to spec.scope.exclude.clusters.
 
-The broker refuses an excluded or held cluster on every path to its Kubernetes
+The broker refuses an excluded cluster on every path to its Kubernetes
 API (scope_exclude). A gcloud read about a cluster through the GKE or Logging
 API is a separate path, and before this it was held to the install's scope only
 by a profile task's single-cluster confinement. Here it is held for every
-caller:
+caller. spec.hold is not consulted: a hold pauses the agents' reach into a
+cluster and leaves its metadata readable (scope_exclude.Exclusions.check's
+include_holds).
 
   - `container clusters describe NAME` and `container node-pools list|describe
-    --cluster NAME` name one cluster. An excluded or held one is refused. One
+    --cluster NAME` name one cluster. An excluded one is refused. One
     named without its location (gcloud's default fills it in) is refused when
-    any excluded or held cluster has that name in that project.
+    any excluded cluster has that name in that project.
   - `logging read [FILTER]` gets a clause ANDed onto its filter that drops every
-    excluded or held cluster's entries (scope_exclude.Exclusions.
+    excluded cluster's entries (scope_exclude.Exclusions.
     log_exclusion_clause), so the result can't include them whatever the
     filter says. The filter isn't parsed for cluster names, which would be a
     denylist on free text. A filter the clause can't be appended to safely
-    (an open string or unbalanced parentheses, which could swallow the clause)
-    is refused while anything is excluded or held.
+    (an open string, a single quote, a `--` comment or unbalanced parentheses,
+    any of which could swallow the clause) is refused while anything is
+    excluded.
 
-Every other command, and every command on an install that excludes and holds
+Every other command, and every command on an install that excludes
 nothing, is returned unchanged.
 """
 
@@ -60,13 +63,17 @@ _ESCAPE = "\\"
 _OPEN = "("
 _CLOSE = ")"
 _SINGLE_QUOTE = "'"
+# The Logging query language's comment marker: the rest of the line is ignored.
+_COMMENT = "--"
+_NEWLINE = "\n"
 
 UNREADABLE_FILTER = (
-    "this install excludes or holds clusters, and the broker can't add its exclusion to this"
-    " logging filter safely (an open string, a single quote or unbalanced parentheses); fix the filter"
+    "this install excludes clusters, and the broker can't add its exclusion to this"
+    " logging filter safely (an open string, a single quote, a -- comment or unbalanced parentheses);"
+    " fix the filter"
 )
 UNREADABLE_COMMAND = (
-    "this install excludes or holds clusters, and the broker can't read this command's flags"
+    "this install excludes clusters, and the broker can't read this command's flags"
     " to tell which cluster it names"
 )
 
@@ -124,24 +131,25 @@ def _resource_cluster(value: str) -> tuple[str, str, str] | None:
 def _check_cluster(exclusions: scope_exclude.Exclusions, named: str, flags: dict[str, str]) -> None:
     resource = _resource_cluster(named)
     if resource is not None:
-        exclusions.check(*resource)
+        exclusions.check(*resource, include_holds=False)
         return
     project = _flag(flags, (PROJECT_FLAG,)) or os.environ.get(DEFAULT_PROJECT_ENV, "")
     location = _flag(flags, tuple(sorted(LOCATION_FLAGS)))
     if location:
-        exclusions.check(project, location, named)
+        exclusions.check(project, location, named, include_holds=False)
     else:
         exclusions.check_name(project, named)
 
 
 def filter_is_appendable(text: str) -> bool:
     """Whether a Logging filter is safe to wrap in parentheses and AND onto: every
-    double-quoted string closed, no single quote outside one, and parentheses
-    outside strings balanced and never closing below zero."""
+    double-quoted string closed, no single quote or `--` comment outside one,
+    and parentheses outside strings balanced and never closing below zero. A
+    comment would swallow the closing parenthesis and the clause after it."""
     depth = 0
     in_string = False
     escaped = False
-    for char in text:
+    for position, char in enumerate(text):
         if in_string:
             if escaped:
                 escaped = False
@@ -152,7 +160,7 @@ def filter_is_appendable(text: str) -> bool:
             continue
         if char == _QUOTE:
             in_string = True
-        elif char == _SINGLE_QUOTE:
+        elif char == _SINGLE_QUOTE or text.startswith(_COMMENT, position):
             return False
         elif char == _OPEN:
             depth += 1
@@ -170,12 +178,14 @@ def _combine(text: str, clause: str) -> str:
         return clause
     if not filter_is_appendable(text):
         raise scope_exclude.ExcludedCluster(scope_exclude.RULE_EXCLUDED_CLUSTER, UNREADABLE_FILTER)
-    return f"({text}) AND {clause}"
+    # Each on its own line as well, so nothing on the filter's last line can
+    # reach the clause.
+    return f"({_NEWLINE}{text}{_NEWLINE}) AND {clause}"
 
 
 def filter_with_exclusion(text: str, exclusions: scope_exclude.Exclusions) -> str:
     """A Logging filter with the install's exclusion clause ANDed on (the relay's
-    `entries:list` body); the filter itself when nothing is excluded or held."""
+    `entries:list` body); the filter itself when nothing is excluded."""
     clause = exclusions.log_exclusion_clause()
     return text if clause is None else _combine(text, clause)
 
@@ -193,11 +203,10 @@ def _with_log_exclusion(argv: list[str], surface: list[tuple[int, str]], clause:
 
 
 def scoped_argv(argv: list[str], exclusions: scope_exclude.Exclusions) -> list[str]:
-    """argv as the broker runs it against the install's exclusions and holds.
+    """argv as the broker runs it against the install's exclusions.
 
-    Raises scope_exclude.ExcludedCluster (or HeldCluster, its subclass) when the
-    command names an excluded or held cluster, or can't be read or rewritten
-    while any is. Returns argv itself when nothing applies.
+    Raises scope_exclude.ExcludedCluster when the command names an excluded
+    cluster, or can't be read or rewritten while any is. Returns argv itself when nothing applies.
     """
     if not argv or os.path.basename(argv[0]) != GCLOUD:
         return argv
@@ -206,7 +215,7 @@ def scoped_argv(argv: list[str], exclusions: scope_exclude.Exclusions) -> list[s
         # The read-only gate refuses an unreadable flag first; with enforcement
         # off, such a command still can't be tied to a cluster.
         words, _ = command_policy._gcloud_words_and_flag(argv)
-        if words is None and _names_target_command(argv) and _anything_held(exclusions):
+        if words is None and _names_target_command(argv) and _anything_excluded(exclusions):
             raise scope_exclude.ExcludedCluster(scope_exclude.RULE_EXCLUDED_CLUSTER, UNREADABLE_COMMAND)
         return argv
     flags, positionals = walked
@@ -217,7 +226,7 @@ def scoped_argv(argv: list[str], exclusions: scope_exclude.Exclusions) -> list[s
         if names:
             _check_cluster(exclusions, names[0], flags)
         else:
-            exclusions.check_unnamed()
+            exclusions.check_unnamed(include_holds=False)
         return argv
     if words[:len(next(iter(NODE_POOL_COMMANDS)))] in NODE_POOL_COMMANDS:
         cluster = flags.get(CLUSTER_FLAG, "")
@@ -225,7 +234,7 @@ def scoped_argv(argv: list[str], exclusions: scope_exclude.Exclusions) -> list[s
             _check_cluster(exclusions, cluster, flags)
         else:
             # gcloud's container/cluster default, which the broker can't see.
-            exclusions.check_unnamed()
+            exclusions.check_unnamed(include_holds=False)
         return argv
     if words[:len(LOGGING_READ)] == LOGGING_READ:
         clause = exclusions.log_exclusion_clause()
@@ -240,7 +249,7 @@ def _names_target_command(argv: list[str]) -> bool:
     return any(words <= present for words in _TARGET_WORD_SETS)
 
 
-def _anything_held(exclusions: scope_exclude.Exclusions) -> bool:
+def _anything_excluded(exclusions: scope_exclude.Exclusions) -> bool:
     try:
         return exclusions.log_exclusion_clause() is not None
     except scope_exclude.ExcludedCluster:
