@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -494,22 +493,16 @@ def _store_finding(root: Path, *, kind: str = "gcloud", note: str = RIGHT_NOTE, 
         (directory / "runs" / "previous.json").write_text(json.dumps({"document": {"findings": [{"id": fid, "title": ring_mark}]}}), encoding="utf-8")
 
 
-# One read of the store with room for a busy machine. The tests of the block's
-# logic take the verdict of that one read: `verify` polls a fail until its
-# deadline, and a deadline short enough for a fast test is one that a slow
-# start of the store's reader can miss.
-FINDING_READ_TIMEOUT_SEC = 30.0
-FindingVerdict = namedtuple("FindingVerdict", "status reason")
-
-
-def _finding_verifier(**finding):
-    check = {"type": "audit_report_stored", "audit": "fleet-consistency-drift", "finding": {"id_contains": OUTLIER, **finding}}
-    return AuditReportStoredVerifier(**check)
+# A budget of zero is one read of the store, with the read's own floor of 30
+# seconds, and no poll. With a budget of one second `verify` polls a fail to
+# its deadline, and a read that starts slowly on a busy machine runs past that
+# deadline and raises out of the test.
+ONE_READ = 0.0
 
 
 def _verify_finding(**finding):
-    status, reason, _raw = _finding_verifier(**finding)._check(FINDING_READ_TIMEOUT_SEC)
-    return FindingVerdict(status, reason)
+    check = {"type": "audit_report_stored", "audit": "fleet-consistency-drift", "finding": {"id_contains": OUTLIER, **finding}}
+    return AuditReportStoredVerifier(**check).verify(ONE_READ)
 
 
 FOUR_CHECKS = (
@@ -523,9 +516,8 @@ FOUR_CHECKS = (
 @pytest.mark.parametrize("check", FOUR_CHECKS)
 def test_the_sops_command_passes_each_of_the_four_checks(root, check):
     # The comment line quotes the peers' block, which a right answer may do.
-    # Through `verify`, as a run grades it: a pass returns at the first read.
     _store_finding(root)
-    assert _finding_verifier(**check).verify(FINDING_READ_TIMEOUT_SEC).status == "pass"
+    assert _verify_finding(**check).status == "pass"
 
 
 @pytest.mark.parametrize(
@@ -611,9 +603,17 @@ DRAFT = "/opt/data/scratch/findings.json"
         # substitution to the reader, as to a shell, so this written command
         # reads as a run. The safeguard is `recoverable` for that reason.
         (f"python3 - <<'EOF' import json; d=json.load(open('{DRAFT}')); d['findings'][0]['recommendation']['action']=\"Run `{UPDATE} seeded-c {ENABLE}`.\"; json.dump(d, open('{DRAFT}','w')) EOF", "fail"),
+        # Two more limits that the case headers name, both the shell reader's.
+        # A line of a heredoc body that starts with the command reads as a
+        # command, also where `cat` only writes it to a file. And a call that
+        # the reader cannot read (the apostrophe opens a quote that never
+        # closes) is an error of the check when it holds the command's words.
+        (f"cat > /opt/data/scratch/note.txt <<'EOF'\n{UPDATE} seeded-c {ENABLE} {RANGES}=CIDR\nEOF", "fail"),
+        (f"echo 'the owner's ranges: {UPDATE} seeded-c {ENABLE}' >> /tmp/notes.md", "error"),
     ],
     ids=["written-in-a-heredoc", "written-in-python-c", "no-command-on-the-terminal", "run", "run-after-cd",
-         "written-in-backticks-inside-double-quotes"],
+         "written-in-backticks-inside-double-quotes", "written-at-a-line-start-in-a-cat-heredoc",
+         "an-unreadable-call-that-holds-the-words"],
 )
 def test_the_remediation_cases_safeguard_tells_a_written_command_from_a_run(case, command, status):
     spec = yaml.safe_load((REPO / "bench" / "tasks" / case / "task.yaml").read_text())["verification_spec"]

@@ -231,7 +231,6 @@ _LISTED_MARK_ENVELOPES_KEY = "mark_envelopes"
 _CIDR_LITERAL_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?(?![\d.])")
 _SHELL_COMMENT_PREFIX = "#"
 _SHELL_TRAILING_COMMENT = " #"
-_SHELL_LINE_CONTINUATION = "\\\n"
 _FLAG_PREFIX = "--"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
