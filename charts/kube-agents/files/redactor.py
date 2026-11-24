@@ -267,11 +267,15 @@ class AuditRedactor:
     # - Either part may also hold a JSON escape, whole (`\u0026`, `\"`, `\\`):
     #   Go's encoder writes `&`, `<` and `>` that way, and any JSON encoder a
     #   `"` or a `\`, so a password printed inside JSON is still matched.
+    #   The scheme may also start right after an escape: `\b` already holds
+    #   there, but it would count the escape's letters into the capped scheme
+    #   (`\u0026` plus a long scheme), so the escape itself is a boundary too.
     #   This only widens the match; nothing the pattern took before is left.
     #   An escaped newline no longer stops it, so a `\n` between a URL and a
     #   later `@` can over-mask; it never leaks.
     URL_PASSWORD_PATTERN = re.compile(
-        r"\b([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://"
+        r"(?:\b|(?<=\\[ntrbf\"/\\])|(?<=\\u[0-9a-fA-F]{4}))"
+        r"([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://"
         r"(?:[^\s:/?#@\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\"\\/bfnrt]))*:)"
         r"((?:[^\s/?#\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\"\\/bfnrt]))+)@"
     )
