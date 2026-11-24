@@ -98,12 +98,13 @@ one until every worker it can run under accepts the name.
 
 An adapter maps a loaded persona to a harness and reads nothing else: no
 network, no credentials, no environment. Whatever the pod knows, such as
-the relay's address, the worker passes in as a `Target`. What a harness
-cannot express comes back as a warning, never an error.
+the relay's address, the worker passes in as a `Target`. For Claude Code,
+what the harness cannot express comes back as a warning; the `core-agent`
+adapter refuses it instead (below).
 `render.For(harness)` picks the adapter by the harness the worker is started
 with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
 `spec.harness.type`, or on a profile worker `PROFILE_HARNESS` when that is
-unset (`claude-code` or `antigravity`). A session pod refuses `antigravity`
+unset (`claude-code`, `antigravity` or `core-agent`). A session pod refuses `antigravity`
 unless `A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, until
 #6710 lands; a profile worker refuses it because it has no persona adapter
 yet.
@@ -129,6 +130,19 @@ yet.
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
+
+- **`core-agent`** (`coreagent`): renders `instructions.md` and `skills/`,
+  each skill in the Agent Skills layout (`<name>/SKILL.md` and its files),
+  for a directory the worker's render step writes before the harness runs.
+  The harness takes the instructions as a layer above its own system prompt
+  and lists the skills to the model. `coreagent.Snapshot` reads that
+  directory into memory once, refusing any other top-level name, a symlink
+  or a special file, so a later change on disk doesn't reach the harness.
+  Tools pass through as the manifest names them, for the harness's tool
+  registry to map. Refused rather than dropped: an `mcp.yaml` server (no MCP
+  path yet), a skill frontmatter key other than `name`, `description`,
+  `license`, `compatibility` and `metadata`, a skill's `allowed-tools`, and
+  an executable skill file. No worker selects it yet.
 
 ## An example
 
