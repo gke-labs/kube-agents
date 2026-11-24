@@ -396,11 +396,48 @@ class RemovedProfileTest(_VolumeTest):
             self.add("sa-role-watch", "completed", minute, profile="cluster-a")
         self.assertEqual({("stall-watch", "succeeded"): 3, ("sa-role-watch", "succeeded"): 3}, self.runs())
 
+    def remake(self, profile, runs):
+        """Remove ``profile`` and make it again with ``runs`` ended runs, with no read in between.
+
+        The new ledger is written while the old one still exists, so the file
+        system cannot give it the old file's inode.
+        """
+        old = self.ledger(profile)
+        staged = self.root / "staged-executions.db"
+        with sqlite3.connect(staged) as conn:
+            conn.execute(SCHEMA)
+            for index in range(runs):
+                conn.execute(
+                    "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) VALUES (?, 'sa-role-watch', 'builtin', 'p', 1, 'completed', ?)",
+                    (f"new{index:04d}", _at(30 + index)),
+                )
+        self.assertNotEqual(old.stat().st_ino, staged.stat().st_ino)
+        shutil.rmtree(self.root / "profiles" / profile)
+        old.parent.mkdir(parents=True)
+        staged.rename(old)
+
+    def test_a_profile_remade_between_two_reads_counts_every_new_run(self):
+        """Whatever the new ledger's size against the old position: fewer rows, one under it, more."""
+        for new_runs in (1, 4, 5, 9):
+            with self.subTest(new_runs=new_runs):
+                profile = f"cluster-{new_runs}"
+                counter = cron.CronRunsCounter(root=lambda: self.root)
+                counter.counts()
+                for minute in range(10, 15):
+                    self.add("stall-watch", "completed", minute, profile=profile)
+                self.assertEqual({("stall-watch", "succeeded"): 5}, self.counted(counter.counts()[0]))
+                self.assertEqual(6, counter._ledgers[self.ledger(profile)].mark)
+                self.remake(profile, new_runs)
+                expected = {("stall-watch", "succeeded"): 5, ("sa-role-watch", "succeeded"): new_runs}
+                self.assertEqual(expected, self.counted(counter.counts()[0]))
+                self.assertEqual(expected, self.counted(counter.counts()[0]))
+                shutil.rmtree(self.root / "profiles" / profile)
+
     def test_a_ledger_missing_while_its_profile_stays_keeps_its_place(self):
         self.counter.counts()
         self.add("stall-watch", "completed", 10, profile="platform")
         self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
-        with mock.patch.object(Path, "is_file", return_value=False):
+        with mock.patch.object(cron.os, "stat", side_effect=FileNotFoundError):
             self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
         self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
 

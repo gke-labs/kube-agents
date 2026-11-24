@@ -60,8 +60,10 @@ is a ledger whose newer rows are never reached.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
+import stat
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -165,11 +167,15 @@ def reason_label(reason: Any) -> str:
 
 
 class _Ledger:
-    """Where the read of one ledger stands: its low-water mark, the rowids seen terminal at or after it, and whether it is still taking its baseline."""
+    """Where the read of one ledger stands: which file it is, its low-water mark, the rowids seen terminal at or after it, and whether it is still taking its baseline."""
 
-    __slots__ = ("mark", "counted", "baselining")
+    __slots__ = ("identity", "mark", "counted", "baselining")
 
-    def __init__(self, baselining: bool) -> None:
+    def __init__(self, identity: tuple[int, int], baselining: bool) -> None:
+        # The file's device and inode. A mark is a position in one file: a
+        # profile removed and made again has a ledger of the same name that
+        # numbers its rows from 1.
+        self.identity = identity
         self.mark = _NO_MARK
         self.counted: set[int] = set()
         # True until a read reaches the end of the table: the rows terminal
@@ -187,7 +193,10 @@ class CronRunsCounter:
     first can be, and so does every ledger while the profiles directory has
     not yet been listed. A ledger that cannot be read keeps its mark and is
     tried again at the next read; the failure is logged once per streak. A
-    ledger whose profile is removed is forgotten.
+    ledger whose profile is removed is forgotten, and one whose file is not the
+    file last read (its device and inode differ) is a new ledger. A file system
+    that gives the new file the old one's inode hides that change; the table's
+    newest rowid falling under the mark then catches most of it.
     :meth:`counts` does not raise.
     """
 
@@ -255,12 +264,23 @@ class CronRunsCounter:
             conn.close()
 
     def _read_ledger(self, path: Path) -> None:
-        if not path.is_file():
+        try:
+            status = os.stat(path)
+        except FileNotFoundError:
             return  # a profile with no cron run yet
+        if not stat.S_ISREG(status.st_mode):
+            return
+        identity = (status.st_dev, status.st_ino)
         ledger = self._ledgers.get(path)
+        if ledger is not None and ledger.identity != identity:
+            # Another file under the same name: the profile was removed and made
+            # again, whether or not a read saw it gone. It is a ledger that
+            # appears later, and counts every row it holds.
+            del self._ledgers[path]
+            ledger = None
         newest, rows = self._rows(path, ledger.mark if ledger is not None else _NO_MARK)
         if ledger is None:
-            ledger = self._ledgers[path] = _Ledger(baselining=not self._baselined or path in self._unbaselined)
+            ledger = self._ledgers[path] = _Ledger(identity, baselining=not self._baselined or path in self._unbaselined)
             self._unbaselined.discard(path)
         elif isinstance(newest, int) and newest < ledger.mark - 1:
             # Rebuilt: the rowids kept no longer name the same rows, so what is
