@@ -151,7 +151,8 @@ k8s-api-proxy/
     └── upstream/
         ├── upstream.go           # GKE HTTPS UpstreamTransport for in-cluster and fleet GKE clusters
         ├── gke.go                # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com
-        └── static.go             # Static HTTP/HTTPS UpstreamTransport for single-upstream bridges
+        ├── static.go             # Static HTTP/HTTPS UpstreamTransport for single-upstream bridges
+        └── tokenfile.go          # Rotating bearer token file a static upstream is sent
 ```
 
 #### Core interfaces (`pkg/k8sapiproxy`)
@@ -423,9 +424,9 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - A request arriving after an invalidation never joins a fetch that started before it, and such a fetch does not keep its result: it skips the store, or evicts what it stored if the invalidation landed while it was storing.
    - Invalidation is per replica: the scope index lives in the process, and `CacheStore` has no prefix delete. A shared `CacheStore` across replicas keeps entries another replica stored after a write it did not see, so resource TTLs above `0s` stay correct only with `sessionAffinity` routing a caller to one replica.
 
-### 9. Pluggable GKE HTTPS transport (`pkg/upstream`)
+### 9. Pluggable upstream transports (`pkg/upstream`)
 
-`pkg/upstream` implements `k8sapiproxy.UpstreamTransport` for GKE clusters in `kube-agents`:
+`pkg/upstream` implements `k8sapiproxy.UpstreamTransport` twice: `upstream.New` for the cluster the proxy runs in and the fleet's GKE clusters, as `kube-agents` deploys it, and `upstream.NewStatic` for one API server on any Kubernetes cluster:
 
 1. **`in-cluster` (or host cluster matching `KUBE_CONTEXT_NAME`)**:
    - Uses `https://kubernetes.default.svc.cluster.local` (`CREDENTIAL_PROXY_KUBE_API_SERVER`, which the operator sets; the proxy's own default is `https://kubernetes.default.svc`) with the mounted CA certificate (`CREDENTIAL_PROXY_KUBE_CA_FILE`, `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`) and the proxy pod's projected Kubernetes API `ServiceAccount` token (`CREDENTIAL_PROXY_KUBE_TOKEN_FILE`, `/var/run/secrets/kubeagents/kube-api/token`), avoiding external round trips to `container.googleapis.com` for the host cluster.
@@ -436,6 +437,12 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 10-minute TTL and automatic invalidation on connection failure.
    - Injects `Authorization: Bearer <gcp-access-token>` on every upstream request and refuses `3xx` upstream redirects (`502 Bad Gateway`) so the bearer token is never followed to a redirect target.
    - When `spec.security.scopedServiceAccountPool.enabled` (`CREDENTIAL_PROXY_SCOPED_SA_POOL=1`) is armed, `kube-proxy` loads `/etc/credential-proxy/scoped-sa-pool.json`, constructs a per-project `upstream.Transport` that exchanges the base credential for that project's scoped service account token via `iamcredentials.googleapis.com`, and refuses any cluster whose project has no entry in the pool without falling back to the ambient credential.
+3. **One static upstream on any Kubernetes cluster (`--upstream-url`, `upstream.NewStatic`)**:
+   - Forwards `in-cluster` to one `http://` or `https://` endpoint with no cloud discovery, for a sidecar, workstation or CI proxy in front of a single API server. With an `--auth-mode` without `token-review` the binary then reads no ServiceAccount file and no Google credentials.
+   - `--upstream-token-file` (`KUBE_PROXY_UPSTREAM_TOKEN_FILE`, `StaticConfig.BearerTokenFile`) is the bearer token the proxy sends in place of the caller's `Authorization` header. It requires an `https://` upstream, loopback included, is re-read at most once a second so a rotated token needs no restart, and fails closed: an unusable file stops the proxy at startup, and a request that reaches the upstream while the file is missing or empty gets `502 Bad Gateway` rather than an earlier token. Three things outlast a withdrawn or changed token: it can still be sent for up to a second, until the file is read again; a request already in flight (a watch, a log follow or an exec) keeps streaming; and answers already in the response cache (section 8a), discovery documents by default, are served until their TTL ends (`--cache-max-bytes=0` turns the cache off). With `--auth-mode=none` every peer that can reach the listener acts with the token's identity, so the listener is bound to loopback or otherwise restricted, and the proxy logs a startup warning for the combination.
+   - `--upstream-ca-file` (`KUBE_PROXY_UPSTREAM_CA_FILE`, `StaticConfig.CAFile`) is the PEM bundle the upstream's certificate is verified against, reloaded by `certreload.CAPool` on rotation with hostname verification unchanged; a changed bundle that does not load is logged and counted in `kubeagents_kube_proxy_certificate_reload_failures_total`, and the previous one kept. A removed or permanently unreadable bundle file is reported once and its roots stay trusted until restart, so trust in a CA is withdrawn by replacing the bundle's contents, not by deleting the file.
+
+Neither transport needs Google credentials to start, so a proxy that serves `in-cluster` alone runs on a cluster that has none, and only a `gke_` request fails, naming the missing credentials. The binary's own token source (`cmd/k8s-api-proxy/tokens.go`) looks them up on first use; `upstream.New` does the same for an embedder that passes no `Config.TokenSource`.
 
 ### 10. Observability: Prometheus metrics, OpenTelemetry tracing, and audit logging (`pkg/k8sapiproxy/metrics.go`, `pkg/k8sapiproxy/telemetry.go`, `pkg/k8sapiproxy/audit.go`)
 
@@ -452,7 +459,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - `kubeagents_kube_proxy_cache_entries`: Gauge of the current number of serialized responses stored in the `kube-proxy` cache.
    - `kubeagents_kube_proxy_request_duration_seconds` (`verb`, `resource`, `outcome`): Histogram of request durations in seconds.
    - `kubeagents_kube_proxy_in_flight_requests`: Gauge of requests currently in flight.
-   - `kubeagents_kube_proxy_certificate_reload_failures_total`: Total changed TLS server certificate or key files that could not be loaded, each time keeping the previous certificate.
+   - `kubeagents_kube_proxy_certificate_reload_failures_total`: Total changed TLS server certificate or key files, or `--upstream-ca-file` bundles, that could not be loaded, each time keeping the previous one.
    - `process_start_time_seconds`: Gauge of the process start timestamp since the Unix epoch in seconds.
 2. **OpenTelemetry distributed tracing**:
    - The operator injects `OTEL_SERVICE_NAME=<agent>-kube-proxy`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and `OTEL_RESOURCE_ATTRIBUTES` (or `OTEL_SDK_DISABLED=true` when the cluster has no collector).
