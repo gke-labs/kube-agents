@@ -5244,13 +5244,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// And one that could set the MCP callers could unbind the MCP
 		// ServiceAccount from its audience, or bind another to it.
 		credentialProxyMCPCallersEnvVar,
-		// The scope role's three: one that could set the audience or the
-		// callers would decide who holds the scope role, and one that could
+		// The scope role's four: one that could set the audience or the
+		// callers would decide who holds the scope role, one that could
 		// set the file would choose the declaration that bounds its
-		// arguments.
+		// arguments, and one that could set the management project would
+		// add a project its `clusters list` takes.
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		credentialProxyScopeManagementProjectEnvVar,
 		// One that could set the hold file would lift an operator's hold.
 		credentialProxyHoldFileEnvVar,
 		credentialProxyCuratorAudienceEnvVar,

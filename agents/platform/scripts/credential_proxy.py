@@ -16081,7 +16081,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     self._refuse_excluded_cluster(exc, request_id, audit, count)
                     return
         # The scope role's whole surface: five lookups, each on an argument
-        # scope.json declares or an earlier lookup returned (scope_policy).
+        # scope.json declares or an earlier lookup returned, and the clusters
+        # list also on the management project (scope_policy).
         scope_admitted = None
         if principal.role == CALLER_ROLE_SCOPE:
             scope_refusal, scope_admitted = scope_policy.check(
@@ -16089,6 +16090,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 extras=stdin is not None or cwd is not None or kubeconfig_context is not None or wants_kubeconfig,
                 scope_file=os.getenv(scope_policy.SCOPE_FILE_ENV, ""),
                 window=self.scope_window,
+                management_project=os.getenv(scope_policy.MANAGEMENT_PROJECT_ENV, "").strip(),
             )
             if scope_refusal is not None:
                 LOGGER.warning(

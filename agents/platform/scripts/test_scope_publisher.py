@@ -24,6 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cluster_agent_reconcile as rec  # noqa: E402
+import scope_policy  # noqa: E402
 import scope_publisher as pub  # noqa: E402
 
 # The shared memberHash vector: lane 4 (the Go gateway) and the operator's ScopeResolved
@@ -96,12 +97,16 @@ class FakeBroker:
     Scope to the project numbers it monitors; `names` a number to its project ID; `probes`
     a project to the stderr its `clusters list` fails with (absent: it lists one cluster).
     `fail` maps an argument to the stderr its shape-2/3/4/5 call fails with; `timeouts`
-    holds the arguments whose call times out. Every call is recorded in `calls`.
+    holds the arguments whose call times out. `direct` holds the projects the broker admits
+    to the probe without a lookup (the management project, and the declared `projects` no
+    exclude entry matches): the management project unless a test says otherwise. Every call
+    is recorded in `calls`.
     """
 
     def __init__(self, assets=None, xpn=None, scopes=None, names=None, probes=None, fail=None, timeouts=(),
-                 listings=None):
+                 listings=None, direct=None):
         self.listings = listings or {}
+        self.direct = set(direct) if direct is not None else {MANAGEMENT}
         self.assets, self.xpn, self.scopes = assets or {}, xpn or {}, scopes or {}
         self.names, self.probes, self.fail = names or {}, probes or {}, fail or {}
         self.timeouts = set(timeouts)
@@ -114,7 +119,7 @@ class FakeBroker:
         if matched is None:
             raise AssertionError(f"argv outside the scope role's five shapes: {argv}")
         shape, argument = matched
-        if shape in (SHAPE_PROBE, SHAPE_PROJECT_NAME) and argument not in self.window:
+        if not self.admits(shape, argument):
             raise AssertionError(f"{argument} was not returned to the scope caller before {argv}")
         if argument in self.timeouts:
             raise subprocess.TimeoutExpired(argv, timeout)
@@ -142,6 +147,13 @@ class FakeBroker:
         project = self.names[argument]
         self.window.add(project)
         return self._answer(argv, check, project + "\n", "", 0)
+
+    def admits(self, shape, argument):
+        if shape == SHAPE_PROBE:
+            return argument in self.window or argument in self.direct
+        if shape == SHAPE_PROJECT_NAME:
+            return argument in self.window
+        return True
 
     @staticmethod
     def _answer(argv, check, stdout, stderr, code):
@@ -477,7 +489,7 @@ class FakeBrokerThroughClient:
                 self.refusals[argument] = None  # the mount caught up: a new digest
                 self.broker.window.clear()
         matched = _match_shape(argv)
-        if matched and matched[0] in (SHAPE_PROBE, SHAPE_PROJECT_NAME) and matched[1] not in self.broker.window:
+        if matched and not self.broker.admits(*matched):
             return self._refused(cmd)
         answer = self.broker(argv, check=False, timeout=kwargs["timeout"])
         return subprocess.CompletedProcess(cmd, answer.returncode, answer.stdout, answer.stderr)
@@ -647,10 +659,15 @@ class BuildDocumentTest(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def _build(self, broker, declared, previous=None):
+        # The broker admits what scope_policy admits directly: the management project, and the
+        # declared projects no exclude entry matches.
+        patterns = (declared.get("exclude") or {}).get("projects") or []
+        broker.direct |= {p for p in declared.get("projects") or [] if not scope_policy._excluded_by(p, patterns)}
         with mock.patch.object(rec, "COMMAND_RUNNER", broker):
             document = pub.build_document(declared, MANAGEMENT, previous)
         for argv in broker.calls:
-            self.assertNotIn(MANAGEMENT, " ".join(argv), "the management project is never named to the broker")
+            if argv[:4] != list(SHAPE_PROBE[:4]):
+                self.assertNotIn(MANAGEMENT, " ".join(argv), "the management project is named only to the probe")
         return document
 
     @staticmethod
@@ -659,7 +676,15 @@ class BuildDocumentTest(unittest.TestCase):
 
     @staticmethod
     def _probed(broker):
-        return sorted(argv[5] for argv in broker.calls if argv[:4] == list(SHAPE_PROBE[:4]))
+        """The member probes: every `clusters list` but the ones the broker admits directly."""
+        return sorted(argv[5] for argv in broker.calls
+                      if argv[:4] == list(SHAPE_PROBE[:4]) and argv[5] not in broker.direct)
+
+    @staticmethod
+    def _listed_directly(broker):
+        """The `clusters list` calls for the management project and the declared projects."""
+        return sorted(argv[5] for argv in broker.calls
+                      if argv[:4] == list(SHAPE_PROBE[:4]) and argv[5] in broker.direct)
 
     def test_container_members_are_probed_and_confirmed(self):
         broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"], ORG: ["team-b", "team-c"]})
@@ -674,11 +699,15 @@ class BuildDocumentTest(unittest.TestCase):
         ])
         self.assertEqual(self._probed(broker), ["team-a", "team-b", "team-c"])
 
-    def test_explicit_and_management_projects_get_no_row_and_no_probe(self):
+    def test_explicit_and_management_projects_get_no_row_and_are_listed_only_for_the_map(self):
         broker = FakeBroker(assets={FOLDER_A: ["team-a", "explicit-1", MANAGEMENT]})
         document = self._build(broker, _scope(projects=["explicit-1"], folders=[FOLDER_A.split("/")[1]]))
         self.assertEqual(list(self._rows(document)), ["team-a"])
         self.assertEqual(self._probed(broker), ["team-a"])
+        self.assertEqual(self._listed_directly(broker), ["explicit-1", MANAGEMENT])
+        # Listed after every member probe: they decide no row.
+        probes = [argv[5] for argv in broker.calls if argv[:4] == list(SHAPE_PROBE[:4])]
+        self.assertEqual(probes[-2:], ["explicit-1", MANAGEMENT])
 
     def test_selector_members_by_id_and_by_number(self):
         broker = FakeBroker(xpn={"host-project": ["svc-proj-a"]},
@@ -1162,6 +1191,17 @@ class BuildDocumentTest(unittest.TestCase):
         self.assertEqual(1, self._recoveries(logged))
         self.assertEqual(self._rows(document)["team-a"]["outcome"], "unreachable")
 
+    def test_a_refused_listing_of_a_direct_project_starts_no_recovery_pass(self):
+        # A broker without the management project's variable refuses its listing as not
+        # declared. That decides no row, so it must not cost a run a second resolve.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]}, direct=set())
+        with mock.patch.object(pub, "log") as logged:
+            document, _ = self._build_through_client(broker, {}, _scope(projects=["explicit-1"],
+                                                                        folders=["111111111111"]))
+        self.assertEqual(0, self._recoveries(logged))
+        self.assertEqual(self._rows(document)["team-a"]["outcome"], "ok")
+        self.assertEqual(list(document["clusters"]), ["team-a"])
+
     def test_no_recovery_pass_without_a_refused_probe_or_the_budget_for_one(self):
         broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
         with mock.patch.object(pub, "log") as logged:
@@ -1307,7 +1347,9 @@ class BuildDocumentTest(unittest.TestCase):
     def test_a_declaration_without_a_scope_block_resolves_nothing(self):
         broker = FakeBroker()
         document = self._build(broker, {"present": False, "folders": ["111111111111"]})
-        self.assertEqual((document["state"], document["projects"], broker.calls), (pub.STATE_OK, [], []))
+        # No lookup runs; only the management project is listed, for the clusters map.
+        self.assertEqual((document["state"], document["projects"]), (pub.STATE_OK, []))
+        self.assertEqual(broker.calls, [[*SHAPE_PROBE[:5], MANAGEMENT, SHAPE_PROBE[6]]])
 
 
 class MainTest(unittest.TestCase):
@@ -1406,14 +1448,55 @@ class ClustersMapTest(unittest.TestCase):
         broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"]})
         document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
         self.assertEqual(document["clusters"], {
+            MANAGEMENT: {"at": document["resolvedAt"], "clusters": [["us-central1", "prod"]]},
             "team-a": {"at": document["resolvedAt"], "clusters": [["us-central1", "prod"]]},
             "team-b": {"at": document["resolvedAt"], "clusters": [["us-central1", "prod"]]},
         })
 
-    def test_management_and_explicit_projects_are_not_in_the_map(self):
-        broker = FakeBroker(assets={FOLDER_A: ["team-a", "explicit-1", MANAGEMENT]})
-        document = self._build(broker, _scope(projects=["explicit-1"], folders=[FOLDER_A.split("/")[1]]))
-        self.assertEqual(list(document["clusters"]), ["team-a"])
+    def test_management_and_explicit_projects_are_in_the_map_with_no_row(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "explicit-1", MANAGEMENT]},
+                            listings={MANAGEMENT: "hub us-east1\n", "explicit-2": "edge europe-west1\n"})
+        document = self._build(broker, _scope(projects=["explicit-1", "explicit-2"], folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(sorted(document["clusters"]), sorted(["team-a", "explicit-1", "explicit-2", MANAGEMENT]))
+        self.assertEqual(document["clusters"][MANAGEMENT], {"at": document["resolvedAt"], "clusters": [["us-east1", "hub"]]})
+        self.assertEqual(document["clusters"]["explicit-2"],
+                         {"at": document["resolvedAt"], "clusters": [["europe-west1", "edge"]]})
+        self.assertEqual([row["id"] for row in document["projects"]], ["team-a"])
+        self.assertNotIn("explicit-2", [row["id"] for row in document.get("carried", [])])
+
+    def test_excluded_and_over_cap_explicit_projects_are_not_listed(self):
+        # maxProjects 3: the management project, explicit-a and explicit-b fill it; explicit-c is
+        # over the cap, legacy-1 is excluded. Neither is listed, so neither reaches the broker.
+        broker = FakeBroker()
+        document = self._build(broker, _scope(maxProjects=3, projects=["explicit-a", "explicit-b", "explicit-c",
+                                                                       "legacy-1"],
+                                              folders=[FOLDER_A.split("/")[1]], exclude={"projects": ["legacy-*"]}))
+        self.assertEqual(sorted(document["clusters"]), ["explicit-a", "explicit-b", MANAGEMENT])
+        listed = [argv[5] for argv in broker.calls if argv[:4] == list(SHAPE_PROBE[:4])]
+        self.assertNotIn("legacy-1", listed)
+        self.assertNotIn("explicit-c", listed)
+
+    def test_a_failed_listing_of_a_direct_project_keeps_its_previous_entry(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [],
+                    "clusters": {MANAGEMENT: {"at": PREVIOUS_TIME, "clusters": [["us-east1", "hub"]]},
+                                 "explicit-1": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "edge"]]}}}
+        declared = _scope(projects=["explicit-1", "explicit-2"], folders=[FOLDER_A.split("/")[1]])
+        for name, broker in {
+            "denied": FakeBroker(probes={MANAGEMENT: DENIED_STDERR, "explicit-1": DENIED_STDERR,
+                                         "explicit-2": DENIED_STDERR}),
+            "timed out": FakeBroker(timeouts={MANAGEMENT, "explicit-1", "explicit-2"}),
+            # A broker that admits neither directly: one without the management project's
+            # variable, or whose scope.json mount is behind the Job's.
+            "refused by the broker": FakeBroker(direct=set()),
+        }.items():
+            with self.subTest(name):
+                if name == "refused by the broker":
+                    with mock.patch.object(rec, "COMMAND_RUNNER", broker):
+                        document = pub.build_document(declared, MANAGEMENT, previous)
+                else:
+                    document = self._build(broker, declared, previous)
+                self.assertEqual(document["clusters"], previous["clusters"])
+                self.assertNotIn("explicit-2", document["clusters"], "never an empty list for an unread project")
 
     def test_a_failed_probe_keeps_the_last_good_list_never_an_empty_one(self):
         previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
@@ -1430,7 +1513,8 @@ class ClustersMapTest(unittest.TestCase):
                                  {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"], ["us-east1", "b"]]})
 
     def test_a_failed_probe_with_no_earlier_list_has_no_entry(self):
-        broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"]}, probes={"team-b": DENIED_STDERR})
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"]},
+                            probes={"team-b": DENIED_STDERR, MANAGEMENT: DENIED_STDERR})
         document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
         self.assertEqual(list(document["clusters"]), ["team-a"])
 
@@ -1440,7 +1524,7 @@ class ClustersMapTest(unittest.TestCase):
             "clusters": {"gone": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]}}}
         broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
         document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]), previous)
-        self.assertEqual(list(document["clusters"]), ["team-a"])
+        self.assertEqual(list(document["clusters"]), [MANAGEMENT, "team-a"])
 
     def test_the_projects_rows_are_the_same_with_and_without_the_map(self):
         # The map is for readers that list clusters. It must never change the rows, which
@@ -1485,7 +1569,8 @@ class ClustersMapTest(unittest.TestCase):
         self.assertEqual(published["state"], pub.STATE_OK)
         self.assertEqual(len(published["projects"]), 4000)
         self.assertNotIn("clusters", published)
-        self.assertTrue(any("cluster" in str(c) for c in log.call_args_list), "dropping the map is logged")
+        self.assertTrue(any("dropping 4000 projects' cluster listings" in str(c) for c in log.call_args_list),
+                        f"dropping the map is logged with its count: {log.call_args_list}")
 
     def test_an_ok_probe_with_no_clusters_writes_an_empty_list(self):
         previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [

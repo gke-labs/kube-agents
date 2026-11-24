@@ -21508,6 +21508,30 @@ class ScopeExecRouteTest(unittest.TestCase):
         self.assertEqual("c1 us-central1\n", body["stdout"])
         self.assertEqual(2, len(self.calls.read_text(encoding="utf-8").splitlines()))
 
+    def test_the_management_project_variable_opens_the_probe_for_that_project_alone(self):
+        mgmt_probe = [*SCOPE_PROBE[:5], "mgmt-proj", SCOPE_PROBE[6]]
+        self.refused({"argv": mgmt_probe}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        with mock.patch.dict(os.environ, {credential_proxy.scope_policy.MANAGEMENT_PROJECT_ENV: " mgmt-proj \n"}):
+            status, body = self.scope({"argv": mgmt_probe})
+            self.assertEqual(200, status, body)
+            self.assertEqual("c1 us-central1\n", body["stdout"])
+            # Only the clusters list takes it, and it opens nothing else.
+            self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+            self.refused({"argv": ["gcloud", "compute", "shared-vpc", "list-associated-resources", "mgmt-proj",
+                                   "--format=json(id,type)"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        self.assertEqual(["container clusters list --project mgmt-proj --format=value(name,location)"],
+                         self.calls.read_text(encoding="utf-8").splitlines())
+
+    def test_a_declared_project_opens_the_probe_unless_excluded(self):
+        declaration = json.loads(self.scope_file.read_text(encoding="utf-8"))
+        declaration["projects"] = ["team-a", "legacy-1"]
+        declaration["exclude"]["projects"] = ["legacy-*"]
+        self.scope_file.write_text(json.dumps(declaration), encoding="utf-8")
+        status, body = self.scope({"argv": [*SCOPE_PROBE[:5], "team-a", SCOPE_PROBE[6]]})
+        self.assertEqual(200, status, body)
+        self.refused({"argv": [*SCOPE_PROBE[:5], "legacy-1", SCOPE_PROBE[6]]},
+                     credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+
     def test_a_failed_lookup_records_nothing(self):
         self.exit_file.write_text("1", encoding="utf-8")
         status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})

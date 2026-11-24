@@ -20,6 +20,13 @@ Two checks, both before the command runs:
   `scope` caller: the member window. `clusters list --project` takes a project
   that an asset search, a Shared VPC lookup or a `projects describe` returned;
   `projects describe` takes a number that a Metrics Scope lookup returned.
+  `clusters list --project` also takes the install's management project (the
+  broker's `MANAGEMENT_PROJECT_ENV`, spec.harness.projectId), which an
+  `exclude.projects` entry never removes, and a project `scope.json` names in
+  `projects` that no `exclude.projects` entry matches (`_excluded_by`, the
+  reconcile's own rule). These are the projects the reconcile lists directly;
+  the publisher probes them so their clusters reach the published list. Only
+  this read-only shape takes them: no other shape admits a project this way.
 
 The member window is broker memory: `MemberWindow`. It records what the
 broker's own successful lookups printed, for `MEMBER_WINDOW_SECONDS` from the
@@ -36,6 +43,7 @@ Standard library only. No refusal message repeats caller text.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -45,6 +53,9 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 SCOPE_FILE_ENV = "CREDENTIAL_PROXY_SCOPE_FILE"
+# The install's management project (spec.harness.projectId), which the operator
+# renders on the broker while a publisher may run. Empty admits no project by it.
+MANAGEMENT_PROJECT_ENV = "CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT"
 # How long a member a lookup returned may be probed. The publisher runs every
 # lookup before its first probe, and a run at maxProjects 5000 can take about
 # 4.2 hours, so the window outlasts the longest run.
@@ -84,6 +95,9 @@ DECLARATION_FOLDERS = CONTAINER_KIND_FOLDERS
 DECLARATION_ORGANIZATIONS = "organizations"
 DECLARATION_SHARED_VPC_HOSTS = "sharedVpcHosts"
 DECLARATION_METRICS_SCOPES = "metricsScopes"
+DECLARATION_PROJECTS = "projects"
+DECLARATION_EXCLUDE = "exclude"
+DECLARATION_EXCLUDE_PROJECTS = "projects"
 _CONTAINER = re.compile(r"\A(?P<kind>folders|organizations)/(?P<id>[0-9]{1,20})\Z")
 
 SHAPE_CLUSTERS_LIST = "clusters-list"
@@ -167,13 +181,42 @@ class Declaration(NamedTuple):
     organizations: frozenset[str]
     shared_vpc_hosts: frozenset[str]
     metrics_scopes: frozenset[str]
+    projects: frozenset[str] = frozenset()
+    exclude_projects: tuple[str, ...] = ()
 
 
-def _string_set(document: dict[str, Any], key: str) -> frozenset[str]:
+def _string_set(document: dict[str, Any], key: str, label: str | None = None) -> frozenset[str]:
     values = document.get(key) or []
     if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
-        raise ValueError(f"scope.json {key} is not a list of strings")
+        raise ValueError(f"scope.json {label or key} is not a list of strings")
     return frozenset(values)
+
+
+def _exclude_projects(document: dict[str, Any]) -> tuple[str, ...]:
+    exclude = document.get(DECLARATION_EXCLUDE)
+    if exclude is None:
+        return ()
+    if not isinstance(exclude, dict):
+        raise ValueError(f"scope.json {DECLARATION_EXCLUDE} is not an object")
+    label = f"{DECLARATION_EXCLUDE}.{DECLARATION_EXCLUDE_PROJECTS}"
+    return tuple(sorted(_string_set(exclude, DECLARATION_EXCLUDE_PROJECTS, label)))
+
+
+def _excluded_by(project: str, patterns: list[str] | tuple[str, ...]) -> str | None:
+    """The first `exclude.projects` entry that matches: an ID or a shell-style glob for a project ID,
+    the entry itself for a project number.
+
+    A copy of `cluster_agent_reconcile._excluded_by`, which this module may not import (standard
+    library only); test_scope_policy holds the two in step. A glob is written against IDs and is
+    never matched against a number. A project ID starts with a letter, so an all-digit value is a
+    number.
+    """
+    if project.isdigit():
+        return project if project in patterns else None
+    for pattern in patterns:
+        if fnmatch.fnmatchcase(project, pattern):
+            return pattern
+    return None
 
 
 def load_declaration(path: str) -> Declaration:
@@ -192,6 +235,8 @@ def load_declaration(path: str) -> Declaration:
         organizations=_string_set(document, DECLARATION_ORGANIZATIONS),
         shared_vpc_hosts=_string_set(document, DECLARATION_SHARED_VPC_HOSTS),
         metrics_scopes=_string_set(document, DECLARATION_METRICS_SCOPES),
+        projects=_string_set(document, DECLARATION_PROJECTS),
+        exclude_projects=_exclude_projects(document),
     )
 
 
@@ -239,8 +284,15 @@ def argv_refusal(argv: list[str]) -> tuple[Refusal | None, tuple[str, str] | Non
     ), None
 
 
-def argument_admitted(shape: str, argument: str, declaration: Declaration, window: "MemberWindow") -> bool:
-    """Whether `scope.json` declares the argument, or the member window holds it."""
+def argument_admitted(
+    shape: str, argument: str, declaration: Declaration, window: "MemberWindow", management_project: str = ""
+) -> bool:
+    """Whether `scope.json` declares the argument, or the member window holds it.
+
+    A `clusters list` project is also admitted when it is the management project, whatever
+    `exclude.projects` says (the reconcile records such an entry and does not apply it), or a
+    project `scope.json` names in `projects` that no `exclude.projects` entry matches.
+    """
     if shape == SHAPE_ASSET_SEARCH:
         container = _CONTAINER.match(argument)
         declared = declaration.folders if container["kind"] == CONTAINER_KIND_FOLDERS else declaration.organizations
@@ -250,6 +302,10 @@ def argument_admitted(shape: str, argument: str, declaration: Declaration, windo
     if shape == SHAPE_METRICS_SCOPE:
         return argument in declaration.metrics_scopes
     if shape == SHAPE_CLUSTERS_LIST:
+        if management_project and argument == management_project:
+            return True
+        if argument in declaration.projects and not _excluded_by(argument, declaration.exclude_projects):
+            return True
         return window.holds(KIND_PROJECTS, argument, declaration.digest)
     return window.holds(KIND_NUMBERS, argument, declaration.digest)
 
@@ -347,12 +403,16 @@ class Admitted(NamedTuple):
     declaration: Declaration
 
 
-def check(argv: list[str], *, extras: bool, scope_file: str, window: MemberWindow) -> tuple[Refusal | None, Admitted | None]:
+def check(
+    argv: list[str], *, extras: bool, scope_file: str, window: MemberWindow, management_project: str = ""
+) -> tuple[Refusal | None, Admitted | None]:
     """Decide one scope-role `/v1/exec` request before it runs.
 
     `extras` is whether the request carried stdin, a working directory or a
     kubeconfig field; the five lookups need none of them. A missing, unreadable
-    or malformed `scope.json` refuses every request.
+    or malformed `scope.json` refuses every request. `management_project` is the
+    install's management project (`MANAGEMENT_PROJECT_ENV`), which only the
+    `clusters list` shape takes; empty admits nothing by it.
     """
     if extras:
         return Refusal(RULE_SCOPE_REQUEST, "The scope caller may send only argv: no stdin, cwd or kubeconfig."), None
@@ -366,11 +426,12 @@ def check(argv: list[str], *, extras: bool, scope_file: str, window: MemberWindo
         return Refusal(
             RULE_SCOPE_ARGUMENT, f"The broker cannot read the scope declaration ({type(exc).__name__}); nothing is admitted."
         ), None
-    if not argument_admitted(shape, argument, declaration, window):
+    if not argument_admitted(shape, argument, declaration, window, management_project):
         return Refusal(
             RULE_SCOPE_ARGUMENT,
             "The scope caller may name only what scope.json declares, or a member an earlier lookup returned "
-            f"within the last {MEMBER_WINDOW_SECONDS // SECONDS_PER_HOUR} hours.",
+            f"within the last {MEMBER_WINDOW_SECONDS // SECONDS_PER_HOUR} hours; a clusters list also takes "
+            "the management project and a declared project no exclude.projects entry matches.",
         ), None
     return None, Admitted(shape, declaration)
 
