@@ -1034,6 +1034,19 @@ DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
 # name segments (`log-bd`) and fold different owners together; a missed fold
 # only announces an event, a wrong one silences it.
 POD_TEMPLATE_HASH_POD_RE = re.compile(r"^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$")
+# A Deployment pod's name that Kubernetes cut, for display like
+# DEPLOYMENT_POD_NAME_RE. The name generator keeps at most 58 characters of
+# `<deployment>-<hash>-` and appends its five with no separator. With a
+# ten-character hash, a Deployment named in 47 to 56 characters has pods that
+# end in a hyphen, what is left of the hash, and the five
+# (`...-55c6d97c65q5rwx`). Only a name of exactly 63 characters can be one. At
+# least four characters of the hash must be left: with fewer, the start of a
+# name segment (`db`, `cache`) passes for a hash, and such a name stays as it
+# is. A segment that starts with four or more of the hash's characters still
+# passes: nothing in a name tells it from a hash. No fold key is read from
+# this pattern.
+K8S_GENERATED_NAME_MAX = 63
+CUT_DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*)-[4-9bcdf]{4,10}[a-z0-9]{5}$")
 # The Pod's owning workload, as the watcher reads it from the Pod's controller
 # ownerReference (cmd/k8s-event-watcher/owner.go): `context.controller_ref`,
 # "<Kind>/<name>" in the event's namespace, or empty when the Pod has no
@@ -2775,6 +2788,11 @@ def clean_workload_name(kind: str, name: str) -> str:
         m = DEPLOYMENT_POD_NAME_RE.match(name)
         if m:
             return m.group(1)
+        # The same replica with a name that Kubernetes cut at 63 characters
+        if len(name) == K8S_GENERATED_NAME_MAX:
+            m = CUT_DEPLOYMENT_POD_NAME_RE.match(name)
+            if m:
+                return m.group(1)
         # Match pattern of statefulset/job/pod replica (e.g. -0 or -abcde)
         m = re.match(r"^(.*?)-[a-z0-9]{5}$", name)
         if m:

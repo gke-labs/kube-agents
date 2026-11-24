@@ -722,6 +722,49 @@ class ConfigBackfillTest(unittest.TestCase):
         )
 
 
+class ChatTemplateToolLockdownTest(unittest.TestCase):
+    """The tool lockdown the front-door chat profile ships with, per platform key.
+
+    `platform_toolsets` in agents/chat/config.yaml is the list Hermes resolves for the
+    platform a session arrived on. A key absent from it falls back to that platform's
+    base bundle, which leaves `agent.disabled_toolsets` as the only thing between a
+    message on that platform and the tools the image carries. The entrypoint seeds and
+    back-fills the live config from this template (step 2d), so what the template pins
+    is what a fresh install's front door starts with.
+    """
+
+    # The delegation surface: route the ask, file the card, and the memory provider.
+    _DELEGATION_SURFACE = ["kanban", "mcp-router", "memory"]
+    # The keys the template must pin: the CLI, the API server the A2A bridge posts to,
+    # and the two chat platforms the default profile can run itself.
+    _REQUIRED_PLATFORMS = ("cli", "api_server", "google_chat", "teams")
+
+    def setUp(self):
+        self.template = yaml.safe_load(_CHAT_TEMPLATE.read_text(encoding="utf-8"))
+        self.pins = self.template["platform_toolsets"]
+
+    def test_teams_is_pinned_to_the_delegation_surface(self):
+        """Microsoft Teams ingress resolves under `teams`; without the pin it would take
+        the base bundle."""
+        self.assertEqual(sorted(self.pins.get("teams", [])), self._DELEGATION_SURFACE)
+
+    def test_every_pinned_platform_carries_the_same_surface(self):
+        """One surface whichever platform the message came from: a required key that is
+        dropped, or any key given a wider list, is the same hole on that platform. A new
+        key pinned to the same surface is fine."""
+        self.assertEqual(set(self._REQUIRED_PLATFORMS) - set(self.pins), set())
+        for platform, toolsets in self.pins.items():
+            with self.subTest(platform=platform):
+                # Sorted, not a set: the order is incidental, a duplicate is not.
+                self.assertEqual(sorted(toolsets), self._DELEGATION_SURFACE)
+
+    def test_no_pinned_toolset_is_also_disabled(self):
+        """`agent.disabled_toolsets` is subtracted last, so a toolset on both lists nets
+        to off; for `memory` that hides the provider's tools from the model."""
+        disabled = set(self.template["agent"]["disabled_toolsets"])
+        self.assertEqual(disabled & set(self._DELEGATION_SURFACE), set())
+
+
 class RemoteMcpUserAgentRepairTest(unittest.TestCase):
     """The in-place repair of the remote MCP User-Agent in a profile's live config.yaml.
 

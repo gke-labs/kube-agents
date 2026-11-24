@@ -162,6 +162,47 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Only Pod names change.
         self.assertEqual(clean_workload_name("Deployment", "ingest-batch"), "ingest-batch")
 
+    def test_clean_workload_name_reads_a_deployment_pod_name_that_kubernetes_cut(self):
+        """Kubernetes cuts a generated pod name at 63 characters: it keeps 58
+        characters of `<deployment>-<hash>-` and adds five. Every name here is
+        built by that rule (`cut_pod_name`), not typed. If the cleaner changes,
+        change these cases and the design doc together.
+        """
+
+        def cut_pod_name(deployment, pod_hash="55c6d97c65", suffix="q5rwx"):
+            return f"{deployment}-{pod_hash}-"[:58] + suffix
+
+        # With a ten-character hash the hyphen before the five is gone from 47
+        # characters; at 53, four characters of the hash are left. Those fold
+        # into the Deployment.
+        for length in (47, 48, 53):
+            deployment = "billing-" + "x" * (length - 8)
+            name = cut_pod_name(deployment)
+            self.assertEqual(len(name), 63)
+            self.assertEqual(clean_workload_name("Pod", name), deployment, length)
+        # A nine-character hash is cut the same way.
+        deployment = "billing-" + "x" * 40
+        self.assertEqual(clean_workload_name("Pod", cut_pod_name(deployment, pod_hash="5c6d97c65")), deployment)
+        # With fewer than four characters of the hash left, the start of a
+        # name segment passes for a hash, so the name stays as it is.
+        for length in (54, 56):
+            name = cut_pod_name("billing-" + "x" * (length - 8))
+            self.assertEqual(clean_workload_name("Pod", name), name, length)
+        # At 57 the hyphen is back, and the five-character rule applies.
+        deployment = "billing-" + "x" * 49
+        self.assertEqual(clean_workload_name("Pod", cut_pod_name(deployment)), deployment)
+        # Only a name of exactly 63 characters can be a cut name: the same
+        # ending on a shorter name and on a longer, typed name stays.
+        self.assertEqual(clean_workload_name("Pod", "web-55c6d97c65q5rwx"), "web-55c6d97c65q5rwx")
+        typed = "x" * 48 + "-55c6d97c65q5rwx"
+        self.assertEqual((len(typed), clean_workload_name("Pod", typed)), (64, typed))
+        # A 63-character name whose tail is no hash stays: a character that no
+        # pod-template hash has, and more characters than a hash has.
+        no_hash = "x" * 47 + "-0123456789q5rwx"
+        self.assertEqual((len(no_hash), clean_workload_name("Pod", no_hash)), (63, no_hash))
+        too_long = "x" * 46 + "-55c6d97c65fq5rwx"
+        self.assertEqual((len(too_long), clean_workload_name("Pod", too_long)), (63, too_long))
+
     def test_clean_reason_label_camel_case(self):
         self.assertEqual(clean_reason_label("FailedToDrainNode"), "Failed to drain node")
         self.assertEqual(clean_reason_label("PodEviction"), "Pod eviction")

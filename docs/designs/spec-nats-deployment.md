@@ -1246,13 +1246,19 @@ process, with concurrent presentations of one token sharing one review; a failur
 never remembered, and the identity-map lookup is not cached, so a map change reaches the
 next connection as before. A reconnecting fleet therefore costs one review per distinct
 token per thirty seconds, its retries are free, and the log line for an authorized
-connection says whether its review was `fresh` or `cached`. Measured, not read off the
-code, by two tests in `a2a/authcallout`: `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
+connection says whether its review was `fresh` or `cached`. Three tests in
+`a2a/authcallout` measure the pool. `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
 connects sixty-four clients with distinct tokens to the operator's rendered server, holds
-every review until sixteen are in flight, and asserts the peak is exactly sixteen; and
-`TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast` hands sixty-four requests to the
-handler directly with a 50ms review each and asserts every one is answered inside a
-second, sixteen abreast. Before this the
+every review until sixteen are in flight, and asserts the peak is exactly sixteen.
+`TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast` starts sixty-four decisions
+with no server and no handler in front of them, holds every review, and releases the
+reviews one round at a time; it asserts that each round is exactly sixteen reviews, that
+no request waiting behind a held round is reviewed or answered, and that sixty-four
+requests take four rounds. `TestHandleReturnsBeforeTheDecisionIsMade` asserts that the
+handler returns while its request's review is still waiting. No test asserts a wall
+clock. Sixty-four connections answered inside a second at a 50ms review is derived from
+the four rounds, which are 200ms of review against 3.2s one at a time; what a decision
+costs outside its review is logged by the round test and has no bound. Before this the
 handler did its TokenReview inline and a replica answered one request at a time, and
 twelve A2A workers reconnecting per replica were enough to queue past the first-ping
 timer, each failed connect reconnecting and reviewing again; that outage was the

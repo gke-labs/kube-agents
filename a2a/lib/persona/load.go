@@ -83,6 +83,9 @@ func LoadWithOptions(dir string, opts Options) (*Persona, error) {
 type loader struct {
 	dir  string
 	opts Options
+	// scope limits the integrity check to the paths it selects (CheckTree);
+	// nil covers everything, as Load does.
+	scope func(rel string) bool
 	// readSums are the SHA-256 digests of the bytes readFile returned, by
 	// persona-relative path: the integrity check compares what was read and
 	// will be rendered, not a second read of the file.

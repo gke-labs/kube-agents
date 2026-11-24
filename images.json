@@ -105,6 +105,14 @@
       "description": "The GKE Support Agent's persona (agents/tse/persona) as a persona image (a2a/Dockerfile.persona-tse): the manifest, instructions, MCP servers and skill under /files, on busybox for the staging copy."
     },
     {
+      "name": "persona-fleet-audit",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/persona-fleet-audit",
+      "tagPolicy": "release",
+      "pulledBy": "The worker pods of the fleet-audit AgentProfile, when the chart's profiles.fleetAudit.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
+      "description": "The fleet-audit AgentProfile's persona (agents/fleet-audit/persona) as a persona image (a2a/Dockerfile.persona-fleet-audit): the manifest, instructions and skill under /files, text only, on busybox for the staging copy."
+    },
+    {
       "name": "a2a-authcallout",
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-authcallout",
@@ -121,6 +129,15 @@
       "override": "A2A_CONSOLE_IMAGE",
       "pulledBy": "The console server Deployment the operator renders, the MCP server Deployment it renders unless `operator.mcpServer.enabled` is `false`, and the opt-in OKF memory curator Deployment when A2A_CURATOR is set.",
       "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus, plus /mcp for the MCP server pod and /curator for the opt-in OKF memory curator pod (a2a/Dockerfile.console)."
+    },
+    {
+      "name": "a2a-teams-inbound",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-teams-inbound",
+      "tagPolicy": "release",
+      "override": "A2A_TEAMS_INBOUND_IMAGE",
+      "pulledBy": "The Teams inbound receiver Deployment the operator renders when spec.integration.teams.inbound is enabled.",
+      "description": "The Microsoft Teams inbound receiver: the address Bot Framework delivers Teams messages to, which verifies Microsoft's signed token, pins the tenant and hands the activity to the credential broker's Teams queue (a2a/Dockerfile.teams-inbound)."
     },
     {
       "name": "a2a-verifier",
@@ -313,7 +330,7 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker, a2a/Dockerfile.teams-inbound and a2a/Dockerfile.console builder stages.",
       "description": "Go toolchain for the operator, k8s-api-proxy, and k8s-event-watcher builds."
     },
     {
@@ -340,7 +357,7 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages.",
+      "pulledBy": "deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.teams-inbound and a2a/Dockerfile.console runtime stages.",
       "description": "Runtime base for the operator and kube-proxy images."
     },
     {
