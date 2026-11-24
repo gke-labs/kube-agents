@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -204,6 +205,21 @@ class PlantTest(unittest.TestCase):
                 self.assertIn("203.0.113.0/24", finding["remediation"]["note"])
                 self.assertIn(_MARK, finding["remediation"]["note"])
 
+    def test_a_manual_plant_asks_no_content_rule_of_a_gcloud_remediation(self):
+        """Why the stack must pass the state to the plant: the default plant
+        is a manual note. `finish` keeps its title and leaves this run's
+        `gcloud` remediation alone, with the rules and without them. A control
+        that got the default plant would pass with no rule asked."""
+        self.assertEqual(self.run_plant(_MANIFEST), 0)
+        document = self.audit_report.previous_run_document(self.plant.AUDIT, _REPO)
+        for rules in (self.audit_report.CARRY_RULES, ()):
+            with mock.patch.object(self.audit_report, "CARRY_RULES", rules):
+                finding = self.worker_gcloud_finding()
+                own = json.dumps([finding["recommendation"], finding["remediation"]], sort_keys=True)
+                self.audit_report.carry_unchanged_findings([finding], document)
+                self.assertEqual(json.dumps([finding["recommendation"], finding["remediation"]], sort_keys=True), own)
+                self.assertTrue(finding["title"].startswith(_MARK))
+
     def test_the_collector_gets_the_stacks_arguments(self):
         collected = subprocess.CompletedProcess([], 0, stdout=json.dumps(_MANIFEST), stderr="")
         with mock.patch.dict(os.environ, {self.plant.COLLECTOR_ARGS_ENV: "--scope-projects acme"}), \
@@ -257,6 +273,7 @@ class RemediationCasesTest(unittest.TestCase):
     _TASKS = _REPO_ROOT / "bench" / "tasks"
     _WITNESS = "the-kept-title-shows-that-the-plant-matched"
     _STORE_GUARD = "the-store-was-not-read"
+    _NO_KEPT_TITLE = "the-title-is-not-the-previous-runs"
     _STREAM = "fleet-consistency-drift"
     _CASES = {
         "fleet-audit-remediation-right-and-not-stale": "gcloud-stale",
@@ -299,8 +316,20 @@ class RemediationCasesTest(unittest.TestCase):
             return out
 
         stale, control = (checks(case) for case in self._CASES)
-        self.assertEqual(stale, [entry for entry in control if entry[0] not in (self._WITNESS, self._STORE_GUARD)])
-        self.assertEqual([role for _name, role, _type, _finding in stale].count("objective"), 4)
+        shared = [entry for entry in stale if entry[0] != self._NO_KEPT_TITLE]
+        self.assertEqual(shared, [entry for entry in control if entry[0] not in (self._WITNESS, self._STORE_GUARD)])
+        self.assertEqual([role for _name, role, _type, _finding in shared].count("objective"), 4)
+
+    def test_the_two_cases_read_the_title_in_opposite_ways(self):
+        """The first case's plant must not match: its title must not hold its
+        mark. The control's plant must match: its title must hold its mark."""
+        stale, control = (self._load(case) for case in self._CASES)
+        (no_kept,) = [entry for entry in stale["verification_spec"] if entry["name"] == self._NO_KEPT_TITLE]
+        self.assertEqual(no_kept["role"], "objective")
+        self.assertEqual(no_kept["check"]["finding"]["title_lacks"], [stale["infrastructure"]["variables"]["mark"]])
+        self.assertNotIn(self._NO_KEPT_TITLE, [entry["name"] for entry in control["verification_spec"]])
+        self.assertNotIn("title_contains", json.dumps(stale["verification_spec"]))
+        self.assertNotIn("title_lacks", json.dumps(control["verification_spec"]))
 
     def test_the_control_alone_has_the_witness_and_it_reads_the_same_finding(self):
         """A plant that does not match keeps nothing, and the four checks then
@@ -344,10 +373,30 @@ class RemediationCasesTest(unittest.TestCase):
                 self.assertEqual(self._load(case)["audit_streams"], [self._STREAM])
 
     def test_the_states_the_cases_ask_for_are_states_the_plant_knows(self):
-        spec = importlib.util.spec_from_file_location("unchanged_finding_wording_plant_states", _PLANT)
-        plant = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(plant)
-        self.assertLessEqual(set(self._CASES.values()), set(plant.REMEDIATIONS))
+        self.assertLessEqual(set(self._CASES.values()), set(_load_plant().REMEDIATIONS))
+
+
+class StackWiringTest(unittest.TestCase):
+    """The stack hands the plant what each case asks for. A stack that drops
+    the state plants the default, a manual note: `finish` then keeps the
+    title, asks no content rule, and the control passes with no rule."""
+
+    _STACK = _PLANT.parent
+
+    def test_the_stack_passes_the_mark_the_state_and_the_collector_arguments_to_the_plant(self):
+        main = (self._STACK / "main.tf").read_text(encoding="utf-8")
+        plant = _load_plant()
+        # The plant's `main` reads: verb, scripts directory, mark, state.
+        self.assertIn('python3 - "$1" "${local.scripts_dir}" "${var.mark}" "${var.planted_remediation}"', main)
+        self.assertIn(f'{plant.COLLECTOR_ARGS_ENV}="${{var.collector_args}}"', main)
+
+    def test_the_stacks_defaults_are_the_plants(self):
+        variables = (self._STACK / "variables.tf").read_text(encoding="utf-8")
+        plant = _load_plant()
+        blocks = dict(re.findall(r'variable "(\w+)" \{(.*?)\n\}', variables, re.S))
+        self.assertIn(f'default     = "{plant.MANUAL_KIND}"', blocks["planted_remediation"])
+        self.assertIn('default     = ""', blocks["collector_args"])
+        self.assertNotIn("default", blocks["mark"])
 
 
 if __name__ == "__main__":

@@ -71,7 +71,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from contextvars import ContextVar
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import wraps
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
@@ -222,6 +222,8 @@ _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 # run under test has written its own `latest.json`, for as long as the ring,
 # which keeps the newest envelopes only, still holds it.
 _REPORT_RUNS_DIR = "runs"
+# The copy of the newest envelope, beside the ring (audit_report.REPORT_LATEST_NAME).
+_REPORT_LATEST_NAME = "latest.json"
 # Keys of the listing `report_store_command` prints for a `finding` block: the
 # selected findings, and how many envelopes hold the planted mark.
 _LISTED_FINDINGS_KEY = "findings"
@@ -9910,8 +9912,10 @@ def report_store_command(
     which ``finish`` takes from the collector. With ``fragments``, also
     the ``title``, ``recommendation`` and ``remediation`` of each finding whose id contains
     every fragment (``findings``); with ``mark``, how many envelopes of that
-    directory, ``latest.json`` and the ring, hold it (``mark_envelopes``). The
-    rest stays in the pod.
+    directory, ``latest.json`` and the ring, hold it (``mark_envelopes``). A
+    directory with a ring and no ``latest.json`` gives an entry with that count
+    alone: ``finish`` drops ``latest.json`` before it writes the ledger, and a
+    run that stops there has not lost the plant. The rest stays in the pod.
     """
     wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
@@ -9947,6 +9951,18 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
+if {mark!r}:
+    for runs in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*", "*", {_REPORT_RUNS_DIR!r}))):
+        if os.path.exists(os.path.join(os.path.dirname(runs), {_REPORT_LATEST_NAME!r})):
+            continue
+        try:
+            held = 0
+            for stored in glob.glob(os.path.join(runs, "*.json")):
+                with open(stored, encoding="utf-8") as handle:
+                    held += {mark!r} in handle.read()
+            out.append({{"path": runs, {_LISTED_MARK_ENVELOPES_KEY!r}: held}})
+        except Exception as exc:
+            out.append({{"path": runs, "error": str(exc)}})
 print({_REPORT_STORE_READ!r} + json.dumps(out))
 """
     return f"python3 -c {shlex.quote(script)}"
@@ -9999,6 +10015,18 @@ def read_report_store(
     except (IndexError, json.JSONDecodeError):
         return None
     return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
+
+
+def _string_values(value: Any) -> Iterator[str]:
+    """Each string in ``value``, a JSON value: the values of its objects, the items of its lists."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_values(item)
 
 
 def remediation_commands(note: str, prefix: str) -> list[list[str]]:
@@ -10054,7 +10082,8 @@ class StoredFindingCheck(BaseModel):
     IPv4 address or range. ``forbidden_text`` must not occur
     in the finding's ``recommendation`` or ``remediation``. ``title_contains``
     must each occur in its ``title``: the witness that ``finish`` kept a
-    planted run's wording for this finding. ``planted_mark`` is
+    planted run's wording for this finding. ``title_lacks`` must each be
+    absent from it: nothing of a planted run's wording was kept. ``planted_mark`` is
     the mark of a previous run the case's stack planted: when no envelope of
     the store holds it, the plant is gone and the check is an error, not a pass.
     """
@@ -10069,6 +10098,7 @@ class StoredFindingCheck(BaseModel):
     no_cidr_value: list[str] = Field(default_factory=list)
     forbidden_text: list[str] = Field(default_factory=list)
     title_contains: list[str] = Field(default_factory=list)
+    title_lacks: list[str] = Field(default_factory=list)
     planted_mark: str | None = None
 
     @model_validator(mode="after")
@@ -10113,13 +10143,19 @@ class StoredFindingCheck(BaseModel):
                 ]
                 if literal:
                     found.append(f"{flag} is given a literal address or range: {literal}")
-        text = json.dumps([finding.get("recommendation"), finding.get("remediation")])
-        held = [word for word in self.forbidden_text if word in text]
+        # The values, not a JSON dump of them: a dump escapes a quote, a line
+        # break and a letter outside ASCII, and it holds the key names too.
+        texts = list(_string_values([finding.get("recommendation"), finding.get("remediation")]))
+        held = [word for word in self.forbidden_text if any(word in text for text in texts)]
         if held:
             found.append(f"its recommendation or remediation holds {held}")
-        missing = [word for word in self.title_contains if word not in str(finding.get("title") or "")]
+        title = str(finding.get("title") or "")
+        missing = [word for word in self.title_contains if word not in title]
         if missing:
             found.append(f"its title does not hold {missing}")
+        kept = [word for word in self.title_lacks if word in title]
+        if kept:
+            found.append(f"its title holds {kept}")
         return found
 class _StoredReportVerifier(_OnboardingPollVerifier):
     """What ``audit_report_stored`` and ``shadow_report_stored`` share: one stream's store read and its grading.

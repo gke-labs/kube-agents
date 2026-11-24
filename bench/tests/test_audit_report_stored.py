@@ -484,7 +484,7 @@ MARK = "stale-remedy-7b2e"
 
 
 def _store_finding(root: Path, *, kind: str = "gcloud", note: str = RIGHT_NOTE, action: str = "Enable authorized networks.",
-                   fid: str = OUTLIER_ID, ring_mark: str | None = MARK, title: str | None = None) -> None:
+                   fid: str = OUTLIER_ID, ring_mark: str | None = MARK, title: str | None = None, latest: bool = True) -> None:
     directory = root / "fleet-consistency-drift" / "acme" / "infra"
     (directory / "runs").mkdir(parents=True)
     finding = {"id": fid, "recommendation": {"action": action}, "remediation": {"kind": kind, "note": note}}
@@ -492,7 +492,8 @@ def _store_finding(root: Path, *, kind: str = "gcloud", note: str = RIGHT_NOTE, 
         finding["title"] = title
     envelope = {"repo": "acme/infra", "status": "UPDATED", "finished_at": (STARTED + timedelta(minutes=5)).isoformat(),
                 "document": {"findings": [finding, {"id": "no-environment-label.acme._.cluster-x"}]}}
-    (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
+    if latest:
+        (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
     if ring_mark:
         (directory / "runs" / "previous.json").write_text(json.dumps({"document": {"findings": [{"id": fid, "title": ring_mark}]}}), encoding="utf-8")
 
@@ -509,12 +510,41 @@ def _verify_finding(**finding):
     return AuditReportStoredVerifier(**check).verify(ONE_READ)
 
 
-FOUR_CHECKS = (
-    {"remediation_kind": "gcloud"},
-    {"command_prefix": UPDATE, "command_argument": "seeded-c", "command_flags": [ENABLE, RANGES]},
-    {"command_prefix": UPDATE, "no_cidr_value": [RANGES]},
-    {"forbidden_text": [MARK], "planted_mark": MARK},
+REMEDIATION_CASES = ("fleet-audit-remediation-right-and-not-stale", "fleet-audit-wrong-kept-remediation-gives-way")
+
+
+def _case_checks(case: str) -> dict[str, dict]:
+    """The `finding` block of each stored-report objective of ``case``, by the objective's name, without its id."""
+    spec = yaml.safe_load((REPO / "bench" / "tasks" / case / "task.yaml").read_text())["verification_spec"]
+    blocks = {entry["name"]: dict(entry["check"]["finding"]) for entry in spec if "finding" in entry["check"]}
+    assert all(block.pop("id_contains") == OUTLIER for block in blocks.values())
+    return blocks
+
+
+# The tests grade the first case's own checks, read from its file, not a copy
+# of them: a check that the file loses is a check that these tests lose.
+STALE_CHECKS = _case_checks(REMEDIATION_CASES[0])
+FOUR_CHECKS = tuple(
+    STALE_CHECKS[name]
+    for name in (
+        "the-outlier-remediation-is-a-gcloud-command",
+        "the-command-enables-authorized-networks-on-the-outlier",
+        "the-command-gives-no-literal-range",
+        "the-remediation-is-not-the-previous-runs",
+    )
 )
+TITLE_CHECK = STALE_CHECKS["the-title-is-not-the-previous-runs"]
+
+
+def test_the_cases_checks_are_the_ones_these_tests_name():
+    assert FOUR_CHECKS == (
+        {"remediation_kind": "gcloud"},
+        {"command_prefix": UPDATE, "command_argument": "seeded-c", "command_flags": [ENABLE, RANGES]},
+        {"command_prefix": UPDATE, "no_cidr_value": [RANGES]},
+        {"forbidden_text": [MARK], "planted_mark": MARK},
+    )
+    assert TITLE_CHECK == {"title_lacks": [MARK]}
+    assert len(STALE_CHECKS) == len(FOUR_CHECKS) + 1
 
 
 @pytest.mark.parametrize("check", FOUR_CHECKS)
@@ -537,9 +567,13 @@ def test_the_sops_command_passes_each_of_the_four_checks(root, check):
         ({"note": f"{RIGHT_NOTE}\ngcloud beta container clusters update seeded-c {ENABLE} {RANGES}=0.0.0.0/0"}, {2}),
         ({"note": f"# {MARK}\n{UPDATE} seeded-c {ENABLE} {RANGES}=<ranges>"}, {3}),
         ({"action": f"{MARK} action."}, {3}),
+        # A comment line is not a command: a wrong command in a comment fails nothing.
+        ({"note": f"# not this: {UPDATE} seeded-a {ENABLE} {RANGES}=10.0.0.0/8\n{UPDATE} seeded-c {ENABLE} {RANGES}=<ranges>"}, set()),
+        # The line must open with the command: the same words after other text are no command line.
+        ({"note": f"Run {UPDATE} seeded-c {ENABLE} {RANGES}=<ranges>"}, {1}),
     ],
     ids=["manual", "peer-block", "invented-block", "bare-address", "longer-flag", "qualified-name", "another-cluster", "second-line-in-another-spelling",
-         "marked-note", "marked-action"],
+         "marked-note", "marked-action", "a-command-in-a-comment", "the-command-after-other-text"],
 )
 def test_each_wrong_remediation_fails_its_own_check_and_no_other(root, stored, failing):
     _store_finding(root, **stored)
@@ -555,6 +589,51 @@ def test_a_lost_plant_is_an_error_not_a_pass(root):
     _store_finding(root, ring_mark=None)
     result = _verify_finding(**FOUR_CHECKS[3])
     assert result.status == "error" and MARK in result.reason
+
+
+def test_a_run_that_stopped_after_finish_dropped_latest_json_has_not_lost_the_plant(root):
+    # `finish` drops `latest.json` before it writes the ledger. A run that
+    # stops there stored no report: that is a fail of each check, with the
+    # plant still in the ring, and not the error of a lost plant.
+    _store_finding(root, latest=False)
+    result = _verify_finding(**FOUR_CHECKS[3])
+    assert result.status == "fail" and "no fleet-consistency-drift report" in result.reason
+    # With no plant in the ring either, the plant is gone.
+    (root / "fleet-consistency-drift" / "acme" / "infra" / "runs" / "previous.json").unlink()
+    assert _verify_finding(**FOUR_CHECKS[3]).status == "error"
+
+
+def test_a_kept_title_fails_the_first_case_when_a_content_rule_dropped_the_command(root):
+    # What the store holds when `finish` keeps the planted wording by mistake:
+    # its content rule drops the planted command, so the remediation is this
+    # run's own and right, and the mark stands in the title.
+    _store_finding(root, title=f"{MARK} authorized-networks Cluster/seeded-c")
+    assert [_verify_finding(**check).status for check in FOUR_CHECKS] == ["pass"] * len(FOUR_CHECKS)
+    result = _verify_finding(**TITLE_CHECK)
+    assert result.status == "fail" and "title" in result.reason
+    # This run's own title passes it.
+    (root / "fleet-consistency-drift" / "acme" / "infra" / "latest.json").unlink()
+    (root / "fleet-consistency-drift" / "acme" / "infra" / "runs" / "previous.json").unlink()
+    (root / "fleet-consistency-drift" / "acme" / "infra" / "runs").rmdir()
+    _store_finding(root, title="seeded-c has no authorized networks")
+    assert _verify_finding(**TITLE_CHECK).status == "pass"
+
+
+@pytest.mark.parametrize(
+    ("forbidden", "action", "status"),
+    [
+        ('say "copied" here', 'Do it, and say "copied" here.', "fail"),
+        ("first line\nsecond line", "first line\nsecond line", "fail"),
+        ("propriétaire", "Demandez au propriétaire.", "fail"),
+        # A key name of the stored finding is not its text.
+        ("note", "Enable authorized networks.", "pass"),
+        ("action", "Enable authorized networks.", "pass"),
+    ],
+    ids=["a-double-quote", "a-line-break", "a-letter-outside-ascii", "the-key-note", "the-key-action"],
+)
+def test_forbidden_text_is_searched_in_the_values_as_they_are_stored(root, forbidden, action, status):
+    _store_finding(root, action=action, note=f"{UPDATE} seeded-c {ENABLE} {RANGES}=<ranges>")
+    assert _verify_finding(forbidden_text=[forbidden]).status == status
 
 
 def test_a_run_that_did_not_file_the_finding_fails(root):
@@ -588,7 +667,6 @@ def test_a_title_without_the_mark_fails_the_witness(root, title):
     assert result.status == "fail" and "title" in result.reason
 
 
-REMEDIATION_CASES = ("fleet-audit-remediation-right-and-not-stale", "fleet-audit-wrong-kept-remediation-gives-way")
 PROPOSED = f"{UPDATE} seeded-c {ENABLE} {RANGES}=<ranges the owner approves>"
 DRAFT = "/opt/data/scratch/findings.json"
 

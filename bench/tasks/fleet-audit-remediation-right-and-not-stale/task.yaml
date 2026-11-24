@@ -12,11 +12,12 @@
 # SOP gives that finding one remediation (section 4.5): `kind: gcloud`,
 # `gcloud container clusters update ... --enable-master-authorized-networks
 # --master-authorized-networks=<ranges the cluster's own owner approves>`,
-# never a peer's CIDRs and never an invented range. The four objectives read
+# never a peer's CIDRs and never an invented range. Four objectives read
 # that one finding in the stored report (`latest.json`, `document.findings[]`)
 # and parse the command in `remediation.note`; none reads prose, and each has
 # one cause: the kind, the command with both flags on this cluster, no literal
-# range as the flag's value, and no mark of the planted run. Flag order,
+# range as the flag's value, and no mark of the planted run. A fifth reads
+# the finding's title: it does not hold the mark either. Flag order,
 # `--project` and `--location` are not graded: the SOP leaves them out.
 #
 # THE PLANT (prebuilt/unchanged-finding-wording, `planted_remediation:
@@ -24,14 +25,21 @@
 # id, a `gcloud` command that gives a literal range, the mark in every field,
 # and evidence that differs from this run's. It does two things.
 # It is the stale remediation: `finish` must not carry it (the evidence
-# changed) and the worker must not copy it. And it makes each run a sample of
-# its own: without it, `finish` carries the first run's remediation onto every
-# later run with equal evidence and severity, and the checks would read old
-# text. A plant lost before grading is an error, never a pass.
+# changed) and the worker must not copy it. A `finish` that keeps the planted
+# wording by mistake drops the planted command by its content rule, so the
+# check on the title is the one that sees that mistake. And it makes each run
+# a sample of its own: without it, `finish` carries the first run's
+# remediation onto every later run with equal evidence and severity, and the
+# checks would read old text. A plant lost before grading is an error, never
+# a pass.
 #
 # What the case does not cover: a command for another cluster of the same
 # name (the command's project and location are not graded), and a wrong
 # command that this run wrote itself and that the four checks do not name.
+# Two limits of the command check: the cluster's name is matched as a whole
+# word anywhere on the command line, and the line must open with `gcloud
+# container clusters update`, so a flag before `container` is not read as the
+# command.
 #
 # THE CONTROL is a case of its own, fleet-audit-wrong-kept-remediation-gives-way:
 # the same stack with `planted_remediation: gcloud-same` plants the command on
@@ -133,6 +141,19 @@ verification_spec:
         id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
         forbidden_text: ["stale-remedy-7b2e"]
         planted_mark: "stale-remedy-7b2e"
+  # Nothing of the previous run is kept. A content rule of `finish` drops the
+  # planted command also when `finish` keeps the planted wording by mistake,
+  # so the check above alone would pass on that mistake. A kept title holds
+  # the mark.
+  - name: the-title-is-not-the-previous-runs
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: fleet-consistency-drift
+      finding:
+        id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
+        title_lacks: ["stale-remedy-7b2e"]
   # The audit proposes the command and never runs it: enabling the setting on
   # seeded-c removes the fixture for every case on the fleet. Graded where the
   # lane reads worker commands; the agent's role is read-only besides. The
