@@ -1852,6 +1852,62 @@ class TestStoreFamilyReadKeepsItsVerdict(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
 
 
+class TestTokenPrinterReadKeepsItsVerdict(unittest.TestCase):
+    """A gcloud token printer withholds when its group word stands ahead of
+    it. The read copied the words ahead of each printer word, which costs
+    quadratic time on a command that repeats one. The one-pass read must give
+    the same verdict."""
+
+    @staticmethod
+    def old_read(words):
+        # The line before the one-pass read, kept here ONLY as the reference for equal output.
+        groups = worker_transcript.GCLOUD_TOKEN_PRINTER_GROUPS
+        return any(groups[word] in words[:index] for index, word in enumerate(words) if word in groups)
+
+    def test_the_one_pass_read_gives_the_old_verdict(self):
+        import itertools
+
+        # Each list of 1 to 5 words from the printers, their group words, and
+        # words that only look like one of them.
+        units = sorted(worker_transcript.GCLOUD_TOKEN_PRINTER_GROUPS) + ["auth", "config", "authx", "print-access-tokens"]
+        withheld = 0
+        for length in range(1, 6):
+            for words in itertools.product(units, repeat=length):
+                verdict = worker_transcript._token_printer_behind_its_group(words)
+                self.assertEqual(verdict, self.old_read(words), words)
+                withheld += verdict
+        # Both verdicts occur, so the comparison is of a read that decides.
+        self.assertGreater(withheld, 1000)
+        self.assertFalse(worker_transcript._token_printer_behind_its_group(("print-access-token", "auth")))
+        self.assertFalse(worker_transcript._token_printer_behind_its_group(("config", "print-access-token")))
+        self.assertTrue(worker_transcript._token_printer_behind_its_group(("auth", "x", "print-identity-token")))
+
+    def test_a_run_of_printer_words_reads_in_linear_time(self):
+        # The words of one simple command that repeats a printer word 48000
+        # times. The first two lists have no group word; the third has the
+        # group word of another printer ahead. The old read needs about 6 s of
+        # CPU time for each of the three; the one-pass read needs 0.01 s for
+        # all four lists. The last list has the printer's own group word
+        # ahead, so each read withholds it at the first printer word. The
+        # bound is on CPU time, as in the other linear-time tests of this file.
+        import time
+
+        def walk(words):
+            budget = [worker_transcript.MAX_READ_CHARS_FLOOR] * worker_transcript.READ_COUNT
+            return worker_transcript._words_print_token_or_environment(words, 0, budget)
+
+        for words, withheld in (
+            (["echo"] + ["print-access-token"] * 48000, False),
+            (["echo"] + ["config-helper"] * 48000, False),
+            (["echo", "config"] + ["print-identity-token"] * 48000, False),
+            (["echo", "auth"] + ["print-access-token"] * 48000, True),
+        ):
+            with self.subTest(words=words[:3]):
+                start = time.process_time()
+                self.assertEqual(walk(words), withheld)
+                self.assertLess(time.process_time() - start, 1.0)
+
+
 class TestSecretReadDetector(unittest.TestCase):
     WITHHELD_COMMANDS = [
         "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
