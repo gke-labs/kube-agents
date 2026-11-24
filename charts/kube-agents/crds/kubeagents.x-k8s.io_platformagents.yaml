@@ -12845,6 +12845,21 @@ spec:
                         model thinks at its own default, and absent while the served CRD predates it.
                       type: string
                   type: object
+                inferenceKeys:
+                  description: |-
+                    InferenceKeys records the inference gateway key Secrets the operator
+                    created. Absent until it creates one, and while the served CRD predates
+                    the field, in which case the operator creates none.
+                  properties:
+                    secretUIDs:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        SecretUIDs maps each such Secret's name to the UID it was created with.
+                        A tier key's Secret is in the profile namespace; every other one is in
+                        the PlatformAgent's namespace.
+                      type: object
+                  type: object
                 lastReconcileTime:
                   description:
                     LastReconcileTime is the timestamp when the operator

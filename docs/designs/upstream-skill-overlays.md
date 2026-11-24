@@ -12,7 +12,7 @@
 
 | Question   | Answer                                                                                                                                                                                                                     |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| What       | The 29 `gke-*` skills under `agents/platform/skills/` are copies of `skills/cloud/gke-*` in [`google/skills`](https://github.com/google/skills), the repository the removed `scripts/sync-upstream-skills.py` synced from. |
+| What       | The 31 `gke-*` skills under `agents/platform/skills/` are copies of `skills/cloud/gke-*` in [`google/skills`](https://github.com/google/skills), the repository the removed `scripts/sync-upstream-skills.py` synced from. |
 | Constraint | Another team maintains `google/skills`; it accepts issues but no external pull requests. Our changes (credential proxy, `$HERMES_HOME`, routing to our own skills, persona rules) live here for as long as the skills do.  |
 
 ## What happened before this design
@@ -440,7 +440,7 @@ Optional, not part of this design: an `OWNERS` file on `third_party/google-skill
 
 ## Costs
 
-- Two copies of each mirrored skill (about 440 KiB for 29 skills).
+- Two copies of each mirrored skill (the upstream copies are about 570 KiB for 31 skills).
 - A new script with eight subcommands (`sync`, `continue`, `import`, `refresh`, `generate`, `check`, `status`, `verify-upstream`) and its tests.
 - Patch files are awkward to edit by hand, hence `make skills-refresh`; a sync PR carries refreshed patches alongside the upstream and generated diffs.
 - Migration rewrites the script the open skill-sync PRs edit, so it lands after them.
@@ -529,7 +529,7 @@ sequenceDiagram
 
 Open before this is built:
 
-- The eval policy for automated sync PRs: each needs eval evidence, and per-skill coverage is thin today (one of the 29 mirrored skills is named by any case), so a bot PR would wait on a person writing a case.
+- The eval policy for automated sync PRs: each needs eval evidence, and per-skill coverage is thin today (12 of the 31 mirrored skills are named by a case), so a bot PR would wait on a person writing a case.
 - The token the job opens PRs with, which needs a repository admin and the robot's operator.
 - How `kube-agents-robot` is pointed at `skill-sync-conflict` issues, and review load in weeks when upstream changes many skills at once.
 

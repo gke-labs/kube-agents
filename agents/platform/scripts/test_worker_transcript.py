@@ -79,18 +79,73 @@ class TestScrubStepText(unittest.TestCase):
             if not self._parses(nested):
                 self.skipTest("the JSON parser refuses %d levels here, so no document of this depth parses" % depth)
             self.assertEqual(_scrub("tool_result", nested), WITHHELD)
-        # A document too deep to parse is scrubbed as text rather than dropped.
-        # The parser's depth limit is the interpreter's: some thousands of
-        # levels on Python 3.12 and 3.13, and on 3.14 as many as the stack
-        # holds (more than 100,000 with a 16 MB stack). So the test finds a
-        # depth above it and holds no fixed one.
-        deep = nested
+
+    def _too_deep_to_parse(self):
+        """A document the JSON parser of this Python refuses for its depth.
+
+        The parser's depth limit is the interpreter's: some thousands of
+        levels on Python 3.12 and 3.13, and on 3.14 as many as the stack holds
+        (more than 100,000 with a 16 MB stack). So the search finds a depth
+        above it and holds no fixed one.
+        """
+        depth = 2 * sys.getrecursionlimit()
+        deep = "[" * depth + "]" * depth
         while self._parses(deep):
             if 2 * depth > self.DEEPEST_DOCUMENT_TRIED:
                 self.skipTest("the JSON parser of this Python parses %d levels; the search stops there" % depth)
             depth *= 2
             deep = "[" * depth + "]" * depth
-        self.assertEqual(_scrub("tool_result", deep), deep)
+        return deep
+
+    def test_withheld_when_the_document_is_too_deep_to_parse(self):
+        """More depth never gets a weaker rule: a document the parser refuses
+        is withheld as one too deep to walk is, not served under the text rules."""
+        deep = self._too_deep_to_parse()
+        for kind in ("thinking", "tool_call", "tool_result", "reply"):
+            with self.subTest(kind=kind):
+                self.assertEqual(_scrub(kind, deep), WITHHELD)
+
+    def test_withheld_when_a_string_inside_the_step_is_too_deep_to_parse(self):
+        deep = self._too_deep_to_parse()
+        for name, step in (
+            ("a value of a structure", json.dumps({"output": deep})),
+            ("a value of a nested structure", json.dumps({"result": [{"stdout": deep}]})),
+        ):
+            for kind in ("tool_call", "tool_result"):
+                with self.subTest(step=name, kind=kind):
+                    self.assertEqual(_scrub(kind, step), WITHHELD)
+        # The inline-object rule is a tool result's, and parses each `{...}` in a line of text.
+        inline = 'the call returned {"items": %s} and exited' % deep
+        self.assertEqual(_scrub("tool_result", inline), WITHHELD)
+
+    def test_withheld_when_the_parser_gives_up_on_text_that_is_no_document(self):
+        """Brackets that never close: no JSON document, but the parser stops
+        for the depth before it can say so, and that is all this module sees."""
+        deep = self._too_deep_to_parse()
+        unclosed = deep[: len(deep) // 2]
+        self.assertFalse(self._parses(unclosed))
+        self.assertEqual(_scrub("tool_result", unclosed), WITHHELD)
+
+    def test_text_the_parser_refuses_for_its_form_is_still_scrubbed_as_text(self):
+        for step in ('{"a": 1', "[1, 2,", "{not json}", "[" * 50):
+            with self.subTest(step=step):
+                self.assertEqual(_scrub("tool_result", step), step)
+        # Scrubbed, not only served: the text rules still mask a value in it.
+        out = _scrub("tool_result", '{"password": "hunter2hunter2", "a": 1')
+        self.assertNotIn("hunter2hunter2", out)
+        self.assertIn(MARKER, out)
+        self.assertNotEqual(out, WITHHELD)
+
+    def test_arguments_too_deep_to_parse_count_as_a_secret_read(self):
+        """They cannot be shown not to print a secret, so the call's result is
+        withheld with them."""
+        deep = self._too_deep_to_parse()
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(deep))
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(deep[: len(deep) // 2]))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": "ls -la"})))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call("ls -la"))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call('{"command": "ls'))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call("[" * 50))
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
         for cmd, cred, kept in (
@@ -1794,6 +1849,62 @@ class TestStoreFamilyReadKeepsItsVerdict(unittest.TestCase):
             with self.subTest(command=command[:20]):
                 start = time.process_time()
                 worker_transcript._simple_command_reads_a_secret(command, worker_transcript.MAX_NESTED_COMMAND_DEPTH)
+                self.assertLess(time.process_time() - start, 1.0)
+
+
+class TestTokenPrinterReadKeepsItsVerdict(unittest.TestCase):
+    """A gcloud token printer withholds when its group word stands ahead of
+    it. The read copied the words ahead of each printer word, which costs
+    quadratic time on a command that repeats one. The one-pass read must give
+    the same verdict."""
+
+    @staticmethod
+    def old_read(words):
+        # The line before the one-pass read, kept here ONLY as the reference for equal output.
+        groups = worker_transcript.GCLOUD_TOKEN_PRINTER_GROUPS
+        return any(groups[word] in words[:index] for index, word in enumerate(words) if word in groups)
+
+    def test_the_one_pass_read_gives_the_old_verdict(self):
+        import itertools
+
+        # Each list of 1 to 5 words from the printers, their group words, and
+        # words that only look like one of them.
+        units = sorted(worker_transcript.GCLOUD_TOKEN_PRINTER_GROUPS) + ["auth", "config", "authx", "print-access-tokens"]
+        withheld = 0
+        for length in range(1, 6):
+            for words in itertools.product(units, repeat=length):
+                verdict = worker_transcript._token_printer_behind_its_group(words)
+                self.assertEqual(verdict, self.old_read(words), words)
+                withheld += verdict
+        # Both verdicts occur, so the comparison is of a read that decides.
+        self.assertGreater(withheld, 1000)
+        self.assertFalse(worker_transcript._token_printer_behind_its_group(("print-access-token", "auth")))
+        self.assertFalse(worker_transcript._token_printer_behind_its_group(("config", "print-access-token")))
+        self.assertTrue(worker_transcript._token_printer_behind_its_group(("auth", "x", "print-identity-token")))
+
+    def test_a_run_of_printer_words_reads_in_linear_time(self):
+        # The words of one simple command that repeats a printer word 48000
+        # times. The first two lists have no group word; the third has the
+        # group word of another printer ahead. The old read needs about 6 s of
+        # CPU time for each of the three; the one-pass read needs 0.01 s for
+        # all four lists. The last list has the printer's own group word
+        # ahead, so each read withholds it at the first printer word. The
+        # bound is on CPU time, as in the other linear-time tests of this file.
+        import time
+
+        def walk(words):
+            budget = [worker_transcript.MAX_READ_CHARS_FLOOR] * worker_transcript.READ_COUNT
+            return worker_transcript._words_print_token_or_environment(words, 0, budget)
+
+        for words, withheld in (
+            (["echo"] + ["print-access-token"] * 48000, False),
+            (["echo"] + ["config-helper"] * 48000, False),
+            (["echo", "config"] + ["print-identity-token"] * 48000, False),
+            (["echo", "auth"] + ["print-access-token"] * 48000, True),
+        ):
+            with self.subTest(words=words[:3]):
+                start = time.process_time()
+                self.assertEqual(walk(words), withheld)
                 self.assertLess(time.process_time() - start, 1.0)
 
 
