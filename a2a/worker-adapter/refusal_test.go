@@ -684,6 +684,7 @@ func TestTheRecordsNamesAgreeWithTheBrokerClient(t *testing.T) {
 		{client, "REFUSAL_RECORD_TASK", field("Task")},
 		{policy, "KUBERNETES_READ_ONLY_RULE", kubernetesReadOnlyRule},
 		{broker, "RULE_CALLER_KUBECTL_FLAG", callerKubectlFlagRule},
+		{client, "WRITE_ATTEMPT_RULE", writeAttemptRule},
 	} {
 		line := regexp.MustCompile(`(?m)^` + tc.constant + ` = "([^"]*)"`).FindStringSubmatch(tc.src)
 		if line == nil {

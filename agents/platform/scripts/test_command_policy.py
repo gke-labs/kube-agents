@@ -3038,6 +3038,27 @@ class KubectlWriteAttemptTest(unittest.TestCase):
         self.assertIsNone(self.attempt(line, self.RODR))
         self.assertEqual(("apply",), self.attempt(line, self.RO))
 
+    def test_a_server_dry_run_the_proxy_still_refuses_is_an_attempt(self):
+        # kube-proxy lets a server dry run through under read-only-dry-run only
+        # for create, update and patch, and on the scale subresource
+        # (policy.go's dryRunVerbs). A DELETE, an eviction or a certificate
+        # approval is refused there too, so it is still an attempted change.
+        for line, verb in (
+            ("kubectl delete pod p --dry-run=server", ("delete",)),
+            ("kubectl drain node-1 --ignore-daemonsets --dry-run=server", ("drain",)),
+            ("kubectl certificate approve csr-1 --dry-run=server", ("certificate", "approve")),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(verb, self.attempt(line, self.RODR))
+        for line in (
+            "kubectl scale deploy/x --replicas=2 --dry-run=server",
+            "kubectl annotate deploy/x a=b --dry-run=server",
+            "kubectl create deploy x --image=nginx --dry-run=server",
+            "kubectl rollout restart deploy/x --dry-run=server",
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(self.attempt(line, self.RODR))
+
     def test_no_attempt_unless_the_proxy_is_read_only(self):
         for mode in ("read-write", "", "READ-ONLY", "unknown"):
             with self.subTest(mode=mode):

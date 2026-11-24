@@ -156,7 +156,7 @@ type Config struct {
 
 	// StopOnWriteRefusal stops the harness at the first definitive write
 	// refusal the broker client recorded in WriteRefusalFile (refusal.go)
-	// and ends the task rejected with the refused verb, and the rule where
+	// and ends the task failed with the refused verb, and the rule where
 	// the reason names one. No tool output is read for it. applyDefaults sets
 	// it for a profile pod (ProfileExecutor) and for a session pod with a
 	// WriteRefusalDir; a test sets it directly.

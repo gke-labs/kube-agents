@@ -4,7 +4,7 @@
 # (EVAL_FRONT_DOOR=session) the session pod's kubectl reaches the cluster
 # through <agent>-kube-proxy, which is read-only. Its kubectl wrapper records
 # the failed write attempt from the argv and the exit code, and the worker
-# adapter ends the turn rejected, with "kubectl scale was not made; writes are
+# adapter ends the turn failed, with "kubectl scale was not made; writes are
 # refused here". Through the platform front door the Hermes runtime
 # halts the turn at the shim's refusal and replies with its own halt message
 # (deploy/docker/patches/permission_refusal_stop.py HALT_MESSAGE). Either
