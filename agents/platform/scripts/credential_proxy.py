@@ -1526,6 +1526,16 @@ RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
 # The refusal code a profile caller gets for a version-control verb its task
 # credential doesn't cover (no credential, or a write without the permit).
 CALLER_PERMIT_REQUIRED_CODE = "CALLER_PERMIT_REQUIRED"
+# A refusal body's mark of a definitive write refusal: a write refused however
+# it is attempted, which a retry or another spelling cannot get through. Set on
+# a policy rule's refusal of a mutating kubectl verb that is not a local render
+# (command_policy.kubectl_definitive_write): the read-only rule's
+# (read_only_refusal) and, for a profile caller, the flag rule's. Never on a
+# busy, rate or timeout answer, nor on a version-control refusal, whose answer
+# is the patch the version-control skill gives. The in-pod client (credential_proxy_client.WRITE_REFUSAL_KEY)
+# records such a refusal for the profile worker, which stops the task at the
+# first one; every other refusal carries it false or not at all.
+WRITE_REFUSAL_KEY = "write_refusal"
 # A profile caller's permitted write that names a proposal or branch this
 # install does not own (VcsBroker.require_agent_proposal, #3993).
 RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
@@ -5946,7 +5956,7 @@ class ServiceAccountAuthenticator:
     def _own_token(self) -> str:
         try:
             return Path(self.token_file).read_text(encoding="utf-8").strip()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             raise AuthenticationError(
                 f"this pod's own API server token is unreadable: {type(exc).__name__}"
             ) from exc
@@ -5981,11 +5991,12 @@ class ServiceAccountAuthenticator:
                 request, timeout=self.timeout_seconds, context=context
             ) as response:
                 review = json.load(response)
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, RecursionError) as exc:
             # A TokenReview that cannot be completed is a rejection, not an
             # allow. An API server outage must not turn into an open broker.
             # HTTPException: an answer that is not HTTP, or a body that ends
-            # early, is not an OSError.
+            # early, is not an OSError. RecursionError: a body nested past the
+            # JSON parser's depth is not a ValueError.
             raise AuthenticationError(
                 f"TokenReview could not be completed: {type(exc).__name__}"
             ) from exc
@@ -6003,6 +6014,11 @@ class ServiceAccountAuthenticator:
         # authenticated for some other audience is not for us, and one it
         # validated for two of ours breaks the assumption the role rests on.
         audiences = status.get("audiences") or []
+        # The audiences, the user, its username, its uid and its groups: a value
+        # of another type than the API server's is a malformed answer, and a
+        # malformed answer is a rejection.
+        if not isinstance(audiences, list):
+            raise AuthenticationError("TokenReview returned audiences that are not a list")
         matched = sorted(
             {
                 audience
@@ -6017,7 +6033,11 @@ class ServiceAccountAuthenticator:
                 "the presented token names more than one of this broker's audiences"
             )
         user = status.get("user") or {}
+        if not isinstance(user, dict):
+            raise AuthenticationError("TokenReview returned a user that is not a mapping")
         username = user.get("username") or ""
+        if not isinstance(username, str):
+            raise AuthenticationError("TokenReview returned a username that is not text")
         if username not in self.allowed_callers:
             raise AuthenticationError("the authenticated caller is not permitted")
         role = self.audience_roles[matched[0]]
@@ -6065,6 +6085,11 @@ class ServiceAccountAuthenticator:
         if role == CALLER_ROLE_PROFILE and username not in self.profile_callers:
             raise AuthenticationError("the profile audience is only for profile callers")
         groups = user.get("groups") or []
+        if not isinstance(groups, list):
+            raise AuthenticationError("TokenReview returned groups that are not a list")
+        uid = user.get("uid") or ""
+        if not isinstance(uid, str):
+            raise AuthenticationError("TokenReview returned a uid that is not text")
         extra = user.get("extra") or {}
         pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
         pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
@@ -6072,7 +6097,7 @@ class ServiceAccountAuthenticator:
         pod_uid = pod_uids[0] if isinstance(pod_uids, list) and pod_uids else ""
         return Principal(
             workload=username,
-            uid=str(user.get("uid") or ""),
+            uid=uid,
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
             role=role,
             pod=pod if isinstance(pod, str) else "",
@@ -13992,8 +14017,10 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     # so the shim can print them beside the rule: the agent runtime's refusal
     # stop reads those lines instead of re-deriving the verb from shell text.
     verb_words = list(decision.verb_tuple) if decision.verb_tuple else None
-    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE:
+    read_only_rule = decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE
+    if verb_words and read_only_rule:
         verb_words = verb_words[:2] if verb_words[1:2] and verb_words[1] in _KUBECTL_SUBCOMMANDS.get(verb_words[0], ()) else verb_words[:1]
+    rendered = read_only_rule and command_policy.local_render(argv)
     return (
         {
             "status": "blocked",
@@ -14001,7 +14028,13 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
             "rule": decision.rule_id,
             "message": decision.message,
             "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in verb_words] if verb_words else None,
-            "local_render": decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and command_policy.local_render(argv),
+            "local_render": rendered,
+            # A definitive write refusal: the read-only rule refused a mutating
+            # kubectl verb that was not a local render. The in-pod client
+            # records it for the profile worker's stop (WRITE_REFUSAL_KEY).
+            WRITE_REFUSAL_KEY: read_only_rule
+            and not rendered
+            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),
         },
         log_hint,
     )
@@ -15952,6 +15985,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         refused_flag = session_kubectl_flag_refusal(principal.role, argv)
         if refused_flag is not None:
+            # A profile caller's write the flag rule refused is refused outright:
+            # marked for the worker's stop like a read-only refusal, with the
+            # verb words the record names. Only this policy refusal and the
+            # read-only rule's are marked, never a busy, rate or timeout answer.
+            flag_write = command_policy.kubectl_definitive_write(argv) if principal.role == CALLER_ROLE_PROFILE else None
             LOGGER.warning(
                 "flag refused for role request_id=%s role=%s executable=%s flag=%s",
                 request_id,
@@ -15972,6 +16010,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "is not one of them (file inputs, file-backed output formats, streaming flags and the "
                         "API server's own endpoints under --raw are not available to a session)."
                     ),
+                    "verb": list(flag_write) if flag_write else None,
+                    WRITE_REFUSAL_KEY: flag_write is not None,
                 },
             )
             return

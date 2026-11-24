@@ -41,6 +41,12 @@ func TestTheClaudeDecoderMapsEachLine(t *testing.T) {
 				{Kind: EventActivity, Tool: "Write", Input: json.RawMessage(`{"file_path":"x"}`)},
 			}},
 		{"assistant with no message", `{"type":"assistant"}`, nil},
+		{"one tool result", `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"exit status 77"}]}}`,
+			[]Event{{Kind: EventToolResult}}},
+		{"two parallel tool results", `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"text","text":"x"},{"type":"tool_result","tool_use_id":"t2"}]}}`,
+			[]Event{{Kind: EventToolResult}, {Kind: EventToolResult}}},
+		{"a user line with no tool result", `{"type":"user","message":{"content":[{"type":"text","text":"steer"}]}}`, nil},
+		{"user with no message", `{"type":"user"}`, nil},
 		{"success", `{"type":"result","subtype":"success","result":"done"}`,
 			[]Event{{Kind: EventResult, Text: "done", Token: "success"}}},
 		{"error subtype", `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"out"}`,
@@ -195,6 +201,8 @@ func (toyDecoder) Decode(line []byte) ([]Event, error) {
 		return []Event{{Kind: EventThinking, Text: rest}}, nil
 	case "P":
 		return []Event{{Kind: EventProgress, Text: rest}}, nil
+	case "R":
+		return []Event{{Kind: EventToolResult}}, nil
 	case "A":
 		return []Event{{Kind: EventActivity, Tool: rest, Input: json.RawMessage(`{}`)}}, nil
 	case "OK":
@@ -611,5 +619,72 @@ sleep 30
 	}
 	if refusalBeforeTerminal(t, url, session, taskID) < 0 {
 		t.Error("the held steer was not refused before the evicted terminal")
+	}
+}
+
+// productionDriverToolSteps is, for each driver a task can run on, a
+// recorded stream of known tool steps. A driver added to the registry adds
+// its row here (the agy driver with #6745), so the write-refusal stop, which
+// runs on EventToolResult, applies to it.
+var productionDriverToolSteps = []struct {
+	name   string
+	driver Driver
+	lines  []string
+	steps  int
+}{
+	{"claude", claudeDriver{}, []string{
+		`{"type":"system","subtype":"init","session_id":"s","model":"m"}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"kubectl get pods"}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}},{"type":"tool_use","id":"t3","name":"Read","input":{}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2"},{"type":"tool_result","tool_use_id":"t3"}]}}`,
+		`{"type":"result","subtype":"success","result":"done"}`,
+	}, 3},
+	// agy 1.5.13 as recorded: one shell step that ends DONE, across two
+	// turns, and one that ends ERROR when headless approval was refused.
+	{"agy done", agyDriver{}, agyFixtureLines("tool"), 1},
+	{"agy error", agyDriver{}, agyFixtureLines("deny"), 1},
+}
+
+// agyFixtureLines is testdata/agy/<name>.jsonl's lines, read when the table
+// is built.
+func agyFixtureLines(name string) []string {
+	raw, err := os.ReadFile(filepath.Join("testdata", "agy", name+".jsonl"))
+	if err != nil {
+		panic(err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// TestEveryDriverEmitsOneToolResultPerToolStep: the write-refusal stop reads
+// its record on EventToolResult, so a driver that emits none would never
+// stop a task, and nothing would say so. Each production driver emits
+// exactly one per recorded tool step.
+func TestEveryDriverEmitsOneToolResultPerToolStep(t *testing.T) {
+	for _, tc := range productionDriverToolSteps {
+		t.Run(tc.name, func(t *testing.T) {
+			dec := tc.driver.NewDecoder()
+			got := 0
+			for _, line := range tc.lines {
+				evs, err := dec.Decode([]byte(line))
+				if err != nil {
+					t.Fatalf("decode %q: %v", line, err)
+				}
+				for _, ev := range evs {
+					if ev.Kind == EventToolResult {
+						got++
+					}
+				}
+			}
+			if got != tc.steps {
+				t.Fatalf("%d EventToolResult for %d tool steps", got, tc.steps)
+			}
+		})
 	}
 }

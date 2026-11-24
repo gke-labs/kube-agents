@@ -11616,6 +11616,46 @@ spec:
                         - endpoint
                       type: object
                   type: object
+                schedules:
+                  description:
+                    Schedules adjusts the built-in AgentSchedules the operator
+                    renders.
+                  properties:
+                    overrides:
+                      description: |-
+                        Overrides sets spec.suspend on built-in schedules, keyed on the
+                        schedule's rendered name: a canary (<name>-canary) and its live row
+                        are separate entries, so a suspend never carries from one phase to the
+                        other. An entry naming no built-in is reported on the PlatformAgent's
+                        BuiltinSchedules condition and otherwise ignored. A run-now-only
+                        built-in, such as onboarding, takes only suspend: true, which stops
+                        the operator from starting its run; suspend: false is refused and
+                        reported, since it would put the schedule on its nominal cron.
+                      items:
+                        description:
+                          AgentScheduleOverride sets one built-in schedule's
+                          spec.suspend.
+                        properties:
+                          name:
+                            description: Name is the built-in schedule's rendered name.
+                            maxLength: 63
+                            minLength: 1
+                            type: string
+                          suspend:
+                            description: |-
+                              Suspend is the value the operator writes to the schedule's
+                              spec.suspend.
+                            type: boolean
+                        required:
+                          - name
+                          - suspend
+                        type: object
+                      maxItems: 64
+                      type: array
+                      x-kubernetes-list-map-keys:
+                        - name
+                      x-kubernetes-list-type: map
+                  type: object
                 scope:
                   description: |-
                     Scope declares which GCP projects, beyond the one the agent runs in, the

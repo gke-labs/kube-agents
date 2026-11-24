@@ -538,6 +538,91 @@ resource "kubernetes_pod_disruption_budget_v1" "calibration" {
   }
 }
 
+# Posture (waste, generated names, finished Jobs): three Jobs that a spawner
+# would make, each named `reindex-<uuid>`, with one common parent label, no
+# owner and no ttl_seconds_after_finished. Each one ran to completion and
+# stays. The cost SOP's 3.9 `terminal-pods` files a finished Job that has no
+# TTL once it finished 7 days ago: one finding for each member, under a name
+# that no file in a GitOps repository declares. They live in the Deployment
+# family's namespace, so the fleet gets no new namespace and no new policy.
+#
+# The names are literals for the reason the calibration names are. A changed
+# literal plans as a replace, which the reconciler refuses without a row in
+# reconcile-allow.json, and a new Job starts the 7-day clock again: the role
+# is not ready until then (fixtures.json, `ready_after_hours` on
+# status.completionTime). Plant no object with the exact name `reindex` in
+# this namespace: an audit that rolls such a family up to its parent would
+# take that name for the parent, as the waste audit does for the Deployments
+# above. No TTL also keeps each later apply a no-op, as for
+# legacy_endpoints_writer_first_run below.
+#
+# The apply does not wait for the Jobs (wait_for_completion false). A wait
+# that fails or passes its timeout leaves the resource tainted, the next plan
+# is then a replace, and the reconciler refuses that project on each run. A
+# Job needs nothing that an apply must prove, so it finishes by itself, and a
+# Job that cannot finish reads as drift on the fixture-state scan (the role
+# asserts status.succeeded). backoff_limit 2 lets a pod that a node drain cut
+# run again.
+# Catalogue role: generated-name-job-family.
+locals {
+  reindex_parent = "reindex"
+  reindex_jobs = {
+    one   = { name = "reindex-8daede4e-4620-426c-9e07-58f5f0505f39" }
+    two   = { name = "reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041" }
+    three = { name = "reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2" }
+  }
+}
+
+resource "kubernetes_job_v1" "reindex" {
+  for_each = local.reindex_jobs
+
+  metadata {
+    name      = each.value.name
+    namespace = kubernetes_namespace_v1.seeded_family.metadata[0].name
+    labels    = { "app.kubernetes.io/part-of" = local.reindex_parent }
+  }
+  spec {
+    backoff_limit = 2
+    template {
+      metadata {
+        labels = {
+          app                         = each.value.name
+          "app.kubernetes.io/part-of" = local.reindex_parent
+        }
+      }
+      spec {
+        automount_service_account_token = false
+        restart_policy                  = "Never"
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "reindex"
+          image   = "docker.io/library/python:3.14-slim"
+          command = ["python3", "-c", "pass"]
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "20m", memory = "32Mi" }
+            limits   = { memory = "64Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_completion = false
+}
+
 # Posture (rightsizing dependency): a Guaranteed-QoS workload, the second
 # dependency a request cut must name besides inference-server's HPA. Two
 # replicas whose one container sets requests equal to limits on both
