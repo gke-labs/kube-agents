@@ -904,8 +904,8 @@ def test_a_value_that_fit_before_the_clip_still_does(data_root: Path) -> None:
 
 
 # The search for the JSON parser's depth limit tries no document deeper than
-# this (about a million levels): the in-pod script's time on such a document
-# grows faster than its depth, and a deeper one would take minutes.
+# this (about a million levels): the search parses each candidate in this
+# process, so the limit bounds its time and memory.
 DEEPEST_DOCUMENT_TRIED = 1 << 20
 
 
@@ -914,10 +914,11 @@ def _document_too_deep_to_parse() -> str | None:
 
     The parser's depth limit is the interpreter's: some thousands of levels on
     Python 3.12 and 3.13, and on 3.14 as many as the stack holds. A document
-    that parses and is too deep to walk is withheld, so a fixed depth is the
-    wrong side of the limit on some Python. The document is a quarter deeper
-    than the first depth that this process refuses: the in-pod script runs in
-    a process of its own, whose parser accepts a few levels more.
+    that parses and is too deep to walk is withheld by the walk, so a fixed
+    depth would test the walk and not the parser on some Python. The document
+    is a quarter deeper than the first depth that this process refuses: the
+    in-pod script runs in a process of its own, whose parser accepts a few
+    levels more.
     """
     depth = 20000
     while depth <= DEEPEST_DOCUMENT_TRIED:
@@ -938,18 +939,26 @@ TOO_DEEP_TO_PARSE = _document_too_deep_to_parse()
     [
         "not json " + "y" * 3000,
         json.dumps(["y" * 3000, "short"]),
-        pytest.param(
-            TOO_DEEP_TO_PARSE,
-            marks=pytest.mark.skipif(TOO_DEEP_TO_PARSE is None, reason="the JSON parser of this Python has no depth limit that the search finds"),
-        ),
     ],
-    ids=["text", "array", "nested-past-the-recursion-limit"],
+    ids=["text", "array"],
 )
 def test_arguments_that_are_not_a_json_object_are_clipped_as_they_stand(
     data_root: Path, arguments: str
 ) -> None:
     _plant_call(data_root, "write_file", arguments)
     assert _pod_args(data_root) == arguments[:2000] + " ...[clipped %d chars]" % (len(arguments) - 2000)
+
+
+@pytest.mark.skipif(TOO_DEEP_TO_PARSE is None, reason="the JSON parser of this Python has no depth limit that the search finds")
+def test_arguments_too_deep_to_parse_are_withheld(data_root: Path) -> None:
+    """The shared rules withhold a document the parser refuses for its depth, as they do one too deep to walk.
+
+    They also count such arguments as a secret read, so the call's result is recorded as withheld.
+    """
+    _plant_call(data_root, "write_file", TOO_DEEP_TO_PARSE)
+    call = next(c for c in _payload(_run_script(data_root, [FRONT]))["calls"] if c["task"] == FRONT)
+    assert call["args"] == worker_trajectory.WITHHELD
+    assert call["result"] == worker_trajectory.WITHHELD_READ_RESULT
 
 
 def test_a_scrubbed_argument_stays_scrubbed_when_it_moves_first(data_root: Path) -> None:

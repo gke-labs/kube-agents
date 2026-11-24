@@ -141,7 +141,7 @@ A scheduled brief posts flat in that channel, never inside a thread. A job that 
 
 The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report and fleet-audit reports into cards, and changes how the harness's own messages read on Slack (below).
 
-To turn the flag off, set `KAGE_SLACK_UX=false` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`); an install that never set it has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
+To turn the flag off, add `KAGE_SLACK_UX=false` to the chart value `platformAgent.deployment.env`; [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the `install.env` line. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply. An install that never set the flag has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
 
 #### What the reaction means
 
@@ -434,7 +434,9 @@ By default every conversation's tasks go to the `platform` route above. `/sessio
 
 A DM conversation with only one message so far is on a shorter clock: its pod goes 5 minutes after your last message (`dmSessionIdleMinutes`), since most DMs are a single question. Its second message puts it back on the 30.
 
-An install runs at most 10 session pods at once (`spec.harness.tuning.maxSessions`). When a conversation needs a new pod at that cap, the pod that has been idle longest is deleted to make room, and its conversation is told `⏸️ this session was paused to make room for another conversation; your next message here starts it fresh with the conversation so far`. If every other conversation with a pod still has a task in progress, the new task is refused instead, with `🚦 not started: 10 session workers are already running (cap 10). …`. A follow-up to a task on the session route gets `✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running`.
+An install runs at most 10 session pods at once (`spec.harness.tuning.maxSessions`). When a conversation needs a new pod at that cap, the pod that has been idle longest is deleted to make room, and its conversation is told `⏸️ this session was paused to make room for another conversation; your next message here starts it fresh with the conversation so far`. If every other conversation with a pod still has a task in progress, the new task waits in line instead, with one message that moves as the line does: `⏳ queued — every session worker is busy and you're next in line; I'll start if one frees up in the next few minutes` (or how many conversations are ahead). It starts when a slot frees, oldest first; `stop` takes it out of the line, and later messages in the conversation wait behind it.
+
+After five minutes in line, wherever it is in the line, it is taken out with `🚦 not started: every session worker stayed busy while this waited …`, which also names any later messages dropped with it. When 20 conversations are already waiting, it is refused at once with `🚦 not started: 10 session workers are already running (cap 10). …`. Messages from a chat app, the console and the eval harness's inject door wait this way. A task sent through the A2A door is refused at the cap rather than queued, because an A2A caller is a program that reads that answer as nothing started. A follow-up to a task on the session route gets `✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running`.
 
 On Slack, start the message with the bot's mention, `@bot /session`, because Slack takes a bare leading `/` as one of its own slash commands. In a Google Chat space, mention the app as with any message.
 
@@ -754,7 +756,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in the chart value `platformAgent.deployment.env`, or in `spec.deployment.env` on an install that no chart manages:
 
 ```yaml
 platformAgent:
