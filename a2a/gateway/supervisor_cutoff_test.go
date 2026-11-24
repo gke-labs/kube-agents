@@ -935,3 +935,91 @@ func TestTheRelayStopsHoldingARefusalAfterTheLimit(t *testing.T) {
 		t.Errorf("a refused event was rendered: %+v", got)
 	}
 }
+
+// The hold budget counts holds for the names and nothing else. A delivery
+// the durable already handed out many times for other reasons (a failed KV
+// write's give-back, a stop's, an AckWait that lapsed) is still held, and
+// the event is settled only after profileNamesHoldLimit holds of its own.
+func TestKVRequeuesDoNotSpendTheRelaysNamesHolds(t *testing.T) {
+	t.Parallel()
+	r := startCutoffRigNames(t, time.Now().Add(-time.Minute), &lib.ProfileNames{})
+	conv := "discord:cut/kv-requeues"
+	r.putRecord(t, cutoffRecord(conv, cutoffSessionAddressee, cutoffSessionTask, false))
+	subject := lib.TaskSupervisorSubject(cutoffSessionAddressee, cutoffSessionTask)
+	env := supervisorTerminalEnvelope(t, cutoffSessionTask)
+	deliver := func(n uint64) *redeliveredDelivery {
+		d := &redeliveredDelivery{nakDelivery: nakDelivery{stampedDelivery: stampedDelivery{
+			fakeDelivery: fakeDelivery{env: env, subj: subject, seq: 704}, at: r.cutoff.Add(30 * time.Second)}}, n: n}
+		r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}})
+		return d
+	}
+	// Forty earlier deliveries given back for other reasons, then three more
+	// between every hold: NumDelivered is past the limit from the start.
+	n := uint64(41)
+	for hold := 1; hold <= profileNamesHoldLimit; hold++ {
+		if d := deliver(n); d.acks != 0 || d.naks != 1 {
+			t.Fatalf("hold %d (delivery %d): acks %d, naks %d; want given back", hold, n, d.acks, d.naks)
+		}
+		n += 3
+	}
+	if d := deliver(n); d.acks != 1 || d.naks != 0 {
+		t.Errorf("after %d holds (delivery %d): acks %d, naks %d; want settled", profileNamesHoldLimit, n, d.acks, d.naks)
+	}
+	if drops := r.client.ProfileSupervisorDrops(); drops != 1 {
+		t.Errorf("drops = %d after the settle, want 1", drops)
+	}
+}
+
+// A session task's five-token terminal held while the names are unloaded
+// renders once the names load and it comes back: exactly once, however many
+// times it is delivered after that.
+func TestAHeldSessionTerminalRendersOnceTheNamesLoad(t *testing.T) {
+	t.Parallel()
+	names := &lib.ProfileNames{}
+	r := startCutoffRigNames(t, time.Now().Add(-time.Minute), names)
+	conv := "discord:cut/held-then-loaded"
+	r.putRecord(t, cutoffRecord(conv, cutoffSessionAddressee, cutoffSessionTask, false))
+	subject := lib.TaskSupervisorSubject(cutoffSessionAddressee, cutoffSessionTask)
+	env := supervisorTerminalEnvelope(t, cutoffSessionTask)
+	deliver := func(n uint64) *redeliveredDelivery {
+		d := &redeliveredDelivery{nakDelivery: nakDelivery{stampedDelivery: stampedDelivery{
+			fakeDelivery: fakeDelivery{env: env, subj: subject, seq: 705}, at: r.cutoff.Add(30 * time.Second)}}, n: n}
+		r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}})
+		return d
+	}
+
+	if d := deliver(1); d.acks != 0 || d.naks != 1 {
+		t.Fatalf("names unloaded: acks %d, naks %d; want held", d.acks, d.naks)
+	}
+	if got := r.terminalsFor(cutoffSessionTask); len(got) != 0 {
+		t.Fatalf("a held event was rendered: %+v", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "profile-names.json")
+	if err := os.WriteFile(path, []byte(`{"profiles":["`+cutoffProfileAddressee+`"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := names.LoadFile(path); err != nil || !r.client.ProfileNamesLoaded() {
+		t.Fatalf("loading the names: %v, loaded %v", err, r.client.ProfileNamesLoaded())
+	}
+
+	if d := deliver(2); d.acks != 1 || d.naks != 0 {
+		t.Errorf("names loaded: acks %d, naks %d; want rendered and settled", d.acks, d.naks)
+	}
+	waitFor(t, "the held terminal rendered", func() bool { return len(r.terminalsFor(cutoffSessionTask)) >= 1 })
+	// The same message once more, as an ack the server lost would bring it.
+	if d := deliver(3); d.naks != 0 {
+		t.Errorf("third delivery: naks %d; want no hold", d.naks)
+	}
+	time.Sleep(200 * time.Millisecond)
+	got := r.terminalsFor(cutoffSessionTask)
+	if len(got) != 1 {
+		t.Fatalf("the held terminal rendered %d times, want once: %+v", len(got), got)
+	}
+	if got[0].source != TerminalFromSupervisor || got[0].state != lib.StateFailed {
+		t.Errorf("rendered %+v, want the supervisor's failed terminal", got[0])
+	}
+	if drops := r.client.ProfileSupervisorDrops(); drops != 0 {
+		t.Errorf("a session task's terminal counted %d drops", drops)
+	}
+}

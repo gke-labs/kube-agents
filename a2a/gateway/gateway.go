@@ -368,6 +368,9 @@ type Gateway struct {
 	taskSessions map[string]string
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
+	// namesHolds counts the relay's holds of a five-token supervisor event
+	// while the profile names are not loaded (relay.go).
+	namesHolds namesHolds
 	// cardStopTimers holds each in-flight card-stop control's timeout, by
 	// task id, under mu (cardstop.go). Memory only: a restart loses them,
 	// and the next turn on the conversation expires a control past its

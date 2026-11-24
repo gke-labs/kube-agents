@@ -391,14 +391,96 @@ func firstDeliveryLevel(item relayItem) slog.Level {
 	return slog.LevelDebug
 }
 
-// giveBacks is how many times the item's message was delivered before this
-// delivery: the relay durable redelivers only what was given back or not
-// settled in time. An item with no delivery has none.
-func (item relayItem) giveBacks() int {
-	if item.d == nil || item.d.NumDelivered() <= 1 {
-		return 0
+// namesHolds counts, per message, the times the relay held a five-token
+// supervisor event because the profile names were not loaded
+// (profileNamesHoldLimit). The delivery's own count (NumDelivered) is not
+// that: it also counts a give-back after a failed KV write, a stop's or a
+// rollout's give-back, and an AckWait that lapsed, none of which is a wait
+// for the names, and each of which would eat into the hold budget. The
+// count is kept here instead, keyed by the message's stream sequence, and
+// bumped only on a names hold. It is bounded at namesHoldsMax entries,
+// the oldest forgotten first; an event held at once is one the durable has
+// not acked, so relayMaxAckPending of them is every one that can be held.
+// A gateway restart forgets the counts, and a held event's budget starts
+// again, which only waits longer for names that may load.
+type namesHolds struct {
+	mu    sync.Mutex
+	count map[any]int
+	order []any
+}
+
+// namesHoldsMax bounds namesHolds.
+const namesHoldsMax = relayMaxAckPending
+
+// namesHoldKey is the item's key in namesHolds: its stream sequence, or for
+// an item that didn't come off the durable, its envelope (the in-memory
+// requeue hands the same one back). A delivery with no sequence (no
+// metadata from the server) has no stable key and reads as nil.
+func (item relayItem) namesHoldKey() any {
+	if item.d == nil {
+		return item.env
 	}
-	return int(item.d.NumDelivered() - 1)
+	if seq := item.d.Sequence(); seq != 0 {
+		return seq
+	}
+	return nil
+}
+
+// held is how many times the item has been held for the names so far.
+func (h *namesHolds) held(item relayItem) int {
+	key := item.namesHoldKey()
+	if key == nil {
+		// No key to count under: fall back to the delivery count, which
+		// at worst stops holding early.
+		if item.d.NumDelivered() <= 1 {
+			return 0
+		}
+		return int(item.d.NumDelivered() - 1)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.count[key]
+}
+
+// hold counts one more names hold for the item.
+func (h *namesHolds) hold(item relayItem) {
+	key := item.namesHoldKey()
+	if key == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.count == nil {
+		h.count = map[any]int{}
+	}
+	if _, ok := h.count[key]; !ok {
+		for len(h.order) >= namesHoldsMax {
+			delete(h.count, h.order[0])
+			h.order = h.order[1:]
+		}
+		h.order = append(h.order, key)
+	}
+	h.count[key]++
+}
+
+// forget drops the item's count, once it is settled or rendered.
+func (h *namesHolds) forget(item relayItem) {
+	key := item.namesHoldKey()
+	if key == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.count[key]; !ok {
+		return
+	}
+	delete(h.count, key)
+	for i, k := range h.order {
+		if k == key {
+			h.order = append(h.order[:i], h.order[i+1:]...)
+			break
+		}
+	}
 }
 
 // storedAt is when the stream stored the item's message, zero when it has no
@@ -626,13 +708,15 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			// unloaded; the sequence guard still keeps it from rendering
 			// twice.
 			if !g.client.ProfileNamesLoaded() {
-				if holds := item.giveBacks(); holds < profileNamesHoldLimit {
+				if holds := g.namesHolds.held(item); holds < profileNamesHoldLimit {
 					g.log.Log(g.runCtx, firstDeliveryLevel(item), "relay: five-token supervisor event held; the profile names are not loaded, so every task reads as a profile's",
 						"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
-						"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
+						"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff(), "holds", holds)
+					g.namesHolds.hold(item)
 					g.giveBackAfter(item, profileNamesHoldDelay)
 					continue
 				}
+				g.namesHolds.forget(item)
 				g.client.CountProfileSupervisorDrop()
 				g.log.Error("relay: five-token supervisor event dropped; the profile names never loaded while it was held",
 					"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
@@ -640,12 +724,17 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 				g.settle(item)
 				continue
 			}
+			g.namesHolds.forget(item)
 			g.client.CountProfileSupervisorDrop()
 			g.log.Warn("relay: five-token supervisor event on a profile task, stored after the cutoff, dropped",
 				"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
 				"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
 			g.settle(item)
 			continue
+		}
+		if lib.IsFiveTokenSupervisorSubject(item.subject) {
+			// Taken: whatever holds it had waiting for the names are done.
+			g.namesHolds.forget(item)
 		}
 		// A redelivery can share a batch with its original (a hold that
 		// outlived AckWait). It renders once, and is settled with its

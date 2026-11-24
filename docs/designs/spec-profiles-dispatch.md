@@ -566,7 +566,9 @@ leave open:
   the file is re-read every 30 seconds, and a later read that fails keeps the names last read.
   The gateway's relay doesn't settle a refusal it made before the names were read, since the
   names may take it: it gives the event back to the stream for 30 seconds, up to 20 times, then
-  settles it with an Error and counts the drop once. A held event the names then take renders
+  settles it with an Error and counts the drop once. The 20 counts only these holds, by stream
+  sequence in the gateway's memory, not the message's deliveries: a give-back after a failed
+  KV write, a rollout's give-back or a lapsed ack wait doesn't spend it. A held event the names then take renders
   when it comes back, so it can render after later events of the same task; that ordering
   effect is known and accepted.
   The stored time is the server's, and only where the server alone writes it: a consumer
