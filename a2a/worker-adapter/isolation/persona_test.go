@@ -121,3 +121,36 @@ func TestCheckPersonaDirFailsClosed(t *testing.T) {
 		t.Error("a symlinked persona dir accepted")
 	}
 }
+
+func TestCheckPersonaDirChecksItsAncestors(t *testing.T) {
+	parent := tempDir(t)
+	d := filepath.Join(parent, "persona")
+	must(t, os.Mkdir(d, 0o755))
+	write(t, filepath.Join(d, "AGENTS.md"), "x")
+	lockDown(t, d)
+	must(t, os.Chmod(parent, 0o777)) // others could rename persona away
+	if err := CheckPersonaDir(d, otherUID, otherGID); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("a writable parent: %v", err)
+	}
+	must(t, os.Chmod(parent, 0o755))
+	if err := CheckPersonaDir(d, otherUID, otherGID); err != nil {
+		t.Fatalf("a read-only parent: %v", err)
+	}
+}
+
+func TestLoadPersonaReadsTheCheckedTreeOnce(t *testing.T) {
+	d := personaDir(t)
+	files, err := LoadPersona(d, otherUID, otherGID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(files["AGENTS.md"]) != "be careful" || len(files["skills/triage/SKILL.md"]) == 0 || len(files) != 3 {
+		t.Fatalf("loaded %v", files)
+	}
+	// A directory that fails the check loads nothing.
+	bad := personaDir(t)
+	must(t, os.Chmod(bad, 0o757))
+	if _, err := LoadPersona(bad, otherUID, otherGID); err == nil {
+		t.Fatal("a writable persona dir loaded")
+	}
+}

@@ -25,6 +25,13 @@ func CheckPersonaDir(dir string, uid, gid int) error {
 	if err := checkRoot("persona dir", dir); err != nil {
 		return err
 	}
+	// The path to it first: a writable ancestor could swap the directory
+	// for another after this check.
+	if last, err := walkChecked(filepath.Clean(dir), uid, gid); err != nil {
+		return fmt.Errorf("isolation: persona dir %s: %w", dir, err)
+	} else if last == nil {
+		return fmt.Errorf("isolation: persona dir %s does not exist", dir)
+	}
 	fi, err := os.Lstat(dir)
 	if err != nil {
 		return fmt.Errorf("isolation: persona dir: %w", err)
@@ -78,4 +85,42 @@ func writableBy(fi fs.FileInfo, uid, _ int) bool {
 		return true
 	}
 	return fi.Mode().Perm()&0o022 != 0
+}
+
+// LoadPersona checks dir (CheckPersonaDir) and reads every file in it into
+// memory through one handle on that directory (os.OpenRoot, which also
+// refuses to follow a link out of it), so the harness loads exactly the
+// tree that was checked, once, and later writes to the directory change
+// nothing. The result maps a slash-separated path under dir to its bytes.
+func LoadPersona(dir string, uid, gid int) (map[string][]byte, error) {
+	if err := CheckPersonaDir(dir, uid, gid); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("isolation: persona dir: %w", err)
+	}
+	defer root.Close()
+	files := map[string][]byte{}
+	err = fs.WalkDir(root.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return fmt.Errorf("persona entry %s is not a regular file", p)
+		}
+		b, err := fs.ReadFile(root.FS(), p)
+		if err != nil {
+			return err
+		}
+		files[p] = b
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("isolation: persona dir: %w", err)
+	}
+	return files, nil
 }
