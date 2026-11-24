@@ -90,6 +90,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "`status: True`, `Reason: ProgressDeadlineExceeded`. The bus applies a config change without waiting for every callout replica to load the current identity map, so until the rollout finishes some connections may be placed by the previous map. Check the `<agent>-a2a-callout` Deployment's rollout (`kubectl rollout status`) and its pods' events. Removed once the rollout completes.",
 	},
 	{
+		Type:    a2aProvisionRetryingConditionType,
+		Written: "While the current A2A provision Job has failed pods and has neither completed nor failed",
+		Meaning: "`status: True`, `Reason: ProvisionJobPodsFailing`. The message names the Job, how many of its pods have failed, and the `kubectl logs` command that shows why. The Job retries up to its `backoffLimit`, which can take over an hour, before it fails and `A2AProvisionFailed` takes over. Not `Degraded`; `BusProvisioned`, `Ready` and the phase are unaffected, because the Job also re-runs on a bus that is already provisioned and a retry can be routine (an upgrade waiting on the auth callout). Each new failed pod also records a Warning Event. Removed once the Job completes, fails, or is replaced.",
+	},
+	{
 		Type:    a2aGatewayConditionType,
 		Written: "Only on an install upgraded from an operator that ran the A2A gateway at zero replicas for want of a chat backend: from the pass that scales it back to one replica until that replica is ready. Written and cleared by every pass that renders the stack, whichever phase it ends on (`Ready`, `Provisioning`, or `Degraded` for `A2AProvisionFailed` and `ShellSandboxKeysMissing`), so only a pass that stops before rendering leaves it as it was",
 		Meaning: "`status: False`, `Reason: WaitingForReplica`. Every install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.",

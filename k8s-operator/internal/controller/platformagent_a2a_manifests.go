@@ -7779,6 +7779,13 @@ type a2aProvisionState struct {
 	// such a rollout, and the status writers carry it as
 	// a2aCalloutStalledConditionType so the wedged rollout is visible.
 	calloutStalled string
+	// provisionRetrying is the A2AProvisionRetrying message while the
+	// current provision Job has failed pods and has neither completed nor
+	// given up, "" otherwise. The Job retries up to its backoffLimit before
+	// JobFailed (and A2AProvisionFailed) appears, which can take over an
+	// hour; this makes the retries visible meanwhile without touching
+	// BusProvisioned, Ready or the phase (#7100).
+	provisionRetrying string
 	// calloutMap is what the callout pods' /status said about the identity
 	// map this pass rendered (A2AIdentityMapApplied, #4487); nil on a pass
 	// that did not get as far as rendering one.
@@ -8497,6 +8504,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// check (or on an unknown verdict), and a pass that created it but
 		// failed later never wrote the clear.
 		state.busMeta = a2aBusMetaState{checked: true}
+		terminal := false
+		for _, cond := range existing.Status.Conditions {
+			if cond.Status == corev1.ConditionTrue && (cond.Type == batchv1.JobComplete || cond.Type == batchv1.JobFailed) {
+				terminal = true
+			}
+		}
+		if !terminal && existing.Status.Failed > 0 {
+			state.provisionRetrying = a2aProvisionRetryingMessage(existing.Name, existing.Namespace, existing.Status.Failed)
+			if !a2aProvisionRetryingConditionCurrent(agent, state.provisionRetrying) {
+				r.recordEvent(agent, corev1.EventTypeWarning, a2aProvisionRetryingReason, state.provisionRetrying)
+			}
+		}
 		for _, cond := range existing.Status.Conditions {
 			if cond.Status != corev1.ConditionTrue {
 				continue
@@ -9360,6 +9379,49 @@ func setA2ACalloutStalledCondition(agent *agentv1alpha1.PlatformAgent, callout s
 		Status:             metav1.ConditionTrue,
 		Reason:             a2aCalloutStalledReason,
 		Message:            a2aCalloutStalledMessage(callout),
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+const (
+	// a2aProvisionRetryingConditionType is present, True, while the current
+	// provision Job has failed pods and is still retrying, and absent
+	// otherwise. Informational: it changes neither BusProvisioned, Ready nor
+	// the phase, so a routine retry (an upgrade waiting on the auth callout)
+	// does not flip a Ready install or fail `helm upgrade --wait`.
+	a2aProvisionRetryingConditionType = "A2AProvisionRetrying"
+	a2aProvisionRetryingReason        = "ProvisionJobPodsFailing"
+)
+
+func a2aProvisionRetryingMessage(job, namespace string, failed int32) string {
+	return fmt.Sprintf("A2A provision Job %s has %d failed pod(s) and is retrying; `kubectl logs -n %s job/%s` shows why. If it stops retrying it is reported as A2AProvisionFailed",
+		job, failed, namespace, job)
+}
+
+// a2aProvisionRetryingConditionCurrent and setA2AProvisionRetryingCondition
+// carry a2aProvisionRetryingConditionType on the A2ACalloutRolloutStalled
+// pattern: present while a2aProvisionState.provisionRetrying holds a
+// message, and written by both status writers.
+func a2aProvisionRetryingConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aProvisionRetryingConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == a2aProvisionRetryingReason && existing.Message == msg
+}
+
+func setA2AProvisionRetryingCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aProvisionRetryingConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aProvisionRetryingConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             a2aProvisionRetryingReason,
+		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	})
