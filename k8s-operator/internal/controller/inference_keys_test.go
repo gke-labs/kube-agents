@@ -116,7 +116,10 @@ func litellmGatewayPod(agent *agentv1alpha1.PlatformAgent, name, ip string) *cor
 func platformAgentCRDObject(withField bool) *unstructured.Unstructured {
 	statusProps := map[string]any{"phase": map[string]any{"type": "string"}}
 	if withField {
-		statusProps["inferenceKeys"] = map[string]any{"type": "object"}
+		statusProps["inferenceKeys"] = map[string]any{"type": "object", "properties": map[string]any{
+			"secretUIDs":    map[string]any{"type": "object"},
+			"tierUnboundAt": map[string]any{"type": "object"},
+		}}
 	}
 	crd := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{"versions": []any{map[string]any{
@@ -1417,6 +1420,127 @@ func TestAnOlderCRDWritesNothing(t *testing.T) {
 		t.Error("a Secret at a reserved name was replaced under an older CRD")
 	}
 	assertNoInferenceKeysBut(t, cl, agent, inferenceKeyClassAgent)
+}
+
+// A CRD that serves status.inferenceKeys but not its tierUnboundAt would
+// prune the time a tier's bound runs from: it counts as an older CRD.
+func TestACRDWithoutTierUnboundAtIsOutdated(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(crdGVK)
+	if err := cl.Get(ctx, types.NamespacedName{Name: servedPlatformAgentCRDName}, crd); err != nil {
+		t.Fatal(err)
+	}
+	partial := platformAgentCRDObject(true)
+	versions, _, _ := unstructured.NestedSlice(partial.Object, "spec", "versions")
+	unstructured.RemoveNestedField(versions[0].(map[string]any), "schema", "openAPIV3Schema", "properties", "status", "properties", "inferenceKeys", "properties", "tierUnboundAt")
+	_ = unstructured.SetNestedSlice(partial.Object, versions, "spec", "versions")
+	crd.Object["spec"] = partial.Object["spec"]
+	if err := cl.Update(ctx, crd); err != nil {
+		t.Fatal(err)
+	}
+	if out := r.reconcileInferenceKeys(ctx, agent); out.condition.Reason != inferenceKeysReasonCRDOutdated {
+		t.Errorf("condition %+v, want CRDOutdated for a CRD without tierUnboundAt", out.condition)
+	}
+	assertNoInferenceKeys(t, cl, agent)
+}
+
+// A tier the applied config lists as live, with no profile binding it, keeps
+// its key from the pass it is first found unbound, for at most the drain
+// window from then; a profile binding it again clears that time.
+func TestALiveListedTierKeepsItsKeyOnlyWithinTheWindow(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	unattended := tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret
+	profile := &agentv1alpha1.AgentProfile{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	// The A2A step never rewrites the config: the tier stays listed as live.
+	if err := cl.Create(ctx, appliedDispatchConfigObject(t, agent, a2aDispatchProfile{Name: "auditor",
+		Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}})); err != nil {
+		t.Fatal(err)
+	}
+
+	before := time.Now().Add(-time.Second)
+	r.reconcileInferenceKeys(ctx, agent)
+	if err := cl.Get(ctx, unattended, &corev1.Secret{}); err != nil {
+		t.Fatalf("the tier's key went on its first pass unbound: %v", err)
+	}
+	at, ok := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]
+	if !ok || at.Time.Before(before) {
+		t.Fatalf("tierUnboundAt = %v, want the unattended tier at this pass", agent.Status.InferenceKeys.TierUnboundAt)
+	}
+
+	// Inside the window the time stands and the key stays.
+	r.reconcileInferenceKeys(ctx, agent)
+	if got := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]; !got.Equal(&at) {
+		t.Errorf("tierUnboundAt moved from %v to %v while the tier stayed unbound", at, got)
+	}
+	if err := cl.Get(ctx, unattended, &corev1.Secret{}); err != nil {
+		t.Fatalf("the tier's key went inside the window: %v", err)
+	}
+
+	// Past the window the key goes, though the config still lists the tier.
+	stale := agent.DeepCopy()
+	stale.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended] = metav1.NewTime(time.Now().Add(-a2aDrainingWindow - time.Minute))
+	if err := cl.Status().Update(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcileInferenceKeys(ctx, agent)
+	if err := cl.Get(ctx, unattended, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Errorf("a live-listed tier kept its key past the drain window: %v", err)
+	}
+	// The pass after the deletion forgets the tier.
+	r.reconcileInferenceKeys(ctx, agent)
+	if _, ok := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]; ok {
+		t.Error("tierUnboundAt still names a tier whose key is gone")
+	}
+}
+
+// A tier bound again loses its tierUnboundAt entry, so a later unbinding
+// starts a fresh window.
+func TestARebondTierClearsItsUnboundTime(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	profile := &agentv1alpha1.AgentProfile{}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}
+	if err := cl.Get(ctx, key, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, appliedDispatchConfigObject(t, agent, a2aDispatchProfile{Name: "auditor",
+		Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}})); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcileInferenceKeys(ctx, agent)
+	if _, ok := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]; !ok {
+		t.Fatal("no tierUnboundAt for the unbound tier")
+	}
+	if err := cl.Get(ctx, key, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcileInferenceKeys(ctx, agent)
+	if len(agent.Status.InferenceKeys.TierUnboundAt) != 0 {
+		t.Errorf("tierUnboundAt = %v after the tier was bound again", agent.Status.InferenceKeys.TierUnboundAt)
+	}
 }
 
 // assertNoInferenceKeysBut is assertNoInferenceKeys with one class's Secret

@@ -3116,6 +3116,13 @@ type InferenceKeysStatus struct {
 	// the PlatformAgent's namespace.
 	// +optional
 	SecretUIDs map[string]string `json:"secretUIDs,omitempty"`
+	// TierUnboundAt maps a tier whose key Secret is recorded to when the
+	// operator first found no bound profile listing it. While the applied
+	// dispatch config still lists such a tier as live, its key is kept for at
+	// most the drain window from then. An entry goes when a bound profile
+	// lists the tier again, and on the pass after its key is deleted.
+	// +optional
+	TierUnboundAt map[string]metav1.Time `json:"tierUnboundAt,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was

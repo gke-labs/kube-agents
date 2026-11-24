@@ -12841,6 +12841,17 @@ spec:
                         A tier key's Secret is in the profile namespace; every other one is in
                         the PlatformAgent's namespace.
                       type: object
+                    tierUnboundAt:
+                      additionalProperties:
+                        format: date-time
+                        type: string
+                      description: |-
+                        TierUnboundAt maps a tier whose key Secret is recorded to when the
+                        operator first found no bound profile listing it. While the applied
+                        dispatch config still lists such a tier as live, its key is kept for at
+                        most the drain window from then. An entry goes when a bound profile
+                        lists the tier again, and on the pass after its key is deleted.
+                      type: object
                   type: object
                 lastReconcileTime:
                   description:

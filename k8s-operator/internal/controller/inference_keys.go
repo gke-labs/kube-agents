@@ -421,7 +421,7 @@ func (r *PlatformAgentReconciler) forgetServedCRDAnswer() {
 }
 
 // crdSchemaHasInferenceKeys reports whether crd's schema for version has
-// status.inferenceKeys.
+// status.inferenceKeys, with its tierUnboundAt.
 func crdSchemaHasInferenceKeys(crd *unstructured.Unstructured, version string) bool {
 	versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
 	for _, v := range versions {
@@ -429,7 +429,9 @@ func crdSchemaHasInferenceKeys(crd *unstructured.Unstructured, version string) b
 		if !ok || entry["name"] != version {
 			continue
 		}
-		_, found, _ := unstructured.NestedMap(entry, "schema", "openAPIV3Schema", "properties", "status", "properties", "inferenceKeys")
+		// The record this step writes needs both fields: an older CRD would
+		// prune tierUnboundAt silently and so lift the bound on kept tiers.
+		_, found, _ := unstructured.NestedMap(entry, "schema", "openAPIV3Schema", "properties", "status", "properties", "inferenceKeys", "properties", "tierUnboundAt")
 		return found
 	}
 	return false
@@ -480,6 +482,62 @@ func (r *PlatformAgentReconciler) updateSecretUIDs(ctx context.Context, agent *a
 	agent.Status.InferenceKeys = written.Status.InferenceKeys
 	agent.ResourceVersion = written.ResourceVersion
 	return nil
+}
+
+// tierUnboundAt is, for each tier with a recorded key that no bound profile
+// lists, when the operator first found it unbound: the stored time, or now
+// for a tier newly unbound. A bound tier, or one whose key is gone, has no
+// entry. The map is written back to status.inferenceKeys.tierUnboundAt only
+// when it changed. A failed write is logged and the answer still used, so a
+// tier's first pass unbound always keeps its key; the time restarts on the
+// next pass that writes.
+func (r *PlatformAgentReconciler) tierUnboundAt(ctx context.Context, agent *agentv1alpha1.PlatformAgent, haveKey, bound []string) map[string]time.Time {
+	var stored map[string]metav1.Time
+	if agent.Status.InferenceKeys != nil {
+		stored = agent.Status.InferenceKeys.TierUnboundAt
+	}
+	now := metav1.NewTime(time.Now().UTC().Truncate(time.Second))
+	next := map[string]metav1.Time{}
+	out := map[string]time.Time{}
+	for _, tier := range haveKey {
+		if slices.Contains(bound, tier) {
+			continue
+		}
+		at, ok := stored[tier]
+		if !ok {
+			at = now
+		}
+		next[tier] = at
+		out[tier] = at.Time
+	}
+	if len(next) == len(stored) {
+		same := true
+		for tier, at := range next {
+			if prev, ok := stored[tier]; !ok || !prev.Equal(&at) {
+				same = false
+				break
+			}
+		}
+		if same {
+			return out
+		}
+	}
+	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	written := agent.DeepCopy()
+	if written.Status.InferenceKeys == nil {
+		written.Status.InferenceKeys = &agentv1alpha1.InferenceKeysStatus{}
+	}
+	written.Status.InferenceKeys.TierUnboundAt = next
+	if len(next) == 0 {
+		written.Status.InferenceKeys.TierUnboundAt = nil
+	}
+	if err := r.Status().Patch(ctx, written, patch); err != nil {
+		logf.FromContext(ctx).Info("could not record when inference gateway key tiers became unbound; the next pass tries again", "failure", apiFailure(err))
+		return out
+	}
+	agent.Status.InferenceKeys = written.Status.InferenceKeys
+	agent.ResourceVersion = written.ResourceVersion
+	return out
 }
 
 // createRecorded creates secret and records its UID. When the record can't
@@ -550,31 +608,30 @@ func tiersInUse(profiles []agentv1alpha1.AgentProfile, draining []string) []stri
 // PlatformAgent counts, a drain whose end has passed or lies beyond
 // a2aDrainingWindow from now keeps nothing, and the caller keeps only tiers
 // that already have a recorded key, so nothing in it mints a key.
-func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
+func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (liveListed, draining []string, err error) {
 	cm := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	if ref := metav1.GetControllerOf(cm); ref == nil || ref.UID != agent.UID {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var applied a2aDispatchConfig
 	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
 		// dispatchDraining reports an undecodable config; it drains nothing
 		// there either.
-		return nil, nil
+		return nil, nil, nil
 	}
 	now := time.Now()
-	draining := func(until time.Time) bool {
+	inWindow := func(until time.Time) bool {
 		return now.Before(until) && !until.After(now.Add(a2aDrainingWindow))
 	}
-	var out []string
-	keep := func(tier string) {
+	keep := func(out *[]string, tier string) {
 		if isDNS1123LabelToken(tier) {
-			out = append(out, tier)
+			*out = append(*out, tier)
 		}
 	}
 	for _, p := range applied.Profiles {
@@ -585,18 +642,23 @@ func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context,
 		// still lists it as live, with no drain written yet, and its tasks
 		// are still running. A zero end is the drain about to start, as
 		// drainingDispatchProfiles reads it.
-		if p.DrainingUntil.IsZero() || draining(p.DrainingUntil) {
+		switch {
+		case p.DrainingUntil.IsZero():
 			for _, tier := range p.Tiers {
-				keep(tier)
+				keep(&liveListed, tier)
+			}
+		case inWindow(p.DrainingUntil):
+			for _, tier := range p.Tiers {
+				keep(&draining, tier)
 			}
 		}
 		for _, d := range p.DrainingTiers {
-			if draining(d.Until) {
-				keep(d.Tier)
+			if inWindow(d.Until) {
+				keep(&draining, d.Tier)
 			}
 		}
 	}
-	return out, nil
+	return liveListed, draining, nil
 }
 
 // inferenceKeysCondition is a condition of the type this file writes.
@@ -736,12 +798,23 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		if err != nil {
 			return notWritten("the profile namespace could not be read: "+apiFailure(err), true)
 		}
-		draining, err := r.drainingInferenceKeyTiers(ctx, agent)
+		liveListed, draining, err := r.drainingInferenceKeyTiers(ctx, agent)
 		if err != nil {
 			return notWritten("the applied dispatch config could not be read for the draining tiers: "+apiFailure(err), true)
 		}
-		// A draining tier only keeps a key it already has.
+		// A draining tier only keeps a key it already has. A tier the config
+		// lists as live without any profile binding it is one whose drain
+		// hasn't been written yet: it keeps its key for at most the drain
+		// window from when it was first found unbound, so a config that is
+		// never rewritten can't keep a key indefinitely.
 		haveKey := recordedTiers(agent, recorded)
+		unboundAt := r.tierUnboundAt(ctx, agent, haveKey, tiersInUse(profiles, nil))
+		now := time.Now()
+		for _, tier := range liveListed {
+			if at, ok := unboundAt[tier]; !ok || now.Sub(at) <= a2aDrainingWindow {
+				draining = append(draining, tier)
+			}
+		}
 		draining = slices.DeleteFunc(draining, func(tier string) bool { return !slices.Contains(haveKey, tier) })
 		tiers, tiersKnown, profileNamespaceReady = nil, true, ready
 		if ready {
