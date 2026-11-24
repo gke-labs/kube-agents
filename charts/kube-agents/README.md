@@ -1360,9 +1360,9 @@ own identity while the release record says armed, so the chart looks the CRD
 up and fails the render until `kubectl apply --server-side -f
 charts/kube-agents/crds/` has run. The schema refuses the retired per-cluster
 key `platformAgent.security.scopedServiceAccounts` by name, empty or
-populated. A release record that has had no full upgrade since the pool moved
-to projects still carries that key, so a harness- or operator-mode retag from
-such a record is refused: run `--upgrade-mode=full` once, and `install.env`
+populated. A release record whose last install or full upgrade ran at 0.4.0
+to 0.8.0, before the pool moved to projects, still carries that key, so a
+harness- or operator-mode retag from such a record is refused: run `--upgrade-mode=full` once, and `install.env`
 renders the new block. `upgrade.sh --drop-undeclared-values` drops the key
 instead, and with it a populated list, which was a pool armed under the old
 per-cluster field; the pool then stays off until a full upgrade arms the new
