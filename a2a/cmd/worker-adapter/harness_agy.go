@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/antigravity"
 )
@@ -93,6 +94,21 @@ func agyGrant(spec harnessSpec) antigravity.Grant {
 	return g
 }
 
+// The Claude Code tool names agyPolicy maps, as the session allowlist spells
+// them (defaultAllowedTools, clusterViewAllowedTools).
+var (
+	claudeReadTools = []string{"Read", "Glob", "Grep", "LS"}
+)
+
+const (
+	claudeWriteTool     = "Write"
+	claudeWebSearchTool = "WebSearch"
+	claudeTodoWriteTool = "TodoWrite"
+	claudeBashTool      = "Bash"
+	// claudePrefixSuffix ends a scoped Bash grant: Bash(<prefix>:*).
+	claudePrefixSuffix = ":*)"
+)
+
 // agyPolicy reads a Claude Code --allowedTools/--disallowedTools pair as a
 // harness-neutral grant. A name the disallowed list carries grants nothing,
 // as in Claude Code. TodoWrite has no agy equivalent and is dropped (agy's
@@ -116,16 +132,16 @@ func agyPolicy(allowed, disallowed string) (antigravity.Policy, error) {
 			continue
 		}
 		switch {
-		case !scoped && slices.Contains([]string{"Read", "Glob", "Grep", "LS"}, t):
+		case !scoped && slices.Contains(claudeReadTools, t):
 			p.ReadFiles = true
-		case t == "Write":
+		case t == claudeWriteTool:
 			p.WriteFiles = true
-		case t == "WebSearch":
+		case t == claudeWebSearchTool:
 			p.WebSearch = true
-		case t == "TodoWrite", t == delegateToolID:
-		case base == "Bash" && scoped && strings.HasSuffix(arg, ":*)"):
-			p.ShellPrefixes = append(p.ShellPrefixes, strings.TrimSuffix(arg, ":*)"))
-		case t == "Bash":
+		case t == claudeTodoWriteTool, t == delegateToolID:
+		case base == claudeBashTool && scoped && strings.HasSuffix(arg, claudePrefixSuffix):
+			p.ShellPrefixes = append(p.ShellPrefixes, strings.TrimSuffix(arg, claudePrefixSuffix))
+		case t == claudeBashTool:
 			return antigravity.Policy{}, fmt.Errorf("an unrestricted Bash has no agy grant yet")
 		default:
 			return antigravity.Policy{}, fmt.Errorf("tool %q has no agy grant", t)
@@ -134,15 +150,33 @@ func agyPolicy(allowed, disallowed string) (antigravity.Policy, error) {
 	return p, nil
 }
 
-// splitTools is a comma-separated tool list's entries, trimmed, empties
-// dropped.
+// splitTools is a tool list's entries, separated as the harness takes them
+// (allowsBash): by commas or whitespace, except inside a scoped entry's
+// parentheses, where a space belongs to the argument (Bash(gh pr list:*)).
+// Empty entries are dropped.
 func splitTools(list string) []string {
 	var out []string
-	for _, t := range strings.Split(list, ",") {
-		if t = strings.TrimSpace(t); t != "" {
+	var cur strings.Builder
+	depth := 0
+	flush := func() {
+		if t := cur.String(); t != "" {
 			out = append(out, t)
 		}
+		cur.Reset()
 	}
+	for _, r := range list {
+		switch {
+		case r == '(':
+			depth++
+		case r == ')' && depth > 0:
+			depth--
+		case depth == 0 && (r == ',' || unicode.IsSpace(r)):
+			flush()
+			continue
+		}
+		cur.WriteRune(r)
+	}
+	flush()
 	return out
 }
 
