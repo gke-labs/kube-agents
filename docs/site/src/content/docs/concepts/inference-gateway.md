@@ -126,17 +126,17 @@ The gateway checks the key each caller sends. The chart runs LiteLLM with a mast
 
 An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
 
-`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart. While the Secret is absent the gateway knows no caller key and every caller is `keyless`. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
+`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart. While the Secret is absent the gateway knows no caller key: a call with no key or a placeholder is still admitted as `keyless`, and a caller that sends its class's key is refused until the operator writes the map again on its next pass. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
 
 ### Which key each caller sends
 
 The operator mints one key per caller class and gives a class's callers its key once the gateway serves it. When a pass finds `InferenceKeysServed` `True`, the operator marks each class's key Secret, and from the next pass it renders that class's callers with a reference to the Secret:
 
-| Caller                                                                     | Class         | How it sends the key                                                                                                       |
-| -------------------------------------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| The agent pod's `platform-agent` container and its `hermes-bridge` sidecar | `agent`       | Env `LITELLM_API_KEY` from `<agent>-inference-key-agent`. The managed config's `model.api_key` reads `${LITELLM_API_KEY}`. |
-| The curator                                                                | `curator`     | Env `LITELLM_API_KEY` from `<agent>-inference-key-curator`.                                                                |
-| AgentProfile workers: warm pools, Jobs and scheduled runs                  | `tier-<tier>` | Env `ANTHROPIC_API_KEY` from `<agent>-inference-key-tier-<tier>` in the profile namespace. `ANTHROPIC_BASE_URL` stays set. |
+| Caller                                                                                          | Class         | How it sends the key                                                                                                       |
+| ----------------------------------------------------------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| The agent pod's `platform-agent` container and the `hermes-bridge` sidecar the operator renders | `agent`       | Env `LITELLM_API_KEY` from `<agent>-inference-key-agent`. The managed config's `model.api_key` reads `${LITELLM_API_KEY}`. |
+| The curator                                                                                     | `curator`     | Env `LITELLM_API_KEY` from `<agent>-inference-key-curator`.                                                                |
+| AgentProfile workers: warm pools, Jobs and scheduled runs                                       | `tier-<tier>` | Env `ANTHROPIC_API_KEY` from `<agent>-inference-key-tier-<tier>` in the profile namespace. `ANTHROPIC_BASE_URL` stays set. |
 
 A2A session pods, the shell sandbox, Hindsight and the web console send no key and are admitted as `keyless`.
 
