@@ -22,8 +22,8 @@ The recommendation in short:
 - Give a verb to each profile only when the model's work in a profile calls it. Three reads that
   only scripts call get no grant here.
 - Writes wait for the unattended write permit.
-- Four other designs own parts of this work: the unattended write permit, the hooks, the dial and
-  post-merge state, and reads with no cluster.
+- Four other designs own parts of this work: the unattended write permit, the hooks, the state
+  homes (with the dial and post-merge state), and reads with no cluster.
 - [What Stays Out](#what-stays-out) lists five things that get no grant.
 
 ## What a Profile Reaches Today
@@ -62,8 +62,9 @@ pod, such as `gitops_preflight.py`, needs a change of the script and no new gran
    mutation in `hack/conformance-mutations.py` that removes the hold and must go red.
 4. **A read is still a grant.** A read verb reads each managed repository, not only the one of the
    task. That is true for the eight reads of today, and it stays true for a new read.
-5. **A write needs a permit and an ownership rule.** The import check keeps this true. This
-   document does not relax it.
+5. **A write of a version-control verb needs a permit and an ownership rule.** The import check
+   keeps this true. This document does not relax it. The report and findings routes have their own
+   write rule, which the state homes design owns.
 
 ## Options
 
@@ -90,7 +91,7 @@ issue writes, `label-ensure`, `proposal-comment`, `proposal-close`, `proposal-ac
 
 | Verb                | Work today                                                                                         | Who gets it  | Proposal                                                                                                                                                                                                                                                                                                                                                   | Check that changes                                                                                                                             |
 | ------------------- | -------------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `proposal-reviews`  | The post-merge check reads change requests                                                         | None         | No grant in this document. The caller is a script with no model, and `vcs.py` has no command for the verb. Option D: the work stays with the script run. Decide again with the dial and post-merge state design                                                                                                                                            | None                                                                                                                                           |
+| `proposal-reviews`  | The post-merge check reads change requests                                                         | None         | No grant in this document. The caller is a script with no model, and `vcs.py` has no command for the verb. Option D: the work stays with the script run. The state homes design (`platform-as-profile-state-homes.md`) decides who runs the post-merge work, and this document adds the verb row when that decision is made                                | None                                                                                                                                           |
 | `revision-contains` | The post-merge check asks if a revision contains a commit                                          | None         | Same                                                                                                                                                                                                                                                                                                                                                       | None                                                                                                                                           |
 | `proposal-closer`   | The decision-memory sweep reads who closed a proposal                                              | None         | No grant in this document, for the same reason. Decide with the move of the watcher script                                                                                                                                                                                                                                                                 | None                                                                                                                                           |
 | `capabilities`      | `submit-suggestion` reads the install's write mode before a publish                                | Each profile | Grant only with a new hold: for the profile role the broker's dispatch (`_dispatch_vcs_post`) resolves the repository and asks the managed list, as for each other verb. Open question 1                                                                                                                                                                   | The import check; the row that holds the exact verb set; a new row: a profile's `capabilities` for a repository that is not managed is refused |
@@ -126,7 +127,7 @@ verb set, and the two gated sets that the import check reads.
 | `proposal-comment`                             | Replies on a proposal; the post-merge follow-ups                                                                                             | None until open question 6       | The ownership bar: the install's own proposal (`is_agent_pull_request`). The task bar passes only a proposal of the same task, so a reply or a follow-up in a later run needs what open question 6 decides                                                                                                                                                                                 | After the issue verbs |
 | `proposal-close`, `proposal-acknowledge`       | The audit closes a stale proposal; a reply marks a review as seen                                                                            | None until open question 6       | Same                                                                                                                                                                                                                                                                                                                                                                                       | After the issue verbs |
 | `branch-delete`                                | `submit-suggestion` uses a branch name again; the audit and the auto-merge switch delete a spent branch                                      | None until open question 6       | The broker's rule of today: under the install's branch prefix, and the proposal is done. A spent branch is from an earlier run, so the task bar cannot hold it                                                                                                                                                                                                                             | After the issue verbs |
-| `proposal-practice-label`                      | The audit labels an auto-merge candidate                                                                                                     | None                             | No grant in this document. It belongs to the dial and auto-merge state                                                                                                                                                                                                                                                                                                                     | With the dial design  |
+| `proposal-practice-label`                      | The audit labels an auto-merge candidate                                                                                                     | None                             | No grant in this document. The state homes design decides the dial and auto-merge state, and this document adds the verb row when that decision is made                                                                                                                                                                                                                                    | After that decision   |
 
 ## Routes
 
@@ -203,7 +204,7 @@ question 12.
 5. The proposal verbs and `branch-delete`, after open question 6.
 
 The work goes one pull request at a time on `credential_proxy.py`. The tests-only change, the
-permit gate and the findings route take turns in the same queue.
+permit gate and the findings route of the state homes design take turns in the same queue.
 
 ## Done When
 
