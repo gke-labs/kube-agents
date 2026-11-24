@@ -180,6 +180,8 @@ Some skill use is not counted:
 - A run counts when it ends. `outcome` is `succeeded`, `failed`, or `lost` for a run whose process went away before it recorded an end.
 - A slot that did not run counts as a skip. `reason` is the ledger's reason, such as `missed_window` or `already_running`.
 - A job id or a reason that is not shaped like one counts under `other`. So does a new job once 200 are held.
+- A job's three outcomes are served from `0` as soon as the job has a run in its ledger, so a rate sees the first failure after a restart. A skip reason has a series once the job has been skipped for it.
+- A run that is lost because the gateway itself restarts is counted only when the ledger records the loss after the listener has started.
 
 The operator serves the matching pair for an [`AgentSchedule`](/kube-agents/operator/agentschedule-crd/): `kubeagents_schedule_runs_total` and `kubeagents_schedule_skips_total`. Those name the schedule in a `schedule` label. The cron series use three of that counter's outcome words.
 

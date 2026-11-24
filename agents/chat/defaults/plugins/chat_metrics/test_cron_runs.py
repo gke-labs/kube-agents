@@ -77,11 +77,20 @@ class _VolumeTest(unittest.TestCase):
         with sqlite3.connect(self.ledger(profile)) as conn:
             conn.execute("UPDATE executions SET status = ? WHERE id = ?", (status, execution_id))
 
+    @staticmethod
+    def counted(series):
+        """The series that have counted something: a series is served from zero, which most tests do not care about."""
+        return {key: value for key, value in series.items() if value}
+
     def runs(self):
-        return self.counter.counts()[0]
+        return self.counted(self.counter.counts()[0])
 
     def skips(self):
-        return self.counter.counts()[1]
+        return self.counted(self.counter.counts()[1])
+
+    def both(self, counter=None):
+        runs, skips = (counter or self.counter).counts()
+        return self.counted(runs), self.counted(skips)
 
 
 class LabelTest(unittest.TestCase):
@@ -113,8 +122,14 @@ class LabelTest(unittest.TestCase):
                 self.assertEqual(reason, cron.reason_label(reason))
         self.assertEqual(patch.SKIP_REASON_UNSPECIFIED, cron.REASON_UNSPECIFIED)
 
-    def test_the_ledger_statuses_map_to_the_schedule_counters_outcomes(self):
-        self.assertEqual({"completed": "succeeded", "failed": "failed", "unknown": "lost"}, cron.RUN_OUTCOMES)
+    def test_each_run_outcome_is_one_of_the_schedule_counters_words(self):
+        """The operator's AgentSchedule outcomes, read from its source: the cron family uses a subset of them."""
+        source = (REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "agentschedule_types.go").read_text(encoding="utf-8")
+        operator = {word.lower() for word in re.findall(r'AgentScheduleOutcome\w+\s*=\s*"(\w+)"', source)}
+        self.assertGreaterEqual(len(operator), 3, operator)
+        self.assertEqual({"completed", "failed", "unknown"}, set(cron.RUN_OUTCOMES))
+        self.assertLessEqual(set(cron.RUN_OUTCOMES.values()), operator)
+        self.assertEqual(len(cron.RUN_OUTCOMES), len(set(cron.RUN_OUTCOMES.values())))
 
 
 class CounterTest(_VolumeTest):
@@ -122,8 +137,8 @@ class CounterTest(_VolumeTest):
         self.add("compliance-audit", "completed", 1, profile="platform")
         self.add("compliance-audit", "failed", 2, profile="platform")
         self.add("profile-cron-tick", "skipped", 3, reason="missed_window")
-        self.assertEqual(({}, {}), self.counter.counts())
-        self.assertEqual(({}, {}), self.counter.counts())
+        self.assertEqual(({}, {}), self.both())
+        self.assertEqual(({}, {}), self.both())
 
     def test_runs_that_end_after_the_baseline_count_by_job_and_outcome(self):
         self.add("compliance-audit", "completed", 1, profile="platform")
@@ -216,10 +231,10 @@ class CounterTest(_VolumeTest):
 
     def test_a_volume_with_no_ledger_reads_as_nothing(self):
         with self.assertNoLogs(cron.logger, level="WARNING"):
-            self.assertEqual(({}, {}), self.counter.counts())
+            self.assertEqual(({}, {}), self.both())
         (self.root / "profiles" / "platform").mkdir(parents=True)
         with self.assertNoLogs(cron.logger, level="WARNING"):
-            self.assertEqual(({}, {}), self.counter.counts())
+            self.assertEqual(({}, {}), self.both())
 
     def test_the_same_job_in_two_profiles_adds_up(self):
         self.counter.counts()
@@ -249,7 +264,7 @@ class FailureTest(_VolumeTest):
         with sqlite3.connect(other) as conn:
             conn.execute("CREATE TABLE executions (id TEXT)")
         with self.assertLogs(cron.logger, level="WARNING"):
-            self.assertEqual(({}, {}), self.counter.counts())
+            self.assertEqual(({}, {}), self.both())
 
     def test_no_failure_of_a_read_reaches_the_caller(self):
         self.counter.counts()
@@ -257,9 +272,9 @@ class FailureTest(_VolumeTest):
         for error in (RuntimeError("bug"), sqlite3.OperationalError("locked"), MemoryError(), OSError("EIO")):
             with self.subTest(error=type(error).__name__):
                 with mock.patch.object(self.counter, "_read_ledger", side_effect=error):
-                    self.assertEqual(({}, {}), self.counter.counts())
+                    self.assertEqual(({}, {}), self.both())
                 with mock.patch.object(cron, "ledger_files", side_effect=error):
-                    self.assertEqual(({}, {}), self.counter.counts())
+                    self.assertEqual(({}, {}), self.both())
         self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
 
     def test_a_locked_ledger_keeps_the_last_counts_and_is_read_when_it_frees(self):
@@ -276,8 +291,8 @@ class FailureTest(_VolumeTest):
         self.add("stall-watch", "completed", 1, profile="platform")
         with mock.patch.object(self.counter, "_rows", side_effect=sqlite3.OperationalError("database is locked")):
             with self.assertLogs(cron.logger, level="WARNING"):
-                self.assertEqual(({}, {}), self.counter.counts())
-        self.assertEqual(({}, {}), self.counter.counts())
+                self.assertEqual(({}, {}), self.both())
+        self.assertEqual(({}, {}), self.both())
         self.add("stall-watch", "completed", 10, profile="platform")
         self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
 
@@ -286,8 +301,8 @@ class FailureTest(_VolumeTest):
         self.add("profile-cron-tick", "completed", 1)
         with mock.patch.object(cron, "profile_homes", side_effect=OSError("EIO")):
             with self.assertLogs(cron.logger, level="WARNING"):
-                self.assertEqual(({}, {}), self.counter.counts())
-        self.assertEqual(({}, {}), self.counter.counts())
+                self.assertEqual(({}, {}), self.both())
+        self.assertEqual(({}, {}), self.both())
         self.add("stall-watch", "completed", 10, profile="platform")
         self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
 
@@ -314,6 +329,80 @@ class FailureTest(_VolumeTest):
         self.assertEqual({("other", "succeeded"): 2}, self.runs())
         self.assertEqual({("stall-watch", "other"): 2}, self.skips())
         self.assertEqual({("other", "succeeded"): 2}, self.runs())
+
+
+class ZeroTest(_VolumeTest):
+    """A series is served from zero, so a rate sees its first count."""
+
+    def test_a_job_met_at_the_baseline_has_its_three_outcomes_at_zero(self):
+        self.add("compliance-audit", "completed", 1, profile="platform")
+        self.add("stall-watch", "running", 2, profile="platform")
+        runs, skips = self.counter.counts()
+        self.assertEqual(
+            {(job, outcome): 0 for job in ("compliance-audit", "stall-watch") for outcome in ("succeeded", "failed", "lost")},
+            runs,
+        )
+        self.assertEqual({}, skips)
+
+    def test_the_first_failure_after_the_baseline_moves_a_series_that_was_at_zero(self):
+        self.add("compliance-audit", "completed", 1, profile="platform")
+        before = self.counter.counts()[0]
+        self.assertEqual(0, before[("compliance-audit", "failed")])
+        self.add("compliance-audit", "failed", 10, profile="platform")
+        self.assertEqual(1, self.counter.counts()[0][("compliance-audit", "failed")])
+
+    def test_a_skip_met_at_the_baseline_has_its_series_at_zero(self):
+        self.add("stall-watch", "skipped", 1, profile="platform", reason="missed_window")
+        runs, skips = self.counter.counts()
+        self.assertEqual({("stall-watch", "missed_window"): 0}, skips)
+        self.assertEqual(0, runs[("stall-watch", "failed")])
+        self.add("stall-watch", "skipped", 10, profile="platform", reason="missed_window")
+        self.assertEqual({("stall-watch", "missed_window"): 1}, self.counter.counts()[1])
+
+    def test_a_job_first_met_after_the_baseline_starts_from_zero_too(self):
+        self.counter.counts()
+        self.add("leeway-watch", "claimed", 10, profile="platform")
+        runs = self.counter.counts()[0]
+        self.assertEqual({("leeway-watch", "succeeded"): 0, ("leeway-watch", "failed"): 0, ("leeway-watch", "lost"): 0}, runs)
+
+
+class ValueBoundTest(_VolumeTest):
+    def test_an_oversized_value_is_not_loaded_whole(self):
+        self.counter.counts()
+        huge = "j" * 2_000_000
+        self.add(huge, "completed", 10, profile="platform")
+        self.add("stall-watch", "skipped", 11, profile="platform", reason="r" * 2_000_000)
+        rows = self.counter._rows(self.ledger("platform"), 0)[1]
+        self.assertLessEqual(max(len(str(value)) for row in rows for value in row), cron.JOB_ID_MAX_LENGTH + 1)
+        self.assertEqual({("other", "succeeded"): 1}, self.runs())
+        self.assertEqual({("stall-watch", "other"): 1}, self.skips())
+
+    def test_a_value_one_character_too_long_still_reads_as_too_long(self):
+        self.counter.counts()
+        self.add("j" * (cron.JOB_ID_MAX_LENGTH + 1), "completed", 10)
+        self.add("j" * cron.JOB_ID_MAX_LENGTH, "completed", 11)
+        self.assertEqual({("other", "succeeded"): 1, ("j" * cron.JOB_ID_MAX_LENGTH, "succeeded"): 1}, self.runs())
+
+
+class RemovedProfileTest(_VolumeTest):
+    def test_a_profile_removed_and_made_again_counts_its_new_runs(self):
+        self.counter.counts()
+        for minute in (10, 11, 12):
+            self.add("stall-watch", "completed", minute, profile="cluster-a")
+        self.assertEqual({("stall-watch", "succeeded"): 3}, self.runs())
+        shutil.rmtree(self.root / "profiles" / "cluster-a")
+        self.assertEqual({("stall-watch", "succeeded"): 3}, self.runs())
+        for minute in (20, 21, 22):
+            self.add("sa-role-watch", "completed", minute, profile="cluster-a")
+        self.assertEqual({("stall-watch", "succeeded"): 3, ("sa-role-watch", "succeeded"): 3}, self.runs())
+
+    def test_a_ledger_missing_while_its_profile_stays_keeps_its_place(self):
+        self.counter.counts()
+        self.add("stall-watch", "completed", 10, profile="platform")
+        self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
+        with mock.patch.object(Path, "is_file", return_value=False):
+            self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
+        self.assertEqual({("stall-watch", "succeeded"): 1}, self.runs())
 
 
 class OrderTest(_VolumeTest):
@@ -366,7 +455,7 @@ class OrderTest(_VolumeTest):
         self.add("sa-role-watch", "completed", 11, profile="platform")
         for _ in range(6):
             counter.counts()
-        self.assertEqual({("stall-watch", "succeeded"): 7, ("sa-role-watch", "succeeded"): 1}, counter.counts()[0])
+        self.assertEqual({("stall-watch", "succeeded"): 7, ("sa-role-watch", "succeeded"): 1}, self.counted(counter.counts()[0]))
 
     def test_a_rebuilt_table_takes_a_new_baseline_and_counts_what_follows(self):
         self.counter.counts()
@@ -417,7 +506,7 @@ class BoundTest(_VolumeTest):
         for minute, job in enumerate(("one", "two", "three", "one", "four"), start=10):
             self.add(job, "completed", minute)
         self.add("five", "skipped", 20, reason="missed_window")
-        runs, skips = counter.counts()
+        runs, skips = self.both(counter)
         self.assertEqual({("one", "succeeded"): 2, ("two", "succeeded"): 1, ("other", "succeeded"): 2}, runs)
         self.assertEqual({("other", "missed_window"): 1}, skips)
 
@@ -427,14 +516,14 @@ class BoundTest(_VolumeTest):
         self.add("stall-watch", "skipped", 10, reason="missed_window")
         self.add("stall-watch", "skipped", 11, reason="already_running")
         self.add("stall-watch", "skipped", 12, reason="missed_window")
-        self.assertEqual({("stall-watch", "missed_window"): 2, ("stall-watch", "other"): 1}, counter.counts()[1])
+        self.assertEqual({("stall-watch", "missed_window"): 2, ("stall-watch", "other"): 1}, self.counted(counter.counts()[1]))
 
     def test_a_read_cut_at_the_row_limit_carries_on_at_the_next_read(self):
         counter = cron.CronRunsCounter(root=lambda: self.root, max_rows=3)
         counter.counts()
         for minute in range(10, 18):
             self.add("stall-watch", "completed", minute)
-        seen = [sum(counter.counts()[0].values()) for _ in range(6)]
+        seen = [sum(counter.counts()[0].values()) for _ in range(6)]  # zeros add nothing
         self.assertEqual(8, seen[-1])
         self.assertEqual(sorted(seen), seen)
         self.assertLess(seen[0], 8)
@@ -444,9 +533,9 @@ class BoundTest(_VolumeTest):
             self.add("stall-watch", "completed", minute)
         counter = cron.CronRunsCounter(root=lambda: self.root, max_rows=3)
         for _ in range(6):
-            self.assertEqual(({}, {}), counter.counts())
+            self.assertEqual(({}, {}), self.both(counter))
         self.add("stall-watch", "completed", 20)
-        self.assertEqual({("stall-watch", "succeeded"): 1}, counter.counts()[0])
+        self.assertEqual({("stall-watch", "succeeded"): 1}, self.counted(counter.counts()[0]))
 
     def test_the_skip_ledger_patch_is_where_the_comments_say(self):
         self.assertTrue(SKIP_LEDGER_PATCH.is_file(), SKIP_LEDGER_PATCH)
@@ -459,7 +548,7 @@ class BoundTest(_VolumeTest):
             self.add("stall-watch", "completed", minute)
         for _ in range(8):
             counter.counts()
-        self.assertEqual({("stall-watch", "succeeded"): 8}, counter.counts()[0])
+        self.assertEqual({("stall-watch", "succeeded"): 8}, self.counted(counter.counts()[0]))
 
 
 class RenderTest(_VolumeTest):
@@ -483,7 +572,10 @@ class RenderTest(_VolumeTest):
         self.add("stall-watch", "failed", 10, profile="platform")
         self.add("stall-watch", "skipped", 11, profile="platform", reason="missed_window")
         text = registry.render()
-        self.assertEqual([("stall-watch", "failed", "1")], _RUN_LINE.findall(text))
+        self.assertEqual(
+            [("stall-watch", "failed", "1"), ("stall-watch", "lost", "0"), ("stall-watch", "succeeded", "0")],
+            _RUN_LINE.findall(text),
+        )
         self.assertEqual([("stall-watch", "missed_window", "1")], _SKIP_LINE.findall(text))
 
     def test_series_render_sorted_and_two_scrapes_agree(self):
@@ -494,7 +586,14 @@ class RenderTest(_VolumeTest):
         self.add("compliance-audit", "completed", 12)
         text = registry.render()
         self.assertEqual(
-            [("compliance-audit", "failed", "1"), ("compliance-audit", "succeeded", "1"), ("stall-watch", "succeeded", "1")],
+            [
+                ("compliance-audit", "failed", "1"),
+                ("compliance-audit", "lost", "0"),
+                ("compliance-audit", "succeeded", "1"),
+                ("stall-watch", "failed", "0"),
+                ("stall-watch", "lost", "0"),
+                ("stall-watch", "succeeded", "1"),
+            ],
             _RUN_LINE.findall(text),
         )
         self.assertEqual(text, registry.render())

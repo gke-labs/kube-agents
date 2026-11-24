@@ -25,6 +25,13 @@ none is counted twice. Rows terminal at the first read are a baseline and
 count nothing; a run in flight then counts when it ends. So both families
 start at zero in each process, like the other counters here.
 
+A series is served from zero. Each job met in a ledger, at the baseline too,
+gets its three run outcomes at 0, and each (job, reason) met among the skipped
+rows gets a 0, before anything is added: a rate over a counter cannot see a
+series whose first sample is already 1, and the first failed run of a job
+after a restart is the one an alert is for. A reason a job has never been
+skipped for has no series until its first skip.
+
 The order followed is the table's own, its rowid, not ``claimed_at``. Hermes
 writes that timestamp in the profile's time zone and takes it before it has
 the write lock, so its text is in time order only at one fixed offset and a
@@ -43,7 +50,8 @@ once ``MAX_JOB_SERIES`` are held, counts under ``other``; so does a reason
 that is not shaped like one, or a new one past ``MAX_REASON_SERIES``. The
 ledger sits on a volume every process of the agent can write, so its rows are
 data from an untrusted writer: a read takes at most ``MAX_ROWS_PER_READ`` rows
-and carries on after the last one, and a read never raises into the scrape.
+and carries on after the last one, takes no more of a value than a label can
+be long, and never raises into the scrape.
 A read that fills that limit moves the mark past its last row even when a run
 before it is still in flight, whose end is then not counted: the alternative
 is a ledger whose newer rows are never reached.
@@ -59,7 +67,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import quote
 
-from chat_metrics.volume import hermes_root, profile_homes
+from chat_metrics.volume import hermes_root, home_gone, profile_homes
 
 logger = logging.getLogger("hermes.plugin.chat_metrics")
 
@@ -108,10 +116,19 @@ LEDGER_BUSY_TIMEOUT_SECONDS = 1.0
 # rows a job, so a healthy read is far under this; a larger table is read over
 # several scrapes.
 MAX_ROWS_PER_READ = 20_000
+# The longest status the ledger's CHECK allows is nine characters.
+STATUS_MAX_LENGTH = 16
 # Rows from the low-water mark on, in the table's own order, so a read cut at
-# the limit carries on after its last row.
-_ROWS_SQL = "SELECT rowid, job_id, status, skip_reason FROM executions WHERE rowid >= ? ORDER BY rowid LIMIT ?"
+# the limit carries on after its last row. Each value is cut in SQL to one
+# character more than its label may be long, so an oversized one still reads
+# as too long and is never loaded whole.
+_ROWS_SQL = (
+    f"SELECT rowid, substr(job_id, 1, {JOB_ID_MAX_LENGTH + 1}), substr(status, 1, {STATUS_MAX_LENGTH}), "
+    f"substr(skip_reason, 1, {REASON_MAX_LENGTH + 1}) FROM executions WHERE rowid >= ? ORDER BY rowid LIMIT ?"
+)
 _NEWEST_SQL = "SELECT max(rowid) FROM executions"
+# Both statements of a read run in one transaction, so they see one snapshot.
+_BEGIN_SQL = "BEGIN"
 # SQLite's URI form of a path, opened read-only: the listener never writes a ledger.
 _READ_ONLY_URI = "file:{path}?mode=ro"
 # Before any row has been seen: every rowid is at or after it.
@@ -169,7 +186,8 @@ class CronRunsCounter:
     one that could not be read at the baseline takes its baseline when it
     first can be, and so does every ledger while the profiles directory has
     not yet been listed. A ledger that cannot be read keeps its mark and is
-    tried again at the next read; the failure is logged once per streak.
+    tried again at the next read; the failure is logged once per streak. A
+    ledger whose profile is removed is forgotten.
     :meth:`counts` does not raise.
     """
 
@@ -205,14 +223,22 @@ class CronRunsCounter:
         held.add(label)
         return label
 
-    def _count(self, job_id: Any, status: str, reason: Any) -> None:
+    def _job(self, job_id: Any) -> str:
+        """The label for ``job_id``, with its three run outcomes served from zero the first time it is met."""
         job = self._bounded(job_label(job_id), self._jobs, self._max_jobs)
+        for outcome in RUN_OUTCOMES.values():
+            self._runs.setdefault((job, outcome), 0)
+        return job
+
+    def _count(self, job_id: Any, status: str, reason: Any, add: bool) -> None:
+        """Serve the series of a terminal row from zero, and add the row to it when ``add``."""
+        job = self._job(job_id)
         if status == SKIPPED_STATUS:
             key = (job, self._bounded(reason_label(reason), self._reasons, self._max_reasons))
-            self._skips[key] = self._skips.get(key, 0) + 1
+            self._skips[key] = self._skips.setdefault(key, 0) + add
         else:
             key = (job, RUN_OUTCOMES[status])
-            self._runs[key] = self._runs.get(key, 0) + 1
+            self._runs[key] += add
 
     def _rows(self, path: Path, mark: int) -> tuple[Optional[int], list[tuple[Any, ...]]]:
         """The table's newest rowid (None for an empty table) and its rows from ``mark`` on, read in one snapshot."""
@@ -220,7 +246,7 @@ class CronRunsCounter:
         # `/` is left alone and SQLite decodes the rest back.
         conn = sqlite3.connect(_READ_ONLY_URI.format(path=quote(str(path))), uri=True, timeout=LEDGER_BUSY_TIMEOUT_SECONDS)
         try:
-            conn.execute("BEGIN")
+            conn.execute(_BEGIN_SQL)
             newest = conn.execute(_NEWEST_SQL).fetchone()[0]
             if isinstance(newest, int) and newest < mark - 1:
                 mark = _NO_MARK  # the table was rebuilt under the mark: read it from its start
@@ -249,10 +275,11 @@ class CronRunsCounter:
             last = rowid
             if status == SKIPPED_STATUS or status in RUN_OUTCOMES:
                 terminal.append(rowid)
-                if not ledger.baselining and rowid not in ledger.counted:
-                    self._count(job_id, status, reason)
-            elif in_flight is None:
-                in_flight = rowid
+                self._count(job_id, status, reason, add=not ledger.baselining and rowid not in ledger.counted)
+            else:
+                self._job(job_id)
+                if in_flight is None:
+                    in_flight = rowid
         cut = len(rows) >= self._max_rows
         # The next read starts at the oldest run in flight, else after the last
         # row read; a read cut at the limit moves on past its last row whatever
@@ -279,6 +306,10 @@ class CronRunsCounter:
                     failed = exc
                     if not self._baselined:
                         self._unbaselined.add(path)
+            # A profile that was removed: a ledger of that name later is a new
+            # profile's, and counts every row it holds.
+            for path in [known for known in self._ledgers if known not in files and home_gone(known.parent.parent)]:
+                del self._ledgers[path]
             # The baseline is taken from a read that saw which ledgers exist: until
             # one does, a ledger met for the first time takes a baseline of its own.
             self._baselined = self._baselined or listed

@@ -48,3 +48,14 @@ def profile_homes(root: Path) -> list[Path]:
     except FileNotFoundError:
         pass
     return homes
+
+
+def home_gone(home: Path) -> bool:
+    """Whether a profile's home has been removed; False when that cannot be told."""
+    try:
+        os.stat(home)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
