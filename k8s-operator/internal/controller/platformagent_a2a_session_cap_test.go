@@ -809,10 +809,13 @@ func TestAPrunedSessionCapHoldsThePlatformRoute(t *testing.T) {
 		r.sessionCapReadings.Clear()
 	}
 
-	// The pass that sees the prune carries only the write's version to the
-	// render copy and to instance. Each holds status the store doesn't: the
-	// render copy the universe domain Reconcile stamps on it, and instance,
-	// here, a source no write has stored. Taking the echo's status drops both.
+	// The pass that sees the prune takes no status from the write's echo, on
+	// the render copy or on instance. Each holds status the store doesn't:
+	// the render copy the universe domain Reconcile stamps on it, and
+	// instance, here, a source no write has stored. Taking the echo's status
+	// drops both. Both end the pass at the stored version; on instance the
+	// hold's own write sets it too, so that check does not tell the two
+	// carries apart.
 	first, instance := storedCapAgent(t, cl, agent), storedCapAgent(t, cl, agent)
 	first.Status.ResolvedUniverseDomain = testCustomUniverseDomain
 	instance.Status.UniverseDomainSource = universeDomainSourceDiscovered
@@ -823,15 +826,15 @@ func TestAPrunedSessionCapHoldsThePlatformRoute(t *testing.T) {
 		t.Fatal("the echo without the cap was not noticed")
 	}
 	if first.Status.ResolvedUniverseDomain != testCustomUniverseDomain {
-		t.Errorf("the render copy's resolvedUniverseDomain = %q after the pruned write, want %q: only the version is carried from the echo",
+		t.Errorf("the render copy's resolvedUniverseDomain = %q after the pruned write, want %q: the echo's status is not taken",
 			first.Status.ResolvedUniverseDomain, testCustomUniverseDomain)
 	}
 	if instance.Status.UniverseDomainSource != universeDomainSourceDiscovered {
-		t.Errorf("instance's universeDomainSource = %q after the pruned write, want %q: only the version is carried from the echo",
+		t.Errorf("instance's universeDomainSource = %q after the pruned write, want %q: the echo's status is not taken",
 			instance.Status.UniverseDomainSource, universeDomainSourceDiscovered)
 	}
 	if want := storedCapAgent(t, cl, agent).ResourceVersion; first.ResourceVersion != want || instance.ResourceVersion != want {
-		t.Errorf("after the pruned write the render copy is at version %q and instance at %q, want the stored %q",
+		t.Errorf("after the pass that sees the prune the render copy is at version %q and instance at %q, want the stored %q",
 			first.ResourceVersion, instance.ResourceVersion, want)
 	}
 
