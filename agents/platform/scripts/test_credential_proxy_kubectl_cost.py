@@ -320,6 +320,86 @@ class KubectlChargeAdmissionTest(_GateFixture):
             release.set()
             self.assertTrue(big_done.wait(5))
 
+    def test_a_background_read_that_fits_only_by_taking_the_reserve_is_refused_at_once(self):
+        # A charge just under the budget fits an interactive read, but a
+        # background one must also leave the interactive reserve, which even a
+        # drained broker withholds: no wait can admit it.
+        executor = self.executor()
+        reserve = executor.admitted_requests() - executor.class_cap(credential_proxy.CLASS_BACKGROUND)
+        self.assertGreater(reserve, 0)
+        charge = executor.kubectl_charge(["kubectl", "get", "events", "-A", "-o", "json"])
+        with self.assertRaises(credential_proxy.KubectlCapacityExceeded):
+            with executor.request_slot(klass=credential_proxy.CLASS_BACKGROUND, charge=charge):
+                self.fail("admitted a background read that only fits by taking the reserve")
+        self.assertEqual(0, executor.queued_requests)
+        # The same read, interactive, fits and is admitted on a drained broker.
+        with executor.request_slot(charge=charge):
+            self.assertEqual(1000 * MEBIBYTE, executor.reserved_bytes)
+
+    def test_a_charged_read_that_fits_memory_keeps_its_place_for_a_slot(self):
+        # Memory is not what holds the read, a full slot cap is: a flat
+        # request behind it does not pass it.
+        executor = self.executor()
+        executor.max_concurrent_commands = 1
+        release = threading.Event()
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        charge = executor.kubectl_charge(["kubectl", "get", "pods", "-A", "-o", "json"])
+        order = []
+
+        def reader():
+            with executor.request_slot(charge=charge):
+                order.append("read")
+
+        def flat():
+            with executor.request_slot():
+                order.append("flat")
+
+        r = threading.Thread(target=reader)
+        r.start()
+        self.addCleanup(r.join)
+        deadline = time.monotonic() + 2
+        while executor.queued_requests < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        f = threading.Thread(target=flat)
+        f.start()
+        self.addCleanup(f.join)
+        deadline = time.monotonic() + 2
+        while executor.queued_requests < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(2, executor.queued_requests)
+        release.set()
+        r.join(5)
+        f.join(5)
+        self.assertEqual(["read", "flat"], order)
+
+    def test_a_flat_ticket_passes_a_charged_one_only_while_memory_holds_it(self):
+        executor = self.executor()
+        Ticket = credential_proxy._AdmissionTicket
+        fits = Ticket(takes_slot=True, child_bytes=300 * MEBIBYTE)
+        flat = Ticket(takes_slot=True)
+        with executor._slot_condition:
+            executor._slot_queue.extend([fits, flat])
+            try:
+                # The charged read fits memory now: the flat one keeps behind it.
+                self.assertFalse(executor._ahead_may_be_passed(flat))
+                # Memory taken, so the charged read no longer fits: it may pass.
+                executor._reserved_bytes += CHILDREN_BUDGET - 200 * MEBIBYTE
+                self.assertTrue(executor._ahead_may_be_passed(flat))
+            finally:
+                executor._reserved_bytes -= CHILDREN_BUDGET - 200 * MEBIBYTE
+                executor._slot_queue.clear()
+
     def test_budget_off_charges_nothing_and_never_loads_the_gate(self):
         executor = self.executor(budget=False, tier="fleet")
         self.assertIsNone(executor.kubectl_charge(["kubectl", "get", "pods", "-A", "-o", "json"]))

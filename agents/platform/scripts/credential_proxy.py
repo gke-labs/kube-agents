@@ -11234,7 +11234,7 @@ class CommandExecutor:
         gate = getattr(self, "kubectl_cost_gate", None)
         return gate.charge(argv) if gate is not None else None
 
-    def refuse_if_never_fits(self, charge: KubectlCharge | None) -> None:
+    def refuse_if_never_fits(self, charge: KubectlCharge | None, klass: str = CLASS_INTERACTIVE) -> None:
         """Raise KubectlCapacityExceeded for a charge larger than the whole
         child memory budget, which no wait can admit. Asked before the request
         queues, and asked again by `_admit`, so the degenerate admit-alone
@@ -11244,7 +11244,16 @@ class CommandExecutor:
         # allowance of a slot), so a read admission could only take alone,
         # with every other request drained, is refused here rather than left
         # at the head of the queue.
-        if charge is None or budget is None or self._request_cost_bytes(True, charge.child_bytes) <= budget:
+        if charge is None or budget is None:
+            return
+        needed = self._request_cost_bytes(True, charge.child_bytes)
+        if klass == CLASS_BACKGROUND:
+            # A background read must also leave the whole interactive reserve
+            # (`_leaves_reserve`): even a drained broker withholds it, so a
+            # read that fits only by taking it never fits.
+            reserve = max(0, self.admitted_requests() - self.class_cap(CLASS_BACKGROUND))
+            needed += self._request_cost_bytes(True) * reserve
+        if needed <= budget:
             return
         raise KubectlCapacityExceeded(
             f"capacity: `{charge.command}` at this install's size is measured at about "
@@ -11641,14 +11650,25 @@ class CommandExecutor:
             # the charge every request cost the same, so a request that fits
             # never waited on one that does not. The charged read keeps its
             # place, still bounded by the slot wait.
+            # Only while memory is what holds it: a charged read that fits and
+            # waits for a slot keeps arrival order like any other.
             if (ahead.klass == ticket.klass and ahead.child_bytes > REQUEST_CHILD_MEMORY_RESERVE_BYTES
-                    and ticket.child_bytes <= REQUEST_CHILD_MEMORY_RESERVE_BYTES):
+                    and ticket.child_bytes <= REQUEST_CHILD_MEMORY_RESERVE_BYTES
+                    and not self._ahead_fits_memory(ahead)):
                 continue
             if ahead.klass == ticket.klass:
                 return False
             if ticket.klass == CLASS_BACKGROUND and not (interactive_full and ahead.takes_slot):
                 return False
         return False
+
+    def _ahead_fits_memory(self, ahead: _AdmissionTicket) -> bool:
+        """Whether a queued ticket's memory would be granted now: its cost fits
+        the budget and, for a background slot-taker, also leaves the
+        interactive reserve. Called under `_slot_condition`."""
+        if not self._fits_budget(ahead.takes_slot, ahead.child_bytes):
+            return False
+        return not (ahead.takes_slot and ahead.klass == CLASS_BACKGROUND) or self._leaves_reserve(ahead.child_bytes)
 
     def _leaves_reserve(self, child_bytes: int | None = None) -> bool:
         """Whether one more background slot-taker still leaves the budget room
@@ -11716,7 +11736,7 @@ class CommandExecutor:
         # None for the flat reserve: every helper reads None as that figure.
         child_bytes: int | None = None
         if charge is not None and self.children_budget_bytes is not None:
-            self.refuse_if_never_fits(charge)
+            self.refuse_if_never_fits(charge, klass)
             child_bytes = charge.child_bytes
         if not takes_slot and self.children_budget_bytes is None:
             previously_reserved = getattr(self._request_budget, "reserved", False)
@@ -16568,7 +16588,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # An executor stand-in's answer, or nothing: the flat reserve.
                 charge = None
             if charge is not None:
-                self.executor.refuse_if_never_fits(charge)
+                self.executor.refuse_if_never_fits(charge, admission_class(principal.role))
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
             # The session or scope role's own bound is taken first, so a caller
