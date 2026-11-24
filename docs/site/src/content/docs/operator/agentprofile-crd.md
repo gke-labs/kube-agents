@@ -151,7 +151,9 @@ The operator binds profiles oldest first, by creation time with name breaking ti
 
 Near the ceiling, a profile's share can move it. Adding a tier to an older profile grows that profile's share, which can leave the newest bound profile out. Deleting a profile only ever brings refused ones back, oldest first.
 
-With the dispatcher on, each admitted profile also gets a warm pool for each of its interactive tiers: a Deployment `agentprofile-<profile>-<tier>` in the profile namespace, running `warmReplicas` worker pods plus one surge pod during a rollout. The profile quota budgets those pods. The pods hold the profile's bus and broker tokens, and the operator copies the bus CA bundle beside them. A worker empties its writable directories after every task, so nothing one task leaves reaches the next. Turning the dispatcher off, or removing or refusing the profile, removes its pools.
+With the dispatcher on, each admitted profile also gets a warm pool for each of its interactive tiers: a Deployment `agentprofile-<profile>-<tier>` in the profile namespace, running its warm worker pods plus one surge pod during a rollout. The profile quota budgets those pods. The pods hold the profile's bus and broker tokens, and the operator copies the bus CA bundle beside them. A worker empties its writable directories after every task, so nothing one task leaves reaches the next. Turning the dispatcher off, or removing or refusing the profile, removes its pools.
+
+How many warm pods a pool runs follows the route the operator resolved (`spec.harness.tuning.defaultRoute`). On `session`, every session pod hands its cluster reads to a profile as children, which run only on that pool, so it runs the profile's `concurrency` pods, held to the profile ceiling. Otherwise it runs `1`. Setting `spec.harness.tuning.profiles.warmReplicas` sets every pool's count on either route.
 
 ## Status
 

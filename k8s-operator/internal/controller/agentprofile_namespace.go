@@ -165,13 +165,24 @@ func resolveProfileAcceptTimeoutSeconds(agent *agentv1alpha1.PlatformAgent) int 
 	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.AcceptTimeoutSeconds }, agentv1alpha1.DefaultProfileAcceptTimeoutSeconds)
 }
 
-// resolveProfileWarmReplicas is spec.harness.tuning.profiles.warmReplicas,
-// defaulted.
-func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent) int {
-	if t := agentTuning(agent); t != nil && t.Profiles != nil && t.Profiles.WarmReplicas != nil {
-		return *t.Profiles.WarmReplicas
+// resolveProfileWarmReplicas is how many warm worker pods each of profile's
+// interactive tiers keeps: spec.harness.tuning.profiles.warmReplicas when it
+// is set, on any route. Unset, the session route sizes the pool to the
+// profile's concurrency (gke-labs/kube-agents#7014): every session pod hands
+// its reads to a profile as children, which run only on that pool, so a pool
+// of one serialises them all while the dispatcher would run concurrency of
+// them. It is held to the ceiling, which caps the tasks the pool could serve,
+// and to warmReplicas' own maximum. Any other route keeps
+// DefaultProfileWarmReplicas, so it renders as before.
+func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile) int {
+	if t := profileTuning(agent); t != nil && t.WarmReplicas != nil {
+		return *t.WarmReplicas
 	}
-	return agentv1alpha1.DefaultProfileWarmReplicas
+	if profile == nil || resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
+		return agentv1alpha1.DefaultProfileWarmReplicas
+	}
+	return max(agentv1alpha1.DefaultProfileWarmReplicas,
+		min(int(profile.Spec.Concurrency), resolveProfileCeiling(agent), agentv1alpha1.MaxProfileWarmReplicas))
 }
 
 // interactiveProfileTiers counts the warm pools the profiles need: one per
@@ -191,7 +202,7 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 // profileQuotaHard is the profile namespace's quota, one entry per key.
 //
 // pods covers the three kinds of pod the namespace runs: the warm workers
-// (warmReplicas for each interactive (profile, tier)), one rollout surge pod
+// (resolveProfileWarmReplicas for each interactive (profile, tier)), one rollout surge pod
 // per warm pool, and the Job pods (unattended tasks', and at any tier
 // permit-carrying ones', #5646), which the dispatcher holds to the ceiling. Interactive tasks run in the warm workers, so they
 // add no pods. Like the session quota, the key is `pods`, which counts
@@ -204,7 +215,12 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 // requests.memory join the map once the sizing budget gives them values,
 // and adding one is a line here.
 func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[corev1.ResourceName]int64 {
-	pools := interactiveProfileTiers(profiles)
+	var pools, warm int
+	for i := range profiles {
+		n := interactiveProfileTiers(profiles[i : i+1])
+		pools += n
+		warm += n * resolveProfileWarmReplicas(agent, &profiles[i])
+	}
 	jobs := resolveProfileCeiling(agent)
 	// Under Job mode every profile has Job templates (its unattended tasks',
 	// and at every tier its permit-carrying ones', #5646), so the Job pods'
@@ -213,7 +229,7 @@ func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 		jobs *= 2
 	}
 	return map[corev1.ResourceName]int64{
-		corev1.ResourcePods: int64(pools*resolveProfileWarmReplicas(agent) + pools + jobs),
+		corev1.ResourcePods: int64(warm + pools + jobs),
 	}
 }
 

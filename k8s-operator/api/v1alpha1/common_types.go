@@ -1279,7 +1279,9 @@ type ProfileTuning struct {
 	MaxTaskDeadlineSeconds *int `json:"maxTaskDeadlineSeconds,omitempty"`
 
 	// WarmReplicas is how many warm worker pods each interactive (profile,
-	// tier) keeps running. Absent means DefaultProfileWarmReplicas.
+	// tier) keeps running, on any route. Absent means the profile's
+	// concurrency on the session route (held to the ceiling and to 100),
+	// and DefaultProfileWarmReplicas otherwise.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
 	// +optional
@@ -1300,6 +1302,10 @@ const (
 	DefaultRouteSession  = "session"
 	DefaultRoutePlatform = "platform"
 )
+
+// MaxProfileWarmReplicas is ProfileTuning.WarmReplicas' maximum, which the
+// session route's default also holds to.
+const MaxProfileWarmReplicas = 100
 
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.

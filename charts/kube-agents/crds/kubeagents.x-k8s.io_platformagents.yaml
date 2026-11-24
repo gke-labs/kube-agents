@@ -10430,7 +10430,9 @@ spec:
                             warmReplicas:
                               description: |-
                                 WarmReplicas is how many warm worker pods each interactive (profile,
-                                tier) keeps running. Absent means DefaultProfileWarmReplicas.
+                                tier) keeps running, on any route. Absent means the profile's
+                                concurrency on the session route (held to the ceiling and to 100),
+                                and DefaultProfileWarmReplicas otherwise.
                               maximum: 100
                               minimum: 0
                               type: integer

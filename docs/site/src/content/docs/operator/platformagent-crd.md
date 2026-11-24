@@ -586,7 +586,7 @@ door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), 
 `maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, the gateway's
 `defaultRoute`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `defaultRoute` renders `platform`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
+`maxSessions` renders `10`, `defaultRoute` renders `platform`, `profiles.ceiling` follows `maxInProgress` (`6` unless set), and `profiles.warmReplicas` renders `1` on `platform` and each profile's `concurrency` on `session` ([AgentProfile](./agentprofile-crd.md)).
 
 `defaultRoute` is where the A2A gateway sends a plain conversation's first message: `platform` to the
 Platform Agent, `session` to a session pod of the conversation's own. Unset means `platform`, today's
