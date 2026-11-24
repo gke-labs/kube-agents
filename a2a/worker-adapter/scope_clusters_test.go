@@ -18,9 +18,9 @@ var scTargets = &lib.DelegateTargets{Targets: []lib.DelegateTarget{
 		{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}},
 }, WidthMax: 3}
 
-// addresseeWithScope lists the tools over a fresh server given a page, and
-// returns the delegate tool's addressee description.
-func addresseeWithScope(t *testing.T, targets *lib.DelegateTargets, scope *lib.ScopeClusters) string {
+// toolWithScope lists the tools over a fresh server given a page, and
+// returns the delegate tool's own description and its schema as JSON.
+func toolWithScope(t *testing.T, targets *lib.DelegateTargets, scope *lib.ScopeClusters) (string, string) {
 	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
@@ -29,49 +29,73 @@ func addresseeWithScope(t *testing.T, targets *lib.DelegateTargets, scope *lib.S
 	go func() { _ = ServeDelegateMCPWith(ctx, inR, outW, "/nonexistent.sock", targets, scope, slog.Default()) }()
 	list := rpc(t, inW, bufio.NewReader(outR), `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	tool := list["result"].(map[string]any)["tools"].([]any)[0].(map[string]any)
-	props := tool["inputSchema"].(map[string]any)["properties"].(map[string]any)
-	return props["addressee"].(map[string]any)["description"].(string)
+	schema, err := json.Marshal(tool["inputSchema"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tool["description"].(string), string(schema)
 }
 
-// The page is named after the agents: the count, each cluster on the page,
-// how many are off it, the oldest listing, and the projects listed
-// elsewhere. An unknown count says so.
+// The page is named once, at the end of the tool's description: the count
+// of clusters with a published listing, each cluster on the page, how many
+// are off it, the oldest listing, the projects listed elsewhere, and what
+// the page was checked against. The input schema, and so every batch entry,
+// is the one without a page.
 func TestDelegateMCPNamesTheScopeClustersPage(t *testing.T) {
 	page := &lib.ScopeClusters{Count: 4, Truncated: true, Clusters: []lib.ScopeCluster{
 		{Project: "member-a", Location: "europe-west1", Cluster: "a3"},
 		{Project: "member-a", Location: "us-central1", Cluster: "a1"},
 		{Project: "member-a", Location: "us-central1", Cluster: "a2"},
 	}, UnlistedProjects: []string{"explicit-a", "mgmt-proj"}, UnlistedCount: 3, OldestListing: "2026-11-23T10:00:00Z"}
-	desc := addresseeWithScope(t, scTargets, page)
-	base := addresseeDescription(scTargets)
-	if !strings.HasPrefix(desc, base) {
-		t.Fatalf("the agents' list moved: %q", desc)
+	baseDesc, baseSchema := toolWithScope(t, scTargets, nil)
+	cases := []struct {
+		name string
+		page *lib.ScopeClusters
+		want string
+	}{
+		{"page", page, " Clusters this task may delegate to that have a published listing: 4." +
+			" On this page (project/location/cluster): member-a/europe-west1/a3, member-a/us-central1/a1, member-a/us-central1/a2." +
+			" Not on this page: 1. Oldest cluster listing read at 2026-11-23T10:00:00Z." +
+			" Projects in scope whose clusters are listed elsewhere: explicit-a, mgmt-proj, and 1 more." +
+			" These clusters pass the install's scope check; a profile's tiers and pins are checked when a task is delegated."},
+		{"unknown", &lib.ScopeClusters{Unknown: true, Truncated: true, Clusters: []lib.ScopeCluster{},
+			UnlistedProjects: []string{"explicit-a"}, UnlistedCount: 1},
+			" Clusters this task may delegate to that have a published listing: unknown, as the gateway has no full listing; 0 known." +
+				" Projects in scope whose clusters are listed elsewhere: explicit-a."},
+		{"unbounded", &lib.ScopeClusters{Unbounded: true, Unknown: true, Truncated: true, Count: 1,
+			Clusters: []lib.ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}, OldestListing: "2026-11-23T10:00:00Z"},
+			" Clusters this task may delegate to: unknown, as the install's scope draws no boundary; 1 with a published listing are known." +
+				" On this page (project/location/cluster): p/l/c. Oldest cluster listing read at 2026-11-23T10:00:00Z." +
+				" These clusters pass the install's scope check; a profile's tiers and pins are checked when a task is delegated."},
+		{"age unknown", &lib.ScopeClusters{Count: 1, Clusters: []lib.ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}},
+			" Clusters this task may delegate to that have a published listing: 1." +
+				" On this page (project/location/cluster): p/l/c. The listing's age is unknown." +
+				" These clusters pass the install's scope check; a profile's tiers and pins are checked when a task is delegated."},
+		{"parent scoped", &lib.ScopeClusters{ParentScoped: true, Count: 1, Clusters: []lib.ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}},
+			" This task is scoped to one cluster: p/l/c." +
+				" These clusters pass the install's scope check; a profile's tiers and pins are checked when a task is delegated."},
+		{"parent scoped, out of scope", &lib.ScopeClusters{ParentScoped: true, Clusters: []lib.ScopeCluster{}},
+			" This task is scoped to one cluster, which the install's scope does not admit."},
 	}
-	want := " Clusters in this install's scope: 4." +
-		" On this page (project/location/cluster): member-a/europe-west1/a3, member-a/us-central1/a1, member-a/us-central1/a2." +
-		" Not on this page: 1. Oldest cluster listing read at 2026-11-23T10:00:00Z." +
-		" Projects in scope whose clusters are listed elsewhere: explicit-a, mgmt-proj, and 1 more."
-	if got := strings.TrimPrefix(desc, base); got != want {
-		t.Fatalf("the page reads\n%q\nwant\n%q", got, want)
+	for _, tc := range cases {
+		desc, schema := toolWithScope(t, scTargets, tc.page)
+		if got := strings.TrimPrefix(desc, baseDesc); !strings.HasPrefix(desc, baseDesc) || got != tc.want {
+			t.Errorf("%s: the page reads\n%q\nwant\n%q", tc.name, got, tc.want)
+		}
+		if schema != baseSchema {
+			t.Errorf("%s: the input schema moved with the page", tc.name)
+		}
 	}
 
-	unknown := addresseeWithScope(t, scTargets, &lib.ScopeClusters{Unknown: true, Truncated: true, Clusters: []lib.ScopeCluster{},
-		UnlistedProjects: []string{"explicit-a"}, UnlistedCount: 1})
-	if got := strings.TrimPrefix(unknown, base); got != " Clusters in this install's scope: unknown, as the gateway has no full list; 0 known."+
-		" Projects in scope whose clusters are listed elsewhere: explicit-a." {
-		t.Fatalf("an unknown page reads %q", got)
-	}
-
-	// No page, or no agents to delegate to, leaves the description as it was.
-	if desc := addresseeWithScope(t, scTargets, nil); desc != base {
-		t.Fatalf("no page: %q, want %q", desc, base)
-	}
-	none := &lib.DelegateTargets{Targets: []lib.DelegateTarget{}}
-	if desc := addresseeWithScope(t, none, page); desc != addresseeDescription(none) {
-		t.Fatalf("no agents: %q", desc)
-	}
-	if desc := addresseeWithScope(t, nil, page); desc != addresseeFallbackDescription {
-		t.Fatalf("no list: %q", desc)
+	// No page, no agents, or no agent that takes a cluster: no page named.
+	pinnedOnly := &lib.DelegateTargets{Targets: []lib.DelegateTarget{{Name: "prod-east", Description: "pinned"}}, WidthMax: 3}
+	for name, targets := range map[string]*lib.DelegateTargets{
+		"no list": nil, "no agents": {Targets: []lib.DelegateTarget{}}, "no cluster-taking agent": pinnedOnly,
+	} {
+		bare, _ := toolWithScope(t, targets, nil)
+		if desc, _ := toolWithScope(t, targets, page); desc != bare {
+			t.Errorf("%s: %q, want %q", name, desc, bare)
+		}
 	}
 }
 
@@ -145,10 +169,12 @@ func TestTheTurnsScopeClustersReachTheMCPServer(t *testing.T) {
 	}
 }
 
-// A worker that predates the part reads the submission as it did: every
-// reader it has (the prompt text, the targets, the width, the task
-// parameters) gives the same answer with the scopeClusters part present.
-func TestAWorkerThatPredatesScopeClustersIgnoresThePart(t *testing.T) {
+// The worker's other readers of a submission (the prompt text, the targets,
+// the width, the task parameters) give the same answer with the
+// scopeClusters part present: each reads text parts or its own data key and
+// passes over any other. They are unchanged from before the part, so this is
+// also how a worker that predates it reads the submission.
+func TestTheScopeClustersPartLeavesTheWorkersOtherReadersAlone(t *testing.T) {
 	scopePart, err := lib.ScopeClustersPart(lib.ScopeClusters{Count: 2, Truncated: true,
 		Clusters: []lib.ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}})
 	if err != nil {
