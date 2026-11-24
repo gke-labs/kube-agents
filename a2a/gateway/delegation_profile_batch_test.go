@@ -775,56 +775,75 @@ func withoutProfileParentIn(t *testing.T, url string) func() {
 // record and the heal would never find it again.
 func TestAWithdrawnProfileBatchSendsAnUnsentEndAsRecorded(t *testing.T) {
 	t.Parallel()
-	r := startProfileRig(t)
-	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
-	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
-	ctx := context.Background()
-	conv := "console:tab-profile-batch-withdrawn-unsent"
-	turn := profileTurn(conv, "chat", nil)
-	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
-	r.adapter.inbox <- turn
-	origin := submissionOn(t, r, "chat")
-	parent := r.execFor(t, origin, "chat")
-	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
-		t.Fatal(err)
-	}
-	art := delegateBatchArtifact(t,
-		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
-		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
-	if err := parent.PublishArtifact(ctx, art); err != nil {
-		t.Fatal(err)
-	}
-	first := submissionOn(t, r, "cluster")
-	restore := withoutProfileParentIn(t, r.url)
-	completeChild(t, r, first, "a is fine")
-	waitForRecord(t, r, conv, "a's end recorded unsent", func(rec *SessionRecord) bool {
-		k, ok := rec.TaskRefFor(first.TaskID)
-		return ok && k.BatchEnd != nil && k.BatchEnd.Unsent
-	})
-	restore()
-	r.g.profiles.put("cluster", nil)
-	if err := parent.PublishArtifact(ctx, art); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "an end for each entry", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) >= 2 })
-	time.Sleep(200 * time.Millisecond)
-	got := childResultsOn(t, r, "chat", origin.TaskID)
-	if len(got) != 2 {
-		t.Fatalf("%d ends, want one per entry: %+v", len(got), got)
-	}
-	for _, c := range got {
-		switch c.Entry {
-		case 1:
-			if c.ChildTaskID != first.TaskID || c.State != lib.StateCompleted || c.Text != "a is fine" {
-				t.Fatalf("entry 1's end = %+v, want a's recorded completed end", c)
+	for _, tc := range []struct {
+		name      string
+		finish    func(t *testing.T, r *rig, child *lib.Envelope)
+		wantState lib.TaskState
+		wantText  string
+	}{
+		{"completed", func(t *testing.T, r *rig, child *lib.Envelope) { completeChild(t, r, child, "a is fine") },
+			lib.StateCompleted, "a is fine"},
+		// A child that asked ends input-required on the record; the parent
+		// is sent it canceled with the question, as the heal's resend
+		// sends it, since a non-terminal end is refused (profileBatchEndState).
+		{"asked", func(t *testing.T, r *rig, child *lib.Envelope) {
+			publishQuestion(t, r, child, "cluster", "which namespace?")
+		}, lib.StateCanceled, "which namespace?"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := startProfileRig(t)
+			r.g.cfg.DelegationWidthMax = 10
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+			r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+			ctx := context.Background()
+			conv := "console:tab-profile-batch-withdrawn-unsent-" + tc.name
+			turn := profileTurn(conv, "chat", nil)
+			turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+			r.adapter.inbox <- turn
+			origin := submissionOn(t, r, "chat")
+			parent := r.execFor(t, origin, "chat")
+			if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+				t.Fatal(err)
 			}
-		case 2:
-			if c.State != lib.StateFailed || c.ChildTaskID != "" {
-				t.Fatalf("entry 2's end = %+v, want failed with no child", c)
+			art := delegateBatchArtifact(t,
+				lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+				lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+			if err := parent.PublishArtifact(ctx, art); err != nil {
+				t.Fatal(err)
 			}
-		default:
-			t.Fatalf("an end for entry %d", c.Entry)
-		}
+			first := submissionOn(t, r, "cluster")
+			restore := withoutProfileParentIn(t, r.url)
+			tc.finish(t, r, first)
+			waitForRecord(t, r, conv, "a's end recorded unsent", func(rec *SessionRecord) bool {
+				k, ok := rec.TaskRefFor(first.TaskID)
+				return ok && k.BatchEnd != nil && k.BatchEnd.Unsent
+			})
+			restore()
+			r.g.profiles.put("cluster", nil)
+			if err := parent.PublishArtifact(ctx, art); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "an end for each entry", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) >= 2 })
+			time.Sleep(200 * time.Millisecond)
+			got := childResultsOn(t, r, "chat", origin.TaskID)
+			if len(got) != 2 {
+				t.Fatalf("%d ends, want one per entry: %+v", len(got), got)
+			}
+			for _, c := range got {
+				switch c.Entry {
+				case 1:
+					if c.ChildTaskID != first.TaskID || c.State != tc.wantState || c.Text != tc.wantText {
+						t.Fatalf("entry 1's end = %+v, want a's recorded end as %s %q", c, tc.wantState, tc.wantText)
+					}
+				case 2:
+					if c.State != lib.StateFailed || c.ChildTaskID != "" {
+						t.Fatalf("entry 2's end = %+v, want failed with no child", c)
+					}
+				default:
+					t.Fatalf("an end for entry %d", c.Entry)
+				}
+			}
+		})
 	}
 }
