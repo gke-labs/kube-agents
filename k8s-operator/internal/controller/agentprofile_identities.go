@@ -256,10 +256,10 @@ func resolveOneAgentProfile(p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.
 		// instead of failing the whole render.
 		return agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name), reason: reasonAgentProfileInvalid}
 	case !agentProfileHarnessSupported(p.Spec.Harness.Type):
-		// The CRD's enum refuses these too. Refused here as well so that a
-		// type admitted by an older, newer or edited CRD renders no worker
-		// rather than one this operator would start as Claude Code.
-		return agentProfileResolution{refused: fmt.Errorf("spec.harness.type %q is not a harness this operator renders (supported: %s)", p.Spec.Harness.Type, agentv1alpha1.AgentProfileHarnessClaudeCode), reason: reasonAgentProfileHarnessNotSupported}
+		// No worker for a harness the worker image can't run: with none
+		// available (renderableHarness), every profile is refused here and
+		// dispatch has nothing to send it.
+		return agentProfileResolution{refused: agentProfileHarnessRefusal(p.Spec.Harness.Type), reason: reasonAgentProfileHarnessNotSupported}
 	case malformedTopicGrant(p) != "":
 		return agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
 	case foreignPublishTopic(p) != "":
@@ -490,8 +490,27 @@ func isDispatcherBucketUser(name string) bool {
 	return err == nil && n >= 0 && n < a2aDispatcherBuckets
 }
 
-// agentProfileHarnessSupported is whether the operator renders workers for
-// a profile's spec.harness.type: absent (Claude Code) or claude-code.
+// renderableHarness is the harness the worker image runs for a profile that
+// names none, and the only one the operator renders workers for. It is empty:
+// the worker image carries no harness until another is available (#6707), so
+// no profile renders a worker. Tests that exercise the rest of the render set
+// it in their package's test files; nothing outside tests does.
+var renderableHarness = ""
+
+// agentProfileHarnessRefusal is the refusal for a profile whose harness the
+// worker image can't run.
+func agentProfileHarnessRefusal(t string) error {
+	if renderableHarness == "" {
+		return fmt.Errorf("no harness is available for profile workers: the worker image carries none until another harness is available (spec.harness.type %q)", t)
+	}
+	return fmt.Errorf("spec.harness.type %q is not a harness this operator renders (supported: %s)", t, renderableHarness)
+}
+
+// agentProfileHarnessSupported is whether the operator renders workers for a
+// profile's spec.harness.type: absent, meaning the install's default harness,
+// or that harness by name, and only when there is one (renderableHarness).
+// claude-code, the prototype harness removed from the worker image, is
+// refused like any other type the image can't run.
 func agentProfileHarnessSupported(t string) bool {
-	return t == "" || t == agentv1alpha1.AgentProfileHarnessClaudeCode
+	return renderableHarness != "" && (t == "" || t == renderableHarness)
 }
