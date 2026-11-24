@@ -286,10 +286,12 @@ def night_anchors(records: list[dict], data: dict) -> dict[str, str]:
     re-run of another part, which the collector's runs would fold into its
     night, also stays apart here, because nothing in the store says which
     part it ran. A build whose id does not date it (``record_build_start``)
-    stands alone. The limit: a re-run that ``data`` lacks and that started
-    inside the spread of the cron builds, before or after them, is drawn in
-    their night until the collector has it; the collector's runs then file
-    a main re-run as a night of its own."""
+    stands alone. The limits, both inside the spread and both gone once the
+    collector has every build: a re-run that ``data`` lacks and that started
+    within the spread of the cron builds, before or after them, is drawn in
+    their night, where the collector's runs file a main re-run as a night
+    of its own; and cron builds that ``data`` lacks are drawn in the night
+    of such a re-run when it is the only build of the group ``data`` knows."""
     anchors = nightly.night_builds(data)
     starts: dict[str, datetime.datetime] = {}
     for record in records:

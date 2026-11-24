@@ -603,9 +603,10 @@ class NightsTheCollectorLacksTest(unittest.TestCase):
         self.assertEqual([(n["build"], n["cases"]) for n in nights], [(self.MAIN, 3)])
 
     def test_the_spread_is_measured_from_the_first_build_of_the_group(self):
-        """00:00, 00:12 and 00:24: the third is within the spread of the
+        """00:00, 00:15 and 00:24: the second is exactly the spread after
+        the first and joins it; the third is within the spread of the
         second and not of the first, and begins a night of its own."""
-        first, second, third = (build_started_at(f"2025-09-10T00:{minute}:00+00:00") for minute in ("00", "12", "24"))
+        first, second, third = (build_started_at(f"2025-09-10T00:{minute}:00+00:00") for minute in ("00", "15", "24"))
         records = [self.record(case, build, "2025-09-10T06:00:00Z") for case, build in (("case-19", first), ("case-23", second), ("case-24", third))]
         self.assertEqual([(n["build"], n["cases"]) for n in trend.night_documents(records, data_with_nightly(DOMAINS))], [(first, 2), (third, 1)])
 
@@ -635,7 +636,7 @@ class NightsTheCollectorLacksTest(unittest.TestCase):
 
     def test_a_build_its_record_does_not_date_stands_alone(self):
         """An id is a start only when the record agrees: written at or
-        after it, inside the longest job's budget. Two ids seconds
+        after it, within ``nightly.RUNNING_MAX_AGE``. Two ids seconds
         apart whose records predate them, or trail them by days, are two
         nights; so are ids of another shape."""
         early = (self.record("case-19", self.MAIN, "2025-09-09T12:00:00Z"), self.record("case-23", self.WRITERS, "2025-09-09T12:00:00Z"))

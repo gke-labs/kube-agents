@@ -1267,8 +1267,8 @@ nightly runs lack, as after a refresh that swept a bounded span or while a
 part is not collected yet, is grouped with the builds of its night date
 that started within 15 minutes (`NIGHT_START_SPREAD` in `trend.py`) of the
 first of them, each start read from the build id and used only when a
-record of the build is stamped at or after it and within `RUNNING_MAX_AGE`
-of it, and shares the build of the nearest start in the group that
+record of the build is stamped at or after it and within 14 h 30 m
+(`RUNNING_MAX_AGE` in `nightly.py`) of it, and shares the build of the nearest start in the group that
 `data.json` files, else the first of the group to start, so a re-run
 started past those 15 minutes begins a night of its own), `started` and `log_url` the collector's when that
 build is a nightly run in `data.json` (`null` otherwise); the page dates
