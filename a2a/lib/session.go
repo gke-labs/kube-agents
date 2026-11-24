@@ -71,9 +71,14 @@ const (
 	// EnvProfileWorkerOneShot ends a profile worker after its first task: a
 	// Job's pod. Literal "1" or "true" is on.
 	EnvProfileWorkerOneShot = "PROFILE_WORKER_ONE_SHOT"
-	// EnvProfileHarness names the persona adapter a profile worker renders
-	// its persona with (persona.ClaudeCode is the default and, for now, the
-	// only one written).
+	// EnvHarness names the harness a worker runs, session pod or profile
+	// worker alike (persona.ClaudeCode or persona.Antigravity): its driver,
+	// its argv and env, and a profile worker's persona adapter. Unset is
+	// Claude Code; a value the worker doesn't know refuses to start.
+	EnvHarness = "A2A_HARNESS"
+	// EnvProfileHarness is EnvHarness's older name, read only by a profile
+	// worker and only when EnvHarness is unset. It once picked the persona
+	// adapter alone.
 	EnvProfileHarness = "PROFILE_HARNESS"
 	// EnvPersonaIntegrity sets whether a profile worker requires its persona
 	// to carry a build-time content manifest (persona.IntegrityManifestFile).
