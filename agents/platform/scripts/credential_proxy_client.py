@@ -1198,6 +1198,8 @@ def record_shell_context(context: str) -> bool:
     directory = _shell_context_dir()
     path = directory / f"{keys[0]}{SHELL_CONTEXT_SUFFIX}"
     try:
+        # `.kubeconfigs` first: root as the owner counts only for the folder above it.
+        _claim_callers_folder(kubeconfig_dir())
         _claim_callers_folder(directory)
         _replace_file(path, context)
     except OSError as exc:

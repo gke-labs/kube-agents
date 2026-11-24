@@ -523,7 +523,19 @@ class PerTargetKubeconfigFolderOwnerTest(ContextLessTestCase):
         self.assertEqual([], list(self.shells.iterdir()))
         self.assertEqual(0, captured["exit_code"])
         self.assertIn(f"could not write {self.expected_file}: {self.folder} belongs to uid", stderr)
-        self.assertIn(f"could not record the shell's context in {self.pin}: {self.shells} belongs to uid", stderr)
+        self.assertIn(f"could not record the shell's context in {self.pin}: {self.folder} belongs to uid", stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root is the caller, so the folder would be its own")
+    def test_no_pin_lands_below_a_folder_of_root_that_has_no_shells_folder(self):
+        # A `.kubeconfigs` that root made before this rule, in a home that the caller owns.
+        self.folder.mkdir()
+        with self.owned_by(self.ROOT, self.folder):
+            captured, stderr = self.fetch_in_a_shell()
+        self.assertEqual([], list(self.folder.iterdir()))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertIn(
+            f"could not record the shell's context in {self.pin}: {self.folder} belongs to uid {self.ROOT}", stderr
+        )
 
     def test_after_a_refused_caller_the_owner_writes_its_file_and_its_pin(self):
         with self.owned_by(self.ANOTHER_USER, self.home):
