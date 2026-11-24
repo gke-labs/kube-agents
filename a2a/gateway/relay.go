@@ -435,7 +435,9 @@ func (h *namesHolds) held(item relayItem) int {
 		if item.d.NumDelivered() <= 1 {
 			return 0
 		}
-		return int(item.d.NumDelivered() - 1)
+		// Only ever compared with profileNamesHoldLimit, so clamp to it.
+		n := min(item.d.NumDelivered()-1, uint64(profileNamesHoldLimit))
+		return int(n) // #nosec G115 -- clamped to profileNamesHoldLimit just above
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
