@@ -20,6 +20,9 @@ func TestToolChildrenNeverSeeModelOrBusCredentials(t *testing.T) {
 		"GEMINI_API_KEY", "OPENAI_API_KEY",
 		"NATS_URL", "NATS_USER", "NATS_PASSWORD", "A2A_BUS_TOKEN_FILE",
 		"LITELLM_MASTER_KEY", "AGY_LLM_GATEWAY_URL", "A2A_LIVE_GATEWAY_PASSWORD",
+		// core-models' built-in model profiles' credentials.
+		"XAI_API_KEY", "GROQ_API_KEY", "AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_SERVICE_KEY",
+		"AICORE_AUTH_URL", "AI_API_URL", "GW_CLIENT_ID", "GW_CLIENT_SECRET", "GW_TOKEN_URL",
 	}
 	keep := []string{
 		"PATH", "HOME", "LANG",

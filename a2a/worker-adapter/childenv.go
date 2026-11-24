@@ -22,10 +22,15 @@ var withheldPrefixes = []string{
 	"NATS_",      // the bus: URL, user, password
 	"A2A_BUS_",   // the bus token file
 	"AGY_LLM_",   // a gateway URL for a model client
+	"XAI_",       // XAI_API_KEY
+	"GROQ_",      // GROQ_API_KEY
+	"AICORE_",    // SAP AI Core: client id and secret, service key, URLs
+	"GW_",        // a model gateway's OAuth client: id, secret, token URL
 }
 
 // withheldNames are single variables withheld besides the prefixes.
 var withheldNames = []string{
+	"AI_API_URL", // SAP AI Core's API endpoint
 	"LITELLM_MASTER_KEY",
 	"LITELLM_API_KEY",
 	"A2A_LIVE_GATEWAY_PASSWORD",
