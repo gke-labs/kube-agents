@@ -1715,6 +1715,20 @@ class InjectTask:
         probe = Probe.from_body(self._poll(task_id, 0, 0))
         return probe is not None and probe.could_look and probe.concerns(task_id) and not probe.final
 
+    def released(self, task_id: str) -> bool:
+        """One read: whether the gateway looked and ``task_id`` no longer
+        holds its record, or its stream shows it ended. A read that could not
+        look (no probe, or ``could_look`` false) is not released, so a caller
+        waiting for a worker to free stays on the safe side.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        probe = Probe.from_body(self._poll(task_id, 0, 0))
+        if probe is None or not probe.could_look:
+            return False
+        return probe.final or not probe.concerns(task_id)
+
     def await_working(self, task_id: str, deadline: float) -> Fold:
         """Read ``task_id``'s lifecycle until an executor has it working,
         it ends, or ``deadline`` (``time.monotonic()``) passes.

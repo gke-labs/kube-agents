@@ -4201,8 +4201,11 @@ class KubeAgentsHarness(AgentHarness):
                     if not (rec.cancelled and rec.task_id):
                         continue
                     while True:
+                        # Released only when the gateway looked and saw it
+                        # gone; a door it couldn't reach, or a read that
+                        # couldn't look, counts as still running.
                         try:
-                            running = task.still_running(rec.task_id)
+                            running = not task.released(rec.task_id)
                         except inject.InjectUnavailable:
                             running = True
                         if not running:

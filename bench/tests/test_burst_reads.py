@@ -233,11 +233,11 @@ class _FakeTask(_RealInjectTask):
         self.left += 1
         return True
 
-    def still_running(self, task_id):
+    def released(self, task_id):
         # A cancelled straggler's session is released at once, unless the
         # plan says it sticks.
-        self._note("still_running")
-        return self.what == "stuck"
+        self._note("released")
+        return self.what != "stuck"
 
 
 @pytest.fixture
@@ -376,7 +376,7 @@ def test_the_entry_is_graded_on_every_record():
 def test_the_next_level_waits_for_a_cancelled_straggler_to_be_released(fake):
     fake.plan = {"L3-1": "deadline"}
     _run()
-    assert fake.log.index(("still_running", "L3-1")) < fake.log.index(("submit", "L6-0"))
+    assert fake.log.index(("released", "L3-1")) < fake.log.index(("submit", "L6-0"))
 
 
 def test_a_straggler_never_released_is_infrastructure(fake, monkeypatch):
@@ -427,3 +427,21 @@ def test_the_result_sums_every_conversations_tokens(fake, monkeypatch):
         if isinstance(value, int) and not isinstance(value, bool) and value:
             assert got.tokens[bucket] == 4 * value, (bucket, got.tokens)
 
+
+
+@pytest.mark.parametrize(
+    "body, released",
+    [
+        ({}, False),
+        ({"probe": {"active": True, "taskId": "t1", "error": "kv: timeout"}}, False),
+        ({"probe": {"active": True, "taskId": "t1"}}, False),
+        ({"probe": {"active": True, "taskId": "t1", "final": True}}, True),
+        ({"probe": {"active": True, "taskId": "t2"}}, True),
+        ({"probe": {"active": False}}, True),
+    ],
+)
+def test_released_counts_only_a_read_that_looked_and_saw_it_gone(monkeypatch, body, released):
+    """A read that couldn't look is not released, so the next level waits."""
+    task = inject.InjectTask(base_url="http://x", conversation="c", prompt="p", token="t", author="a", message_id="m")
+    monkeypatch.setattr(task, "_poll", lambda task_id, after, wait, **kw: body)
+    assert task.released("t1") is released
