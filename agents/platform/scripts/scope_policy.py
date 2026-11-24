@@ -186,7 +186,11 @@ class Declaration(NamedTuple):
 
 
 def _string_set(document: dict[str, Any], key: str, label: str | None = None) -> frozenset[str]:
-    values = document.get(key) or []
+    # Absent or null is an empty list; any other non-list (`{}`, `""`,
+    # `false`) is malformed and refuses everything, the exclude list included.
+    values = document.get(key)
+    if values is None:
+        return frozenset()
     if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
         raise ValueError(f"scope.json {label or key} is not a list of strings")
     return frozenset(values)

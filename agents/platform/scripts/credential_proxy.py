@@ -2515,7 +2515,9 @@ CALLER_ROLE_MCP = "mcp"
 CALLER_ROLE_PROFILE = "profile"
 # The scope publisher Job. The exec route only, gcloud only, and within it the
 # five lookups scope_policy names, each on an argument scope.json declares or an
-# earlier lookup returned.
+# earlier lookup returned; `clusters list` also on the management project
+# (CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT) and a declared project no
+# exclude.projects entry matches.
 # An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
 # window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -561,3 +562,33 @@ class MemberWindowTest(ScopeFileTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FalsyNonListFieldsFailClosedTest(unittest.TestCase):
+    """A falsy non-list `projects` or `exclude.projects` (`{}`, `""`, `false`)
+    is malformed, not empty: it refuses everything rather than dropping the
+    exclusions."""
+
+    def test_falsy_non_lists_are_refused(self):
+        for value in ({}, "", False, 0):
+            for key in ("projects", "exclude"):
+                with self.subTest(key=key, value=value):
+                    doc = {"projects": ["p-1"], "exclude": {"projects": []}}
+                    if key == "projects":
+                        doc["projects"] = value
+                    else:
+                        doc["exclude"] = {"projects": value}
+                    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                        json.dump(doc, f)
+                    self.addCleanup(os.unlink, f.name)
+                    with self.assertRaises(ValueError):
+                        scope_policy.load_declaration(f.name)
+
+    def test_null_reads_as_empty(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"projects": None, "exclude": {"projects": None}}, f)
+        self.addCleanup(os.unlink, f.name)
+        decl = scope_policy.load_declaration(f.name)
+        self.assertEqual(decl.projects, frozenset())
+        self.assertEqual(decl.exclude_projects, ())
+
