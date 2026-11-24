@@ -10162,8 +10162,9 @@ class AuditReportStoredVerifier(_StoredReportVerifier):
     from an older image, with no key, is read by ``finished_at`` alone -- has
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
-    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``,
+    which fails any other value and meets a required ``null``), has, for each
+    ``required_finding_phrases`` entry, a finding
     in its ``document`` whose id contains it, and has no finding whose id
     contains a ``forbidden_finding_phrases`` entry (the silent half of a case
     that plants a look-alike the check must leave alone), and, for each

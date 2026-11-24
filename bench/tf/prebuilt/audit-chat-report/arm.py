@@ -14,15 +14,24 @@
 
 """Fire one scheduled fleet-audit run on the install and wait for its delivery.
 
-Runs in the agent container, streamed in by main.tf. Four commands:
+Runs in the agent container, streamed in by main.tf. An eval run pauses the
+clock-started audits (hack/ci_pause_scheduled_audits.py), and Hermes'
+``trigger_job`` re-enables a paused job, so ``wait`` and ``clean`` pause it again
+when ``fire`` found it paused. Four commands:
 
   idle <home> <job> <seconds>  wait until no run of <job> is claimed or running, so a run
                                already going is not read as the fired one
   fire <home> <python> <job>   mark <job> due with Hermes' own ``cron.jobs.trigger_job``
-                               and record when, in STATE_FILE
-  wait <home> <job> <seconds>  wait until a run claimed after the mark has finished, and
-                               record when and how its delivery went
-  clean <home>                 remove STATE_FILE
+                               and record when, and whether it was paused, in STATE_FILE;
+                               a job disabled with no pause on it is refused
+  wait <home> <job> <seconds> [result]
+                               wait until a run claimed after the mark has finished, and
+                               record when and how its delivery went; pause the job
+                               again when it was paused. With the word ``result``, a
+                               run that has not finished in time is no failure of
+                               the stack: the case's check then finds no report
+                               from it
+  clean <home>                 pause the job again if that is still owed; remove STATE_FILE
 
 Runs are read from the profile's ``cron/executions.db``, where the scheduler
 records each run with its claim time, its end, and its delivery outcome. A run
@@ -41,15 +50,33 @@ import time
 from datetime import datetime, timezone
 
 STATE_NAME = ".bench-audit-chat-report.json"
-PROFILE_HOME = ("profiles", "platform")
+PROFILE = "platform"
+PROFILE_HOME = ("profiles", PROFILE)
 ROSTER = ("cron", "jobs.json")
 EXECUTIONS = ("cron", "executions.db")
 ACTIVE = ("claimed", "running")
 SKIPPED = "skipped"
+PAUSED_STATE = "paused"
+# The roster's fields this script reads on a job, beside its id.
+JOB_ENABLED = "enabled"
+JOB_STATE = "state"
+JOB_PAUSED_AT = "paused_at"
+# The keys `fire` writes to STATE_FILE; `wait` adds the run's end and its
+# delivery outcome.
+STATE_JOB_ID = "job_id"
+STATE_FIRED_AT = "fired_at"
+STATE_WAS_PAUSED = "was_paused"
+STATE_REPAUSED = "repaused"
 SQLITE_BUSY_TIMEOUT_S = 10
 TRIGGER_SCRIPT = "import sys\nfrom cron.jobs import trigger_job\nsys.exit(0 if trigger_job(sys.argv[1]) else 3)\n"
 TRIGGER_TIMEOUT_S = 60
 POLL_S = 20
+HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
+HERMES_TIMEOUT_S = 30
+PAUSE_ARGS = ("cron", "pause")
+PROFILE_FLAG = "-p"
+# `wait`'s optional last word: an unfinished run is the case's result to grade.
+UNFINISHED_IS_RESULT = "result"
 
 
 def _state_path(home):
@@ -92,72 +119,136 @@ def idle(home, job_id, seconds):
         time.sleep(POLL_S)
 
 
+def _paused(job):
+    """The markers `hermes cron pause` writes, which hack/ci_pause_scheduled_audits.py reads too."""
+    return job.get(JOB_STATE) == PAUSED_STATE or bool(job.get(JOB_PAUSED_AT))
+
+
+def _reads_unpaused(home, job_id):
+    """Whether the roster shows `job_id` without a pause; an unreadable roster is not that."""
+    try:
+        return not _paused(_job(home, job_id))
+    except (OSError, ValueError, SystemExit):
+        return False
+
+
+def _read(home):
+    with open(_state_path(home), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def _write(home, state):
     with open(_state_path(home), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
 
 
+def _pause_again(home, state):
+    """Put the pause back that `trigger_job` lifted; best effort, recorded in the state."""
+    if not state.get(STATE_WAS_PAUSED) or state.get(STATE_REPAUSED):
+        return
+    job_id = state[STATE_JOB_ID]
+    try:
+        done = subprocess.run(
+            [HERMES_BIN, PROFILE_FLAG, PROFILE, *PAUSE_ARGS, job_id],
+            capture_output=True, text=True, timeout=HERMES_TIMEOUT_S, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # A hung or missing CLI is no reason for `wait` or `clean` to fail:
+        # the pause is best effort, and the state file is still removed.
+        print(f"WARNING: could not pause {job_id} again: {exc}", file=sys.stderr)
+        return
+    if done.returncode != 0:
+        print(f"WARNING: could not pause {job_id} again: {(done.stderr or done.stdout).strip()}", file=sys.stderr)
+    elif _reads_unpaused(home, job_id):
+        # A scheduler tick that read the store before the pause can write it
+        # back without the markers; left as owed, so `clean` tries again.
+        print(f"WARNING: {job_id} reads un-paused after the pause; the teardown pauses it again", file=sys.stderr)
+    else:
+        state[STATE_REPAUSED] = True
+        print(f"paused {job_id} again, as the eval run had it")
+    _write(home, state)
+
+
 def fire(home, python, job_id):
     job = _job(home, job_id)
-    # `trigger_job` re-enables a disabled or paused job, and nothing here would
-    # put it back; hack/ci_platform_runs.py reads the same three markers.
-    if job.get("enabled") is False or job.get("state") == "paused" or job.get("paused_at"):
-        raise SystemExit(
-            f"the {job_id} job is paused or disabled on this install; resume it before running this case"
-        )
+    was_paused = _paused(job)
+    # `trigger_job` re-enables a disabled job as it lifts a pause. A pause is
+    # put back after the run; a job switched off with no pause on it is the
+    # install's own choice, and nothing here would know to switch it off again.
+    if job.get(JOB_ENABLED) is False and not was_paused:
+        raise SystemExit(f"the {job_id} job is disabled on this install and carries no pause; enable it before running this case")
     fired_at = datetime.now(timezone.utc).isoformat()
-    _write(home, {"job_id": job_id, "fired_at": fired_at})
+    _write(home, {STATE_JOB_ID: job_id, STATE_FIRED_AT: fired_at, STATE_WAS_PAUSED: was_paused, STATE_REPAUSED: False})
     env = {**os.environ, "HERMES_HOME": os.path.join(home, *PROFILE_HOME)}
     done = subprocess.run(
         [python, "-c", TRIGGER_SCRIPT, job_id],
-        env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TRIGGER_TIMEOUT_S,
+        env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TRIGGER_TIMEOUT_S, check=False,
     )
     if done.returncode != 0:
         raise SystemExit(f"trigger_job({job_id}) failed: {(done.stderr or done.stdout).strip()}")
-    print(f"marked {job_id} due at {fired_at}")
+    print(f"marked {job_id} due at {fired_at}{' (it was paused; it is paused again after the run)' if was_paused else ''}")
 
 
-def wait(home, job_id, seconds):
-    with open(_state_path(home), encoding="utf-8") as handle:
-        state = json.load(handle)
-    fired = datetime.fromisoformat(state["fired_at"])
+def wait(home, job_id, seconds, unfinished_is_result=False):
+    state = _read(home)
+    fired = datetime.fromisoformat(state[STATE_FIRED_AT])
     deadline = time.monotonic() + float(seconds)
-    while True:
-        # An occurrence the scheduler dropped is not a run: a `skipped` row, or
-        # a row closed without ever starting (a lost fire claim ends `failed`
-        # with no `started_at`).
-        ours = [
-            run for run in _executions(home, job_id)
-            if run["status"] != SKIPPED and run["started_at"]
-            and run["claimed_at"] and datetime.fromisoformat(run["claimed_at"]) > fired
-        ]
-        if ours and ours[-1]["finished_at"]:
-            run = ours[-1]
-            state.update(last_run_at=run["finished_at"], delivery_outcome=run["delivery_outcome"])
-            _write(home, state)
-            print(f"{job_id} finished at {run['finished_at']}: {run['status']}, {run['delivery_outcome']}")
-            return
-        if time.monotonic() > deadline:
-            raise SystemExit(f"{job_id} did not finish a run within {seconds}s of {state['fired_at']}")
-        time.sleep(POLL_S)
+    try:
+        while True:
+            # An occurrence the scheduler dropped is not a run: a `skipped` row, or
+            # a row closed without ever starting (a lost fire claim ends `failed`
+            # with no `started_at`).
+            ours = [
+                run for run in _executions(home, job_id)
+                if run["status"] != SKIPPED and run["started_at"]
+                and run["claimed_at"] and datetime.fromisoformat(run["claimed_at"]) > fired
+            ]
+            if ours and ours[-1]["finished_at"]:
+                run = ours[-1]
+                state.update(last_run_at=run["finished_at"], delivery_outcome=run["delivery_outcome"])
+                _write(home, state)
+                print(f"{job_id} finished at {run['finished_at']}: {run['status']}, {run['delivery_outcome']}")
+                return
+            if time.monotonic() > deadline:
+                unfinished = f"{job_id} did not finish a run within {seconds}s of {state[STATE_FIRED_AT]}"
+                if not unfinished_is_result:
+                    raise SystemExit(unfinished)
+                # A fired run that nobody claimed, or that never ended, is what
+                # the case asking for this is there to find: a failed apply
+                # would be graded as broken infrastructure, not as that case.
+                print(unfinished, file=sys.stderr)
+                return
+            time.sleep(POLL_S)
+    finally:
+        _pause_again(home, state)
 
 
 def clean(home):
+    try:
+        state = _read(home)
+    except (OSError, ValueError):
+        state = None
+    if state:
+        _pause_again(home, state)
     try:
         os.unlink(_state_path(home))
     except FileNotFoundError:
         pass
 
 
-if __name__ == "__main__":
+def main():
     command, home = sys.argv[1], sys.argv[2]
     if command == "idle":
         idle(home, sys.argv[3], sys.argv[4])
     elif command == "fire":
         fire(home, sys.argv[3], sys.argv[4])
     elif command == "wait":
-        wait(home, sys.argv[3], sys.argv[4])
+        wait(home, sys.argv[3], sys.argv[4], unfinished_is_result=sys.argv[5:] == [UNFINISHED_IS_RESULT])
     elif command == "clean":
         clean(home)
     else:
         raise SystemExit(f"unknown command {command!r}")
+
+
+if __name__ == "__main__":
+    main()
