@@ -1036,6 +1036,10 @@ class Fold:
         every post otherwise. A post a later edit rewrote (the status
         placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
+        # A window that held only relayed reports is still this task's
+        # window: falling back to every post would grade an earlier task's.
+        if not windowed and any(report["inWindow"] for report in self.reports):
+            return []
         return windowed or self.posts
 
     @property
@@ -1139,6 +1143,12 @@ class Fold:
         text = str(entry.get("text") or "")
         entry_message_id = str(entry.get("messageId") or "")
 
+        if kind == ENTRY_EDIT and entry.get(ENTRY_REPORT_FIELD) is True and any(
+            post["messageId"] == entry_message_id for post in self.posts
+        ):
+            # An edit marked report on an ordinary post still rewrites it.
+            if entry_message_id:
+                self.edited.add(entry_message_id)
         if kind in (ENTRY_POST, ENTRY_EDIT) and entry.get(ENTRY_REPORT_FIELD) is True:
             self.reports.append({
                 "kind": kind, "messageId": entry_message_id, "text": text,

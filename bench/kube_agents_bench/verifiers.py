@@ -1065,6 +1065,11 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
         name = str(entry.get("name") or "")
         if not isinstance(result, str) or name.startswith(_KANBAN_TOOL_PREFIX):
             continue
+        # A card's report relayed onto the conversation (the inject door's
+        # `report` posts) is a worker's own words too, as a kanban result is.
+        args = entry.get("args")
+        if isinstance(args, dict) and args.get("report") is True:
+            continue
         if result == _WITHHELD_RESULT:
             withheld.append(f"a {name or 'tool'} result was withheld")
             continue

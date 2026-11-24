@@ -2367,6 +2367,27 @@ def test_a_relayed_report_is_never_this_task_s_answer() -> None:
     assert "inj-2" not in fold.edited
 
 
+def test_a_window_with_only_a_report_does_not_fall_back_to_an_earlier_task() -> None:
+    """With this task's marker seen and only a relayed report in its window,
+    the answer is empty, not the earlier task's post."""
+    fold = inject.Fold("task-two")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="first answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_TASK, taskId="task-two"))
+    fold.apply(entry(4, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True))
+    assert fold.deliverable == ""
+    assert fold.window_posts == []
+
+
+def test_an_edit_marked_report_on_an_ordinary_post_still_rewrites_it() -> None:
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="Working on it...", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_EDIT, text="card report", messageId="inj-1", report=True))
+    fold.apply(entry(4, inject.ENTRY_POST, text="answer", messageId="inj-2"))
+    assert fold.deliverable == "answer"
+
+
 def test_a_post_marked_report_false_is_an_ordinary_post() -> None:
     """Only a true `report` sets a post aside; anything else is read as before."""
     fold = inject.Fold("task-one")
