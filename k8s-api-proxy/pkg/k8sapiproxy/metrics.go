@@ -176,8 +176,11 @@ var (
 		ReasonSubresourceBlocked:       {},
 		ReasonDryRunRequired:           {},
 		ReasonVerbBlocked:              {},
+		ReasonStreamingBlocked:         {},
 		ReasonExcludedCluster:          {},
 		ReasonExcludeUnreadable:        {},
+		ReasonHeldCluster:              {},
+		ReasonHoldUnreadable:           {},
 	}
 
 	knownOutcomes = map[string]struct{}{

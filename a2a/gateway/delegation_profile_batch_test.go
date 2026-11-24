@@ -616,6 +616,22 @@ func TestAProfileParentThatEndsCancelsItsSingleLiveChild(t *testing.T) {
 		_, stop := dispatchStopFor(t, r.url, "cluster", child.TaskID)
 		return cancelled && stop
 	})
+	// The cancelled child no longer holds the conversation: it's detached,
+	// as a stop detaches it, so the next turn is a new task, not a steer.
+	waitForRecord(t, r, conv, "the cancelled child detached", func(rec *SessionRecord) bool {
+		return rec.ActiveTask == nil || (rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached)
+	})
+	next := profileTurn(conv, "chat", nil)
+	next.Backend, next.AuthorID, next.MessageID, next.Text = consoleBackend, consoleAuthor, "after-cancel", "look again"
+	r.adapter.inbox <- next
+	waitFor(t, "a new task for the next turn, not a steer into the cancelled child", func() bool {
+		for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"chat.>") {
+			if e.env.TaskID != origin.TaskID && e.env.TaskID != child.TaskID {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // TestABatchChildUnderAConfirmedParentCarriesItsChangeRequest: each batch
@@ -667,7 +683,7 @@ func TestAnUnsentBatchChildEndIsSentAgainByTheHeal(t *testing.T) {
 	conv := "console:tab-profile-batch-unsent"
 	_, origin, kids := profileBatchParent(t, r, conv, "a", "b")
 	// The parent's .in stops being stored, so the publish fails.
-	restore := withoutTaskInSubject(t, r.url, "chat", origin.TaskID)
+	restore := withoutProfileParentIn(t, r.url)
 	completeChild(t, r, kids[0], "a is fine")
 	waitForRecord(t, r, conv, "a's end recorded unsent", func(rec *SessionRecord) bool {
 		k, ok := rec.TaskRefFor(kids[0].TaskID)
@@ -722,9 +738,10 @@ func TestAMissedBatchChildTerminalIsHealedForAProfileParent(t *testing.T) {
 	})
 }
 
-// withoutTaskInSubject stops TASKS storing one task's .in, so a publish to
-// it fails, and returns the function that puts it back.
-func withoutTaskInSubject(t *testing.T, url, addressee, taskID string) func() {
+// withoutProfileParentIn stops TASKS storing any .in but the cluster
+// profile's, so a publish to a chat parent's .in fails, and returns the
+// function that puts the subjects back.
+func withoutProfileParentIn(t *testing.T, url string) func() {
 	t.Helper()
 	nc, err := connectTest(url)
 	if err != nil {
@@ -752,6 +769,66 @@ func withoutTaskInSubject(t *testing.T, url, addressee, taskID string) func() {
 		defer cancel()
 		if _, err := js.UpdateStream(ctx, orig); err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+// TestAWithdrawnProfileBatchSendsAnUnsentEndAsRecorded: an entry whose end
+// was recorded but couldn't be sent before its batch was withdrawn gets that
+// end, not a generic failure, since the withdrawal drops the child from the
+// record and the heal would never find it again.
+func TestAWithdrawnProfileBatchSendsAnUnsentEndAsRecorded(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-withdrawn-unsent"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	first := submissionOn(t, r, "cluster")
+	restore := withoutProfileParentIn(t, r.url)
+	completeChild(t, r, first, "a is fine")
+	waitForRecord(t, r, conv, "a's end recorded unsent", func(rec *SessionRecord) bool {
+		k, ok := rec.TaskRefFor(first.TaskID)
+		return ok && k.BatchEnd != nil && k.BatchEnd.Unsent
+	})
+	restore()
+	r.g.profiles.put("cluster", nil)
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "an end for each entry", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) >= 2 })
+	time.Sleep(200 * time.Millisecond)
+	got := childResultsOn(t, r, "chat", origin.TaskID)
+	if len(got) != 2 {
+		t.Fatalf("%d ends, want one per entry: %+v", len(got), got)
+	}
+	for _, c := range got {
+		switch c.Entry {
+		case 1:
+			if c.ChildTaskID != first.TaskID || c.State != lib.StateCompleted || c.Text != "a is fine" {
+				t.Fatalf("entry 1's end = %+v, want a's recorded completed end", c)
+			}
+		case 2:
+			if c.State != lib.StateFailed || c.ChildTaskID != "" {
+				t.Fatalf("entry 2's end = %+v, want failed with no child", c)
+			}
+		default:
+			t.Fatalf("an end for entry %d", c.Entry)
 		}
 	}
 }

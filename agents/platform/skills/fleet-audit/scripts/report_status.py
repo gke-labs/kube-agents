@@ -99,6 +99,28 @@ LATEST_KEYS = (
     "collect_s",
 )
 
+# A shadow run's envelope carries this (#5623; audit_report.py's shadow runs,
+# `finish --store-only`): its stream is a canary's, not a live audit's, so
+# readers hide it unless asked. The writer's contract is what makes reading
+# the newest envelope enough: a shadow run writes only to a stream of its
+# own (the schedule's name, or `<audit>-shadow`) and never to a live audit's,
+# which its writer refuses, so a stream's newest envelope says what the
+# whole stream is.
+SHADOW_KEY = "shadow"
+
+
+def stream_is_shadow(stream: dict) -> bool:
+    """Whether a projected stream is a shadow run's: its newest envelope in any repository says so.
+
+    A stream whose envelopes can't be read can't be told apart, and stays in
+    as unreadable: unknown is never clean.
+    """
+    return any(
+        isinstance(entry, dict) and (entry.get("latest") or {}).get(SHADOW_KEY) is True
+        for entry in (stream.get("repos") or {}).values()
+    )
+
+
 # Keys the projection never carries. `document` is the whole findings document
 # and runs to megabytes; `ledger_body` is the rendered issue body, which is
 # `finish`'s memory and not a status; the three id lists are summarised as
@@ -503,12 +525,18 @@ def project(
     root: str | None = None,
     now: float | datetime | None = None,
     scratch: str | None = None,
+    *,
+    include_shadow: bool = False,
 ) -> dict:
     """The whole store as one document the view can render off-pod.
 
     One unreadable stream may not cost the others, so each stream's reads are
     wrapped and a failure becomes that stream's `error` plus `liveness:
     "error"` while the sweep continues.
+
+    A shadow run's stream (`stream_is_shadow`) is left out unless
+    `include_shadow`, so nothing that reports the fleet's audits shows a
+    canary's results as a live audit's; `shadow_hidden` counts what was left out.
     """
     if not isinstance(root, BrokerReportStore):
         root = reports_root(root)
@@ -533,6 +561,16 @@ def project(
     except OSError as exc:
         in_flight, lease_error = [], _failure(f"{scratch}/", exc)
     ids = sorted(set(ids) | set(in_flight))
+    streams = {
+        audit_id: project_stream(root, scratch, audit_id, now_epoch, lease_error)
+        for audit_id in ids
+    }
+    hidden = 0
+    if not include_shadow:
+        shadow = [audit_id for audit_id, stream in streams.items() if stream_is_shadow(stream)]
+        for audit_id in shadow:
+            del streams[audit_id]
+        hidden = len(shadow)
     return {
         "root": str(root),
         "root_exists": root_exists,
@@ -543,10 +581,8 @@ def project(
         # stream to carry it, and a first run in flight is exactly what the
         # unlisted scratch directory would have shown.
         "lease_error": lease_error,
-        "streams": {
-            audit_id: project_stream(root, scratch, audit_id, now_epoch, lease_error)
-            for audit_id in ids
-        },
+        "streams": streams,
+        "shadow_hidden": hidden,
     }
 
 
@@ -1289,10 +1325,20 @@ def main(argv: list[str] | None = None) -> int:
         "--scratch",
         help=f"in-flight note directory (default: $FLEET_AUDIT_SCRATCH_DIR or {SCRATCH_DIR})",
     )
+    parser.add_argument(
+        "--include-shadow",
+        action="store_true",
+        help="also project shadow runs' streams (a canary's, not a live audit's)",
+    )
     args = parser.parse_args(argv)
     # Exit 0 even with no store: `root_exists: false` is the answer, and the
     # view decides what a missing store costs.
-    print(json.dumps(project(report_store(args.root), scratch=args.scratch), sort_keys=True))
+    print(
+        json.dumps(
+            project(report_store(args.root), scratch=args.scratch, include_shadow=args.include_shadow),
+            sort_keys=True,
+        )
+    )
     return 0
 
 

@@ -801,13 +801,14 @@ func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord
 // was withdrawn (it was cut short, or a child couldn't reach the bus) and
 // had no end yet, so a parent counting its batch's ends isn't left waiting
 // for children that never ran. ended is the entries whose child had already
-// ended, and been sent, before the withdrawal (endedBatchEntries); they get
-// nothing more. Each other end is failed with why. A child still on the
+// ended before the withdrawal (endedBatchEntries): one whose end was sent gets
+// nothing more, and one recorded Unsent is sent its recorded end. Each
+// other end is failed with why. A child still on the
 // record after withdrawBatch is one whose cancel couldn't be sent, so it
 // may still run: its end names it. The rest name only the entry. A parent
 // that isn't a profile task is left alone; a session parent is woken by
 // nothing for a batch that minted nothing.
-func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionRecord, taskID string, size int, why string, ended map[int]bool) {
+func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionRecord, taskID string, size int, why string, ended map[int]TaskRef) {
 	parent, ok := rec.TaskRefFor(taskID)
 	if !ok || parent.Tier == "" || !g.profileParentListens(ctx, &parent, "") {
 		return
@@ -817,7 +818,14 @@ func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionReco
 		kept[k.BatchIndex] = k
 	}
 	for i := 1; i <= size; i++ {
-		if ended[i] {
+		if k, done := ended[i]; done {
+			// Its end was recorded before the withdrawal. One the parent
+			// never got (Unsent) is sent now, as it was recorded: the
+			// withdrawal drops the child from the record, so the heal
+			// would never find it again.
+			if k.BatchEnd.Unsent {
+				g.sendChildResult(ctx, rec, parent, k, k.BatchEnd.State, k.BatchEnd.Text, k.BatchEnd.Text)
+			}
 			continue
 		}
 		child, ok := kept[i]

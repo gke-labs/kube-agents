@@ -33,7 +33,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -98,27 +97,6 @@ const (
 	// pod (lib.EnvProfileExecutor), which reaches clusters its own way.
 	noClusterPrompt = "You have no access to any cluster or the fleet on this turn, and this pod's files and environment hold no cluster credentials or tools, so don't search them for any. When an ask needs a cluster, delegate it if you can; otherwise say plainly that you can't reach it from here."
 
-	// strictMCPConfigFlag makes the harness load MCP servers from
-	// --mcp-config only, ignoring .mcp.json in the cwd and the user config's
-	// servers. Without --mcp-config it means no MCP servers at all. Every
-	// argv carries it: in a reused pod the cwd (/scratch) and the config dir
-	// have hosted an earlier turn's harness, which had Write.
-	strictMCPConfigFlag = "--strict-mcp-config"
-	// settingSourcesFlag and adapterSettingSources: the harness reads
-	// settings only from the user source ($CLAUDE_CONFIG_DIR, where the image
-	// puts the persona's CLAUDE.md and skills, which load under that source
-	// and no other) plus the flag and managed sources it always reads. The
-	// project and local sources, .claude/ under the cwd, are where an earlier
-	// turn's Write could leave hooks, permissions or env for the next turn's
-	// harness; the adapter puts nothing there.
-	settingSourcesFlag    = "--setting-sources"
-	adapterSettingSources = "user"
-	// The user source's file (harnessUserSettings): the harness reads
-	// settings.json in $CLAUDE_CONFIG_DIR, which defaults to ~/.claude.
-	claudeConfigDirEnv     = "CLAUDE_CONFIG_DIR"
-	claudeDefaultConfigDir = ".claude"
-	claudeUserSettingsFile = "settings.json"
-
 	// delegateToolID is the MCP-qualified tool name the harness's
 	// --allowedTools expects: "mcp__" + server name + "__" + tool name
 	// (worker-adapter/mcp.go names both halves so this can't drift from the
@@ -141,18 +119,6 @@ const (
 		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can. " +
 		"When the person wants a change made, applied or opened as a pull request, and `platform` is listed, hand the whole ask to `platform` in the turn it arrives, with the reads it depends on, unless they named another agent: one handoff is the shorter path, and `platform` makes those reads itself. " +
 		"A fix you are only asked to propose is not a change: write it in your reply."
-
-	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey
-	// is not a credential: the gateway here runs keyless and the harness only
-	// checks that the variable is non-empty.
-	defaultModelBaseURL = "http://inference-gateway"
-	defaultModelAPIKey  = "a2a-playground" // #nosec G101 -- placeholder, not a secret
-
-	// The env names that tell the harness how to reach the model.
-	modelBaseURLEnv   = "ANTHROPIC_BASE_URL"
-	modelAPIKeyEnv    = "ANTHROPIC_API_KEY"    // #nosec G101 -- env name, not a credential
-	modelAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN" // #nosec G101 -- env name, not a credential
-	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
 func main() {
@@ -226,10 +192,8 @@ func run() int {
 
 	if os.Getenv(lib.EnvProfileWorker) == "true" {
 		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
-		harness := persona.Harness(os.Getenv(lib.EnvProfileHarness))
-		if harness == "" {
-			harness = persona.ClaudeCode
-		}
+		// The harness configFromEnv selected: its driver names it.
+		harness := cfg.Driver.Harness()
 		cfg = profileModeConfig(cfg)
 		requireIntegrity, err := workeradapter.ParsePersonaIntegrity(os.Getenv(lib.EnvPersonaIntegrity))
 		if err != nil {
@@ -259,6 +223,15 @@ func run() int {
 			return 1
 		}
 		return 0
+	}
+
+	// The session's shipped persona and skills, checked against their
+	// build-time manifest before the harness first runs.
+	if dir := harnessConfigDir(); dir != "" {
+		if err := workeradapter.CheckSessionHome(dir, log); err != nil {
+			log.Error("session worker failed", "err", err)
+			return 1
+		}
 	}
 
 	res, err := workeradapter.Run(ctx, cfg)
@@ -359,6 +332,16 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		return workeradapter.Config{}, false
 	}
 
+	harness, driver, builder, err := selectHarness(os.Getenv)
+	if err != nil {
+		log.Error("the worker's harness is not one it can run; set "+lib.EnvHarness+" to "+string(persona.ClaudeCode)+" or leave it unset",
+			lib.EnvHarness, os.Getenv(lib.EnvHarness), lib.EnvProfileHarness, os.Getenv(lib.EnvProfileHarness), "err", err)
+		return workeradapter.Config{}, false
+	}
+	// Chosen before anything below builds an argv or env from it.
+	activeHarness = builder
+	log.Info("harness selected", "harness", string(harness))
+
 	originSeq, originSeqStated := originSeq(log)
 	// delegateSocket feeds Config.DelegateSocket (commented in adapter.go):
 	// it answers only the tool's own switch and knows nothing of
@@ -392,6 +375,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		CapabilityOptional: capability.OptionalFromEnv(),
 		OriginSeq:          originSeq,
 		OriginSeqStated:    originSeqStated,
+		Driver:             driver,
 		HarnessCommand:     harnessCommand(),
 		HarnessEnv:         harnessEnv(),
 		// Removed before each turn of a reused pod; see the field's comment.
@@ -419,7 +403,7 @@ func harnessCommand() []string {
 	}
 	path := os.Getenv("A2A_HARNESS_PATH")
 	if path == "" {
-		path = workeradapter.DefaultHarnessPath
+		path = activeHarness.defaultPath()
 	}
 	model := os.Getenv("A2A_MODEL")
 	if model == "" {
@@ -474,45 +458,24 @@ func harnessCommand() []string {
 		allowed += "," + delegateToolID
 		prompts = append(prompts, delegatePrompt)
 	}
-	argv := []string{
-		path,
-		"--print",
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--model", model,
-		"--max-turns", maxTurns,
-		"--allowedTools", allowed,
-		"--disallowedTools", disallowed,
-		settingSourcesFlag, adapterSettingSources,
-		// With or without the delegate tool: a wake's argv has no
-		// --mcp-config, and without this flag it would load whatever MCP
-		// config an earlier turn in the same pod left on disk.
-		strictMCPConfigFlag,
+	spec := harnessSpec{
+		path:       path,
+		model:      model,
+		maxTurns:   maxTurns,
+		tools:      true,
+		allowed:    allowed,
+		disallowed: disallowed,
+		prompts:    prompts,
+		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
-		// and speaks MCP to it over stdio; strictMCPConfigFlag above keeps a
-		// stray project or user MCP config from adding tools the gateway
-		// never vetted.
-		self := selfPath()
-		sock := workeradapter.DelegateSocketPath()
-		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
-			workeradapter.DelegateMCPServer: map[string]any{
-				"command":               self,
-				"args":                  []string{"mcp"},
-				workeradapter.MCPEnvKey: map[string]string{workeradapter.EnvDelegateSocket: sock},
-			},
-		}})
-		argv = append(argv, workeradapter.MCPConfigFlag, string(mcpCfg))
+		// and speaks MCP to it over stdio; the builder keeps any other MCP
+		// config the harness might find from adding tools the gateway never
+		// vetted.
+		spec.delegate = &delegateServer{command: selfPath(), socket: workeradapter.DelegateSocketPath()}
 	}
-	if len(prompts) > 0 {
-		argv = append(argv, "--append-system-prompt", strings.Join(prompts, "\n\n"))
-	}
-	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
-		argv = append(argv, strings.Fields(extra)...)
-	}
-	return argv
+	return activeHarness.command(spec)
 }
 
 // profileHarnessCommand is a profile worker's base argv: the harness over the
@@ -527,7 +490,7 @@ func profileHarnessCommand() []string {
 	}
 	path := os.Getenv("A2A_HARNESS_PATH")
 	if path == "" {
-		path = workeradapter.DefaultHarnessPath
+		path = activeHarness.defaultPath()
 	}
 	model := os.Getenv("A2A_MODEL")
 	if model == "" {
@@ -537,19 +500,12 @@ func profileHarnessCommand() []string {
 	if maxTurns == "" {
 		maxTurns = defaultMaxTurns
 	}
-	argv := []string{
-		path,
-		"--print",
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--model", model,
-		"--max-turns", maxTurns,
-	}
-	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
-		argv = append(argv, strings.Fields(extra)...)
-	}
-	return argv
+	return activeHarness.command(harnessSpec{
+		path:     path,
+		model:    model,
+		maxTurns: maxTurns,
+		extra:    strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+	})
 }
 
 // delegateToolEnabled is the delegate tool's single switch: everything that
@@ -578,18 +534,16 @@ func harnessCommandWithoutDelegate() []string {
 }
 
 // harnessUserSettings is the settings file the harness reads for its user
-// source: settings.json in $CLAUDE_CONFIG_DIR, else in ~/.claude. "" when
-// neither is known.
+// source, removed before each turn of a reused pod, or "" when there is none
+// to find.
 func harnessUserSettings() string {
-	dir := os.Getenv(claudeConfigDirEnv)
-	if dir == "" {
-		home := os.Getenv("HOME")
-		if home == "" {
-			return ""
-		}
-		dir = filepath.Join(home, claudeDefaultConfigDir)
-	}
-	return filepath.Join(dir, claudeUserSettingsFile)
+	return activeHarness.userSettings(os.Getenv)
+}
+
+// harnessConfigDir is the harness's config directory: $CLAUDE_CONFIG_DIR,
+// else ~/.claude. "" when neither is known.
+func harnessConfigDir() string {
+	return claudeConfigDir(os.Getenv)
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare
@@ -658,34 +612,7 @@ func harnessEnv() []string {
 		}
 		env = append(env, kv)
 	}
-	has := func(key string) bool {
-		return os.Getenv(key) != ""
-	}
-	if !has(modelBaseURLEnv) && !has(modelUseVertexEnv) && !has(modelAPIKeyEnv) {
-		env = append(env, modelBaseURLEnv+"="+defaultModelBaseURL)
-	}
-	// The gateway runs keyless. The placeholder only satisfies the harness's
-	// "an API key exists" check. The adapter adds it here, in the child env,
-	// also when the pod sets ANTHROPIC_BASE_URL (an AgentProfile worker sets
-	// the full gateway name). Thus a pod spec does not need a literal model
-	// key, which the AI workload audit flags (fleet-audit check 3.5,
-	// model-credential-plaintext-env). Vertex and a bearer token do not use
-	// the key, so the adapter does not add it.
-	if !has(modelAPIKeyEnv) && !has(modelUseVertexEnv) && !has(modelAuthTokenEnv) {
-		env = append(env, modelAPIKeyEnv+"="+defaultModelAPIKey)
-	}
-	for _, kv := range []string{
-		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-		"DISABLE_AUTOUPDATER=1",
-		"DISABLE_TELEMETRY=1",
-		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-	} {
-		key := kv[:strings.Index(kv, "=")]
-		if !has(key) {
-			env = append(env, kv)
-		}
-	}
-	return env
+	return activeHarness.env(env, func(key string) bool { return os.Getenv(key) != "" })
 }
 
 // originSeq reads the submission's stream sequence from the pod env, and
@@ -757,4 +684,36 @@ func selfPath() string {
 		return "/usr/local/bin/worker-adapter"
 	}
 	return self
+}
+
+// selectHarness picks the pod's harness: lib.EnvHarness, else on a profile
+// worker lib.EnvProfileHarness (its older name), else Claude Code. It returns
+// the harness's stream driver and argv builder. A value the worker doesn't
+// know is an error, never a fall back to Claude Code: a typo would otherwise
+// run the wrong harness without a word.
+func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.Driver, harnessBuilder, error) {
+	h := persona.Harness(getenv(lib.EnvHarness))
+	if h == "" && getenv(lib.EnvProfileWorker) == "true" {
+		h = persona.Harness(getenv(lib.EnvProfileHarness))
+	}
+	driver, err := workeradapter.DriverFor(h)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	builder, err := builderFor(driver.Harness())
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return driver.Harness(), driver, builder, nil
+}
+
+// builderFor is the argv and env builder for a harness that has a driver. A
+// harness with a driver but no builder is an error, never Claude Code's
+// argv and env under another harness's driver.
+func builderFor(h persona.Harness) (harnessBuilder, error) {
+	switch h {
+	case persona.ClaudeCode:
+		return claudeBuilder{}, nil
+	}
+	return nil, fmt.Errorf("harness %q has no argv builder", h)
 }

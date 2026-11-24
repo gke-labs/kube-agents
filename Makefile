@@ -45,7 +45,7 @@ HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v))
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check recipe-new recipe-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -217,6 +217,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
+	$(wildcard agents/platform/scripts/fix_recipes/*/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
@@ -894,6 +895,19 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 	}
 	@python3 scripts/validate_bench_cases.py
 
+# The fix recipes (agents/platform/scripts/fix_recipes/). recipe-check flags a
+# change that edits a recipe and the shared plumbing beside it when given
+# RECIPE_CHECK_BASE, the commit to compare against; CI passes the pull
+# request's base.
+RECIPE_CHECK_BASE ?=
+recipe-new: ## Scaffold a fix recipe: make recipe-new KIND=<audit check id>.
+	@test -n "$(KIND)" || { echo "usage: make recipe-new KIND=<audit check id>"; exit 1; }
+	@python3 scripts/recipe_new.py "$(KIND)"
+
+recipe-check: ## Validate every fix recipe: it loads, its eval case names it back, no scaffold line is left.
+	@python3 -c "import yaml" 2>/dev/null || { echo "recipe-check needs PyYAML: python3 -m pip install pyyaml"; exit 1; }
+	@python3 scripts/check_recipes.py $(if $(RECIPE_CHECK_BASE),--base "$(RECIPE_CHECK_BASE)")
+
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
 # The tier now gates: tests/integration is in PYTHON_TEST_DIRS, so `make
@@ -944,7 +958,7 @@ skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG=
 skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
 	@$(SKILL_OVERLAY) generate $(SKILL)
 
-skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line, and every shipped skill document fits skill_view.
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line and a Retire-When line in one of its three forms, and every shipped skill document fits skill_view.
 	@$(SKILL_OVERLAY) check
 	@python3 scripts/check_skill_size.py
 

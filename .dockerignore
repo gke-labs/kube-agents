@@ -25,6 +25,7 @@ __pycache__/
 *.pyd
 .pytest_cache/
 node_modules/
+**/node_modules/
 .venv/
 venv/
 # `terraform init` writes provider plugins to `.terraform/`, about 436M on a tree

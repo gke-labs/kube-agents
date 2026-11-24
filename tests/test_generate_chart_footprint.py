@@ -942,6 +942,51 @@ def _a2a_gateway_env(docs):
     raise AssertionError("the A2A gateway container is not in the golden")
 
 
+class TeamsInboundFootprintTest(unittest.TestCase):
+    """One Teams inbound receiver pod, read from the operator's fixed resource constants,
+    the source the operator itself renders the pod from."""
+
+    _GO = """package controller
+
+const (
+	teamsInboundCPURequest    = "{cpu_req}"
+	teamsInboundMemoryRequest = "64Mi"
+	teamsInboundCPULimit      = "200m"
+	teamsInboundMemoryLimit   = "128Mi"
+)
+"""
+
+    def test_the_entry_is_the_operators_constants(self):
+        data = gcf.extract_footprint()
+        self.assertNotIn("teamsInboundReceiver", data["operatorRendered"])
+        entry = data["operatorRenderedPerReplica"]["teamsInboundReceiver"]
+        text = gcf._TEAMS_INBOUND_SOURCE.read_text()
+        for (section, key), name in gcf._TEAMS_INBOUND_CONSTANTS.items():
+            match = re.search(name + r'\s*=\s*"([^"]+)"', text)
+            self.assertIsNotNone(match, name)
+            self.assertEqual(entry[section][key], match.group(1), name)
+        self.assertEqual(entry["pods"], 1)
+        self.assertEqual(entry["cpuMillisRequest"], gcf.parse_cpu_millis(entry["requests"]["cpu"]))
+        self.assertEqual(entry["memoryBytesLimit"], gcf.parse_bytes(entry["limits"]["memory"]))
+        self.assertEqual(entry["ephemeralStorageBytesRequest"], 0)
+        self.assertEqual(entry["ephemeralStorageBytesLimit"], 0)
+
+    def test_a_changed_constant_moves_the_entry(self):
+        """The entry follows the source, not a copy of today's numbers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp) / "platformagent_teams_inbound.go"
+            source.write_text(self._GO.format(cpu_req="75m"))
+            self.assertEqual(gcf._teams_inbound_entry(source)["cpuMillisRequest"], 75)
+
+    def test_a_missing_constant_fails_rather_than_counting_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp) / "platformagent_teams_inbound.go"
+            source.write_text("package controller\n")
+            with self.assertRaises(ValueError) as caught:
+                gcf._teams_inbound_entry(source)
+            self.assertIn("teamsInboundCPURequest", str(caught.exception))
+
+
 class SessionPodFootprintTest(unittest.TestCase):
     """#6028: one session pod, read from the session env the operator renders on the
     A2A gateway, the source the gateway itself sizes the pods from."""

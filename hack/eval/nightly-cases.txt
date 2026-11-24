@@ -1473,6 +1473,13 @@
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
 
+# A question about the agent's own cluster while spec.hold holds it: the
+# answer reports the hold and its reason and lists no pod. The runner holds the
+# host cluster for this case's repetitions alone, after every other unit, and
+# restores the hold after them (scope_hold); deployer: noop, read-only, no
+# seeded fleet.
+./tasks/scope-held-cluster-is-reported/task.yaml
+
 # #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
 # stack plants two namespaces exporting one host everywhere and two exporting
 # another to themselves only, on the host cluster, installing a minimal
@@ -1667,6 +1674,20 @@
 # per seeded cluster (the three slot roles beside the planted one tell a
 # missed cluster from an absent one). Nightly from its first merge.
 ./tasks/upgrades-readiness-changed-defaults/task.yaml
+
+# The explicit question behind the readiness report's `answered` list: which
+# fail-closed admission webhooks the readiness check tested, and whether each
+# one's backend answered. The fleet-upgrade-verification report names a webhook
+# with an unreachable backend in its table and one whose backend answered in
+# its JSON, so the names come from the run; the route check, the same as
+# upgrades-fleet-readiness-failclosed-webhook's, fails a hand survey of webhook
+# configurations. The case grades the planted gate's line as "backend: missing"
+# (seeded-b, role readiness-failclosed-webhook) and requires one webhook line
+# with "backend: ready"; it names no live webhook, because the fleet plants
+# none and GKE's own give one on a seeded cluster. Read-only chat prompt;
+# deployer: noop, no lock. Nightly from its first merge; a presubmit seat is a
+# later pull request that cites its record.
+./tasks/upgrades-readiness-checked-webhooks-named/task.yaml
 
 # Catalogue entry 10 through the readiness report's client-addon-skew rule:
 # stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0
