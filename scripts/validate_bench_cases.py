@@ -596,6 +596,13 @@ FIXTURE_NOT_READY = {
     # 2027-02-17. The entry goes in the pull request that moves the case to
     # the nightly file on that date, once the fixture-state scan reads both
     # roles ready on every pool project.
+    # Needs a Deployment with a name of 47 characters or more whose live pod is
+    # idle and whose replaced pod, inside the seven-day window, was busy. No
+    # planted Deployment with a long name has a replaced pod.
+    "cost-long-name-replaced-pod-window": (
+        "#7048: needs the long-name-replaced-pod role, a long-named Deployment with an idle live pod "
+        "and a busy pod replaced inside the audit's seven-day window; no pool project carries one"
+    ),
     "compute-declared-intent-no-finding": (
         "#1408: needs the declared-orphan-snapshot and orphan-snapshot roles past their "
         "91-day age gate (bench/tf/fleet/fixtures.json ready_after_hours); the pool's "
