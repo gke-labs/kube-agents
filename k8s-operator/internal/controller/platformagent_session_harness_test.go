@@ -4,9 +4,13 @@ import (
 	"context"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -96,5 +100,42 @@ func TestAnUnsupportedSessionHarnessIsReportedAndClears(t *testing.T) {
 		if c := meta.FindStatusCondition(agent.Status.Conditions, sessionHarnessCondition); c != nil {
 			t.Errorf("after %+v the condition stays: %+v", fixed, c)
 		}
+	}
+}
+
+// TestASessionHarnessWarningIsRecordedOnceEvenWhenItsWriteConflicts: the
+// Warning event goes out only once the condition is stored, so a status
+// write that conflicts (another writer in the same pass) doesn't repeat it
+// on the next pass. Seen live: two events before this.
+func TestASessionHarnessWarningIsRecordedOnceEvenWhenItsWriteConflicts(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	if agent.Spec.Harness == nil {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+	}
+	agent.Spec.Harness.SessionWorker = &agentv1alpha1.SessionWorkerSpec{Type: "antigravity"}
+	conflicts := 1
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if conflicts > 0 {
+				conflicts--
+				return apierrors.NewConflict(schema.GroupResource{Resource: "platformagents"}, obj.GetName(), nil)
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		}}).Build()
+	rec := record.NewFakeRecorder(16)
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: rec}
+	ctx := context.Background()
+	if err := r.syncSessionHarness(ctx, agent); err == nil {
+		t.Fatal("the conflicting write reported no error")
+	}
+	// The next pass reads the object as stored: without the condition.
+	meta.RemoveStatusCondition(&agent.Status.Conditions, sessionHarnessCondition)
+	if err := r.syncSessionHarness(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Events) != 1 {
+		t.Errorf("%d Warning events, want one", len(rec.Events))
 	}
 }

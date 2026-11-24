@@ -9811,8 +9811,8 @@ func a2aSessionHarness(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // syncSessionHarness writes the SessionHarness condition: False with
-// reason SessionHarnessNotSupported, and a Warning event when it is first
-// written, while the spec names a session harness this operator doesn't
+// reason SessionHarnessNotSupported, and a Warning event once it is first
+// stored, while the spec names a session harness this operator doesn't
 // render; removed once the value is supported or unset.
 func (r *PlatformAgentReconciler) syncSessionHarness(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	t := a2aSessionHarnessSpec(agent)
@@ -9831,8 +9831,14 @@ func (r *PlatformAgentReconciler) syncSessionHarness(ctx context.Context, agent 
 	}) {
 		return nil
 	}
+	// The event only once the condition is stored: a write that conflicts
+	// leaves the condition unstored, so the next pass would read it as
+	// first and warn again.
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
 	if first {
 		r.recordEvent(agent, "Warning", sessionHarnessReasonNotSupported, msg)
 	}
-	return r.Status().Update(ctx, agent)
+	return nil
 }
