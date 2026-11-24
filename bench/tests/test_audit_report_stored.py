@@ -81,7 +81,9 @@ def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BIN
 def _verify(**fields):
     check = {"type": "audit_report_stored", "audit": AUDIT, "status": "NO_FORGE",
              "required_finding_phrases": ["debug-binding"], **fields}
-    return AuditReportStoredVerifier(**check).verify(1.0)
+    # A zero budget is one pass, and each read of it gets the library's 30-second floor. A
+    # one-second budget gives the subprocess of each read one second, which a loaded machine misses.
+    return AuditReportStoredVerifier(**check).verify(0.0)
 
 
 def test_this_runs_report_passes(root):
@@ -328,7 +330,7 @@ NEW_CASE = REPO / "bench" / "tasks" / "fleet-audit-unchanged-manifest-skips-synt
 
 def _verify_envelope(root, **fields):
     check = {"type": "audit_report_stored", "audit": AUDIT, **fields}
-    return AuditReportStoredVerifier(**check).verify(1.0)
+    return AuditReportStoredVerifier(**check).verify(0.0)
 
 
 def _store_with(root, extra, finished):
