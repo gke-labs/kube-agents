@@ -62,8 +62,85 @@ func TestARefusedProfileParentIsToldOnItsIn(t *testing.T) {
 		got = refusalsOn(t, r, "prod-east", taskID)
 		return len(got) > 0
 	})
-	if len(got) != 1 || !strings.HasPrefix(got[0].Text, noticeDelegationRefusedFor) || !strings.Contains(got[0].Text, want) {
-		t.Fatalf("refusals on the parent's .in = %+v, want one naming %q", got, want)
+	// A first refusal is untagged: it ends the parent's wait.
+	if len(got) != 1 || got[0].Repeat || !strings.HasPrefix(got[0].Text, noticeDelegationRefusedFor) || !strings.Contains(got[0].Text, want) {
+		t.Fatalf("refusals on the parent's .in = %+v, want one untagged naming %q", got, want)
+	}
+}
+
+// TestABusyRefusedProfileParentIsToldOnItsIn: the conversation's one live
+// child belongs to another task, so the profile parent's first request is
+// refused busy (delegation.busy), and that refusal reaches its .in untagged,
+// as every other first refusal does.
+func TestABusyRefusedProfileParentIsToldOnItsIn(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-busy"
+	parent, taskID := startProfileParent(t, r, conv)
+	const live = "busy-child-1"
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		rec.Tasks = append(rec.Tasks, TaskRef{ID: live, Role: taskRoleChild, Addressee: "cluster"})
+	})
+	r.g.mu.Lock()
+	r.g.taskSessions[live] = conv
+	r.g.mu.Unlock()
+	before := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">"))
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	var got []lib.DelegationRefusal
+	waitFor(t, "the busy refusal on the parent's .in", func() bool {
+		got = refusalsOn(t, r, "prod-east", taskID)
+		return len(got) > 0
+	})
+	if len(got) != 1 || got[0].Repeat || !strings.Contains(got[0].Text, "a delegated task is still running (task "+live+")") {
+		t.Fatalf("refusals on the parent's .in = %+v, want one untagged busy refusal naming %s", got, live)
+	}
+	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">")); after != before {
+		t.Fatalf("%d submission(s) for a busy request", after-before)
+	}
+}
+
+// TestAProfileParentsRepeatWhileItsBatchRunsIsToldTagged: a profile parent
+// waits open on the batch its first request minted, so a second request is
+// refused to it tagged as a repeat, which ends nothing. Nothing more is
+// minted, the first request's record is untouched, and its children's ends
+// still reach the parent.
+func TestAProfileParentsRepeatWhileItsBatchRunsIsToldTagged(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-repeat-live"
+	parent, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+	again := delegateArtifactWithParameters(t, "cluster", "look again", targetParams("p1", "us-east1", "c"))
+	again.ArtifactID += "-again"
+	if err := parent.PublishArtifact(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+	var got []lib.DelegationRefusal
+	waitFor(t, "the repeat's refusal on the parent's .in", func() bool {
+		got = refusalsOn(t, r, "chat", origin.TaskID)
+		return len(got) > 0
+	})
+	if len(got) != 1 || !got[0].Repeat || got[0].Text != noticeDelegationRefusedFor+noticeDelegationRepeat {
+		t.Fatalf("refusals on the parent's .in = %+v, want one tagged repeat", got)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if ref, _ := rec.TaskRefFor(origin.TaskID); ref.DelegationEnd != "" || len(ref.Children) != len(kids) {
+		t.Fatalf("the parent's entry after the repeat = %+v, want its batch untouched", ref)
+	}
+	if n := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>")); n != len(kids) {
+		t.Fatalf("%d child submissions after the repeat, want %d", n, len(kids))
+	}
+	for i, k := range kids {
+		completeChild(t, r, k, fmt.Sprintf("result %d", i+1))
+	}
+	waitFor(t, "both children's ends on the parent's .in", func() bool {
+		return len(childResultsOn(t, r, "chat", origin.TaskID)) == len(kids)
+	})
+	if got := refusalsOn(t, r, "chat", origin.TaskID); len(got) != 1 {
+		t.Fatalf("%d refusals after the children ended, want the one repeat", len(got))
 	}
 }
 
@@ -97,11 +174,12 @@ func TestAProfileWhoseCardDoesNotDelegateIsRefused(t *testing.T) {
 	}
 }
 
-// TestARefusedProfileParentsRequestAgainIsIgnored: the parent was told its
+// TestARefusedProfileParentsRequestAgainIsARepeat: the parent was told its
 // refusal ends its wait, so the same task's request seen again (a
-// redelivery after a restart reads the same way) is ignored: not refused
-// twice, and not minted late once what refused it has cleared.
-func TestARefusedProfileParentsRequestAgainIsIgnored(t *testing.T) {
+// redelivery after a restart reads the same way) is refused as a repeat,
+// tagged so it ends nothing, and is not minted late once what refused it has
+// cleared.
+func TestARefusedProfileParentsRequestAgainIsARepeat(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
 	ctx := context.Background()
@@ -134,9 +212,15 @@ func TestARefusedProfileParentsRequestAgainIsIgnored(t *testing.T) {
 	if err := parent.PublishArtifact(ctx, ask); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond)
-	if got := refusalsOn(t, r, "prod-east", taskID); len(got) != 1 {
-		t.Fatalf("%d refusals after the request came again, want 1", len(got))
+	var got []lib.DelegationRefusal
+	waitFor(t, "the repeat's refusal on the parent's .in", func() bool {
+		got = refusalsOn(t, r, "prod-east", taskID)
+		return len(got) >= 2
+	})
+	time.Sleep(300 * time.Millisecond)
+	got = refusalsOn(t, r, "prod-east", taskID)
+	if len(got) != 2 || got[0].Repeat || !got[1].Repeat || got[1].Text != noticeDelegationRefusedFor+noticeDelegationRepeat {
+		t.Fatalf("refusals after the request came again = %+v, want the first untagged and one tagged repeat", got)
 	}
 	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">")); after != before {
 		t.Fatalf("%d submission(s) for a request already answered", after-before)
@@ -179,5 +263,61 @@ func TestACutShortBatchWhoseProfileLostDelegatesIsWithdrawn(t *testing.T) {
 	rec, _ := r.g.reg.Get(ctx, conv)
 	if ref, ok := rec.TaskRefFor(origin.TaskID); !ok || ref.DelegationEnd == "" {
 		t.Fatalf("the parent's entry = %+v, want the batch withdrawn", ref)
+	}
+}
+
+// TestAProfileParentsRequestAfterItsBatchWasWithdrawnIsARepeat: a batch
+// withdrawn whole has had each entry ended (endWithdrawnProfileBatch), and
+// no refusal beside those ends. The task's request after that is refused as
+// a repeat, tagged, with nothing minted.
+func TestAProfileParentsRequestAfterItsBatchWasWithdrawnIsARepeat(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	ctx := context.Background()
+	conv := "console:tab-repeat-withdrawn"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	submissionOn(t, r, "cluster")
+	// What the resume meets refuses it, so the batch is withdrawn.
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "an end for each entry", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 2 })
+	if got := refusalsOn(t, r, "chat", origin.TaskID); len(got) != 0 {
+		t.Fatalf("refusals beside the withdrawn batch's ends = %+v, want none", got)
+	}
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
+	r.g.beforeBatchChild = nil
+	before := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>"))
+	art.ArtifactID += "-again"
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	var got []lib.DelegationRefusal
+	waitFor(t, "the repeat's refusal on the parent's .in", func() bool {
+		got = refusalsOn(t, r, "chat", origin.TaskID)
+		return len(got) > 0
+	})
+	if len(got) != 1 || !got[0].Repeat {
+		t.Fatalf("refusals after the withdrawn batch's request again = %+v, want one tagged repeat", got)
+	}
+	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>")); after != before {
+		t.Fatalf("%d submission(s) for a repeat", after-before)
 	}
 }

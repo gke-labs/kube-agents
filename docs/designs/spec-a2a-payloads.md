@@ -825,7 +825,11 @@ nothing.
 refused it or nothing started, gets a `message` on its `…in` carrying `{"delegationRefused": {"text"}}`
 (#4860), so it stops waiting for a child that won't exist. `text` is the notice the room sees, at most
 64 KiB. A waiting parent reads it as the end of the whole wait. A refusal that fails to publish is logged and not sent again, so the parent's own deadline still bounds its wait. A batch whose plan was written gets
-its per-entry ends instead, and a stopped or ended parent gets nothing.
+its per-entry ends instead, and a stopped or ended parent gets nothing. A request the task makes after an earlier
+one minted its child or batch, or ended, is refused too, with `"repeat": true` beside `text`. The earlier request's
+children are still the task's to wait for, so a repeat ends nothing: a waiting parent keeps waiting on them. The
+gateway mints nothing for a repeat, records nothing, and posts nothing to the room. `repeat` is a JSON bool, left
+out of a first refusal; a part whose `repeat` is any other type isn't a refusal.
 
 This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A
 profile parent that has already ended gets no child result; the gateway drops it and logs it. A

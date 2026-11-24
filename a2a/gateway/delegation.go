@@ -171,7 +171,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 			g.log.Error("session record write failed after a delegation minted no child", "conversation", rec.Key, "err", err)
 		}
-		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason)
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, false)
 	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
@@ -179,7 +179,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	refuse := func(rule, notice string, extra ...any) {
 		log.Warn("delegation refused", append(append([]any{"rule", rule}, audit...), extra...)...)
 		g.deferNotice(taskID, notice)
-		noChild("reason: " + reasonDelegationRefused + " - " + notice)
+		noChild(refusedEnd(notice))
 	}
 
 	// Only the task the gateway started, from the incarnation that owns it
@@ -197,13 +197,25 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		ignore(ruleDelegationStale, "busSession", rec.BusSession)
 		return
 	}
+	// refuseRepeat refuses a profile parent's request made after one that
+	// minted its child or batch, or ended: the parent waits open, so it is
+	// told, tagged so it ends nothing (lib.DelegationRefusal.Repeat). Nothing
+	// is minted or recorded, and the room is not told: the first request's
+	// mark and children stand, and a DelegationEnd written here would hold
+	// back its children's ends (profileBatchChildEnded).
+	refuseRepeat := func(extra ...any) {
+		log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationBusy, "repeat", true}, audit...), extra...)...)
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+noticeDelegationRepeat), true)
+	}
 	if profileParent {
-		// A profile parent's request that already ended with no child
-		// (DelegationEnd) has had its answer, and the parent was told it
-		// was the end of its wait (#4860): its redelivery, after a restart
-		// or a fenced batch, is ignored, never refused twice or minted late.
-		if parent.DelegationEnd != "" && len(parent.Children) == 0 {
-			ignore(ruleDelegationStale, "delegationEnd", "already answered")
+		// A profile parent's request that already ended (DelegationEnd:
+		// refused, not started, or a batch withdrawn) has had its answer,
+		// and the parent was told it (#4860), or had each entry ended
+		// (endWithdrawnProfileBatch). Its request again, a redelivery or a
+		// second ask, is refused as a repeat, never minted late: its
+		// children's ends would all be held back by the mark.
+		if parent.DelegationEnd != "" {
+			refuseRepeat("delegationEnd", parent.DelegationEnd)
 			return
 		}
 	}
@@ -222,7 +234,14 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	resuming, minting := false, false
 	if len(parent.Children) > 0 {
 		if parent.batchComplete() || parent.DelegationEnd != "" {
-			ignore(ruleDelegationBusy, "child", parent.Children[len(parent.Children)-1])
+			last := parent.Children[len(parent.Children)-1]
+			// A profile parent waits open on the children its first
+			// request minted: a repeat is refused to it, and ends nothing.
+			if profileParent {
+				refuseRepeat("child", last)
+				return
+			}
+			ignore(ruleDelegationBusy, "child", last)
 			return
 		}
 		resuming = true
@@ -1422,26 +1441,45 @@ func wakeToDoor(parent *TaskRef) bool {
 	return false
 }
 
+// refusedEnd is the DelegationEnd reason of a request refused with notice.
+func refusedEnd(notice string) string {
+	return "reason: " + reasonDelegationRefused + " - " + notice
+}
+
 // tellProfileParentNoChild sends a profile parent the refusal its delegate
 // request ended in (#4860), on its .in, so it stops waiting for a child that
 // will never exist. A session parent's turn has already ended on the hand-off
 // and needs nothing; nor does a batch whose plan was written, whose entries
 // each get their own end (endWithdrawnProfileBatch), nor a parent a stop
 // cancelled or that has ended (profileParentListens).
-func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string) {
+//
+// repeat is a refusal of a request made after one that minted its child or
+// whole batch, or ended (DelegationEnd): the parent's wait is on those
+// children, or is already over, so the refusal goes out tagged
+// (lib.DelegationRefusal.Repeat) and ends nothing. Only such a parent gets
+// one: one with no earlier request is a first refusal, and a batch cut short
+// and being finished has its entries' ends coming instead.
+func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string, repeat bool) {
 	parent, ok := rec.TaskRefFor(taskID)
-	if !ok || parent.Tier == "" || session != parent.Addressee || parent.BatchSize > 0 || len(parent.Children) > 0 {
+	if !ok || parent.Tier == "" || session != parent.Addressee {
+		return
+	}
+	if repeat {
+		if parent.DelegationEnd == "" && (len(parent.Children) == 0 || !parent.batchComplete()) {
+			return
+		}
+	} else if parent.BatchSize > 0 || len(parent.Children) > 0 {
 		return
 	}
 	if !g.profileParentListens(ctx, &parent, "") {
 		return
 	}
 	text := delegationRefusalText(reason)
-	if err := g.publishDelegationRefusal(ctx, rec, parent, text); err != nil {
-		g.log.Error("delegation refusal not delivered to its parent", "parent", parent.ID, "err", err)
+	if err := g.publishDelegationRefusal(ctx, rec, parent, text, repeat); err != nil {
+		g.log.Error("delegation refusal not delivered to its parent", "parent", parent.ID, "repeat", repeat, "err", err)
 		return
 	}
-	g.log.Info("delegation refusal delivered to its parent", "parent", parent.ID)
+	g.log.Info("delegation refusal delivered to its parent", "parent", parent.ID, "repeat", repeat)
 }
 
 // delegationRefusalText is the parent's line for a DelegationEnd reason:
@@ -1458,11 +1496,11 @@ func delegationRefusalText(reason string) string {
 
 // publishDelegationRefusal publishes a lib.DelegationRefusal on the parent's
 // .in, under the parent's own capability, as publishChildResult does.
-func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionRecord, parent TaskRef, text string) error {
+func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionRecord, parent TaskRef, text string, repeat bool) error {
 	if len(text) > lib.ChildResultTextCap {
 		text = truncateBytes(text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
 	}
-	part, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: text})
+	part, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: text, Repeat: repeat})
 	if err != nil {
 		return fmt.Errorf("build: %w", err)
 	}
