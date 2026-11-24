@@ -1,7 +1,5 @@
 package main
 
-import ()
-
 // agyBuilder is the Antigravity CLI's (`agy`) argv and env: the binary
 // driven over its headless stream-json dialect (workeradapter's agyDriver).
 //
@@ -11,9 +9,11 @@ import ()
 //     prompts (harnessSpec.tools and what goes with it): #6711 and #6712;
 //   - the model and the gateway (AGY_LLM_GATEWAY_*): #6714. The pod's
 //     values reach agy unchanged, and the builder adds none;
-//   - HOME: a session pod's agy uses the pod's own HOME, shared by every
-//     turn of a reused pod, until #6710 gives each task its own and locks
-//     it. That is part of what the A2A_HARNESS_UNISOLATED waiver accepts;
+//   - HOME: agy uses the pod's own HOME. Before every agy process the
+//     driver clears agy's configuration entries from its conversation
+//     directories there and from the workspace (#6710); the read-only HOME
+//     layout comes with the image (#6715). Until the agy half of the
+//     isolation canary lands, the A2A_HARNESS_UNISOLATED waiver stays;
 //   - a default path: the image is #6715's, so A2A_HARNESS_PATH is required
 //     unless A2A_HARNESS_CMD replaces the whole argv (selectHarness refuses
 //     otherwise);
@@ -41,5 +41,5 @@ func (agyBuilder) command(spec harnessSpec) []string {
 func (agyBuilder) env(env []string, _ func(string) bool) []string { return env }
 
 // userSettings: none. agy's settings live under its HOME (see the type's
-// comment), which #6710 makes per task and resets.
+// comment).
 func (agyBuilder) userSettings(func(string) string) string { return "" }

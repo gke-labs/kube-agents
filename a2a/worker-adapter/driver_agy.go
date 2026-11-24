@@ -8,9 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -37,8 +37,10 @@ import (
 //   - it reports no cost, so its telemetry carries no running total and the
 //     adapter publishes none, until #6808 takes the per-turn cost from
 //     LiteLLM through the loopback proxy (#6714);
-//   - result.usage is cumulative over the process, so the decoder reports
-//     each result's difference from the last.
+//   - result.usage and duration_seconds are cumulative over the
+//     conversation, across a --conversation resume too, so the decoder
+//     reports each result's difference from the conversation's last
+//     (agyUsageLedger), whichever process reported it.
 //
 // Before every agy process starts, the first included, PrepareTurn clears
 // agy's configuration entries from the workspace and its conversation
@@ -51,6 +53,43 @@ type agyDriver struct {
 	// iso picks the isolation table from the agy binary's version. Nil
 	// means the binary is unknown, and every turn is refused.
 	iso *agyIsolation
+	// ledger carries each conversation's running usage from one agy
+	// process to the next. Nil counts from zero in every process.
+	ledger *agyUsageLedger
+}
+
+// agyUsageLedger is each conversation's last accepted cumulative usage and
+// duration, by conversation id. One agy process takes one user turn and a
+// later one resumes the conversation; agy's figures keep running across
+// the resume, so a new process's decoder starts from where the last left
+// off rather than from zero.
+type agyUsageLedger struct {
+	mu sync.Mutex
+	by map[string]agyCumulative
+}
+
+type agyCumulative struct{ input, output, duration float64 }
+
+func (l *agyUsageLedger) get(conv string) (agyCumulative, bool) {
+	if l == nil || conv == "" {
+		return agyCumulative{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c, ok := l.by[conv]
+	return c, ok
+}
+
+func (l *agyUsageLedger) put(conv string, c agyCumulative) {
+	if l == nil || conv == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.by == nil {
+		l.by = map[string]agyCumulative{}
+	}
+	l.by[conv] = c
 }
 
 var _ Driver = agyDriver{}
@@ -58,24 +97,41 @@ var _ Driver = agyDriver{}
 // NewAgyDriver is the driver for the agy binary at bin, whose version
 // chooses the isolation table on the first PrepareTurn.
 func NewAgyDriver(bin string) agyDriver {
-	return agyDriver{iso: &agyIsolation{bin: bin}}
+	return agyDriver{iso: &agyIsolation{bin: bin}, ledger: &agyUsageLedger{}}
 }
 
-// agyIsolation reads the agy binary's version once and keeps the table, or
-// the error, for every later turn.
+// agyIsolation reads the agy binary's version and keeps the table for
+// every later turn. A failed read is not kept: a timeout or a canceled
+// context is tried again at the next turn, which is refused meanwhile.
 type agyIsolation struct {
 	bin   string
-	once  sync.Once
+	mu    sync.Mutex
+	known bool
 	table isolation.Table
-	err   error
 }
+
+// agyOthersSettle bounds how long PrepareTurn waits for processes the
+// last kill reached to be gone; agyOthersPoll is the interval.
+var (
+	agyOthersSettle = 2 * time.Second
+	agyOthersPoll   = 20 * time.Millisecond
+)
 
 // agyVersionTimeout bounds `agy --version`.
 const agyVersionTimeout = 30 * time.Second
 
 func (i *agyIsolation) resolve(ctx context.Context) (isolation.Table, error) {
-	i.once.Do(func() { i.table, i.err = readAgyTable(ctx, i.bin) })
-	return i.table, i.err
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.known {
+		return i.table, nil
+	}
+	t, err := readAgyTable(ctx, i.bin)
+	if err != nil {
+		return isolation.Table{}, err
+	}
+	i.table, i.known = t, true
+	return t, nil
 }
 
 // readAgyTable runs `agy --version` from an empty directory with an empty
@@ -95,7 +151,13 @@ func readAgyTable(ctx context.Context, bin string) (isolation.Table, error) {
 	cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- the configured harness binary, no shell
 	cmd.Dir = dir
 	cmd.Env = []string{"HOME=" + dir, "PATH=/usr/local/bin:/usr/bin:/bin"}
+	// Its own process group, killed whole once it returns, so nothing it
+	// started outlives the read and trips the no-other-process check.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, err := cmd.Output()
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	if err != nil {
 		return isolation.Table{}, fmt.Errorf("agy --version: %w", err)
 	}
@@ -148,13 +210,32 @@ func (agyDriver) EncodeUser(text string) ([]byte, error) {
 	}{Event: "user", Message: message{Role: "user", Content: []part{{Type: "text", Text: text}}}})
 }
 
-func (agyDriver) NewDecoder() Decoder { return &agyDecoder{} }
+func (d agyDriver) NewDecoder() Decoder { return &agyDecoder{ledger: d.ledger} }
 
+// WithResume resumes conversation id, replacing a --conversation already in
+// argv: a later process of the task resumes the conversation agy reported,
+// whatever the first one was told.
 func (agyDriver) WithResume(argv []string, id string) []string {
 	if id == "" {
 		return argv
 	}
-	return append(slices.Clone(argv), agyResumeFlag, id)
+	return append(withoutFlag(argv, agyResumeFlag), agyResumeFlag, id)
+}
+
+// withoutFlag is argv without flag and its value, in either the
+// `flag value` or the `flag=value` form.
+func withoutFlag(argv []string, flag string) []string {
+	out := make([]string, 0, len(argv)+2)
+	for i := 0; i < len(argv); i++ {
+		switch {
+		case argv[i] == flag:
+			i++ // and its value
+		case strings.HasPrefix(argv[i], flag+"="):
+		default:
+			out = append(out, argv[i])
+		}
+	}
+	return out
 }
 
 // WithDelegateServerEnv reports the delegate server unconfigured: agy takes
@@ -188,9 +269,17 @@ func (d agyDriver) PrepareTurn(ctx context.Context, dirs TurnDirs) error {
 	if pid := adapterPID(); pid != containerInitPID {
 		return fmt.Errorf("agy needs the adapter as the container's init (pid %d, not %d) to end each turn's processes", containerInitPID, pid)
 	}
-	others, err := otherProcesses()
-	if err != nil {
-		return fmt.Errorf("checking for processes left from an earlier turn: %w", err)
+	// Briefly: a process the kill reached may not have finished dying.
+	var others []int
+	for deadline := time.Now().Add(agyOthersSettle); ; {
+		var err error
+		if others, err = otherProcesses(); err != nil {
+			return fmt.Errorf("checking for processes left from an earlier turn: %w", err)
+		}
+		if len(others) == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(agyOthersPoll)
 	}
 	if len(others) > 0 {
 		return fmt.Errorf("%d processes outlived the last turn (pids %v)", len(others), others)
@@ -234,17 +323,7 @@ func AgyPrintTimeout(budget time.Duration) time.Duration {
 // process, RestartsPerTurn), so a later turn's bound is what is left, not
 // the whole task's. Any earlier --print-timeout in argv is replaced.
 func (agyDriver) WithTurnBudget(argv []string, left time.Duration) []string {
-	out := make([]string, 0, len(argv)+2)
-	for i := 0; i < len(argv); i++ {
-		switch {
-		case argv[i] == agyPrintTimeoutFlag:
-			i++ // and its value
-		case strings.HasPrefix(argv[i], agyPrintTimeoutFlag+"="):
-		default:
-			out = append(out, argv[i])
-		}
-	}
-	return append(out, agyPrintTimeoutFlag, AgyPrintTimeout(left).String())
+	return append(withoutFlag(argv, agyPrintTimeoutFlag), agyPrintTimeoutFlag, AgyPrintTimeout(left).String())
 }
 
 // RestartsPerTurn is true: each user turn gets a fresh agy process, so a
@@ -309,6 +388,10 @@ type agyUsage struct {
 // agyDecoder decodes one agy process's stdout. It keeps the last result's
 // cumulative usage and duration, so each result reports its own turn.
 type agyDecoder struct {
+	// ledger and conv carry the conversation's running figures across
+	// processes (agyUsageLedger); conv is set at init.
+	ledger   *agyUsageLedger
+	conv     string
 	model    string
 	input    float64
 	output   float64
@@ -329,6 +412,10 @@ func (d *agyDecoder) Decode(line []byte) ([]Event, error) {
 	switch ln.Event {
 	case "init":
 		ev := Event{Kind: EventInit, Session: ln.ConversationID}
+		d.conv = ln.ConversationID
+		if c, ok := d.ledger.get(d.conv); ok {
+			d.input, d.output, d.duration = c.input, c.output, c.duration
+		}
 		if ln.Init != nil {
 			d.model = ln.Init.Model
 			ev.Model = ln.Init.Model
@@ -405,12 +492,12 @@ func (d *agyDecoder) result(r agyResult) Event {
 }
 
 // telemetry is this result's turn: the difference between its cumulative
-// usage and duration and the last accepted one. agy reports no cost (#6808), so there
-// is no running total. duration_seconds is wall time since the process
-// started (the probe's second turn read 47.3s after a first of 18.0s and a
-// 25s pause before its message), so the difference includes any wait between
-// one result and the next message; with steers written at the boundary that
-// wait is the adapter's own, and short.
+// usage and duration and the last accepted one, which may come from an
+// earlier process of the same conversation (agyUsageLedger). agy reports
+// no cost (#6808), so there is no running total. duration_seconds runs
+// across the conversation like the tokens (a resumed process's first
+// result read 3.3s after the last process's 2.6s), so the difference
+// includes any wait between one result and the next turn's start.
 //
 // A field that is absent or null is no figure at all, and leaves its
 // baseline alone. A baseline moves only when its figure is accepted: a
@@ -451,6 +538,7 @@ func (d *agyDecoder) telemetry(r agyResult) resultTelemetry {
 			t.dropped = append(t.dropped, "usage.output_tokens")
 		}
 	}
+	d.ledger.put(d.conv, agyCumulative{input: d.input, output: d.output, duration: d.duration})
 	return t
 }
 

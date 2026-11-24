@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -921,12 +922,14 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	if restartsPerTurn(drv) {
 		resumed := plan.resume != ""
 		respawn = func(prompt string, left time.Duration) (*harnessProc, error) {
+			// The session the harness reported wins; the plan's resume id
+			// stands only if it reported none.
 			rargv := argv
-			if !resumed {
-				if a.harnessSession == "" {
-					return nil, errors.New("the harness reported no session to resume")
-				}
+			switch {
+			case a.harnessSession != "":
 				rargv = drv.WithResume(argv, a.harnessSession)
+			case !resumed:
+				return nil, errors.New("the harness reported no session to resume")
 			}
 			if b, ok := drv.(turnBudgeter); ok {
 				rargv = b.WithTurnBudget(rargv, left-cfg.KillGrace)
@@ -1065,13 +1068,51 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// halt records a stop. Every place below that stops the task calls it.
 	halt := func(s supervisorStop) { halted = append(halted, s) }
 
+	// pendingStops takes, without waiting, a stop that is already waiting
+	// on one of the channels the loop selects on: what the loop's own arms
+	// would have done had it still been running. One pass, since a closed
+	// cancel channel is always ready.
+	pendingStops := func() {
+		select {
+		case reason := <-a.abandon:
+			a.mu.Lock()
+			a.abandonSeen, a.abandonReason = true, reason
+			a.mu.Unlock()
+			halt(stopAbandoned)
+		default:
+		}
+		select {
+		case <-cancelCh:
+			if !canceled {
+				canceled = true
+				halt(stopCanceled)
+			}
+		default:
+		}
+		select {
+		case <-deadline.C:
+			deadlineHit = true
+			halt(stopDeadline)
+		default:
+		}
+		if ctx.Err() != nil {
+			halt(stopEvicted)
+		}
+	}
+
 	// refuseHeld refuses, on the stream and before the terminal, every steer
 	// still held when the task ends with no turn left for it: after the
 	// loop, and on the eviction arm's early returns. An abandoned task's
 	// terminal is the dispatcher's, so nothing goes out for it.
 	refuseHeld := func() {
 		if a.abandoned() {
+			held, nextPrompt = nil, ""
 			return
+		}
+		// A steer taken for the next process (respawn mode) never ran.
+		if nextPrompt != "" {
+			a.publishSteerRefusal(nextPrompt, "")
+			nextPrompt = ""
 		}
 		for _, text := range held {
 			a.publishSteerRefusal(text, "")
@@ -1168,7 +1209,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						// Drain steers that raced this result: they were published
 						// while the task was working and must be delivered, not
 						// dropped (assertion 21). A driver that holds steers gets
-						// them after PrepareTurn, below, with the ones it held.
+						// them at the boundary below, with the ones it held.
 						for drained := false; !drained; {
 							select {
 							case text := <-steerCh:
@@ -1189,11 +1230,13 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						pendingTurns--
 						// Another turn follows when a steer is held and the turn
 						// neither failed nor was ended by cancel or the deadline,
-						// whose kill is already on its way: the driver prepares
-						// that turn, then the oldest held steer goes onto stdin.
-						// One per boundary, so every turn the harness runs gets
-						// its own PrepareTurn; the rest wait for the next result.
-						if respawn != nil && holdSteers && len(held) > 0 && !ev.Failed && !canceled && !deadlineHit {
+						// whose kill is already on its way. One steer per
+						// boundary, so every turn the harness runs gets its own
+						// PrepareTurn; the rest wait for the next result. A driver
+						// that takes one turn per process (respawn) gets the
+						// oldest steer on a fresh process once this one is gone;
+						// any other gets it on stdin after PrepareTurn.
+						if respawn != nil && nextPrompt == "" && holdSteers && len(held) > 0 && !ev.Failed && !canceled && !deadlineHit {
 							// One turn per process: this one ends here, and the
 							// steer starts the next process once it is gone.
 							nextPrompt, held = held[0], held[1:]
@@ -1384,28 +1427,43 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		if nextPrompt == "" {
 			break
 		}
-		prompt := nextPrompt
-		nextPrompt = ""
 		// Fail closed: the next process starts only when no stop was
 		// recorded (halt) and the last process exited cleanly after its stdin
 		// closed. A stop that kills the process leaves an exit error, so one
-		// that forgot to record itself still starts nothing.
+		// that forgot to record itself still starts nothing. Stops that arrived
+		// while the loop wound down are taken first (pendingStops), and again
+		// after PrepareTurn, the last moment before the spawn. A steer refused
+		// here is refused after the loop (refuseHeld), unless the task was
+		// abandoned.
+		left := a.cfg.TaskDeadline - time.Since(started)
+		if left <= a.cfg.KillGrace && !deadlineHit {
+			deadlineHit = true
+			halt(stopDeadline)
+		}
+		pendingStops()
 		if len(halted) > 0 || a.abandoned() || waitErr != nil {
 			log.Info("no further harness process for the held steer; refusing it",
 				"task", a.taskID, "stops", halted, "exitErr", waitErr)
-			a.publishSteerRefusal(prompt, "")
 			break
 		}
 		if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
 			log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
 			sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
-			a.publishSteerRefusal(prompt, "")
+			halt(stopDecided)
 			break
 		}
+		pendingStops()
+		if len(halted) > 0 || a.abandoned() {
+			log.Info("a stop arrived while the next turn was prepared; refusing the held steer", "task", a.taskID, "stops", halted)
+			break
+		}
+		prompt := nextPrompt
+		nextPrompt = ""
 		next, err := respawn(prompt, a.cfg.TaskDeadline-time.Since(started))
 		if err != nil {
 			log.Warn("starting the next harness process failed; ending the task", "task", a.taskID, "err", err)
 			sawResult, resultErr, resultText = true, "spawn-failed"+reasonDetailSeparator+err.Error(), ""
+			halt(stopDecided)
 			a.publishSteerRefusal(prompt, "")
 			break
 		}
@@ -1428,6 +1486,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	switch {
 	case a.abandoned():
 		return Result{Abandoned: true}, nil
+	case slices.Contains(halted, stopEvicted):
+		// SIGTERM landed between processes (pendingStops); the arm that
+		// handles it in the loop returns the same.
+		state := lib.StateFailed
+		err := a.finalize(state, a.evictedReason(), resultText)
+		return Result{State: state, Evicted: true}, err
 	case refused != nil:
 		return a.endRefused(refused)
 	case sawResult && resultErr == "":

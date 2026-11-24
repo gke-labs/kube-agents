@@ -15,13 +15,24 @@ import (
 // agyStopStub is an agy stand-in for the stop tests. Each run, n counting
 // from 1, records itself in $dir/runs, reads its one user line, says init,
 // marks turn one started, then acts on $dir/mode:
+//
 //   - error: a failed result after 1.5s;
+//
 //   - sleep: no result for 20s (cancel or the deadline ends it);
+//
 //   - refusal: a clean result after 1.5s, then a write refusal record and a
 //     tool step's result after it;
+//
 //   - anything else: a clean result after 1.5s.
 //
-// It then reads stdin to its end and exits with $dir/exitcode (0 if none).
+//   - linger: a clean result after the steer is sent, then it stays up,
+//     reading nothing, until SIGTERM, on which it exits 0: a stop that
+//     reaches it after its result leaves a clean exit, so only the stop
+//     registry can refuse the held steer's process.
+//
+// Every result waits until $dir/steer-sent exists, so the steer is held
+// before it. It then reads stdin to its end and exits with $dir/exitcode
+// (0 if none).
 func agyStopStub(t *testing.T, dir, taskID string) []string {
 	t.Helper()
 	record := refusalRecord(t, true, kubernetesReadOnlyRule, "scale", taskID)
@@ -32,16 +43,21 @@ mode=$(cat "$dir/mode" 2>/dev/null)
 read first || exit 1
 echo '{"event":"init","conversation_id":"conv-s","init":{"model":"m"}}'
 echo 1 > "$dir/turn1"
+i=0; while [ ! -e "$dir/steer-sent" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done
 case "$mode" in
-error) sleep 1.5; echo '{"event":"result","result":{"conversation_id":"conv-s","status":"ERROR","error":"boom"}}' ;;
+error) echo '{"event":"result","result":{"conversation_id":"conv-s","status":"ERROR","error":"boom"}}' ;;
 sleep) sleep 20 ;;
 refusal)
-  sleep 1.5
   echo '{"event":"result","result":{"conversation_id":"conv-s","status":"SUCCESS","response":"turn '$n'"}}'
   sleep 0.3
   printf '%%s\n' %q >> "$%s"
   echo '{"event":"step_update","step_update":{"conversation_id":"conv-s","step_index":3,"state":"DONE","step_type":"tool","tool_name":"run_command"}}' ;;
-*) sleep 1.5; echo '{"event":"result","result":{"conversation_id":"conv-s","status":"SUCCESS","response":"turn '$n'"}}' ;;
+linger)
+  echo '{"event":"result","result":{"conversation_id":"conv-s","status":"SUCCESS","response":"turn '$n'"}}'
+  echo 1 > "$dir/result"
+  trap 'exit 0' TERM
+  while :; do sleep 0.05; done ;;
+*) echo '{"event":"result","result":{"conversation_id":"conv-s","status":"SUCCESS","response":"turn '$n'"}}' ;;
 esac
 while read -r more; do :; done
 exit $(cat "$dir/exitcode" 2>/dev/null || echo 0)
@@ -51,7 +67,7 @@ exit $(cat "$dir/exitcode" 2>/dev/null || echo 0)
 // stopRun runs one agy task in mode with a steer held during turn one,
 // calling trigger once the steer is sent, and returns the outcome and how
 // many agy processes ran.
-func stopRun(t *testing.T, mode string, exitCode int, setup func(*Config), trigger func(c *lib.Client, origin *lib.Envelope, session, taskID string)) (runOutcome, string) {
+func stopRun(t *testing.T, mode string, exitCode int, setup func(*Config), trigger func(c *lib.Client, origin *lib.Envelope, session, taskID, dir string)) (runOutcome, string) {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "mode"), []byte(mode), 0o644); err != nil {
@@ -76,18 +92,40 @@ func stopRun(t *testing.T, mode string, exitCode int, setup func(*Config), trigg
 	}
 	done := runAdapter(context.Background(), cfg)
 	waitFile(t, filepath.Join(dir, "turn1"), 10*time.Second)
-	publishSteerFor(t, c, origin, session, "a steer during turn one")
+	publishSteerFor(t, c, origin, session, stopSteer)
+	time.Sleep(300 * time.Millisecond) // the steer reaches the adapter and is held
+	if err := os.WriteFile(filepath.Join(dir, "steer-sent"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if trigger != nil {
-		trigger(c, origin, session, taskID)
+		trigger(c, origin, session, taskID, dir)
 	}
 	out := waitOutcome(t, done, 45*time.Second)
 	b, _ := os.ReadFile(filepath.Join(dir, "runs"))
+	if !steerRefused(t, url, session, taskID, stopSteer) {
+		t.Errorf("the held steer was not refused visibly")
+	}
 	return out, strings.TrimSpace(string(b))
+}
+
+// stopSteer is the steer every stop test holds.
+const stopSteer = "a steer during turn one"
+
+// steerRefused reports whether the task's events carry a visible refusal
+// of steer (publishSteerRefusal echoes it).
+func steerRefused(t *testing.T, url, session, taskID, steer string) bool {
+	t.Helper()
+	for _, env := range replayEvents(t, url, session, taskID) {
+		p := string(env.Payload)
+		if strings.Contains(p, "steer refused") && strings.Contains(p, steer) {
+			return true
+		}
+	}
+	return false
 }
 
 func publishCancelFor(t *testing.T, c *lib.Client, origin *lib.Envelope, session, taskID string) {
 	t.Helper()
-	time.Sleep(300 * time.Millisecond) // the steer is held first
 	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, origin.ContextID, origin.CorrelationID, lib.WithTo(lib.Party{Session: session}))
 	if err != nil {
 		t.Fatalf("cancel envelope: %v", err)
@@ -114,15 +152,21 @@ func TestNoSupervisorStopStartsAnotherAgyProcess(t *testing.T) {
 			run:  func(t *testing.T) (runOutcome, string) { return stopRun(t, "error", 0, nil, nil) },
 			want: lib.StateFailed,
 		},
+		// Canceled and deadline land after the result, while the process
+		// lingers, and it exits 0 on the SIGTERM they send: the clean-exit
+		// check passes, so only the stop registry refuses the steer.
 		stopCanceled: {
 			run: func(t *testing.T) (runOutcome, string) {
-				return stopRun(t, "sleep", 0, nil, func(c *lib.Client, o *lib.Envelope, s, id string) { publishCancelFor(t, c, o, s, id) })
+				return stopRun(t, "linger", 0, nil, func(c *lib.Client, o *lib.Envelope, s, id, dir string) {
+					waitFile(t, filepath.Join(dir, "result"), 10*time.Second)
+					publishCancelFor(t, c, o, s, id)
+				})
 			},
 			want: lib.StateCanceled,
 		},
 		stopDeadline: {
 			run: func(t *testing.T) (runOutcome, string) {
-				return stopRun(t, "sleep", 0, func(cfg *Config) { cfg.TaskDeadline = 3 * time.Second }, nil)
+				return stopRun(t, "linger", 0, func(cfg *Config) { cfg.TaskDeadline = 4 * time.Second }, nil)
 			},
 			want: lib.StateFailed,
 		},

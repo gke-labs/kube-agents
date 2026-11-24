@@ -72,9 +72,7 @@ func useAgyTestDriver(t *testing.T, cfg *Config) *agyTestEnv {
 	t.Chdir(ws)
 	cfg.HarnessEnv = append(cfg.HarnessEnv, "HOME="+env.home)
 
-	iso := &agyIsolation{}
-	iso.once.Do(func() { iso.table, iso.err = isolation.ForVersion("1.5.13") })
-	cfg.Driver = agyDriver{iso: iso}
+	cfg.Driver = agyDriver{iso: knownIso(t), ledger: &agyUsageLedger{}}
 
 	prevPID, prevKill, prevReap, prevOthers := adapterPID, killEveryoneButMe, reapKilledChildren, otherProcesses
 	t.Cleanup(func() {
@@ -101,11 +99,10 @@ func useAgyTestDriver(t *testing.T, cfg *Config) *agyTestEnv {
 
 func TestAgyPrepareTurnRefusesWithoutABoundary(t *testing.T) {
 	ws, home := t.TempDir(), t.TempDir()
-	iso := &agyIsolation{}
-	iso.once.Do(func() { iso.table, iso.err = isolation.ForVersion("1.5.13") })
-	d := agyDriver{iso: iso}
-	prevPID, prevOthers := adapterPID, otherProcesses
-	t.Cleanup(func() { adapterPID, otherProcesses = prevPID, prevOthers })
+	d := agyDriver{iso: knownIso(t)}
+	prevPID, prevOthers, prevSettle := adapterPID, otherProcesses, agyOthersSettle
+	t.Cleanup(func() { adapterPID, otherProcesses, agyOthersSettle = prevPID, prevOthers, prevSettle })
+	agyOthersSettle = 50 * time.Millisecond
 
 	if err := (agyDriver{}).PrepareTurn(context.Background(), TurnDirs{Workspace: ws, Home: home}); err == nil {
 		t.Error("a driver with no binary prepared a turn")
@@ -124,8 +121,7 @@ func TestAgyPrepareTurnRefusesWithoutABoundary(t *testing.T) {
 	if err := d.PrepareTurn(context.Background(), TurnDirs{Workspace: ws, Home: home}); err == nil {
 		t.Error("an unreadable process list prepared a turn")
 	}
-	bad := &agyIsolation{}
-	bad.once.Do(func() { bad.table, bad.err = isolation.ForVersion("9.9.9") })
+	bad := &agyIsolation{bin: fakeAgyBin(t, "9.9.9")}
 	otherProcesses = func() ([]int, error) { return nil, nil }
 	if err := (agyDriver{iso: bad}).PrepareTurn(context.Background(), TurnDirs{Workspace: ws, Home: home}); !errors.Is(err, isolation.ErrUnknownVersion) {
 		t.Errorf("unknown version: err = %v", err)
@@ -370,4 +366,24 @@ exit 0
 	if got := strings.TrimSpace(string(b)); got != "1" {
 		t.Fatalf("%s agy processes ran; a write refusal must stop the held steer's respawn", got)
 	}
+}
+
+// knownIso is an agyIsolation that already holds the 1.5.13 table.
+func knownIso(t *testing.T) *agyIsolation {
+	t.Helper()
+	tb, err := isolation.ForVersion("1.5.13")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &agyIsolation{known: true, table: tb}
+}
+
+// fakeAgyBin is a stand-in agy binary that prints version for --version.
+func fakeAgyBin(t *testing.T, version string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "agy")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho "+version+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
