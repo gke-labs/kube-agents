@@ -75,6 +75,9 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 			if !persona.LocalPath(f.Path) {
 				return persona.Output{}, fmt.Errorf("skills/%s/%s: leaves the skill's directory", s.Name, f.Path)
 			}
+			if f.Executable && !scriptPathRE.MatchString(f.Path) {
+				return persona.Output{}, fmt.Errorf("skills/%s/%s: a script's path may hold only letters, digits, '.', '_', '-' and '/', since the shell runs it by that path", s.Name, f.Path)
+			}
 			if f.Executable && !slices.Contains(p.Manifest.Tools, shellTool) {
 				return persona.Output{}, fmt.Errorf("skills/%s/%s: an executable skill file needs the %s tool, which the persona doesn't grant", s.Name, f.Path, shellTool)
 			}
@@ -143,6 +146,10 @@ func canonicalSkill(skill string, data []byte) ([]byte, error) {
 	return []byte("---\n" + string(front) + "---\n" + strings.Join(lines[end+1:], "")), nil
 }
 
+// scriptPathRE is a script path the shell's allow rule and the model can
+// both take literally: no space, quote, separator or newline.
+var scriptPathRE = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
 // shellTool is the persona built-in a skill's scripts need: the model runs
 // them with the shell, from the skill's directory on disk.
 const shellTool = "shell"
@@ -161,6 +168,10 @@ var skillNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,62}[a-z0-9])?$`)
 const urlPlaceholder = "{url}"
 
 // mcpServers maps each server the manifest grants to the worker's relay,
+// (The <server>_<tool> names the harness registers are checked for
+// collisions with each other and with its built-in tools where the tool
+// grant is rendered, toolgrant, so the rule lives in one place.)
+//
 // with the granted tools listed: a grant of "server.tool" names one tool,
 // and a grant of the whole server takes its include list. A server nothing
 // grants isn't started.
@@ -230,6 +241,10 @@ func DelegateServer(self string, env map[string]string) persona.MCPServer {
 	return persona.MCPServer{Name: persona.ReservedServer, Command: self, Args: []string{"delegate-mcp"}, Env: maps.Clone(env), Tools: []string{"delegate"}}
 }
 
+// IsScriptPath reports whether a path relative to a skill's directory is one
+// a script may have.
+func IsScriptPath(rel string) bool { return scriptPathRE.MatchString(rel) }
+
 // ScriptPaths are the absolute paths, under personaDir, of a rendering's
 // executable skill files: the only commands the harness's shell may run from
 // the persona, each directly by its path. A path outside personaDir's skills
@@ -240,7 +255,7 @@ func ScriptPaths(out persona.Output, personaDir string) ([]string, error) {
 		if !f.Executable {
 			continue
 		}
-		if path.Clean(f.Path) != f.Path || !strings.HasPrefix(f.Path, SkillsDir+"/") || strings.Count(f.Path, "/") < 2 {
+		if path.Clean(f.Path) != f.Path || !strings.HasPrefix(f.Path, SkillsDir+"/") || strings.Count(f.Path, "/") < 2 || !scriptPathRE.MatchString(f.Path) {
 			return nil, fmt.Errorf("%s: an executable outside a skill's directory", f.Path)
 		}
 		paths = append(paths, path.Join(personaDir, f.Path))

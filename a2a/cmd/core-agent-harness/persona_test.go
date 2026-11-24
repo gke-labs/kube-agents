@@ -230,3 +230,64 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 		t.Errorf("read instructions through a link outside the dir: %q", got)
 	}
 }
+
+// The scripts a loaded skill lists are exactly the ones ScriptPaths grants
+// the shell, for the same rendering on disk.
+func TestTheListedScriptsAreTheGrantedOnes(t *testing.T) {
+	p, err := persona.Load("../../../agents/cluster/persona")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := coreagent.Adapter{}.Render(p, persona.Target{Relay: testRelay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "agent-persona")
+	if err := render.WriteFiles(dir, out.Files); err != nil {
+		t.Fatal(err)
+	}
+	granted, err := coreagent.ScriptPaths(out, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := coreagent.Snapshot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec, err := executables(r.Skills)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed []string
+	for name, rels := range exec {
+		for _, rel := range rels {
+			listed = append(listed, filepath.Join(dir, "skills", name, rel))
+		}
+	}
+	slices.Sort(listed)
+	slices.Sort(granted)
+	if len(granted) == 0 || !slices.Equal(listed, granted) {
+		t.Errorf("listed %v, granted %v", listed, granted)
+	}
+}
+
+func TestARelativePersonaDirectoryIsRefused(t *testing.T) {
+	if _, _, err := loadPersona(context.Background(), "agent-persona"); err == nil || !strings.Contains(err.Error(), "not absolute") {
+		t.Errorf("err = %v, want a relative directory refused", err)
+	}
+}
+
+// A skill name the model supplies that isn't a skill is refused, not read.
+func TestLoadingANameThatIsntASkillFails(t *testing.T) {
+	dir, _ := renderPersona(t, "cluster")
+	r, err := coreagent.Snapshot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := baseDirSource{Source: skill.NewFileSystemSource(r.Skills), base: filepath.Join(dir, coreagent.SkillsDir)}
+	for _, name := range []string{"../x", "x/scripts", ""} {
+		if _, err := src.LoadInstructions(context.Background(), name); err == nil {
+			t.Errorf("LoadInstructions(%q) succeeded", name)
+		}
+	}
+}

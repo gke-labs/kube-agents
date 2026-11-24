@@ -234,6 +234,9 @@ func TestWhatCoreAgentCantTakeIsRefused(t *testing.T) {
 		{"a name with --", skillPersona("a--b", persona.File{Path: "SKILL.md", Data: []byte("---\nname: a--b\ndescription: d\n---\n")}), "skills/a--b"},
 		{"a skill named ..", skillPersona("..", persona.File{Path: "instructions.md", Data: []byte("x")}), "skills/.."},
 		{"a file path climbing out", skillPersona("s", persona.File{Path: "../../instructions.md", Data: []byte("x")}), "leaves"},
+		{"a script with a space", shellSkill("s", "scripts/run me.sh"), "may hold only"},
+		{"a script with a separator", shellSkill("s", "scripts/run;id"), "may hold only"},
+		{"a script with a newline", shellSkill("s", "scripts/run\n- /etc/x"), "may hold only"},
 		{"a script without the shell", skillPersona("s",
 			persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n---\n")},
 			persona.File{Path: "run.sh", Data: []byte("#!/bin/sh\n"), Executable: true}), "needs the shell tool"},
@@ -244,6 +247,15 @@ func TestWhatCoreAgentCantTakeIsRefused(t *testing.T) {
 			}
 		})
 	}
+}
+
+// shellSkill is a persona granting the shell whose skill has one script at rel.
+func shellSkill(skill, rel string) *persona.Persona {
+	p := skillPersona(skill,
+		persona.File{Path: "SKILL.md", Data: []byte("---\nname: " + skill + "\ndescription: d\n---\n")},
+		persona.File{Path: rel, Data: []byte("#!/bin/sh\n"), Executable: true})
+	p.Manifest.Tools = []string{"shell"}
+	return p
 }
 
 func TestEveryAgentSkillsKeyTheHarnessReadsPasses(t *testing.T) {

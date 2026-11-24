@@ -159,3 +159,49 @@ func write(t *testing.T, path, data string) {
 		t.Fatal(err)
 	}
 }
+
+// The worker's session check and the harness's snapshot read one rendering:
+// its manifest sits beside it, the check verifies the rendering against it,
+// and the snapshot skips it.
+func TestTheSessionCheckAndTheSnapshotReadOneRendering(t *testing.T) {
+	p := load(t, fleetAuditPersonaDir)
+	out, err := coreagent.Adapter{}.Render(p, persona.Target{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "agent-persona")
+	if err := render.WriteFiles(dir, out.Files); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{}
+	for _, f := range out.Files {
+		files[f.Path] = f.Data
+	}
+	write(t, filepath.Join(dir, persona.IntegrityManifestFile), string(persona.FormatIntegrityManifest(files)))
+	integrity, n, err := persona.CheckTree(dir, coreagent.Covers)
+	if err != nil || integrity != persona.IntegrityVerified || n != len(out.Files) {
+		t.Fatalf("CheckTree = %v, %d, %v; want verified over %d files", integrity, n, err, len(out.Files))
+	}
+	if _, err := coreagent.Snapshot(dir); err != nil {
+		t.Fatalf("snapshot beside a manifest: %v", err)
+	}
+}
+
+// A file with any execute bit is a script in the snapshot.
+func TestAGroupExecutableFileIsAScript(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, coreagent.InstructionsFile), "x\n")
+	write(t, filepath.Join(dir, "skills", "s", "SKILL.md"), "---\nname: s\ndescription: d\n---\n")
+	write(t, filepath.Join(dir, "skills", "s", "run.sh"), "#!/bin/sh\n")
+	if err := os.Chmod(filepath.Join(dir, "skills", "s", "run.sh"), 0o614); err != nil {
+		t.Fatal(err)
+	}
+	r, err := coreagent.Snapshot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := fs.Stat(r.Skills, "s/run.sh")
+	if err != nil || info.Mode()&0o111 == 0 {
+		t.Errorf("run.sh mode = %v, %v; want executable", info, err)
+	}
+}

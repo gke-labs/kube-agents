@@ -29,6 +29,11 @@ func loadPersona(ctx context.Context, dir string) (string, []adktool.Toolset, er
 	if dir == "" {
 		return "", nil, nil
 	}
+	// The skills' directories are named to the model and granted to the
+	// shell by absolute path.
+	if !filepath.IsAbs(dir) {
+		return "", nil, fmt.Errorf("the persona directory %q is not absolute", dir)
+	}
 	r, err := coreagent.Snapshot(dir)
 	if err != nil {
 		return "", nil, err
@@ -103,6 +108,9 @@ func executables(skills fs.FS) (map[string][]string, error) {
 		}
 		if info.Mode()&0o111 != 0 {
 			name, rel, _ := strings.Cut(p, "/")
+			if !coreagent.IsScriptPath(rel) {
+				return fmt.Errorf("skills/%s: not a path a script may have", p)
+			}
 			exec[name] = append(exec[name], rel)
 		}
 		return nil

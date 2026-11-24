@@ -9,6 +9,8 @@ import (
 	"path"
 	"slices"
 	"testing/fstest"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // maxSnapshotBytes bounds what Snapshot reads: a persona is prose and a few
@@ -25,9 +27,10 @@ type Rendering struct {
 	Skills       fs.FS
 }
 
-// Snapshot reads a rendering from root, which holds only Names: an
+// Snapshot reads a rendering from root, which holds only Names (an
 // instructions file and, optionally, a skills directory of skill
-// directories. It refuses any other entry, a symlink or anything that isn't
+// directories) and, beside them, the rendering's integrity manifest, which
+// it skips. It refuses any other entry, a symlink or anything that isn't
 // a regular file or a directory anywhere in it, a file directly under
 // skills/, and a rendering over maxSnapshotBytes. Every file is opened
 // through an os.Root, so nothing outside root is read even if an entry
@@ -61,6 +64,11 @@ func (s *snapshot) read() error {
 		return err
 	}
 	for _, e := range entries {
+		if e.Name() == persona.IntegrityManifestFile {
+			// The rendering's build-time manifest, which the worker's session
+			// check reads; not part of what the harness is given.
+			continue
+		}
 		if !slices.Contains(Names, e.Name()) {
 			return fmt.Errorf("it holds %q, which isn't one of %v", e.Name(), Names)
 		}
