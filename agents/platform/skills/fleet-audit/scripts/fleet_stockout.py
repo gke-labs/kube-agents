@@ -678,6 +678,11 @@ CLASS_RESERVATION_MISSING_IMPACT = (
     "if no rule is below it."
 )
 RESERVED_CLASSES_KEY = "_reserved_classes"
+# Whose zones a class rule is compared in: the rule's own `location.zones`, or
+# the cluster's node locations for a rule that names none. The word is part of
+# the finding's excerpt.
+CLASS_ZONES_OF_RULE = "rule"
+CLASS_ZONES_OF_CLUSTER = "cluster"
 RESERVATION_ZONES_KEY = "_reservation_zones"
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
@@ -2345,11 +2350,16 @@ def _record_uncompared_reservations(entry: dict, slug: str, unread: list[str], o
         entry["limitations"] = "; ".join([*filter(None, [entry.get("limitations")]), *limitations])
 
 
-def reserved_class_rules(cc: dict, project: str) -> list[dict]:
+def reserved_class_rules(cc: dict, project: str, cluster_zones: list[str] | tuple[str, ...] = ()) -> list[dict]:
     """The priority rules of a ComputeClass that consume only named
-    reservations (§3.10(b)): for each, its 1-based place, its zones (empty when
-    the rule names none) and its `(owner project, name)` reservations. A
-    reservation with no `project` is one of the cluster's own project."""
+    reservations (§3.10(b)): for each, its 1-based place, its zones and its
+    `(owner project, name)` reservations. A reservation with no `project` is
+    one of the cluster's own project.
+
+    The zones are the rule's own `location.zones`. A rule that names none gets
+    `cluster_zones`, the zones in which the cluster makes nodes; `zones_of`
+    says which of the two the zones are. With neither, the zones are empty and
+    the rule can use each zone."""
     rules = []
     for place, priority in enumerate((cc.get("spec") or {}).get("priorities") or [], start=1):
         reservations = (priority.get("reservations") or {}) if isinstance(priority, dict) else {}
@@ -2361,16 +2371,25 @@ def reserved_class_rules(cc: dict, project: str) -> list[dict]:
             if isinstance(item, dict) and item.get("name")
         )
         if named:
-            zones = sorted((priority.get("location") or {}).get("zones") or [])
-            rules.append({"class": cc["metadata"]["name"], "rule": place, "zones": zones, "reservations": named})
+            own_zones = (priority.get("location") or {}).get("zones") or []
+            rules.append(
+                {
+                    "class": cc["metadata"]["name"],
+                    "rule": place,
+                    "zones": sorted(own_zones or cluster_zones),
+                    "zones_of": CLASS_ZONES_OF_RULE if own_zones or not cluster_zones else CLASS_ZONES_OF_CLUSTER,
+                    "reservations": named,
+                }
+            )
     return rules
 
 
 def file_reserved_classes(entry: dict, zones_by_project: dict[str, dict[str, list[str]]], swept: frozenset[str]) -> None:
     """§3.10(b) for one cluster entry, where GKE's status does not name the
     reservation: a ComputeClass rule that consumes only named reservations,
-    none of which exists in a zone that the rule can use. A rule with no zones
-    can use each zone, so one zone that holds a named reservation is enough.
+    none of which exists in a zone that the rule can use: the rule's own zones,
+    else the cluster's. With no zone known, the rule can use each zone, so one
+    zone that holds a named reservation is enough.
 
     Run by `collect_fleet` beside `file_reserved_pools`, with the same two
     halves. One finding for a class, with each such rule in its excerpt."""
@@ -2395,7 +2414,7 @@ def file_reserved_classes(entry: dict, zones_by_project: dict[str, dict[str, lis
                 f"reservation {name}: found {'only in ' + ', '.join(sorted(zones)) if zones else 'in no zone'} of project {owner}"
                 for owner, name, zones in found
             )
-            rule_zones = f", rule zones {', '.join(reserved['zones'])}" if reserved["zones"] else ""
+            rule_zones = f", {reserved['zones_of']} zones {', '.join(reserved['zones'])}" if reserved["zones"] else ""
             excerpt = f"priority {reserved['rule']}: reservations.affinity={CLASS_SPECIFIC_RESERVATION}{rule_zones}; {where}"
             missing.setdefault(reserved["class"], []).append((excerpt, owners, reserved["command"]))
     for name, rules in missing.items():
@@ -3228,7 +3247,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         elif not non_production:
             # GKE did not name a reservation: the fleet step compares the rules
             # with the reservations of their owner projects.
-            reserved_classes += [{**rule, "command": dump_record["command"]} for rule in reserved_class_rules(cc, project)]
+            node_zones = sorted({*(cluster.get("locations") or []), *(cluster.get("autoprovisioning_locations") or [])})
+            reserved_classes += [{**rule, "command": dump_record["command"]} for rule in reserved_class_rules(cc, project, node_zones)]
         for hit in [check_compute_class_status(cc, reservation_filed=bool(reservation_hit))]:
             if hit:
                 # Stamped, as the workload arms below are: a failed pool list pops

@@ -4518,10 +4518,38 @@ class ReservedClassTest(unittest.TestCase):
         self.assertEqual(
             fs.reserved_class_rules(cc, "acme"),
             [
-                {"class": "reserved-ccc", "rule": 1, "zones": [], "reservations": [("acme", "r1")]},
-                {"class": "reserved-ccc", "rule": 2, "zones": ["us-central1-a", "us-central1-f"], "reservations": [("acme", "r3"), ("host", "r2")]},
+                {"class": "reserved-ccc", "rule": 1, "zones": [], "zones_of": "rule", "reservations": [("acme", "r1")]},
+                {"class": "reserved-ccc", "rule": 2, "zones": ["us-central1-a", "us-central1-f"], "zones_of": "rule", "reservations": [("acme", "r3"), ("host", "r2")]},
             ],
         )
+
+    def test_a_rule_with_no_zones_takes_the_cluster_s_node_locations(self):
+        """GKE makes a node for such a rule in a zone of the cluster."""
+        cc = self.reserved_class(self.rule("r1"), self.rule("r2", zones=("us-central1-f",)))
+        first, second = fs.reserved_class_rules(cc, "acme", ["us-central1-b", "us-central1-a"])
+        self.assertEqual((first["zones"], first["zones_of"]), (["us-central1-a", "us-central1-b"], "cluster"))
+        self.assertEqual((second["zones"], second["zones_of"]), (["us-central1-f"], "rule"))
+
+    def test_a_reservation_outside_the_cluster_s_zones_is_a_finding(self):
+        rules = fs.reserved_class_rules(self.reserved_class(self.rule("r1")), "acme", ["us-central1-a"])
+        entry = {
+            "name": "acme/us-central1/c1", "project": "acme", "location": "us-central1", "outcome": "collected",
+            "commands": [{"check": self.SLUG, "command": self.CLASSES_COMMAND, "rc": 0}], "candidates": [],
+            fs.RESERVED_CLASSES_KEY: [{**rule, "command": self.CLASSES_COMMAND} for rule in rules],
+        }
+        fs.file_reserved_classes(entry, {"acme": fs.reservation_zones([listed_reservation("r1", "us-central1-f")])}, frozenset({"acme"}))
+        [candidate] = entry["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific, cluster zones us-central1-a; "
+            "reservation r1: found only in us-central1-f of project acme",
+        )
+
+    def test_collect_cluster_gives_the_cluster_s_zones_to_a_rule_with_none(self):
+        cluster = {**self.CLUSTER, "locations": ["us-central1-c"], "autoprovisioning_locations": ["us-central1-a"]}
+        entry = CollectClusterTest.run_with(self, dump_items=[self.reserved_class(self.rule("no-such-reservation"))], cluster=cluster)
+        [reserved] = entry[fs.RESERVED_CLASSES_KEY]
+        self.assertEqual((reserved["zones"], reserved["zones_of"]), (["us-central1-a", "us-central1-c"], "cluster"))
 
     def test_other_rules_are_not_reserved(self):
         any_affinity = self.rule("r1")
