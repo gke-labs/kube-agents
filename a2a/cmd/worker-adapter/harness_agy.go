@@ -17,8 +17,9 @@ import (
 //   - the delegate server and the system prompts: #6712. The tool grant is
 //     here (#6711): agyPolicy reads the same Claude Code allowlist a session
 //     pod's harnessCommand builds, and the builder renders it as agy's
-//     --settings permissions. The model proxy (#6714) enforces the offered
-//     tools; these rules are defence in depth;
+//     --settings permissions. The model proxy is to enforce the offered
+//     tools (#6714's follow-up PR), with these rules as defence in depth;
+//     until it does, they are the only layer (lib/persona/antigravity);
 //   - the model and the gateway (AGY_LLM_GATEWAY_*): #6714. The pod's
 //     values reach agy unchanged, and the builder adds none;
 //   - HOME: a session pod's agy uses the pod's own HOME, shared by every
@@ -67,10 +68,14 @@ func (agyBuilder) command(spec harnessSpec) []string {
 	return append(argv, spec.extra...)
 }
 
-// agyGrant is spec's tool grant as agy's. A grant that doesn't map renders
-// as nothing granted: selectHarness has already refused the one input that
-// can carry an unknown name (A2A_ALLOWED_TOOLS), so this is the fail-closed
-// floor, not a path a pod takes.
+// agyGrant is spec's tool grant as agy's. A grant that doesn't map or
+// render is nothing granted. selectHarness refuses the inputs that could
+// cause that (an A2A_ALLOWED_TOOLS override, A2A_WORKDIR) at startup, so
+// this is the fail-closed floor, not a path a pod is expected to take.
+//
+// A profile worker's base argv (spec.tools false) carries this deny-all
+// grant; the persona's grant (#6713) is to replace it, not add a second
+// --settings.
 func agyGrant(spec harnessSpec) antigravity.Grant {
 	workdir := spec.workdir
 	if workdir == "" {
@@ -78,10 +83,8 @@ func agyGrant(spec harnessSpec) antigravity.Grant {
 	}
 	var p antigravity.Policy
 	if spec.tools {
-		var err error
-		if p, err = agyPolicy(spec.allowed, spec.disallowed); err != nil {
-			p = antigravity.Policy{}
-		}
+		// agyPolicy returns nothing granted with its error.
+		p, _ = agyPolicy(spec.allowed, spec.disallowed)
 	}
 	g, err := p.Render(workdir)
 	if err != nil {
@@ -98,6 +101,14 @@ func agyGrant(spec harnessSpec) antigravity.Grant {
 // doesn't know, and an unrestricted Bash, is an error: no guess at a grant.
 func agyPolicy(allowed, disallowed string) (antigravity.Policy, error) {
 	deny := splitTools(disallowed)
+	for _, d := range deny {
+		// A scoped deny (Bash(kubectl delete:*)) would narrow a prefix grant
+		// in Claude Code. No session pod sets one; refused rather than
+		// ignored if one ever appears.
+		if strings.Contains(d, "(") {
+			return antigravity.Policy{}, fmt.Errorf("scoped disallowed tool %q has no agy form", d)
+		}
+	}
 	var p antigravity.Policy
 	for _, t := range splitTools(allowed) {
 		base, arg, scoped := strings.Cut(t, "(")

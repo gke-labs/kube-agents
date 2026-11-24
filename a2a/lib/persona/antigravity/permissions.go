@@ -5,14 +5,23 @@
 // agy offers its model a fixed set of tools and has no setting that removes
 // one, and several of them (search_web, schedule, the subagent tools, swarm,
 // send_message, manage_task) run with no permission check at all. So the
-// grant is enforced in two places:
-//   - Tools is the set the loopback model proxy (#6714) leaves in each model
-//     request; it strips every other declaration and refuses a model call to
-//     a tool it did not offer. That is the boundary;
+// grant is meant to be enforced in two places:
+//   - Tools is the set the loopback model proxy (#6714) is to leave in each
+//     model request, stripping every other declaration and refusing a model
+//     call to a tool it did not offer. That is the boundary, and it lands
+//     in #6714's follow-up PR: until then the proxy only forwards, agy's
+//     model is offered all its tools, the ungated ones work, and these
+//     rules are the only layer. agy runs only with the
+//     A2A_HARNESS_UNISOLATED waiver meanwhile;
 //   - Allow and Deny are agy's own rules, rendered into --settings. They are
 //     defence in depth, never the boundary: the shell's boundary stays the
 //     sandbox, the credential broker and the verb allowlist, as for Claude
 //     Code.
+//
+// One rule category covers more than one tool: write_file(<dir>) also
+// allows agy's edit_file there, which a session pod's Claude Code denies.
+// The proxy strips edit_file; until it does, a grant with WriteFiles lets
+// agy edit in the workspace too.
 //
 // What agy 1.5.13 was seen to do (round_4 probes, 2026-11-24): --settings
 // accepts only the `permissions` key, and any other key is a hard error; a
@@ -24,6 +33,7 @@ package antigravity
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -100,8 +110,9 @@ var ruleGrammar = regexp.MustCompile(`^(command|read_file|write_file|mcp)\(([^()
 // Render maps p onto agy for a worker whose workspace is the absolute path
 // workspace.
 func (p Policy) Render(workspace string) (Grant, error) {
-	if !strings.HasPrefix(workspace, "/") || strings.ContainsAny(workspace, "()*") {
-		return Grant{}, fmt.Errorf("workspace %q is not a plain absolute path", workspace)
+	if !strings.HasPrefix(workspace, "/") || strings.ContainsAny(workspace, "()*") ||
+		path.Clean(workspace) != workspace || workspace == "/" {
+		return Grant{}, fmt.Errorf("workspace %q is not a clean absolute path below /", workspace)
 	}
 	var g Grant
 	if p.ReadFiles {

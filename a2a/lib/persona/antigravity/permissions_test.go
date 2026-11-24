@@ -76,7 +76,7 @@ func TestAShellPrefixIsABinaryAndItsSubcommandsOnly(t *testing.T) {
 // TestTheWorkspaceIsAPlainAbsolutePath: the workspace lands inside a rule, so
 // a relative path or one with rule syntax is refused.
 func TestTheWorkspaceIsAPlainAbsolutePath(t *testing.T) {
-	for _, bad := range []string{"", "scratch/ws", "/scratch/(ws)", "/scratch/*"} {
+	for _, bad := range []string{"", "scratch/ws", "/scratch/(ws)", "/scratch/*", "/", "/scratch/..", "/scratch/./ws", "/scratch/ws/", "//scratch"} {
 		if _, err := (Policy{WriteFiles: true}).Render(bad); err == nil {
 			t.Errorf("workspace %q accepted", bad)
 		}

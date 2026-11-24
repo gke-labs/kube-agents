@@ -128,7 +128,10 @@ yet.
   Without the `shell` tool a skill ships only its markdown. A server that
   no `tools` entry grants is dropped.
 
-- **`antigravity`**: not written yet; `render.For` refuses it by name.
+- **`antigravity`**: not written yet; `render.For` refuses it by name. The
+  package `lib/persona/antigravity` is agy's tool grant (which tools its
+  model may be offered, and its `permissions` rules), not a persona adapter;
+  the adapter (#6713) will use it.
 
 ## An example
 

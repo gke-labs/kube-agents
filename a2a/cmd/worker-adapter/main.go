@@ -420,6 +420,9 @@ func harnessCommand() []string {
 	// egress under NetworkPolicy is a black hole, and each call would burn
 	// its connect timeout against the task deadline. The fence is the
 	// control; this list agreeing with it is what keeps the failure legible.
+	// Under agy the list keeps search_web out of the grant, but agy offers
+	// and runs it whatever its rules say until the model proxy strips it
+	// (#6714's follow-up PR; lib/persona/antigravity).
 	// Under A2A_CLUSTER_VIEW the egress fence has one more peer, the
 	// credential broker, and Bash is what reaches it.
 	allowed := os.Getenv("A2A_ALLOWED_TOOLS")
@@ -734,11 +737,19 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	// agy's grant comes from the same allowlist, and an override is the one
 	// input that can name a tool agy has no grant for (agyPolicy). Refused
 	// at startup rather than rendered as nothing granted.
+	// The check is stricter than harnessCommand, which would drop a
+	// disallowed entry: an override naming one is refused here.
 	if driver.Harness() == persona.Antigravity {
-		if override := getenv("A2A_ALLOWED_TOOLS"); override != "" {
-			if _, err := agyPolicy(override, ""); err != nil {
-				return "", nil, nil, fmt.Errorf("A2A_ALLOWED_TOOLS for harness %q: %w", driver.Harness(), err)
-			}
+		workdir := getenv("A2A_WORKDIR")
+		if workdir == "" {
+			workdir = defaultWorkdir
+		}
+		p, err := agyPolicy(getenv("A2A_ALLOWED_TOOLS"), "")
+		if err == nil {
+			_, err = p.Render(workdir)
+		}
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("the tool grant for harness %q (A2A_ALLOWED_TOOLS, A2A_WORKDIR): %w", driver.Harness(), err)
 		}
 	}
 	// A harness with no default path in the image needs one named, unless a

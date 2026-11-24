@@ -11,13 +11,15 @@ import (
 
 // harnessSpec is the worker's harness policy for one argv, in terms a
 // harnessBuilder renders as its harness's flags. The tool names are Claude
-// Code's until the permissions vocabulary is neutral (#6711).
+// Code's; the agy builder reads them into the neutral grant of
+// lib/persona/antigravity (agyPolicy).
 type harnessSpec struct {
 	path, model, maxTurns string
 	// tools is a session pod's full argv: the tool allowlist and denylist,
 	// the settings and MCP isolation, the delegate server and the system
-	// prompts. A profile worker's base argv carries none of them; the
-	// persona's rendering supplies its own (worker-adapter/profile.go).
+	// prompts. A profile worker's base argv carries none of them (agy's
+	// carries a deny-all --settings instead); the persona's rendering
+	// supplies its own (worker-adapter/profile.go).
 	tools               bool
 	allowed, disallowed string
 	delegate            *delegateServer

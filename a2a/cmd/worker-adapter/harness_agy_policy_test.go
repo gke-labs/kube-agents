@@ -95,7 +95,7 @@ func TestEveryHarnessGrantsExactlyTheMappedTools(t *testing.T) {
 	t.Setenv("A2A_HARNESS_PATH", "/bin/harness")
 	t.Setenv("A2A_HARNESS_EXTRA_ARGS", "")
 	t.Setenv("A2A_ALLOWED_TOOLS", "")
-	t.Setenv("A2A_WORKDIR", "/scratch")
+	t.Setenv("A2A_WORKDIR", "/work")
 	for _, c := range []struct {
 		name, clusterView, delegate string
 		tools                       []string
@@ -122,7 +122,8 @@ func TestEveryHarnessGrantsExactlyTheMappedTools(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Claude Code's allowlist has no agy grant: %v", err)
 			}
-			g, err := p.Render("/scratch")
+			// A non-default workdir, so the write rule shows it came through.
+			g, err := p.Render("/work")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -156,6 +157,56 @@ func TestAProfileWorkersAgyArgvGrantsNothing(t *testing.T) {
 	for _, d := range []string{"read_file(*)", "write_file(*)", "command(*)"} {
 		if !slices.Contains(g.Deny, d) {
 			t.Errorf("deny %q missing from %q", d, g.Deny)
+		}
+	}
+}
+
+// TestAnAgyGrantThatCantRenderGrantsNothing: agyGrant's floor. A workdir or
+// prefix Render refuses, or an allowlist agyPolicy refuses, renders the
+// deny-all grant, never a zero one that would leave agy on its own defaults
+// (which allow in-workspace reads).
+func TestAnAgyGrantThatCantRenderGrantsNothing(t *testing.T) {
+	denyAll := `{"permissions":{"deny":["read_file(*)","write_file(*)","command(*)"]}}`
+	for name, spec := range map[string]harnessSpec{
+		"relative workdir":    {tools: true, allowed: "Read,Write", workdir: "scratch"},
+		"workdir with dotdot": {tools: true, allowed: "Read,Write", workdir: "/scratch/.."},
+		"root workdir":        {tools: true, allowed: "Read,Write", workdir: "/"},
+		"bad prefix":          {tools: true, allowed: "Bash(kubectl;sh:*)", workdir: "/scratch"},
+		"empty prefix":        {tools: true, allowed: "Bash(:*)", workdir: "/scratch"},
+		"unmappable":          {tools: true, allowed: "Read,Bash", workdir: "/scratch"},
+		"scoped deny":         {tools: true, allowed: "Bash(kubectl:*)", disallowed: "Bash(kubectl delete:*)", workdir: "/scratch"},
+	} {
+		if got := agyGrant(spec).Settings(); got != denyAll {
+			t.Errorf("%s: settings %s, want deny-all", name, got)
+		}
+	}
+	if got := agyGrant(harnessSpec{tools: true, allowed: "Read,Write", workdir: "/work"}).Allow; !slices.Equal(got, []string{"write_file(/work)"}) {
+		t.Errorf("workdir not carried into the write rule: allow %q", got)
+	}
+}
+
+// TestAnAgyWorkerRefusesAGrantItCantRenderAtStartup: an override or workdir
+// that would render as nothing granted stops the worker at startup instead.
+func TestAnAgyWorkerRefusesAGrantItCantRenderAtStartup(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"bad prefix":       {"A2A_ALLOWED_TOOLS": "Read,Bash(kubectl;sh:*)"},
+		"empty prefix":     {"A2A_ALLOWED_TOOLS": "Bash(:*)"},
+		"relative workdir": {"A2A_WORKDIR": "scratch"},
+		"root workdir":     {"A2A_WORKDIR": "/"},
+	} {
+		getenv := func(k string) string {
+			switch k {
+			case lib.EnvHarness:
+				return "antigravity"
+			case lib.EnvHarnessUnisolated:
+				return "allow"
+			case "A2A_HARNESS_PATH":
+				return "/bin/agy"
+			}
+			return env[k]
+		}
+		if _, _, _, err := selectHarness(getenv); err == nil || !strings.Contains(err.Error(), "tool grant") {
+			t.Errorf("%s: err %v, want a tool-grant refusal", name, err)
 		}
 	}
 }
