@@ -1261,8 +1261,12 @@ spreads and appear nowhere else (not as points, nights, key changes or in
 only when it is not today). `nights[]` is every night inside the drawn window the
 store holds a record for, oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
 `build:<prow build id>` from the object name (or `at:<recorded_at>` for a
-record without one; the records of a split night's two builds share the
-build `nightly.nights[]` files that night by), `started` and `log_url` the collector's when that
+record without one; the records of a split night's builds share the
+build `nightly.nights[]` files that night by; builds that `data.json`'s
+nightly runs lack, as after a refresh that swept a bounded span, share the
+first to start of those of one night date that started within
+`NIGHT_START_GRACE` of it, each start read from the build id, so a re-run
+later that date stays a night of its own), `started` and `log_url` the collector's when that
 build is a nightly run in `data.json` (`null` otherwise); the page dates
 every night by `at`, the stamp its points and markers are placed by, and
 uses `build` only for the link to the report. `cases{}` is per case `{domain, points[],
