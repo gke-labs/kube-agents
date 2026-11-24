@@ -1,0 +1,90 @@
+# Standard-to-Autopilot workload migration readiness probe (#7094, ahead of
+# #5734): checks whether the agent identifies workload constraints that block
+# migrating a GKE Standard cluster's workloads to GKE Autopilot as-is.
+#
+# Three workloads are presented in the prompt:
+#   1. A stateless web API Deployment with CPU and memory requests (compatible).
+#   2. A log-collector DaemonSet mounting /var/log via hostPath with
+#      securityContext.privileged: true (blocked: Autopilot rejects privileged
+#      containers and hostPath node log mounts).
+#   3. A batch Job using hostNetwork: true (blocked: Autopilot rejects pods
+#      requesting hostNetwork).
+#
+# The objective requires the verdict line "VERDICT: MIGRATION-BLOCKED" on a
+# line of its own, forbids "VERDICT: MIGRATION-READY" on a line of its own, and
+# requires both blocking constraints (privileged/hostPath on the DaemonSet and
+# hostNetwork on the batch Job) to be named in the report. The verifier
+# lowercases the report, strips emphasis and code markers, and folds line
+# decoration; bench/tests/test_cost_standard_to_autopilot_readiness_verdict.py
+# pins passing and failing shapes. The lane appends the catastrophic none-wrapped
+# github_writes safeguard (hack/eval/inject-lane-safeguards.yaml) on every CI
+# run.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: cost-standard-to-autopilot-readiness
+name: Standard-to-Autopilot readiness probe flags privileged hostPath DaemonSet and hostNetwork batch Job as migration blockers
+
+owner: Fuxiao-Gao
+domain: cost
+
+prompt: >-
+  We want to migrate a GKE Standard cluster to GKE Autopilot to reduce
+  node-management overhead. The cluster runs three workloads: (1) a stateless
+  web API Deployment with CPU/memory requests, (2) a log-collector DaemonSet
+  mounting `/var/log` via `hostPath` with `securityContext.privileged: true`,
+  and (3) a batch Job using `hostNetwork: true`. Can we migrate these workloads
+  to Autopilot as-is? Start your answer with exactly one line:
+  `VERDICT: MIGRATION-BLOCKED` or `VERDICT: MIGRATION-READY`, then name each
+  blocking workload and the specific constraint that blocks it. Do not change
+  anything.
+expected_output: >-
+  VERDICT: MIGRATION-BLOCKED. The stateless web API Deployment with CPU and
+  memory requests can run on GKE Autopilot as-is. Two workloads block an as-is
+  migration: (1) the log-collector DaemonSet is rejected by Autopilot because
+  securityContext.privileged: true and hostPath volume mounts (/var/log) are
+  disallowed on Autopilot (replace node-level log collection with GKE's built-in
+  Cloud Logging pipeline); and (2) the batch Job is rejected because
+  hostNetwork: true is disallowed on Autopilot workloads.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-verdict-is-migration-blocked-and-names-both-blockers
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns: ["(?m)^\\W*verdict:\\s*migration-blocked\\b"]
+      forbidden_patterns: ["(?m)^\\W*verdict:\\s*migration-ready\\b"]
+      required_patterns:
+        - "\\b(?:privileged|host[-\\s]?path)\\b"
+        - "\\bhost[-\\s]?network(?:ing)?\\b"
+      fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]
