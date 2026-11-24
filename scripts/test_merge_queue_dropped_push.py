@@ -141,6 +141,27 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(result["built"], merge)
         self.assertEqual(result["commits"], [(late, "fix: a late change")])
 
+    def test_a_late_commit_with_a_late_merge_of_the_base_after_it_names_the_commit_only(self):
+        main = self.repo.move_main()
+        merged = self.repo.squash(self.first)
+        late = self.repo.commit({"late.txt": "late\n"}, "fix: a late change")
+        head = self.repo.merge_main(main)
+        result = self.decide(merged, head)
+        self.assertEqual(result["verdict"], dropped.DROPPED)
+        self.assertEqual(result["built"], self.first)
+        # Neither the merge commit nor the commit of `main` that it brought in.
+        self.assertEqual(result["commits"], [(late, "fix: a late change")])
+
+    def test_a_late_commit_with_no_subject_is_named_with_an_empty_one(self):
+        merged = self.repo.squash(self.first)
+        (self.repo.directory / "late.txt").write_text("late\n")
+        self.repo.git.run("add", "--all")
+        self.repo.git.run("commit", "--quiet", "--allow-empty-message", "--message", "")
+        head = self.repo.git.output("rev-parse", "HEAD")
+        result = self.decide(merged, head)
+        self.assertEqual(result["commits"], [(head, "")])
+        self.assertIn(f"- {head[:12]} ``", dropped.comment_body("main", merged, head, result["built"], result["commits"]))
+
     def test_a_late_commit_that_changes_nothing_in_the_end_is_complete(self):
         merged = self.repo.squash(self.first)
         self.repo.commit({"late.txt": "late\n"}, "fix: a late change")

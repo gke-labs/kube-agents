@@ -2,8 +2,8 @@
 """Tell the author when the merge queue merged less than the pull request's last head.
 
 GitHub's merge queue merges the commit it built when the pull request entered
-the queue. A push to the pull request after that does not remove it from the
-queue and does not change what merges, but GitHub still shows the pushed commit
+the queue. On a push to the pull request after that, GitHub does not remove it
+from the queue and does not change what merges, but still shows the pushed commit
 as the merged head. The pushed commits are then not on the base branch, and
 nothing says so. `merge-gate.yml` runs this once a pull request is merged, and
 it posts one comment when that happened: which commits are missing, and what
@@ -22,9 +22,9 @@ that was merged.
   - Different tree: the queue merged an earlier head. The comment goes out. To
     name the missing commits, the same merge is tried on the head's ancestors,
     newest first; the first one that gives the merged tree is the head the
-    queue built from, and the commits after it are the missing ones. When no
-    ancestor gives it (the head was force-pushed after the entry was made), the
-    comment says so without a list.
+    queue built from, and the commits after it, merges left out, are the
+    missing ones. When no ancestor gives it (the head was force-pushed after
+    the entry was made), the comment goes out without a list.
   - No answer: the final head conflicts with the merged commit's parent, or the
     merged commit is not a squash (one parent). Nothing is posted and the log
     says why. A wrong notice costs more than a missed one.
@@ -78,6 +78,8 @@ GIT_TIMEOUT_SECONDS = 300
 #: `git merge-tree --write-tree` exits 0 on a clean merge and 1 on a conflict.
 MERGE_CLEAN = 0
 MERGE_CONFLICT = 1
+#: `cat-file -e` exits with one of these when the repository does not hold the object.
+OBJECT_ABSENT = (1, 128)
 #: A squash commit has one parent.
 SQUASH_PARENTS = 1
 #: Keeps git from waiting on a prompt for credentials the fetch does not need.
@@ -160,9 +162,16 @@ def built_from(git, parent, head, tree):
 
 
 def missing_commits(git, built, head, merge_commit):
-    """`(sha, subject)` of the commits on `head` that are neither on `built` nor on the base, oldest first."""
-    out = git.output("log", "--topo-order", "--reverse", COMMIT_FORMAT, head, f"^{built}", f"^{merge_commit}")
-    return [tuple(line.split(FIELD_SEPARATOR, 1)) for line in out.splitlines() if line]
+    """`(sha, subject)` of the commits on `head` that are neither on `built` nor on the base, oldest first.
+
+    Merge commits are left out: a merge of the base adds nothing of the author's, and the
+    commits it brings in are on the base already.
+    """
+    out = git.output(
+        "log", "--topo-order", "--reverse", "--no-merges", COMMIT_FORMAT, head, f"^{built}", f"^{merge_commit}"
+    )
+    # An empty subject leaves a line that ends at the separator, or at the commit id on the last line.
+    return [(sha, subject) for sha, _, subject in (line.partition(FIELD_SEPARATOR) for line in out.splitlines()) if sha]
 
 
 def decide(git, merge_commit, head):
@@ -185,7 +194,7 @@ def decide(git, merge_commit, head):
     if built is None:
         return _result(DROPPED, f"{short(merge_commit)} differs from the final head {short(head)}; no ancestor gives it")
     commits = missing_commits(git, built, head, merge_commit)
-    why = f"{short(merge_commit)} was built from {short(built)}; {len(commits)} later commits are missing"
+    why = f"{short(merge_commit)} was built from {short(built)}; later commits missing: {len(commits)}"
     return _result(DROPPED, why, built=built, commits=commits)
 
 
@@ -216,7 +225,7 @@ def comment_body(base, merge_commit, head, built=None, commits=()):
 
 def fetch(git, url, commits):
     """Bring the commits and their history into the repository, unless it already has them."""
-    wanted = [sha for sha in commits if git.run("cat-file", "-e", f"{sha}^{{commit}}", ok=(0, 1, 128))[0]]
+    wanted = [sha for sha in commits if git.run("cat-file", "-e", f"{sha}^{{commit}}", ok=(0, *OBJECT_ABSENT))[0]]
     if wanted:
         git.run("fetch", "--quiet", "--no-tags", url, *wanted)
 

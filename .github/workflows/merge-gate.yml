@@ -149,12 +149,12 @@ jobs:
   dropped-push:
     name: Tell the author when the queue merged less than the last head
     # The queue merges the commit it built when the pull request entered it.
-    # A later push does not take the pull request out and does not merge, and
-    # GitHub still shows the pushed commit as the merged head. After a merge,
+    # On a later push GitHub does not take the pull request out and does not
+    # merge the push, and still shows the pushed commit as the merged head. After a merge,
     # `scripts/merge_queue_dropped_push.py` repeats the queue's merge with the
     # final head; when the result differs from what merged, it posts one
-    # comment that names the missing commits. The script's docstring is the
-    # reference.
+    # comment, which names the missing commits when it can find them. The
+    # script's docstring is the reference.
     if: >-
       github.repository == 'gke-labs/kube-agents' &&
       github.event_name == 'pull_request_target' &&

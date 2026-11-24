@@ -691,7 +691,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           pinned to the default branch with `persist-credentials: false`,
           the pull request number passed through the environment. Its one
           write is a comment on a pull request that is already merged, which
-          names the commits the merge queue did not merge. It reports a
+          says that the merge queue did not merge its last commits. It reports a
           merge; it cannot approve, label, or merge anything. The two gate
           jobs hold `pull-requests: read`.
         - retest-actions: `issue_comment` on a `/retest` that opens the
@@ -705,7 +705,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
-        a capability, and this asserts membership rather than absence so an
+        a capability, and this asserts membership rather than absence so a
         ninth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
