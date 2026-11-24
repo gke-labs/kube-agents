@@ -167,8 +167,9 @@ const (
 // backend's answerFeedback=false. The gateway keeps one switch for every
 // backend it holds, so either name turns feedback off on Chat and Slack
 // alike. envTeamsAnswerFeedback is the same switch under Teams's name; no
-// CRD field renders it yet, so an install sets it on the gateway through
-// the operator's extra environment.
+// CRD field renders it yet, so the operator carries it from its own
+// environment (A2A_TEAMS_ANSWER_FEEDBACK=false on the controller-manager,
+// the chart's operator.extraEnv) onto a gateway that holds Teams.
 const (
 	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
 	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
