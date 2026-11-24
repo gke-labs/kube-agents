@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"os"
 
 	adkmodel "google.golang.org/adk/v2/model"
 
@@ -30,9 +29,6 @@ func buildModel(ctx context.Context, name string) (adkmodel.LLM, error) {
 	cfg.Model.Provider = config.ProviderGemini
 	cfg.Model.Name = name
 	cfg.Model.APIKey = placeholderKey
-	if k := os.Getenv("GEMINI_API_KEY"); k != "" {
-		cfg.Model.APIKey = k
-	}
 	off := false
 	cfg.Model.BuiltinTools = &config.BuiltinToolsConfig{WebSearch: &off, URLContext: &off, CodeExecution: &off}
 	p, err := models.Resolve(cfg)

@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"testing/fstest"
 
 	adktool "google.golang.org/adk/v2/tool"
@@ -13,9 +13,11 @@ import (
 )
 
 // loadPersona reads the persona once, at the start of the turn: the
-// instructions file's text and every file under the skills directory, into
+// instructions file's text and every regular file under skills/, into
 // memory, so nothing written to those paths later in the turn is read.
-// core-agent's own skills loader (env interpolation, discovery) is not used.
+// Every read goes through an os.Root opened on dir, so a link inside it
+// can't lead a read outside it. core-agent's own skills loader (env
+// interpolation, discovery) is not used.
 //
 // SEAM (dev-2): the persona's layout, rendered read-only to this process by
 // a second UID (#6713); PrepareTurn checks the directory before each spawn.
@@ -24,35 +26,36 @@ func loadPersona(ctx context.Context, dir string) (string, []adktool.Toolset, er
 	if dir == "" {
 		return "", nil, nil
 	}
-	instructionsFile, skillsDir := filepath.Join(dir, "instructions.md"), filepath.Join(dir, "skills")
-	var instructions string
-	if _, err := os.Stat(instructionsFile); err == nil {
-		b, err := os.ReadFile(instructionsFile)
-		if err != nil {
-			return "", nil, err
-		}
-		instructions = string(b)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", nil, err
 	}
-	if _, err := os.Stat(skillsDir); err != nil {
+	defer root.Close()
+	var instructions string
+	switch b, err := root.ReadFile("instructions.md"); {
+	case err == nil:
+		instructions = string(b)
+	case !errors.Is(err, fs.ErrNotExist):
+		return "", nil, err
+	}
+	skills, err := root.OpenRoot("skills")
+	if errors.Is(err, fs.ErrNotExist) {
 		return instructions, nil, nil
 	}
+	if err != nil {
+		return "", nil, err
+	}
+	defer skills.Close()
 	snapshot := fstest.MapFS{}
-	err := filepath.WalkDir(skillsDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	err = fs.WalkDir(skills.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
 			return err
 		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		rel, err := filepath.Rel(skillsDir, path)
+		b, err := skills.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		snapshot[filepath.ToSlash(rel)] = &fstest.MapFile{Data: b, Mode: 0o444}
+		snapshot[path] = &fstest.MapFile{Data: b, Mode: 0o444}
 		return nil
 	})
 	if err != nil {
