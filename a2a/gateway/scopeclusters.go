@@ -25,12 +25,18 @@ import (
 // Projects in scope the map doesn't cover (an explicit project, the
 // management project, a member no probe has listed) go in UnlistedProjects.
 // With no map at all (no document, or one that dropped the map for size)
-// Count is only what is known: Unknown, and Truncated. OldestListing is the
-// oldest `at` among the projects the counted clusters came from.
+// Count is only what is known: Unknown, and Truncated. An install whose
+// scope declares no boundary admits any project not excluded, so no list can
+// be complete: Unknown and Unbounded, and no projects named as listed
+// elsewhere. OldestListing is the oldest `at` among the projects the counted
+// clusters came from; a stamp ahead of this clock (past the skew allowed)
+// makes the age unknown, and OldestListing is left out.
 //
 // A parent scoped to one cluster is accepted for that cluster only, so its
 // page is that cluster when it is in scope and nothing otherwise, with no map
-// read. A parent the delegation refuses outright gets an empty page.
+// read, marked ParentScoped. A parent the delegation refuses outright, or an
+// install whose scope file can't be read (every target refused), gets an
+// empty page with a known count of zero.
 func (g *Gateway) profileScopeClusters(parent TaskRef) lib.ScopeClusters {
 	out := lib.ScopeClusters{Clusters: []lib.ScopeCluster{}}
 	if parent.Requester == nil || parent.Depth >= g.cfg.DelegationDepthMax {
@@ -49,10 +55,19 @@ func (g *Gateway) profileScopeClusters(parent TaskRef) lib.ScopeClusters {
 	if lerr != nil {
 		g.log.Warn("resolved scope unreadable; the scope clusters page lists none", "err", lerr)
 	}
+	return g.buildScopeClustersFor(decl, doc, capability.Scope(parent.Scope), time.Now())
+}
+
+// buildScopeClustersFor is the page for decl and doc under a parent at
+// parentScope: the document indexed once, its listing from the source's
+// cache, and the gateway's own verdict.
+func (g *Gateway) buildScopeClustersFor(decl *scopeDeclaration, doc *resolvedScope, parentScope capability.Scope, now time.Time) lib.ScopeClusters {
+	listing, known := g.resolvedClusters(doc)
 	return buildScopeClusters(scopeClustersInput{
-		decl: decl, doc: doc, armed: g.resolvedScope != nil, now: time.Now(),
-		parentScope: capability.Scope(parent.Scope), pageMax: g.scopeClustersPageMax(),
-		verdict: g.scopeVerdict, holds: g.parentScopeHolds, management: g.cfg.ManagementProject,
+		decl: decl, doc: doc, listing: listing, known: known, now: now,
+		parentScope: parentScope, pageMax: g.scopeClustersPageMax(),
+		verdict: g.scopeVerdict(decl, newResolvedIndex(doc, decl), g.resolvedScope != nil, now),
+		holds:   g.parentScopeHolds, management: g.cfg.ManagementProject,
 	})
 }
 
@@ -71,12 +86,13 @@ func (g *Gateway) scopeClustersPageMax() int {
 type scopeClustersInput struct {
 	decl        *scopeDeclaration
 	doc         *resolvedScope
-	armed       bool
+	listing     map[string]resolvedClusters
+	known       bool
 	now         time.Time
 	parentScope capability.Scope
 	pageMax     int
 	management  string
-	verdict     func(decl *scopeDeclaration, doc *resolvedScope, armed bool, now time.Time, t clusterTarget) error
+	verdict     func(t clusterTarget) error
 	holds       func(parent, child capability.Scope) bool
 }
 
@@ -88,7 +104,8 @@ const scopeProbeToken = "probe_target"
 func buildScopeClusters(in scopeClustersInput) lib.ScopeClusters {
 	out := lib.ScopeClusters{Clusters: []lib.ScopeCluster{}}
 	if pc, ok := scopeCluster(in.parentScope); ok {
-		if validClusterTarget(pc) && in.verdict(in.decl, in.doc, in.armed, in.now, pc) == nil && in.holds(in.parentScope, pc.scope()) {
+		out.ParentScoped = true
+		if validClusterTarget(pc) && in.verdict(pc) == nil && in.holds(in.parentScope, pc.scope()) {
 			out.Count = 1
 			out.Clusters = append(out.Clusters, lib.ScopeCluster{Project: pc.Project, Location: pc.Location, Cluster: pc.Cluster})
 		}
@@ -102,19 +119,20 @@ func buildScopeClusters(in scopeClustersInput) lib.ScopeClusters {
 	projectIn := func(p string) bool {
 		v, seen := verdicts[p]
 		if !seen {
-			v = in.verdict(in.decl, in.doc, in.armed, in.now, clusterTarget{Project: p, Location: scopeProbeToken, Cluster: scopeProbeToken}) == nil
+			v = in.verdict(clusterTarget{Project: p, Location: scopeProbeToken, Cluster: scopeProbeToken}) == nil
 			verdicts[p] = v
 		}
 		return v
 	}
 
-	listing, known := resolvedClustersOf(in.doc)
+	listing := in.listing
 	projects := make([]string, 0, len(listing))
 	for p := range listing {
 		projects = append(projects, p)
 	}
 	sort.Strings(projects)
 	var oldest time.Time
+	ageUnknown := false
 	for _, p := range projects {
 		if !lib.ValidSubjectToken(p) || !projectIn(p) {
 			continue
@@ -147,15 +165,27 @@ func buildScopeClusters(in scopeClustersInput) lib.ScopeClusters {
 			}
 			out.Clusters = append(out.Clusters, lib.ScopeCluster{Project: t.Project, Location: t.Location, Cluster: t.Cluster})
 		}
-		if at, err := time.Parse(time.RFC3339, entry.At); err == nil && (oldest.IsZero() || at.Before(oldest)) {
+		at, err := time.Parse(resolvedListingTimeFormat, entry.At)
+		switch {
+		case err != nil || at.After(in.now.Add(resolvedScopeClockSkew)):
+			// No age to give: a stamp ahead of this clock would read as
+			// fresher than any listing can be.
+			ageUnknown = true
+		case oldest.IsZero() || at.Before(oldest):
 			oldest = at
 		}
 	}
-	if !oldest.IsZero() {
+	if !oldest.IsZero() && !ageUnknown {
 		out.OldestListing = oldest.UTC().Format(time.RFC3339)
 	}
-	out.Unknown = !known
+	out.Unbounded = !in.decl.Present
+	out.Unknown = !in.known || out.Unbounded
 	out.Truncated = out.Unknown || out.Count > len(out.Clusters)
+	if out.Unbounded {
+		// Every project not excluded is in scope, so there is no set the
+		// unlisted ones could be the rest of.
+		return out
+	}
 
 	// The projects in scope whose clusters the map doesn't carry: the
 	// explicit ones and the management project, which the publisher never

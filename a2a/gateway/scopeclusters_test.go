@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -197,14 +198,21 @@ func TestScopeClustersWithoutTheResolvedScopesMapAreUnknown(t *testing.T) {
 	}
 }
 
-// scBuildInput is buildScopeClusters' input for decl and doc under an
-// install-scoped parent, with the gateway's own verdict.
-func scBuildInput(decl *scopeDeclaration, doc *resolvedScope, now time.Time) scopeClustersInput {
-	g := &Gateway{cfg: &Config{Namespace: "kubeagents-system", ManagementProject: scTestManagement},
-		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	return scopeClustersInput{decl: decl, doc: doc, armed: true, now: now,
-		parentScope: capability.NamespaceScope("kubeagents-system"), pageMax: lib.ScopeClustersPageMax,
-		management: scTestManagement, verdict: g.scopeVerdict, holds: g.parentScopeHolds}
+// scGateway is a gateway that reads doc as its resolved scope, with the
+// widest page.
+func scGateway(doc *resolvedScope) *Gateway {
+	return &Gateway{cfg: &Config{Namespace: "kubeagents-system", ManagementProject: scTestManagement,
+		DelegationWidthMax: lib.ScopeClustersPageMax, DelegationDepthMax: 3},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)), resolvedScope: &fakeResolvedSource{doc: doc}}
+}
+
+// scBuild is the page for decl and doc under a parent at parentScope (the
+// install's scope when empty).
+func scBuild(decl *scopeDeclaration, doc *resolvedScope, now time.Time, parentScope capability.Scope) lib.ScopeClusters {
+	if parentScope == "" {
+		parentScope = capability.NamespaceScope("kubeagents-system")
+	}
+	return scGateway(doc).buildScopeClustersFor(decl, doc, parentScope, now)
 }
 
 func scParseDoc(t *testing.T, raw string) *resolvedScope {
@@ -216,9 +224,17 @@ func scParseDoc(t *testing.T, raw string) *resolvedScope {
 	return &doc
 }
 
+// mustPart fails the test when s isn't a valid part.
+func mustPart(t *testing.T, s lib.ScopeClusters) {
+	t.Helper()
+	if _, err := lib.ScopeClustersPart(s); err != nil {
+		t.Fatalf("the part %+v is refused: %v", s, err)
+	}
+}
+
 // TestScopeClustersUnknownCases: a too-large document, an unreadable one,
-// and a map that doesn't parse all read as unknown; a malformed map never
-// costs the admissions the rows decide.
+// and a `clusters` value that isn't a map all read as unknown, and a value
+// of the wrong type never costs the admissions the rows decide.
 func TestScopeClustersUnknownCases(t *testing.T) {
 	t.Parallel()
 	decl := scopeFrom(t, scTestScope)
@@ -228,104 +244,275 @@ func TestScopeClustersUnknownCases(t *testing.T) {
 	tooLarge := *good
 	tooLarge.State = "too-large"
 	tooLarge.Projects = nil
-	malformed := *good
-	malformed.Clusters = json.RawMessage(`{"member-a":{"at":"x","clusters":[["us-central1",5]]}}`)
-	for name, doc := range map[string]*resolvedScope{"too large": &tooLarge, "unreadable": nil, "malformed map": &malformed} {
-		got := buildScopeClusters(scBuildInput(decl, doc, now))
+	notAMap := *good
+	notAMap.Clusters = json.RawMessage(`[["us-central1","a1"]]`)
+	for name, doc := range map[string]*resolvedScope{"too large": &tooLarge, "unreadable": nil, "not a map": &notAMap} {
+		got := scBuild(decl, doc, now, "")
 		if !got.Unknown || !got.Truncated || got.Count != 0 {
 			t.Errorf("%s: %+v, want unknown, truncated, nothing counted", name, got)
 		}
-		if _, err := lib.ScopeClustersPart(got); err != nil {
-			t.Errorf("%s: the part is refused: %v", name, err)
-		}
+		mustPart(t, got)
 	}
-	g := &Gateway{cfg: &Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), resolvedScope: &fakeResolvedSource{doc: &malformed}}
+	g := scGateway(&notAMap)
 	if err := g.checkScope(decl, clusterTarget{Project: "member-a", Location: "l", Cluster: "c"}); err != nil {
-		t.Fatalf("a malformed clusters map refused a resolved member: %v", err)
+		t.Fatalf("a clusters value that isn't a map refused a resolved member: %v", err)
 	}
-	// And a document read whole with a map of the wrong type still admits.
 	odd := strings.Replace(scTestDocument(t, decl, now, false), `"v":1`, `"v":1,"clusters":5`, 1)
 	if doc := scParseDoc(t, odd); checkResolvedScope(doc, decl, now, clusterTarget{Project: "member-a", Location: "l", Cluster: "c"}) != nil {
 		t.Fatal("a clusters value of the wrong type cost a resolved member its admission")
 	}
 }
 
+// TestScopeClustersSkipsABadEntryAlone: an entry that isn't whole (an `at`
+// that isn't the publisher's time, a non-string name, a pair of three, no
+// clusters list) is left out on its own, as the publisher's _clean_clusters
+// does: the rest of the map still counts, and the project reads as one no
+// probe has listed.
+func TestScopeClustersSkipsABadEntryAlone(t *testing.T) {
+	t.Parallel()
+	decl := scopeFrom(t, scTestScope)
+	now := time.Now()
+	stamp := now.UTC().Format(time.RFC3339)
+	doc := scParseDoc(t, scTestDocument(t, decl, now, false))
+	for _, id := range []string{"member-d", "member-e", "member-f", "member-g"} {
+		doc.Projects = append(doc.Projects, resolvedRow{ID: id, Outcome: "ok", ConfirmedAt: stamp})
+	}
+	doc.Clusters = json.RawMessage(`{
+		"member-a": {"at": "` + stamp + `", "clusters": [["us-central1", "a1"]]},
+		"member-b": {"at": "yesterday", "clusters": [["us-east1", "keep"]]},
+		"member-c": {"at": "` + stamp + `", "clusters": [["us-east1", 5]]},
+		"member-d": {"at": "` + stamp + `", "clusters": [["us-east1", "c", "extra"]]},
+		"member-e": {"at": "` + stamp + `"},
+		"member-f": {"at": null, "clusters": []},
+		"member-g": "not an entry"
+	}`)
+	got := scBuild(decl, doc, now, "")
+	want := lib.ScopeClusters{Count: 1, Clusters: []lib.ScopeCluster{{Project: "member-a", Location: "us-central1", Cluster: "a1"}},
+		UnlistedProjects: []string{"explicit-a", "member-b", "member-c", "member-d", "member-e", "member-f", "member-g", scTestManagement},
+		UnlistedCount:    8, OldestListing: stamp}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("a map with bad entries =\n%+v\nwant\n%+v", got, want)
+	}
+	mustPart(t, got)
+}
+
+// TestScopeClustersAgeUnknownForAFutureListing: a listing stamped ahead of
+// this clock gives no age, so the page leaves the oldest listing out rather
+// than reporting the others' age as the page's.
+func TestScopeClustersAgeUnknownForAFutureListing(t *testing.T) {
+	t.Parallel()
+	decl := scopeFrom(t, scTestScope)
+	now := time.Now()
+	doc := scParseDoc(t, scTestDocument(t, decl, now, false))
+	future := now.Add(time.Hour).UTC().Format(time.RFC3339)
+	past := now.Add(-time.Hour).UTC().Format(time.RFC3339)
+	doc.Clusters = json.RawMessage(`{"member-a":{"at":"` + past + `","clusters":[["l","a"]]},"member-b":{"at":"` + future + `","clusters":[["l","b"]]}}`)
+	got := scBuild(decl, doc, now, "")
+	if got.Count != 2 || got.OldestListing != "" {
+		t.Fatalf("a future listing: count %d oldest %q, want 2 and no age", got.Count, got.OldestListing)
+	}
+	doc.Clusters = json.RawMessage(`{"member-a":{"at":"` + past + `","clusters":[["l","a"]]}}`)
+	if got := scBuild(decl, doc, now, ""); got.OldestListing != past {
+		t.Fatalf("a past listing: oldest %q, want %q", got.OldestListing, past)
+	}
+}
+
+// TestScopeClustersUnderAnUnboundedScope: a scope that declares no boundary
+// admits any project not excluded, so the page is unknown and unbounded and
+// names nothing as listed elsewhere, as though the rest were known.
+func TestScopeClustersUnderAnUnboundedScope(t *testing.T) {
+	t.Parallel()
+	decl := scopeFrom(t, `{"present":false,"exclude":{"clusters":[{"projectId":"member-b","location":"us-east1","clusterName":"dropped"}]}}`)
+	now := time.Now()
+	doc := scParseDoc(t, scTestDocument(t, scopeFrom(t, scTestScope), now, true))
+	got := scBuild(decl, doc, now, "")
+	if !got.Unbounded || !got.Unknown || !got.Truncated || len(got.UnlistedProjects) != 0 || got.UnlistedCount != 0 {
+		t.Fatalf("an unbounded scope: %+v", got)
+	}
+	if slices.Contains(got.Clusters, lib.ScopeCluster{Project: "member-b", Location: "us-east1", Cluster: "dropped"}) {
+		t.Fatalf("an excluded cluster is on an unbounded page: %+v", got.Clusters)
+	}
+	mustPart(t, got)
+}
+
 // TestScopeClustersUnderAClusterScopedParent: a parent scoped to one cluster
 // is accepted for that cluster only, so its page is that cluster, or nothing
-// when the cluster is out of scope.
+// when the cluster is out of scope, and it says the parent is scoped.
 func TestScopeClustersUnderAClusterScopedParent(t *testing.T) {
 	t.Parallel()
 	decl := scopeFrom(t, scTestScope)
 	now := time.Now()
 	doc := scParseDoc(t, scTestDocument(t, decl, now, true))
-	in := scBuildInput(decl, doc, now)
-	in.parentScope = clusterTarget{Project: "member-a", Location: "us-central1", Cluster: "a1"}.scope()
-	got := buildScopeClusters(in)
-	want := lib.ScopeClusters{Count: 1, Clusters: []lib.ScopeCluster{{Project: "member-a", Location: "us-central1", Cluster: "a1"}}}
+	got := scBuild(decl, doc, now, clusterTarget{Project: "member-a", Location: "us-central1", Cluster: "a1"}.scope())
+	want := lib.ScopeClusters{Count: 1, ParentScoped: true, Clusters: []lib.ScopeCluster{{Project: "member-a", Location: "us-central1", Cluster: "a1"}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("cluster-scoped parent: %+v, want %+v", got, want)
 	}
-	in.parentScope = clusterTarget{Project: "member-b", Location: "us-east1", Cluster: "dropped"}.scope()
-	if got := buildScopeClusters(in); got.Count != 0 || len(got.Clusters) != 0 || got.Truncated {
-		t.Fatalf("a parent on an excluded cluster: %+v, want an empty page", got)
+	mustPart(t, got)
+	got = scBuild(decl, doc, now, clusterTarget{Project: "member-b", Location: "us-east1", Cluster: "dropped"}.scope())
+	if !got.ParentScoped || got.Count != 0 || len(got.Clusters) != 0 || got.Truncated {
+		t.Fatalf("a parent on an excluded cluster: %+v, want an empty scoped page", got)
 	}
+	mustPart(t, got)
 }
 
-// TestScopeClustersAtScale: thousands of clusters over hundreds of projects.
-// The document parses and the page builds quickly, the page is capped at its
-// size and in order, the count is every cluster, and the part stays inside
-// its bounds.
-func TestScopeClustersAtScale(t *testing.T) {
+// TestScopeClustersUnderANarrowerParentScope: a parent whose scope is
+// neither a cluster nor the install's holds only what its scope path
+// contains, as the delegation's parentScopeHolds does: a project scope gets
+// that project's clusters, and a scope that contains no cluster gets none.
+func TestScopeClustersUnderANarrowerParentScope(t *testing.T) {
 	t.Parallel()
-	const projects, perProject = 500, 10
-	explicit := make([]string, 0, 40)
-	for i := range 40 {
-		explicit = append(explicit, fmt.Sprintf("explicit-%03d", i))
-	}
-	declRaw, _ := json.Marshal(map[string]any{"present": true, "folders": []string{"123"}, "projects": explicit, "maxProjects": 1000})
-	decl := scopeFrom(t, string(declRaw))
+	decl := scopeFrom(t, scTestScope)
 	now := time.Now()
+	doc := scParseDoc(t, scTestDocument(t, decl, now, true))
+	got := scBuild(decl, doc, now, capability.Scope(scopeKindProject+"/member-a"))
+	want := lib.ScopeClusters{Count: 3, Clusters: []lib.ScopeCluster{
+		{Project: "member-a", Location: "europe-west1", Cluster: "a3"},
+		{Project: "member-a", Location: "us-central1", Cluster: "a1"},
+		{Project: "member-a", Location: "us-central1", Cluster: "a2"},
+	}, OldestListing: got.OldestListing}
+	if !reflect.DeepEqual(got, want) || got.OldestListing == "" {
+		t.Fatalf("a project-scoped parent: %+v, want %+v", got, want)
+	}
+	got = scBuild(decl, doc, now, capability.NamespaceScope("another-namespace"))
+	if got.Count != 0 || len(got.Clusters) != 0 || got.UnlistedCount != 0 || got.Unknown {
+		t.Fatalf("a parent whose scope holds no cluster: %+v, want an empty known page", got)
+	}
+	mustPart(t, got)
+}
+
+// TestScopeClustersWithNoScopeFile: with no declaration every target is
+// refused, so the page is empty with a known count of zero, not unknown.
+func TestScopeClustersWithNoScopeFile(t *testing.T) {
+	t.Parallel()
+	g := scGateway(nil)
+	g.cfg.ScopeFile = filepath.Join(t.TempDir(), "absent.json")
+	requester := TaskRequester{Backend: consoleBackend, Subject: "hmac:00"}
+	got := g.profileScopeClusters(TaskRef{Addressee: "chat", Tier: string(capability.TierRead), Scope: installScope, Requester: &requester})
+	want := lib.ScopeClusters{Clusters: []lib.ScopeCluster{}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("no scope file: %+v, want %+v", got, want)
+	}
+	mustPart(t, got)
+}
+
+// scScaleDocument is a resolved scope of rows member projects, each with
+// perProject clusters in its listing when withClusters.
+func scScaleDocument(t *testing.T, decl *scopeDeclaration, now time.Time, rows, perProject int, withClusters bool) string {
+	t.Helper()
 	stamp := now.UTC().Format(time.RFC3339)
-	rows := make([]any, 0, projects)
+	projects := make([]any, 0, rows)
 	clusters := map[string]any{}
-	for p := range projects {
-		id := fmt.Sprintf("member-%04d-%s", p, strings.Repeat("x", 12))
-		rows = append(rows, map[string]any{"id": id, "via": []string{"folders/123"}, "outcome": "ok", "confirmedAt": stamp})
+	for p := range rows {
+		id := fmt.Sprintf("member-%05d-%s", p, strings.Repeat("x", 12))
+		projects = append(projects, map[string]any{"id": id, "via": []string{"folders/123"}, "outcome": "ok", "confirmedAt": stamp})
 		pairs := make([][]string, 0, perProject)
 		for c := range perProject {
 			pairs = append(pairs, []string{"us-central1-" + string(rune('a'+c%3)), fmt.Sprintf("cluster-%02d-%s", c, strings.Repeat("y", 30))})
 		}
 		clusters[id] = map[string]any{"at": stamp, "clusters": pairs}
 	}
-	raw, _ := json.Marshal(map[string]any{"v": 1, "resolvedAt": stamp, "memberHash": memberHash(decl), "state": "ok",
-		"excludedProjects": []string{}, "projects": rows, "clusters": clusters})
-
-	start := time.Now()
-	doc := scParseDoc(t, string(raw))
-	got := buildScopeClusters(scBuildInput(decl, doc, now))
-	part, err := lib.ScopeClustersPart(got)
-	elapsed := time.Since(start)
+	doc := map[string]any{"v": 1, "resolvedAt": stamp, "memberHash": memberHash(decl), "state": "ok",
+		"excludedProjects": []string{}, "projects": projects}
+	if withClusters {
+		doc["clusters"] = clusters
+	}
+	raw, err := json.Marshal(doc)
 	if err != nil {
-		t.Fatalf("the part at scale is refused: %v", err)
+		t.Fatal(err)
 	}
-	if got.Count != projects*perProject || len(got.Clusters) != lib.ScopeClustersPageMax || !got.Truncated || got.Unknown {
-		t.Fatalf("count %d page %d truncated %v unknown %v, want %d, %d, true, false",
-			got.Count, len(got.Clusters), got.Truncated, got.Unknown, projects*perProject, lib.ScopeClustersPageMax)
+	return string(raw)
+}
+
+// TestScopeClustersAtScale: 5000 member rows, with a listing of two
+// clusters each and without one. Each page builds in time linear in the
+// rows (the document indexed once per build, its listing parsed once per
+// read), inside a bound a tenfold regression would pass; the page is capped
+// and in (project, location, cluster) order, the count is every cluster,
+// and the part stays inside its bounds.
+//
+// It runs on its own, not in parallel with the suite's rigs, so the time
+// bound measures the build rather than the suite's load.
+func TestScopeClustersAtScale(t *testing.T) {
+	const rows, perProject = 5000, 2
+	// The bound on one build after the read. A build here takes about 5ms
+	// with the map (3ms without); with the member hash and the row scan
+	// per project it took about 650ms, and re-parsing the listing on each
+	// build added about 9ms. A tenfold regression passes the bound.
+	const buildBound = 40 * time.Millisecond
+	explicit := make([]string, 0, 40)
+	for i := range 40 {
+		explicit = append(explicit, fmt.Sprintf("explicit-%03d", i))
 	}
-	if !slices.IsSortedFunc(got.Clusters, func(a, b lib.ScopeCluster) int {
-		return strings.Compare(a.Project+"/"+a.Location+"/"+a.Cluster, b.Project+"/"+b.Location+"/"+b.Cluster)
-	}) {
-		t.Fatalf("the page is out of order: %+v", got.Clusters)
+	declRaw, _ := json.Marshal(map[string]any{"present": true, "folders": []string{"123"}, "projects": explicit, "maxProjects": 10000})
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, declRaw, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if got.UnlistedCount != len(explicit)+1 || len(got.UnlistedProjects) != lib.ScopeClustersUnlistedMax {
-		t.Fatalf("unlisted %d named of %d, want %d of %d", len(got.UnlistedProjects), got.UnlistedCount, lib.ScopeClustersUnlistedMax, len(explicit)+1)
+	decl := scopeFrom(t, string(declRaw))
+	byTuple := func(a, b lib.ScopeCluster) int {
+		return cmp.Or(strings.Compare(a.Project, b.Project), strings.Compare(a.Location, b.Location), strings.Compare(a.Cluster, b.Cluster))
 	}
-	if len(part.Data) > lib.ScopeClustersMaxBytes+len(`{"scopeClusters":}`) {
-		t.Fatalf("the part is %d bytes", len(part.Data))
+
+	for _, withClusters := range []bool{true, false} {
+		now := time.Now()
+		raw := scScaleDocument(t, decl, now, rows, perProject, withClusters)
+		client := fake.NewSimpleClientset(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kubeagents-system", Name: scTestConfigMap},
+			Data:       map[string]string{resolvedScopeDataKey: raw},
+		})
+		g := scGateway(nil)
+		g.cfg.ScopeFile = scope
+		g.SetResolvedScope(client, "kubeagents-system", scTestConfigMap)
+		requester := TaskRequester{Backend: consoleBackend, Subject: "hmac:00"}
+		parent := TaskRef{Addressee: "chat", Tier: string(capability.TierRead), Scope: installScope, Requester: &requester}
+		g.cfg.Namespace = chainTestNamespace
+
+		got := g.profileScopeClusters(parent) // the read, the parse, and the first build
+		var slowest time.Duration
+		for range 5 {
+			start := time.Now()
+			again := g.profileScopeClusters(parent)
+			slowest = max(slowest, time.Since(start))
+			if !reflect.DeepEqual(again, got) {
+				t.Fatalf("a second build differs: %+v", again)
+			}
+		}
+		// The listing was parsed once for the document the source holds.
+		cache := g.resolvedScope.(*configMapResolvedScope)
+		doc, _ := cache.load(context.Background())
+		first, _ := cache.clustersOf(doc)
+		second, _ := cache.clustersOf(doc)
+		if withClusters && (cache.listingDoc != doc || reflect.ValueOf(first).Pointer() != reflect.ValueOf(second).Pointer()) {
+			t.Fatal("the parsed listing isn't kept for the document read")
+		}
+		part, err := lib.ScopeClustersPart(got)
+		if err != nil {
+			t.Fatalf("the part at scale is refused: %v", err)
+		}
+		if len(part.Data) > lib.ScopeClustersMaxBytes+len(`{"scopeClusters":}`) {
+			t.Fatalf("the part is %d bytes", len(part.Data))
+		}
+		if withClusters {
+			if got.Count != rows*perProject || len(got.Clusters) != lib.ScopeClustersPageMax || !got.Truncated || got.Unknown {
+				t.Fatalf("count %d page %d truncated %v unknown %v, want %d, %d, true, false",
+					got.Count, len(got.Clusters), got.Truncated, got.Unknown, rows*perProject, lib.ScopeClustersPageMax)
+			}
+			if !slices.IsSortedFunc(got.Clusters, byTuple) {
+				t.Fatalf("the page is out of order: %+v", got.Clusters)
+			}
+			if got.UnlistedCount != len(explicit)+1 {
+				t.Fatalf("unlisted %d, want %d", got.UnlistedCount, len(explicit)+1)
+			}
+		} else if !got.Unknown || got.Count != 0 || got.UnlistedCount != rows+len(explicit)+1 {
+			t.Fatalf("without the map: unknown %v count %d unlisted %d, want unknown, 0, %d", got.Unknown, got.Count, got.UnlistedCount, rows+len(explicit)+1)
+		}
+		if len(got.UnlistedProjects) != lib.ScopeClustersUnlistedMax {
+			t.Fatalf("%d unlisted named, want %d", len(got.UnlistedProjects), lib.ScopeClustersUnlistedMax)
+		}
+		if slowest > buildBound {
+			t.Fatalf("with the map %v: a build over %d rows took %v, over %v", withClusters, rows, slowest, buildBound)
+		}
+		t.Logf("with the map %v: %d rows, %d-byte document, slowest build %v", withClusters, rows, len(raw), slowest)
 	}
-	// Generous, so a loaded machine passes: the build is milliseconds.
-	if elapsed > 2*time.Second {
-		t.Fatalf("parsing %d bytes and building the page took %v", len(raw), elapsed)
-	}
-	t.Logf("%d clusters, %d-byte document: parsed and built in %v", got.Count, len(raw), elapsed)
 }
