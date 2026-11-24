@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Fifty-four fixtures: forty-seven across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Fifty-five fixtures: forty-eight across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the fourteen seeded namespaces `seeded-debug`,
@@ -126,6 +126,7 @@ its roles are never published.
 | `declared-token-workload`           | a       | 0   | `deployment/token-reader` and `deployment/token-sidecar` in `seeded-token`, on the default ServiceAccount with the token mounted; `token-reader` declared on purpose in the GitOps repository's `knowledge/`, `token-sidecar` not                                                                                                             |
 | `declared-overrequest-workload`     | a       | 0   | `deployment/burst-ingest` in `seeded-headroom`, two pause replicas requesting `10m` / `128Mi` each and using almost none of the memory; declared on purpose in the GitOps repository's `knowledge/`                                                                                                                                           |
 | `generated-name-family`             | a       | 0   | three Deployments named `calibration-<uuid>` in `seeded-family`, the shape a spawner leaves, with one common `app.kubernetes.io/part-of` label and no owner reference; each is two pause replicas requesting `10m` / `128Mi`. The names are literals in the stack, the same on every project; nothing declares them                           |
+| `generated-name-job-family`         | a       | 7   | three finished Jobs named `reindex-<uuid>` in `seeded-family`, the shape a spawner leaves, with one common `app.kubernetes.io/part-of` label, no owner reference and no `ttlSecondsAfterFinished`. The names are literals in the stack, the same on every project; nothing declares them                                                      |
 | `guaranteed-qos-workload`           | a       | 0   | `deployment/ledger-writer` in `seeded-qos`, two replicas with requests equal to limits (`10m` / `32Mi`), so Guaranteed QoS, burning the whole CPU limit                                                                                                                                                                                       |
 | `stalled-controller`                | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                                                                                                                                                                            |
 | `crashloop-workload`                | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                                                                                                                                                                         |
@@ -145,7 +146,7 @@ its roles are never published.
 | `orphan-snapshot`                   | project | 91  | `orphan-snap-<prefix>`, the second snapshot of the same disk, undeclared: the control the compute audit keeps filing beside the declared one                                                                                                                                                                                                  |
 | `version-laggard`                   | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                                                                                                                                    |
 | `drift-outlier`                     | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                                                                                                                                       |
-| `drift-pool-outlier`                | c       | 1   | `default-pool` on a 50 GB boot disk with `kubeletConfig.cpuCfsQuota` false, where every other pool runs 20 GB and no kubelet block; planted ahead of the `boot-disk` and `kubelet-config` drift facets, which the drift SOP does not read yet                                                                                                 |
+| `drift-pool-outlier`                | c       | 1   | `default-pool` on a 50 GB boot disk with `kubeletConfig.podPidsLimit` 4096, where every other pool runs 20 GB and no kubelet block; planted ahead of the `boot-disk` and `kubelet-config` drift facets, which the drift SOP does not read yet                                                                                                 |
 | `untargeted-compute-class-workload` | c       | 0   | `app-worker-a`, three replicas, no compute-class nodeSelector or affinity, in `seeded-compute-class`, on the cluster whose only untainted pool carries the class label; the pods run                                                                                                                                                          |
 | `compute-class-affinity-workload`   | c       | 0   | `app-worker-b`, the class named only in a required nodeAffinity term: a targeted control, no defect                                                                                                                                                                                                                                           |
 | `compute-class-toleration-workload` | c       | 0   | `batch-worker-a`, nodeSelector on the class with a toleration that names key, value and effect and no operator (GKE adds its own `Equal` toleration: no defect); the pool carries no taint, so the pod runs                                                                                                                                   |
@@ -294,10 +295,10 @@ sends someone to edit a manifest that is correct.
 
 The fleet is not fully assertable on the day it is applied, and the delay is not
 provisioning — it is the SOPs' own age rules. A collector that filters on
-`creationTimestamp` returns nothing for a fixture younger than its window, so the audit
+`creationTimestamp` (or, for a finished Job, on `status.completionTime`) returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Forty-four of the forty-seven are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+Forty-four of the forty-eight are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `declared-single-zone-pool`, `missing-reservation-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
@@ -322,7 +323,12 @@ The hourly seeded-fleet scan watches both halves of that arithmetic: `drift-outl
 block; only time clears the age. A new peer's age is not asserted, because it leaves `seeded-c`
 outvoted 2/3 by the other two.
 
-`idle-nodepool` waits seven, and the GKE node pool has no creation timestamp to read:
+`generated-name-job-family` waits seven: the cost audit files a finished Job once its
+`status.completionTime` is 7 days old, and until then the fixture-state scan reports the role not
+ready, with the date (`ready_after_hours` in `fixtures.json`). A Job that is created again starts
+the clock again.
+
+`idle-nodepool` waits seven too, and the GKE node pool has no creation timestamp to read:
 `gcloud container node-pools describe` returns no `createTime` and neither does the REST
 resource. The cost collector dates a pool from its `CREATE_NODE_POOL` operation in
 `gcloud container operations list`. A pool with no such operation arrived with the cluster
@@ -340,7 +346,7 @@ because `fleet-cost-idle-pool` needs both of its
 fixtures — so that case waits 30 days, not 7. The two orphaned-snapshot roles wait ninety-one,
 the longest gate in the fleet: the GCE compute audit's orphaned-snapshots check flags a snapshot
 only when `(now - creationTimestamp).days > 90`, and the snapshot's timestamp is as immutable as
-the disk's. They are the one pair the fixture-state scan reports **not ready**, with the date,
+the disk's. They, and the finished-Job family for its 7 days, are the roles the fixture-state scan reports **not ready**, with the date,
 rather than drifted until then (`ready_after_hours` in `fixtures.json`), so a project applied
 today is registrable; the compute stream's declared-intent case,
 `compute-declared-intent-no-finding`, is parked `FIXTURE_NOT_READY` until the scan reads both roles

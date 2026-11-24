@@ -129,6 +129,7 @@ k8s-api-proxy/
 ├── cmd/
 │   └── k8s-api-proxy/
 │       ├── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream + pkg/certreload
+│       ├── auth.go               # --auth-mode list, --jwt-* flags, authenticator chain, --partition-by-caller
 │       └── tokens.go             # Workload Identity Federation and Application Default Credentials token source
 └── pkg/
     ├── k8sapiproxy/
@@ -168,6 +169,10 @@ type CallerIdentity struct {
 	Username string
 	UID      string
 	Groups   []string
+	// Partition is a tenant the authenticator verified; Config.CallerPartition may separate by it.
+	Partition string
+	// Authenticator names the authenticator that admitted the caller; empty when it does not say.
+	Authenticator string
 }
 
 // ErrAuthenticationUnavailable is wrapped by an authenticator that could not decide, so the
@@ -257,6 +262,19 @@ Every request names its cluster in the path: `/clusters/{clusterID}/{k8s-path...
 
 Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path contains `.` or `..` segments, empty internal segments (`//`), or percent-encoded slashes (`%2f`, `%2F`) with `400 Bad Request`. This guarantees that `RequestInfoFactory` and the upstream `kube-apiserver` interpret the URL path identically.
 
+Once the cluster is known, and before policy, cache or upstream, two install-wide refusals apply, each answered as a `403` whose message ends in its `policy rule:` line and counted under that reason. A resource request gets the usual `Status`. A discovery path (`/api`, `/api/<v>`, `/apis`, `/apis/<g>`, `/apis/<g>/<v>`, `/version`, `/openapi/...`) gets the same message as `text/plain`, because client-go's discovery client can't decode a `Status` there and reports it as `unknown`, so `kubectl cluster-info` would hide the refusal; a text body becomes its error message:
+
+| Rule                       | When                                                                                                                                            |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scope.excluded-cluster`   | `spec.scope.exclude.clusters` names the cluster (`--scope-file`, `KUBE_PROXY_SCOPE_FILE`, the `scope.json` key of `<agent>-config`).            |
+| `scope.exclude-unreadable` | The configured scope file can't be read or parsed; every cluster is refused until it can.                                                       |
+| `scope.held-cluster`       | `spec.hold` names the cluster, or sets `all` (`--hold-file`, `KUBE_PROXY_HOLD_FILE`, the `hold.json` key of `<agent>-hold`). Quotes the reason. |
+| `scope.hold-unreadable`    | The configured hold file can't be read or parsed; every cluster is refused until it can.                                                        |
+
+Both files are ConfigMap directory mounts the proxy stats on every request and re-parses when they change, so an edit applies without a restart. An empty path refuses nothing. `in-cluster` is checked as `--exclude-host-cluster-id`. The credential broker refuses the same clusters under the same rule names (`scope_exclude.py`).
+
+Both refusals are checked when a request starts. A watch, a followed log, or an `exec`, `attach`, `portforward` or `proxy` stream opened before an exclusion or a hold reached the proxy keeps running until it ends; the broker's relayed watcher streams behave the same way.
+
 ### 4. Sandbox `kubectl` and `kubeconfig` setup
 
 In [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile):
@@ -312,8 +330,10 @@ The token mounted at `/var/run/secrets/kubeagents/credential-proxy/token` is a s
 Because `Config.Authenticator` is an interface (`CallerAuthenticator`), deployments can choose the caller authentication mechanism that matches their sandbox boundary:
 
 - **Projected `ServiceAccount` JWT (`TokenReview`)**: Default for multi-pod Kubernetes sandboxes (`kube-agents`).
-- **Signed JWT from the sandbox platform (`pkg/jwtauth`)**: The platform mints a per-sandbox token (for example an agent runtime's actor token, injected at its egress gateway); the proxy verifies it against the issuer's key set, issuer, audience and expiry, with no call back to the issuer per request.
+- **Signed JWT from the sandbox platform (`pkg/jwtauth`, `--auth-mode=jwt`)**: The platform mints a per-sandbox token (for example an agent runtime's actor token, injected at its egress gateway); the proxy verifies it against the issuer's key set, issuer, audience and expiry, with no call back to the issuer per request. The key set URL is configured (`--jwt-jwks-url`) or discovered from `<issuer>/.well-known/openid-configuration`, read again on every key set fetch, whose `issuer` must equal the configured one and whose `jwks_uri` must be `https://`; redirects stay on `https://` and on the host being fetched. The username, UID, groups and partition are read from claim paths (`--jwt-username-claim`, `--jwt-uid-claim`, `--jwt-groups-claim`, `--jwt-partition-claim`), where dots separate nested keys and `\.` is a dot inside a key. `--jwt-required-sub-prefix` and `--jwt-allowed-partitions` narrow who is admitted, a bearer token over 16 KiB is refused unparsed, and a token whose unverified `iss` is not the configured issuer is refused before any key set lookup, so another authenticator's tokens never make the proxy fetch from or wait on this issuer.
+- **Several authenticators in order (`--auth-mode=token-review,jwt`)**: For a migration or a deployment with mixed sandbox runtimes, the binary tries the listed authenticators in order and admits the caller the first one accepts. When none does, it answers `503` if any of them could not decide and `401` only when every one refused. Each authenticator sees the request's original `Authorization` header, and the audit record's `caller_authenticator` says which one admitted the caller, since two authenticators can name different callers alike.
 - **Workload mTLS (`client-certificate` / `client-key` or SPIFFE X.509 SVID)**: The sandbox authenticates to `kube-proxy` with a client TLS certificate without reading a bearer token file.
+- **Caller partitions (`--partition-by-caller`)**: `--partition-by-caller` sets `Config.CallerPartition`, so the response cache and the in-flight coalescer of section 8a share nothing across partitions. `partition` separates callers by `CallerIdentity.Partition`, a tenant the JWT authenticator verified (`--jwt-partition-claim`, which it requires). `username` separates them by `CallerIdentity.Username` under whichever single authenticator is configured; it is refused with more than one mode in `--auth-mode`, where two authenticators could name different callers alike. The default, `none`, keeps every caller in one partition, which is what the operator-managed deployment runs.
 - **Host-local network isolation (`veth` pair or Unix domain socket)**: When `kube-proxy` runs on the host or hypervisor boundary for a single local sandbox (such as a local VM or NVIDIA OpenShell supervisor), binding `kube-proxy` to the dedicated host-side interface or socket authenticates the caller by transport endpoint (`--auth-mode=none` or a caller-provided `CallerAuthenticator`).
 
 ### 6. Request parsing and L7 verb policy (`pkg/k8sapiproxy/policy.go`)
@@ -335,7 +355,7 @@ When `Mode == ModeReadOnlyWithDryRun` and `info.Verb` is `create`, `update`, or 
 - It admits the request only when `dryRun` has exactly one value and that value is `All`. It does not rewrite the outbound query: the query that passed the check is the query that `kube-apiserver` receives.
 
 **Native Kubernetes refusal responses**:
-When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body:
+When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body (a scope refusal on a discovery path is the exception: plain text, section 3):
 
 ```json
 {
@@ -375,7 +395,7 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 - `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*`
 - `Connection` and `Upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled and `Upgrade` is non-empty, in which case `Connection: Upgrade` is set)
 
-Today the proxy does not change `User-Agent`: the header reaches `kube-apiserver` as the caller sent it, with no `kproxy/<caller-username>` suffix. The target cluster's audit log therefore shows the proxy's upstream identity and `kubectl`'s own `User-Agent`, and does not name the sandbox caller. The record of the caller is the proxy's own audit record (`caller_username`, `caller_uid`, `caller_groups`; see section 10). A request that the proxy forwarded is matched to the cluster's audit log by its `cluster`, its time (the record is written when the request ends, and `duration_ms` gives the start) and its request fields (`verb`, `api_group`, `resource`, `namespace`, `name`). A record whose `cache` is `hit` or `coalesced` has no entry of its own in the cluster's audit log. The two logs share no request ID.
+Today the proxy does not change `User-Agent`: the header reaches `kube-apiserver` as the caller sent it, with no `kproxy/<caller-username>` suffix. The target cluster's audit log therefore shows the proxy's upstream identity and `kubectl`'s own `User-Agent`, and does not name the sandbox caller. The record of the caller is the proxy's own audit record (`caller_username`, `caller_uid`, `caller_groups`, `caller_partition` when the authenticator named one, and `caller_authenticator`, the `--auth-mode` entry that admitted the caller; see section 10). A request that the proxy forwarded is matched to the cluster's audit log by its `cluster`, its time (the record is written when the request ends, and `duration_ms` gives the start) and its request fields (`verb`, `api_group`, `resource`, `namespace`, `name`). A record whose `cache` is `hit` or `coalesced` has no entry of its own in the cluster's audit log. The two logs share no request ID.
 
 For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering. When `Policy.DenyStreaming` (`--deny-streaming` or `KUBE_PROXY_DENY_STREAMING`) is set, the proxy refuses `watch` requests, `log` `follow` streams (`streaming_blocked`), and protocol upgrades with `403 Forbidden`.
 
@@ -439,7 +459,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - For every Kubernetes API request, `kube-proxy` extracts incoming W3C `traceparent`/`tracestate` headers before header sanitization, starts a server span (`k8s.api.proxy <verb> <resource>`), records structured attributes (`k8s.cluster.id`, `k8s.verb`, `k8s.resource`, `k8s.subresource`, `k8s.namespace`, `k8s.dry_run`, `kube_proxy.mode`, `kube_proxy.outcome`, `kube_proxy.rejection_reason`, `kube_proxy.secret_redacted`, `http.response.status_code`), and wraps the upstream round trip in a child client span (`k8s.api.upstream`).
 3. **Pluggable audit sink and structured JSON audit logging (`pkg/k8sapiproxy/audit.go`)**:
    - `pkg/k8sapiproxy` defines the `AuditSink` interface (`Record(ctx context.Context, event AuditEvent)`), `AuditSinkFunc`, and `NewSlogAuditSink(logger)` so OSS deployments and hosted services can route typed `AuditEvent` records to different backends.
-   - By default (`NewSlogAuditSink(logger)`), `kube-proxy` emits a structured audit record (`msg: "k8s-api-proxy request"`) via `log/slog` for every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes) with `outcome`, `cluster`, `caller_username` (with `caller_uid` and `caller_groups`), `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `rejection_reason`, `status_code`, `duration_ms`, `user_agent`, `error`, and `cache` (the response cache's result when it handled the request; `hit` and `coalesced` never reached the cluster).
+   - By default (`NewSlogAuditSink(logger)`), `kube-proxy` emits a structured audit record (`msg: "k8s-api-proxy request"`) via `log/slog` for every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes) with `outcome`, `cluster`, `caller_username` (with `caller_uid` and `caller_groups`, `caller_partition` only when the authenticator named one, and `caller_authenticator`, which the binary sets to the `--auth-mode` entry that admitted the caller, `token-review` or `jwt`, and an embedder's authenticator may leave out), `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `rejection_reason`, `status_code`, `duration_ms`, `user_agent`, `error`, and `cache` (the response cache's result when it handled the request; `hit` and `coalesced` never reached the cluster).
    - Request and response bodies and authentication credentials are never written to the audit log.
 
 ### 11. Deployment topology in `kube-agents`

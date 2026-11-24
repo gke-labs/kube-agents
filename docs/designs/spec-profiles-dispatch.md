@@ -428,7 +428,11 @@ leave open:
 
   The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
   broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
-  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. Its bound is
+  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. (A model
+  turn's harness, unlike a script, also gets a triggered task's stream and origin as
+  `PROFILE_TRIGGER_STREAM` and `PROFILE_TRIGGER_ORIGIN`, read from the submission's authority block,
+  which the dispatcher held to the grant; the broker still decides any report write from the signed
+  credential's trigger.) Its bound is
   its `timeoutSeconds` within the task's deadline. It starts in a session of its own, and its kill (at
   the bound, on a cancel, abandon or SIGTERM, and once more after it exits) SIGKILLs its process group
   and every process `/proc` lists in its session; where the worker is the container's pid 1, as the

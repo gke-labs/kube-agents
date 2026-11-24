@@ -271,7 +271,17 @@ func TestSlogAuditSink(t *testing.T) {
 				auditKeyUsername: "system:serviceaccount:agents:shell", auditKeyUID: "u1",
 				auditKeyGroups: []any{"system:serviceaccounts"}, auditKeyCache: "hit",
 			},
-			absent: []string{auditKeyAPIGroup, auditKeyNamespace, auditKeyName, auditKeyReason, auditKeyDryRun, auditKeyError},
+			absent: []string{auditKeyAPIGroup, auditKeyNamespace, auditKeyName, auditKeyReason, auditKeyDryRun, auditKeyError, auditKeyPartition, auditKeyAuthenticator},
+		},
+		{
+			name: "caller with a partition and its authenticator",
+			event: AuditEvent{
+				Caller:  &CallerIdentity{Username: "agent-1", Partition: "team-a", Authenticator: "jwt"},
+				Outcome: OutcomeForwarded, StatusCode: http.StatusOK,
+			},
+			wantLevel: "INFO",
+			want:      map[string]any{auditKeyUsername: "agent-1", auditKeyPartition: "team-a", auditKeyAuthenticator: "jwt"},
+			absent:    []string{auditKeyUID, auditKeyGroups},
 		},
 		{
 			name:      "refused",
