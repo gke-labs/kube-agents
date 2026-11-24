@@ -2444,8 +2444,11 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) (resp
 			if rec.Status != StatusProposed {
 				continue
 			}
-			if wantRepo != "" && rec.Repo != "" && !strings.EqualFold(rec.Repo, wantRepo) {
-				continue
+			if wantRepo != "" {
+				effRepo := firstNonEmpty(strings.TrimSpace(rec.Repo), strings.TrimSpace(repoID))
+				if effRepo != "" && !SameRepoSlug(effRepo, wantRepo) {
+					continue
+				}
 			}
 			pending = append(pending, rec)
 		}
@@ -2521,10 +2524,20 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) (resp
 	byID := make(map[string]Record, len(scopedRecords))
 	byDocID := make(map[string]Record, len(scopedRecords))
 	for _, entry := range scopedRecords {
-		docID := entry.rec.DocumentID(entry.repoID)
-		byDocID[docID] = entry.rec
-		if _, exists := byID[entry.rec.Meta.ID]; !exists || entry.repoID == c.cfg.RepoID {
-			byID[entry.rec.Meta.ID] = entry.rec
+		rec := entry.rec
+		if strings.TrimSpace(rec.Meta.Repo) == "" && strings.TrimSpace(entry.repoID) != "" {
+			rec.Meta.Repo = strings.TrimSpace(entry.repoID)
+		}
+		docID := rec.DocumentID(entry.repoID)
+		byDocID[docID] = rec
+		if canonRepo := CanonicalRepoID(entry.repoID); canonRepo != "" {
+			byDocID[rec.DocumentID(canonRepo)] = rec
+		}
+		isPrimary := strings.TrimSpace(entry.repoID) == "" || SameRepoSlug(entry.repoID, c.cfg.RepoID)
+		if isPrimary {
+			byID[rec.Meta.ID] = rec
+		} else if _, exists := byID[rec.Meta.ID]; !exists && strings.TrimSpace(c.cfg.RepoID) == "" {
+			byID[rec.Meta.ID] = rec
 		}
 	}
 
@@ -2630,7 +2643,7 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) (resp
 		hsErr = err
 		if hsErr == nil {
 			backend = "hindsight"
-			results = FilterRecallResults(rawResults, byID, byDocID, req.Cluster, req.Path)
+			results = FilterRecallResultsForRepo(rawResults, c.cfg.RepoID, byID, byDocID, req.Cluster, req.Path)
 		}
 	}
 
@@ -2699,6 +2712,12 @@ func (c *Curator) InvalidateCache() {
 // FilterRecallResults enforces optional cluster and path scope filters on
 // Hindsight recall hits using local OKF metadata, chunk tags, or embedded YAML frontmatter.
 func FilterRecallResults(results []HindsightRecallResult, byID, byDocID map[string]Record, cluster, pathFilter string) []HindsightRecallResult {
+	return FilterRecallResultsForRepo(results, "", byID, byDocID, cluster, pathFilter)
+}
+
+// FilterRecallResultsForRepo enforces optional cluster and path scope filters
+// while restricting legacy bare-ID lookups to primaryRepoID or untagged records.
+func FilterRecallResultsForRepo(results []HindsightRecallResult, primaryRepoID string, byID, byDocID map[string]Record, cluster, pathFilter string) []HindsightRecallResult {
 	cluster = strings.TrimSpace(cluster)
 	pathFilter = strings.TrimSpace(pathFilter)
 	if cluster == "" && pathFilter == "" {
@@ -2706,7 +2725,7 @@ func FilterRecallResults(results []HindsightRecallResult, byID, byDocID map[stri
 	}
 	filtered := make([]HindsightRecallResult, 0, len(results))
 	for _, hr := range results {
-		rec, found := lookupRecordForRecallResult(hr, byID, byDocID)
+		rec, found := lookupRecordForRecallResult(hr, primaryRepoID, byID, byDocID)
 		if !found && strings.Contains(hr.Text, "---\n") {
 			if parsed, err := ParseRecord(hr.Text, ""); err == nil {
 				rec = parsed
@@ -2732,26 +2751,91 @@ func FilterRecallResults(results []HindsightRecallResult, byID, byDocID map[stri
 	return filtered
 }
 
-func lookupRecordForRecallResult(hr HindsightRecallResult, byID, byDocID map[string]Record) (Record, bool) {
+func extractRecallHitRepoAndDocID(hr HindsightRecallResult) (hitRepo, docBareID string) {
+	if docID := strings.TrimSpace(hr.DocumentID); docID != "" {
+		rest := strings.TrimPrefix(docID, DocPrefix)
+		if idx := strings.LastIndex(rest, ":"); idx >= 0 {
+			hitRepo = strings.TrimSpace(rest[:idx])
+			docBareID = strings.TrimSpace(rest[idx+1:])
+		} else if strings.HasPrefix(docID, DocPrefix) {
+			docBareID = strings.TrimSpace(rest)
+		}
+	}
+	if hitRepo == "" {
+		for _, t := range hr.Tags {
+			if rTag, ok := strings.CutPrefix(strings.TrimSpace(t), repoTagPrefix); ok && strings.TrimSpace(rTag) != "" {
+				hitRepo = strings.TrimSpace(rTag)
+				break
+			}
+		}
+	}
+	return hitRepo, docBareID
+}
+
+func recallCandidateIDs(hr HindsightRecallResult, docBareID string) []string {
+	var ids []string
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		for _, existing := range ids {
+			if existing == id {
+				return
+			}
+		}
+		ids = append(ids, id)
+	}
+	add(docBareID)
+	add(hr.ID)
+	for _, t := range hr.Tags {
+		if rawID, ok := strings.CutPrefix(strings.TrimSpace(t), idTagPrefix); ok {
+			add(rawID)
+		}
+	}
+	return ids
+}
+
+func lookupRecordForRecallResult(hr HindsightRecallResult, primaryRepoID string, byID, byDocID map[string]Record) (Record, bool) {
 	if hr.DocumentID != "" {
 		if r, ok := byDocID[hr.DocumentID]; ok {
 			return r, true
 		}
-		if idx := strings.LastIndex(hr.DocumentID, ":"); idx >= 0 && idx+1 < len(hr.DocumentID) {
-			docRepo := strings.TrimPrefix(hr.DocumentID[:idx], DocPrefix)
-			if r, ok := byID[hr.DocumentID[idx+1:]]; ok && (r.Meta.Repo == "" || docRepo == "" || r.Meta.Repo == docRepo) {
+	}
+	hitRepo, docBareID := extractRecallHitRepoAndDocID(hr)
+	candIDs := recallCandidateIDs(hr, docBareID)
+	if hitRepo != "" {
+		canonHitRepo := CanonicalRepoID(hitRepo)
+		for _, cid := range candIDs {
+			if canonHitRepo != "" {
+				if r, ok := byDocID[DocPrefix+canonHitRepo+":"+cid]; ok {
+					return r, true
+				}
+			}
+			for k, r := range byDocID {
+				kRest, hasPrefix := strings.CutPrefix(k, DocPrefix)
+				if !hasPrefix {
+					continue
+				}
+				idx := strings.LastIndex(kRest, ":")
+				if idx <= 0 || kRest[idx+1:] != cid {
+					continue
+				}
+				if SameRepoSlug(kRest[:idx], hitRepo) {
+					return r, true
+				}
+			}
+			if r, ok := byID[cid]; ok && strings.TrimSpace(r.Meta.Repo) != "" && SameRepoSlug(r.Meta.Repo, hitRepo) {
 				return r, true
 			}
 		}
+		return Record{}, false
 	}
-	if hr.ID != "" {
-		if r, ok := byID[hr.ID]; ok {
-			return r, true
-		}
-	}
-	for _, t := range hr.Tags {
-		if strings.HasPrefix(t, "id:") {
-			if r, ok := byID[strings.TrimPrefix(t, "id:")]; ok {
+
+	for _, cid := range candIDs {
+		if r, ok := byID[cid]; ok {
+			recRepo := strings.TrimSpace(r.Meta.Repo)
+			if recRepo == "" || (strings.TrimSpace(primaryRepoID) != "" && SameRepoSlug(recRepo, primaryRepoID)) {
 				return r, true
 			}
 		}

@@ -61,6 +61,7 @@ poller by disabling its roster entry. ``GITHUB_WATCHER_SWEEPS`` gives that back.
 import base64
 from collections import defaultdict
 from contextlib import closing
+import hashlib
 import io
 import json
 import os
@@ -310,6 +311,14 @@ PRIVATE_DIR_MODE = 0o700
 SNAPSHOT_STAGE_PREFIX = "ka-repo-index-"
 INTENT_MANIFEST_REL = ".kube-agents/intent.yaml"
 REPO_SCAN_STATE_REL = Path("memory") / "repo_scan_state.json"
+REPO_TREES_DIR_REL = Path("memory") / "repo-trees"
+REPO_TREE_TMP_PREFIX = ".repo_tree."
+REPO_TREE_TMP_SUFFIX = ".tmp"
+REPO_TREE_DEFAULT_SLUG = "repo"
+MAX_REPO_TREE_SLUG_CHARS = 80
+REPO_TREE_HASH_HEX_CHARS = 16
+MAX_CACHED_TRACKED_FILES = 50_000
+_REPO_TREE_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 SNAPSHOT_DOC_ROOTS = frozenset(
     {
         "knowledge",
@@ -337,16 +346,22 @@ SNAPSHOT_DOC_DIR_PREFIXES = (
 )
 _EVAL_NOISE_RE = re.compile(r"eval-spend|probe:|\[withdrawn-eval-probe\]", re.I)
 _REVERT_PR_RE = re.compile(
-    r"Reverts\s+(?:PR|MR|pull\s+request|merge\s+request)?\s*"
-    r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?[#!]\s*(\d+)"
-    r"|^Revert\s+(?:PR|MR)\s+[#!]\s*(\d+)"
-    r"|^Revert\s+[\"“].+[\"”]",
+    r"\bReverts\s+(?:PR|MR|pull\s+request|merge\s+request)?\s*"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?([#!])\s*(\d+)"
+    r"|^Revert\s+(?:PR|MR)\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?([#!])\s*(\d+)"
+    r'|^Revert\s+["“].+["”]',
+    re.I | re.M,
+)
+_REVERT_NUMBER_RE = re.compile(
+    r"\bReverts\s+(?:PR|MR|pull\s+request|merge\s+request)?\s*"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?([#!])\s*(\d+)"
+    r"|^Revert\s+(?:PR|MR)\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?([#!])\s*(\d+)",
     re.I | re.M,
 )
 _FIXES_ISSUE_RE = re.compile(
     r"\b(?:fixes|resolves|mitigates|closes)\s+"
     r"(?:SEV-\d+\s+Incident\s+|Incident\s+|issue\s+)?"
-    r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?[#!]\s*(\d+)",
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?([#!])\s*(\d+)",
     re.I,
 )
 _HIGH_SIGNAL_FIX_TITLE_RE = re.compile(r"^(?:fix|perf)\([^)]+\):", re.I)
@@ -2363,12 +2378,82 @@ def _is_indexable_doc_path(rel_path: str) -> bool:
     return False
 
 
+def _repo_tree_cache_path(repo: str) -> Path:
+    """Return the bounded `0600` tracked-tree cache path for `repo`."""
+    safe_prefix = (
+        _REPO_TREE_SLUG_RE.sub("_", str(repo or ""))
+        .strip("._-")[:MAX_REPO_TREE_SLUG_CHARS]
+        or REPO_TREE_DEFAULT_SLUG
+    )
+    digest = hashlib.sha256(str(repo or "").encode("utf-8")).hexdigest()[
+        :REPO_TREE_HASH_HEX_CHARS
+    ]
+    return _agent_home_path() / REPO_TREES_DIR_REL / f"{safe_prefix}-{digest}.json"
+
+
+def _load_repo_tree_cache(repo: str, expected_revision: str) -> set[str] | None:
+    """Load cached live tracked paths for `repo` when `expected_revision` matches."""
+    rev = str(expected_revision or "").strip()
+    if not rev:
+        return None
+    path = _repo_tree_cache_path(repo)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or str(data.get("revision") or "").strip() != rev:
+        return None
+    raw_files = data.get("files")
+    if not isinstance(raw_files, list) or len(raw_files) > MAX_CACHED_TRACKED_FILES:
+        return None
+    return {f for f in raw_files if isinstance(f, str) and f}
+
+
+def _save_repo_tree_cache(
+    repo: str, revision: str, tracked_files: set[str], *, dry_run: bool = False
+) -> None:
+    """Persist sorted live tracked file paths with `0600` permissions."""
+    rev = str(revision or "").strip()
+    if dry_run or not rev or len(tracked_files) > MAX_CACHED_TRACKED_FILES:
+        return
+    path = _repo_tree_cache_path(repo)
+    tmp_name = ""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, PRIVATE_DIR_MODE)
+        payload = {"revision": rev, "files": sorted(tracked_files)}
+        with tempfile.NamedTemporaryFile(
+            dir=str(path.parent),
+            prefix=REPO_TREE_TMP_PREFIX,
+            suffix=REPO_TREE_TMP_SUFFIX,
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+        os.chmod(tmp_name, PRIVATE_FILE_MODE)
+        os.replace(tmp_name, path)
+    except OSError as exc:
+        sys.stderr.write(
+            f"github_scan_gate: could not write repo tree cache for {repo}: {exc}\n"
+        )
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
 def _extract_snapshot_docs(
-    archive_b64: str | tuple[str, ...] | list[str], dest_dir: Path
+    archive_b64: str | tuple[str, ...] | list[str], dest_dir: Path | None = None
 ) -> tuple[int, set[str]]:
     """Validate uncompressed tar archives in memory and write matching docs into `dest_dir`.
 
-    Returns `(extracted_file_count, tracked_regular_files)`. Raises
+    When `dest_dir` is `None`, validates archive members in memory and returns
+    `(0, tracked_regular_files)` without writing to disk. Raises
     `_SnapshotArchiveError` on compressed streams, path traversal, `.git`
     segments, doc symlinks, non-regular members, or size violations.
     """
@@ -2386,7 +2471,7 @@ def _extract_snapshot_docs(
     if not raw_tars:
         return 0, set()
 
-    dest_real = dest_dir.resolve()
+    dest_real = dest_dir.resolve() if dest_dir is not None else None
     tracked_files: set[str] = set()
     seen_symlinks: set[str] = set()
     staged_docs: list[tuple[str, bytes]] = []
@@ -2433,7 +2518,7 @@ def _extract_snapshot_docs(
                         )
 
                     tracked_files.add(rel_path)
-                    if not _is_indexable_doc_path(rel_path):
+                    if dest_dir is None or not _is_indexable_doc_path(rel_path):
                         continue
 
                     if member.size > SNAPSHOT_MAX_MEMBER_BYTES:
@@ -2458,6 +2543,9 @@ def _extract_snapshot_docs(
                     staged_docs.append((rel_path, data))
     except tarfile.TarError as exc:
         raise _SnapshotArchiveError(f"corrupt or compressed tar archive: {exc}") from exc
+
+    if dest_dir is None or dest_real is None:
+        return 0, tracked_files
 
     for rel_path, _ in staged_docs:
         rel_parts = rel_path.split("/")
@@ -2734,6 +2822,82 @@ def _run_curator_emit_ok(curator_bin: str, args: list[str], label: str) -> bool:
     return False
 
 
+def _ref_matches_repo(ref_repo: str | None, repo: str) -> bool:
+    """Return True when an optional `<owner>/<repo>` prefix names `repo`."""
+    cleaned_ref = str(ref_repo or "").strip().strip("/")
+    if not cleaned_ref:
+        return True
+    r_target = repo_ref.try_parse(repo)
+    r_ref = repo_ref.try_parse(cleaned_ref)
+    if r_target is None or r_ref is None:
+        return cleaned_ref.lower() == str(repo or "").strip().strip("/").lower()
+    if r_ref.host:
+        target_host = r_target.host.lower() or repo_ref.GITHUB_CANONICAL_HOST
+        return (
+            r_ref.host.lower() == target_host
+            and r_ref.path.lower() == r_target.path.lower()
+        )
+    if r_ref.path.lower() == r_target.path.lower():
+        return True
+    if r_target.host and r_ref.path.lower() == f"{r_target.host}/{r_target.path}".lower():
+        return True
+    return False
+
+
+def _extract_revert_target(title: str, body: str, repo: str) -> tuple[bool, str]:
+    """Detect a revert proposal and extract its reverted target citation.
+
+    Searches `f"{title}\\n{body}"` with `_REVERT_NUMBER_RE` separately from the
+    quoted-title check so auto-generated `Revert "<title>"` proposals still
+    capture `Reverts #N` from `body`. Cross-repository prefixes keep their
+    `<owner>/<repo>#N` qualifier instead of resolving as local `#N`.
+    """
+    combined = f"{title}\n{body}"
+    if _REVERT_PR_RE.search(combined) is None:
+        return False, ""
+    cross_ref = ""
+    for match in _REVERT_NUMBER_RE.finditer(combined):
+        if match.group(3):
+            ref_repo = (match.group(1) or "").strip()
+            sigil = match.group(2)
+            num_str = match.group(3)
+        else:
+            ref_repo = (match.group(4) or "").strip()
+            sigil = match.group(5)
+            num_str = match.group(6)
+        if _ref_matches_repo(ref_repo, repo):
+            return True, f"#{num_str}"
+        if not cross_ref:
+            cross_ref = f"{ref_repo}{sigil}{num_str}"
+    return True, cross_ref
+
+
+def _extract_backfill_issue_match(
+    text: str, repo: str, issues_by_num: dict[int, dict]
+) -> tuple[bool, dict | None, str]:
+    """Extract a linked issue from `text`, distinguishing local vs cross-repo refs.
+
+    Returns `(matched, local_issue_obj, citation_text)`. Cross-repository issue
+    references (`Fixes other-org/other-repo#10`) never resolve against `repo`'s
+    local `issues_by_num` map and are cited verbatim instead.
+    """
+    cross_citation = ""
+    for match in _FIXES_ISSUE_RE.finditer(str(text or "")):
+        ref_repo = (match.group(1) or "").strip()
+        sigil = match.group(2)
+        inc_num = int(match.group(3))
+        if inc_num <= 0:
+            continue
+        if _ref_matches_repo(ref_repo, repo):
+            inc_obj = issues_by_num.get(inc_num)
+            return True, inc_obj, _format_backfill_issue_ref(inc_obj, inc_num)
+        if not cross_citation:
+            cross_citation = f"{ref_repo}{sigil}{inc_num}"
+    if cross_citation:
+        return True, None, cross_citation
+    return False, None, ""
+
+
 def _extract_backfill_rejection_reason(
     comments: list,
     viewer: str,
@@ -2745,13 +2909,12 @@ def _extract_backfill_rejection_reason(
     """Find a write-access maintainer technical rejection comment on a closed PR.
 
     Returns `("indeterminate", None)` when collaborator write access cannot be
-    verified, `("ok", reason)` when a maintainer technical rejection is found,
-    or `("none", None)` otherwise.
+    verified, `("ok", reason)` when the latest maintainer technical rejection
+    is not superseded by a later situational close comment, or `("none", None)`
+    otherwise.
     """
     viewer_key = forge.normalise_login(viewer) if viewer else ""
     author_key = forge.normalise_login(pr_author) if pr_author else ""
-    maintainer_bodies: list[str] = []
-    chosen_reason: str | None = None
 
     for comment in reversed(comments or []):
         if not isinstance(comment, dict):
@@ -2770,19 +2933,12 @@ def _extract_backfill_rejection_reason(
             return _WRITE_ACCESS_INDETERMINATE, None
         if write_state is not True:
             continue
-        maintainer_bodies.append(body)
-        if (
-            chosen_reason is None
-            and _TECHNICAL_REJECTION_RE.search(body)
-            and not _is_backfill_situational_close(body)
-        ):
-            chosen_reason = body[:MAX_REASON_CHARS]
+        if _is_backfill_situational_close(body):
+            return "none", None
+        if _TECHNICAL_REJECTION_RE.search(body):
+            return "ok", body[:MAX_REASON_CHARS]
 
-    if chosen_reason is None:
-        return "none", None
-    if _is_backfill_situational_close("\n".join(maintainer_bodies)):
-        return "none", None
-    return "ok", chosen_reason
+    return "none", None
 
 
 def _backfill_one_managed_repo(
@@ -2791,6 +2947,8 @@ def _backfill_one_managed_repo(
     *,
     curator_bin: str,
     tracked_files: set[str] | None,
+    indexed_revision: str = "",
+    snapshot_attempted: bool = False,
     cutoff_dt: datetime,
     since_spec: str,
     cur_now: datetime,
@@ -2842,6 +3000,45 @@ def _backfill_one_managed_repo(
                 issues_by_num[int(raw_issue["number"])] = raw_issue
     except Exception:  # noqa: BLE001 - issues may be disabled on the repository
         issues_by_num = {}
+
+    if tracked_files is None and indexed_revision:
+        tracked_files = _load_repo_tree_cache(repo, indexed_revision)
+    lazy_snapshot_attempted = tracked_files is not None or snapshot_attempted
+
+    def _ensure_tracked_files() -> set[str] | None:
+        nonlocal tracked_files, lazy_snapshot_attempted
+        if lazy_snapshot_attempted:
+            return tracked_files
+        lazy_snapshot_attempted = True
+        try:
+            snap_ans = forge.call(
+                "snapshot",
+                {"maxBytes": SNAPSHOT_MAX_BYTES},
+                repo,
+                retry_transient=True,
+            )
+            snap_rev = str((snap_ans or {}).get("revision") or "").strip()
+            snap_b64 = str((snap_ans or {}).get("archiveBase64") or "")
+            _, parsed_files = _extract_snapshot_docs(
+                (snap_b64,) if snap_b64 else (), None
+            )
+            tracked_files = parsed_files
+            if snap_rev:
+                _save_repo_tree_cache(repo, snap_rev, parsed_files, dry_run=dry_run)
+        except forge.ForgeError as snap_err:
+            # `/v1/vcs/snapshot` `SNAPSHOT_TOO_LARGE` returns top-level `entries`
+            # rather than a recursive file tree (`vcs_broker._snapshot_entries`),
+            # so whole-tree deleted-file pruning degrades gracefully when a
+            # repository exceeds `SNAPSHOT_MAX_BYTES`.
+            if snap_err.reason != "SNAPSHOT_TOO_LARGE":
+                sys.stderr.write(
+                    f"github_scan_gate: backfill snapshot of {repo} failed: {snap_err}\n"
+                )
+        except (_SnapshotArchiveError, Exception) as snap_err:  # noqa: BLE001
+            sys.stderr.write(
+                f"github_scan_gate: backfill snapshot of {repo} failed: {snap_err}\n"
+            )
+        return tracked_files
 
     raw_proposals = [p for p in ((ans or {}).get("proposals") or []) if isinstance(p, dict)]
     is_truncated = bool((ans or {}).get("truncated"))
@@ -2938,11 +3135,17 @@ def _backfill_one_managed_repo(
             continue
 
         pr_ref = _format_backfill_pr_ref(raw_pr, pr_num, repo)
-        rev_match = _REVERT_PR_RE.search(f"{title}\n{body}") if is_merged else None
-        fix_match = _FIXES_ISSUE_RE.search(f"{body} {title}") if is_merged else None
+        is_revert, brk_ref = (
+            _extract_revert_target(title, body, repo) if is_merged else (False, "")
+        )
+        has_fix_ref, inc_obj, inc_citation = (
+            _extract_backfill_issue_match(f"{body} {title}", repo, issues_by_num)
+            if is_merged
+            else (False, None, "")
+        )
         is_fix_title = bool(is_merged and _HIGH_SIGNAL_FIX_TITLE_RE.search(title))
 
-        if is_merged and rev_match is not None:
+        if is_merged and is_revert:
             try:
                 view_ans = forge.call(
                     "proposal-view",
@@ -2960,26 +3163,22 @@ def _backfill_one_managed_repo(
             pr_ref = _format_backfill_pr_ref(prop_detail, pr_num, repo)
             diff_files = _files_from_diff_text(str((view_ans or {}).get("diff") or ""))
             non_knowledge = [f for f in diff_files if not f.startswith("knowledge/")]
+            cur_tracked = _ensure_tracked_files()
             live_paths = [
-                f for f in non_knowledge if tracked_files is None or f in tracked_files
+                f for f in non_knowledge if cur_tracked is None or f in cur_tracked
             ] or non_knowledge
-            brk_str = rev_match.group(1) or rev_match.group(2) or ""
-            inc_num = int(fix_match.group(1)) if fix_match else 0
-            inc_obj = issues_by_num.get(inc_num) if inc_num else None
             rec_title = (
                 str((inc_obj or {}).get("title") or "").strip()
                 or title
                 or f"Lesson from revert proposal #{pr_num}"
             )
             summary_parts = [
-                f"Reverted breaking proposal #{brk_str} in {pr_ref}."
-                if brk_str
+                f"Reverted breaking proposal {brk_ref} in {pr_ref}."
+                if brk_ref
                 else f"Reverted prior change in {pr_ref}."
             ]
-            if inc_num:
-                summary_parts.append(
-                    f"Linked issue: {_format_backfill_issue_ref(inc_obj, inc_num)}."
-                )
+            if inc_citation:
+                summary_parts.append(f"Linked issue: {inc_citation}.")
             if body:
                 summary_parts.append(body[:BACKFILL_SUMMARY_MAX_CHARS])
             emit_args = [
@@ -3016,7 +3215,7 @@ def _backfill_one_managed_repo(
                 held_unresolved = True
             continue
 
-        if is_merged and (fix_match is not None or is_fix_title):
+        if is_merged and (has_fix_ref or is_fix_title):
             try:
                 view_ans = forge.call(
                     "proposal-view",
@@ -3033,28 +3232,25 @@ def _backfill_one_managed_repo(
             prop_detail = (view_ans or {}).get("proposal") or raw_pr
             pr_ref = _format_backfill_pr_ref(prop_detail, pr_num, repo)
             diff_files = _files_from_diff_text(str((view_ans or {}).get("diff") or ""))
+            cur_tracked = _ensure_tracked_files()
             live_files = [
                 f
                 for f in diff_files
                 if not f.startswith("knowledge/")
-                and (tracked_files is None or f in tracked_files)
+                and (cur_tracked is None or f in cur_tracked)
             ]
             if not live_files:
                 processed_prs = _append_processed_pr(processed_prs, pr_num)
                 processed_set.add(pr_num)
                 continue
-            inc_num = int(fix_match.group(1)) if fix_match else 0
-            inc_obj = issues_by_num.get(inc_num) if inc_num else None
             rec_title = (
                 str((inc_obj or {}).get("title") or "").strip()
                 or title
                 or f"Lesson from fix proposal #{pr_num}"
             )
             summary_parts = [f"Resolved in {pr_ref} ({title})."]
-            if inc_num:
-                summary_parts.append(
-                    f"Linked issue: {_format_backfill_issue_ref(inc_obj, inc_num)}."
-                )
+            if inc_citation:
+                summary_parts.append(f"Linked issue: {inc_citation}.")
             if body:
                 summary_parts.append(body[:BACKFILL_SUMMARY_MAX_CHARS])
             emit_args = [
@@ -3360,6 +3556,7 @@ def sweep_repo_memory(
         item for _, item in sorted(enumerate(candidates), key=_scan_sort_key)
     ]
     tracked_files_by_repo: dict[str, set[str]] = {}
+    snapshot_attempted_repos: set[str] = set()
 
     for item in ordered_candidates[:MAX_REPO_SCANS_PER_TICK]:
         repo = str(item["repo"])
@@ -3367,6 +3564,7 @@ def sweep_repo_memory(
         ref = item.get("ref")
         repo_entry = repos_state[repo]
 
+        snapshot_attempted_repos.add(repo)
         fetched = _fetch_repo_snapshot(repo, role, ref)
         if fetched is None:
             continue
@@ -3377,6 +3575,19 @@ def sweep_repo_memory(
             and role == repo_entry.get("role")
             and ref == repo_entry.get("ref")
         ):
+            if role == "managed":
+                cached_tree = _load_repo_tree_cache(repo, revision)
+                if cached_tree is not None:
+                    tracked_files_by_repo[repo] = cached_tree
+                elif not narrowed:
+                    try:
+                        _, tracked = _extract_snapshot_docs(archive_b64_tuple, None)
+                        tracked_files_by_repo[repo] = tracked
+                        _save_repo_tree_cache(repo, revision, tracked, dry_run=dry_run)
+                    except _SnapshotArchiveError as err:
+                        sys.stderr.write(
+                            f"github_scan_gate: unsafe snapshot for {repo} ({role}): {err}\n"
+                        )
             continue
 
         tmpdir = tempfile.mkdtemp(prefix=SNAPSHOT_STAGE_PREFIX)
@@ -3433,6 +3644,10 @@ def sweep_repo_memory(
             repo_entry["ref"] = ref
             repo_entry["indexed_revision"] = revision
             repo_entry["indexed_at"] = now_iso
+            if role == "managed" and repo in tracked_files_by_repo:
+                _save_repo_tree_cache(
+                    repo, revision, tracked_files_by_repo[repo], dry_run=dry_run
+                )
             state_dirty = True
         except (subprocess.TimeoutExpired, OSError) as exc:
             sys.stderr.write(
@@ -3452,12 +3667,15 @@ def sweep_repo_memory(
             r_name for _, r_name in sorted(enumerate(managed_repos), key=_backfill_sort_key)
         ]
         for m_repo in ordered_managed[:MAX_BACKFILL_REPOS_PER_TICK]:
-            hist = repos_state[m_repo]["history"]
+            m_entry = repos_state[m_repo]
+            hist = m_entry["history"]
             if _backfill_one_managed_repo(
                 m_repo,
                 hist,
                 curator_bin=curator_bin,
                 tracked_files=tracked_files_by_repo.get(m_repo),
+                indexed_revision=str(m_entry.get("indexed_revision") or "").strip(),
+                snapshot_attempted=m_repo in snapshot_attempted_repos,
                 cutoff_dt=cutoff_dt,
                 since_spec=since_spec,
                 cur_now=cur_now,

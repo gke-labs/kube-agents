@@ -89,6 +89,8 @@ EXTERNAL_DOC_DIRS = (
     "runbooks",
     "playbooks",
 )
+DECISION_DOC_DIR_PREFIXES = ("docs/decisions", "decisions")
+RUNBOOK_DOC_DIR_PREFIXES = ("docs/runbooks", "runbooks", "docs/playbooks", "playbooks")
 RECORD_TYPES = (
     "decision",
     "lesson",
@@ -432,9 +434,20 @@ _EXTERNAL_ID_RE = re.compile(
 _LEADING_NUM_RE = re.compile(r"^0*(\d{1,5})(?:[-_.\s]+(.*))?$")
 
 
+def _strip_repo_prefix_for_doc_type(rel_path: str) -> str:
+    slash_path = rel_path.replace("\\", "/")
+    if ":" in slash_path:
+        slash_path = slash_path.split(":", 1)[1]
+    if "/" in slash_path:
+        first, rest = slash_path.split("/", 1)
+        if "__" in first:
+            slash_path = rest
+    return slash_path
+
+
 def _infer_external_doc_type_and_prefix(meta: Dict[str, Any], rel_path: str) -> Tuple[str, str]:
     raw_type = str(meta.get("type") or "").strip().lower()
-    sub_rel = rel_path.split(":", 1)[-1] if ":" in rel_path else rel_path
+    sub_rel = _strip_repo_prefix_for_doc_type(rel_path)
     lower_rel = sub_rel.lower()
     type_aliases = {
         "decision": ("decision", "RFC" if "rfc" in lower_rel else "ADR"),
@@ -454,6 +467,11 @@ def _infer_external_doc_type_and_prefix(meta: Dict[str, Any], rel_path: str) -> 
     }
     if raw_type in type_aliases:
         return type_aliases[raw_type]
+    dir_slash = Path(lower_rel).parent.as_posix()
+    if any(dir_slash == p or dir_slash.startswith(f"{p}/") for p in DECISION_DOC_DIR_PREFIXES):
+        return ("decision", "ADR")
+    if any(dir_slash == p or dir_slash.startswith(f"{p}/") for p in RUNBOOK_DOC_DIR_PREFIXES):
+        return ("runbook", "RUN")
     if "runbook" in lower_rel or "playbook" in lower_rel:
         return ("runbook", "RUN")
     if "blueprint" in lower_rel:

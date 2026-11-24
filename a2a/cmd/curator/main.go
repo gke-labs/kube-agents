@@ -17,7 +17,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,15 +31,25 @@ import (
 )
 
 const (
-	defaultCLIStoreDir      = "/opt/data/memory/knowledge-store"
-	defaultManagedReposPath = "/etc/gitops/managed_repos"
-	defaultRecurrenceFloor  = 2
-	cliOpTimeout            = 30 * time.Second
-	indexOpTimeout          = 60 * time.Second
-	overseerTimeout         = 15 * time.Second
-	maxCheckFileBytes       = 4 << 20
-	statusReadHeaderTimeout = 5 * time.Second
-	exitCodeBlocked         = 2
+	defaultCLIStoreDir           = "/opt/data/memory/knowledge-store"
+	defaultAgentHomeDir          = "/opt/data"
+	defaultManagedReposPath      = "/etc/gitops/managed_repos"
+	hindsightConfigSubdir        = "hindsight"
+	hindsightConfigFilename      = "config.json"
+	hindsightConfigEndpointField = "api_url"
+	hindsightConfigFallbackField = "url"
+	envDecisionHindsightURL      = "DECISION_MEMORY_HINDSIGHT_URL"
+	envHindsightAPIURL           = "HINDSIGHT_API_URL"
+	envPlatformAgentHome         = "PLATFORM_AGENT_HOME"
+	flagNameRepoID               = "repo-id"
+	flagNameGuardSeverity        = "guard-severity"
+	defaultRecurrenceFloor       = 2
+	cliOpTimeout                 = 30 * time.Second
+	indexOpTimeout               = 60 * time.Second
+	overseerTimeout              = 15 * time.Second
+	maxCheckFileBytes            = 4 << 20
+	statusReadHeaderTimeout      = 5 * time.Second
+	exitCodeBlocked              = 2
 )
 
 const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator and Dreamer for kube-agents
@@ -164,84 +173,8 @@ func connectNATS(ctx context.Context, name string, log *slog.Logger) (*lib.Clien
 	)
 }
 
-func trimGitSuffix(p string) string {
-	p = strings.Trim(p, "/")
-	if strings.HasSuffix(p, ".git") {
-		if trimmed := strings.TrimSuffix(p, ".git"); trimmed != "" && !strings.HasSuffix(trimmed, "/") {
-			p = trimmed
-		}
-	}
-	return strings.Trim(p, "/")
-}
-
-func isGitHubHost(host string) bool {
-	switch strings.ToLower(strings.TrimSpace(host)) {
-	case "github.com", "www.github.com", "ssh.github.com":
-		return true
-	}
-	return false
-}
-
 func extractRepoSlug(u string) string {
-	s := strings.TrimRight(strings.TrimSpace(u), "/")
-	if s == "" {
-		return ""
-	}
-	var host, rawPath string
-	if strings.Contains(s, "://") {
-		parsed, err := url.Parse(s)
-		if err != nil {
-			return trimGitSuffix(s)
-		}
-		host = strings.ToLower(parsed.Hostname())
-		rawPath = trimGitSuffix(parsed.Path)
-	} else {
-		if at := strings.Index(s, "@"); at >= 0 {
-			slash := strings.Index(s, "/")
-			colon := strings.Index(s, ":")
-			if (colon > at) || (slash > at && colon < 0) {
-				s = s[at+1:]
-			}
-		}
-		if colon := strings.Index(s, ":"); colon > 0 {
-			slash := strings.Index(s, "/")
-			if slash < 0 || colon < slash {
-				portPart := s[colon+1:]
-				if slash > colon {
-					portPart = s[colon+1 : slash]
-				}
-				isPort := portPart != ""
-				for _, ch := range portPart {
-					if ch < '0' || ch > '9' {
-						isPort = false
-						break
-					}
-				}
-				host = strings.ToLower(s[:colon])
-				if isPort && slash > colon {
-					rawPath = trimGitSuffix(s[slash+1:])
-				} else if !isPort {
-					rawPath = trimGitSuffix(s[colon+1:])
-				}
-			}
-		}
-		if host == "" && rawPath == "" {
-			cleaned := trimGitSuffix(s)
-			if first, rest, ok := strings.Cut(cleaned, "/"); ok && strings.Contains(rest, "/") && strings.Contains(first, ".") {
-				host = strings.ToLower(first)
-				rawPath = rest
-			} else {
-				rawPath = cleaned
-			}
-		}
-	}
-	if rawPath == "" {
-		return ""
-	}
-	if host == "" || isGitHubHost(host) {
-		return rawPath
-	}
-	return host + "/" + rawPath
+	return memory.ExtractRepoSlug(u)
 }
 
 func defaultRepoID() string {
@@ -291,22 +224,22 @@ func defaultRepoDir() string {
 }
 
 func defaultHindsightURL() string {
-	if v := strings.TrimSpace(os.Getenv("DECISION_MEMORY_HINDSIGHT_URL")); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envDecisionHindsightURL)); v != "" {
 		return v
 	}
-	if v := strings.TrimSpace(os.Getenv("HINDSIGHT_API_URL")); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envHindsightAPIURL)); v != "" {
 		return v
 	}
-	agentHome := strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_AGENT_HOME")), "/")
+	agentHome := strings.TrimRight(strings.TrimSpace(os.Getenv(envPlatformAgentHome)), "/")
 	if agentHome == "" {
-		agentHome = "/opt/data"
+		agentHome = defaultAgentHomeDir
 	}
-	cfgPath := filepath.Join(filepath.Clean(agentHome), "hindsight", "config.json")
+	cfgPath := filepath.Join(filepath.Clean(agentHome), hindsightConfigSubdir, hindsightConfigFilename)
 	if raw, err := readFileViaDirRoot(cfgPath); err == nil && strings.TrimSpace(string(raw)) != "" {
 		var parsed map[string]any
 		if json.Unmarshal(raw, &parsed) == nil {
-			for _, key := range []string{"api_url", "url"} {
-				if u, ok := parsed[key].(string); ok && strings.TrimSpace(u) != "" {
+			for _, field := range []string{hindsightConfigEndpointField, hindsightConfigFallbackField} {
+				if u, ok := parsed[field].(string); ok && strings.TrimSpace(u) != "" {
 					return strings.TrimSpace(u)
 				}
 			}
@@ -454,7 +387,7 @@ func runEmit(args []string) error {
 	}
 	guardSeverityExplicit := false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "guard-severity" {
+		if f.Name == flagNameGuardSeverity {
 			guardSeverityExplicit = true
 		}
 	})
@@ -508,7 +441,9 @@ func runEmit(args []string) error {
 			ReviewerReason:  *reason,
 			InitialProposal: *initialProposal,
 			SoakWindow:      *soakWindow,
-			GuardSeverity:   strings.TrimSpace(*guardSeverity),
+		}
+		if guardSeverityExplicit {
+			ev.GuardSeverity = strings.TrimSpace(*guardSeverity)
 		}
 		if len(paths) > 0 || *cluster != "" || *checkID != "" {
 			ev.Scope = &memory.RecordScope{Paths: paths}
@@ -576,11 +511,22 @@ func runEmit(args []string) error {
 }
 
 func runPending(args []string) error {
+	defaultRepo := defaultRepoID()
 	fs := flag.NewFlagSet("curator pending", flag.ContinueOnError)
 	repoDir := fs.String("repo", defaultRepoDir(), "knowledge repository directory (used as local fallback)")
-	repoID := fs.String("repo-id", defaultRepoID(), "canonical repository identifier")
+	repoID := fs.String(flagNameRepoID, defaultRepo, "canonical repository identifier")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	repoIDExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == flagNameRepoID {
+			repoIDExplicit = true
+		}
+	})
+	wantRepo := ""
+	if repoIDExplicit {
+		wantRepo = strings.TrimSpace(*repoID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cliOpTimeout)
 	defer cancel()
@@ -592,7 +538,7 @@ func runPending(args []string) error {
 			if resp, qErr := memory.QueryViaNATS(ctx, client, memory.MemoryQueryRequest{
 				Schema: memory.MemoryQuerySchema,
 				Action: "pending",
-				Repo:   strings.TrimSpace(*repoID),
+				Repo:   wantRepo,
 			}); qErr == nil {
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
@@ -609,14 +555,19 @@ func runPending(args []string) error {
 		return err
 	}
 	digest := memory.BuildBlueprintDigest(*repoID, records, "local-pending", nil)
-	wantRepo := strings.TrimSpace(*repoID)
 	var pending []memory.BlueprintRecordDigest
 	for _, r := range digest.Records {
 		if r.Status != memory.StatusProposed {
 			continue
 		}
-		if wantRepo != "" && r.Repo != "" && !strings.EqualFold(r.Repo, wantRepo) {
-			continue
+		if wantRepo != "" {
+			effRepo := strings.TrimSpace(r.Repo)
+			if effRepo == "" {
+				effRepo = strings.TrimSpace(defaultRepo)
+			}
+			if effRepo != "" && !memory.SameRepoSlug(effRepo, wantRepo) {
+				continue
+			}
 		}
 		pending = append(pending, r)
 	}
@@ -1008,17 +959,35 @@ func runRecall(args []string) error {
 	byDocID := map[string]memory.Record{}
 	if localRecs, lErr := memory.LoadRecords(*repoDir); lErr == nil {
 		for _, r := range localRecs {
-			byID[r.Meta.ID] = r
-			byDocID[r.DocumentID(*repoID)] = r
+			if strings.TrimSpace(r.Meta.Repo) == "" && strings.TrimSpace(*repoID) != "" {
+				r.Meta.Repo = strings.TrimSpace(*repoID)
+			}
+			recRepo := strings.TrimSpace(r.Meta.Repo)
+			if recRepo == "" {
+				recRepo = strings.TrimSpace(*repoID)
+			}
+			if recRepo == "" || *repoID == "" || memory.SameRepoSlug(recRepo, *repoID) {
+				byID[r.Meta.ID] = r
+			}
+			byDocID[r.DocumentID(recRepo)] = r
 		}
 	}
 	if extRecs, eErr := memory.LoadExternalDocRecords(*repoDir); eErr == nil {
 		for _, r := range extRecs {
-			byID[r.Meta.ID] = r
-			byDocID[r.DocumentID(*repoID)] = r
+			if strings.TrimSpace(r.Meta.Repo) == "" && strings.TrimSpace(*repoID) != "" {
+				r.Meta.Repo = strings.TrimSpace(*repoID)
+			}
+			recRepo := strings.TrimSpace(r.Meta.Repo)
+			if recRepo == "" {
+				recRepo = strings.TrimSpace(*repoID)
+			}
+			if recRepo == "" || *repoID == "" || memory.SameRepoSlug(recRepo, *repoID) {
+				byID[r.Meta.ID] = r
+			}
+			byDocID[r.DocumentID(recRepo)] = r
 		}
 	}
-	results = memory.FilterRecallResults(results, byID, byDocID, *clusterFilter, *pathFilter)
+	results = memory.FilterRecallResultsForRepo(results, *repoID, byID, byDocID, *clusterFilter, *pathFilter)
 	if *maxResults > 0 && len(results) > *maxResults {
 		results = results[:*maxResults]
 	}

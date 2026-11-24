@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -70,10 +71,18 @@ const (
 	SubjectCuratorOutcomes = "a2a.topics.agent.platform.curator-outcomes"
 
 	maxSlugLen              = 60
+	minRepoSlugSegments     = 2
 	proposalBranchPrefix    = "platform-agent/memory/"
 	defaultPodStateDir      = "/etc/gitops"
 	defaultManagedReposFile = "managed_repos"
 	defaultContextReposFile = "context_repos"
+	gitSuffix               = ".git"
+	schemeDelimiter         = "://"
+	githubHost              = "github.com"
+	githubWWWHost           = "www.github.com"
+	githubSSHHost           = "ssh.github.com"
+	repoTagPrefix           = "repo:"
+	idTagPrefix             = "id:"
 	recordDirPerm           = 0o750
 	recordFilePerm          = 0o600
 	maxRecordFileBytes      = 4 << 20
@@ -1057,10 +1066,194 @@ var (
 )
 
 func isSafeRepoSegment(seg string) bool {
-	if seg == "." || seg == ".." || seg == ".git" || strings.HasPrefix(seg, "-") {
+	if seg == "." || seg == ".." || seg == gitSuffix || strings.HasPrefix(seg, "-") {
 		return false
 	}
 	return reSafeRepoSegment.MatchString(seg)
+}
+
+func isGitHubHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case githubHost, githubWWWHost, githubSSHHost:
+		return true
+	}
+	return false
+}
+
+func isValidRepoHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") || strings.HasPrefix(host, "-") || strings.HasSuffix(host, "-") || strings.Contains(host, "..") {
+		return false
+	}
+	for _, ch := range host {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func cleanRepoSlugPath(rawPath string) string {
+	trimmed := strings.Trim(rawPath, "/")
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(trimmed, "/")
+	segments := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if part == "." || part == ".." {
+			return ""
+		}
+		segments = append(segments, part)
+	}
+	if len(segments) == 0 {
+		return ""
+	}
+	last := segments[len(segments)-1]
+	if strings.HasSuffix(last, gitSuffix) {
+		stem := strings.TrimSuffix(last, gitSuffix)
+		if stem == "" || stem == "." || stem == ".." {
+			return ""
+		}
+		segments[len(segments)-1] = stem
+	}
+	if len(segments) < minRepoSlugSegments {
+		return ""
+	}
+	for _, seg := range segments {
+		if !isSafeRepoSegment(seg) {
+			return ""
+		}
+	}
+	return strings.Join(segments, "/")
+}
+
+// ExtractRepoSlug normalizes a Git remote URL or host-qualified slug into a
+// canonical repository identifier ("owner/repo" for GitHub, "<host>/owner/repo"
+// for non-GitHub hosts). It returns "" when the input is malformed or empty.
+func ExtractRepoSlug(u string) string {
+	s := strings.TrimRight(strings.TrimSpace(u), "/")
+	if s == "" {
+		return ""
+	}
+	var host, rawPath string
+	if strings.Contains(s, schemeDelimiter) {
+		parsed, err := url.Parse(s)
+		if err != nil || parsed.Hostname() == "" || parsed.Opaque != "" {
+			return ""
+		}
+		host = strings.ToLower(parsed.Hostname())
+		rawPath = parsed.Path
+	} else {
+		hadUserinfo := false
+		slash := strings.Index(s, "/")
+		prefix := s
+		if slash >= 0 {
+			prefix = s[:slash]
+		}
+		if at := strings.LastIndex(prefix, "@"); at >= 0 {
+			hadUserinfo = true
+			s = s[at+1:]
+		}
+		if s == "" || strings.HasPrefix(s, ":") || strings.HasPrefix(s, "/") {
+			return ""
+		}
+		if colon := strings.Index(s, ":"); colon > 0 {
+			slash = strings.Index(s, "/")
+			if slash < 0 || colon < slash {
+				portPart := s[colon+1:]
+				if slash > colon {
+					portPart = s[colon+1 : slash]
+				}
+				isPort := portPart != ""
+				for _, ch := range portPart {
+					if ch < '0' || ch > '9' {
+						isPort = false
+						break
+					}
+				}
+				hostCandidate := strings.ToLower(s[:colon])
+				if isPort {
+					if slash <= colon {
+						return ""
+					}
+					host = hostCandidate
+					rawPath = s[slash+1:]
+				} else {
+					if !strings.Contains(hostCandidate, ".") {
+						return ""
+					}
+					host = hostCandidate
+					rawPath = s[colon+1:]
+				}
+			} else {
+				return ""
+			}
+		} else {
+			if first, rest, ok := strings.Cut(s, "/"); ok {
+				rest = strings.TrimLeft(rest, "/")
+				if strings.Contains(rest, "/") && strings.Contains(first, ".") {
+					host = strings.ToLower(first)
+					rawPath = rest
+				} else if !hadUserinfo {
+					rawPath = s
+				}
+			}
+		}
+		if hadUserinfo && host == "" {
+			return ""
+		}
+	}
+	if host != "" && !isValidRepoHost(host) {
+		return ""
+	}
+	cleanPath := cleanRepoSlugPath(rawPath)
+	if cleanPath == "" {
+		return ""
+	}
+	if host == "" || isGitHubHost(host) {
+		return cleanPath
+	}
+	return host + "/" + cleanPath
+}
+
+// CanonicalRepoID normalizes a repository URL or slug to a lowercase canonical
+// identifier for case-insensitive cross-format comparison.
+func CanonicalRepoID(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if slug := ExtractRepoSlug(trimmed); slug != "" {
+		return strings.ToLower(slug)
+	}
+	if strings.Contains(trimmed, schemeDelimiter) || strings.Contains(trimmed, "@") || strings.Contains(trimmed, ":") {
+		return ""
+	}
+	cleaned := strings.Trim(trimmed, "/")
+	if cleaned == "" || cleaned == "." || cleaned == ".." || strings.Contains(cleaned, "/") {
+		return ""
+	}
+	if !isSafeRepoSegment(cleaned) {
+		return ""
+	}
+	return strings.ToLower(cleaned)
+}
+
+// SameRepoSlug reports whether two repository identifiers refer to the same
+// canonical repository (for example, "github.com/acme/infra" and "acme/infra").
+func SameRepoSlug(a, b string) bool {
+	ca := CanonicalRepoID(a)
+	cb := CanonicalRepoID(b)
+	return ca != "" && ca == cb
 }
 
 func trimGitRepoPath(p string) string {

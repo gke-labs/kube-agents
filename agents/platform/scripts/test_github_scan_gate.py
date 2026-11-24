@@ -4218,7 +4218,10 @@ class RepoMemorySweepTest(unittest.TestCase):
             self.assertEqual(emit_t1[0][emit_t1[0].index("--kind") + 1], "proposed")
             self.assertEqual(emit_t1[0][emit_t1[0].index("--guard-severity") + 1], "warn")
             self.assertIn("#35", emit_t1[0][emit_t1[0].index("--pr") + 1])
-            self.assertIn("#29", emit_t1[0][emit_t1[0].index("--summary") + 1])
+            self.assertIn(
+                "Reverted breaking proposal #29 in",
+                emit_t1[0][emit_t1[0].index("--summary") + 1],
+            )
             self.assertIn("#10", emit_t1[0][emit_t1[0].index("--summary") + 1])
 
             # Live fix PR #34 -> proposed, backfill, warn, paths=clusters/prod/deployment.yaml.
@@ -4850,6 +4853,355 @@ class RepoMemorySweepTest(unittest.TestCase):
             self.assertIn("ADR-0005", by_id)
             self.assertEqual(by_id["ADR-0003"].type, "decision")
             self.assertEqual(by_id["ADR-0005"].type, "decision")
+
+    def test_revert_quoted_title_extracts_body_pr_number_and_preserves_cross_repo_qualifier(self):
+        live_tar = _build_tar_base64([
+            {"name": "clusters/prod/app.yaml", "data": "kind: Deployment\n"},
+        ])
+        proposals = [
+            {
+                "number": 91,
+                "state": "merged",
+                "title": 'Revert "feat: bad limit"',
+                "body": "Reverts #42",
+                "author": "sre-alice",
+                "source": "revert-42",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-22T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/91",
+            },
+            {
+                "number": 90,
+                "state": "merged",
+                "title": 'Revert "feat: upstream contract bump"',
+                "body": "Reverts other-org/other-repo#42",
+                "author": "sre-alice",
+                "source": "revert-upstream",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-21T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/90",
+            },
+        ]
+        emits = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-1", "archiveBase64": live_tar}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "proposal-view":
+                return {
+                    "proposal": next(p for p in proposals if p["number"] == payload["number"]),
+                    "diff": "--- a/clusters/prod/app.yaml\n+++ b/clusters/prod/app.yaml\n",
+                }
+            return {}
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(emits), 2)
+        summary_91 = emits[0][emits[0].index("--summary") + 1]
+        summary_90 = emits[1][emits[1].index("--summary") + 1]
+        self.assertIn("Reverted breaking proposal #42 in", summary_91)
+        self.assertIn("Reverted breaking proposal other-org/other-repo#42 in", summary_90)
+        self.assertNotIn("Reverted breaking proposal #42 in", summary_90)
+
+    def test_cross_repo_fixes_issue_does_not_resolve_against_local_issues(self):
+        live_tar = _build_tar_base64([
+            {"name": "clusters/prod/app.yaml", "data": "kind: Deployment\n"},
+        ])
+        proposals = [
+            {
+                "number": 88,
+                "state": "merged",
+                "title": "fix(prod): raise upstream rpc timeout",
+                "body": "Fixes other-org/other-repo#10",
+                "author": "sre-bob",
+                "source": "fix-rpc-timeout",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-22T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/88",
+            },
+            {
+                "number": 87,
+                "state": "merged",
+                "title": "fix(prod): local dns retry",
+                "body": "Fixes acme/infra#10",
+                "author": "sre-bob",
+                "source": "fix-dns",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-21T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/87",
+            },
+        ]
+        emits = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-1", "archiveBase64": live_tar}
+            if verb == "issue-list":
+                return {
+                    "issues": [
+                        {
+                            "number": 10,
+                            "title": "Unrelated local DNS outage",
+                            "url": "https://github.com/acme/infra/issues/10",
+                        }
+                    ]
+                }
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "proposal-view":
+                return {
+                    "proposal": next(p for p in proposals if p["number"] == payload["number"]),
+                    "diff": "--- a/clusters/prod/app.yaml\n+++ b/clusters/prod/app.yaml\n",
+                }
+            return {}
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(emits), 2)
+        # PR #88 (cross-repo `other-org/other-repo#10`): preserves PR title and verbatim cross-repo ref.
+        title_88 = emits[0][emits[0].index("--title") + 1]
+        summary_88 = emits[0][emits[0].index("--summary") + 1]
+        self.assertEqual(title_88, "fix(prod): raise upstream rpc timeout")
+        self.assertIn("Linked issue: other-org/other-repo#10.", summary_88)
+        self.assertNotIn("Unrelated local DNS outage", summary_88)
+        self.assertNotIn("https://github.com/acme/infra/issues/10", summary_88)
+
+        # PR #87 (same-repo `acme/infra#10`): resolves local issue #10 title and URL.
+        title_87 = emits[1][emits[1].index("--title") + 1]
+        summary_87 = emits[1][emits[1].index("--summary") + 1]
+        self.assertEqual(title_87, "Unrelated local DNS outage")
+        self.assertIn(
+            "Linked issue: https://github.com/acme/infra/issues/10 (#10) (Unrelated local DNS outage).",
+            summary_87,
+        )
+
+    def test_page2_and_deferred_repo_prune_deleted_file_fixes_when_revision_unchanged(self):
+        live_tar = _build_tar_base64([
+            {"name": "clusters/prod/live.yaml", "data": "kind: Deployment\n"},
+        ])
+        page1 = [
+            {
+                "number": 200 + i,
+                "state": "merged",
+                "title": f"chore: bump {i}",
+                "body": "",
+                "author": "dev",
+                "source": f"b-{i}",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-20T10:00:00Z",
+                "url": f"https://github.com/acme/infra/pull/{200 + i}",
+            }
+            for i in range(30)
+        ]
+        page2 = [
+            {
+                "number": 150,
+                "state": "merged",
+                "title": "fix(legacy): tune removed deployment",
+                "body": "Fixes #5",
+                "author": "sre-alice",
+                "source": "fix-removed",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-10T10:00:00Z",
+                "url": "https://github.com/acme/infra/pull/150",
+            },
+            {
+                "number": 149,
+                "state": "merged",
+                "title": "fix(prod): keep live workload floor",
+                "body": "Fixes #6",
+                "author": "sre-alice",
+                "source": "fix-live",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-09T10:00:00Z",
+                "url": "https://github.com/acme/infra/pull/149",
+            },
+        ]
+        emits = []
+        snap_count = [0]
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                snap_count[0] += 1
+                return {"revision": "sha-unchanged", "archiveBase64": live_tar}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                pg = payload.get("page", 1)
+                return {
+                    "proposals": page1 if pg == 1 else page2,
+                    "truncated": pg == 1,
+                }
+            if verb == "proposal-view":
+                num = payload["number"]
+                if num == 150:
+                    return {
+                        "proposal": page2[0],
+                        "diff": "--- a/clusters/legacy/deleted.yaml\n+++ b/clusters/legacy/deleted.yaml\n",
+                    }
+                return {
+                    "proposal": page2[1],
+                    "diff": "--- a/clusters/prod/live.yaml\n+++ b/clusters/prod/live.yaml\n",
+                }
+            return {}
+
+        cur_now = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            # Tick 1: indexes snapshot + processes page 1 (advances to page 2).
+            gate.sweep_repo_memory(now=cur_now)
+            cache_file = gate._repo_tree_cache_path("acme/infra")
+            self.assertTrue(cache_file.is_file())
+            self.assertEqual(cache_file.stat().st_mode & 0o777, 0o600)
+
+            # Tick 2 (`page=2`, `revision == indexed_revision`): deleted-file PR #150 is pruned!
+            gate.sweep_repo_memory(now=cur_now)
+            saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+
+        self.assertEqual(len(emits), 1)
+        self.assertIn("#149", emits[0][emits[0].index("--pr") + 1])
+        self.assertIn(150, saved["repos"]["acme/infra"]["history"]["processed_prs"])
+
+        # Also verify lazy snapshot fetch when `_backfill_one_managed_repo` runs with `tracked_files=None`
+        # (e.g. a repository deferred past `MAX_REPO_SCANS_PER_TICK` with no prior cache file).
+        emits.clear()
+        snap_count[0] = 0
+        with tempfile.TemporaryDirectory() as td2, \
+             mock.patch.dict("os.environ", {"PLATFORM_AGENT_HOME": td2}, clear=True), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            hist = {"completed_initial": False, "next_page": 2, "processed_prs": []}
+            changed = gate._backfill_one_managed_repo(
+                "acme/infra",
+                hist,
+                curator_bin="/usr/local/bin/curator",
+                tracked_files=None,
+                cutoff_dt=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                since_spec="90d",
+                cur_now=cur_now,
+                dry_run=False,
+            )
+            self.assertTrue(changed)
+            self.assertEqual(snap_count[0], 1)
+            self.assertEqual(len(emits), 1)
+            self.assertIn("#149", emits[0][emits[0].index("--pr") + 1])
+            self.assertIn(150, hist["processed_prs"])
+
+    def test_rejection_reason_keeps_later_technical_rejection_after_earlier_rebase_comment(self):
+        provider = mock.Mock()
+        provider._has_write.side_effect = lambda repo, login, bot=False: login == "maintainer-carol"
+
+        # Earlier rebase/conflict note followed by a technical policy rejection -> emits `ok`.
+        status, reason = gate._extract_backfill_rejection_reason(
+            [
+                {
+                    "author": "maintainer-carol",
+                    "body": "Needs rebase after merge conflict",
+                    "bot": False,
+                },
+                {
+                    "author": "maintainer-carol",
+                    "body": "Closing — pods in prod must not run without memory limits",
+                    "bot": False,
+                },
+            ],
+            viewer="kage-bot",
+            pr_author="contributor-dan",
+            provider=provider,
+            repo="acme/infra",
+        )
+        self.assertEqual(status, "ok")
+        self.assertEqual(
+            reason, "Closing — pods in prod must not run without memory limits"
+        )
+
+        # Earlier technical objection superseded by a later situational close -> suppressed (`none`).
+        status2, reason2 = gate._extract_backfill_rejection_reason(
+            [
+                {
+                    "author": "maintainer-carol",
+                    "body": "We cannot merge this without limits.",
+                    "bot": False,
+                },
+                {
+                    "author": "maintainer-carol",
+                    "body": "Closing stale pull request after merge conflict.",
+                    "bot": False,
+                },
+            ],
+            viewer="kage-bot",
+            pr_author="contributor-dan",
+            provider=provider,
+            repo="acme/infra",
+        )
+        self.assertEqual((status2, reason2), ("none", None))
 
 
 if __name__ == "__main__":

@@ -1341,6 +1341,21 @@ class LLMSynthesisTests(unittest.TestCase):
         )
         self.assertEqual(dm._workspace_clone_dir_name("acme/runbooks"), "acme__runbooks")
 
+    def test_external_doc_directory_precedence_matches_go_curator(self):
+        cases = [
+            ("docs/decisions/0001-runbook-layout.md", "# Standardize runbook layout\n", "ADR-0001", "decision"),
+            ("decisions/0002-metric-naming.md", "# Metric naming convention\n", "ADR-0002", "decision"),
+            ("acme__standards:docs/decisions/0003-lesson-format.md", "# Lesson format\n", "ADR-0003", "decision"),
+            ("acme__standards/docs/decisions/0004-escalation-policy.md", "# Escalation policy\n", "ADR-0004", "decision"),
+            ("docs/runbooks/0001-decision-service-drain.md", "# Drain procedure\n", "RUN-0001", "runbook"),
+            ("playbooks/0002-lesson-triage.md", "# Triage playbook\n", "RUN-0002", "runbook"),
+        ]
+        for rel_path, content, expected_id, expected_type in cases:
+            with self.subTest(rel_path=rel_path):
+                rec = dm.parse_external_doc_record(content, rel_path)
+                self.assertEqual(rec.id, expected_id)
+                self.assertEqual(rec.type, expected_type)
+
 
 @unittest.skipUnless(os.environ.get("DECISION_MEMORY_LIVE_URL"), "set DECISION_MEMORY_LIVE_URL for a live run")
 class LiveHindsightTests(unittest.TestCase):

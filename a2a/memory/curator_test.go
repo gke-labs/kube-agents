@@ -3470,3 +3470,129 @@ func TestGuardSeverityCapMultiRepoDreamAndExplicitVerifiedRepoDir(t *testing.T) 
 		t.Fatalf("expected secondary ADR isolated under explicit VerifiedRepoDir/acme__payments: %v", err)
 	}
 }
+
+func TestHandleQueryRecallCrossRepoBareIDIsolationAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	repoDir := t.TempDir()
+
+	// Primary repo (acme/repo-a) has DEC-2026-001 in memory governing prod-eu and clusters/prod-eu/**.
+	primaryRec := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Primary EU ingress floor",
+			Date:   "2026-11-24",
+			Scope:  RecordScope{Clusters: []string{"prod-eu"}, Paths: []string{"clusters/prod-eu/**"}},
+		},
+		Body: "## Context\nKeep EU ingress replicas >= 2.\n",
+	}
+	if err := SaveRecord(repoDir, &primaryRec); err != nil {
+		t.Fatal(err)
+	}
+
+	// Secondary repo (acme/repo-b) is NOT loaded in Curator memory (simulating post-restart before re-index),
+	// and shares bare ID DEC-2026-001 in Hindsight with different scope (prod-us, payments/**).
+	repoBRec := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Repo:   "acme/repo-b",
+			Title:  "Repo B payment retry timeout",
+			Date:   "2026-11-24",
+			Scope:  RecordScope{Clusters: []string{"prod-us"}, Paths: []string{"payments/**"}},
+		},
+		Body: "## Context\nPayment retry timeout in repo-b.\n",
+	}
+
+	var mode atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/default/banks/kube-agents-decisions/memories/recall", func(w http.ResponseWriter, _ *http.Request) {
+		switch mode.Load() {
+		case 0:
+			// Cross-repo hits from acme/repo-b (both DocumentID-scoped and repo-tag-scoped, with and without frontmatter).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []HindsightRecallResult{
+					{
+						ID:         "DEC-2026-001",
+						DocumentID: "okf:acme/repo-b:DEC-2026-001",
+						Text:       repoBRec.RenderForIndex(),
+						Tags:       []string{"scope:shared", "repo:acme/repo-b", "id:DEC-2026-001", "cluster:prod-us"},
+					},
+					{
+						ID:         "DEC-2026-001",
+						DocumentID: "okf:acme/repo-b:DEC-2026-001",
+						Text:       "Summary chunk without frontmatter for payment retry timeout",
+						Tags:       []string{"scope:shared", "repo:acme/repo-b", "id:DEC-2026-001"},
+					},
+					{
+						ID:   "DEC-2026-001",
+						Text: "Tag-only chunk from repo-b without DocumentID",
+						Tags: []string{"scope:shared", "repo:acme/repo-b", "id:DEC-2026-001"},
+					},
+				},
+			})
+		case 1:
+			// Host-qualified slug variant for the primary repo (github.com/acme/repo-a == acme/repo-a)
+			// plus a legacy untagged primary-repo hit (hitRepo == "").
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []HindsightRecallResult{
+					{
+						ID:         "DEC-2026-001",
+						DocumentID: "okf:github.com/acme/repo-a:DEC-2026-001",
+						Text:       "Host-qualified primary repo chunk without frontmatter",
+						Tags:       []string{"scope:shared", "repo:github.com/acme/repo-a", "id:DEC-2026-001"},
+					},
+					{
+						ID:   "DEC-2026-001",
+						Text: "Legacy untagged primary repo chunk",
+						Tags: []string{"scope:shared"},
+					},
+				},
+			})
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   repoDir,
+		RepoID:    "acme/repo-a",
+		Hindsight: NewHindsightClient(srv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Cross-repo okf:acme/repo-b:DEC-2026-001 must NOT inherit acme/repo-a's prod-eu / clusters/prod-eu/** scope.
+	crossResp := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Query:   "payment retry timeout",
+		Cluster: "prod-eu",
+		Path:    "clusters/prod-eu/ingress.yaml",
+	})
+	if len(crossResp.Results) != 0 {
+		t.Fatalf("expected 0 results when Hindsight only returns cross-repo okf:acme/repo-b:DEC-2026-001, got %+v", crossResp.Results)
+	}
+
+	// Also verify path-only filter (Cluster == "") rejects cross-repo bare-ID fallback.
+	crossPathOnly := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Query: "payment retry timeout",
+		Path:  "clusters/prod-eu/ingress.yaml",
+	})
+	if len(crossPathOnly.Results) != 0 {
+		t.Fatalf("expected 0 results on path-filtered query for cross-repo hit, got %+v", crossPathOnly.Results)
+	}
+
+	// 2. Host-qualified github.com/acme/repo-a and legacy untagged primary-repo chunks DO match acme/repo-a's DEC-2026-001.
+	mode.Store(1)
+	cur.InvalidateCache()
+	sameRepoResp := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Query:   "host-qualified legacy",
+		Cluster: "prod-eu",
+		Path:    "clusters/prod-eu/ingress.yaml",
+	})
+	if len(sameRepoResp.Results) != 2 {
+		t.Fatalf("expected both github.com/acme/repo-a and legacy untagged primary hits to match acme/repo-a, got %+v", sameRepoResp.Results)
+	}
+}

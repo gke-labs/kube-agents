@@ -636,12 +636,21 @@ func TestExtractRepoSlugAndDefaultRepoIDNonGitHubHosts(t *testing.T) {
 		{"ssh://git@ssh.github.com:443/acme/infra.git", "acme/infra"},
 		{"git@github.com:acme/infra.git", "acme/infra"},
 		{"github.com/acme/infra", "acme/infra"},
+		{"github.com//acme/infra", "acme/infra"},
 		{"acme/infra", "acme/infra"},
 		{"my.org/infra", "my.org/infra"},
 		{"https://gitlab.com/org/repo.git", "gitlab.com/org/repo"},
 		{"https://gitlab.com/org/sub/repo.git", "gitlab.com/org/sub/repo"},
 		{"git@gitlab.com:org/repo.git", "gitlab.com/org/repo"},
 		{"gitlab.com/org/repo", "gitlab.com/org/repo"},
+		{"gitlab.com//org/repo.git", "gitlab.com/org/repo"},
+		{"https://token@gitlab.com/org/repo.git", "gitlab.com/org/repo"},
+		{"user:secret@gitlab.com/org/repo.git", "gitlab.com/org/repo"},
+		{"token@github.com//acme/infra.git", "acme/infra"},
+		{"https://user:bad%zz@github.com/acme/infra.git", ""},
+		{"https:///acme/infra", ""},
+		{"github.com/acme/../other", ""},
+		{"user@notahost/repo", ""},
 		{"https://gitea.internal:8443/platform/gitops.git", "gitea.internal/platform/gitops"},
 		{"ssh://git@gitlab.corp.example:2222/team/sub/cluster.git", "gitlab.corp.example/team/sub/cluster"},
 	}
@@ -841,4 +850,255 @@ func TestRunEmitCommitFlagGuardSeverityCapAndRunIndexContextRepoIsolation(t *tes
 	if brokerCalled.Load() {
 		t.Fatal("expected FromLocal=true on local `curator index` to skip broker snapshot HTTP call")
 	}
+}
+
+func TestRunEmitDefaultGuardSeverityPreservesBlockAndExplicitWarnCaps(t *testing.T) {
+	natsURL := startCLIJetStream(t)
+	t.Setenv("NATS_URL", natsURL)
+	t.Setenv(lib.EnvBusUser, "curator")
+	t.Setenv("DECISION_MEMORY_LLM_URL", "")
+	t.Setenv("HINDSIGHT_API_URL", "")
+	t.Setenv("DECISION_MEMORY_HINDSIGHT_URL", "")
+
+	daemonStore := t.TempDir()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonContext(ctx, []string{"--repo", daemonStore, "--repo-id", "acme/gitops", "--status-listen", addr})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, rErr := httpClient.Get("http://" + addr + "/readyz"); rErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1. Omitting --guard-severity on resolved-merged with crash evidence leaves ev.GuardSeverity == "" and promotes to severity: block.
+	resolvedOut, err := captureStdout(t, func() error {
+		return run([]string{
+			"emit",
+			"--kind", "resolved-merged",
+			"--repo", "acme/gitops",
+			"--pr", "https://github.com/acme/gitops/pull/91 (#91)",
+			"--title", "OOM exit 137 memory floor",
+			"--summary", "Container hit OOM exit 137 under load",
+			"--rule", "Keep memory limit >= 512Mi",
+			"--paths", "apps/**",
+		})
+	})
+	if err != nil {
+		t.Fatalf("curator emit resolved-merged failed: %v", err)
+	}
+	var resolvedResp struct {
+		RecordID   string              `json:"record_id"`
+		PRMarkdown string              `json:"pr_markdown"`
+		Event      memory.OutcomeEvent `json:"event"`
+	}
+	if err := json.Unmarshal([]byte(resolvedOut), &resolvedResp); err != nil {
+		t.Fatalf("decode resolved-merged output: %v", err)
+	}
+	if resolvedResp.Event.GuardSeverity != "" {
+		t.Fatalf("expected omitted --guard-severity to leave ev.GuardSeverity empty, got %q", resolvedResp.Event.GuardSeverity)
+	}
+	if !strings.Contains(resolvedResp.PRMarkdown, "severity: block") {
+		t.Fatalf("expected crash resolved-merged without --guard-severity to preserve severity: block, got:\n%s", resolvedResp.PRMarkdown)
+	}
+
+	// 2. Omitting --guard-severity on modified-merged preserves existing severity: block.
+	modOut, err := captureStdout(t, func() error {
+		return run([]string{
+			"emit",
+			"--kind", "modified-merged",
+			"--id", resolvedResp.RecordID,
+			"--repo", "acme/gitops",
+			"--pr", "https://github.com/acme/gitops/pull/92 (#92)",
+			"--rule", "Keep memory limit >= 1Gi",
+		})
+	})
+	if err != nil {
+		t.Fatalf("curator emit modified-merged failed: %v", err)
+	}
+	var modResp struct {
+		PRMarkdown string              `json:"pr_markdown"`
+		Event      memory.OutcomeEvent `json:"event"`
+	}
+	if err := json.Unmarshal([]byte(modOut), &modResp); err != nil {
+		t.Fatalf("decode modified-merged output: %v", err)
+	}
+	if modResp.Event.GuardSeverity != "" || !strings.Contains(modResp.PRMarkdown, "severity: block") {
+		t.Fatalf("expected modified-merged without --guard-severity to preserve severity: block, got event=%+v md:\n%s", modResp.Event, modResp.PRMarkdown)
+	}
+
+	// 3. Explicit --guard-severity warn caps existing severity: block to warn.
+	cappedOut, err := captureStdout(t, func() error {
+		return run([]string{
+			"emit",
+			"--kind", "modified-merged",
+			"--id", resolvedResp.RecordID,
+			"--repo", "acme/gitops",
+			"--pr", "https://github.com/acme/gitops/pull/93 (#93)",
+			"--guard-severity", "warn",
+			"--rule", "Keep memory limit >= 1Gi",
+		})
+	})
+	if err != nil {
+		t.Fatalf("curator emit --guard-severity warn failed: %v", err)
+	}
+	var cappedResp struct {
+		PRMarkdown string              `json:"pr_markdown"`
+		Event      memory.OutcomeEvent `json:"event"`
+	}
+	if err := json.Unmarshal([]byte(cappedOut), &cappedResp); err != nil {
+		t.Fatalf("decode capped output: %v", err)
+	}
+	if cappedResp.Event.GuardSeverity != "warn" {
+		t.Fatalf("expected explicit --guard-severity warn to set ev.GuardSeverity=warn, got %q", cappedResp.Event.GuardSeverity)
+	}
+	if strings.Contains(cappedResp.PRMarkdown, "severity: block") || !strings.Contains(cappedResp.PRMarkdown, "severity: warn") {
+		t.Fatalf("expected explicit --guard-severity warn to cap block to warn, got:\n%s", cappedResp.PRMarkdown)
+	}
+}
+
+func TestRunPendingReturnsAllManagedReposWithoutFlagAndFiltersWithExplicitRepoID(t *testing.T) {
+	natsURL := startCLIJetStream(t)
+	t.Setenv("NATS_URL", natsURL)
+	t.Setenv(lib.EnvBusUser, "curator")
+	t.Setenv("CURATOR_REPO_ID", "acme/gitops")
+	t.Setenv("HINDSIGHT_API_URL", "")
+	t.Setenv("DECISION_MEMORY_HINDSIGHT_URL", "")
+
+	daemonStore := t.TempDir()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonContext(ctx, []string{"--repo", daemonStore, "--repo-id", "acme/gitops", "--status-listen", addr})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, rErr := httpClient.Get("http://" + addr + "/readyz"); rErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	for _, spec := range []struct {
+		repo  string
+		title string
+		pr    string
+	}{
+		{"acme/gitops", "Primary bare GitHub proposal", "https://github.com/acme/gitops/pull/10 (#10)"},
+		{"github.com/acme/gitops", "Primary host-qualified GitHub proposal", "https://github.com/acme/gitops/pull/11 (#11)"},
+		{"gitlab.com/acme/payments", "Secondary GitLab managed proposal", "https://gitlab.com/acme/payments/-/merge_requests/12 (!12)"},
+	} {
+		if _, err := captureStdout(t, func() error {
+			return run([]string{
+				"emit",
+				"--kind", "proposed",
+				"--type", "lesson",
+				"--repo", spec.repo,
+				"--pr", spec.pr,
+				"--title", spec.title,
+				"--rule", "Rule for " + spec.title,
+				"--paths", "apps/**",
+			})
+		}); err != nil {
+			t.Fatalf("emit %s failed: %v", spec.repo, err)
+		}
+	}
+
+	assertPendingCounts := func(mode string) {
+		t.Helper()
+		// Without --repo-id: returns all 3 pending records across all repos while preserving envelope "repo".
+		allOut, err := captureStdout(t, func() error {
+			return run([]string{"pending", "--repo", daemonStore})
+		})
+		if err != nil {
+			t.Fatalf("%s: curator pending without --repo-id failed: %v", mode, err)
+		}
+		var allJSON struct {
+			Repo    string                         `json:"repo"`
+			Records []memory.BlueprintRecordDigest `json:"records"`
+		}
+		if err := json.Unmarshal([]byte(allOut), &allJSON); err != nil {
+			t.Fatalf("%s: decode all pending: %v", mode, err)
+		}
+		if allJSON.Repo != "acme/gitops" || len(allJSON.Records) != 3 {
+			t.Fatalf("%s: expected repo=acme/gitops and 3 pending records across all repos, got repo=%q records=%+v", mode, allJSON.Repo, allJSON.Records)
+		}
+
+		// With explicit --repo-id acme/gitops (and github.com/acme/gitops): matches both GitHub slug forms (2 records).
+		for _, ghQuery := range []string{"acme/gitops", "github.com/acme/gitops"} {
+			ghOut, err := captureStdout(t, func() error {
+				return run([]string{"pending", "--repo", daemonStore, "--repo-id", ghQuery})
+			})
+			if err != nil {
+				t.Fatalf("%s: curator pending --repo-id %s failed: %v", mode, ghQuery, err)
+			}
+			var ghJSON struct {
+				Records []memory.BlueprintRecordDigest `json:"records"`
+			}
+			if err := json.Unmarshal([]byte(ghOut), &ghJSON); err != nil {
+				t.Fatalf("%s: decode gh pending: %v", mode, err)
+			}
+			if len(ghJSON.Records) != 2 {
+				t.Fatalf("%s: expected 2 GitHub pending records for --repo-id %s, got %+v", mode, ghQuery, ghJSON.Records)
+			}
+		}
+
+		// With explicit --repo-id gitlab.com/acme/payments: returns only the GitLab record.
+		glOut, err := captureStdout(t, func() error {
+			return run([]string{"pending", "--repo", daemonStore, "--repo-id", "gitlab.com/acme/payments"})
+		})
+		if err != nil {
+			t.Fatalf("%s: curator pending --repo-id gitlab failed: %v", mode, err)
+		}
+		var glJSON struct {
+			Records []memory.BlueprintRecordDigest `json:"records"`
+		}
+		if err := json.Unmarshal([]byte(glOut), &glJSON); err != nil {
+			t.Fatalf("%s: decode gl pending: %v", mode, err)
+		}
+		if len(glJSON.Records) != 1 || glJSON.Records[0].Repo != "gitlab.com/acme/payments" {
+			t.Fatalf("%s: expected 1 GitLab pending record, got %+v", mode, glJSON.Records)
+		}
+	}
+
+	assertPendingCounts("nats")
+	t.Setenv("NATS_URL", "")
+	assertPendingCounts("local-fallback")
 }
