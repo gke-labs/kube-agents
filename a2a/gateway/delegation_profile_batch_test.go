@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -939,5 +940,59 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 				t.Fatalf("children after the repeat = %v, want the %d from before it", ref.Children, kids)
 			}
 		})
+	}
+}
+
+// TestAWithdrawnProfileBatchRetriesAnEndThatFailsToSend: nothing sends a
+// withdrawn batch's ends again (the withdrawal leaves the heal no child to
+// find), so a send that fails is tried again on the spot, and the parent
+// still gets one end per entry.
+func TestAWithdrawnProfileBatchRetriesAnEndThatFailsToSend(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	var armed, failed atomic.Int32
+	r.g.childResultFails = func() bool {
+		// Once armed, the first publish fails; the rest go through.
+		return armed.Load() == 1 && failed.Add(1) == 1
+	}
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-withdrawn-retry"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	submissionOn(t, r, "cluster")
+	waitForRecord(t, r, conv, "the cut-short mint", func(rec *SessionRecord) bool {
+		ref, _ := rec.TaskRefFor(origin.TaskID)
+		return ref.BatchSize == 2 && len(ref.Children) == 1
+	})
+	r.g.profiles.put("cluster", nil)
+	armed.Store(1)
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "an end for each entry", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 2 })
+	if failed.Load() < 2 {
+		t.Fatalf("publishes seen by the hook = %d, want the failed one and its retry", failed.Load())
+	}
+	seen := map[int]bool{}
+	for _, c := range childResultsOn(t, r, "chat", origin.TaskID) {
+		seen[c.Entry] = true
+	}
+	if !seen[1] || !seen[2] {
+		t.Fatalf("entries ended = %v, want 1 and 2", seen)
 	}
 }

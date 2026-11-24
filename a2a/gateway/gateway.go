@@ -291,6 +291,9 @@ type Gateway struct {
 	// minted, with the entry's index; true stops the mint there, as a
 	// gateway that died partway through a batch would (tests only).
 	beforeBatchChild func(i int) bool
+	// childResultFails, when set, runs before each childResult publish;
+	// true fails that publish, as a bus fault would (tests only).
+	childResultFails func() bool
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
