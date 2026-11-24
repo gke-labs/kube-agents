@@ -359,7 +359,8 @@ line's decoration folded when the check sets `fold_decoration: true` (indentatio
 numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
 negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
 spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
-line break; a phrase that may wrap says `\s+`), for what no substring can
+line break; a phrase that may wrap says `\s+`; the text is lowercased, so a pattern that spells a
+letter in upper case outside a character class and `(?i)` does not load), for what no substring can
 express: a banned word whose negated uses are legitimate, a value only the work produces, such
 as a 32-hex trace id, where the words around it are the prompt's own and a report of failure
 would echo them (`required_patterns` must each match), a phrase that must start at a word

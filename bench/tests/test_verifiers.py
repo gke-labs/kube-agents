@@ -2167,6 +2167,53 @@ def test_an_any_of_pattern_that_does_not_compile_is_rejected():
         ReportContainsVerifier(type="report_contains", any_of_patterns=["("])
 
 
+@pytest.mark.parametrize("field", ["required_patterns", "forbidden_patterns", "any_of_patterns"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "KA-7741-ORCHID",
+        r"\bticket KA-\d+",
+        "(?m)^(?:Status|state): ready$",
+        "(?i:ka)-7741-ORCHID",
+        "(?i)ka-(?-i:ORCHID)",
+        "(?=Ready)ready",
+        "{cluster:a}: Ready",
+    ],
+)
+def test_a_pattern_with_an_uppercase_literal_is_rejected(field, pattern):
+    """The report is lowercased before a pattern runs, so an uppercase letter
+    outside a character class and outside ``(?i)`` matches no report: the
+    required pattern misses on every run and the forbid never fires."""
+    with pytest.raises(ValueError, match="in upper case"):
+        ReportContainsVerifier(type="report_contains", **{field: [pattern]})
+
+
+def test_an_uppercase_pattern_rejection_names_the_letters_once_each():
+    with pytest.raises(ValueError, match=r"spells 'K', 'A', 'O' in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["KA-7741-OAK"])
+
+
+@pytest.mark.parametrize(
+    ("pattern", "report", "status"),
+    [
+        ("ka-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i)KA-7741-ORCHID", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i:KA)-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        (r"\Aticket \S+ is\Z", "Ticket KA-7741-ORCHID is", "pass"),
+        ("(?P<ID>ka-[0-9a-fA-F]+) (?P=ID)", "KA-7F KA-7F", "pass"),
+        ("(?x) ka-7741 # The Ticket", "KA-7741", "pass"),
+        (r"ka-[A-Z]+", "KA-ORCHID", "fail"),
+    ],
+)
+def test_an_uppercase_letter_that_is_not_a_literal_still_loads(pattern, report, status):
+    """An escape, a group name, a ``(?x)`` comment and a character class are
+    not refused, and neither is a letter under ``(?i)``; the verdict is the
+    one the pattern gave before the refusal existed."""
+    v = ReportContainsVerifier(type="report_contains", required_patterns=[pattern])
+    _stash(report)
+    assert v.verify(5.0).status == status
+
+
 # ------------------ the healthy-workload objective's shipped phrase list
 
 # Read the list out of the task file rather than copying it here. It is edited

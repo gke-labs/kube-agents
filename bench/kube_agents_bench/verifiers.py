@@ -73,6 +73,7 @@ from collections import Counter
 from contextvars import ContextVar
 from collections.abc import Callable
 from functools import wraps
+from re import _constants as _regex_constants, _parser as _regex_parser
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
 
@@ -300,6 +301,14 @@ _NO_RECORDED_SLOT_REASON = (
     "cluster was reached before the run"
 )
 _PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
+# `pattern_surface` lowercases the report, so a letter a pattern spells in upper
+# case outside a character class and outside `(?i)` is text no report carries:
+# a required pattern that misses on every run, a forbid that never fires.
+_UPPERCASE_PATTERN_REASON = (
+    "the report is lowercased before the pattern runs, so no report carries them: a required "
+    "pattern misses on every run and a forbidden one never fires; spell the letters in lower "
+    "case, or open the pattern with (?i)"
+)
 
 
 # Emphasis and code markers, dropped before matching. The agent answers in
@@ -530,7 +539,9 @@ class ReportContainsVerifier(BaseVerifier):
     bullet into its unnegated neighbour before the regex runs. A literal
     space in a pattern therefore does not cross a line break; a phrase that
     may wrap says ``\\s+`` where it may. The text is lowercased before the
-    regex runs, so a pattern spells its letters in lower case.
+    regex runs, so a pattern spells its letters in lower case; one with an
+    uppercase letter outside a character class and ``(?i)`` matches no report
+    and is refused at spec load.
     ``required_patterns`` must each match somewhere; ``any_of_patterns``
     and ``any_of_phrases`` are one pool of alternatives: at least one of
     either has to match.
@@ -636,13 +647,52 @@ class ReportContainsVerifier(BaseVerifier):
             # compile now is the pattern around a frame, not around a letter:
             # a lookbehind or a character class that is legal around `x` is
             # not around a variable-width group.
+            expanded = cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern))
             try:
-                re.compile(cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern)))
+                re.compile(expanded)
             except re.error as exc:
                 # Re-raised as the same type, so a caller that catches re.error
                 # for a pattern that does not compile still does.
                 raise re.error(f"pattern {pattern!r} does not compile once its cluster placeholders are expanded: {exc}") from exc
+            uppercase = cls._uppercase_literals(expanded)
+            if uppercase:
+                raise ValueError(f"pattern {pattern!r} spells {', '.join(map(repr, uppercase))} in upper case; {_UPPERCASE_PATTERN_REASON}")
         return patterns
+
+    @staticmethod
+    def _uppercase_literals(pattern: str) -> list[str]:
+        """The letters ``pattern`` matches only in upper case, in order, once each.
+
+        Read from the parsed pattern, not its text, so an escape (``\\A``,
+        ``\\S``), a group name and a ``(?x)`` comment are not letters. A
+        character class is passed over (it may list both cases), and so is
+        anything under ``(?i)`` or ``(?i:...)``.
+        """
+        # `re` exposes its parser only as private modules (`sre_parse` is their
+        # deprecated alias). A Python that moves them fails this module's
+        # import, so no pattern passes unread.
+        parsed = _regex_parser.parse(pattern)
+        found: list[str] = []
+
+        def walk(node: Any, ignorecase: bool) -> None:
+            if isinstance(node, _regex_parser.SubPattern):
+                for op, av in node:
+                    if op is _regex_constants.LITERAL:
+                        letter = chr(av)
+                        if not ignorecase and letter != letter.lower() and letter not in found:
+                            found.append(letter)
+                    elif op is _regex_constants.SUBPATTERN:
+                        _group, add_flags, del_flags, inner = av
+                        scoped = (ignorecase or bool(add_flags & re.IGNORECASE)) and not del_flags & re.IGNORECASE
+                        walk(inner, scoped)
+                    elif op is not _regex_constants.IN:
+                        walk(av, ignorecase)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    walk(item, ignorecase)
+
+        walk(parsed, bool(parsed.state.flags & re.IGNORECASE))
+        return found
 
     @staticmethod
     def _stand_in_records(pattern: str) -> dict[str, tuple[str, str]]:
