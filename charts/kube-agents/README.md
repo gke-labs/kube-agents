@@ -1016,6 +1016,15 @@ when the gateway runs the Slack adapter. Empty by default, and an `operator.extr
 user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
 off a real install, and a listed member's posts through any app in the workspace read as theirs.
 
+### Delegation rounds (`operator.delegation.roundsMax`)
+
+How many delegate requests one AgentProfile task may make, each minted or refused using one up;
+the A2A gateway refuses one past it under its `delegation.rounds` rule. `1`, the default, is the
+only value supported until a profile task's later rounds ship: the values schema and the render
+refuse any other. The controller manager renders `A2A_DELEGATION_ROUNDS_MAX=1` onto the gateway,
+and an `A2A_DELEGATION_ROUNDS_MAX` it carries from `operator.extraEnv` other than `1` is refused
+in its startup log and rendered as `1`.
+
 ### Microsoft Teams on the A2A gateway (`A2A_TEAMS_BACKEND`)
 
 An `operator.extraEnv` entry `A2A_TEAMS_BACKEND=true` (no value key yet) has the A2A gateway's
