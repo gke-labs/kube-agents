@@ -46,14 +46,21 @@ past `--max-bytes` is left out and counted; its key's answers then weigh 1.
 
 What fits under `--max-bytes` is chosen before anything downloads, in this
 order, newest record first within each kind: answers in the older layout;
-alternates; slots whose key has a chosen answer; variants; messages. An object
-is costed as the disk it takes, its size rounded up to whole 4 KiB blocks plus
-one block for its directory entry (and a block for each new variant or
-alternate directory), from the size the record gives. What
-does not fit is left out and counted, never refused: the lane replays less
-rather than nothing. After the download each file is costed again at its real
-size (an object the nightly found already in the bucket can differ from the
-copy it recorded), and one past the bound is removed and counted. A slot whose
+alternates; a weights file for each key with two or more chosen alternates;
+slots whose key has a chosen answer; variants; messages. Weights come
+straight after the answers they weigh, so a variant or message never takes
+their room; the counts come from the records, so a file is charged at its
+size over every chosen alternate, which is never less than the file written
+over the ones that arrive. An object is costed as the disk it takes, its size
+rounded up to whole 4 KiB blocks plus one block for its directory entry (and
+a block for each new variant or alternate directory), from the size the
+record gives. What does not fit is left out and counted, never refused: the
+lane replays less rather than nothing. After the download each file is costed
+again at its real size in the same order, the weights files written once the
+alternates are in (an object the nightly found already in the bucket can
+differ from the copy it recorded), and one past the bound is removed and
+counted, so a weights file is left out only when the answers leave no room
+for it. A slot whose
 key has no answer that arrived (left out, expired, or never written) is
 removed too, so no pointer names a key the pod has no answer for.
 
@@ -162,7 +169,8 @@ GCLOUD_TIMEOUT_SECONDS = 600.0
 TEXT_ENCODING = "utf-8"
 STAGING_PREFIX = "replay-cache-fetch-"
 GCLOUD_ENV = {"CLOUDSDK_CORE_DISABLE_PROMPTS": "1"}
-# The order kinds are chosen in, and the kinds' names in the summary.
+# The order kinds are chosen in, and the kinds' names in the summary; the
+# weights files (WEIGHTS) are charged between alternates and slots.
 PRIORITY = (P.ANSWERS, P.ALTS, P.SLOTS, P.VARIANTS, P.MESSAGES)
 # Kinds stored one directory deeper on disk (object_path), each new directory a block.
 NESTED_KINDS = (P.VARIANTS, P.ALTS)
@@ -509,14 +517,24 @@ class Fetcher:
         result.commit = max(answers, key=lambda c: (len(answers[c]), latest[c], c))
         return result
 
-    def _plan(self, confirmed: List[Tuple[str, int, str]], result: Fetched) -> Dict[str, List[Tuple[str, int, str]]]:
-        """What fits under max_bytes, by kind in PRIORITY order; the rest counted as left out."""
+    def _plan(self, confirmed: List[Tuple[str, int, str]], result: Fetched,
+              produced_by: Dict[str, Set[Tuple[str, str]]], counted: Dict[str, Dict[Tuple[str, str], int]],
+              ) -> Tuple[Dict[str, List[Tuple[str, int, str]]], Set[str]]:
+        """What fits under max_bytes, by kind in PRIORITY order with weights after alternates; the rest counted as left out.
+
+        Returns the objects chosen by kind and the keys whose weights file is
+        charged: each key with two or more chosen alternates, at the cost of
+        its file over all of them, which is never less than the file written
+        over the ones that arrive.
+        """
         by_kind: Dict[str, List[Tuple[str, int, str]]] = {kind: [] for kind in PRIORITY}
         for item in confirmed:
             by_kind[item[0].partition("/")[0]].append(item)
         chosen: Dict[str, List[Tuple[str, int, str]]] = {kind: [] for kind in PRIORITY}
         answers: Set[str] = set()
         contexts: Set[str] = set()
+        alternates_of: Dict[str, List[str]] = {}
+        weighed: Set[str] = set()
         used = 0
         for kind in PRIORITY:
             for name, size, target in by_kind[kind]:
@@ -536,29 +554,45 @@ class Fetcher:
                 key = P.answered_key(name)
                 if key is not None:
                     answers.add(key)
+                parts = P.alternate_parts(name)
+                if parts is not None:
+                    alternates_of.setdefault(parts[0], []).append(parts[1])
                 chosen[kind].append((name, size, target))
-        return chosen
+            if kind != P.ALTS:
+                continue
+            for fingerprint, names in sorted(alternates_of.items()):
+                if len(names) < 2:
+                    continue
+                cost = weights_cost(weights_of(fingerprint, names, produced_by, counted))
+                if used + cost > self.max_bytes:
+                    result.count(result.left_out, WEIGHTS)
+                    continue
+                used += cost
+                weighed.add(fingerprint)
+        return chosen, weighed
 
     def _write_weights(self, dest: str, produced_by: Dict[str, Set[Tuple[str, str]]],
                        counted: Dict[str, Dict[Tuple[str, str], int]], answers_of: Dict[str, List[str]],
-                       used: int, result: Fetched) -> None:
-        """A weights file (replay_cache.WEIGHTS_DIR) for every key two or more alternates arrived for, within the bound.
+                       weighed: Set[str], used: int, result: Fetched) -> int:
+        """A weights file (replay_cache.WEIGHTS_DIR) for every planned key two or more alternates arrived for, within the bound.
 
         A key with one answer has nothing to weigh. A file past the bound is
-        left out and counted: its key's answers then each weigh 1.
+        left out and counted: its key's answers then each weigh 1. Returns
+        the bytes used, these files included.
         """
         cache = replay_cache.AnswerCache(dest)
         for fingerprint, names in sorted(answers_of.items()):
-            if len(names) < 2:
+            if len(names) < 2 or fingerprint not in weighed:
                 continue
-            weights = {name: weight((fingerprint, name), produced_by, counted) for name in sorted(names)}
-            cost = disk_cost(len(json.dumps(weights, sort_keys=True)))
+            weights = weights_of(fingerprint, names, produced_by, counted)
+            cost = weights_cost(weights)
             if used + cost > self.max_bytes:
                 result.count(result.left_out, WEIGHTS)
                 continue
             if cache.save_weights(fingerprint, weights):
                 used += cost
                 result.count(result.by_kind, WEIGHTS)
+        return used
 
     def fetch(self, dest: str, runs_out: Optional[str] = None, night_out: Optional[str] = None) -> Fetched:
         result = Fetched()
@@ -655,7 +689,7 @@ class Fetcher:
                 else:
                     confirmed.setdefault(name, (name, UNKNOWN_SIZE, ""))
             result.objects = len(confirmed)
-            chosen = self._plan(list(confirmed.values()), result)
+            chosen, weighed = self._plan(list(confirmed.values()), result, produced_by, counted)
             prefix = P.cache_prefix(self.bucket, self.version)
             used = 0
             contexts: Set[str] = set()
@@ -663,6 +697,9 @@ class Fetcher:
             # Each key's alternates that arrived, for its weights file.
             answers_of: Dict[str, List[str]] = {}
             for kind in PRIORITY:
+                if kind == P.SLOTS:
+                    # Right after the alternates, before anything below them can take the room.
+                    used = self._write_weights(dest, produced_by, counted, answers_of, weighed, used, result)
                 if not chosen[kind]:
                     continue
                 into = os.path.join(stage, kind)
@@ -697,7 +734,6 @@ class Fetcher:
                     result.downloaded += 1
                     result.bytes += size
                     result.count(result.by_kind, kind)
-            self._write_weights(dest, produced_by, counted, answers_of, used, result)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
         result.night_builds, result.night_commit_builds, _ = newest_night(started, commits)
@@ -726,6 +762,17 @@ def weight(pair: Tuple[str, str], produced_by: Dict[str, Set[Tuple[str, str]]],
     """
     return sum(counted.get(build, {}).get(pair, 1)
                for build, pairs in sorted(produced_by.items()) if pair in pairs)
+
+
+def weights_of(fingerprint: str, names: Sequence[str], produced_by: Dict[str, Set[Tuple[str, str]]],
+               counted: Dict[str, Dict[Tuple[str, str], int]]) -> Dict[str, int]:
+    """A key's weights file content: each named alternate's weight()."""
+    return {name: weight((fingerprint, name), produced_by, counted) for name in sorted(names)}
+
+
+def weights_cost(weights: Dict[str, int]) -> int:
+    """What a weights file takes on disk, written as replay_cache.AnswerCache.save_weights writes it."""
+    return disk_cost(len(json.dumps(weights, sort_keys=True).encode(TEXT_ENCODING)))
 
 
 def answers_arrived(dest: str) -> bool:
