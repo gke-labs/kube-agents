@@ -237,7 +237,9 @@ def test_the_write_paths_are_forbidden():
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py push',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr create --title t --body-file /tmp/b.md',
         "python3 /opt/data/profiles/platform/skills/version-control/scripts/vcs.py proposal open --title t",
-        # argparse takes `--title` as `--title=t` and by any unambiguous prefix (`--ti` and up).
+        # argparse takes `--title` as `--title=t` and by any unambiguous prefix; `--t` counts too,
+        # since only create's `--target` makes it ambiguous today.
+        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py proposal create --t=t',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py mr create --repo acme/infra --title=t',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py proposal open --ti t',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr open --titl=t --draft',
