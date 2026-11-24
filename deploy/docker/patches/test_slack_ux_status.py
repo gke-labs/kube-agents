@@ -99,6 +99,10 @@ TEAM = "T1"
 PLAN_TS = "222.000"
 PHRASE = "is thinking..."
 FLAG_OFF_VALUES = ("", "0", "false")
+# How far past a timer's due time the stepped clock lands. A real clock reads
+# late, never early; a float sum that lands just short of the due time reads
+# early, and the runtime takes that for a hold that has not run out.
+STEP_LATENESS_SECONDS = 1e-9
 
 
 def _run(coro):
@@ -108,8 +112,9 @@ def _run(coro):
 class _SteppedClockLoop(asyncio.SelectorEventLoop):
     """An event loop that jumps its clock to the next timer instead of waiting for it.
 
-    The loop runs timers in the order of their due times and at exactly those
-    times on its own clock, however long the process stalls between them.
+    The loop runs timers in the order of their due times, each
+    :data:`STEP_LATENESS_SECONDS` after its due time on the loop's own clock,
+    however long the process stalls between them.
     """
 
     def __init__(self):
@@ -120,7 +125,7 @@ class _SteppedClockLoop(asyncio.SelectorEventLoop):
         def step(timeout=None):
             # A timeout is the loop's wait for its next timer: take it at once.
             if timeout:
-                self._clock += timeout
+                self._clock += timeout + STEP_LATENESS_SECONDS
                 timeout = 0
             return wait(timeout)
 
@@ -131,7 +136,7 @@ class _SteppedClockLoop(asyncio.SelectorEventLoop):
 
 
 def _run_on_stepped_clock(coro):
-    """Run ``coro`` with the loop's timers and the runtime's ``time.monotonic`` on one stepped clock."""
+    """Run ``coro`` with the loop's timers and ``time.monotonic``, which the runtime reads, on one stepped clock."""
     loop = _SteppedClockLoop()
     try:
         with mock.patch.object(runtime.time, "monotonic", loop.time):
@@ -1727,8 +1732,8 @@ class PlanTest(_RuntimeCase):
     def test_a_card_answered_beside_a_newer_plan_ends_on_its_own_timer(self):
         # The answered plan is armed well after the newer plan, so the newer
         # plan's lapse is not what ends its processing. The loop's timers and
-        # the runtime's time.monotonic read one stepped clock, so each lapse
-        # runs at its due time and no wall-clock margin decides the order.
+        # the time.monotonic the runtime reads are one stepped clock, so each
+        # lapse runs when it is due and no wall-clock margin decides the order.
         hold = 0.5
 
         async def scenario(adapter):
