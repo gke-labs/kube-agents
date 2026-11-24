@@ -1,0 +1,74 @@
+package workeradapter
+
+import "strings"
+
+// A harness that runs in the adapter's process (rather than as its own
+// subprocess) starts the processes a turn's tools run, such as a shell
+// command or an MCP stdio server, from the adapter's own environment. Those
+// children need the broker-routed tools' variables (CREDENTIAL_PROXY_*,
+// which carry only the task's own token) but never the adapter's model,
+// provider or bus credentials. withheldFromToolChildren names what must not
+// reach them; an in-process harness passes the result to its own withhold
+// list, and toolChildEnv strips the same from an environment it builds.
+
+// withheldPrefixes are variable name prefixes whose every variable is a
+// model, provider or bus credential or endpoint.
+var withheldPrefixes = []string{
+	"ANTHROPIC_", // the model gateway: key, auth token, base URL
+	"GOOGLE_",    // Google credentials and endpoints, GOOGLE_GEMINI_BASE_URL among them
+	"GEMINI_",    // GEMINI_API_KEY
+	"OPENAI_",    // OPENAI_API_KEY, OPENAI_BASE_URL
+	"NATS_",      // the bus: URL, user, password
+	"A2A_BUS_",   // the bus token file
+	"AGY_LLM_",   // a gateway URL for a model client
+}
+
+// withheldNames are single variables withheld besides the prefixes.
+var withheldNames = []string{
+	"LITELLM_MASTER_KEY",
+	"LITELLM_API_KEY",
+	"A2A_LIVE_GATEWAY_PASSWORD",
+}
+
+// withheld reports whether a turn's tool children must not see the
+// variable name.
+func withheld(name string) bool {
+	for _, p := range withheldPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	for _, n := range withheldNames {
+		if name == n {
+			return true
+		}
+	}
+	return false
+}
+
+// withheldFromToolChildren is the names in env (KEY=value entries) that a
+// turn's tool children must not see, for an in-process harness's withhold
+// list.
+func withheldFromToolChildren(env []string) []string {
+	var out []string
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if withheld(name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// toolChildEnv is env without the variables a turn's tool children must not
+// see.
+func toolChildEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if !withheld(name) {
+			out = append(out, kv)
+		}
+	}
+	return out
+}

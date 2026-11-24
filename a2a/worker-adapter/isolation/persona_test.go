@@ -1,0 +1,123 @@
+package isolation
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// otherUID and otherGID stand for agy's user when the test's own user
+// renders the persona: neither owns anything the test creates.
+const otherUID, otherGID = 4242, 4242
+
+// personaDir is a rendered persona owned by the test's user: rules files
+// and a skill, read-only to everyone.
+func personaDir(t *testing.T) string {
+	t.Helper()
+	d := tempDir(t)
+	write(t, filepath.Join(d, "AGENTS.md"), "be careful")
+	write(t, filepath.Join(d, "GEMINI.md"), "be careful")
+	write(t, filepath.Join(d, "skills", "triage", "SKILL.md"), "---\nname: triage\n---\n")
+	lockDown(t, d)
+	return d
+}
+
+// lockDown removes every write bit under d.
+func lockDown(t *testing.T, d string) {
+	t.Helper()
+	_ = filepath.Walk(d, func(p string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0o444)
+		if fi.IsDir() {
+			mode = 0o555
+		}
+		return os.Chmod(p, mode)
+	})
+}
+
+func TestCheckPersonaDirAcceptsAReadOnlyPersona(t *testing.T) {
+	if err := CheckPersonaDir(personaDir(t), otherUID, otherGID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckPersonaDirFailsClosed(t *testing.T) {
+	cases := map[string]struct {
+		mutate   func(t *testing.T, d string)
+		uid, gid int
+		want     string
+	}{
+		// The owner can chmod, so an entry agy owns is writable even with
+		// no write bit set.
+		"the dir owned by agy, no write bits": {
+			mutate: func(t *testing.T, d string) {},
+			uid:    os.Getuid(), gid: os.Getgid(), want: "writable",
+		},
+		// agy's supplementary groups are unknown here, so any group write
+		// bit fails, whatever gid is passed.
+		"the dir group-writable": {
+			mutate: func(t *testing.T, d string) { must(t, os.Chmod(d, 0o575)) },
+			uid:    otherUID, gid: otherGID, want: "writable",
+		},
+		"the dir writable by others": {
+			mutate: func(t *testing.T, d string) { must(t, os.Chmod(d, 0o557)) },
+			uid:    otherUID, gid: otherGID, want: "writable",
+		},
+		"a skill file writable by others": {
+			mutate: func(t *testing.T, d string) {
+				must(t, os.Chmod(filepath.Join(d, "skills", "triage", "SKILL.md"), 0o446))
+			},
+			uid: otherUID, gid: otherGID, want: "writable",
+		},
+		"a hooks file beside the persona": {
+			mutate: func(t *testing.T, d string) {
+				must(t, os.Chmod(d, 0o755))
+				write(t, filepath.Join(d, "hooks.json"), "{}")
+				lockDown(t, d)
+			},
+			uid: otherUID, gid: otherGID, want: "not a persona entry",
+		},
+		"a symlink under skills": {
+			mutate: func(t *testing.T, d string) {
+				sk := filepath.Join(d, "skills")
+				must(t, os.Chmod(sk, 0o755))
+				must(t, os.Symlink("/etc/passwd", filepath.Join(sk, "link")))
+				must(t, os.Chmod(sk, 0o555))
+			},
+			uid: otherUID, gid: otherGID, want: "neither a directory nor a regular file",
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := personaDir(t)
+			c.mutate(t, d)
+			err := CheckPersonaDir(d, c.uid, c.gid)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v; want one saying %q", err, c.want)
+			}
+		})
+	}
+	for name, dir := range map[string]string{
+		"empty":    "",
+		"relative": "persona",
+		"missing":  filepath.Join(tempDir(t), "nope"),
+	} {
+		if err := CheckPersonaDir(dir, otherUID, otherGID); err == nil {
+			t.Errorf("%s dir: accepted", name)
+		}
+	}
+	f := filepath.Join(tempDir(t), "f")
+	write(t, f, "")
+	if err := CheckPersonaDir(f, otherUID, otherGID); err == nil {
+		t.Error("a file accepted as the persona dir")
+	}
+	real := personaDir(t)
+	link := filepath.Join(tempDir(t), "persona")
+	must(t, os.Symlink(real, link))
+	if err := CheckPersonaDir(link, otherUID, otherGID); err == nil {
+		t.Error("a symlinked persona dir accepted")
+	}
+}
