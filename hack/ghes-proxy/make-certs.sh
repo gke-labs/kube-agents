@@ -28,6 +28,13 @@
 # no key can be committed. The certificates expire after [days] (default 30).
 set -euo pipefail
 
+# The key of the CA and of the server: P-256, with the curve named in the key.
+# OpenSSL names the curve by default. LibreSSL, the openssl of macOS, writes the
+# curve's parameters in full, and an OpenSSL 3 client refuses a certificate with
+# such a key. ec_param_enc comes after ec_paramgen_curve: it changes the group
+# that the curve option makes, and before it there is none.
+readonly EC_KEY_OPTIONS=(-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -pkeyopt ec_param_enc:named_curve)
+
 usage() {
   echo "usage: $0 <hostname> <out-dir> [days]" >&2
   exit 2
@@ -83,7 +90,7 @@ ossl() {
 }
 
 ossl req -x509 -new -nodes -sha256 -days "$days" \
-  -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  "${EC_KEY_OPTIONS[@]}" \
   -keyout "$work/ca.key" -out "$work/ca.crt" \
   -subj "/CN=ghes-proxy eval CA for $host" \
   -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
@@ -91,7 +98,7 @@ ossl req -x509 -new -nodes -sha256 -days "$days" \
   -addext "subjectKeyIdentifier=hash"
 
 ossl req -new -nodes -sha256 \
-  -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  "${EC_KEY_OPTIONS[@]}" \
   -keyout "$work/tls.key" -out "$work/tls.csr" \
   -subj "/CN=$host"
 

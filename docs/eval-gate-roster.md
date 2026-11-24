@@ -921,8 +921,9 @@ The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
 project's GitLab repository instead of its GitHub one, in a run of its own beside the GitHub
 presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 `presubmit-cases.txt`: registered cases that grade the forge, a `pull_request_opened` or
-`pull_request_diff_contains` check (a merge request) or a `ledger_issue_contains` check (a ledger
-issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
+`pull_request_diff_contains` check (a merge request), a `ledger_issue_contains` check (a ledger
+issue) or a `forge_issue_state` check (the issue the reply names), since a chat probe passes the
+same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
 (`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode weekly job, around the

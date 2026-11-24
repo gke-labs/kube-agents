@@ -241,6 +241,10 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `tiers.membership[].backend` | `string` | yes |  | one of `gchat`, `slack`, `discord`, `a2a-google`, `a2a-entra` | Backend is the surface the person writes from: one whose requester is one verified person. The a2a door's eval class isn't one: its callers name themselves under a shared token; its Google and Entra sign-in classes are. |
 | `tiers.membership[].user` | `string` | yes |  | min length `1`; max length `128`; pattern `^[^,=\s]+$` | User is the person's id on that backend: their email on Google Chat (compared without case) and on a2a-google (as their Google token carries it), their Entra object id on a2a-entra (as their Entra token carries it), their user id on Slack or Discord. |
 | `tiers.membership[].tier` | `string` | yes |  | max length `63`; pattern `^[a-z0-9]([-a-z0-9]*[a-z0-9])?$` | Tier is the name of an interactive-mode Tier. |
+| `schedules` | `object` | no |  |  | Schedules adjusts the built-in AgentSchedules the operator renders. |
+| `schedules.overrides` | `[]object` | no |  | max items `64` | Overrides sets spec.suspend on built-in schedules, keyed on the schedule's rendered name: a canary (&lt;name&gt;-canary) and its live row are separate entries, so a suspend never carries from one phase to the other. An entry naming no built-in is reported on the PlatformAgent's BuiltinSchedules condition and otherwise ignored. A run-now-only built-in, such as onboarding, takes only suspend: true, which stops the operator from starting its run; suspend: false is refused and reported, since it would put the schedule on its nominal cron. |
+| `schedules.overrides[].name` | `string` | yes |  | min length `1`; max length `63` | Name is the built-in schedule's rendered name. |
+| `schedules.overrides[].suspend` | `boolean` | yes |  |  | Suspend is the value the operator writes to the schedule's spec.suspend. |
 
 ## Status
 

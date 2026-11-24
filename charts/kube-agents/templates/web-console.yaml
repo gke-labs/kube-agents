@@ -302,7 +302,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: web-console
-    app.kubernetes.io/instance: {{ .Release.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
 automountServiceAccountToken: false
 ---
@@ -312,7 +311,6 @@ metadata:
   name: {{ .Release.Name }}-web-console-environment
   labels:
     app.kubernetes.io/name: web-console
-    app.kubernetes.io/instance: {{ .Release.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
@@ -331,7 +329,6 @@ metadata:
   name: {{ .Release.Name }}-web-console-environment
   labels:
     app.kubernetes.io/name: web-console
-    app.kubernetes.io/instance: {{ .Release.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -349,7 +346,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: web-console
-    app.kubernetes.io/instance: {{ .Release.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["kubeagents.x-k8s.io"]
@@ -367,7 +363,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: web-console
-    app.kubernetes.io/instance: {{ .Release.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
