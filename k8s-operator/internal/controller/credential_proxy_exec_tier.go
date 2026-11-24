@@ -174,6 +174,10 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// a subscription change must not roll every exec replica.
 	a2aGoogleChatSubscriptionEnvVar:      true,
 	credentialProxyA2AChatAudienceEnvVar: true,
+	// The Teams inbound receiver's audience: the intake is the stateful
+	// broker's route, so an exec pod confers no teams-inbound role. Its
+	// callers binding stays, holding the receiver's account to its audience.
+	credentialProxyTeamsInboundAudienceEnvVar: true,
 	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
 	// allowed callers, the A2A gateway among them on every install, and
 	// the binding is what holds that account to the a2a-chat audience. The
@@ -500,7 +504,7 @@ func buildCredentialProxyExecTierPDB(agent *agentv1alpha1.PlatformAgent) *policy
 }
 
 // buildCredentialProxyExecTierNetworkPolicy admits the tier's callers (§3.3):
-// the sandbox, the session pods under the cluster-view flag, and the profile
+// the sandbox, the session pods under the session pods' cluster view, and the profile
 // namespace while there is a profile caller, on the credentialed port; and the
 // metrics port to Managed Prometheus and, where it is set, the operator. No
 // gateway and no agent pod: neither calls /v1/exec.

@@ -4983,8 +4983,9 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		envVars = append(envVars, corev1.EnvVar{Name: watcherSubscriptionEnvVar, Value: watcherPubsubSubscription(agent)})
 	}
 	if a2aSessionClusterViewEnabled(agent) {
-		// The session pods' audience. Rendered only with the flag, so a
-		// broker on an install without it has no session role to confer
+		// The session pods' audience. Rendered only under the session pods'
+		// cluster view (the session route's default, or the operator's flag),
+		// so a broker on an install without it has no session role to confer
 		// and a stray session token is "another audience", 401.
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience},
@@ -5114,6 +5115,10 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 			if teams.TenantId != "" {
 				envVars = append(envVars, corev1.EnvVar{Name: "TEAMS_TENANT_ID", Value: teams.TenantId})
 			}
+			// The inbound receiver's audience and caller binding, while it runs
+			// (platformagent_teams_inbound.go): the one caller of the Teams
+			// intake that is not a chat consumer.
+			envVars = append(envVars, teamsInboundBrokerEnv(agent)...)
 		}
 	}
 	// Rendered here, in the broker's managed env and nowhere else: the broker
@@ -5212,6 +5217,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// the a2a-chat role. Rendered only while a relay is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
+		// The Teams inbound receiver's audience and callers: one that could
+		// set them would choose who may post onto the Teams queue.
+		credentialProxyTeamsInboundAudienceEnvVar,
+		credentialProxyTeamsInboundCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
 		// (a2a_report_reader.go, a2aReportsEnvNames).
 		credentialProxyA2AReportsAudienceEnvVar,

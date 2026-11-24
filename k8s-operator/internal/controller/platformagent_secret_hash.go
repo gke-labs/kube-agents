@@ -46,7 +46,7 @@ import (
 // indefinitely, with no sign in the CR or the Deployment that it had happened
 // (#971, finding 5).
 //
-// Four of the operator's pods read credentials that way, and three are
+// Five of the operator's pods read credentials that way, and four are
 // stamped:
 //
 //   - the gateway, for the API_SERVER_KEY and SESSION_KV_API_KEY keys of
@@ -62,8 +62,11 @@ import (
 //     Slack-armed install reads here instead of on the credential proxy) and a
 //     door's bearer token. Stamped on its Secret refs generally rather than
 //     for Slack alone: Discord's token was never covered either.
+//   - the Teams inbound receiver, when enabled, for the bot's app id, which it
+//     reads from the Teams Secret once at boot as the audience every token
+//     must name (platformagent_teams_inbound.go).
 //
-// The fourth, the mode-next A2A callout, reads NATS_PASSWORD, A2A_ISSUER_SEED
+// The fifth, the mode-next A2A callout, reads NATS_PASSWORD, A2A_ISSUER_SEED
 // and A2A_XKEY_SEED through SecretKeyRef and is not stamped: rotating one of
 // those needs a rollout restart of the callout Deployment.
 //

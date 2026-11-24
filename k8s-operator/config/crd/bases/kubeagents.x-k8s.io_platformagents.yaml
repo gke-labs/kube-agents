@@ -10185,8 +10185,10 @@ spec:
                             and keeps its history, and on any bus a new value on the
                             kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
                             rendered width. On an existing install, until the operator has read the bus's
-                            width once, the provision Job waits. On `platform` none of this
-                            applies.
+                            width once, the provision Job waits. On the session route the session
+                            pods also get the read-only cluster view by default; the operator's
+                            A2A_SESSION_CLUSTER_VIEW overrides it ("false" keeps it off). On
+                            `platform` none of this applies.
                           enum:
                             - session
                             - platform
@@ -11391,6 +11393,27 @@ spec:
                             HomeChannelName is the human-readable name for
                             the home channel.
                           type: string
+                        inbound:
+                          description: |-
+                            Inbound is the receiver for the messages Microsoft delivers to the
+                            bot. Without it the bot can post to Teams, but a message typed in
+                            Teams does not reach the agent: Bot Framework delivers each message
+                            by an HTTPS request to the address registered for the bot, and no
+                            component of the install listens for it. With it the operator runs a
+                            small pod that verifies Microsoft's signed token on each request,
+                            pins the tenant, and hands the message to the credential broker's
+                            Teams queue; the admin exposes its Service with their own Ingress and
+                            TLS certificate and registers that address with the bot. It needs
+                            tenantId. The receiver holds no credential of the install's own.
+                          properties:
+                            enabled:
+                              default: false
+                              description: |-
+                                Enabled runs the receiver. Off by default: the install then accepts
+                                no connection from the internet, as it did before the receiver
+                                existed.
+                              type: boolean
+                          type: object
                         tenantId:
                           description:
                             TenantId is the Microsoft Entra ID Tenant ID
@@ -11404,6 +11427,14 @@ spec:
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef)
                             && has(self.appPasswordSecretRef))"
+                        - message:
+                            "integration.teams.enabled and a tenantId in GUID form
+                            are required when integration.teams.inbound is enabled: the
+                            receiver serves one tenant of one enabled integration"
+                          rule:
+                            "!has(self.inbound) || !has(self.inbound.enabled) || self.inbound.enabled
+                            == false || (has(self.enabled) && self.enabled == true &&
+                            has(self.tenantId) && self.tenantId.matches('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'))"
                   type: object
                   x-kubernetes-validations:
                     - message:

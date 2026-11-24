@@ -877,7 +877,7 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // the callers that have a reason to: the sandbox, whose wrapped CLIs are the
 // proxy's purpose; the gateway, which pulls chat events from the relay hosted
 // here; when the next stack takes Google Chat, the A2A gateway, which pulls the
-// same relay's A2A routes; and, under the cluster-view flag, the session pods.
+// same relay's A2A routes; and, under the session pods' cluster view, the session pods.
 // TokenReview already rejects a caller this pod does not serve; this is the
 // layer that keeps such a caller from opening the connection.
 //
@@ -892,7 +892,7 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // broker. buildAgentEgressNetworkPolicy enumerates the agent Pod's egress and
 // deliberately leaves this one alone.
 //
-// The session-pod peer admitted under the cluster-view flag is the bare
+// The session-pod peer admitted under the session pods' cluster view is the bare
 // part-of/component pair, because the spawner stamps no instance label. The
 // webhook admits one PlatformAgent per cluster, so no other agent's session
 // pods share this namespace; were that rule relaxed, this fence would admit
@@ -914,7 +914,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
 	})
 	if a2aSessionClusterViewEnabled(agent) {
-		// The session pods, under the cluster-view flag: the same selector
+		// The session pods, under the session pods' cluster view: the same selector
 		// the session fence and the bus fence name, on the credentialed port
 		// only. TokenReview, the session audience and the session-callers
 		// binding keep this peer to the session role; this is the layer
@@ -928,6 +928,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 	// beside their place on allowedBrokerCallers (scopeBrokerPeers).
 	callers = append(callers, scopeBrokerPeers(agent)...)
 	callers = append(callers, a2aCuratorBrokerPeers(agent)...)
+	callers = append(callers, teamsInboundBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},

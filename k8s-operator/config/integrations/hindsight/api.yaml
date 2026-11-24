@@ -95,10 +95,10 @@ spec:
               value: http://inference-gateway/v1
             - name: HINDSIGHT_API_LLM_MODEL
               value: model-default
-            # LiteLLM runs with no master key — the agents authenticate to it the
-            # same way, with the literal string "none" (deploy/shared/defaults/
-            # config.yaml). The client library insists on a non-empty value, so
-            # this is a placeholder rather than a credential.
+            # A placeholder rather than a credential, as the agents send
+            # (deploy/shared/defaults/config.yaml): the client library insists on
+            # a non-empty value, and the gateway admits "none" as a keyless caller
+            # (config/integrations/litellm/base/litellm_caller_auth.py).
             - name: HINDSIGHT_API_LLM_API_KEY
               value: none
             # Omit `temperature` from every LLM call rather than send a value.
