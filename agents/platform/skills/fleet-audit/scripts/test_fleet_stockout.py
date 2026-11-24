@@ -221,6 +221,34 @@ NAP_ENTRY = {
     },
 }
 
+# The `errorMsg` arm for a node pool whose named reservation does not exist:
+# the first of the two entries, 5 minutes apart, that a throwaway cluster (GKE
+# 1.35.8-gke.1796000) logged on 2026-11-18 (capture
+# `out-a/res-missing.ca-visibility.json`), with the project replaced. The
+# capture `out-b/res-other-zone.ca-visibility.json` of that day has the same
+# shape for a reservation that exists only in another zone.
+RESERVATION_NOT_FOUND_GROUP = "gke-ws2-e1r-reservation-a-res-missing-01bf9e69-grp"
+RESERVATION_NOT_FOUND_GROUP_URL = (
+    f"https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-a/instanceGroups/{RESERVATION_NOT_FOUND_GROUP}"
+)
+RESERVATION_NOT_FOUND_ENTRY = {
+    "timestamp": "2026-11-18T16:37:13.235984554Z",
+    "jsonPayload": {
+        "resultInfo": {
+            "measureTime": "1795019831",
+            "results": [
+                {
+                    "eventId": "d4c0497e-139a-4816-9c18-2205c77ef99b",
+                    "errorMsg": {
+                        "messageId": "scale.up.error.reservation.not.found",
+                        "parameters": [RESERVATION_NOT_FOUND_GROUP_URL],
+                    },
+                }
+            ],
+        }
+    },
+}
+
 # A healthy tick. The SOP's log filter does not return it; it carries neither
 # arm, so an entry like it that arrives anyway must count for nothing.
 HEALTHY_ENTRY = {"timestamp": "2026-08-14T02:00:00Z", "jsonPayload": {"status": "ok"}}
@@ -1854,6 +1882,33 @@ class AutoscalerVisibilityTest(unittest.TestCase):
                 [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([entry]))
                 self.assertEqual(hit["object"], f"ScaleUpError/{message_id}")
                 self.assertNotIn("needs_triage", hit)
+
+    def test_a_reservation_that_was_not_found_is_read(self):
+        """The two entries of the capture: one id, one instance group."""
+        second = json.loads(json.dumps(RESERVATION_NOT_FOUND_ENTRY))
+        second["timestamp"] = "2026-11-18T16:42:26.385377717Z"
+        found = fs.autoscaler_message_ids([RESERVATION_NOT_FOUND_ENTRY, second, HEALTHY_ENTRY])
+        self.assertEqual(set(found), {fs.AUTOSCALER_RESERVATION_NOT_FOUND})
+        self.assertEqual(found[fs.AUTOSCALER_RESERVATION_NOT_FOUND]["count"], 2)
+        [hit] = fs.check_autoscaler_out_of_resources(found)
+        self.assertEqual(hit["object"], "ScaleUpError/scale.up.error.reservation.not.found")
+        self.assertIn("2 occurrences", hit["excerpt"])
+        self.assertIn("2026-11-18T16:37:13 .. 2026-11-18T16:42:26", hit["excerpt"])
+        self.assertIn(f"first affected: {RESERVATION_NOT_FOUND_GROUP}", hit["excerpt"])
+
+    def test_a_reservation_that_was_not_found_has_its_own_impact_and_marker(self):
+        """The check's own sentence is about supply, quota and pod IPs. Each
+        fix creates billed capacity or replaces the node pool, as for
+        §3.10(d), so the sweep opens no pull request, class-backed or not."""
+        for groups in (frozenset(), frozenset({RESERVATION_NOT_FOUND_GROUP})):
+            with self.subTest(groups=groups):
+                [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([RESERVATION_NOT_FOUND_ENTRY]), groups)
+                self.assertEqual(hit["impact"], fs.RESERVATION_NOT_FOUND_IMPACT)
+                self.assertEqual(hit["needs_triage"], fs.RESERVED_POOL_TRIAGE)
+
+    def test_the_other_ids_keep_the_check_s_own_impact(self):
+        [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([ERROR_MSG_ENTRY]))
+        self.assertNotIn("impact", hit)
 
 
 class SpotScarcityTest(unittest.TestCase):
@@ -4114,13 +4169,38 @@ class ReservedPoolTest(unittest.TestCase):
         zones = {project: fs.reservation_zones([r for r in reservations if f"/projects/{project}/" in r["zone"]]) for project in read}
         fs.file_reserved_pools(entry, zones, frozenset(swept))
         self.assertNotIn(fs.RESERVED_POOLS_KEY, entry)
+        self.assertNotIn(fs.RESERVATION_SIGN_GROUPS_KEY, entry)
         return entry
+
+    SIGN_SLUG = "autoscaler-out-of-resources"
+    SIGN_OBJECT = "ScaleUpError/scale.up.error.reservation.not.found"
+
+    @staticmethod
+    def pool_with_group(name, reservation, **config):
+        """A reserved pool with the instance group that the recorded autoscaler
+        entry names."""
+        return {**reserved_node_pool(name, reservation, **config), "instanceGroupUrls": [RESERVATION_NOT_FOUND_GROUP_URL]}
+
+    def sign(self, groups=(RESERVATION_NOT_FOUND_GROUP,)):
+        """What `collect_cluster` leaves on an entry whose autoscaler log has
+        the reservation-not-found sign for `groups`: the §3.11 candidate and
+        the groups."""
+        return {
+            "candidates": [fs._emit(self.SIGN_SLUG, {"object": self.SIGN_OBJECT, "excerpt": "x"})],
+            fs.RESERVATION_SIGN_GROUPS_KEY: list(groups),
+        }
+
+    def checks_filed(self, entry):
+        return [(c["check"], c["object"]) for c in entry["candidates"]]
 
     def test_the_pool_shape_gke_returns(self):
         self.assertEqual(
             fs.reserved_pool(reserved_node_pool("res-pool", "r1", zones=("us-central1-c", "us-central1-a")), "acme"),
-            {"pool": "res-pool", "zones": ["us-central1-a", "us-central1-c"], "reservations": [("acme", "r1")]},
+            {"pool": "res-pool", "zones": ["us-central1-a", "us-central1-c"], "reservations": [("acme", "r1")], "groups": []},
         )
+
+    def test_the_pool_s_instance_groups_are_named_without_their_url(self):
+        self.assertEqual(fs.reserved_pool(self.pool_with_group("res-pool", "r1"), "acme")["groups"], [RESERVATION_NOT_FOUND_GROUP])
 
     def test_a_zero_node_pool_with_no_autoscaling_is_reserved_too(self):
         """The shape the seeded fixture plants: GKE omits `autoscaling` and
@@ -4274,6 +4354,56 @@ class ReservedPoolTest(unittest.TestCase):
         self.assertEqual(entry["commands"], [])
         self.assertTrue(entry["limitations"].startswith("an earlier limitation; reservation-mismatch-risk could not be judged: "))
 
+    def test_the_sign_for_a_pool_that_this_arm_filed_is_not_a_second_finding(self):
+        """One fault, one finding: the pool's finding already says that the
+        autoscaler reports the sign."""
+        entry = self.filed(self.pool_with_group("res-missing", "no-such-reservation"), **self.sign())
+        self.assertEqual(self.checks_filed(entry), [(self.SLUG, "NodePool/res-missing")])
+
+    def test_the_sign_stays_when_this_arm_filed_nothing_for_its_group(self):
+        present = [listed_reservation("r1", "us-central1-c")]
+        for why, pools, reservations, groups in (
+            ("no pool consumes only a named reservation", [], [], [RESERVATION_NOT_FOUND_GROUP]),
+            ("the reservation is in the pool's zone now", [self.pool_with_group("res-pool", "r1")], present, [RESERVATION_NOT_FOUND_GROUP]),
+            ("the owner project is outside the run", [self.pool_with_group("shared", "projects/host/reservations/r1")], [], [RESERVATION_NOT_FOUND_GROUP]),
+            ("the pool that was filed has another group", [reserved_node_pool("res-missing", "no-such-reservation")], [], [RESERVATION_NOT_FOUND_GROUP]),
+            ("a second group is of no filed pool", [self.pool_with_group("res-missing", "no-such-reservation")], [], [RESERVATION_NOT_FOUND_GROUP, "other-grp"]),
+            ("the sign named no group", [self.pool_with_group("res-missing", "no-such-reservation")], [], []),
+        ):
+            with self.subTest(why=why):
+                entry = self.filed(*pools, reservations=reservations, **self.sign(groups))
+                self.assertIn((self.SIGN_SLUG, self.SIGN_OBJECT), self.checks_filed(entry))
+
+    def test_another_id_of_the_autoscaler_check_is_never_removed(self):
+        entry = self.filed(
+            self.pool_with_group("res-missing", "no-such-reservation"),
+            candidates=[fs._emit(self.SIGN_SLUG, {"object": "ScaleUpError/scale.up.error.out.of.resources", "excerpt": "x"})],
+            **{fs.RESERVATION_SIGN_GROUPS_KEY: [RESERVATION_NOT_FOUND_GROUP]},
+        )
+        self.assertEqual(self.checks_filed(entry), [(self.SIGN_SLUG, "ScaleUpError/scale.up.error.out.of.resources"), (self.SLUG, "NodePool/res-missing")])
+
+    def test_collect_cluster_hands_the_groups_of_the_sign_to_the_fleet(self):
+        pool = self.pool_with_group("res-missing", "no-such-reservation")
+        entry = CollectClusterTest.run_with(self, pools=[pool], log_entries=[RESERVATION_NOT_FOUND_ENTRY])
+        self.assertEqual(entry[fs.RESERVATION_SIGN_GROUPS_KEY], [RESERVATION_NOT_FOUND_GROUP])
+        self.assertEqual(entry[fs.RESERVED_POOLS_KEY][0]["groups"], [RESERVATION_NOT_FOUND_GROUP])
+        self.assertIn((self.SIGN_SLUG, self.SIGN_OBJECT), self.checks_filed(entry))
+        clean = CollectClusterTest.run_with(self, pools=[pool], log_entries=[ERROR_MSG_ENTRY])
+        self.assertNotIn(fs.RESERVATION_SIGN_GROUPS_KEY, clean)
+
+    def test_the_fleet_files_one_finding_for_one_missing_reservation(self):
+        manifest, cluster = self.fleet(self.pool_with_group("res-missing", "no-such-reservation"), log_entries=[RESERVATION_NOT_FOUND_ENTRY])
+        self.assertEqual([c for c in self.checks_filed(cluster) if c[0] in (self.SLUG, self.SIGN_SLUG)], [(self.SLUG, "NodePool/res-missing")])
+        # The log read ran and stays recorded.
+        self.assertIn(self.SIGN_SLUG, {c["check"] for c in cluster["commands"]})
+        self.assertNotIn(fs.RESERVATION_SIGN_GROUPS_KEY, json.dumps(manifest))
+
+    def test_the_fleet_keeps_the_sign_for_a_pool_that_this_arm_does_not_flag(self):
+        """§3.10 does not flag a non-production pool; the failed scale-up is
+        still in the log."""
+        _, cluster = self.fleet(self.pool_with_group("dev-pool", "no-such-reservation"), log_entries=[RESERVATION_NOT_FOUND_ENTRY])
+        self.assertEqual([c for c in self.checks_filed(cluster) if c[0] in (self.SLUG, self.SIGN_SLUG)], [(self.SIGN_SLUG, self.SIGN_OBJECT)])
+
     def test_an_entry_with_no_reserved_pool_is_left_as_it_is(self):
         entry = {"name": "acme/us-central1/c1", "project": "acme", "outcome": "gate-failed", "error": "x"}
         fs.file_reserved_pools(entry, {}, frozenset({"acme"}))
@@ -4295,13 +4425,15 @@ class ReservedPoolTest(unittest.TestCase):
         # Stamped, since the slug's record is gone.
         self.assertIn("kubectl get computeclasses", candidate["command"])
 
-    def fleet(self, pool, *, reservations_rc=0, reservations=()):
+    def fleet(self, pool, *, reservations_rc=0, reservations=(), log_entries=None):
         """One project, one cluster whose listing carries `pool`."""
         listing = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": [pool]}])
 
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
                 return run_of(0, listing)
+            if argv[:3] == ["gcloud", "logging", "read"]:
+                return run_of(0, json.dumps(log_entries) if log_entries else "")
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
