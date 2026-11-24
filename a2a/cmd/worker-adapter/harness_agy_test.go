@@ -96,7 +96,7 @@ func TestAnAgyTurnRunsOnTheBuiltArgv(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "agy")
 	script := `#!/bin/sh
-want='-p= --input-format stream-json --output-format stream-json --print-timeout 28m50s --conversation conv-1'
+want='-p= --input-format stream-json --output-format stream-json --print-timeout 26m50s --conversation conv-1'
 [ "$*" = "$want" ] || { echo "argv: $*" >&2; exit 9; }
 read -r first || exit 8
 case "$first" in '{"event":"user"'*) ;; *) echo "stdin: $first" >&2; exit 7 ;; esac

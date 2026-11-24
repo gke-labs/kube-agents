@@ -14,16 +14,16 @@ import (
 )
 
 // TestAgysPrintTimeoutHasAFloor: a turn budget at or below the margin plus
-// the floor (120s), as in a test with a short deadline, gets the floor; the
+// the floor (240s), as in a test with a short deadline, gets the floor; the
 // adapter's own deadline may end such a turn first.
 func TestAgysPrintTimeoutHasAFloor(t *testing.T) {
 	for _, c := range []struct {
 		budget, want time.Duration
 	}{
-		{1790 * time.Second, 1730 * time.Second},
-		{121 * time.Second, 61 * time.Second},
-		{120 * time.Second, time.Minute},
-		{90 * time.Second, time.Minute},
+		{1790 * time.Second, 1610 * time.Second},
+		{241 * time.Second, 61 * time.Second},
+		{240 * time.Second, time.Minute},
+		{121 * time.Second, time.Minute},
 		{30 * time.Second, time.Minute},
 		{0, time.Minute},
 		{-time.Second, time.Minute},
@@ -46,7 +46,7 @@ func TestAgysTurnBudgetReplacesAnEarlierOne(t *testing.T) {
 		{"agy", "--print-timeout", "1h", "-p=", "--print-timeout=2h", "--debug"},
 	} {
 		got := d.WithTurnBudget(slices.Clone(in), 1790*time.Second)
-		want := []string{"agy", "-p=", "--debug", "--print-timeout", "28m50s"}
+		want := []string{"agy", "-p=", "--debug", "--print-timeout", "26m50s"}
 		if !slices.Equal(got, want) {
 			t.Errorf("WithTurnBudget(%q)\n got %q\nwant %q", in, got, want)
 		}

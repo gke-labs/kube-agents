@@ -298,12 +298,13 @@ const (
 	// print-timeout reason.
 	agyPrintTimeoutFlag = "--print-timeout"
 	// agyPrintTimeoutMargin is how far below the turn budget agy's own bound
-	// sits, so agy writes its result before the adapter's deadline. agy
-	// retries a failing model call five times, about 50s, before its ERROR
-	// result; a tighter margin turns a gateway error into a print-timeout.
-	agyPrintTimeoutMargin = 60 * time.Second
+	// sits, so agy writes its result before the adapter's deadline. Against
+	// a gateway that answers 503 every time, agy 1.5.13 retried for 147s
+	// (nine requests) before its ERROR result; a margin under that turns an
+	// upstream outage into a print-timeout. 180s leaves room above it.
+	agyPrintTimeoutMargin = 180 * time.Second
 	// agyMinPrintTimeout is the floor: a turn budget at or below the margin
-	// plus the floor (120s), as in tests with a short deadline, gets 60s,
+	// plus the floor (240s), as in tests with a short deadline, gets 60s,
 	// and there the adapter's own deadline may end the turn first.
 	agyMinPrintTimeout = 60 * time.Second
 )
