@@ -23,8 +23,8 @@ pull request.
 One rule needs more than PyYAML: on a case that no other rule faults, each check
 entry is read and loaded with the harness's own YAML reader and parser, which
 are in the bench package (`make test-bench-deps`). Where that package is not installed, as
-in the lint's job, or is another checkout's, the rule does not run and the CLI says so on its
-last line;
+in the lint's job, or is another checkout's, or has installed data behind
+`bench/pyproject.toml`, the rule does not run and the CLI says so on its last line;
 `bench/tests/test_case_entries_load.py` gates it in the job that installs the
 package.
 
@@ -44,12 +44,14 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import functools
+import importlib.metadata
 import importlib.util
 import ipaddress
 import json
 import pathlib
 import re
 import sys
+import tomllib
 from typing import Any
 
 import yaml
@@ -106,6 +108,29 @@ FIELD_CHECK_STALE = (
     "bench-case-check: the field check did NOT run: the bench package is installed, but behind the "
     "tree: this interpreter resolves it to {path}, not to this checkout's bench/. Install this "
     "checkout's with `make test-bench-deps` and run this again."
+)
+# An editable install resolves to this checkout's source after each pull, but two things are as
+# old as the install: the entry points that register this repository's check types, and the
+# installed devops-bench. After a pull that changes bench/pyproject.toml they are behind it, and
+# the rule would refuse an entry that a run loads.
+BENCH_PYPROJECT = BENCH_DIR / "pyproject.toml"
+BENCH_DISTRIBUTION = "kube-agents-bench"
+HARNESS_DISTRIBUTION = "devops-bench"
+VERIFIER_ENTRY_POINT_GROUP = "devops_bench.verifiers"
+# Where pip and uv record the commit of a package that is installed from a git URL (PEP 610).
+DIRECT_URL_FILE = "direct_url.json"
+HARNESS_PIN = re.compile(r"devops-bench\s*@\s*git\+\S+@([0-9a-f]{40})\s*$")
+NO_RECORDED_COMMIT = "no recorded commit"
+ENTRY_POINTS_BEHIND = "its installed entry points of the {group} group differ from bench/pyproject.toml for: {names}"
+# pip can keep the old commit of a git pin when the version did not change.
+HARNESS_BEHIND = (
+    "the installed devops-bench is at {installed}, and bench/pyproject.toml pins {pinned} (if the "
+    "install keeps the old commit, uninstall devops-bench first or use a new environment)"
+)
+PYPROJECT_UNREADABLE = "bench/pyproject.toml cannot be read ({error}), so the installed data cannot be compared with it"
+FIELD_CHECK_STALE_DATA = (
+    "bench-case-check: the field check did NOT run: the bench package is installed, but behind the "
+    "tree: {difference}. Install it again with `make test-bench-deps` and run this again."
 )
 # A run's record is never committed beside a case: a public file names the run
 # and its outcome, nothing from inside the record. The harness writes runs
@@ -820,10 +845,55 @@ GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
 
 
+def declared_bench_data() -> tuple[dict[str, str], str | None]:
+    """The check types that bench/pyproject.toml registers, each with its target, and the
+    devops-bench commit that it pins."""
+    project = tomllib.loads(BENCH_PYPROJECT.read_text(encoding="utf-8")).get("project", {})
+    pins = [match.group(1) for dependency in project.get("dependencies", []) if (match := HARNESS_PIN.match(dependency))]
+    return dict(project.get("entry-points", {}).get(VERIFIER_ENTRY_POINT_GROUP, {})), (pins[0] if pins else None)
+
+
+def installed_bench_data() -> tuple[dict[str, str], str | None]:
+    """The same two, as the last install wrote them into this environment. A distribution that is
+    not there has no entry points; one with no record of a git commit has no commit."""
+    try:
+        entry_points = {
+            entry.name: entry.value
+            for entry in importlib.metadata.distribution(BENCH_DISTRIBUTION).entry_points
+            if entry.group == VERIFIER_ENTRY_POINT_GROUP
+        }
+    except importlib.metadata.PackageNotFoundError:
+        entry_points = {}
+    try:
+        record = json.loads(importlib.metadata.distribution(HARNESS_DISTRIBUTION).read_text(DIRECT_URL_FILE) or "{}")
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        record = {}
+    vcs = record.get("vcs_info") if isinstance(record, dict) else None
+    return entry_points, (vcs.get("commit_id") if isinstance(vcs, dict) else None)
+
+
+def installed_data_behind() -> str | None:
+    """How the installed data differs from bench/pyproject.toml, or None when the two agree. The
+    entry points are compared by name and target."""
+    try:
+        declared, pinned = declared_bench_data()
+    except (OSError, ValueError) as exc:
+        return PYPROJECT_UNREADABLE.format(error=f"{type(exc).__name__}: {exc}")
+    installed, commit = installed_bench_data()
+    differences = []
+    differing = sorted(name for name in declared.keys() | installed.keys() if declared.get(name) != installed.get(name))
+    if differing:
+        differences.append(ENTRY_POINTS_BEHIND.format(group=VERIFIER_ENTRY_POINT_GROUP, names=", ".join(differing)))
+    if commit != pinned:
+        differences.append(HARNESS_BEHIND.format(installed=commit or NO_RECORDED_COMMIT, pinned=pinned or NO_RECORDED_COMMIT))
+    return "; ".join(differences) or None
+
+
 @functools.lru_cache(maxsize=1)
 def spec_parser() -> tuple[Any, Any] | str:
     """The harness's YAML reader and its parser of a case's entries, or the note that says why
-    the rule cannot run here: the bench package is not installed, or it is another checkout's."""
+    the rule cannot run here: the bench package is not installed, it is another checkout's, or
+    its installed data is behind bench/pyproject.toml."""
     try:
         import kube_agents_bench  # noqa: PLC0415 -- the package whose installed entry points register this repository's check types
         from devops_bench.tasks.loader import safe_parse_yaml  # noqa: PLC0415
@@ -833,6 +903,9 @@ def spec_parser() -> tuple[Any, Any] | str:
     origin = getattr(kube_agents_bench, "__file__", None)
     if not origin or pathlib.Path(origin).resolve().parent != BENCH_PACKAGE_DIR.resolve():
         return FIELD_CHECK_STALE.format(path=pathlib.Path(origin).resolve().parent if origin else "a package with no file")
+    difference = installed_data_behind()
+    if difference:
+        return FIELD_CHECK_STALE_DATA.format(difference=difference)
     return safe_parse_yaml, parse_entries
 
 

@@ -824,10 +824,15 @@ Without the package the rule does not run, and the target's last line, on stderr
 The same holds when the installed package is another checkout's, or a copy that an install
 made: the line then says that the package is installed, but behind the tree. Only an editable
 install of this checkout counts. The rule knows the check types and the fields of the
-installed package and of the installed devops-bench, so after a pull that changes
-`bench/pyproject.toml`, install again: `make test-bench-deps` brings the package's entry
-points up to date; for a new devops-bench pin use `uv sync` in `bench/` or a new environment,
-because pip can keep the old commit when the version did not change.
+installed package and of the installed devops-bench, and an editable install does not follow a
+pull that changes `bench/pyproject.toml`. The target therefore compares two things with that
+file: the installed entry points of the `devops_bench.verifiers` group, and the commit of the
+installed devops-bench (an install with no recorded git commit differs). When one differs, the
+rule does not run, and the line names each difference. Then install again:
+`make test-bench-deps` brings the package's entry points up to date; for a new devops-bench
+pin, uninstall devops-bench first or use a new environment, because pip can keep the old commit
+when the version did not change. `uv sync` in `bench/` updates `bench/.venv` only, which the
+target reads only when that environment's `python3` runs it.
 The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
 the rule in the job that does, over every case in the tree.
 
