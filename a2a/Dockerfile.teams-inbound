@@ -1,0 +1,37 @@
+# The Microsoft Teams inbound receiver image.
+#
+# The one component of an install that accepts connections from the internet:
+# Bot Framework delivers each Teams message as an HTTPS request to the address
+# registered for the bot, and this is that address, behind the install's own
+# ingress. It verifies Microsoft's signed token on every request, pins the
+# tenant, and hands the activity to the credential broker's Teams queue. It
+# holds no credential of the install's own.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.teams-inbound -t <registry>/a2a-teams-inbound:<tag> .
+
+# Bases come from images.json, the repo's image inventory, spelled the way
+# k8s-operator/Dockerfile spells them so `make mirror-images` and the pinning
+# there cover this build too.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/teams-inbound ./cmd/teams-inbound
+
+# The binary writes nothing to disk, so a static distroless base with no shell
+# and no package manager is the whole runtime, and the Deployment mounts the
+# root filesystem read-only. `USER nonroot` is the image's own default; the
+# Deployment's runAsUser wins in this product.
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
+COPY --from=build /out/teams-inbound /teams-inbound
+USER nonroot
+ENTRYPOINT ["/teams-inbound"]

@@ -127,6 +127,7 @@ type agyInit struct {
 }
 
 type agyStepUpdate struct {
+	StepIndex *int         `json:"step_index"`
 	StepType  string       `json:"step_type"`
 	State     string       `json:"state"`
 	TextDelta string       `json:"text_delta"`
@@ -171,6 +172,10 @@ type agyDecoder struct {
 	input    float64
 	output   float64
 	duration float64
+	// toolDone is the tool steps, by step_index, whose result is already
+	// in: a step's terminal state is reported once however often agy
+	// repeats it.
+	toolDone map[int]bool
 }
 
 var errNotAgyLine = errors.New("not an agy stream-json line")
@@ -199,12 +204,14 @@ func (d *agyDecoder) Decode(line []byte) ([]Event, error) {
 	return nil, nil
 }
 
-// step maps a step_update onto progress and activity. The model's prose
-// streams as agent_response text deltas; a tool step is announced once, when
-// it starts. A tool step's terminal state carries the tool's output, which
-// goes to the adapter as an EventToolResult for the answer scrub's seen set
-// and is never published. User input, system messages and error messages
-// carry nothing the artifacts show; the result decides failure.
+// step maps a step_update onto progress, activity and tool results. The
+// model's prose streams as agent_response text deltas; a tool step is
+// announced once, when it starts, and its result is in when it first reaches
+// DONE or ERROR (EventToolResult, once per step_index: the write-refusal
+// check runs on it). The event carries the step's output, when it has one,
+// for the answer scrub's seen set (agyToolResult); it is never published.
+// User input, system messages and error messages carry nothing the
+// artifacts show; the result decides failure.
 func (d *agyDecoder) step(s *agyStepUpdate) []Event {
 	if s == nil {
 		return nil
@@ -218,8 +225,21 @@ func (d *agyDecoder) step(s *agyStepUpdate) []Event {
 			input = s.ToolInfo.Parameters
 		}
 		return []Event{{Kind: EventActivity, Tool: s.ToolName, Input: input}}
-	case s.StepType == "tool" && (s.State == "DONE" || s.State == "ERROR") && s.ToolInfo != nil && !agyAbsent(s.ToolInfo.Output):
-		return []Event{{Kind: EventToolResult, ToolResult: agyToolResult(s.ToolInfo.Output)}}
+	case s.StepType == "tool" && (s.State == "DONE" || s.State == "ERROR"):
+		if s.StepIndex != nil {
+			if d.toolDone[*s.StepIndex] {
+				return nil
+			}
+			if d.toolDone == nil {
+				d.toolDone = map[int]bool{}
+			}
+			d.toolDone[*s.StepIndex] = true
+		}
+		ev := Event{Kind: EventToolResult}
+		if s.ToolInfo != nil && !agyAbsent(s.ToolInfo.Output) {
+			ev.ToolResult = agyToolResult(s.ToolInfo.Output)
+		}
+		return []Event{ev}
 	}
 	return nil
 }

@@ -2034,6 +2034,65 @@ class OverrequestTest(unittest.TestCase):
         peaks = {("default", "api-1"): (11.0, 40000.0)}
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
 
+    # A model of a window's usage, as a fraction of the request in each of 75
+    # buckets. The burst profile sits at 10% and reaches 85% in 2 buckets: the
+    # mean is 12% of the request, and the 99th percentile is 85%. The burst is
+    # in the middle, so the first bucket and the last bucket are quiet.
+    BURST_WINDOW = (0.10,) * 40 + (0.85,) * 2 + (0.10,) * 33
+    QUIET_WINDOW = (0.10,) * 75
+
+    def peaks_over(self, cpu_window, mem_window):
+        """What `fetch_usage_peaks` reads for `deployment_pod` (12 vCPU / 48Gi)
+        over a window with these buckets.
+
+        Monitoring takes the maximum over the window and answers with one
+        point per series. The fake session does not: it hands over the
+        buckets, and the collector's maximum over the points stands in. So
+        the query must ask for that maximum, or the stand-in is not the
+        answer that Monitoring gives."""
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", *(12 * level for level in cpu_window))],
+            mem=[series_of("default", "api-1", *(48 * 1024 * MIB * level for level in mem_window))],
+        )
+        peaks, available, _ = fw.fetch_usage_peaks("acme", "prod-usc1", session=session, now=NOW)
+        self.assertTrue(available)
+        for call in session.calls:
+            self.assertEqual(call["secondaryAggregation.perSeriesAligner"], fw.ALIGN_MAX)
+        return peaks
+
+    def test_the_burst_profile_gets_no_cut(self):
+        """Mean at 12% of the request, 99th percentile at 85%. A rule that
+        reads the mean cuts this request. The check reads the peak of the
+        window, and no percentile is above the peak, so it files nothing."""
+        self.assertAlmostEqual(sum(self.BURST_WINDOW) / len(self.BURST_WINDOW), 0.12)
+        # More than 1 bucket in 100 is at 85%, so the 99th percentile is 85%.
+        self.assertGreater(self.BURST_WINDOW.count(0.85) / len(self.BURST_WINDOW), 0.01)
+        context = {"pods": [self.deployment_pod()]}
+        burst = self.peaks_over(self.BURST_WINDOW, self.BURST_WINDOW)
+        self.assertEqual(fw.check_overrequest(context, burst, now=NOW, autopilot=False), [])
+        # Control: the same window with no burst bucket is reported on both
+        # dimensions, so the two burst buckets are what keeps the request.
+        quiet = self.peaks_over(self.QUIET_WINDOW, self.QUIET_WINDOW)
+        [hit] = fw.check_overrequest(context, quiet, now=NOW, autopilot=False)
+        self.assertIn("Over-requested on both dimensions", hit["excerpt"])
+
+    def test_a_burst_on_one_dimension_keeps_that_request(self):
+        """The finding is for the quiet dimension alone: its text says that
+        the other one is in use, and the resize names no figure for it."""
+        context = {"pods": [self.deployment_pod()]}
+        for bursty, quiet, cpu_window, mem_window in (
+            ("cpu", "memory", self.BURST_WINDOW, self.QUIET_WINDOW),
+            ("memory", "cpu", self.QUIET_WINDOW, self.BURST_WINDOW),
+        ):
+            with self.subTest(bursty=bursty):
+                peaks = self.peaks_over(cpu_window, mem_window)
+                [hit] = fw.check_overrequest(context, peaks, now=NOW, autopilot=False)
+                self.assertIn(f"Over-requested on {quiet} only (10% of request)", hit["excerpt"])
+                self.assertIn(f"{bursty} is in use and must not be resized", hit["excerpt"])
+                resize = hit["excerpt"].split("Resize to ")[1]
+                self.assertTrue(resize.startswith(f"{quiet} "), resize)
+                self.assertNotIn(bursty, resize)
+
     def test_an_unmeasured_controller_is_not_reported(self):
         """Absent is not idle, and here absent reads as *maximally* idle.
 

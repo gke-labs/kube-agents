@@ -190,10 +190,18 @@ func profileWorkerConfig(t *testing.T, url string, harness []string) Config {
 // listening, which is the moment the dispatcher may offer.
 func startProfileWorker(t *testing.T, ctx context.Context, cfg Config, oneShot bool) <-chan error {
 	t.Helper()
+	return startProfileWorkerWith(t, ctx, cfg, ProfileWorkerConfig{Tier: pwTier, OneShot: oneShot})
+}
+
+// startProfileWorkerWith is startProfileWorker with the worker's own config,
+// for a test that sets a field the plain one leaves empty.
+func startProfileWorkerWith(t *testing.T, ctx context.Context, cfg Config, pw ProfileWorkerConfig) <-chan error {
+	t.Helper()
 	ln, addr := readyListener(t)
+	pw.ReadyAddr, pw.readyListener, pw.deadlineMargin = addr, ln, time.Second
 	done := make(chan error, 1)
 	go func() {
-		done <- RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, OneShot: oneShot, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second})
+		done <- RunProfileWorker(ctx, cfg, pw)
 	}()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {

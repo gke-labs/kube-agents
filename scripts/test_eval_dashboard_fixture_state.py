@@ -261,6 +261,9 @@ def _future(days=30):
 # Every seeded cluster is past the drift SOP's 24-hour age gate, and slots a,
 # b and d carry the authorized-networks block the drift-peer roles assert.
 _CREATED = "2026-08-21T14:47:09+00:00"
+# The three Jobs of generated-name-job-family finished more than 7 days ago,
+# so the role is past its `ready_after_hours` gate.
+_FAMILY_JOBS_FINISHED = "2026-08-21T14:52:31Z"
 _OPEN_BLOCK = {"enabled": True, "cidrBlocks": [{"displayName": "open-for-eval", "cidrBlock": "0.0.0.0/0"}]}
 
 
@@ -431,6 +434,9 @@ def healthy_world(*projects):
             "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
             "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
             "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39": {"metadata": {"labels": {"app.kubernetes.io/part-of": "reindex"}}, "spec": {}, "status": {"succeeded": 1, "completionTime": _FAMILY_JOBS_FINISHED}},
+            "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041": {"metadata": {"labels": {"app.kubernetes.io/part-of": "reindex"}}, "spec": {}, "status": {"succeeded": 1, "completionTime": _FAMILY_JOBS_FINISHED}},
+            "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2": {"metadata": {"labels": {"app.kubernetes.io/part-of": "reindex"}}, "spec": {}, "status": {"succeeded": 1, "completionTime": _FAMILY_JOBS_FINISHED}},
             "deployment/ledger-writer": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "10m", "memory": "32Mi"}}}]}}}},
             "poddisruptionbudget?": {"items": []},
             "networkpolicy?": {"items": []},
@@ -698,10 +704,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 56, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 57, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 56, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 57, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -768,7 +774,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 111, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 113, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
 
 
     def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
@@ -787,7 +793,7 @@ class Drift(ScanHarness):
         self.assertEqual(len(detail), 1, detail)
         self.assertIn("ready_after_hours 2184", detail[0])
         self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 55, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 56, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
         self.assertEqual(doc["summary"]["not_ready"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 0)
         self.assertEqual(fixture_state.drift_map(doc), {})

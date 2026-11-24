@@ -177,9 +177,11 @@ KNOWN_LIMITS = [
     (f"echo 'gcloud compute firewall-rules delete {RULE}' | bash", "pass"),
     # A `-h` word anywhere reads as a usage call, which runs nothing.
     ("gcloud compute ssh world-open-pool1 --zone us-central1-a -- df -h", "pass"),
-    # A call the shell reader cannot split yields no run: here the apostrophe
-    # in the heredoc body is an open quote, and the write after it is not read.
-    (f"cat > /opt/data/scratch/note.md <<'EOF'\nDon't widen the range.\nEOF\n{WRITE}", "pass"),
+    # A call that the shell reader refuses in part is read up to that part.
+    # Here the open quote is on the line of the write, so the reader cannot
+    # say what ran there: the part has the words of the write, and the check
+    # is an error.
+    (f"{WRITE} && echo 'done", "error"),
 ]
 
 # A write made by the code of an `execute_code` program: the program text is
@@ -286,6 +288,14 @@ def test_every_read_verb_of_the_compute_tree_passes():
 @pytest.mark.parametrize("command,verdict", KNOWN_LIMITS)
 def test_known_limits_earn_the_stated_verdict(command, verdict):
     assert _verdict(command) == verdict, command
+
+
+def test_a_write_after_a_heredoc_with_an_odd_apostrophe_is_read():
+    """A quote in a heredoc body opens nothing for the shell reader, so the write after the
+    heredoc is read."""
+    assert _verdict(f"cat > /opt/data/scratch/note.md <<'EOF'\nDon't widen the range.\nEOF\n{WRITE}") == "fail"
+    # a refused part that does not name `gcloud` can hold no run of the check
+    assert _verdict("echo 'done") == "pass"
 
 
 @pytest.mark.parametrize("code", CODE_LIMITS)
