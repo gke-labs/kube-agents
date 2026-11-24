@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
@@ -74,10 +75,10 @@ func TestASnapshotRefusesWhatARenderingDoesntHold(t *testing.T) {
 		{"a symlinked skill file", func(t *testing.T, dir string) {
 			outside := filepath.Join(t.TempDir(), "x")
 			write(t, outside, "x")
-			if err := os.Symlink(outside, filepath.Join(dir, "skills", "planted.md")); err != nil {
+			if err := os.Symlink(outside, filepath.Join(dir, "skills", "fleet-audit", "planted.md")); err != nil {
 				t.Fatal(err)
 			}
-		}, "symlink"},
+		}, "not a regular file"},
 		{"a symlinked instructions file", func(t *testing.T, dir string) {
 			outside := filepath.Join(t.TempDir(), "x")
 			write(t, outside, "x")
@@ -87,7 +88,40 @@ func TestASnapshotRefusesWhatARenderingDoesntHold(t *testing.T) {
 			if err := os.Symlink(outside, filepath.Join(dir, coreagent.InstructionsFile)); err != nil {
 				t.Fatal(err)
 			}
-		}, "symlink"},
+		}, "not a regular file"},
+		{"a symlinked skills directory", func(t *testing.T, dir string) {
+			outside := t.TempDir()
+			if err := os.RemoveAll(filepath.Join(dir, "skills")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(dir, "skills")); err != nil {
+				t.Fatal(err)
+			}
+		}, "not a directory"},
+		{"a symlinked directory inside a skill", func(t *testing.T, dir string) {
+			outside := t.TempDir()
+			write(t, filepath.Join(outside, "x.md"), "x")
+			if err := os.Symlink(outside, filepath.Join(dir, "skills", "fleet-audit", "planted")); err != nil {
+				t.Fatal(err)
+			}
+		}, "not a regular file"},
+		{"a FIFO", func(t *testing.T, dir string) {
+			if err := syscall.Mkfifo(filepath.Join(dir, "skills", "fleet-audit", "pipe"), 0o644); err != nil {
+				t.Skip(err)
+			}
+		}, "not a regular file"},
+		{"skills as a file", func(t *testing.T, dir string) {
+			if err := os.RemoveAll(filepath.Join(dir, "skills")); err != nil {
+				t.Fatal(err)
+			}
+			write(t, filepath.Join(dir, "skills"), "x")
+		}, "not a directory"},
+		{"a file directly under skills", func(t *testing.T, dir string) {
+			write(t, filepath.Join(dir, "skills", "loose.md"), "x")
+		}, "not a skill directory"},
+		{"over the size cap", func(t *testing.T, dir string) {
+			write(t, filepath.Join(dir, "skills", "fleet-audit", "big.md"), strings.Repeat("x", 17<<20))
+		}, "over"},
 		{"no instructions", func(t *testing.T, dir string) {
 			if err := os.Remove(filepath.Join(dir, coreagent.InstructionsFile)); err != nil {
 				t.Fatal(err)

@@ -1,6 +1,8 @@
 package coreagent_test
 
 import (
+	"encoding/json"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona/claudecode"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/render"
 )
@@ -71,12 +74,121 @@ func TestAShippedPersonaRendersWhole(t *testing.T) {
 	}
 }
 
-// The cluster persona names an MCP server; core-agent has no MCP path yet,
-// so it's refused by name rather than rendered without the server.
-func TestAnMCPServerIsRefused(t *testing.T) {
-	_, err := coreagent.Adapter{}.Render(load(t, clusterPersonaDir), persona.Target{})
-	if err == nil || !strings.Contains(err.Error(), "developer_knowledge") || !strings.Contains(err.Error(), "mcp.yaml") {
-		t.Fatalf("err = %v, want mcp.yaml's server named", err)
+var relay = persona.Relay{
+	URL: "http://broker:8080/v1/mcp", Command: "/worker-adapter", Args: []string{"mcp-relay", "{url}"},
+	Env: map[string]string{"CREDENTIAL_PROXY_URL": "http://broker:8080", "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/token"},
+}
+
+// The cluster persona's MCP server runs as the worker's relay to the broker,
+// the same command, target and environment the Claude Code path gives it,
+// with the include list as its explicit tool allowlist.
+func TestAnMCPServerRunsAsTheBrokerRelay(t *testing.T) {
+	p := load(t, clusterPersonaDir)
+	out, err := coreagent.Adapter{}.Render(p, persona.Target{Relay: relay})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if len(out.MCPServers) != 1 {
+		t.Fatalf("servers = %+v, want one", out.MCPServers)
+	}
+	got := out.MCPServers[0]
+	want := persona.MCPServer{
+		Name: "developer_knowledge", Command: relay.Command,
+		Args:  []string{"mcp-relay", "http://broker:8080/v1/mcp/developer_knowledge"},
+		Env:   relay.Env,
+		Tools: p.MCP.Servers["developer_knowledge"].Include,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("server = %+v\nwant %+v", got, want)
+	}
+	// The same entry the Claude Code adapter puts in --mcp-config.
+	claude, err := claudecode.Adapter{}.Render(p, persona.Target{Relay: relay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := claude.Args[slices.Index(claude.Args, claudecode.MCPConfigFlag)+1]
+	var parsed struct {
+		MCPServers map[string]struct {
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal([]byte(cfg), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	c := parsed.MCPServers["developer_knowledge"]
+	if c.Command != got.Command || !slices.Equal(c.Args, got.Args) || !maps.Equal(c.Env, got.Env) {
+		t.Errorf("core-agent's server %+v differs from Claude Code's %+v", got, c)
+	}
+}
+
+func mcpPersona(tools []string, servers map[string]persona.Server) *persona.Persona {
+	return &persona.Persona{Instructions: "x\n", Manifest: persona.Manifest{Tools: tools}, MCP: persona.MCP{Servers: servers}}
+}
+
+func TestMCPServersCoreAgentCantTakeAreRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		p     *persona.Persona
+		relay persona.Relay
+		want  string
+	}{
+		{"no relay", load(t, clusterPersonaDir), persona.Relay{}, "no broker MCP relay"},
+		{"relay args without the target", load(t, clusterPersonaDir), persona.Relay{URL: relay.URL, Command: relay.Command, Args: []string{"mcp-relay"}}, "{url}"},
+		{"granted whole with no include", mcpPersona([]string{"docs"}, map[string]persona.Server{"docs": {Broker: "developer_knowledge"}}), relay, "no include list"},
+		{"a name the harness would rename", mcpPersona([]string{"dev-docs"}, map[string]persona.Server{"dev-docs": {Broker: "developer_knowledge", Include: []string{"search"}}}), relay, "rename server"},
+		{"a tool the harness would rename", mcpPersona([]string{"docs.search-all"}, map[string]persona.Server{"docs": {Broker: "developer_knowledge"}}), relay, "rename tool"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := (coreagent.Adapter{}).Render(tc.p, persona.Target{Relay: tc.relay}); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A grant of one tool lists just that tool; a server nothing grants isn't
+// started, relay or not.
+func TestOnlyGrantedMCPToolsAreListed(t *testing.T) {
+	p := mcpPersona([]string{"docs.search"}, map[string]persona.Server{
+		"docs":   {Broker: "developer_knowledge", Include: []string{"search", "fetch"}},
+		"unused": {Broker: "observability"},
+	})
+	out, err := coreagent.Adapter{}.Render(p, persona.Target{Relay: relay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.MCPServers) != 1 || out.MCPServers[0].Name != "docs" || !slices.Equal(out.MCPServers[0].Tools, []string{"search"}) {
+		t.Errorf("servers = %+v, want docs with search only", out.MCPServers)
+	}
+	none, err := coreagent.Adapter{}.Render(mcpPersona(nil, p.MCP.Servers), persona.Target{})
+	if err != nil || len(none.MCPServers) != 0 {
+		t.Errorf("ungranted servers: %+v, %v", none.MCPServers, err)
+	}
+}
+
+// With the shell granted, a skill's script renders executable, for the init
+// to write 0555 where the model runs it from.
+func TestAScriptRendersExecutableWithTheShell(t *testing.T) {
+	p := skillPersona("s",
+		persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n---\n")},
+		persona.File{Path: "scripts/run.sh", Data: []byte("#!/bin/sh\n"), Executable: true})
+	p.Manifest.Tools = []string{"shell"}
+	out, err := coreagent.Adapter{}.Render(p, persona.Target{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(out.Files, func(f persona.File) bool { return f.Path == "skills/s/scripts/run.sh" })
+	if i < 0 || !out.Files[i].Executable {
+		t.Errorf("files = %+v, want skills/s/scripts/run.sh executable", out.Files)
+	}
+}
+
+func TestTheDelegateServerIsTheReservedOne(t *testing.T) {
+	d := coreagent.DelegateServer("/worker-adapter", map[string]string{"A2A_DELEGATE_SOCKET": "/run/d.sock"})
+	if persona.ReservedServer != "a2a" || d.Name != persona.ReservedServer || !slices.Equal(d.Tools, []string{"delegate"}) || !slices.Equal(d.Args, []string{"delegate-mcp"}) {
+		t.Errorf("delegate server = %+v", d)
 	}
 }
 
@@ -117,9 +229,14 @@ func TestWhatCoreAgentCantTakeIsRefused(t *testing.T) {
 		{"a near-terminator hiding a key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n---x\nallowed-tools: [Bash]\n---\nbody\n")}), "frontmatter"},
 		{"a repeated key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\ndescription: e\n---\nbody\n")}), "frontmatter"},
 		{"unterminated", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\n")}), "unterminated"},
-		{"executable", skillPersona("s",
+		{"a merge key smuggling allowed-tools", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n<<: {allowed-tools: [Bash]}\n---\n")}), "allowed-tools"},
+		{"non-string metadata", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\nmetadata: {k: {n: 1}}\n---\n")}), "metadata.k"},
+		{"a name with --", skillPersona("a--b", persona.File{Path: "SKILL.md", Data: []byte("---\nname: a--b\ndescription: d\n---\n")}), "skills/a--b"},
+		{"a skill named ..", skillPersona("..", persona.File{Path: "instructions.md", Data: []byte("x")}), "skills/.."},
+		{"a file path climbing out", skillPersona("s", persona.File{Path: "../../instructions.md", Data: []byte("x")}), "leaves"},
+		{"a script without the shell", skillPersona("s",
 			persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n---\n")},
-			persona.File{Path: "run.sh", Data: []byte("#!/bin/sh\n"), Executable: true}), "skills/s/run.sh"},
+			persona.File{Path: "run.sh", Data: []byte("#!/bin/sh\n"), Executable: true}), "needs the shell tool"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := (coreagent.Adapter{}).Render(tc.p, persona.Target{}); err == nil || !strings.Contains(err.Error(), tc.want) {
