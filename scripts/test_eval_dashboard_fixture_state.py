@@ -298,14 +298,14 @@ def _peer():
 
 def _cluster_c():
     # No authorized-networks block, and the default pool bench/tf/fleet/main.tf
-    # plants as the pool-level outlier: a 50 GB disk with cpuCfsQuota false.
+    # plants as the pool-level outlier: a 50 GB disk with podPidsLimit 4096.
     return {
         "currentMasterVersion": "1.34.1-gke.1",
         "createTime": _CREATED,
         # Since the ComputeClass fixtures (defects-c.tf): the pool carries the
         # class label, the NodeLocal DNSCache add-on is off (GKE omits the false
         # boolean, so the block is empty), and node auto-provisioning is unset.
-        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "kubeletConfig": {"cpuCfsQuota": False}, "labels": {"cloud.google.com/compute-class": "general-ccc"}}}],
+        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "kubeletConfig": {"podPidsLimit": "4096"}, "labels": {"cloud.google.com/compute-class": "general-ccc"}}}],
         "addonsConfig": {"dnsCacheConfig": {}},
     }
 

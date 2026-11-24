@@ -881,15 +881,23 @@ resource "google_container_cluster" "seeded_c" {
 # `kubelet-config`, which it does not read yet. Every other pool in this stack runs a 20 GB boot
 # disk of the default type with no kubelet block; this one runs 50 GB (type
 # unchanged: size alone differed in the incident behind the facets) and
-# sets one kubelet key, cpu_cfs_quota, to false. False rather than the
-# default true, so the facet reads a difference whether it treats an absent
-# key as unset or as the default; CFS quota off on a node that runs only
-# system pods changes nothing anyone measures. Both fields update in place
-# on the pinned provider (8.4.0): GKE recreates the pool's one node, the
-# pool keeps its identity, and the cluster's createTime does not move, so
-# the drift SOP's 24-hour cohort gate is untouched and no reconcile-allow
-# entry is needed. The fixture role is drift-pool-outlier (fixtures.json);
-# consistency-boot-disk-pool-outlier reads the disk; the kubelet-config
+# sets one kubelet key, pod_pids_limit, to 4096. GKE sets no pod PID limit
+# unless asked, so the facet reads a difference whether it treats an absent
+# key as unset or as the default, and a PID cap on a node whose only
+# workload pods are the pause containers defects-c.tf plants changes
+# nothing anyone measures. An integer and not the cpu_cfs_quota = false
+# this block first carried: the pinned provider (8.4.0) force-sends an
+# explicit false only when it creates a pool, reads a pool without the key
+# as false, and so planned nothing and sent nothing on a pool that already
+# existed; the key never reached a project older than the block. A
+# non-zero integer is sent on create and on update alike. A pool created
+# with the earlier key may keep it beside this one: the update request
+# leaves it out, and no assertion reads it. Both fields update in place:
+# GKE recreates the pool's one node, the pool keeps its identity, and the
+# cluster's createTime does not move, so the drift SOP's 24-hour cohort
+# gate is untouched and no reconcile-allow entry is needed. The fixture
+# role is drift-pool-outlier (fixtures.json);
+# consistency-boot-disk-pool-outlier reads the disk, and the kubelet-config
 # facet and its case are the follow-up.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
@@ -943,7 +951,7 @@ resource "google_container_node_pool" "seeded_c_default" {
     }
 
     kubelet_config {
-      cpu_cfs_quota = false
+      pod_pids_limit = 4096
     }
 
     workload_metadata_config {

@@ -388,8 +388,8 @@ fixtures:
     objects:
       - cluster/self
     defect: >-
-      Slot c's default pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota
-      false, where every other pool in the fleet runs a 20 GB disk and no
+      Slot c's default pool on a 50 GB boot disk with kubeletConfig.podPidsLimit
+      4096, where every other pool in the fleet runs a 20 GB disk and no
       kubelet block. The drift SOP's boot-disk facet reads the disk; the
       kubelet block is planted ahead of the kubelet-config facet, which the SOP
       does not read yet. Day 1 as for drift-outlier,
