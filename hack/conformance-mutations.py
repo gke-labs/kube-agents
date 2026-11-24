@@ -1880,6 +1880,16 @@ Mutation(
         "credential goes to that domain's hosts",
     ),
     Mutation(
+        "C2-universe-domain-metadata-recheck",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        elif reported != configured:\n",
+         "        elif False and reported != configured:\n"),
+        "test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts",
+        "let a broker that started with no answer from the metadata server "
+        "keep the environment's value when the later answer contradicts it, "
+        "so its credential goes on to that domain's hosts",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',

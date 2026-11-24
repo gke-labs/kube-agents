@@ -2908,6 +2908,41 @@ class C2FailClosed(unittest.TestCase):
         check("universe.example.test", ("universe.example.test", True))
         check("universe.example.test", (None, True))
 
+    def test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts(self) -> None:
+        """A start with no answer from the metadata server does not leave the value unchecked.
+
+        With no answer at its start the broker serves with the environment's
+        value. It asks the metadata server again until it answers, and an
+        answer that differs stops the broker with the error of the start check:
+        the credential must not go on to that domain's hosts. An answer that
+        agrees, and a host with no universe route, stop nothing.
+        """
+        proxy = h.credential_proxy
+
+        def recheck(configured, later):
+            stopped: list[str] = []
+            answers = [(None, False), later]
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answers.pop(0)
+            try:
+                proxy.recheck_universe_domain(configured, sleep=lambda _s: None, stop=stopped.append)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+            return stopped
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                stopped = recheck(configured, (reported, True))
+                self.assertEqual(1, len(stopped))
+                self.assertIn(repr(configured), stopped[0])
+                self.assertIn(repr(reported), stopped[0])
+        self.assertEqual([], recheck("universe.example.test", ("universe.example.test", True)))
+        self.assertEqual([], recheck("universe.example.test", (None, True)))
+
 
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""

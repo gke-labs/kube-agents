@@ -690,12 +690,19 @@ GCE_METADATA_MAX_BYTES = 512
 # metadata server takes to answer a pod that has just started.
 UNIVERSE_CHECK_ATTEMPTS = 10
 UNIVERSE_CHECK_PAUSE_SECONDS = 1.0
-# What the broker does when the metadata server gives no answer in every try:
-# True starts with the value unchecked and says so in one WARNING record, False
-# does not start. A host with no metadata server, such as a harness on kind,
-# never gets an answer, so False stops it. The decision is here and nowhere
-# else.
-UNIVERSE_CHECK_UNANSWERED_STARTS = True
+# With no answer in every try the broker starts with the value unchecked, says
+# so in one WARNING record, and asks again with this pause between tries until
+# the metadata server answers. A host with no metadata server, such as a
+# harness on kind, never gets an answer: it serves, and each try costs it one
+# request of GCE_METADATA_TIMEOUT_SECONDS.
+UNIVERSE_RECHECK_PAUSE_SECONDS = 30.0
+UNIVERSE_RECHECK_THREAD_NAME = "universe-recheck"
+# How long the stop after a later contradiction waits for its own log record.
+# A log write that does not return in this time does not keep the broker up.
+UNIVERSE_STOP_LOG_SECONDS = 5.0
+UNIVERSE_NO_ROUTE_WARNING = (
+    "universe domain %s from the environment was not checked: the metadata server has no universe route"
+)
 _METADATA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _CACHED_METADATA_UNIVERSE_DOMAIN: str | None = None
 _METADATA_UNIVERSE_LOCK = threading.Lock()
@@ -1633,7 +1640,20 @@ def probe_gce_universe_domain_status(
     return domain or credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, answered
 
 
-def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time.sleep) -> None:
+def _universe_contradiction(configured: str, reported: str) -> str:
+    """The error for a universe domain from the environment that the metadata server contradicts."""
+    variables = (
+        f"{credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV} or "
+        f"{credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV}"
+    )
+    return (
+        f"the environment ({variables}) names universe domain {configured!r}, and the metadata "
+        f"server reports {reported!r}. One credential proxy serves one universe domain and sends "
+        f"no credential to another. Set the variable to {reported!r} or remove it."
+    )
+
+
+def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time.sleep) -> bool:
     """Refuse a universe domain from the environment that the metadata server contradicts.
 
     The environment's value otherwise goes unchecked: a value that names hosts
@@ -1642,8 +1662,9 @@ def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time
     host is in, so an answer that differs raises and the broker does not start.
     An answer that agrees passes. A host with no universe route has nothing to
     contradict the value: it passes, with a WARNING record that the value was
-    not checked. No answer in UNIVERSE_CHECK_ATTEMPTS tries is
-    UNIVERSE_CHECK_UNANSWERED_STARTS's case, with the same record.
+    not checked. No answer in UNIVERSE_CHECK_ATTEMPTS tries passes with the same
+    record and returns False: the value is still unchecked, and
+    `recheck_universe_domain` asks again. True is an answer; nothing is left to ask.
     """
     reported, answered = None, False
     for attempt in range(UNIVERSE_CHECK_ATTEMPTS):
@@ -1652,34 +1673,82 @@ def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time
         reported, answered = probe_gce_universe_domain_answer()
         if answered:
             break
-    variables = (
-        f"{credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV} or "
-        f"{credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV}"
-    )
     if not answered:
-        if not UNIVERSE_CHECK_UNANSWERED_STARTS:
-            raise RuntimeError(
-                f"the environment ({variables}) names universe domain {configured!r}, and the "
-                f"metadata server gave no answer in {UNIVERSE_CHECK_ATTEMPTS} tries to check it against"
-            )
         LOGGER.warning(
             "universe domain %s from the environment was not checked: the metadata server gave no answer in %d tries",
             configured,
             UNIVERSE_CHECK_ATTEMPTS,
         )
-        return
+        return False
     if reported is None:
-        LOGGER.warning(
-            "universe domain %s from the environment was not checked: the metadata server has no universe route",
-            configured,
-        )
-        return
+        LOGGER.warning(UNIVERSE_NO_ROUTE_WARNING, configured)
+        return True
     if reported != configured:
-        raise RuntimeError(
-            f"the environment ({variables}) names universe domain {configured!r}, and the metadata "
-            f"server reports {reported!r}. One credential proxy serves one universe domain and sends "
-            f"no credential to another. Set the variable to {reported!r} or remove it."
-        )
+        raise RuntimeError(_universe_contradiction(configured, reported))
+    return True
+
+
+def end_broker_for_universe_contradiction(message: str) -> None:
+    """End the process at once, with the error as one CRITICAL record.
+
+    Not a drain: the broker answers no request after this, where a drain would
+    give each request in flight time to send this host's credential to the
+    universe that the metadata server contradicts. A command that a request
+    started is a process of its own and ends with the container. The exit
+    status is the one of a start that failed. The container starts again, and
+    the start check then refuses the value when the metadata server answers.
+    """
+    # The process ends also when the record cannot be written: a log write that
+    # does not return ends at the timer, and one that raises ends in the `finally`.
+    timer = threading.Timer(UNIVERSE_STOP_LOG_SECONDS, os._exit, (EXIT_STARTUP_FAILURE,))
+    timer.daemon = True
+    timer.start()
+    try:
+        LOGGER.critical("credential proxy stops serving: %s", message)
+        # os._exit runs no exit hook, so a handler that holds its records is flushed here.
+        logging.shutdown()
+    finally:
+        os._exit(EXIT_STARTUP_FAILURE)
+
+
+def recheck_universe_domain(
+    configured: str,
+    *,
+    sleep: Any = time.sleep,
+    stop: Callable[[str], None] = end_broker_for_universe_contradiction,
+) -> None:
+    """After a start with the value unchecked, ask the metadata server until it answers.
+
+    An answer that differs calls `stop` with the error of the start check. An
+    answer that agrees, or a host with no universe route, ends the loop. No
+    answer asks again after UNIVERSE_RECHECK_PAUSE_SECONDS, with no limit of
+    tries. A fault in one try is logged and is not an answer: only an answer
+    that differs stops the broker.
+    """
+    while True:
+        sleep(UNIVERSE_RECHECK_PAUSE_SECONDS)
+        try:
+            reported, answered = probe_gce_universe_domain_answer()
+        except Exception:
+            LOGGER.exception("the check of universe domain %s against the metadata server failed; it is tried again", configured)
+            continue
+        if not answered:
+            continue
+        if reported is None:
+            LOGGER.warning(UNIVERSE_NO_ROUTE_WARNING, configured)
+        elif reported != configured:
+            stop(_universe_contradiction(configured, reported))
+        else:
+            LOGGER.info("universe domain %s from the environment agrees with the metadata server's answer after the start", configured)
+        return
+
+
+def start_universe_recheck(configured: str) -> threading.Thread:
+    thread = threading.Thread(
+        target=recheck_universe_domain, args=(configured,), name=UNIVERSE_RECHECK_THREAD_NAME, daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def _cached_metadata_universe_domain() -> tuple[str, bool]:
@@ -19324,8 +19393,8 @@ def serve(args: argparse.Namespace) -> None:
     # Read before the resolve below, which can put a metadata answer into the
     # environment: only a value the environment came with is checked.
     configured_universe = configured_universe_domain()
-    if configured_universe is not None:
-        check_universe_domain_against_metadata(configured_universe)
+    if configured_universe is not None and not check_universe_domain_against_metadata(configured_universe):
+        start_universe_recheck(configured_universe)
     universe_domain = resolve_universe_domain(probe_metadata=True)
     if universe_domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
         os.environ.setdefault(
