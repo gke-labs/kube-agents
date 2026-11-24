@@ -225,7 +225,7 @@ func (agyDriver) WithResume(argv []string, id string) []string {
 // withoutFlag is argv without flag and its value, in either the
 // `flag value` or the `flag=value` form.
 func withoutFlag(argv []string, flag string) []string {
-	out := make([]string, 0, len(argv)+2)
+	out := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
 		switch {
 		case argv[i] == flag:
