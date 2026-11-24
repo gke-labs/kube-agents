@@ -22,16 +22,16 @@ which the Prow job exports). It writes, into `--out`:
   served from (`nightly`), which is where answers came from, not a verdict:
   uploads are write-once, so that is the night that first wrote the answer,
   often an older one on another commit; and, per conversation that was served anything,
-  whether its run's verdict matched the recording's. Only answers a passing
-  run gave are published (publish_cache.py), though the run that first saved
-  an answer's object may have failed; a mismatch is a replayed run that
-  failed. A conversation whose run
-  can't be told (run_attribution.py), whose run bench-gate graded as neither a
-  pass nor a fail (infra, blocked, not_applicable), or whose recording night
-  is in no record the fetch read is `unknown`, each counted by reason in
-  `unknown_reasons`. The recording night is the one that first wrote the
-  answer, which can be as old as the bucket's lifecycle; the fetch reads runs
-  that far back;
+  whether its replayed run passed (`passed`) or failed (`failed`). Answers
+  from failing runs are published too (publish_cache.py), so a failed
+  conversation is a replayed run that failed, which a case flaky on `main` can
+  be on replay as it can live, not a disagreement with the recording's own
+  verdict (analyze_replay.py's `match`/`mismatch` mean that, so this report
+  does not use those words). A conversation whose run
+  can't be told (run_attribution.py), or whose run bench-gate graded as neither a
+  pass nor a fail (infra, blocked, not_applicable), is `unknown`, each counted
+  by reason in `unknown_reasons`. A failed conversation names the night that first
+  wrote its answers (`recorded_build`), for tracing it;
 - `summary.txt`: the commit replayed, the newest night's builds on it, and the counts. Its lines also go to the job log, where the
   collector masks long hex runs, the commit included; the file in the bucket keeps it whole.
 
@@ -69,12 +69,13 @@ import run_attribution as RA
 REPLAY_REPORT = "replay.json"
 VERDICTS_REPORT = "verdicts.json"
 SUMMARY = "summary.txt"
-MATCH = analyze_replay.VERDICT_MATCH
-MISMATCH = analyze_replay.VERDICT_MISMATCH
+# The replayed run's own verdict, per served conversation. Not analyze_replay's
+# VERDICT_MATCH/VERDICT_MISMATCH, which compare a run with its recording.
+PASSED = "passed"
+FAILED = "failed"
 UNKNOWN = analyze_replay.VERDICT_UNKNOWN
 # Why a served conversation's comparison is unknown, counted in the report.
 RUN_UNATTRIBUTED = "run_unattributed"
-RECORDING_BUILD_UNRECORDED = "recording_build_unrecorded"
 NO_VERDICT = "no_verdict"
 # The report's commit fields, and how the summary reads each source.
 REPORT_COMMIT = "commit"
@@ -239,10 +240,10 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
             if outcomes is None:
                 outcomes = SERVED_FROM_NOT_RUN if build in nightly_runs else UNKNOWN
             case["nightly"][build] = outcomes
-    # Per served conversation: the lane run's verdict against the recording's.
-    conversation_counts = {MATCH: 0, MISMATCH: 0, UNKNOWN: 0}
+    # Per served conversation: the replayed run's own verdict.
+    conversation_counts = {PASSED: 0, FAILED: 0, UNKNOWN: 0}
     unknown_reasons: Dict[str, int] = {}
-    mismatched: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
 
     def unknown(reason: str) -> None:
         conversation_counts[UNKNOWN] += 1
@@ -256,14 +257,9 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
         if len(keys) != 1:
             unknown(RUN_UNATTRIBUTED)
             continue
-        # The night that first wrote the answer, which can be weeks old: the
-        # fetch reads runs back to the bucket's lifecycle (fetch_cache.py).
-        # The comparison is with that night's run, not the newest night's: a
-        # passing run produced the answer, though the run that first wrote its
-        # object may have failed (publish_cache.py, alternates).
-        if not recorded or recorded not in nightly_runs:
-            unknown(RECORDING_BUILD_UNRECORDED)
-            continue
+        # Passed and failed are the replayed run's own verdict, so the
+        # recording night's verdict is not needed: graded runs produced the
+        # answer, passing or failing (publish_cache.py, alternates).
         key = next(iter(keys))
         run = by_key.get(key)  # type: ignore[arg-type]
         # Only a pass or a fail is a verdict; infra, blocked and not_applicable
@@ -271,17 +267,17 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
         if run is None or run.outcome not in (RA.REP_OUTCOME_PASS, RA.REP_OUTCOME_FAIL):
             unknown(NO_VERDICT)
         elif run.passed:
-            conversation_counts[MATCH] += 1
+            conversation_counts[PASSED] += 1
         else:
-            conversation_counts[MISMATCH] += 1
-            mismatched.append({"run": key, "outcome": run.outcome, "recorded_build": recorded,
+            conversation_counts[FAILED] += 1
+            failed.append({"run": key, "outcome": run.outcome, "recorded_build": recorded,
                                "first_request_id": conv.lines[0].request_id})
     add_arms(cases, per_run, read_arms(verdicts_dir))
     return {
         "cases": cases,
         "served_conversations": conversation_counts,
         "unknown_reasons": unknown_reasons,
-        "mismatched_conversations": mismatched,
+        "failed_conversations": failed,
         "unattributed_prompt_tokens": unattributed_tokens,
         "lost_lines": logs.lost,
     }
@@ -323,7 +319,7 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
         f" served {replay['served_token_percent']}% of prompt tokens"
         f" ({replay['served_before_first_miss_token_percent']}% before each conversation's first miss,"
         f" {replay['served_via_answer_slots_token_percent']}% through answer slots)",
-        f"served conversations against the recording's verdict: {report['served_conversations']}"
+        f"served conversations by the replayed run's verdict: {report['served_conversations']}"
         f" (unknown because: {report['unknown_reasons'] or 'none'})",
     ]
     for name, case in sorted(report["cases"].items()):

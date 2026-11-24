@@ -45,9 +45,10 @@ const (
 	// ruleDelegationParentChainMismatch refuses when an ancestor the record
 	// still holds contradicts the parent's carried chain.
 	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
-	// ruleDelegationUnattendedParent refuses a child of an unattended task:
-	// the child's grant would not carry the parent's trigger binding.
-	ruleDelegationUnattendedParent = "delegation.unattended-parent"
+	// ruleDelegationUnattendedChild refuses a scheduled run's child whose
+	// profile's card doesn't list the unattended tier: its owner hasn't
+	// agreed to runs nobody is watching, even read-only ones (#6744).
+	ruleDelegationUnattendedChild = "delegation.unattended-child"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root
@@ -285,8 +286,9 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// platform.
 	check := func(e lib.DelegateTask) (*profileRoute, bool) {
 		// Anything but platform is an AgentProfile: resolved, its target checked
-		// against the scope, and minted at the parent's tier, which for a
-		// session parent is its requester's (profileRouteFor).
+		// against the scope, and minted at the parent's tier (read when the
+		// parent is unattended, #6744), which for a session parent is its
+		// requester's (profileRouteFor).
 		var route *profileRoute
 		var err error
 		addressee := strings.TrimSpace(e.Addressee)
@@ -303,6 +305,14 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		}
 		if addressee != targetPlatform {
 			tier := capability.Tier(parent.Tier)
+			if profileParent && tier == capability.TierUnattended {
+				// A child of an unattended task (#6744) is minted at the read
+				// tier, as a fresh root on the parent's scope (the chain checks
+				// below hold it there), and carries no trigger: an unattended
+				// grant is bound to its trigger, and only the parent writes
+				// under it. A child can read for its parent, never write.
+				tier = capability.TierRead
+			}
 			if !profileParent {
 				authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
 				if tier, err = g.tierFor(authors, unknown); err != nil {
@@ -313,6 +323,28 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			if route, err = g.profileRouteFor(addressee, e.Parameters, tier, lib.SubmitKindChild); err != nil {
 				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
 				return nil, false
+			}
+			if profileParent && parent.belowSchedule() {
+				// The child runs at read, but for a schedule, with nobody
+				// watching: only a profile whose card lists unattended takes
+				// it, as only such a profile takes the trigger itself. So
+				// does a grandchild: the mark rides the chain.
+				if card, ok := g.profiles.lookup(route.Profile); !ok || !cardAllowsTier(card, capability.TierUnattended) {
+					refuse(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+fmt.Sprintf(noticeUnattendedChild, route.Profile), "child", route.Profile)
+					return nil, false
+				}
+				// And a profile pinned to the child's target must list it
+				// too, as a trigger submitted there directly is held to
+				// (profileRouteFor's checkPinnedTiers at unattended).
+				// resolveProfile already succeeded for this address above.
+				_, target, rerr := resolveProfile(g.profiles, addressee, e.Parameters)
+				if rerr == nil {
+					rerr = g.checkPinnedTiers(route.Profile, target, capability.TierUnattended)
+				}
+				if rerr != nil {
+					refuse(ruleDelegationUnattendedChild, refusalNotice(noticeDelegationRefusedFor, rerr), "child", route.Profile)
+					return nil, false
+				}
 			}
 			if profileParent {
 				if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {
@@ -418,6 +450,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		LineNote:             lineNote,
 		Route:                route,
 		ProfileChain:         childProfileChain(parent, profileParent),
+		Scheduled:            profileParent && parent.belowSchedule(),
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),
@@ -928,7 +961,7 @@ func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
 // a wake used to loop to the depth bound with nothing answered.
 const (
 	wakeReplyGuide     = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
-	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it, in the format their question asked for if it gave one. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
 )
 
 // wakeReplyGuideMax is the longer of the two guides, which the result

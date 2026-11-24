@@ -373,9 +373,12 @@ Two details that the trust-boundary and defense tables above rely on:
   GitHub (via Minty), and the MCP tool endpoints agents ground on (e.g. `developer_knowledge`, `gke`).
   The allowlist must never omit MCP endpoints needed for grounding on live docs. An L7 egress proxy
   for hostname-precise allowlisting is a Phase 5 hardening item ([07](07-implementation-roadmap.md)).
-- **Multi-tenant inference:** a shared LiteLLM proxy with **per-tier/per-tenant virtual keys** (own
-  budget, rate-limit, scoped logging); physically separate proxies only if data sensitivity later
-  requires it.
+- **Multi-tenant inference:** a shared LiteLLM proxy where each caller class (agent gateway, each
+  profile tier, sessions, curator, scheduled jobs) authenticates with **its own key**, checked by a
+  gateway auth hook against a map of key digests with no database, which attributes spend and
+  tokens per class and can carry a per-class rate limit. A per-tenant budget needs LiteLLM's
+  virtual keys and its database and is a later decision; physically separate proxies only if data
+  sensitivity later requires it.
 
 ## 11. Verification
 

@@ -393,7 +393,9 @@ Four ways a workload breaks on a new version:
   that namespace, `CONTROL_PLANE_CLUSTER_WRITES` and `CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the same file; the ConfigMap write the
   Jetstack outage deadlocked on left the start-up path in Kubernetes 1.17, and the leader-election
   Leases are already on the node path's list); the object selector, match conditions and the
-  would-fail-once-drained backend are still unread.
+  would-fail-once-drained backend are still unread. The report's JSON also names the fail-closed webhooks
+  whose backend answered (`answered`, beside `blocking` and `outage`), so an answer can list every
+  webhook the run checked with no read of its own.
 - **Manifests in Git, and release state, not just live clusters.** Stored Helm release manifests
   carry removed kinds even when nothing in the cluster runs them, and the next `helm upgrade` of that
   release fails on reading its own stored state. Nothing breaks until someone deploys, which is why

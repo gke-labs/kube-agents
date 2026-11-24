@@ -289,7 +289,7 @@ func (g *Gateway) healStoppedTasks(ctx context.Context, rec *SessionRecord) bool
 			continue
 		}
 		addressee := rec.AddresseeFor(ref.ID)
-		task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, ref.ID)
+		task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, ref.ID, g.profileRead(rec, ref.ID, addressee))
 		// The source each end is booked under, the same way the relay and
 		// healBatchChild read it (terminalSourceOf), so one terminal is
 		// attributed alike on every path.

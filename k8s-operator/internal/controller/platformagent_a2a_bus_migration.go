@@ -1860,11 +1860,14 @@ const reasonA2ABusMigrationStreamsOverCap = "A2ABusMigrationStreamsOverCap"
 
 // a2aBusJszStreamsPath is the monitoring endpoint's JetStream report, with
 // each stream's state (the meta group check reads the summary alone,
-// a2aBusJszPath).
+// a2aBusJszPath). The session cap reads TASKS' max_consumers from it
+// (resolveA2ASessionCap).
 const a2aBusJszStreamsPath = "/jsz?streams=true&config=true"
 
 // a2aBusStream is one stream's state as the bus's /jsz reports it: what
-// the restore's rendered-limit check reads from the snapshot.
+// the restore's rendered-limit check reads from the snapshot, and the
+// stream's configured max_consumers, which the session cap is fitted to.
+// MaxConsumers is nil when the report carried no config for the stream.
 type a2aBusStream struct {
 	Bytes     int64
 	Msgs      int64
@@ -1931,6 +1934,9 @@ func busMigrationStreamsOverCapFrom(agent *agentv1alpha1.PlatformAgent, live map
 func (r *PlatformAgentReconciler) a2aBusStreamState(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 	if r.busStreamState != nil {
 		return r.busStreamState(ctx, agent)
+	}
+	if a2aBusStreamStateDefault != nil {
+		return a2aBusStreamStateDefault(ctx, agent)
 	}
 	ctx, cancel := context.WithTimeout(ctx, a2aBusVarzTimeout)
 	defer cancel()

@@ -72,6 +72,9 @@ PROFILE_HOOK_MODULE_NAME = "bench_profile_hook"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
+# The runner's reader of `scope_hold:` (hack/ci-eval-pr.sh), loaded the same way.
+SCOPE_HOLD_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_hold.py"
+SCOPE_HOLD_MODULE_NAME = "bench_scope_hold"
 # The top-level key a case declares its total of requested pull requests under
 # (bench/kube_agents_bench/lane.py's REQUESTED_KEY); the check types that request a
 # pull request, as lane.py's REQUESTING_CHECK_TYPES names them; and the keys a check
@@ -356,6 +359,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Its harness applied the merged fix to a shared planted defect, which the
+    # read-only fleet refuses and about thirty other cases read. It needs a fixture of
+    # its own and Config Sync to apply the merge, as a customer's reconciler would.
+    "post-merge-verified-fixed": (
+        "#6905: needs its own no-PDB workload and a Config Sync reconciler on the seeded fleet"
+    ),
     # Needs a pool with a live node whose surge node, or green pool, draws more
     # of a regional quota than the project has left. GKE bounds the surge by
     # the pool's live nodes, so a zero-node pool is not a fixture; the suite's
@@ -382,17 +391,6 @@ FIXTURE_NOT_READY = {
     # hack/eval/sized-fleet-cases.txt until the pool carries it.
     "chat-routing-fleet-question-sized": (
         "#3753: needs the sized test fleet, which runs in its own project and is not on the eval pool"
-    ),
-    # Needs Config Sync's RootSync CRD and one root-sync object reporting
-    # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
-    # API, so Config Sync is installed nowhere, and the seeded fleet plants no
-    # custom resource. The CRD alone is enough (no operator): apply the
-    # upstream CRD, create the object, write its status with
-    # `kubectl patch --subresource=status`. #2580's "Fixture & Eval" section
-    # specifies the object.
-    "compliance-configsync-stalled": (
-        "#2580: needs the Config Sync RootSync CRD and a Stalled root-sync object "
-        "on a seeded cluster; no pool project runs Config Sync"
     ),
     # Needs a GitOps repository that declares the namespace under a path a
     # reconciler syncs; no pool project's repository has one. Run by hand on
@@ -926,6 +924,15 @@ def scope_exclude_reader() -> Any:
     spec = importlib.util.spec_from_file_location(SCOPE_EXCLUDE_MODULE_NAME, SCOPE_EXCLUDE_FILE)
     if spec is None or spec.loader is None:
         raise CaseError(f"{SCOPE_EXCLUDE_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def scope_hold_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(SCOPE_HOLD_MODULE_NAME, SCOPE_HOLD_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{SCOPE_HOLD_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -1713,6 +1720,18 @@ def validate_case(
                 )
             elif set(slots) >= catalog:
                 problems.append("'scope_exclude:' excludes every seeded slot; leave at least one in scope")
+
+    # The hold a case puts on the install (agent_cluster, all, a reason). The
+    # runner runs a holding case alone after every other unit, in a loop of its
+    # own; a case that also excluded scope would run twice, once in each loop.
+    if "scope_hold" in spec:
+        reader = scope_hold_reader()
+        try:
+            reader.declared_hold(path)
+        except reader.ScopeHoldError as exc:
+            problems.append(f"{exc}")
+        if "scope_exclude" in spec:
+            problems.append("'scope_hold:' and 'scope_exclude:' in one case: the runner runs each in a phase of its own; declare one")
 
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses

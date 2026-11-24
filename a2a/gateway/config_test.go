@@ -55,6 +55,13 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
 	t.Setenv("A2A_SLACK_ALLOWED_USERS", "")
 	t.Setenv("A2A_SLACK_ALLOW_ALL_USERS", "")
+	t.Setenv("A2A_TEAMS_RELAY_URL", "")
+	t.Setenv("A2A_TEAMS_TOKEN_PATH", "")
+	t.Setenv("A2A_TEAMS_ALLOWED_USERS", "")
+	t.Setenv("A2A_TEAMS_ALLOW_ALL_USERS", "")
+	t.Setenv("A2A_TEAMS_HOME_CHANNEL", "")
+	t.Setenv("A2A_TEAMS_TENANT_ID", "")
+	t.Setenv("A2A_TEAMS_ADAPTIVE_CARDS", "")
 	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
 	t.Setenv("A2A_INJECT_LISTEN", "")
 	t.Setenv("A2A_INJECT_TOKEN", "")
@@ -288,6 +295,36 @@ func TestFromEnvTaskDeadline(t *testing.T) {
 		t.Setenv("A2A_TASK_DEADLINE_SECONDS", bad)
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_TASK_DEADLINE_SECONDS=%q accepted", bad)
+		}
+	}
+}
+
+// TestFromEnvKubectlCostTier: A2A_KUBECTL_COST_TIER, which the operator
+// forwards normalised, reaches KubectlCostTier only as a plain lowercase tier
+// name; anything else is dropped, and the session pod's admission charges its
+// default tier.
+func TestFromEnvKubectlCostTier(t *testing.T) {
+	setBaseEnv(t)
+	for raw, want := range map[string]string{
+		"":                      "",
+		"fleet":                 "fleet",
+		" fleet-2\n":            "fleet-2",
+		"Fleet":                 "",
+		"2fleet":                "",
+		"-fleet":                "",
+		"fleet_x":               "",
+		"../fleet":              "",
+		"fl\u00e9et":            "",
+		strings.Repeat("a", 32): strings.Repeat("a", 32),
+		strings.Repeat("a", 33): "",
+	} {
+		t.Setenv("A2A_KUBECTL_COST_TIER", raw)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.KubectlCostTier != want {
+			t.Errorf("A2A_KUBECTL_COST_TIER=%q: KubectlCostTier = %q, want %q", raw, cfg.KubectlCostTier, want)
 		}
 	}
 }
@@ -634,6 +671,59 @@ func TestFromEnvGchatBackendSelection(t *testing.T) {
 	}
 	if !cfg.GchatAllowAllUsers {
 		t.Fatal("A2A_GCHAT_ALLOW_ALL_USERS=true not honored")
+	}
+}
+
+// TestFromEnvTeamsBackendSelection: the Teams relay URL selects the teams
+// backend; the token path defaults to the chat relay's projected token (one
+// audience serves both relays); the allowlist is split, trimmed and
+// case-preserved; allow-all is off unless stated; cards are on unless
+// A2A_TEAMS_ADAPTIVE_CARDS is exactly "false"; home and tenant are trimmed.
+func TestFromEnvTeamsBackendSelection(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("A2A_TEAMS_RELAY_URL", " http://relay.ns.svc:8081 ")
+	t.Setenv("A2A_TEAMS_ALLOWED_USERS", "05E62547-5ee7-41be-9639-155d9212be8f, 29:1abc ,")
+	t.Setenv("A2A_TEAMS_HOME_CHANNEL", " 19:abc@thread.tacv2 ")
+	t.Setenv("A2A_TEAMS_TENANT_ID", " 759d68f0 ")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "teams" {
+		t.Fatalf("Backend() = %q, want teams", cfg.Backend())
+	}
+	if cfg.TeamsRelayURL != "http://relay.ns.svc:8081" {
+		t.Fatalf("relay URL = %q", cfg.TeamsRelayURL)
+	}
+	if cfg.TeamsTokenPath != "/var/run/secrets/a2a-chat-relay/token" {
+		t.Fatalf("token path default = %q", cfg.TeamsTokenPath)
+	}
+	if len(cfg.TeamsAllowedUsers) != 2 || cfg.TeamsAllowedUsers[0] != "05E62547-5ee7-41be-9639-155d9212be8f" || cfg.TeamsAllowedUsers[1] != "29:1abc" {
+		t.Fatalf("allowed users = %v", cfg.TeamsAllowedUsers)
+	}
+	if cfg.TeamsAllowAllUsers {
+		t.Fatal("allow-all must be off unless stated")
+	}
+	if cfg.TeamsHomeChannel != "19:abc@thread.tacv2" || cfg.TeamsTenantID != "759d68f0" {
+		t.Fatalf("home %q tenant %q", cfg.TeamsHomeChannel, cfg.TeamsTenantID)
+	}
+	if !cfg.TeamsAdaptiveCards {
+		t.Fatal("cards must be on unless stated")
+	}
+	t.Setenv("A2A_TEAMS_ALLOW_ALL_USERS", "true")
+	t.Setenv("A2A_TEAMS_ADAPTIVE_CARDS", "false")
+	t.Setenv("A2A_TEAMS_TOKEN_PATH", "/var/run/secrets/teams/token")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TeamsAllowAllUsers || cfg.TeamsAdaptiveCards || cfg.TeamsTokenPath != "/var/run/secrets/teams/token" {
+		t.Fatalf("allow-all %v cards %v token path %q", cfg.TeamsAllowAllUsers, cfg.TeamsAdaptiveCards, cfg.TeamsTokenPath)
+	}
+	t.Setenv("A2A_TEAMS_ADAPTIVE_CARDS", "off")
+	if cfg, err = FromEnv(); err != nil || !cfg.TeamsAdaptiveCards {
+		t.Fatalf("only the word false turns cards off: cards %v err %v", cfg.TeamsAdaptiveCards, err)
 	}
 }
 

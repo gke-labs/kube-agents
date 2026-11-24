@@ -123,6 +123,12 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
         )
 
     if agent_id.lower() == "platform":
+        # No profile mounts this tool now, so this default has no caller. It is
+        # a Service URL, which a caller on another pod can use, so it differs
+        # from the loopback default of the callers on the gateway's pod
+        # (session_kv_server's PLATFORM_API_URL_DEFAULT). It does not follow the
+        # endpoint that the operator publishes, which is http with the Service
+        # name and the namespace of the PlatformAgent.
         endpoint = (
             os.environ.get("PLATFORM_API_URL")
             or "https://platform-agent.kubeagents-system.svc.cluster.local:8642"

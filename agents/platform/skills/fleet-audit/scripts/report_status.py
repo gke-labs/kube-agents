@@ -99,6 +99,28 @@ LATEST_KEYS = (
     "collect_s",
 )
 
+# A shadow run's envelope carries this (#5623; audit_report.py's shadow runs,
+# `finish --store-only`): its stream is a canary's, not a live audit's, so
+# readers hide it unless asked. The writer's contract is what makes reading
+# the newest envelope enough: a shadow run writes only to a stream of its
+# own (the schedule's name, or `<audit>-shadow`) and never to a live audit's,
+# which its writer refuses, so a stream's newest envelope says what the
+# whole stream is.
+SHADOW_KEY = "shadow"
+
+
+def stream_is_shadow(stream: dict) -> bool:
+    """Whether a projected stream is a shadow run's: its newest envelope in any repository says so.
+
+    A stream whose envelopes can't be read can't be told apart, and stays in
+    as unreadable: unknown is never clean.
+    """
+    return any(
+        isinstance(entry, dict) and (entry.get("latest") or {}).get(SHADOW_KEY) is True
+        for entry in (stream.get("repos") or {}).values()
+    )
+
+
 # Keys the projection never carries. `document` is the whole findings document
 # and runs to megabytes; `ledger_body` is the rendered issue body, which is
 # `finish`'s memory and not a status; the three id lists are summarised as
@@ -503,12 +525,18 @@ def project(
     root: str | None = None,
     now: float | datetime | None = None,
     scratch: str | None = None,
+    *,
+    include_shadow: bool = False,
 ) -> dict:
     """The whole store as one document the view can render off-pod.
 
     One unreadable stream may not cost the others, so each stream's reads are
     wrapped and a failure becomes that stream's `error` plus `liveness:
     "error"` while the sweep continues.
+
+    A shadow run's stream (`stream_is_shadow`) is left out unless
+    `include_shadow`, so nothing that reports the fleet's audits shows a
+    canary's results as a live audit's; `shadow_hidden` counts what was left out.
     """
     if not isinstance(root, BrokerReportStore):
         root = reports_root(root)
@@ -533,6 +561,16 @@ def project(
     except OSError as exc:
         in_flight, lease_error = [], _failure(f"{scratch}/", exc)
     ids = sorted(set(ids) | set(in_flight))
+    streams = {
+        audit_id: project_stream(root, scratch, audit_id, now_epoch, lease_error)
+        for audit_id in ids
+    }
+    hidden = 0
+    if not include_shadow:
+        shadow = [audit_id for audit_id, stream in streams.items() if stream_is_shadow(stream)]
+        for audit_id in shadow:
+            del streams[audit_id]
+        hidden = len(shadow)
     return {
         "root": str(root),
         "root_exists": root_exists,
@@ -543,10 +581,8 @@ def project(
         # stream to carry it, and a first run in flight is exactly what the
         # unlisted scratch directory would have shown.
         "lease_error": lease_error,
-        "streams": {
-            audit_id: project_stream(root, scratch, audit_id, now_epoch, lease_error)
-            for audit_id in ids
-        },
+        "streams": streams,
+        "shadow_hidden": hidden,
     }
 
 
@@ -756,6 +792,10 @@ MAX_ANSWER_BODY_BYTES = 4096
 #: Left in a local stream directory once its envelopes are copied into the
 #: broker store, so the copy happens once.
 SEED_MARKER_NAME = ".seeded-to-broker"
+#: How many ring entries the store listener keeps per stream
+#: (audit_report_store.REPORT_HISTORY): a PUT past it prunes the oldest. The
+#: seed skips a local entry the listener would prune at once.
+BROKER_RING_SIZE = 14
 
 
 class ReportStoreError(OSError):
@@ -872,9 +912,9 @@ class BrokerReportStore(str):
     `latest` that is not a byte copy of a ring entry.
 
     `local_root` is a file store on this pod, if there is one (the shell
-    sandbox's, from before the switch). A stream it holds that the broker
-    store does not is copied in once, the first time this client touches that
-    stream (`_maybe_seed`).
+    sandbox's, from before the switch). The entries of a stream it holds that
+    the broker store lacks are copied in once, the first time this client
+    touches that stream (`_maybe_seed`).
     """
 
     url: str
@@ -1041,14 +1081,17 @@ class BrokerReportStore(str):
         Only when there is a local file store holding the stream and it
         carries no SEED_MARKER_NAME. Under an flock on the local stream
         directory, so two seeds on this pod (and a `finish` here, whose writes
-        seed first) take turns. Then, by what the broker's ring holds:
-
-        - nothing, or only stamps the local ring holds (a seed that stopped
-          part way): the local entries it lacks, newer than its newest, go
-          oldest first, then `latest.json` (`_seed_latest`), then the marker;
-        - stamps the local ring does not hold (a run wrote there since): when
-          every local entry is already in it, the marker alone, so later runs
-          skip the reads; otherwise nothing is copied and nothing marked.
+        seed first) take turns. Each attempt copies every local ring entry the
+        broker's ring lacks, oldest first, whatever other stamps the broker
+        holds (a run that wrote there since: a profile worker, or this shell's
+        own `finish`). The one exception is an entry the listener would prune
+        at once: with the broker's ring at BROKER_RING_SIZE, one older than its
+        oldest is skipped and counted as done. Then `latest.json`
+        (`_seed_latest`, which never rolls the broker's `latest` back), then
+        the marker, once every local entry is on the broker or skipped,
+        including when there was nothing to copy. A PUT of a stamp the broker
+        already holds rewrites the same bytes, so a copy repeated after a lost
+        answer is harmless.
 
         Never deletes or changes a local envelope. A stream whose writes the
         broker refuses (403: a repository the install does not register) is
@@ -1056,11 +1099,11 @@ class BrokerReportStore(str):
         seed it. A broker that cannot be used now (ReportStoreUnavailable)
         raises out of here, and the stream is not counted as checked: the read
         or write that touched it fails as an outage, rather than read a stream
-        part copied as a first run or land a run on it (which would leave the
-        broker's ring with a stamp the local one lacks, and nothing left
-        copied ever after), and the next touch in this process tries again.
-        Any other failure is logged and left for the next run, which resumes
-        where this one stopped.
+        part copied as a first run, and the next touch in this process tries
+        again. Any other failure (a refusal other than the per-entry 400 or
+        413, a local file that cannot be read) is logged with no marker, and
+        the touch goes on; the next process's seed resumes and finishes it,
+        whatever the broker was written in between.
         """
         try:
             key = (audit_id, broker_store_key(repo))
@@ -1116,20 +1159,23 @@ class BrokerReportStore(str):
         if not runs and latest is None:
             return
         copied = 0
+        pruned = 0
         try:
             remote = self._ring(audit_id, repo)
-            if not set(remote) <= set(runs):
-                # A run wrote this stream through the broker since: its ring is
-                # not a partial copy of the local one, so nothing is resumed.
-                if set(runs) <= set(remote):
-                    self._leave_marker(local, label, {"seeded_to": self.url, "runs": 0, "latest": False})
-                return
             if not remote and self._get_latest(audit_id, repo) is not None:
                 # A `latest` with no ring is no state the listener writes;
                 # leave it to a run rather than guess.
                 return
-            missing = [name for name in runs if name not in remote and (not remote or name > remote[-1])]
-            for name in missing:
+            # The broker's ring as each PUT leaves it: the listener keeps the
+            # newest BROKER_RING_SIZE entries.
+            ring = list(remote)
+            for name in runs:
+                if name in ring:
+                    continue
+                if len(ring) >= BROKER_RING_SIZE and name < ring[0]:
+                    # Pruned the moment it landed: as good as copied.
+                    pruned += 1
+                    continue
                 with open(os.path.join(local, RUNS_DIR, name), "rb") as handle:
                     data = handle.read()
                 try:
@@ -1141,13 +1187,21 @@ class BrokerReportStore(str):
                             f"(HTTP 403: a repository this install does not register)"
                         )
                         return
-                    if exc.status in (400, 409, 413) and not isinstance(exc, ReportStoreUnavailable):
-                        # This one entry: not JSON, too large, or stamped in
-                        # the future. The rest of the ring still copies.
+                    if exc.status == 409 and not isinstance(exc, ReportStoreUnavailable):
+                        # The listener's 409 on a run write is about the whole
+                        # stream (a symlink on its path, a full directory, an
+                        # oversized stored entry), not this entry: stop with no
+                        # marker, so a seed after the store is fixed copies it.
+                        self._log(f"report store: not seeding {label} into the broker: it refused runs/{name} ({exc})")
+                        return
+                    if exc.status in (400, 413) and not isinstance(exc, ReportStoreUnavailable):
+                        # This one entry: not JSON, stamped in the future (400),
+                        # or too large (413). The rest of the ring still copies.
                         self._log(f"report store: seeding {label}: skipped runs/{name} ({exc})")
                         continue
                     raise
                 copied += 1
+                ring = sorted({*ring, name})[-BROKER_RING_SIZE:]
             latest_copied = self._seed_latest(audit_id, repo, local, runs, latest)
         except ReportStoreUnavailable as exc:
             self._log(
@@ -1162,10 +1216,13 @@ class BrokerReportStore(str):
             )
             return
         self._streams = None
-        self._leave_marker(local, label, {"seeded_to": self.url, "runs": copied, "latest": latest_copied})
+        self._leave_marker(
+            local, label, {"seeded_to": self.url, "runs": copied, "pruned": pruned, "latest": latest_copied}
+        )
         self._log(
             f"report store: seeded {label} into the broker from {local}: {copied} run(s), "
-            f"latest {'copied' if latest_copied else 'not copied'}"
+            + (f"{pruned} older than the broker's ring skipped, " if pruned else "")
+            + f"latest {'copied' if latest_copied else 'not copied'}"
         )
 
     def _get_latest(self, audit_id: str, repo: str) -> bytes | None:
@@ -1176,12 +1233,13 @@ class BrokerReportStore(str):
 
     def _seed_latest(self, audit_id: str, repo: str, local: str, runs: list[str], latest: bytes | None) -> bool:
         """PUT the local `latest.json` when it is a byte copy of the newest local
-        entry and the broker has nothing newer; whether it was written.
+        entry, the broker's newest ring entry is that same run, and the broker
+        has no `latest`; whether the broker's `latest` is now this one.
 
-        Checked again just before the write: a run that landed through the
-        broker since (a ring entry newer than the newest local one, or a
-        `latest` that is not this one) keeps its own, so a seed never rolls
-        `latest` back.
+        Checked just before the write: a run that landed through the broker
+        (a ring entry newer than the newest local one, or a `latest` that is
+        not this one), whether before this seed began or while it copied,
+        keeps its own, so a seed never rolls `latest` back.
         """
         if latest is None or not runs:
             return False
@@ -1267,10 +1325,20 @@ def main(argv: list[str] | None = None) -> int:
         "--scratch",
         help=f"in-flight note directory (default: $FLEET_AUDIT_SCRATCH_DIR or {SCRATCH_DIR})",
     )
+    parser.add_argument(
+        "--include-shadow",
+        action="store_true",
+        help="also project shadow runs' streams (a canary's, not a live audit's)",
+    )
     args = parser.parse_args(argv)
     # Exit 0 even with no store: `root_exists: false` is the answer, and the
     # view decides what a missing store costs.
-    print(json.dumps(project(report_store(args.root), scratch=args.scratch), sort_keys=True))
+    print(
+        json.dumps(
+            project(report_store(args.root), scratch=args.scratch, include_shadow=args.include_shadow),
+            sort_keys=True,
+        )
+    )
     return 0
 
 

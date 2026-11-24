@@ -45,6 +45,7 @@ func TestMain(m *testing.M) {
 		"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL",
 		"A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP",
 		"A2A_SPAWN_SESSIONS", "A2A_SESSION_SERVICE_ACCOUNT", "A2A_DEFAULT_ADDRESSEE",
+		"A2A_TEAMS_RELAY_URL",
 	} {
 		os.Unsetenv(k)
 	}
@@ -597,6 +598,56 @@ func TestRealMainWiresMetrics(t *testing.T) {
 	t.Setenv("A2A_SESSION_SERVICE_ACCOUNT", "")
 	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
 
+	waitForRisingMetric(t, metricsPort, "kubeagents_a2a_gateway_gchat_pulls_total{outcome=\"empty\"} ")
+}
+
+// The Teams backend is handed the same counters: with only the Teams relay
+// armed, its empty pulls rise on the metrics listener. Without the wiring in
+// buildBackendAdapters every Teams series stays flat and nothing else fails.
+func TestRealMainWiresTeamsMetrics(t *testing.T) {
+	s := startJetStreamTestServer(t)
+	url := s.ClientURL()
+	provisionTasksStream(t, url)
+
+	relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/chat/teams/events" && r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"event":null}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(relaySrv.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "teams-token")
+	if err := os.WriteFile(tokenFile, []byte("test-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	metricsPort := freePort(t)
+
+	t.Setenv("NATS_URL", url)
+	t.Setenv("SESSION_KV_SALT", "test-salt")
+	t.Setenv("A2A_TEAMS_RELAY_URL", relaySrv.URL)
+	t.Setenv("A2A_TEAMS_TOKEN_PATH", tokenFile)
+	t.Setenv("A2A_GCHAT_RELAY_URL", "")
+	t.Setenv("A2A_METRICS_PORT", fmt.Sprintf("%d", metricsPort))
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
+	t.Setenv("A2A_SPAWN_SESSIONS", "")
+	t.Setenv("A2A_SESSION_SERVICE_ACCOUNT", "")
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
+
+	waitForRisingMetric(t, metricsPort, "kubeagents_a2a_gateway_teams_pulls_total{outcome=\"empty\"} ")
+}
+
+// waitForRisingMetric runs realMain under the environment the caller set and
+// waits for the series named by metricPrefix to leave zero on the metrics
+// listener, then cancels and checks realMain returned cleanly.
+func waitForRisingMetric(t *testing.T, metricsPort int, metricPrefix string) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -610,7 +661,6 @@ func TestRealMainWiresMetrics(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	found := false
-	metricPrefix := "kubeagents_a2a_gateway_gchat_pulls_total{outcome=\"empty\"} "
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-errCh:

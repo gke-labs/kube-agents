@@ -11,6 +11,13 @@ type CallerIdentity struct {
 	Username string
 	UID      string
 	Groups   []string
+	// Partition is a verified tenant or namespace the authenticator read from the caller's
+	// credential, for a Config.CallerPartition that separates callers by it; empty when the
+	// authenticator names none.
+	Partition string
+	// Authenticator names the authenticator that admitted the caller, for a deployment
+	// with more than one; empty when the embedder's authenticator does not say.
+	Authenticator string
 }
 
 // ErrAuthenticationUnavailable is the error a CallerAuthenticator wraps when it could not

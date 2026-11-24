@@ -89,6 +89,10 @@ _ORACLE_CASES = (
 )
 
 _EXEC_VALUE = "platformAgent.deployment.credentialProxy.exec.replicas"
+_TEAMS_VALUE = "platformAgent.integration.teams.enabled"
+_TEAMS_INBOUND_VALUE = "platformAgent.integration.teams.inbound.enabled"
+_TEAMS_TENANT_VALUE = "platformAgent.integration.teams.tenantId"
+_TEAMS_TENANT = "759d68f0-65ed-44cd-8487-ce6221b72b2a"
 
 _PROBE_TEMPLATE = """
 {{- if .Values.probe.emitRequirements }}
@@ -439,6 +443,40 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * two_gib)
         self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * two_gib)
         self.assertEqual(three["limitsMemory"] - base["limitsMemory"], 3 * 2 * 1024**3)
+
+    def test_the_teams_inbound_receiver_adds_one_pod_while_its_switch_is_on(self) -> None:
+        """platformAgent.integration.teams.inbound.enabled beside teams.enabled adds the
+        receiver pod at the footprint's per-pod entry (50m/64Mi requests, 200m/128Mi
+        limits, no ephemeral storage); the inbound switch alone, with Teams off, adds
+        nothing, as the operator renders nothing then."""
+        base = self._requirements()
+        self.assertEqual(self._requirements([f"{_TEAMS_INBOUND_VALUE}=true"]), base)
+        on = self._requirements([f"{_TEAMS_VALUE}=true", f"{_TEAMS_TENANT_VALUE}={_TEAMS_TENANT}", f"{_TEAMS_INBOUND_VALUE}=true"])
+        per = yaml.safe_load(_FOOTPRINT.read_text())["operatorRenderedPerReplica"]["teamsInboundReceiver"]
+        for key, field in (("pods", "pods"), ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+                           ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+                           ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+                           ("limitsEphemeral", "ephemeralStorageBytesLimit")):
+            self.assertEqual(on[key] - base[key], per[field], key)
+        self.assertEqual(per["pods"], 1)
+        self.assertEqual(per["cpuMillisRequest"], 50)
+        self.assertEqual(per["ephemeralStorageBytesLimit"], 0)
+        self.assertEqual(on["persistentVolumeClaims"], base["persistentVolumeClaims"])
+
+    def test_the_teams_inbound_receiver_without_its_footprint_entry_fails_the_render(self) -> None:
+        footprint = self.chart / "files" / "footprint.yaml"
+        original = footprint.read_text()
+        try:
+            data = yaml.safe_load(original)
+            data["operatorRenderedPerReplica"].pop("teamsInboundReceiver")
+            footprint.write_text(yaml.safe_dump(data))
+            self.assertEqual(self._render({"probe": {"emitRequirements": True}}).returncode, 0)
+            res = self._render({"probe": {"emitRequirements": True}},
+                               [f"{_TEAMS_VALUE}=true", f"{_TEAMS_TENANT_VALUE}={_TEAMS_TENANT}", f"{_TEAMS_INBOUND_VALUE}=true"])
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("operatorRenderedPerReplica.teamsInboundReceiver", res.stderr)
+        finally:
+            footprint.write_text(original)
 
     def test_exec_tier_without_its_footprint_entry_fails_the_render(self) -> None:
         footprint = self.chart / "files" / "footprint.yaml"

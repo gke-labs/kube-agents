@@ -198,6 +198,8 @@ func verifiedByFor(backend string) string {
 		return gchatVerifiedBy
 	case consoleBackend:
 		return consoleVerifiedBy
+	case teamsBackend:
+		return teamsVerifiedBy
 	case slackBackend:
 		// The map-joined case. A Slack requester's mechanism depends on its
 		// principal, so the authority path asks verifiedByOf, which sends
@@ -237,7 +239,7 @@ func verifiedByFor(backend string) string {
 // everywhere else (Discord's ConfigMap).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
-	case gchatBackend:
+	case gchatBackend, teamsBackend:
 		return "the allowed users list"
 	case slackBackend:
 		// The list is the gate; the map is named too for the one refusal it
@@ -1801,6 +1803,14 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 		return ""
 	case slackBackend:
 		return g.resolveSlackPrincipal(authorID)
+	case teamsBackend:
+		// Chat's rule carried to Teams: the backend-asserted Entra object id
+		// is the principal, gated by the allowlist alone, compared lowercased
+		// (an object id is a GUID; Teams spells it lowercase).
+		if g.teamsAllowAll || g.teamsAllowed[strings.ToLower(authorID)] {
+			return authorID
+		}
+		return ""
 	}
 	return g.pm.Resolve(authorID)
 }

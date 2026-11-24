@@ -2,6 +2,8 @@ package persona
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,8 +61,15 @@ var (
 
 // Load reads and validates the persona directory dir. A validation failure
 // is an *InvalidError listing every problem found; any other error is I/O.
+// A persona that ships an IntegrityManifestFile has its content checked
+// against it; one that doesn't loads as IntegrityUnverified.
 func Load(dir string) (*Persona, error) {
-	l := &loader{dir: dir}
+	return LoadWithOptions(dir, Options{})
+}
+
+// LoadWithOptions is Load with what Options change.
+func LoadWithOptions(dir string, opts Options) (*Persona, error) {
+	l := &loader{dir: dir, opts: opts}
 	p := l.load()
 	if l.err != nil {
 		return nil, l.err
@@ -72,7 +81,15 @@ func Load(dir string) (*Persona, error) {
 }
 
 type loader struct {
-	dir      string
+	dir  string
+	opts Options
+	// scope limits the integrity check to the paths it selects (CheckTree);
+	// nil covers everything, as Load does.
+	scope func(rel string) bool
+	// readSums are the SHA-256 digests of the bytes readFile returned, by
+	// persona-relative path: the integrity check compares what was read and
+	// will be rendered, not a second read of the file.
+	readSums map[string]string
 	imports  []pendingImport
 	problems []Problem
 	err      error
@@ -89,7 +106,7 @@ func (l *loader) load() *Persona {
 		l.err = err
 		return nil
 	}
-	known := map[string]bool{ManifestFile: true, InstructionsFile: true, SkillsDir: true, MCPFile: true, ReadmeFile: true}
+	known := map[string]bool{ManifestFile: true, InstructionsFile: true, SkillsDir: true, MCPFile: true, ReadmeFile: true, IntegrityManifestFile: true}
 	for _, e := range entries {
 		// README.md is never read, so its symlink check is here; the files
 		// that are read get theirs at the open.
@@ -97,8 +114,8 @@ func (l *loader) load() *Persona {
 			l.add(e.Name(), "", "is not a regular file (symlinks and devices are refused)")
 		}
 		if !known[e.Name()] {
-			l.add(e.Name(), "", "not part of the persona format (%s, %s, %s/, %s or %s)",
-				ManifestFile, InstructionsFile, SkillsDir, MCPFile, ReadmeFile)
+			l.add(e.Name(), "", "not part of the persona format (%s, %s, %s/, %s, %s or %s)",
+				ManifestFile, InstructionsFile, SkillsDir, MCPFile, ReadmeFile, IntegrityManifestFile)
 		}
 	}
 	p := &Persona{}
@@ -131,6 +148,12 @@ func (l *loader) load() *Persona {
 		p.Instructions = string(data)
 	}
 	p.Skills = l.skills()
+	if l.err != nil {
+		return nil
+	}
+	// After every read, so the files checked against the manifest are the
+	// bytes this persona renders from.
+	p.Integrity, p.IntegrityFiles = l.checkIntegrity(l.opts.RequireIntegrity)
 	if l.err != nil {
 		return nil
 	}
@@ -197,6 +220,11 @@ func (l *loader) readFile(rel, full string) (data []byte, ok, missing bool) {
 		l.add(rel, "", "the persona passes %d bytes in total", maxTotalBytes)
 		return nil, false, false
 	}
+	if l.readSums == nil {
+		l.readSums = map[string]string{}
+	}
+	sum := sha256.Sum256(data)
+	l.readSums[rel] = hex.EncodeToString(sum[:])
 	return data, true, false
 }
 

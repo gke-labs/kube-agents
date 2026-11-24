@@ -1261,6 +1261,10 @@ type turnWatch struct {
 	unpin func()
 	// resultSeen is signalled on each result frame recorded in results.
 	resultSeen chan struct{}
+	// beforeSnapshot, when set, runs in gatherReports between its read of
+	// what ends the gathering and its read of the buffer. Tests set it, to
+	// place a report, a result or the end of the wait between the two.
+	beforeSnapshot func()
 	// release hands back the conversation's send lock. A turn holds it from
 	// before it is sent until the watch closes, after its answer is read, so
 	// a second turn on the conversation is sent only once this one is done:
@@ -1283,6 +1287,9 @@ type turnWatch struct {
 	// each names (its taskId, or the r-<task> of its message id): whether
 	// any said cards are pending. Bounded by maxTurnResults.
 	results map[string]bool
+	// kinds is the bus's record of how its tasks were learned, which
+	// noticedTask and follow write to; nil records nothing.
+	kinds *taskKinds
 }
 
 // maxTurnResults bounds the result frames one turn records; past it a new
@@ -1357,6 +1364,7 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 		stop:         make(chan struct{}),
 		results:      map[string]bool{},
 		resultSeen:   make(chan struct{}, 1),
+		kinds:        &b.kinds,
 	}
 	// Submissions are every addressee's .in traffic, drained by the turn's
 	// matcher and then its follower. A settled turn has neither, and an
@@ -1794,13 +1802,13 @@ func submissionWithCorrelation(m *nats.Msg) (ref TaskRef, a submissionAuthority,
 	if json.Unmarshal(env.Payload, &msg) != nil {
 		return
 	}
+	// No kind: a message on .in is a new session or platform task, or the
+	// gateway's steer into a running task, a profile's included (steerTask),
+	// and the two read alike here. A caller that can tell says so
+	// (taskKinds).
 	return TaskRef{Addressee: parts[submissionAddressee], TaskID: env.TaskID}, a, strings.TrimSpace(partsText(msg.Parts)), env.CorrelationID, true
 }
 
-// ownSubmission reports whether m carries this turn: a message in this
-// conversation, not delegated from another task, with this turn's text. A
-// message for a task already running is the gateway sending the text into
-// it, and that task is where the turn's answer is.
 // noticedTask is the task an addressed turn's status line names: a fresh
 // notice (no kind, not an edit) carrying the task's id, the profile it was
 // published to, and this turn's own frame id (InReplyTo). Only the gateway
@@ -1820,9 +1828,17 @@ func (w *turnWatch) noticedTask(m *nats.Msg) (TaskRef, bool) {
 	w.mu.Lock()
 	w.known[f.TaskID] = true
 	w.mu.Unlock()
-	return TaskRef{Addressee: f.Addressee, TaskID: f.TaskID}, true
+	ref := TaskRef{Addressee: f.Addressee, TaskID: f.TaskID}
+	w.kinds.note(ref, TaskKindProfile)
+	return ref, true
 }
 
+// ownSubmission reports whether m carries this turn: a message in this
+// conversation, not delegated from another task, with this turn's text. A
+// message for a task already running is the gateway sending the text into
+// it, and that task is where the turn's answer is. That task can be a
+// profile's (steerTask publishes on its .in), so the match learns no kind,
+// and the directory decides (refIsProfile).
 func (w *turnWatch) ownSubmission(m *nats.Msg) (TaskRef, bool) {
 	ref, a, text, corr, ok := submissionWithCorrelation(m)
 	if !ok || a.Audience.Conversation != w.conversation || a.Via != nil || !slices.Contains(w.texts, text) {
@@ -1861,6 +1877,10 @@ func (w *turnWatch) follow() {
 			if linked && !w.known[ref.TaskID] && len(w.followed) < maxFollowedTasks {
 				w.known[ref.TaskID] = true
 				w.followed = append(w.followed, ref)
+				// A task delegated in the chain and submitted on .in is a
+				// session's or the platform agent's: a profile's child is
+				// submitted on a2a.submit, out of this server's sight.
+				w.kinds.note(ref, TaskKindSession)
 			}
 			w.mu.Unlock()
 		}
@@ -2587,6 +2607,12 @@ func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) 
 // nothing reliable about whether it is the last, so nothing in its text ends
 // the gathering. When the tasks had not ended, it takes what is already
 // here.
+//
+// Whatever ends the gathering is read before the buffer is, so a report the
+// listener kept before the root's result was noted, the wait ran out or the
+// quiet period passed is among the reports returned. Read the other way
+// round, a report kept between the two reads was left out of a turn that
+// had heard it.
 func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutcome, ended bool) {
 	if b.events == nil {
 		return
@@ -2594,7 +2620,16 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 	quiet := time.NewTimer(reportQuiet)
 	defer quiet.Stop()
 	var last uint64
+	quietOver := false
 	for {
+		// The root's result says whether the chain handed work to cards:
+		// without it nothing more is coming, with it a card's report may
+		// take a while. With no result heard, the quiet period decides.
+		seen, pending := w.rootResult(out.Root.TaskID)
+		waitOver := ctx.Err() != nil
+		if w.beforeSnapshot != nil {
+			w.beforeSnapshot()
+		}
 		page, changed := b.events.snapshot(w.token)
 		out.Reports, out.ReportCursor = nil, page.Cursor
 		out.ReportsDropped = page.Dropped > 0 && page.DroppedNewest > w.since
@@ -2610,15 +2645,12 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 		if newest > last {
 			last = newest
 			quiet.Reset(reportQuiet)
+			quietOver = false
 		}
 		if !ended {
 			out.ReportsEnd = reportsRunning
 			return
 		}
-		// The root's result says whether the chain handed work to cards:
-		// without it nothing more is coming, with it a card's report may
-		// take a while. With no result heard, the quiet period decides.
-		seen, pending := w.rootResult(out.Root.TaskID)
 		if pending {
 			out.Cards = cardsPending
 		}
@@ -2626,19 +2658,21 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 		case seen && !pending:
 			out.Cards, out.ReportsEnd = cardsNone, reportsNoCards
 			return
-		case ctx.Err() != nil:
+		case waitOver:
 			out.ReportsEnd = reportsWaitOver
 			return
+		case quietOver:
+			out.ReportsEnd = reportsQuiet
+			return
 		}
+		// Each of these goes round again, so that the buffer is read after
+		// what ends the gathering.
 		select {
 		case <-changed:
 		case <-w.resultSeen:
 		case <-quiet.C:
-			out.ReportsEnd = reportsQuiet
-			return
+			quietOver = true
 		case <-ctx.Done():
-			out.ReportsEnd = reportsWaitOver
-			return
 		}
 	}
 }

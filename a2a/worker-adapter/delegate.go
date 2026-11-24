@@ -212,11 +212,16 @@ func taskDelegateSocket(base string) (string, error) {
 // it is, and rewrote reports whether the delegate server's entry was found.
 // Neither input is modified.
 func withDelegateSocket(argv, env []string, socket string) (out, outEnv []string, rewrote bool) {
+	return withDelegateSocketFor(claudeDriver{}, argv, env, socket)
+}
+
+// withDelegateSocketFor is withDelegateSocket for the harness d drives.
+func withDelegateSocketFor(d Driver, argv, env []string, socket string) (out, outEnv []string, rewrote bool) {
 	if env == nil {
 		env = os.Environ()
 	}
 	outEnv = append(slices.Clone(env), EnvDelegateSocket+"="+socket)
-	out, rewrote = withDelegateServerEnv(argv, EnvDelegateSocket, socket)
+	out, rewrote = d.WithDelegateServerEnv(argv, EnvDelegateSocket, socket)
 	return out, outEnv, rewrote
 }
 
@@ -225,6 +230,11 @@ func withDelegateSocket(argv, env []string, socket string) (out, outEnv []string
 // part, or one that doesn't parse, leaves argv as it is, and the server names
 // platform only. It reports whether the server's entry was found.
 func withDelegateTargets(argv []string, origin *lib.Envelope) ([]string, bool) {
+	return withDelegateTargetsFor(claudeDriver{}, argv, origin)
+}
+
+// withDelegateTargetsFor is withDelegateTargets for the harness d drives.
+func withDelegateTargetsFor(d Driver, argv []string, origin *lib.Envelope) ([]string, bool) {
 	var m lib.Message
 	if err := json.Unmarshal(origin.Payload, &m); err != nil {
 		return argv, false
@@ -237,7 +247,7 @@ func withDelegateTargets(argv []string, origin *lib.Envelope) ([]string, bool) {
 	if err != nil {
 		return argv, false
 	}
-	return withDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
+	return d.WithDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
 }
 
 // delegateWidthOf is the batch width the submission's delegateTargets part

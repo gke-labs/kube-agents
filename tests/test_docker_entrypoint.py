@@ -722,6 +722,49 @@ class ConfigBackfillTest(unittest.TestCase):
         )
 
 
+class ChatTemplateToolLockdownTest(unittest.TestCase):
+    """The tool lockdown the front-door chat profile ships with, per platform key.
+
+    `platform_toolsets` in agents/chat/config.yaml is the list Hermes resolves for the
+    platform a session arrived on. A key absent from it falls back to that platform's
+    base bundle, which leaves `agent.disabled_toolsets` as the only thing between a
+    message on that platform and the tools the image carries. The entrypoint seeds and
+    back-fills the live config from this template (step 2d), so what the template pins
+    is what a fresh install's front door starts with.
+    """
+
+    # The delegation surface: route the ask, file the card, and the memory provider.
+    _DELEGATION_SURFACE = ["kanban", "mcp-router", "memory"]
+    # The keys the template must pin: the CLI, the API server the A2A bridge posts to,
+    # and the two chat platforms the default profile can run itself.
+    _REQUIRED_PLATFORMS = ("cli", "api_server", "google_chat", "teams")
+
+    def setUp(self):
+        self.template = yaml.safe_load(_CHAT_TEMPLATE.read_text(encoding="utf-8"))
+        self.pins = self.template["platform_toolsets"]
+
+    def test_teams_is_pinned_to_the_delegation_surface(self):
+        """Microsoft Teams ingress resolves under `teams`; without the pin it would take
+        the base bundle."""
+        self.assertEqual(sorted(self.pins.get("teams", [])), self._DELEGATION_SURFACE)
+
+    def test_every_pinned_platform_carries_the_same_surface(self):
+        """One surface whichever platform the message came from: a required key that is
+        dropped, or any key given a wider list, is the same hole on that platform. A new
+        key pinned to the same surface is fine."""
+        self.assertEqual(set(self._REQUIRED_PLATFORMS) - set(self.pins), set())
+        for platform, toolsets in self.pins.items():
+            with self.subTest(platform=platform):
+                # Sorted, not a set: the order is incidental, a duplicate is not.
+                self.assertEqual(sorted(toolsets), self._DELEGATION_SURFACE)
+
+    def test_no_pinned_toolset_is_also_disabled(self):
+        """`agent.disabled_toolsets` is subtracted last, so a toolset on both lists nets
+        to off; for `memory` that hides the provider's tools from the model."""
+        disabled = set(self.template["agent"]["disabled_toolsets"])
+        self.assertEqual(disabled & set(self._DELEGATION_SURFACE), set())
+
+
 class RemoteMcpUserAgentRepairTest(unittest.TestCase):
     """The in-place repair of the remote MCP User-Agent in a profile's live config.yaml.
 
@@ -3222,9 +3265,7 @@ class TerminalEnvPinGateTest(unittest.TestCase):
         self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
 
 
-_TIRITH_CLEANUP_OPENER = (
-    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then'
-)
+_SCANNER_CLEANUP_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ]; then'
 
 
 def _entrypoint_readonly(name):
@@ -3235,33 +3276,28 @@ def _entrypoint_readonly(name):
     return match.group(1)
 
 
-class TirithCleanupTest(unittest.TestCase):
-    """Step 4.4 removes the tirith copies Hermes downloaded into each home.
+class StaleScannerCleanupTest(unittest.TestCase):
+    """Step 4.4 removes the command scanner copies earlier images left in each home.
 
-    Gated on the image's copy being what PATH resolves, which no host has, so every other
-    entrypoint test skips it. The block runs extracted, with IMAGE_TIRITH pointed at a stub
-    first on PATH. It must never execute a candidate: the files sit on a volume the agent's
-    workers can write.
+    The block runs extracted. It must never execute a candidate: the files sit on a
+    volume the agent's workers can write.
     """
 
     ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 57
 
     @classmethod
     def setUpClass(cls):
-        cls._BLOCK = _extract_shell_block(_TIRITH_CLEANUP_OPENER)
+        cls._BLOCK = _extract_shell_block(_SCANNER_CLEANUP_OPENER)
         cls._ELF_MAGIC_HEX = _entrypoint_readonly("ELF_MAGIC_HEX")
+        cls._NAME = _entrypoint_readonly("STALE_SCANNER_BINARY")
+        cls._DATA_PARENTS = ".local/share .local/state"
 
-    def _run(self, seed, primary="1", image_on_path=True):
+    def _run(self, seed, primary="1"):
         """Seed $TARGET_DIR via `seed(target, tmp)`, run the block, return (proc, target, tmp)."""
         tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         target = tmp / "data"
-        image = tmp / "image" / "tirith"
-        image.parent.mkdir(parents=True)
-        image.write_text("#!/bin/sh\necho tirith 0.4.2\n", encoding="utf-8")
-        image.chmod(0o755)
         seed(target, tmp)
-        path = f"{image.parent}:{os.environ['PATH']}" if image_on_path else os.environ["PATH"]
         proc = subprocess.run(
             ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
             capture_output=True,
@@ -3269,10 +3305,10 @@ class TirithCleanupTest(unittest.TestCase):
             timeout=60,
             env={
                 **os.environ,
-                "PATH": path,
                 "TARGET_DIR": str(target),
                 "IS_BOOTSTRAP_PRIMARY": primary,
-                "IMAGE_TIRITH": str(image),
+                "STALE_SCANNER_BINARY": self._NAME,
+                "STALE_SCANNER_DATA_PARENTS": self._DATA_PARENTS,
                 "ELF_MAGIC_HEX": self._ELF_MAGIC_HEX,
             },
         )
@@ -3287,47 +3323,75 @@ class TirithCleanupTest(unittest.TestCase):
         return path
 
     def _seed_copies(self, target, tmp):
-        self._plant(target / "bin" / "tirith", self.ELF)
-        self._plant(target / "profiles" / "cluster-a" / "bin" / "tirith", self.ELF)
+        self._plant(target / "bin" / self._NAME, self.ELF)
+        self._plant(target / "profiles" / "cluster-a" / "bin" / self._NAME, self.ELF)
 
     def test_the_downloaded_copies_are_removed_and_logged(self):
         proc, target, _ = self._run(self._seed_copies)
-        self.assertFalse((target / "bin" / "tirith").exists())
-        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
-        self.assertEqual(proc.stdout.count("Reclaimed a per-profile tirith copy:"), 2, proc.stdout)
+        self.assertFalse((target / "bin" / self._NAME).exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / self._NAME).exists())
+        self.assertEqual(proc.stdout.count("Removed a per-profile command scanner copy:"), 2, proc.stdout)
+
+    def test_the_entrypoint_names_the_data_parents_this_test_runs_with(self):
+        self.assertIn(
+            f'readonly STALE_SCANNER_DATA_PARENTS="{self._DATA_PARENTS}"',
+            _ENTRYPOINT.read_text(encoding="utf-8"),
+        )
+
+    def test_the_scanner_data_directories_are_removed_and_logged(self):
+        def seed(target, tmp):
+            self._plant(target / "home" / ".local" / "share" / self._NAME / "log.jsonl", b"{}\n", mode=0o600)
+            self._plant(target / "home" / ".local" / "state" / self._NAME / "sessions" / "a.id", b"x", mode=0o600)
+            self._plant(
+                target / "profiles" / "cluster-a" / "home" / ".local" / "share" / self._NAME / "db.dat", b"x"
+            )
+            self._plant(target / "home" / ".local" / "share" / "other" / "keep", b"x")
+
+        proc, target, _ = self._run(seed)
+        self.assertFalse((target / "home" / ".local" / "share" / self._NAME).exists())
+        self.assertFalse((target / "home" / ".local" / "state" / self._NAME).exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "home" / ".local" / "share" / self._NAME).exists())
+        self.assertTrue((target / "home" / ".local" / "share" / "other" / "keep").exists())
+        self.assertEqual(proc.stdout.count("Removed command scanner data:"), 3, proc.stdout)
+
+    def test_a_symlinked_data_directory_and_its_target_stay(self):
+        def seed(target, tmp):
+            self._plant(tmp / "elsewhere" / "data" / "keep", b"x")
+            link = target / "home" / ".local" / "share" / self._NAME
+            link.parent.mkdir(parents=True)
+            link.symlink_to(tmp / "elsewhere" / "data")
+
+        _, target, tmp = self._run(seed)
+        self.assertTrue((target / "home" / ".local" / "share" / self._NAME).is_symlink())
+        self.assertTrue((tmp / "elsewhere" / "data" / "keep").exists())
 
     def test_a_non_primary_replica_leaves_them(self):
         _, target, _ = self._run(self._seed_copies, primary="0")
-        self.assertTrue((target / "bin" / "tirith").exists())
-        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
-
-    def test_without_the_image_copy_on_path_they_stay(self):
-        """Hermes would still need them: with nothing on PATH it falls back to the home copy."""
-        _, target, _ = self._run(self._seed_copies, image_on_path=False)
-        self.assertTrue((target / "bin" / "tirith").exists())
+        self.assertTrue((target / "bin" / self._NAME).exists())
+        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / self._NAME).exists())
 
     def test_a_file_that_is_not_an_elf_binary_stays_and_is_never_run(self):
         def seed(target, tmp):
             marker = tmp / "executed"
             self._plant(
-                target / "profiles" / "cluster-b" / "bin" / "tirith",
-                f'#!/bin/sh\ntouch "{marker}"\necho tirith 0.3.3\n'.encode(),
+                target / "profiles" / "cluster-b" / "bin" / self._NAME,
+                f'#!/bin/sh\ntouch "{marker}"\necho 0.3.3\n'.encode(),
             )
 
         _, target, tmp = self._run(seed)
-        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / self._NAME).exists())
         self.assertFalse((tmp / "executed").exists(), "the cleanup executed a file from the volume")
 
     def test_a_symlink_and_its_target_stay(self):
         def seed(target, tmp):
-            real = self._plant(tmp / "elsewhere" / "tirith", self.ELF)
-            link = target / "profiles" / "cluster-c" / "bin" / "tirith"
+            real = self._plant(tmp / "elsewhere" / self._NAME, self.ELF)
+            link = target / "profiles" / "cluster-c" / "bin" / self._NAME
             link.parent.mkdir(parents=True)
             link.symlink_to(real)
 
         _, target, tmp = self._run(seed)
-        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / "tirith").is_symlink())
-        self.assertTrue((tmp / "elsewhere" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / self._NAME).is_symlink())
+        self.assertTrue((tmp / "elsewhere" / self._NAME).exists())
 
 
 _NPM_CACHE_SHARE_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then'

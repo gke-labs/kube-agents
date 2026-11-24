@@ -1,4 +1,25 @@
 apiVersion: v1
+data:
+  hold.json: |
+    {}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-hold
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   labels:
@@ -808,6 +829,8 @@ spec:
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
             - name: KUBE_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
               value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
@@ -856,6 +879,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-hold-vol
+              readOnly: true
       dnsConfig:
         options:
           - name: ndots
@@ -886,6 +912,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-hold
+            optional: true
+          name: platform-agent-hold-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -1480,6 +1514,8 @@ spec:
               value: system:serviceaccount:kubeagents-system:platformagent-a2a-mcp
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
               value: kubeagents-credential-proxy-a2a-reports
             - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
@@ -1570,6 +1606,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-hold-vol
+              readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
               readOnly: true
@@ -1644,6 +1683,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-hold
+            optional: true
+          name: platform-agent-hold-vol
         - name: audit-report-store-ksa
           projected:
             defaultMode: 256
@@ -3036,7 +3083,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "e659f58d74177b7a",
+      "version": "c825e0fa8fe7db93",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3117,6 +3164,7 @@ data:
               "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
               "chat.notify.gchat",
               "chat.notify.slack",
+              "chat.notify.teams",
               "chat.notify.console",
               "_INBOX.agent.>"
             ],
@@ -3199,10 +3247,12 @@ data:
               "chat.console.*.confirm",
               "chat.notify.gchat",
               "chat.notify.slack",
+              "chat.notify.teams",
               "chat.notify.console",
               "chat.board.reply.gateway.>",
               "a2a.trigger.*.submit",
               "a2a.trigger.*.status",
+              "a2a.trigger.*.stop",
               "_INBOX.gateway.>"
             ],
             "denyPublish": [
@@ -3256,7 +3306,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: e659f58d74177b7a
+    kubeagents.x-k8s.io/a2a-authmap-version: c825e0fa8fe7db93
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3834,6 +3884,7 @@ stringData:
           { stream: { account: APP, subject: "a2a.cap.verify.*" } }
           { stream: { account: APP, subject: "chat.notify.gchat" } }
           { stream: { account: APP, subject: "chat.notify.slack" } }
+          { stream: { account: APP, subject: "chat.notify.teams" } }
           { stream: { account: APP, subject: "chat.notify.console" } }
           { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
         ]
@@ -3926,10 +3977,12 @@ stringData:
                   "chat.console.*.confirm",
                   "chat.notify.gchat",
                   "chat.notify.slack",
+                  "chat.notify.teams",
                   "chat.notify.console",
                   "chat.board.reply.gateway.>",
                   "a2a.trigger.*.submit",
                   "a2a.trigger.*.status",
+                  "a2a.trigger.*.stop",
                   "_INBOX.gateway.>"
                 ]
                 deny = [
@@ -4149,6 +4202,7 @@ stringData:
           { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
           { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
           { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+          { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
           { stream: "chat.notify.console", accounts: [ TRUSTED ] }
           { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
         ]

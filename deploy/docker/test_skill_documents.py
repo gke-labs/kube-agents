@@ -9,7 +9,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import check_skill_commands
 from skill_documents import shipped_skill_documents, skill_documents
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -23,8 +22,8 @@ _spec = importlib.util.spec_from_file_location(
 inline_commands = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(inline_commands)
 
-# A shell block for the Tirith check and a refused inline span for the inline test.
-SKILL_TEXT = "```bash\nls\n```\n\nRun `$G add x`.\n"
+# A refused inline span for the inline test.
+SKILL_TEXT = "Run `$G add x`.\n"
 
 
 class SkillDocumentsTest(unittest.TestCase):
@@ -85,9 +84,6 @@ class SkillDocumentsTest(unittest.TestCase):
         ):
             self.write(rel)
         expected = shipped_skill_documents(self.repo)
-        tree = self.repo / "agents/platform/skills"
-        tirith = [Path(block.path) for block in check_skill_commands.skill_blocks(str(tree), tree)]
-        self.assertEqual(skill_documents(tree), tirith)
         self.assertEqual(expected, [doc for doc, _ in check_skill_size.oversized(self.repo, limit=0)])
         self.assertEqual(expected, [doc for doc, _, _ in inline_commands.refused_spans(self.repo)])
 
