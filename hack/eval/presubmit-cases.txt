@@ -92,11 +92,11 @@
 # in the script carries the measured history of that budget.
 
 # ── The domain probes ────────────────────────────────────────────────────────
-./tasks/reliability-pdb-probe/task.yaml
-./tasks/capacity-pinned-pool-probe/task.yaml
-./tasks/security-overgrant-probe/task.yaml
-./tasks/upgrades-lagging-master-probe/task.yaml
-./tasks/cost-idle-pool-probe/task.yaml
+# twin: ./tasks/reliability-pdb-probe/task.yaml
+# twin: ./tasks/capacity-pinned-pool-probe/task.yaml
+# twin: ./tasks/security-overgrant-probe/task.yaml
+# twin: ./tasks/upgrades-lagging-master-probe/task.yaml
+# twin: ./tasks/cost-idle-pool-probe/task.yaml
 
 # The consistency domain's roster seat since 2026-10-26, moved in from
 # nightly-cases.txt on its record there after the domain's probe,
@@ -124,7 +124,7 @@
 # no pull request (the audit's remediation sweep is off on the inject lane,
 # #3439), so it runs in the first phase. Hinted at 600s in unit_cost_hint.
 # This line took consistency off the docs/designs/domains.yaml allowlist.
-./tasks/consistency-drift-outlier/task.yaml
+# twin: ./tasks/consistency-drift-outlier/task.yaml
 
 # The reliability prompt variation that grades what the probe does not ask
 # for: reliability-pdb-probe asks whether checkout-gateway survives a drain;
@@ -137,7 +137,7 @@
 # obtainability-direct-query, obtainability-refusal-direct-mutation, and
 # since 2026-09-22 #1049's three (pdb-semantics, fleet-exposure-sweep,
 # healthy-namespace-silence) -- run in the nightly.
-./tasks/obtainability-remediation-proposal/task.yaml
+# twin: ./tasks/obtainability-remediation-proposal/task.yaml
 # The remediation domain's writer: submit-suggestion's pull request on the
 # leased *-infra repository, graded by pull_request_opened. Seated held out
 # 2026-09-28 (#2016 step 2); roster line 2026-10-14 (#2016 step 4); demoted
@@ -153,7 +153,7 @@
 # repository reset and, on the inject lane, the GitHub-write settle. Hinted
 # at 1250s in unit_cost_hint. This line takes remediation off the
 # docs/designs/domains.yaml allowlist.
-./tasks/pdb-remediation-pr/task.yaml
+# twin: ./tasks/pdb-remediation-pr/task.yaml
 
 # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
 # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
@@ -162,7 +162,7 @@
 # binding the role to a kubeconfig. It is the cheapest case in this list
 # (142s on the 2026-08-25 run) and it proves the chain the probes above stand
 # on.
-./tasks/cluster-agent-crashloop-debug/task.yaml
+# twin: ./tasks/cluster-agent-crashloop-debug/task.yaml
 
 # Two of the three cluster-debugging cases #982 added in the same family
 # (measured 190s, 142s and 220s on build 2092719124550520832, all
@@ -181,8 +181,8 @@
 # verification objective held throughout).
 # The fourth of the family, cluster-agent-pending-replicas-capped-pool, runs
 # in the nightly; nightly-cases.txt says why.
-./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml
-./tasks/cluster-agent-crashloop-evidence-chain/task.yaml
+# twin: ./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml
+# twin: ./tasks/cluster-agent-crashloop-evidence-chain/task.yaml
 
 # The incident-triage domain's presubmit-eligible probe (#1023, authored in
 # #1625), moved in from nightly-cases.txt on 2026-09-22 on the record it
@@ -198,7 +198,7 @@
 # cluster-debugging cases above share; no infra lock, no watcher, no card
 # wait. Priced at 700s in unit_cost_hint. This line is what took
 # incident-triage off the docs/designs/domains.yaml allowlist.
-./tasks/incident-triage-oom-event-probe/task.yaml
+# twin: ./tasks/incident-triage-oom-event-probe/task.yaml
 
 # The observability domain's first roster seat (#4095; #3633 authored the
 # case for #3467, #3778 registered it), moved in from nightly-cases.txt on
@@ -234,13 +234,13 @@
 # its policy behind; the hourly Compute plant sweep deletes it (#3797).
 # Priced at 600s in unit_cost_hint. This line took observability off the
 # docs/designs/domains.yaml allowlist.
-./tasks/monitoring-alert-policy-read/task.yaml
+# twin: ./tasks/monitoring-alert-policy-read/task.yaml
 
 # agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
 # (~100-300s), not a cluster. Re-admitted to the blocking roster after the
 # 2026-08-27 redesign (a real SRE question graded on kanban_create plus
 # cluster names).
-./tasks/agent-kanban-smoke/task.yaml
+# twin: ./tasks/agent-kanban-smoke/task.yaml
 
 # The source-control domain's first roster seat (#1918 authored the case),
 # moved in from nightly-cases.txt on 2026-10-23 on the record it built
@@ -260,7 +260,7 @@
 # the inject lane, the GitHub-write settle. Priced at 1000s in
 # unit_cost_hint. This line took source-control off the
 # docs/designs/domains.yaml allowlist.
-./tasks/vcs-spent-branch-reuse/task.yaml
+# twin: ./tasks/vcs-spent-branch-reuse/task.yaml
 
 # The audit-machinery canary (fleet-audits), on the roster since 2026-11-02
 # (#2013 step 4, #4094) on the record it built in the held-out section
@@ -285,7 +285,7 @@
 # unit_cost_hint. The residual miss class is #2856 (the worker publishes no
 # ledger). This line took fleet-audits off the
 # docs/designs/domains.yaml allowlist.
-./tasks/compliance-rbac-overgrant/task.yaml
+# twin: ./tasks/compliance-rbac-overgrant/task.yaml
 
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
@@ -338,3 +338,4 @@
 #   obtainability-direct-query,
 #   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.
+./tasks/session-recalls-context-after-idle-reap/task.yaml

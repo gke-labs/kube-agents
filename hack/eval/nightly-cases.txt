@@ -1503,7 +1503,7 @@
 # DM idle TTL, then sends the reply on the same conversation, which reaches a
 # pod rehydrated from the transcript primer. deployer: noop, two front-door
 # turns, reads no cluster; needs the inject door.
-./tasks/session-recalls-context-after-idle-reap/task.yaml
+# twin: ./tasks/session-recalls-context-after-idle-reap/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
