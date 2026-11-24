@@ -852,3 +852,51 @@ func TestTheRelayHoldsARefusalMadeBeforeTheNamesAreLoaded(t *testing.T) {
 		t.Errorf("with the names loaded: acks %d, naks %d; want settled once", pd.acks, pd.naks)
 	}
 }
+
+// redeliveredDelivery is nakDelivery on its nth delivery.
+type redeliveredDelivery struct {
+	nakDelivery
+	n uint64
+}
+
+func (d *redeliveredDelivery) NumDelivered() uint64 { return d.n }
+
+// The relay durable has no MaxDeliver, so with a cutoff set and no names
+// file a held refusal would come back every profileNamesHoldDelay for good,
+// counting a drop each time. It is held profileNamesHoldLimit times, then
+// settled with an Error, and the drop is counted once, at the settle.
+func TestTheRelayStopsHoldingARefusalAfterTheLimit(t *testing.T) {
+	t.Parallel()
+	r := startCutoffRigNames(t, time.Now().Add(-time.Minute), &lib.ProfileNames{})
+	conv := "discord:cut/never-loaded"
+	r.putRecord(t, cutoffRecord(conv, cutoffSessionAddressee, cutoffSessionTask, false))
+	subject := lib.TaskSupervisorSubject(cutoffSessionAddressee, cutoffSessionTask)
+	env := supervisorTerminalEnvelope(t, cutoffSessionTask)
+	deliver := func(n uint64) *redeliveredDelivery {
+		d := &redeliveredDelivery{nakDelivery: nakDelivery{stampedDelivery: stampedDelivery{
+			fakeDelivery: fakeDelivery{env: env, subj: subject, seq: 703}, at: r.cutoff.Add(30 * time.Second)}}, n: n}
+		r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}})
+		return d
+	}
+	for n := uint64(1); n <= profileNamesHoldLimit; n++ {
+		if d := deliver(n); d.acks != 0 || d.naks != 1 {
+			t.Fatalf("delivery %d: acks %d, naks %d; want given back", n, d.acks, d.naks)
+		}
+	}
+	if drops := r.client.ProfileSupervisorDrops(); drops != 0 {
+		t.Errorf("%d holds counted %d drops, want none until the settle", profileNamesHoldLimit, drops)
+	}
+	if d := deliver(profileNamesHoldLimit + 1); d.acks != 1 || d.naks != 0 {
+		t.Errorf("delivery %d: acks %d, naks %d; want settled", profileNamesHoldLimit+1, d.acks, d.naks)
+	}
+	if drops := r.client.ProfileSupervisorDrops(); drops != 1 {
+		t.Errorf("drops = %d after the settle, want 1", drops)
+	}
+	dropped := logRecords(t, r.logs, "relay: five-token supervisor event dropped; the profile names never loaded while it was held")
+	if len(dropped) != 1 || dropped[0]["level"] != "ERROR" {
+		t.Errorf("drop log = %+v, want one Error line", dropped)
+	}
+	if got := r.terminalsFor(cutoffSessionTask); len(got) != 0 {
+		t.Errorf("a refused event was rendered: %+v", got)
+	}
+}

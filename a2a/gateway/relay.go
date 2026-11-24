@@ -167,6 +167,12 @@ const (
 	// relay refused while the profile names were not loaded waits before it
 	// comes back: the names file is re-read every 30 seconds.
 	profileNamesHoldDelay = 30 * time.Second
+	// profileNamesHoldLimit is how many times the relay gives such an event
+	// back before it stops waiting for the names: the relay durable has no
+	// MaxDeliver, so with a cutoff set and no names file at all the event
+	// would come back every profileNamesHoldDelay for good. Twenty is ten
+	// minutes, many re-reads of a file that is rendered or not.
+	profileNamesHoldLimit = 20
 )
 
 // relayMaxAckPending caps the events the relay holds unrendered on its
@@ -381,6 +387,16 @@ func firstDeliveryLevel(item relayItem) slog.Level {
 	return slog.LevelDebug
 }
 
+// giveBacks is how many times the item's message was delivered before this
+// delivery: the relay durable redelivers only what was given back or not
+// settled in time. An item with no delivery has none.
+func (item relayItem) giveBacks() int {
+	if item.d == nil || item.d.NumDelivered() <= 1 {
+		return 0
+	}
+	return int(item.d.NumDelivered() - 1)
+}
+
 // storedAt is when the stream stored the item's message, zero when it has no
 // delivery or the server sent no metadata.
 func (item relayItem) storedAt() time.Time {
@@ -577,7 +593,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			g.settle(item)
 			continue
 		}
-		if !g.client.AcceptSupervisorEvent(item.subject, item.storedAt()) {
+		if !g.client.AcceptSupervisorEventUncounted(item.subject, item.storedAt()) {
 			// A five-token supervisor message on a profile's addressee,
 			// stored after the install's cutoff or at a time the server's
 			// metadata didn't give (#5301): the dispatcher writes a profile
@@ -591,13 +607,36 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			// refusal may be a session task's terminal the names would
 			// take; an ack would lose it for good. It is given back to
 			// the stream instead, and read again once the names are in.
+			//
+			// Held at most profileNamesHoldLimit times: past that the names
+			// are not coming (no names file is configured, or it is never
+			// rendered), and the event is settled with an Error, as a refusal.
+			// The drop is counted once, when the event is settled, not on
+			// each hold.
+			//
+			// A known ordering effect: a held event the names then take
+			// renders when it comes back, up to profileNamesHoldDelay later,
+			// so it can render after events of the same task the relay
+			// delivered meanwhile. Only a session task's five-token
+			// terminal is held this way, and only while the names are
+			// unloaded; the sequence guard still keeps it from rendering
+			// twice.
 			if !g.client.ProfileNamesLoaded() {
-				g.log.Log(g.runCtx, firstDeliveryLevel(item), "relay: five-token supervisor event held; the profile names are not loaded, so every task reads as a profile's",
+				if holds := item.giveBacks(); holds < profileNamesHoldLimit {
+					g.log.Log(g.runCtx, firstDeliveryLevel(item), "relay: five-token supervisor event held; the profile names are not loaded, so every task reads as a profile's",
+						"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
+						"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
+					g.giveBackAfter(item, profileNamesHoldDelay)
+					continue
+				}
+				g.client.CountProfileSupervisorDrop()
+				g.log.Error("relay: five-token supervisor event dropped; the profile names never loaded while it was held",
 					"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
-					"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
-				g.giveBackAfter(item, profileNamesHoldDelay)
+					"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff(), "holds", profileNamesHoldLimit)
+				g.settle(item)
 				continue
 			}
+			g.client.CountProfileSupervisorDrop()
 			g.log.Warn("relay: five-token supervisor event on a profile task, stored after the cutoff, dropped",
 				"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
 				"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())

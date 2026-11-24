@@ -407,17 +407,29 @@ func (c *Client) storedTimeDecides(subject string, storedAt time.Time) bool {
 // enters it: the gate is the operator's two inputs and the server's stored
 // time.
 func (c *Client) AcceptSupervisorEvent(subject string, storedAt time.Time) bool {
+	if c.AcceptSupervisorEventUncounted(subject, storedAt) {
+		return true
+	}
+	c.CountProfileSupervisorDrop()
+	return false
+}
+
+// AcceptSupervisorEventUncounted is AcceptSupervisorEvent without the count,
+// for a reader that may meet the same message again before it settles it
+// (the gateway's relay, which holds a refusal while the names are not
+// loaded) and counts it once, with CountProfileSupervisorDrop, when it does.
+func (c *Client) AcceptSupervisorEventUncounted(subject string, storedAt time.Time) bool {
 	cutoff := c.opts.profileSupervisorCutoff
 	if cutoff.IsZero() {
 		return true
 	}
 	addressee, ok := fiveTokenSupervisorAddressee(subject)
-	if !ok || AcceptsSupervisorEvent(cutoff, subject, storedAt, c.IsProfileAddressee(addressee)) {
-		return true
-	}
-	c.profileSupervisorDrops.Add(1)
-	return false
+	return !ok || AcceptsSupervisorEvent(cutoff, subject, storedAt, c.IsProfileAddressee(addressee))
 }
+
+// CountProfileSupervisorDrop counts one refusal AcceptSupervisorEventUncounted
+// made (ProfileSupervisorDrops).
+func (c *Client) CountProfileSupervisorDrop() { c.profileSupervisorDrops.Add(1) }
 
 // ProfileSupervisorDrops counts the five-token supervisor messages this
 // client's reads have refused as a profile task's terminal: each read that
