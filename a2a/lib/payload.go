@@ -733,8 +733,9 @@ func wrappedData(p Part, key string) (json.RawMessage, bool) {
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
-// receives on a running task: one per follow-up envelope, either queued or
-// refused with a reason. The gateway's relay reads it to word its posts
+// receives on a running task: one when the follow-up arrives, either queued
+// or refused with a reason, and a second, refused, for a queued follow-up
+// that does not get its turn. The gateway's relay reads it to word its posts
 // and to count what it promised the room; a reader that does not know it
 // sees the text part beside it.
 type SteerNotice struct {

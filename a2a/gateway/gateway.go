@@ -2227,13 +2227,7 @@ func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionReco
 	if lib.IsTaskSupervisorSubject(terminalSubject, addressee, taskID) {
 		source = TerminalFromSupervisor
 	}
-	g.mu.Lock()
-	rs, ok := g.relays[taskID]
-	if !ok {
-		rs = &relayState{}
-		g.relays[taskID] = rs
-	}
-	g.mu.Unlock()
+	rs := g.relayFor(taskID)
 	g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 	status := lib.StatusUpdate{TaskID: taskID, ContextID: task.ContextID,
 		Status: lib.TaskStatus{State: task.State, Message: task.FinalMessage}, Final: true}
