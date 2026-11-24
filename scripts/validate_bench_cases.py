@@ -378,6 +378,33 @@ FIXTURE_NOT_READY = {
         "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
         "$9 an hour standing or about $7 a run on a per-run cluster"
     ),
+    # #2581 holds the check (its owner's answer of 2026-11-23). The shape that
+    # the case reads, the fleet's multi-process workload on a pool with no pod
+    # PID limit, is not shown as the fault in live tests and is a setting at
+    # the platform's default, which fixture rule 9 does not take as a fixture.
+    # A fixture for the node's own PIDPressure needs a node of its own and a
+    # privileged pod that lowers kernel.pid_max. In one test each, a Deployment
+    # of that pod made hundreds of refused pods an hour, and one pod with no
+    # controller made none. It is not on the fleet. #5410 owns the gap.
+    "node-pid-pressure-fork-exhaustion": (
+        "#5410: the check is on hold under #2581; the shape that the case reads is the platform's "
+        "default (fixture rule 9); a fixture for the node's PIDPressure needs a node of its own "
+        "and a privileged pod that lowers kernel.pid_max, which is not on the fleet and which no "
+        "issue plans"
+    ),
+    # Needs the order of two times on one node: a workload container that
+    # starts before a per-node agent's pod is Ready. That order is evidence
+    # only on a node made after the agent's DaemonSet, and a workload's restart
+    # resets it. The fleet's pools make a node only at an upgrade or a repair,
+    # and its two zero-node pools are read by other cases as empty; the cost,
+    # not tried, is a pool of its own with one standing small node. The first
+    # plan's signal, a label only a fixture writes, is not a fixture (fixture
+    # rule 9). #5411 owns the gap and proposes the first plan's check.
+    "node-kubelet-startup-admission-race": (
+        "#5411: needs a workload that starts before a per-node agent is Ready on a node made "
+        "after the agent's DaemonSet; no present fleet pool makes such a node, and the cost, not "
+        "tried, is a pool of its own with one standing small node whose two times stay readable"
+    ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the
     # kubectl cost table's fleet tier. No pool project carries one.
