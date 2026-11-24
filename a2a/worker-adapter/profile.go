@@ -627,6 +627,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)
+	removeRefusals := w.makeWriteRefusalFile(&cfg)
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
 	cfg.TaskDeadline = time.Until(h.offer.Deadline) - w.pw.deadlineMargin
@@ -669,6 +670,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		// config.
 		removeConfig()
 		removeToken()
+		removeRefusals()
 		closeTaskBus()
 		h.done <- out
 	}()
@@ -758,6 +760,31 @@ func (w *profileWorker) writeTaskToken(token string) func() {
 		w.cfg.Logger.Error("could not write the proxy token; the task's cluster calls will be refused", "path", path, "err", err)
 		return func() {}
 	}
+	return func() { _ = os.Remove(path) }
+}
+
+// makeWriteRefusalFile makes the task's write-refusal record file empty
+// beside the task token, on the same tmpfs, names it to the broker client
+// (EnvWriteRefusalFile, with the task in EnvWriteRefusalTask) and to the
+// adapter (Config.WriteRefusalFile), and returns what removes it. The client
+// appends to the file and never creates it, so a stale one from an earlier
+// task is removed first. With the stop off or no token directory, or when
+// the file can't be made, there is no file: the task runs, and is never
+// stopped at a refusal (refusal.go says why that is safe).
+func (w *profileWorker) makeWriteRefusalFile(cfg *Config) func() {
+	if !cfg.StopOnWriteRefusal || w.pw.TaskTokenFile == "" {
+		return func() {}
+	}
+	path := filepath.Join(filepath.Dir(w.pw.TaskTokenFile), writeRefusalFileName)
+	_ = os.Remove(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- the worker's own per-task file
+	if err != nil {
+		w.cfg.Logger.Warn("could not make the write-refusal record; the task won't stop at a write refusal", "path", path, "err", err)
+		return func() {}
+	}
+	_ = f.Close()
+	cfg.WriteRefusalFile = path
+	cfg.HarnessEnv = append(cfg.HarnessEnv, EnvWriteRefusalFile+"="+path, EnvWriteRefusalTask+"="+cfg.TaskID)
 	return func() { _ = os.Remove(path) }
 }
 

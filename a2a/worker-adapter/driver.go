@@ -90,6 +90,11 @@ const (
 	EventProgress
 	// EventActivity is a tool invocation (Event.Tool, Event.Input).
 	EventActivity
+	// EventToolResult marks that one tool step's result is in, so the call
+	// that ran it has exited. It carries no field. The adapter reads the
+	// write-refusal record on it (refusal.go), never the result itself. A
+	// driver emits exactly one per tool step.
+	EventToolResult
 	// EventResult ends a turn: Event.Text is the deliverable, Event.Failed
 	// and Event.Token whether it failed and the reason token, and
 	// Event.Telemetry what the turn cost.
