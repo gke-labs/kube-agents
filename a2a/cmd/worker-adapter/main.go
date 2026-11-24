@@ -163,7 +163,8 @@ func main() {
 // at the socket the adapter named and with the delegate targets it wrote into
 // this process's env for the turn.
 func serveMCP(ctx context.Context, in io.Reader, out io.Writer, log *slog.Logger) error {
-	return workeradapter.ServeDelegateMCP(ctx, in, out, workeradapter.DelegateSocketPath(), workeradapter.DelegateTargetsFromEnv(log), log)
+	return workeradapter.ServeDelegateMCPWith(ctx, in, out, workeradapter.DelegateSocketPath(),
+		workeradapter.DelegateTargetsFromEnv(log), workeradapter.ScopeClustersFromEnv(log), log)
 }
 
 func run() int {
