@@ -27571,8 +27571,13 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
             payload[audit_report.REPORT_NOTES_KEY],
             [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
         )
-        self.assertIn(audit_report.REPORT_NOTES_REMINDER, self.err)
-        # The findings run carries the same lines.
+        # No ledger line on this run (`issue_url` is null), so the reminder
+        # anchors the lines at the end of the report instead.
+        self.assertIsNone(payload["issue_url"])
+        self.assertIn(audit_report.REPORT_NOTES_REMINDER_NO_LEDGER, self.err)
+        self.assertNotIn(audit_report.REPORT_NOTES_REMINDER, self.err)
+        # The findings run carries the same lines, and its reminder anchors
+        # them directly before the closing ledger line.
         self.harness.replies = {
             "issue-list": issues_view([]),
             "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
@@ -27584,6 +27589,43 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
             self.stdout_json()[audit_report.REPORT_NOTES_KEY],
             [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
         )
+        self.assertIn(audit_report.REPORT_NOTES_REMINDER, self.err)
+
+    def test_an_invented_noted_finding_is_disclosed_and_not_swept(self):
+        """Through `_finish` and the dry run: a finding the model wrote
+        about a noted object no previous ledger carried reaches the
+        uncorroborated disclosure — the dry run's warning, the JSON line —
+        and still opens nothing, because the noted skip keeps it out of the
+        sweep (`promotion_candidates`)."""
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("DID NOT FLAG THESE", self.err)
+        self.assertIn(derived_id(fid="a"), self.err)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertIn(derived_id(fid="a"), payload["uncorroborated_findings"])
+        self.assertEqual(payload["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_held_noted_entry_logs_not_visible_on_a_findings_run(self):
+        """The findings branch says the noted wording for a noted-only held
+        entry, as the clean branch and the store path do: the collector
+        does not flag the object, so "still emits a candidate" is false."""
+        self.previous_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "UPDATED")
+        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
+        self.assertNotIn("still emits a candidate for it", self.err)
 
     def test_a_dry_run_prints_no_report_notes_reminder(self):
         """A dry run publishes nothing, so there is no report to remind
@@ -28057,6 +28099,41 @@ class TestNotedSetSpeaksOnce(HarnessTestCase):
         self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
         self.assertFalse(first["silent_ok"])
         self.assertTrue(self.finish(noted=True)["silent_ok"])
+
+    def chat_text(self):
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        return "\n".join(str(part.get("text") or "") for part in record["parts"])
+
+    def test_a_later_finish_of_the_run_still_names_the_cleared_objects(self):
+        """The run's first `finish` stores this run's set as the scheduled
+        baseline, so a later `finish` of the same run reading the store
+        back would call the set unchanged. It measures against the saved
+        context instead (`run_noted_baseline`), so its report keeps
+        `noted_changed`, `noted_cleared` and the Visible-again line."""
+        self.finish(noted=True)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        first = self.finish(noted=False)
+        self.assertEqual(first[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        second = self.finish(noted=False)
+        self.assertTrue(second[audit_report.REFINISH_KEY])
+        self.assertIs(second[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertEqual(second[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, self.chat_text())
+
+    def test_a_rerun_after_a_death_before_the_chat_append_keeps_the_clear(self):
+        """The first `finish` died after the store write and before its
+        chat append: the verdict and the saved baseline are on the record,
+        the store already holds this run's set. The re-run still reports
+        the clear."""
+        self.finish(noted=True)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        with patch.object(audit_report, "append_chat_report", lambda *a, **k: None):
+            died = self.finish(noted=False)
+        self.assertEqual(died[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        rerun = self.finish(noted=False)
+        self.assertIs(rerun[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertEqual(rerun[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, self.chat_text())
 
     def test_the_baseline_reads_like_the_published_ids_baseline(self):
         # A record from before the key, or from another id scheme, gives no

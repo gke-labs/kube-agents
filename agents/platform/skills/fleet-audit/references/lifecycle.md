@@ -320,7 +320,8 @@ notes, without the previous run's search record and with each `declared[]` entry
 this run's `start` filed it, and runs `finish --scheduled` on it with this run's manifest, so the cross-check,
 the ledger comparison and `silent_ok` are `finish`'s own: the line is then `finish`'s, plus
 `precheck: unchanged`, and the run is over. Copy its `report_notes` lines, when it has them,
-verbatim directly before the closing ledger line, as [`finish`](finish.md) says; a precheck-closed
+verbatim directly before the closing ledger line (or as the report's last lines when the run has
+no ledger line), as [`finish`](finish.md) says; a precheck-closed
 line with `silent_ok: true` answers `[SILENT]` and prints nothing else. In every other case the line says `closed: false` and
 why, the findings file is as it was, and the SOP continues; a close that dies puts the file back
 too, and the run's in-flight note stays until the SOP's own `finish`. Without the flag it never

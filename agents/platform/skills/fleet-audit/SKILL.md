@@ -146,9 +146,10 @@ Run every script by its full path. A kanban worker starts in its card's workspac
       carries the notes.
    3. Otherwise report `issue_url` in full and every URL in `prs_opened` and `prs_still_open`,
       and keep the line that carries the ledger URL as the last line.
-   4. Copy each line of `report_notes` verbatim, directly before that closing ledger line.
-      Each line names an object a check read but could not see; a report without them calls
-      those objects clean. Relay a `noted_cleared` line the same way: those objects are
+   4. Copy each line of `report_notes` verbatim, directly before that closing ledger line;
+      when the run has no ledger line (`issue_url` is null), they are the last lines of the
+      report. Each line names an object a check read but could not see; a report without them
+      calls those objects clean. Relay a `noted_cleared` line the same way: those objects are
       visible again.
 
    An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.

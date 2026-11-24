@@ -86,7 +86,8 @@ Two rules follow, and they are the whole rule:
   either; its report is `summary`, with the pull request links (see
   [A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker)). Every forge-path
   report also carries each line of `report_notes` on the JSON line, copied verbatim directly
-  before the closing ledger line ([`finish`](finish.md)); the `summary` statuses carry the notes
+  before the closing ledger line — or as the report's last lines when the run has no ledger
+  line (`issue_url` is null) ([`finish`](finish.md)); the `summary` statuses carry the notes
   inside `summary`, and a run that answers `[SILENT]` copies nothing.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?". `finish` returns `true` only when it gets `--scheduled`, and only the cron

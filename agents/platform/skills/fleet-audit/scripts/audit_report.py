@@ -988,6 +988,12 @@ CHAT_REPORT_BASELINE_FILED_KEY = "run_baseline_filed"
 # are against that record (False with no open ledger).
 CHAT_REPORT_BASELINE_SCHEDULED_KEY = "run_baseline_scheduled"
 SCHEDULED_CONTEXT_IDS_KEY = "ids"
+# The noted baseline the run's first `finish` read (`scheduled_noted_baseline`),
+# saved with the rest of the context: a later `finish` of the same run reads
+# the envelope the earlier one just stored, whose `scheduled_noted_ids` is
+# this run's own set, so measuring against it loses `noted_changed`,
+# `noted_cleared` and the Visible-again line.
+SCHEDULED_CONTEXT_NOTED_KEY = "noted"
 SCHEDULED_CONTEXT_REPORTED_KEY = "reported"
 SCHEDULED_CONTEXT_KIND_KEY = "record_scheduled"
 SCHEDULED_CONTEXT_AGAINST_KEY = "against_record"
@@ -1859,9 +1865,14 @@ REPORT_NOTES_KEY = "report_notes"
 # equal; change them together.
 REPORT_NOTE_PREFIX = "Not visible, not clean:"
 # The stderr reminder beside a published, non-silent line that carries
-# `report_notes`, in the style of the NOT VISIBLE and HELD lines.
+# `report_notes`, in the style of the NOT VISIBLE and HELD lines. Two
+# texts, because the anchor differs: a CLEAN run with no ledger has no
+# ledger line (`issue_url` is null), so there the lines close the report.
 REPORT_NOTES_REMINDER = (
     "NOTES: the report must carry report_notes verbatim, directly before the closing ledger line."
+)
+REPORT_NOTES_REMINDER_NO_LEDGER = (
+    "NOTES: the report must carry report_notes verbatim, as its last lines: this run has no ledger line."
 )
 # On the JSON line of a scheduled run whose noted set changed, when objects
 # left the set since the last scheduled run: their ledger ids. The chat
@@ -5180,6 +5191,7 @@ def scheduled_context(
         SCHEDULED_CONTEXT_REPORTED_KEY: sorted(scheduled_reported_baseline(memory)),
         SCHEDULED_CONTEXT_KIND_KEY: kind if isinstance(kind, bool) else None,
         SCHEDULED_CONTEXT_AGAINST_KEY: existing_issue is not None,
+        SCHEDULED_CONTEXT_NOTED_KEY: scheduled_noted_baseline(scheduled_memory),
     }
 
 
@@ -5190,12 +5202,16 @@ def _saved_scheduled_context(value: object) -> dict | None:
     ids = value.get(SCHEDULED_CONTEXT_IDS_KEY)
     reported = value.get(SCHEDULED_CONTEXT_REPORTED_KEY)
     kind = value.get(SCHEDULED_CONTEXT_KIND_KEY)
+    noted = value.get(SCHEDULED_CONTEXT_NOTED_KEY)
     if (
         (ids is None or (isinstance(ids, list) and all(isinstance(fid, str) for fid in ids)))
         and isinstance(reported, list)
         and all(isinstance(fid, str) for fid in reported)
         and (kind is None or isinstance(kind, bool))
         and isinstance(value.get(SCHEDULED_CONTEXT_AGAINST_KEY), bool)
+        # An entry saved without the noted key (an older image's first
+        # `finish`) stays valid; the reader falls back to its own read.
+        and (noted is None or (isinstance(noted, list) and all(isinstance(fid, str) for fid in noted)))
     ):
         return value
     return None
@@ -8512,9 +8528,11 @@ def log_report_notes_reminder(payload: dict) -> None:
     the NOT VISIBLE and HELD lines, printed beside a published line whose
     report the worker composes: it carries `report_notes` and is not silent.
     A `[SILENT]` run, a dry run and a refused document get none, and the
-    `summary` statuses carry the notes inside `summary`."""
+    `summary` statuses carry the notes inside `summary`. The text follows
+    the anchor: directly before the closing ledger line, or, on a run with
+    no ledger line, as the report's last lines."""
     if payload.get(REPORT_NOTES_KEY) and not payload.get("silent_ok"):
-        log(REPORT_NOTES_REMINDER)
+        log(REPORT_NOTES_REMINDER if payload.get("issue_url") else REPORT_NOTES_REMINDER_NO_LEDGER)
 
 
 def report_notes_payload(data: dict) -> dict:
@@ -10909,10 +10927,33 @@ def noted_set_changed(noted: set[str], memory: dict | None) -> bool:
     run with none stays quiet: it has no note to relay, and a cleared set it
     cannot know about is not announced.
     """
-    baseline = scheduled_noted_baseline(memory)
+    return noted_set_changed_against(noted, scheduled_noted_baseline(memory))
+
+
+def noted_set_changed_against(noted: set[str], baseline: list[str] | None) -> bool:
+    """`noted_set_changed` against a baseline list already in hand."""
     if baseline is None:
         return bool(noted)
     return set(noted) != set(baseline)
+
+
+def run_noted_baseline(baseline: "RunBaseline", scheduled_memory: dict | None) -> list[str] | None:
+    """The noted baseline this `finish` measures against.
+
+    What the run's first `finish` read and saved (`scheduled_context`,
+    `SCHEDULED_CONTEXT_NOTED_KEY`), when this is a later `finish` of the
+    same run or its re-run after a death: the earlier `finish` already
+    stored this run's set as `scheduled_noted_ids`, so reading the store
+    again would call the set unchanged and drop `noted_changed`,
+    `noted_cleared` and the Visible-again line. Otherwise this `finish`'s
+    own read (`scheduled_noted_baseline`). An entry saved by an image from
+    before the key falls back the same way.
+    """
+    saved = baseline.scheduled or {}
+    if baseline.from_entry and SCHEDULED_CONTEXT_NOTED_KEY in saved:
+        stored = saved.get(SCHEDULED_CONTEXT_NOTED_KEY)
+        return [str(fid) for fid in stored] if isinstance(stored, list) else None
+    return scheduled_noted_baseline(scheduled_memory)
 
 
 def noted_cleared_ids(noted: set[str], memory: dict | None) -> list[str]:
@@ -12991,9 +13032,18 @@ def promotion_candidates(
             continue
         # A finding on a noted object (`noted_finding_ids`) is carried from a
         # previous run: the collector could not see its result, so nothing
-        # this run backs a fix opened unattended. It is in no block; the
-        # ledger shows it, and `/remediate` still opens it.
+        # this run backs a fix opened unattended. A carried one is in no
+        # block; the ledger shows it, and `/remediate` still opens it. An
+        # INVENTED one — on a noted object no previous ledger carried
+        # (`uncorroborated_findings`) — is disclosed as uncorroborated
+        # first: this skip is the only exit before the uncorroborated
+        # block, and without the record here the dry run's warning, the
+        # per-finding stderr line and the ledger's uncorroborated block all
+        # stayed silent about it. The skip still keeps both out of the
+        # sweep.
         if fid in (not_visible or set()):
+            if fid in uncorroborated_set:
+                unbacked.append(fid)
             continue
         if (finding.get("remediation") or {}).get("kind") != "manifest":
             continue
@@ -27154,8 +27204,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # themselves stay on the JSON line, the ledger and the stored report on
     # every run.
     noted = noted_ids(manifest)
-    noted_moved = noted_set_changed(noted, scheduled_memory)
-    noted_cleared = noted_cleared_ids(noted, scheduled_memory) if noted_moved else []
+    # Against the run's first read on a later `finish` of the same run or
+    # its re-run after a death (`run_noted_baseline`): the earlier `finish`
+    # stored this run's set, and reading it back would drop the change and
+    # the Visible-again line.
+    noted_baseline = run_noted_baseline(baseline, scheduled_memory)
+    noted_moved = noted_set_changed_against(noted, noted_baseline)
+    noted_cleared = sorted(set(noted_baseline or []) - noted) if noted_moved else []
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
@@ -27252,6 +27307,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 "collector manifest and this run passed none, so it is carried "
                 "unchanged. A hold is released only by a manifest run that no longer "
                 "emits the id, a `declared` entry, or the document carrying it."
+            )
+        elif entry.get(NOTED_HELD_KEY):
+            # The noted wording, as the clean branch and the store path say
+            # it: the collector does not flag this object, it could not see
+            # it, so "still emits a candidate" would be false.
+            log(
+                f"NOT VISIBLE: {entry['id']} is on the ledger, absent from this "
+                f"document, and {NOTED_HOLD_CAUSE}; protected rather than resolved."
             )
         else:
             log(

@@ -95,7 +95,8 @@ comparison uses the objects' identities, not the note text. Beside `notes`, the 
 forge statuses carries `report_notes`: the same entries as ready-made lines, one per noted target,
 capped like every rendered notes list, with a closing "…and N more" row when the cap cut some.
 Copy each line of `report_notes` into your report verbatim, directly before the closing ledger
-line — the ledger URL stays the last line — and do not report the objects it
+line — the ledger URL stays the last line; when the run has no ledger line (`issue_url` is null),
+they are the last lines of the report — and do not report the objects it
 names as clean. On `NO_FORGE` and `STORE_LEDGER` there is no `report_notes`: the report is
 `summary` verbatim, and `summary` already carries the notes. The one exception is a scheduled run with `silent_ok: true`: it
 answers `[SILENT]` and does not report the notes in chat, and they stay in the stored report. On
