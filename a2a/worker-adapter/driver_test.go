@@ -624,7 +624,8 @@ sleep 30
 
 // productionDriverToolSteps is, for each driver a task can run on, a
 // recorded stream of known tool steps. A driver added to the registry adds
-// its row here (the agy driver with #6745), so the write-refusal stop, which
+// its row here (the agy driver with #6745, core-agent with its driver), so
+// the write-refusal stop, which
 // runs on EventToolResult, applies to it.
 var productionDriverToolSteps = []struct {
 	name   string
@@ -644,12 +645,25 @@ var productionDriverToolSteps = []struct {
 	// turns, and one that ends ERROR when headless approval was refused.
 	{"agy done", agyDriver{}, agyFixtureLines("tool"), 1},
 	{"agy error", agyDriver{}, agyFixtureLines("deny"), 1},
+	// core-agent-harness as recorded (testdata/coreagent/README.md): a
+	// step that succeeds, one whose command exits nonzero, one the policy
+	// refuses, a call to a tool the turn wasn't offered, and a turn with
+	// no tool at all.
+	{"core-agent tool-step", newCoreAgentDriver(), fixtureLines("coreagent", "tool-step"), 1},
+	{"core-agent tool-error", newCoreAgentDriver(), fixtureLines("coreagent", "tool-error"), 1},
+	{"core-agent tool-refused", newCoreAgentDriver(), fixtureLines("coreagent", "tool-refused"), 1},
+	{"core-agent unknown-tool", newCoreAgentDriver(), fixtureLines("coreagent", "unknown-tool"), 1},
+	{"core-agent text-only", newCoreAgentDriver(), fixtureLines("coreagent", "text-only"), 0},
 }
 
 // agyFixtureLines is testdata/agy/<name>.jsonl's lines, read when the table
 // is built.
-func agyFixtureLines(name string) []string {
-	raw, err := os.ReadFile(filepath.Join("testdata", "agy", name+".jsonl"))
+func agyFixtureLines(name string) []string { return fixtureLines("agy", name) }
+
+// fixtureLines is testdata/<dir>/<name>.jsonl's lines, read when the table
+// is built.
+func fixtureLines(dir, name string) []string {
+	raw, err := os.ReadFile(filepath.Join("testdata", dir, name+".jsonl"))
 	if err != nil {
 		panic(err)
 	}
