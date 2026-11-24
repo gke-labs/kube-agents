@@ -1469,7 +1469,8 @@ platformAgent:
       # 6 unless set), childReserve the share of it kept for child tasks (default
       # max(1, ceil(ceiling/3)); with the interactive reserve, trimmed to leave a
       # free slot, so ceilings 1, 2 and 4 warn), and warmReplicas the warm workers kept per
-      # interactive (profile, tier) (default 1). The <release namespace>-profiles
+      # interactive (profile, tier) (default 1, or on defaultRoute: session the
+      # profile's concurrency split over its interactive tiers). The <release namespace>-profiles
       # namespace's pod quota is the warm workers, a surge pod per warm pool, and
       # the ceiling. The dispatcher's intervals: leaseSeconds (90), renewSeconds
       # (20), restartGraceSeconds (60) and acceptTimeoutSeconds (10); a lease is

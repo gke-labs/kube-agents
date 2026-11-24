@@ -167,13 +167,16 @@ func resolveProfileAcceptTimeoutSeconds(agent *agentv1alpha1.PlatformAgent) int 
 
 // resolveProfileWarmReplicas is how many warm worker pods each of profile's
 // interactive tiers keeps: spec.harness.tuning.profiles.warmReplicas when it
-// is set, on any route. Unset, the session route sizes the pool to the
-// profile's concurrency (gke-labs/kube-agents#7014): every session pod hands
-// its reads to a profile as children, which run only on that pool, so a pool
-// of one serialises them all while the dispatcher would run concurrency of
-// them. It is held to the ceiling, which caps the tasks the pool could serve,
-// and to warmReplicas' own maximum. Any other route keeps
-// DefaultProfileWarmReplicas, so it renders as before.
+// is set, on any route. Unset, the session route sizes the profile's pools to
+// its concurrency (gke-labs/kube-agents#7014): every session pod hands its
+// reads to a profile as children, which run only on those pools, so a pool of
+// one serialises them all while the dispatcher would run concurrency of them.
+// Concurrency is the most pods the profile runs at once across its tiers, so
+// it is split over the interactive tiers, rounding up, at least one each. It
+// is held to the ceiling, which caps the tasks a pool could serve, and to
+// warmReplicas' own maximum. The bound is per profile: idle pools of several
+// profiles may together exceed the ceiling, each sized for its own burst. Any
+// other route keeps DefaultProfileWarmReplicas, so it renders as before.
 func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile) int {
 	if t := profileTuning(agent); t != nil && t.WarmReplicas != nil {
 		return *t.WarmReplicas
@@ -181,8 +184,12 @@ func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent, profile *age
 	if profile == nil || resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
 		return agentv1alpha1.DefaultProfileWarmReplicas
 	}
+	perTier := int(profile.Spec.Concurrency)
+	if tiers := interactiveProfileTiers([]agentv1alpha1.AgentProfile{*profile}); tiers > 1 {
+		perTier = (perTier + tiers - 1) / tiers
+	}
 	return max(agentv1alpha1.DefaultProfileWarmReplicas,
-		min(int(profile.Spec.Concurrency), resolveProfileCeiling(agent), agentv1alpha1.MaxProfileWarmReplicas))
+		min(perTier, resolveProfileCeiling(agent), agentv1alpha1.MaxProfileWarmReplicas))
 }
 
 // interactiveProfileTiers counts the warm pools the profiles need: one per
