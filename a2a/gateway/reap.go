@@ -80,6 +80,7 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 
 func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	g.boundAskCopy(ctx, rec)
+	g.noticeChildWaiting(ctx, rec)
 	g.noticeNoFirstEvent(ctx, rec)
 
 	// Prune records older than SessionTTL whose pod has been reaped (or never
@@ -724,5 +725,10 @@ func (g *Gateway) noticeNoFirstEvent(ctx context.Context, rec *SessionRecord) {
 	g.log.Info("no first event inside the grace; told the conversation",
 		"taskId", active.TaskID, "conversation", fresh.Key, "addressee", fresh.AddresseeFor(active.TaskID),
 		"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
+	// A child whose line says it's waiting gets that line closed instead,
+	// so no ⏳ is left on it (closeWaitingLine); otherwise the post.
+	if g.closeWaitingLine(fresh) {
+		return
+	}
 	g.post(fresh.Key, fmt.Sprintf(noFirstEventNotice, active.TaskID, g.cfg.FirstEventGrace))
 }
