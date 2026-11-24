@@ -31,8 +31,21 @@ A value the operator or gateway doesn't recognise isn't guessed at:
 ## Tools
 
 - A worker is offered only the tools its persona grants, and the harness enforces that list itself. A tool the persona didn't grant is refused.
-- The shell runs single plain commands only. A compound command is refused.
 - Web search is available only when the persona grants it. Fetching a URL is not available.
+
+### Shell commands
+
+A shell grant names commands. It allows each one exactly, or with arguments, only when the whole line is one simple command whose words are all literal text. Plain single or double quotes around literal text are fine (`find . -name '*.go'`). Refused:
+
+- chaining or composition: `;`, `&&`, `||`, pipes, a background `&`, subshells, command groups and negation;
+- redirections of any kind: `>`, `>>`, `<`, `2>&1`, heredocs, and process substitution as a redirect target;
+- words that aren't literal: parameter expansion (`$VAR`), command substitution (`$(...)` and backticks), arithmetic expansion, process substitution, brace expansion and `$'...'` quoting;
+- an environment-variable prefix (`FOO=1 cmd`);
+- an interpreter in front of a script (`python3 script.py`): a persona's script runs by its absolute path;
+- a path that leaves the granted script's directory (`..`), a sibling script, or a command whose name only starts with a granted one;
+- anything the shell parser rejects.
+
+These rules are a second line of defence. The boundary for what a shell command can reach stays the sandbox and the credential broker's verb allowlist.
 
 ## Skills and MCP servers
 
