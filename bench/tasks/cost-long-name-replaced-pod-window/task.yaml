@@ -1,0 +1,69 @@
+# The health signal this case grades is the WINDOW the waste audit sizes a
+# Deployment on. Check 3.1 (overrequest) reads the peak of a controller's
+# pods over seven days, its replaced pods included. Kubernetes cuts a pod
+# name at 63 characters, so the pod of a Deployment with a name of 47
+# characters or more carries part of its hash, or none of it. An audit that
+# does not read such a name sizes the Deployment on its live pods only: a
+# Deployment whose live pod is idle, and whose replaced pod was busy, then
+# gets a resize that its own last week does not support.
+#
+# The case reads the verdict and not the excerpt: a check can bind a finding
+# to its object, but it cannot read the evidence text of one object.
+#
+# PARKED: the fixture does not exist. FIXTURE_NOT_READY in
+# scripts/validate_bench_cases.py names the issue that plants it. The
+# Deployment's name below is a proposal; the change that plants the fixture
+# sets the name and this case's phrase together.
+#
+# Domain: cost (fleet-wide-cost-analysis).
+# Journey: A long-named Deployment is sized on the pod it replaced — the
+# audit reads the replaced pod's peak, which clears the bar, and files no
+# overrequest finding for the Deployment.
+#
+# Planted defect required: role long-name-replaced-pod, one Deployment with a
+# name of 47 characters or more. At each audit run its live pod is older than
+# one hour with a peak under the 20% bar, and a pod that it replaced inside
+# the seven-day window has a peak above the bar. The objective reads the cost
+# LEDGER, and a run with no finding writes no ledger body: the generated-name
+# family in seeded-family (role generated-name-family) is the finding that
+# shows the ledger was written.
+# Isolation class: read-only.
+# Eligible tier: nightly from registration, once the fixture is planted.
+id: cost-long-name-replaced-pod-window
+name: Waste audit sizes a long-named Deployment on the pod it replaced, and files no resize for it
+prompt: >-
+  Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
+expected_output: >-
+  The audit runs to its ledger. The Deployment
+  settlement-batch-reconciliation-exporter-for-partner-feeds, whose live pod
+  is idle and whose replaced pod was busy inside the last seven days, has no
+  overrequest finding: the audit reads the replaced pod's peak through its
+  cut name. The three calibration-<uuid> Deployments in seeded-family are
+  one overrequest finding on Deployment/calibration.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: cost
+
+# Named by ROLE rather than by cluster, as every fleet case is; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - long-name-replaced-pod
+  - generated-name-family
+
+verification_spec:
+  - name: the-long-named-deployment-is-sized-on-its-replaced-pod
+    role: objective
+    mode: assert
+    check:
+      # The forbidden phrase is the start of the Deployment's id: the harness
+      # clips a long id, and a clip keeps its start. The required phrase is
+      # the family's id, which each run on a pool project files, so a run
+      # that wrote no ledger does not pass.
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      scope: finding_ids
+      required_phrases: ["seeded-family.deployment-calibration"]
+      forbidden_phrases: ["deployment-settlement-batch-reconciliation"]

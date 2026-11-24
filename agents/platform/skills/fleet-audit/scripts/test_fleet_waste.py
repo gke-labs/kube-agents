@@ -4181,6 +4181,23 @@ class CutPodNameTest(unittest.TestCase):
         self.assertEqual(len(stranger[1]), 63)
         self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK, stranger: self.BUSY_PEAK}))
 
+    def test_room_for_more_than_a_whole_hash_gives_no_cut_form(self):
+        """One character short of the first cut, the base `<name>-<hash>-` is 58
+        characters with a ten-character hash, so no pod name of the Deployment
+        is cut. A 63-character name with eleven hash characters behind
+        `<name>-` is no pod of it; one character more in the name, and the
+        ten-character form is its own."""
+        name = self.name(self.HYPHEN_CUT - 1)
+        ctx, live, gone = self.deployment(name)
+        self.assertEqual((len(gone[1]), gone[1].count("-", len(name))), (63, 2))
+        self.assertIsNone(fw._cut_pod_pattern("Deployment", name))
+        self.assertIsNotNone(fw._cut_pod_pattern("Deployment", self.name(self.HYPHEN_CUT)))
+        stranger = (self.NS, f"{name}-{self.HASH}{self.HASH[:1]}{self.GONE}")
+        self.assertEqual(len(stranger[1]), 63)
+        self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK, stranger: self.BUSY_PEAK}))
+        # Control: its own replaced pod, which has the ordinary name, is read.
+        self.assertEqual(self.over(ctx, {live: self.IDLE_PEAK, gone: self.BUSY_PEAK}), [])
+
     def test_the_last_five_of_a_cut_name_are_generated_characters(self):
         """`a` is no character the name generator draws."""
         for length in (self.HASH_CUT, self.NAME_CUT):
