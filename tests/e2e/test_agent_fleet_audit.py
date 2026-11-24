@@ -1,4 +1,4 @@
-"""Stage 1 E2E Promotion Test: Autonomous Fleet Audits, Audit Streams & GitHub Integration."""
+"""Stage 1 E2E Promotion Test: GitHub access for the fleet audits (token minting, isolation, repository)."""
 
 import json
 import os

@@ -36,7 +36,8 @@ import vcs_client  # noqa: E402
 
 _AUDIT_REPORT_SCRIPT = Path(audit_report.__file__).resolve()
 
-# Every stream these tests run, with the title its ledger issue carries.
+# The streams these tests run, with the title each ledger issue carries.
+# `test_the_list_names_every_stream` holds the list to `audit_report.AUDITS`.
 AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("compliance-audit", "Security & RBAC Posture Audit"),
     ("security-patch-orchestrator", "Upgrade & Patch Readiness Audit"),
@@ -47,6 +48,7 @@ AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("stockout-prevention", "Fleet Stockout Prevention & Capacity Audit"),
     ("gcp-networking-fabric-audit", "GCP Networking Fabric & VPC IPAM Audit"),
     ("gce-compute-fleet-audit", "GCE Compute Engine and MIG Fleet Audit"),
+    ("upgrade-retrospective", "Upgrade Retrospective"),
 ]
 
 _CLUSTER = "test-cluster"
@@ -151,6 +153,10 @@ class TestFinishOnEveryStream(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp_path = Path(tmp.name)
+
+    def test_the_list_names_every_stream(self):
+        """A stream added to `audit_report.AUDITS` and not to `AUDIT_STREAMS` would run in neither test."""
+        self.assertEqual(sorted(audit_id for audit_id, _ in AUDIT_STREAMS), sorted(audit_report.AUDITS))
 
     def test_audit_report_ledger_dryrun_all_streams(self):
         """`finish --dry-run` accepts the sample document and prints its ledger, on every stream.

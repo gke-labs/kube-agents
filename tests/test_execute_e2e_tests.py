@@ -18,7 +18,7 @@ _CONFIG = _REPO_ROOT / "tests" / "e2e" / "e2e_config.yaml"
 
 # Read by the runner from the ambient environment, so a shell that exports one would
 # shadow the YAML block these tests assert about. Cleared per call rather than trusted.
-_SHADOWING_KEYS = ("FLEET_AUDIT_STREAMS", "STOCKOUT_SCENARIOS", "GITHUB_ORG", "GITHUB_REPO")
+_SHADOWING_KEYS = ("STOCKOUT_SCENARIOS", "GITHUB_ORG", "GITHUB_REPO")
 
 
 def _load_runner():
@@ -63,7 +63,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(self.runner, "find_pytest_executable", return_value="pytest"):
             # The runner builds {**custom_env_vars, **os.environ, ...}, so an exported
             # value deliberately shadows the YAML block's. Without this, a developer who
-            # has FLEET_AUDIT_STREAMS set reds `make test-python` on a change they did
+            # has STOCKOUT_SCENARIOS set reds `make test-python` on a change they did
             # not make. patch.dict restores whatever we pop here on exit.
             for key in _SHADOWING_KEYS:
                 if key not in ambient:
@@ -108,10 +108,10 @@ class ChildEnvironmentTest(unittest.TestCase):
             {
                 "name": "audit",
                 "tests": ["tests/e2e/x.py"],
-                "env_vars": {"FLEET_AUDIT_STREAMS": "compliance-audit"},
+                "env_vars": {"STOCKOUT_SCENARIOS": "04-missing-zone-fallback"},
             }
         )
-        self.assertEqual(captured.get("FLEET_AUDIT_STREAMS"), "compliance-audit")
+        self.assertEqual(captured.get("STOCKOUT_SCENARIOS"), "04-missing-zone-fallback")
         self.assertEqual(captured.get("E2E_SUITE"), "audit")
 
 
