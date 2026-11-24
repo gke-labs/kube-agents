@@ -46,43 +46,58 @@ _HARNESS_COPY = "a2a/worker-harness/package.json a2a/worker-harness/package-lock
 # --omit=optional, which drops the platform package that carries the harness
 # binary) or a second install command changes this list and fails the test.
 _NPM_RUN_COMMANDS = ["npm ci", "npm cache clean --force"]
-_PACKAGE_MANAGER = re.compile(r"\b(npm|npx|pnpm|yarn|corepack)\b")
+_PACKAGE_MANAGER = re.compile(r"\b(npm|npx|pnpm|yarn|corepack|bun)\b")
+# Where DefaultHarnessPath looks for node_modules.
+_HARNESS_WORKDIR = "/app"
 _SHELL_AND = "&&"
 _CONTINUATION = "\\"
 _COMMENT = "#"
 # The instructions that run a shell command: at build time, or in a child build.
 _SHELL_KEYWORDS = ("RUN", "ONBUILD")
-# npm also reads its settings from the environment and from an .npmrc file, so
+# npm also reads its settings from the environment and from an npmrc file, so
 # either one changes what `npm ci` installs with the RUN line unchanged.
-_NPM_SETTING = re.compile(r"npm_config_|\.npmrc", re.IGNORECASE)
+_NPM_SETTING = re.compile(r"npm_config_|npmrc", re.IGNORECASE)
 # A here-document puts shell lines where _instructions expects instructions.
-# Not a here-string (<<<) and not a shift in shell arithmetic (1<<2).
-_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*[\"']?[A-Za-z_]")
+# Not a here-string (<<<) and not a shift in shell arithmetic (1<<2); a
+# here-document this pattern misses leaves a body line with no known keyword.
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*[\"'\\]?[A-Za-z_]")
+_KEYWORDS = frozenset(
+    "ADD ARG CMD COPY ENTRYPOINT ENV EXPOSE FROM HEALTHCHECK LABEL MAINTAINER "
+    "ONBUILD RUN SHELL STOPSIGNAL USER VOLUME WORKDIR".split()
+)
+# The parser directive that replaces the continuation character.
+_ESCAPE_DIRECTIVE = re.compile(r"^#\s*escape\s*=", re.IGNORECASE | re.MULTILINE)
 _MOVED = "a2a/Dockerfile.worker no longer spells this line as the changed copies below expect"
 
 
 def _instructions(dockerfile_text):
     """The Dockerfile's instructions in order, as (keyword, arguments) pairs.
 
-    Continuation lines are joined, and comment and blank lines are dropped, as
-    the Dockerfile parser does, including inside a continued instruction.
+    Continuation lines are joined with nothing between them, and comment and
+    blank lines are dropped, including inside a continued instruction. A
+    Dockerfile this does not read (an escape directive, a here-document, a line
+    that starts with no instruction) is refused, not misread.
     """
+    if _ESCAPE_DIRECTIVE.search(dockerfile_text):
+        raise ValueError("_instructions does not read an escape directive")
     instructions = []
     pending = []
     for raw in dockerfile_text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(_COMMENT):
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith(_COMMENT):
             continue
         continued = line.endswith(_CONTINUATION)
         pending.append(line[: -len(_CONTINUATION)] if continued else line)
         if continued:
             continue
-        keyword, _, arguments = " ".join(pending).partition(" ")
+        keyword, _, arguments = "".join(pending).strip().partition(" ")
         instructions.append((keyword.upper(), " ".join(arguments.split())))
         pending = []
     if pending:
         raise ValueError("the Dockerfile ends inside a continued instruction")
     for keyword, arguments in instructions:
+        if keyword not in _KEYWORDS:
+            raise ValueError(f"not a Dockerfile instruction (a here-document body?): {keyword} {arguments}")
         if _HEREDOC.search(arguments):
             raise ValueError(f"_instructions does not read here-documents: {keyword} {arguments}")
     return instructions
@@ -102,15 +117,28 @@ def _harness_install_problems(dockerfile_text):
         if keyword in _SHELL_KEYWORDS and _PACKAGE_MANAGER.search(arguments)
     ]
     if len(npm_runs) != 1:
-        return problems + [f"expected one RUN that names a package manager, found {len(npm_runs)}"]
+        found = [" ".join(instructions[index]) for index in npm_runs]
+        return problems + [f"expected one RUN that names a package manager, found {len(npm_runs)}: {found}"]
     npm_run = npm_runs[0]
     keyword, arguments = instructions[npm_run]
     commands = [command.strip() for command in arguments.split(_SHELL_AND)]
-    if keyword != "RUN" or commands != _NPM_RUN_COMMANDS:
+    # An ONBUILD instruction fails here too: its first command starts with RUN.
+    if commands != _NPM_RUN_COMMANDS:
         problems.append(f"the npm RUN is {keyword} {commands}, not RUN {_NPM_RUN_COMMANDS}")
     # Directly before, so that nothing between the two replaces or removes the lock.
     if npm_run == 0 or instructions[npm_run - 1] != ("COPY", _HARNESS_COPY):
         problems.append(f"no `COPY {_HARNESS_COPY}` directly before the npm RUN")
+    # In the stage the image is, and in the directory the adapter reads.
+    if "FROM" in [keyword for keyword, _ in instructions[npm_run:]]:
+        problems.append("the npm RUN is not in the last stage")
+    workdirs = []
+    for keyword, arguments in instructions[:npm_run]:
+        if keyword == "FROM":
+            workdirs = []
+        elif keyword == "WORKDIR":
+            workdirs.append(arguments)
+    if workdirs[-1:] != [_HARNESS_WORKDIR]:
+        problems.append(f"the npm RUN's WORKDIR is {workdirs[-1:]}, not {_HARNESS_WORKDIR}")
     return problems
 
 
@@ -258,33 +286,60 @@ class HarnessInstallCheckTest(unittest.TestCase):
             (self._NPM_RUN + "RUN npm add left-pad", 2),
             (self._NPM_RUN + "RUN npx left-pad", 2),
             (self._NPM_RUN + "RUN yarn add left-pad", 2),
+            (self._NPM_RUN + "RUN pnpm add left-pad", 2),
+            (self._NPM_RUN + "RUN corepack enable", 2),
+            (self._NPM_RUN + "RUN bun add left-pad", 2),
+            (self._NPM_RUN + "RUN np\\\nm install left-pad", 2),
             (self._NPM_RUN + "ONBUILD RUN npm install left-pad", 2),
             ("# RUN npm ci && npm cache clean --force", 0),
         ):
             with self.subTest(run=run):
-                self.assertEqual(
-                    self._problems_with_run(run),
-                    [f"expected one RUN that names a package manager, found {count}"],
-                )
+                problems = self._problems_with_run(run)
+                self.assertEqual(len(problems), 1)
+                self.assertIn(f"expected one RUN that names a package manager, found {count}: [", problems[0])
 
     def test_an_npm_run_in_a_child_build_is_a_problem(self):
         problems = self._problems_with_run("ONBUILD RUN npm ci && npm cache clean --force")
         self.assertEqual(len(problems), 1)
         self.assertIn("the npm RUN is ONBUILD", problems[0])
 
+    def test_an_install_outside_the_image_or_its_app_directory_is_a_problem(self):
+        workdir = f"WORKDIR {_HARNESS_WORKDIR}\n"
+        build_stage_workdir = "WORKDIR /src\n"
+        self.assertEqual(self.text.count(workdir), 1, _MOVED)
+        self.assertEqual(self.text.count(build_stage_workdir), 1, _MOVED)
+        install = self._COPY + self._NPM_RUN
+        without = self.text.replace(install, "")
+        for case, text, expected in (
+            (
+                "in the build stage",
+                without.replace(build_stage_workdir, build_stage_workdir + install),
+                ["the npm RUN is not in the last stage", "the npm RUN's WORKDIR is ['/src'], not /app"],
+            ),
+            (
+                "another directory",
+                self.text.replace(workdir, workdir + "WORKDIR /opt\n"),
+                ["the npm RUN's WORKDIR is ['/opt'], not /app"],
+            ),
+            (
+                "no directory in its stage",
+                self.text.replace(workdir, ""),
+                ["the npm RUN's WORKDIR is [], not /app"],
+            ),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(_harness_install_problems(text), expected)
+
     def test_a_missing_or_misplaced_copy_of_the_lock_is_a_problem(self):
         expected = [f"no `COPY {_HARNESS_COPY}` directly before the npm RUN"]
-        build_stage_workdir = "WORKDIR /src\n"
-        self.assertEqual(self.text.count(build_stage_workdir), 1, _MOVED)
         without = self.text.replace(self._COPY, "")
         for case, text in (
             ("commented out", self.text.replace(self._COPY, "# " + self._COPY)),
             ("manifest only", self.text.replace(self._COPY, "COPY a2a/worker-harness/package.json ./\n")),
             ("after the RUN", without.replace(self._NPM_RUN, self._NPM_RUN + self._COPY)),
-            ("in the build stage", without.replace(build_stage_workdir, build_stage_workdir + self._COPY)),
             ("another lock over it", self.text.replace(self._COPY, self._COPY + "COPY other/package-lock.json ./\n")),
             ("the lock removed", self.text.replace(self._COPY, self._COPY + "RUN rm package-lock.json\n")),
-            ("another directory", self.text.replace(self._COPY, self._COPY + "WORKDIR /elsewhere\n")),
+            ("another user between", self.text.replace(self._COPY, self._COPY + "USER node\n")),
         ):
             with self.subTest(case=case):
                 self.assertEqual(_harness_install_problems(text), expected)
@@ -295,6 +350,7 @@ class HarnessInstallCheckTest(unittest.TestCase):
             "ENV npm_config_registry=https://registry.example.com/",
             "ARG NPM_CONFIG_OMIT=optional",
             "COPY a2a/worker-harness/.npmrc /root/.npmrc",
+            "COPY a2a/worker-harness/npmrc /usr/local/etc/npmrc",
             "RUN echo omit=optional > /root/.npmrc",
         ):
             with self.subTest(setting=setting):
@@ -302,9 +358,18 @@ class HarnessInstallCheckTest(unittest.TestCase):
                 self.assertEqual(_harness_install_problems(text), [f"an npm setting outside the lock: {setting}"])
 
     def test_a_here_document_is_refused_rather_than_misread(self):
-        for run in ("RUN <<EOF\nnpm install\nEOF", "RUN <<-'EOF'\nnpm install\nEOF"):
-            with self.subTest(run=run), self.assertRaisesRegex(ValueError, "here-documents"):
+        for run in (
+            "RUN <<EOF\nnpm install\nEOF",
+            "RUN <<-'EOF'\nnpm install\nEOF",
+            "RUN <<\\EOF\nnpm install\nEOF",
+            "RUN <<9\nnpm install\n9",
+        ):
+            with self.subTest(run=run), self.assertRaisesRegex(ValueError, "here-document"):
                 self._problems_with_run(run)
+
+    def test_an_escape_directive_is_refused_rather_than_misread(self):
+        with self.assertRaisesRegex(ValueError, "escape directive"):
+            _harness_install_problems("# escape=`\n" + self.text)
 
     def test_a_here_string_or_a_shift_is_not_a_here_document(self):
         for run in ("RUN cat <<<hello", "RUN echo $((1<<2))", "RUN echo $((1 << 2))"):
