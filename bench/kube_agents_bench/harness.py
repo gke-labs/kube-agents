@@ -190,7 +190,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -782,6 +782,14 @@ def _kubectl_read(args: list[str], what: str, *, missing_ok: bool = False) -> st
         _log.warning("reading %s failed (kubectl exited %d): %s", what, proc.returncode, stderr)
         return None
     return proc.stdout
+
+
+def _session_pod_of(conversation: str) -> str | None:
+    """The live session pod the gateway runs ``conversation`` on (:func:`idle_reply.session_pod`)."""
+    pods = _kubectl_read(
+        ["get", "pods", "-l", idle_reply.SESSION_POD_SELECTOR, "-o", "json"], f"the session pods for {conversation}"
+    )
+    return idle_reply.session_pod(pods, conversation)
 
 
 def _gateway_door_target(agent_service: str, service: str) -> str | None:
@@ -2874,6 +2882,7 @@ _KNOWN_DIRECTIVES = (
     stop_hook.MID_TURN_DIRECTIVE,
     stop_hook.CARD_WAIT_DIRECTIVE,
     pushed_report.DIRECTIVE,
+    idle_reply.DIRECTIVE,
     profile_hook.PROFILE_DIRECTIVE,
     slack.HOME_POST_DIRECTIVE,
     session_cap.DIRECTIVE,
@@ -3693,6 +3702,10 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if idle_reply.is_reply_after_idle(prompt):
+            return AgentResult.errored(
+                f"{idle_reply.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
         if profile_hook.is_profile_ask(prompt):
             return AgentResult.errored(
                 f"{profile_hook.PROFILE_DIRECTIVE} ...] needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
@@ -4475,10 +4488,38 @@ class KubeAgentsHarness(AgentHarness):
         except pushed_report.PlantBroken as exc:
             return AgentResult.errored(str(exc))
         entry = pushed_report.plant_entry(session_id, exchange.conversation, payload)
+        reply, failure = self._send_reply_turn(
+            opening, exchange, replay.reply, pushed_report.DIRECTIVE, pushed_report.REPLY_SUFFIX, retry_seconds
+        )
+        if failure is not None:
+            return failure
+        return pushed_report.merge(opening, reply, entry)
+
+    def _send_reply_turn(
+        self,
+        opening: AgentResult,
+        exchange: inject.Exchange,
+        text: str,
+        directive: str,
+        suffix_base: str,
+        retry_seconds: float,
+    ) -> tuple[AgentResult | None, AgentResult | None]:
+        """Send a two-turn replay's reply on the opening turn's conversation.
+
+        Returns ``(reply, None)`` for a reply turn to merge, or ``(None,
+        failure)`` for the run's infrastructure failure. The reply is a second
+        message on a conversation whose record the relay clears after it acks
+        the opening's terminal; one that lands in that window is absorbed as a
+        steer and the door answers no-task. It is sent again under a fresh
+        message id (``suffix_base``, then ``suffix_base-2`` and so on),
+        :data:`_PUSHED_REPLY_ATTEMPTS` times in all, ``retry_seconds`` apart;
+        a reply still refused after that is infrastructure, as is any other
+        refusal and a reply whose exchange was lost in transport.
+        """
         for attempt in range(1, _PUSHED_REPLY_ATTEMPTS + 1):
-            suffix = pushed_report.REPLY_SUFFIX if attempt == 1 else f"{pushed_report.REPLY_SUFFIX}-{attempt}"
+            suffix = suffix_base if attempt == 1 else f"{suffix_base}-{attempt}"
             reply = self._execute_inject(
-                replay.reply,
+                text,
                 follow_up=_InjectFollowUp(
                     conversation=exchange.conversation,
                     run_id=str(opening.metadata.get("run_id") or ""),
@@ -4494,7 +4535,8 @@ class KubeAgentsHarness(AgentHarness):
             if not absorbed:
                 break
             _log.warning(
-                "pushed report: the reply on %s was absorbed as a steer (attempt %d/%d)",
+                "%s: the reply on %s was absorbed as a steer (attempt %d/%d)",
+                directive,
                 exchange.conversation,
                 attempt,
                 _PUSHED_REPLY_ATTEMPTS,
@@ -4502,21 +4544,77 @@ class KubeAgentsHarness(AgentHarness):
             if attempt < _PUSHED_REPLY_ATTEMPTS:
                 time.sleep(retry_seconds)
         else:
-            return _infra_failure(
-                f"{pushed_report.DIRECTIVE}: the reply on {exchange.conversation} was absorbed as a "
+            return None, _infra_failure(
+                f"{directive}: the reply on {exchange.conversation} was absorbed as a "
                 f"steer {_PUSHED_REPLY_ATTEMPTS} times; the relay never released the opening task's record"
             )
         if reply.metadata.get("outcome") == inject.OUTCOME_NOT_ACCEPTED:
             # Any other refusal: the door, not the agent.
-            return _infra_failure(f"{pushed_report.DIRECTIVE}: {'; '.join(reply.errors) or 'the reply was refused'}")
+            return None, _infra_failure(f"{directive}: {'; '.join(reply.errors) or 'the reply was refused'}")
         if reply.metadata.get("infra_failure") is not None:
             # The reply's exchange was lost in transport or classified as
             # infrastructure by the door's read: the run is that failure, as
             # _infra_failure records it (empty output, empty trajectory, the
             # marker), not a merged record that reads as a completed task
             # beside an infrastructure failure.
-            return reply
-        return pushed_report.merge(opening, reply, entry)
+            return None, reply
+        return reply, None
+
+    def _reply_after_idle(
+        self,
+        opening: AgentResult,
+        exchange: inject.Exchange,
+        replay: idle_reply.Replay,
+        *,
+        retry_seconds: float = _PUSHED_REPLY_RETRY_SECONDS,
+    ) -> AgentResult:
+        """Wait the replay's idle time with the conversation idle, then send its reply there.
+
+        Runs after the opening turn has been classified and graded into
+        ``opening``, with the same gates as a pushed-report reply
+        (:meth:`_reply_under_pushed_report`): an opening an executor ended
+        other than ``completed`` is the run as it stands, and a completed
+        opening the harness read only off the stream, or at its budget, is
+        infrastructure. The wait is what moves the reply onto a session pod
+        rehydrated from history, once the gateway's DM idle TTL has reaped
+        the opening's pod (:mod:`idle_reply`).
+        """
+        if exchange.fold.terminal != inject.STATE_COMPLETED:
+            opening.errors.append(
+                f"{idle_reply.DIRECTIVE}: the opening turn ended "
+                f"{exchange.fold.terminal or exchange.outcome}, so no reply was sent"
+            )
+            return opening
+        if exchange.outcome != inject.OUTCOME_TERMINAL:
+            return _infra_failure(
+                f"{idle_reply.DIRECTIVE}: the opening turn on {exchange.conversation} completed but its "
+                f"exchange ended {exchange.outcome}, so the reply could not be sent on its record"
+            )
+        opening_pod = _session_pod_of(exchange.conversation)
+        if opening_pod is None:
+            # The runner's read failed: that's a runner fault, not a pod the
+            # agent's session didn't have, so no wait is spent on it.
+            return _infra_failure(
+                f"{idle_reply.DIRECTIVE}: the session pods could not be read after the opening turn on "
+                f"{exchange.conversation}, so the reply was not sent"
+            )
+        _log.info("reply after idle: waiting %ds on %s before the reply", replay.idle_seconds, exchange.conversation)
+        started = time.monotonic()
+        time.sleep(replay.idle_seconds)
+        waited = time.monotonic() - started
+        reply, failure = self._send_reply_turn(
+            opening, exchange, replay.reply, idle_reply.DIRECTIVE, idle_reply.REPLY_SUFFIX, retry_seconds
+        )
+        if failure is not None:
+            return failure
+        reply_pod = _session_pod_of(exchange.conversation)
+        if reply_pod is None:
+            return _infra_failure(
+                f"{idle_reply.DIRECTIVE}: the session pods could not be read after the reply on "
+                f"{exchange.conversation}, so which pod it ran on is unknown"
+            )
+        entry = idle_reply.wait_entry(exchange.conversation, replay.idle_seconds, waited, opening_pod, reply_pod)
+        return idle_reply.merge(opening, reply, entry)
 
     def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:
         """Send a planted card's wake and the user's answer, or only the wake for a block replay.
@@ -4615,7 +4713,7 @@ class KubeAgentsHarness(AgentHarness):
 
         ``follow_up`` makes this a second message on a conversation an
         earlier turn of the same run opened (the reply of a
-        :mod:`pushed_report` replay): it carries that turn's conversation
+        :mod:`pushed_report` or :mod:`idle_reply` replay): it carries that turn's conversation
         and identity, so nothing is minted anew, plus the message-id suffix
         the door tells the two apart by. Such a turn parses no directive,
         writes no turn timing and waits on no delegation; it returns once
@@ -4682,12 +4780,15 @@ class KubeAgentsHarness(AgentHarness):
                 prompt = target.prompt
             stop = None if follow_up else stop_hook.parse(prompt)
             pushed = None if follow_up else pushed_report.parse(prompt)
+            idle = None if follow_up else idle_reply.parse(prompt)
         except ValueError as exc:
             return AgentResult.errored(str(exc))
         if stop is not None:
             prompt = stop.prompt
         if pushed is not None:
             prompt = pushed.opening
+        if idle is not None:
+            prompt = idle.opening
 
         agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
         service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
@@ -5097,6 +5198,8 @@ class KubeAgentsHarness(AgentHarness):
 
         if pushed is not None:
             return self._reply_under_pushed_report(result, exchange, pushed)
+        if idle is not None:
+            return self._reply_after_idle(result, exchange, idle)
 
         if delegation_timeout > 0:
             # The seam for delegated work, and it is the case runner's rather

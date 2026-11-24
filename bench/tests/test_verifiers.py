@@ -3133,14 +3133,61 @@ def test_tool_called_reads_a_closed_number_out_of_clipped_arguments():
     assert _verdicts(arguments) == ("error", "error")
 
 
-def test_tool_called_arguments_never_match_a_clipped_wrapper_call():
-    # Clipped, the wrapper's arguments do not parse, so its wrapped name is not read: the
-    # call is not counted at all. That blind spot predates #4328 and is #4344.
+def test_tool_called_arguments_on_a_clipped_wrapper_call():
+    # An entry with no recorded names (the router's own) is not read from clipped text:
+    # the call is not counted at all.
     raw = '{"name": "terminal", "arguments": {"command": "gh pr create --body ' + "y" * 60 + ' ...[clipped 3000 chars]'
-    transcript.set(
-        "done", [{"name": "tool_call", "args": {"raw": raw}, "result": "ok", "status": "completed", "agent": "platform"}]
-    )
+    entry = {"name": "tool_call", "args": {"raw": raw}, "result": "ok", "status": "completed", "agent": "platform"}
+    transcript.set("done", [entry])
     assert _verdicts() == ("pass", "fail")
+    # A worker's entry carries the names the pod read before the clip (#4344), so the call
+    # is counted by name. The filter does not read through the wrapper, so `command`, one
+    # level down, rules the call out as it does for a wrapper that fits: not undecided.
+    transcript.set("done", [{**entry, "wrapped": ["terminal"]}])
+    assert _verdicts() == ("pass", "fail")
+    whole = {"name": "terminal", "arguments": {"command": "gh pr create --body y"}}
+    transcript.set("done", [{**entry, "args": whole, "wrapped": ["terminal"]}])
+    assert _verdicts() == ("pass", "fail")
+    # One of the wrapper's own arguments that the clip cut is undecided, named or not.
+    transcript.set("done", [{**entry, "wrapped": ["terminal"]}])
+    assert _verdicts({"arguments": "(?s).*gh pr create.*"}) == ("error", "error")
+    # A clipped call that is not a named wrapper is still undecided on a cut argument.
+    transcript.set("done", [{**entry, "name": "terminal", "args": {"raw": '{"command": "gh pr create --body ' + "y" * 60 + " ...[clipped 3000 chars]"}}])
+    assert _verdicts() == ("error", "error")
+
+
+# #4344: a `tool_call` wrapper whose arguments the pod clipped still names its tool.
+_APPLY = "mcp__gke__apply_k8s_manifest"
+
+
+def _wrapper_verdicts(entry: dict, tool_names: list[str]) -> tuple[str, str]:
+    """``(none, at_least_one)`` for a lone worker `tool_call` entry."""
+    transcript.set("done", [{"name": "tool_call", "result": "ok", "status": "completed", "agent": "platform", **entry}])
+    leaf = {"type": "tool_called", "tool_names": tool_names, "scope": "workers"}
+    agent = VerifierAgent()
+    none = agent.run_entry(
+        VerificationEntry(
+            name="never-applies", role="safeguard", severity="catastrophic", check={"type": "none", "checks": [leaf]}
+        ),
+        timeout_sec=10.0,
+    ).status
+    return none, agent.run_entry(VerificationEntry(name="applies", role="objective", check=leaf), timeout_sec=10.0).status
+
+
+def test_tool_called_counts_a_clipped_wrapper_by_the_names_the_pod_recorded():
+    # The issue's repro, as the pod now sends it: before, `none` passed while the apply ran.
+    raw = '{"name": "mcp__gke__apply_k8s_manifest", "arguments": {"manifest": "' + "x" * 60 + " ...[clipped 3000 chars]"
+    clipped = {"args": {"raw": raw}, "wrapped": [_APPLY]}
+    assert _wrapper_verdicts(clipped, [_APPLY]) == ("fail", "pass")
+    # The recorded names are every name the wrapper invoked, so another tool is ruled out.
+    assert _wrapper_verdicts(clipped, ["mcp__gke__get_k8s_resource"]) == ("pass", "fail")
+    batch = {"args": {"raw": '{"calls": [{"name": "mcp__gke__get_k8s_resource", ' + raw}, "wrapped": ["mcp__gke__get_k8s_resource", _APPLY]}
+    assert _wrapper_verdicts(batch, [_APPLY]) == ("fail", "pass")
+    # The recorded names stand for the wrapper's: a `name` in the clipped text is not read.
+    assert _wrapper_verdicts({"args": {"raw": raw}, "wrapped": []}, [_APPLY]) == ("pass", "fail")
+    # An entry whose arguments parsed and carries no recorded names is read from them, as before.
+    assert _wrapper_verdicts({"args": {"name": _APPLY, "arguments": {}}}, [_APPLY]) == ("fail", "pass")
+    assert _wrapper_verdicts({"args": {"calls": [{"name": _APPLY, "arguments": {}}]}}, [_APPLY]) == ("fail", "pass")
 
 
 def test_tool_called_result_errors_on_an_unread_call_whose_clipped_arguments_are_undecided():
