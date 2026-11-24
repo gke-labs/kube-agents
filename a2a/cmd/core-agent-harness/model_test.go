@@ -39,7 +39,7 @@ func TestTheModelRequestCarriesNoServerSideTools(t *testing.T) {
 	req := &adkmodel.LLMRequest{
 		Model:    "gemini-test",
 		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
-		Config: &genai.GenerateContentConfig{Tools: []*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{{Name: "read_file", Description: "read"}}}}},
+		Config:   &genai.GenerateContentConfig{Tools: []*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{{Name: "read_file", Description: "read"}}}}},
 	}
 	for _, err := range llm.GenerateContent(context.Background(), req, false) {
 		if err != nil {

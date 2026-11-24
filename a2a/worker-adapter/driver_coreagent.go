@@ -150,7 +150,11 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 
 // NewCoreAgentDriver is the core-agent driver carrying a turn's tool
 // policy and MCP servers, which every turn's envelope sends to the
-// harness. DriverFor's zero driver carries none: every tool refused.
+// harness. DriverFor's driver carries none: every tool refused.
 func NewCoreAgentDriver(p coreagentwire.Policy, mcp []coreagentwire.MCPServer) Driver {
-	return coreAgentDriver{Policy: p, MCP: mcp}
+	// Built from newCoreAgentDriver, so the conversation history store is
+	// there: a driver without it would drop history between turns.
+	d := newCoreAgentDriver()
+	d.Policy, d.MCP = p, mcp
+	return d
 }

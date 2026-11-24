@@ -41,11 +41,11 @@ func TestEveryCoreAgentBuiltinIsClassified(t *testing.T) {
 func TestAPolicyMayRegisterOnlyGrantableBuiltins(t *testing.T) {
 	for _, bad := range []string{"edit_file", "delete_file", "fetch_url", "alert", "todo", "json_query", "record_plan",
 		"wait_and_verify", "sciontool_status", "spawn_agent", "stop_agent", "nonsense", ""} {
-		if _, _, _, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file", bad}}, nil); err == nil {
+		if _, _, _, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file", bad}}, nil, "/scratch"); err == nil {
 			t.Errorf("tool %q accepted", bad)
 		}
 	}
-	if _, _, _, err := policySetup(coreagentwire.Policy{Allow: []string{"read_file:["}}, nil); err == nil {
+	if _, _, _, err := policySetup(coreagentwire.Policy{Allow: []string{"read_file:["}}, nil, "/scratch"); err == nil {
 		t.Error("a malformed pattern accepted")
 	}
 }
@@ -54,7 +54,7 @@ func TestAPolicyMayRegisterOnlyGrantableBuiltins(t *testing.T) {
 // mode, and the tool-policy plugin is the first (here the only) plugin, so
 // nothing earlier in the chain can run a tool before its check.
 func TestTheSetupIsAllowModeWithThePolicyPluginFirst(t *testing.T) {
-	_, opts, plugins, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file"}}, nil)
+	_, opts, plugins, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file"}}, nil, "/scratch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestTheRegisteredToolsAreExactlyThePolicys(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			b, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil)
+			b, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil, "/scratch")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -160,7 +160,7 @@ func TestAToolOutsideTheGrantIsRefusedBeforeItRuns(t *testing.T) {
 		{"a granted MCP tool, nil args", &genai.FunctionCall{Name: "srv_granted"}, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			_, opts, plugins, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file"}}, mcp)
+			_, opts, plugins, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file"}}, mcp, "/scratch")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -226,7 +226,7 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil)
+	_, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil, "/scratch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,9 +245,19 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 		"gcloud info":                   false,
 		script + " --namespace x; id":   false,
 		script + " | sh":                false,
-		"python3 " + script:             false,
-		"python3 -c 'import os'":        false,
-		script + "x":                    false,
+		// The trailing glob of "<path> *" can't smuggle a second command
+		// through the argument part.
+		script + " $(id)":         false,
+		script + " `id`":          false,
+		script + " ; x":           false,
+		script + " && x":          false,
+		script + " || x":          false,
+		script + " & x":           false,
+		script + " --out=$HOME":   false,
+		script + " < /etc/passwd": false,
+		"python3 " + script:       false,
+		"python3 -c 'import os'":  false,
+		script + "x":              false,
 		"/var/lib/agent-persona/skills/stall/scripts/../../other/scripts/evil.py": false,
 		"/var/lib/agent-persona/skills/other/scripts/evil.py":                     false,
 		"sh -c id": false,
