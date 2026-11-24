@@ -52,9 +52,11 @@ func TestCheckPersonaDirFailsClosed(t *testing.T) {
 	}{
 		// The owner can chmod, so an entry agy owns is writable even with
 		// no write bit set.
+		// Refused either for the dir or, where the test user owns a parent
+		// in a sticky /tmp, for that parent; both name uid.
 		"the dir owned by agy, no write bits": {
 			mutate: func(t *testing.T, d string) {},
-			uid:    os.Getuid(), gid: os.Getgid(), want: "writable",
+			uid:    os.Getuid(), gid: os.Getgid(), want: "uid",
 		},
 		// agy's supplementary groups are unknown here, so any group write
 		// bit fails, whatever gid is passed.
