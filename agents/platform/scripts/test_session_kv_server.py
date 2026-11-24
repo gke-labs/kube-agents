@@ -6792,6 +6792,85 @@ class TestFindingsNudgeCardRelay(unittest.TestCase):
         _, calls = self._post()
         self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.HIDDEN_CONTEXT)])
+
+    EARLY_REPORT = (
+        "1 critical issue will delay or block cluster upgrades · 4 open across 2 clusters\n\n"
+        "- critical · kube-system/istiod on prod-central — PodDisruptionBudget blocks drain. Allow at least 1 disruption."
+    )
+    EARLY_ITEM = "1. [new] id=urr-pdb.1 members=urr-pdb.1 location=proj/prod-central/kube-system/istiod covers=1 unreported=0"
+    LATER_REPORT = (
+        "1 new issue needs review · 5 open across 2 clusters\n\n"
+        "- major · billing/worker on staging-east — Deployment mounts a static key. Use Workload Identity."
+    )
+    LATER_ITEM = "1. [new] id=static-key.9 members=static-key.9 location=proj/staging-east/billing/worker covers=1 unreported=0"
+    ITEMS_HEADER = "\n\n[Queued item metadata for thread replies]\n"
+
+    def test_each_chat_leg_keeps_the_earlier_items_of_its_own_thread(self):
+        """Slack and Google Chat have a thread each. The earlier items come from the row of
+        the leg that is written, so a leg that got only the later card keeps none."""
+        os.environ["KAGE_SLACK_UX"] = "false"
+        early = {"severity": "critical", "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain"}
+        later = {"severity": "major", "text": "**billing/worker** on `staging-east` — Deployment mounts a static key"}
+        self._post_card(self.EARLY_REPORT, self.EARLY_ITEM, early)
+        card = {**self.CARD, "text": self.LATER_REPORT, "thread_context": self.LATER_REPORT + self.ITEMS_HEADER + self.LATER_ITEM, "rows": [later]}
+        profile = Path(os.environ["PLATFORM_AGENT_HOME"], "profiles", "platform")
+        session_kv_server.findings_nudge_card.save(session_kv_server.findings_nudge_card.card_path(profile), card)
+        self._post(report=self.LATER_REPORT, platforms=("slack", "google_chat"))
+        stored = {thread_id: report for _chat_id, thread_id, report in self._stored()}
+        self.assertIn("[id=urr-pdb.1 covers=1]", stored[self.SLACK_THREAD])
+        self.assertEqual(stored["spaces/AAA/threads/T1"], self.LATER_REPORT + self.ITEMS_HEADER + self.LATER_ITEM)
+
+    def _post_card(self, report, item, row):
+        """One nudge of the day: its card saved, then its report relayed."""
+        card = {**self.CARD, "text": report, "thread_context": report + self.ITEMS_HEADER + item, "rows": [row]}
+        profile = Path(os.environ["PLATFORM_AGENT_HOME"], "profiles", "platform")
+        session_kv_server.findings_nudge_card.save(session_kv_server.findings_nudge_card.card_path(profile), card)
+        return self._post(report=report)
+
+    def test_a_later_nudge_of_the_day_keeps_the_earlier_cards_items_in_the_threads_context(self):
+        """The thread and its one stored row are per day, and the card prints no id: a
+        later nudge that replaced the row left a reply or a click under the earlier card
+        with the later card's items."""
+        os.environ["KAGE_SLACK_UX"] = "false"
+        self._post_card(
+            self.EARLY_REPORT,
+            self.EARLY_ITEM,
+            {"severity": "critical", "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain"},
+        )
+        self._post_card(
+            self.LATER_REPORT,
+            self.LATER_ITEM,
+            {"severity": "major", "text": "**billing/worker** on `staging-east` — Deployment mounts a static key"},
+        )
+        ((chat_id, thread_id, stored),) = self._stored()
+        self.assertEqual((chat_id, thread_id), (self.HOME, self.SLACK_THREAD))
+        self.assertEqual(
+            stored,
+            self.LATER_REPORT
+            + self.ITEMS_HEADER
+            + self.LATER_ITEM
+            + "\n\n"
+            + session_kv_server.findings_nudge_card.EARLIER_HEADER
+            + "\n(message 1 before the newest)\n"
+            + "- critical · kube-system/istiod on prod-central — PodDisruptionBudget blocks drain. "
+            + "Allow at least 1 disruption. [id=urr-pdb.1 covers=1]",
+        )
+
+        # A nudge whose card is not to hand stores its text and still keeps the earlier items.
+        bare = "A findings nudge with no matching card file."
+        self._post(report=bare)
+        ((_chat, _thread, stored),) = self._stored()
+        self.assertTrue(stored.startswith(bare + "\n\n" + session_kv_server.findings_nudge_card.EARLIER_HEADER))
+        self.assertIn("[id=static-key.9 covers=1]", stored)
+        self.assertIn("(message 2 before the newest)\n- critical · kube-system/istiod", stored)
+
+        # Only the nudge keeps earlier items: another job's later report replaces what its thread stored.
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM incidents")
+        self._post(job_id="some-other-job")
+        self._post(report="A later report of the same job.", job_id="some-other-job")
+        self.assertEqual([row[2] for row in self._stored()], ["A later report of the same job."])
+
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 

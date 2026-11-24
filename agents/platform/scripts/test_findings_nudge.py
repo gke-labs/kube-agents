@@ -348,6 +348,169 @@ class CardAndChatUxTests(unittest.TestCase):
         self.assertEqual([c["text"] for c in chat["choices"]], ["Fix issue"])
 
 
+class EarlierNudgesInOneThreadTests(unittest.TestCase):
+    """A day's nudges share one thread and its one stored context, and the card prints no id.
+
+    Replacing the context with each nudge left a reply or a click under an earlier
+    card with the newest card's items. The newest context keeps the earlier items.
+    """
+
+    def _stored(self, *rows, stored=""):
+        rows = list(rows)
+        bundle = nudge.build_nudge(plan_for(rows), len(rows), False, rows=rows)
+        return nudge_card.thread_context_with_earlier(bundle.card, bundle.text, stored), bundle
+
+    def _earlier(self, context):
+        return context.partition(f"\n{nudge_card.EARLIER_HEADER}\n")[2].splitlines()
+
+    def test_the_first_nudge_of_a_thread_stores_its_context_unchanged(self):
+        stored, bundle = self._stored(finding(id="a"))
+        self.assertEqual(stored, bundle.card["thread_context"])
+        # The same message stored again, as a retried relay does, adds nothing either.
+        again, _ = self._stored(finding(id="a"), stored=stored)
+        self.assertEqual(again, stored)
+
+    def test_a_second_nudge_keeps_the_first_ones_items_under_its_own(self):
+        first, _ = self._stored(finding(id="a", title="first"), finding(id="b", check_slug="x", title="second"))
+        second, bundle = self._stored(finding(id="c", check_slug="y", title="third"), stored=first)
+        self.assertTrue(second.startswith(bundle.card["thread_context"] + "\n\n" + nudge_card.EARLIER_HEADER))
+        self.assertEqual(
+            self._earlier(second),
+            [
+                "(message 1 before the newest)",
+                "- critical · payments/api on prod — first. add a readinessProbe. [id=a covers=1]",
+                "- critical · payments/api on prod — second. add a readinessProbe. [id=b covers=1]",
+            ],
+        )
+
+    def test_a_third_nudge_lists_the_earlier_ones_newest_first(self):
+        first, _ = self._stored(finding(id="a", title="first"))
+        second, _ = self._stored(finding(id="b", check_slug="x", title="second"), stored=first)
+        third, _ = self._stored(finding(id="c", check_slug="y", title="third"), stored=second)
+        self.assertEqual(
+            self._earlier(third),
+            [
+                "(message 1 before the newest)",
+                "- critical · payments/api on prod — second. add a readinessProbe. [id=b covers=1]",
+                "(message 2 before the newest)",
+                "- critical · payments/api on prod — first. add a readinessProbe. [id=a covers=1]",
+            ],
+        )
+
+    def test_a_gathered_line_keeps_its_named_id_and_what_it_covers_not_every_member(self):
+        gathered = [finding(id=f"p{i}", object=f"d{i}") for i in range(8)]
+        first, _ = self._stored(*gathered)
+        second, _ = self._stored(finding(id="z", check_slug="x"), stored=first)
+        (position, line) = self._earlier(second)
+        self.assertEqual(position, "(message 1 before the newest)")
+        self.assertTrue(line.startswith("- critical · payments/d0 (+7 more) on prod"))
+        self.assertTrue(line.endswith("[id=p0 covers=8]"))
+        self.assertNotIn("p7", line)
+
+    def test_items_older_than_the_cap_drop_off(self):
+        stored = ""
+        for i in range(nudge_card.EARLIER_MESSAGES_MAX + 2):
+            stored, _ = self._stored(finding(id=f"f{i}", check_slug=f"s{i}"), stored=stored)
+        earlier = self._earlier(stored)
+        positions = [line for line in earlier if nudge_card.EARLIER_MESSAGE_RE.fullmatch(line)]
+        self.assertEqual(len(positions), nudge_card.EARLIER_MESSAGES_MAX)
+        kept = [line.rsplit("[id=", 1)[1].split()[0] for line in earlier if "[id=" in line]
+        self.assertEqual(kept, ["f4", "f3", "f2", "f1"])
+
+    def test_an_item_the_newest_message_names_again_is_not_repeated_below_it(self):
+        first, _ = self._stored(finding(id="a"), finding(id="b", check_slug="x"))
+        second, bundle = self._stored(finding(id="a"), stored=first)
+        self.assertEqual([line for line in self._earlier(second) if "[id=" in line][0].rsplit("[id=", 1)[1], "b covers=1]")
+        self.assertEqual(second.count("id=a "), bundle.card["thread_context"].count("id=a "))
+
+    def test_a_stored_text_with_no_item_lines_adds_nothing(self):
+        stored, bundle = self._stored(finding(id="a"), stored="A report of another kind.\n\n- a line with no id")
+        self.assertEqual(stored, bundle.card["thread_context"])
+
+    def test_a_context_whose_rows_and_item_lines_do_not_pair_keeps_the_ids_alone(self):
+        odd = (
+            "A head line\n\n- one row\n- another row\n\n"
+            + nudge_card.METADATA_HEADER
+            + "\n1. [new] id=only.1 members=only.1 location=p/c/n/o covers=2 unreported=0"
+        )
+        second, _ = self._stored(finding(id="z"), stored=odd)
+        self.assertEqual(
+            self._earlier(second),
+            ["(message 1 before the newest)", nudge_card.EARLIER_ROW_UNREAD + " [id=only.1 covers=2]"],
+        )
+
+    def test_an_earlier_message_keeps_its_own_position_when_one_between_is_named_again(self):
+        first, _ = self._stored(finding(id="a", title="first"))
+        second, _ = self._stored(finding(id="b", check_slug="x", title="second"), stored=first)
+        # The third names the second's item again: that message has no line of its own left,
+        # and the first is still two messages back, not one.
+        third, _ = self._stored(
+            finding(id="b", check_slug="x", title="second"), finding(id="c", check_slug="y", title="third"), stored=second
+        )
+        self.assertEqual(
+            self._earlier(third),
+            [
+                "(message 2 before the newest)",
+                "- critical · payments/api on prod — first. add a readinessProbe. [id=a covers=1]",
+            ],
+        )
+
+    def test_the_same_nudge_again_leaves_the_earlier_items_where_they_are(self):
+        first, _ = self._stored(finding(id="a", title="first"))
+        second, _ = self._stored(finding(id="b", check_slug="x", title="second"), stored=first)
+        again = second
+        for _ in range(nudge_card.EARLIER_MESSAGES_MAX + 1):
+            again, _ = self._stored(finding(id="b", check_slug="x", title="second"), stored=again)
+        self.assertEqual(again, second)
+
+    def test_a_nudge_with_no_card_to_hand_still_keeps_the_earlier_items(self):
+        first, _ = self._stored(finding(id="a", title="first"))
+        bare = "A nudge whose card was not to hand: its text alone."
+        second = nudge_card.thread_context_with_earlier(None, bare, first)
+        self.assertTrue(second.startswith(bare + "\n\n" + nudge_card.EARLIER_HEADER))
+        third, _ = self._stored(finding(id="c", check_slug="y", title="third"), stored=second)
+        self.assertEqual(
+            self._earlier(third),
+            [
+                "(message 2 before the newest)",
+                "- critical · payments/api on prod — first. add a readinessProbe. [id=a covers=1]",
+            ],
+        )
+
+    def test_a_row_too_long_for_the_card_is_cut_where_the_button_can_still_name_it(self):
+        import slack_presenter
+
+        rows = [finding(id="a", title="word " * 100)]
+        bundle = nudge.build_nudge(plan_for(rows), 1, False, rows=rows)
+        (row,) = bundle.card["rows"]
+        self.assertLessEqual(len(row["text"]), slack_presenter.ROW_TEXT_MAX)
+        self.assertTrue(row["text"].endswith(slack_presenter.ELLIPSIS))
+        label = bundle.card["choices"][0]
+        plain = row["text"].replace("**", "").replace("`", "")
+        self.assertEqual(bundle.card["replies"][label], f"{label}: {plain}")
+        # The text form carries the same cut, and no period follows its ellipsis.
+        self.assertIn(f"{plain} add a readinessProbe.", bundle.text)
+
+    def test_the_next_issues_block_of_a_context_is_not_taken_for_its_items(self):
+        many = [finding(id=f"m{i}", check_slug=f"s{i}", severity="major") for i in range(6)]
+        bundle = nudge.build_nudge(plan_for(many, now=at(6, 16)), len(many), False, rows=many)
+        self.assertIn("by rank", bundle.card["thread_context"])
+        named = [line for line in bundle.card["thread_context"].split(nudge_card.METADATA_HEADER)[1].split("\n\n")[0].splitlines() if line]
+        second, _ = self._stored(finding(id="z", check_slug="x"), stored=bundle.card["thread_context"])
+        self.assertEqual(len([line for line in self._earlier(second) if "[id=" in line]), len(named))
+
+    def test_the_slack_relay_button_carries_the_row_its_gateway_click_names(self):
+        rows = [finding(id="a", title="first"), finding(id="b", check_slug="x", title="second")]
+        bundle = nudge.build_nudge(plan_for(rows), 2, False, rows=rows)
+        label = bundle.card["choices"][0]
+        blocks, _ = nudge_card.blocks_from_card(bundle.card)
+        (button,) = [element for block in blocks if block["type"] == "actions" for element in block["elements"]]
+        chat, _ = nudge_card.chat_from_card(bundle.card)
+        self.assertEqual(button["value"], f"{label}: payments/api on prod — first")
+        self.assertEqual(button["value"], chat["choices"][0]["reply"])
+        self.assertEqual(button["text"]["text"], label)
+
+
 class DetectorWordingTests(unittest.TestCase):
     """The text the detectors really write, not titles made up for a fixture.
 

@@ -190,6 +190,10 @@ app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None, lifespan=_lifespa
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
+# How long a read of a thread's stored report waits on a locked database.
+INCIDENT_DB_TIMEOUT_SECONDS = 5.0
+# The report stored for one chat thread.
+INCIDENT_REPORT_QUERY = "SELECT report FROM incidents WHERE chat_id = ? AND thread_id = ?"
 
 # The data volume warning. A full volume fails every kanban and session write
 # with a bare `disk I/O error` and nothing in chat says why, so this server, the
@@ -5613,6 +5617,19 @@ def _ensure_session_row(session_id: str, profile: str, job_id: str, title: str =
         logger.error(f"Failed to create relay session row for {session_id}: {exc}")
 
 
+def _stored_incident_report(chat_id: str, thread_id: str) -> str:
+    """The text stored for a thread, or "" when it has none or the read fails."""
+    if not (chat_id and thread_id):
+        return ""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_DB_TIMEOUT_SECONDS)) as conn:
+            row = conn.execute(INCIDENT_REPORT_QUERY, (chat_id, thread_id)).fetchone()
+    except Exception as exc:
+        logger.error(f"Failed to read the stored report for thread {thread_id}: {exc}")
+        return ""
+    return str(row[0] or "") if row else ""
+
+
 def _store_incident_report(chat_id: str, thread_id: str, report: str) -> None:
     """Persist the delivered text so a reply in this thread carries it back
     (for the findings nudge, the text and the finding ids it does not print).
@@ -6776,12 +6793,24 @@ def relay_cron_report(
     # `_store_incident_report` is INSERT OR REPLACE on `(chat_id, thread_id)`,
     # so writing those rows would overwrite each channel's stored context with a
     # report it never received and drop the one still on its screen.
+    #
+    # The findings nudge prints no id, and a day's nudges share the thread and
+    # its one row. So its newest context keeps the items of the nudges before
+    # it, read back from the row of each leg: replacing the row would leave a
+    # reply or a click under an earlier card with the newest card's items.
     registered = _lookup_platform_threads(session_id)
-    stored_report = findings_nudge_card.thread_context(nudge, message) if nudge is not None else message
     for platform in threads:
         entry = registered.get(platform)
-        if entry:
-            _store_incident_report(entry[0], entry[1], stored_report)
+        if not entry:
+            continue
+        stored_report = message
+        if job_id == findings_nudge_card.JOB_ID:
+            # Also with no card to hand (a truncated report, a card file missing or
+            # refused): its text alone must not erase the earlier cards' items.
+            stored_report = findings_nudge_card.thread_context_with_earlier(
+                nudge, message, _stored_incident_report(entry[0], entry[1])
+            )
+        _store_incident_report(entry[0], entry[1], stored_report)
 
     logger.info(
         f"Relayed {profile}/{job_id} report to {', '.join(threads)} "

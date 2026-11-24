@@ -935,11 +935,17 @@ and after it `findings_nudge.py` runs hourly and names only what `findings_queue
   (`findings_nudge_card.thread_context`), which a reply in that thread is answered with. The message's
   folded queue breakdown lists the next ten items by rank, one plain line each, above its
   per-cluster table, and the same lines are in that context, so reading them needs no agent turn
-  and no read of the queue's rows. That row
-  holds one report, so a second nudge on the same UTC day, which posts into the same thread,
-  replaces the first one's ids. The ids are stored whenever the card file matches the report,
+  and no read of the queue's rows. The ids are stored whenever the card file matches the report,
   also on a leg that posts the report as text; a truncated report, or one whose card file is
   missing, unreadable or for another report, stores the text alone.
+- **A day's nudges share one thread and one stored row:** a second nudge on the same UTC day posts
+  into the same thread and writes that row again. Its context keeps the earlier nudges' rows and
+  ids under its own (`findings_nudge_card.thread_context_with_earlier`, `EARLIER_MESSAGES_MAX`
+  messages back), so a reply about an earlier card still finds that card's finding; a nudge that
+  stores its text alone keeps them too. The card's button carries its first row's words on both
+  chat paths, and a click sends them when the card shows that row whole. The nudge cuts a title
+  that would take the row past the card's limit; a row whose object name alone passes the limit,
+  or whose title holds strike or italic markup, sends the button's label alone.
 
 The day's limits count additions from `findings_additions` (§3.1, `GET /v1/findings/additions`),
 one row per item added, with the class the item had when it was added, so neither dismissing,

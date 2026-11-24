@@ -193,7 +193,8 @@ SUBJECT_END_CHARS = " (:"
 POD_NOUN = ("pod", "pods")
 CLUSTER_NOUN = ("cluster", "clusters")
 WAITING_JOINER = " and "
-SENTENCE_ENDINGS = (".", "!", "?")
+# A title cut for the card ends in the presenter's ellipsis, which closes it as a period does.
+SENTENCE_ENDINGS = (".", "!", "?", slack_presenter.ELLIPSIS)
 
 # Card and fallback presentation constants.
 ROLE_NEW = "new"
@@ -304,7 +305,7 @@ MAX_FOLD_CLUSTERS = 15
 FOLD_NEXT_ISSUE_MAX = 80
 REPLY_SUMMARY_MAX = 300
 
-METADATA_HEADER = "[Queued item metadata for thread replies]"
+METADATA_HEADER = nudge_card.METADATA_HEADER
 METADATA_LINE = "{index}. [{role}] id={id} members={members} location={location} covers={covers} unreported={unreported}"
 METADATA_NO_LOCATION = "-"
 
@@ -609,7 +610,14 @@ def format_item(
         subject_md = EXTRA_ONLY.format(extra=extra) if extra else ""
         subject_plain = subject_md
 
-    card_text = f"{subject_md} — {summary}" if (subject_md and summary) else (subject_md or summary)
+    # The card shows a row's first line up to the presenter's limit, and a click on the
+    # card's button names that line only when the card shows it whole. So a title that
+    # would take the line past the limit is cut here, where both forms are built.
+    lead_md = f"{subject_md} — " if (subject_md and summary) else ""
+    room = slack_presenter.ROW_TEXT_MAX - len(lead_md)
+    if len(summary) > room > 0:
+        summary = slack_presenter._clip(summary, room)
+    card_text = f"{lead_md}{summary}" if lead_md else (subject_md or summary)
     plain_head = f"{subject_plain} — {summary}" if (subject_plain and summary) else (subject_plain or summary)
 
     action = clean_action(str((top.get("recommendation") or {}).get("action") or ""))
@@ -618,7 +626,8 @@ def format_item(
         card_row["detail"] = action
 
     plain_lead = _ensure_period(plain_head) if action else plain_head
-    plain_line = f"- {severity} · {plain_lead} {action}".strip() if action else f"- {severity} · {plain_lead}"
+    row_start = f"{nudge_card.ROW_LINE_PREFIX}{severity} · {plain_lead}"
+    plain_line = f"{row_start} {action}".strip() if action else row_start
 
     member_ids = ",".join(str(m.get("id") or "") for m in item.members if m.get("id"))
     raw_where = "/".join(

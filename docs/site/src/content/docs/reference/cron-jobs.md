@@ -44,7 +44,7 @@ Once a UTC day, on its first run at or after 12:00 UTC, it repeats up to `FINDIN
 
 Where [cards are on](/kube-agents/concepts/chatops/#reactions) and more findings are open, each message carries a queue breakdown: the next ten findings by rank, one line each, and a table of up to 15 clusters. The breakdown is collapsed on Slack and open on Google Chat, where the table is a monospace block.
 
-One check failing on several objects in one cluster counts as one finding, and its line says how many other objects it covers. The message shows no finding ID: reply in its thread and name the finding by its workload and cluster, with the decision (dismiss, snooze until a date, or accept). The agent reads the IDs from what it stored for that thread's latest message.
+One check failing on several objects in one cluster counts as one finding, and its line says how many other objects it covers. The message shows no finding ID: reply in its thread and name the finding by its workload and cluster, with the decision (dismiss, snooze until a date, or accept). The agent reads the IDs from what it stored for that thread: the latest message's findings, and those of up to four earlier messages of the day in it.
 
 A decision reaches the undecided objects that a message has already named. That scope includes objects the last complete sweep stopped reporting, while any object added later stays open until a message names it. Findings you ask for yourself are never counted, and dismissing or snoozing a finding gives no allowance back the same day.
 

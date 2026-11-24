@@ -961,6 +961,57 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, body, action)
         return (entry[1] for entry in adapter.log)
 
+    def test_a_findings_nudge_button_names_the_row_of_its_own_card(self):
+        """The nudge's card on the relay path: its button's value is the label and the card's
+        first row, a line the card shows whole. So a click under an earlier card of the day
+        names that card's row, whatever a later card stored for the thread."""
+        import findings_nudge_card
+
+        card = {
+            "version": 1,
+            "text": "fallback",
+            "headline": "2 critical issues will delay or block cluster upgrades",
+            "note": "· 4 open issues covering 4 objects on 2 clusters",
+            "rows": [
+                {
+                    "severity": "critical",
+                    "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain",
+                    "detail": "Allow at least 1 disruption.",
+                },
+                {"severity": "critical", "text": "**gke-pool-1** on `prod-central` — Orphan Node has no backing VM"},
+            ],
+            "choices": ["Fix first issue"],
+            "replies": {"Fix first issue": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain"},
+        }
+        blocks, _ = findings_nudge_card.blocks_from_card(card)
+        (button,) = [element for block in blocks if block["type"] == "actions" for element in block["elements"]]
+        self.assertEqual(button["value"], card["replies"]["Fix first issue"])
+        self.assertEqual(
+            runtime._turn("Fix first issue", button["value"], {"blocks": blocks}),
+            "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain",
+        )
+        # A value that named a row this card does not show would send the label alone.
+        self.assertEqual(
+            runtime._turn("Fix first issue", "Fix first issue: billing/worker on staging-east", {"blocks": blocks}),
+            "Fix first issue",
+        )
+
+    def test_a_findings_nudge_button_names_a_row_too_long_for_the_card(self):
+        """A real nudge with a title past the card's row limit: the nudge cuts the row where
+        the card shows it whole, so the click still names it and does not send the label alone."""
+        import findings_nudge
+        import findings_nudge_card
+        from test_findings_nudge import finding, plan_for
+
+        rows = [finding(id="a", title="word " * 100)]
+        bundle = findings_nudge.build_nudge(plan_for(rows), 1, False, rows=rows)
+        label = bundle.card["choices"][0]
+        blocks, _ = findings_nudge_card.blocks_from_card(bundle.card)
+        (button,) = [element for block in blocks if block["type"] == "actions" for element in block["elements"]]
+        turn = runtime._turn(label, button["value"], {"blocks": blocks})
+        self.assertTrue(turn.startswith(f"{label}: payments/api on prod — word word"))
+        self.assertGreater(len(turn), len(label))
+
     def test_a_session_that_never_read_the_card_is_told_which_finding(self):
         # An existing session in the thread is not re-hydrated with it, so the turn itself names the row the card shows.
         update, turn = self._card_click("Fix the first one: seeded-b and seeded-c admit privileged pods")

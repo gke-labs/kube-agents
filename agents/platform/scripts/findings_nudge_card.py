@@ -14,13 +14,16 @@ matches the relayed report:
 * On every leg that lands, ``thread_context`` is stored in Session KV's
   ``incidents`` table instead of the bare text, so a reply or button click in
   that thread receives the finding ids and item coverage counts without showing
-  plumbing in chat.
+  plumbing in chat. A day's nudges share one thread, so the newest one's
+  context keeps the earlier ones' items under its own
+  (:func:`thread_context_with_earlier`).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -77,6 +80,29 @@ BLOCK_ROWS_KEY = "rows"
 BLOCK_COLLAPSIBLE_KEY = "is_collapsible"
 BLOCK_COLLAPSED_KEY = "default_collapsed"
 BLOCK_CHILDREN_KEY = "child_blocks"
+# The stored context of a thread, as findings_nudge.build_nudge writes it: the message's
+# text, then this header, then one line per item with its id, in the rows' order.
+METADATA_HEADER = "[Queued item metadata for thread replies]"
+# What a row of the message's text starts with.
+ROW_LINE_PREFIX = "- "
+# A day's nudges share one thread and one stored context, and the message prints no id.
+# So the newest nudge's context keeps, under it, the items of the nudges before it: this
+# header, then per earlier message its position line and one line per item.
+EARLIER_HEADER = "[Items of earlier messages in this thread, newest first. A reply or a click may mean one of them.]"
+EARLIER_MESSAGE_LINE = "(message {position} before the newest)"
+EARLIER_MESSAGE_RE = re.compile(r"\(message (\d+) before the newest\)")
+EARLIER_ITEM_LINE = "{row} [id={id} covers={covers}]"
+# An item whose row could not be read back keeps its id under these words.
+EARLIER_ROW_UNREAD = ROW_LINE_PREFIX + "(its words were not kept)"
+# How many earlier messages' items the newest context keeps; older ones drop off.
+EARLIER_MESSAGES_MAX = 4
+# The id of an item: in a metadata line of the nudge (findings_nudge.METADATA_LINE), and at the end of an earlier item line.
+METADATA_ID_RE = re.compile(r"^\d+\. \[[^\]]*\] id=(\S+)")
+EARLIER_ID_RE = re.compile(r"\[id=(\S+) covers=\d+\]$")
+ITEM_COVERS_RE = re.compile(r"\bcovers=(\d+)")
+ITEM_COVERS_DEFAULT = "1"
+# What ends a block of lines in a stored context.
+BLOCK_END = "\n\n"
 # The chat message's fields this module reads back to put `tone` and `fold` in spec order.
 CHAT_HEADLINE, CHAT_NOTE, CHAT_DETAIL = "headline", "note", "detail"
 CHAT_ROWS, CHAT_AFTER, CHAT_CHOICES, CHAT_LINKS = "rows", "after", "choices", "links"
@@ -351,6 +377,7 @@ def blocks_from_card(card: dict) -> tuple[list[dict], str]:
         links=card.get(LINKS_KEY) or (),
         action_id_prefix=ACTION_ID_PREFIX,
         after_rows=after_text,
+        replies=card.get(REPLIES_KEY) or {},
     )
     fold = _clean_fold(card.get(FOLD_KEY))
     if fold is not None:
@@ -367,3 +394,90 @@ def thread_context(card: dict, fallback: str) -> str:
     """Return the hidden incident context to store for thread replies."""
     stored = (card.get(THREAD_CONTEXT_KEY) or "").strip()
     return stored if stored else fallback
+
+
+def _item_id(line: str) -> str:
+    found = EARLIER_ID_RE.search(line) or METADATA_ID_RE.match(line)
+    return found.group(1) if found else ""
+
+
+def _metadata_lines(context: str) -> tuple[str, list[str]]:
+    """``(text above the metadata header, the metadata lines)`` of a stored context; no header, no lines."""
+    visible, found, rest = context.partition(f"\n{METADATA_HEADER}\n")
+    if not found:
+        return context, []
+    return visible, [line for line in rest.split(BLOCK_END, 1)[0].splitlines() if line.strip()]
+
+
+def _message_items(context: str) -> list[str]:
+    """The items of the message a stored context is for, a line each: the row's words, then its id."""
+    visible, metadata = _metadata_lines(context)
+    rows = [line for line in visible.splitlines() if line.startswith(ROW_LINE_PREFIX)]
+    paired = len(rows) == len(metadata)
+    items = []
+    for index, line in enumerate(metadata):
+        finding_id = _item_id(line)
+        if not finding_id:
+            continue
+        covers = ITEM_COVERS_RE.search(line)
+        items.append(
+            EARLIER_ITEM_LINE.format(
+                row=rows[index] if paired else EARLIER_ROW_UNREAD,
+                id=finding_id,
+                covers=covers.group(1) if covers else ITEM_COVERS_DEFAULT,
+            )
+        )
+    return items
+
+
+def _earlier_messages(context: str) -> list[tuple[int, list[str]]]:
+    """``(position, item lines)`` of each earlier message a stored context already keeps, newest first."""
+    _, found, section = context.partition(f"\n{EARLIER_HEADER}\n")
+    messages: list[tuple[int, list[str]]] = []
+    for line in section.splitlines() if found else ():
+        position = EARLIER_MESSAGE_RE.fullmatch(line.strip())
+        if position:
+            messages.append((int(position.group(1)), []))
+        elif messages and line.startswith(ROW_LINE_PREFIX):
+            messages[-1][1].append(line)
+    return messages
+
+
+def thread_context_with_earlier(card: dict | None, fallback: str, stored: str) -> str:
+    """The context to store for the newest nudge of a thread: its own, then the earlier nudges' items.
+
+    ``stored`` is what the thread holds now, the context of the nudge before
+    this one or nothing. A day's nudges share the thread and the card prints
+    no id, so replacing the stored context would lose the ids of every card
+    but the newest, and a reply or a click under an earlier card would be
+    read against the newest card's items. The first nudge of a thread stores
+    its context unchanged. An item the newest message names again is not
+    repeated below it. Each earlier message keeps its own position, and one
+    more than :data:`EARLIER_MESSAGES_MAX` messages back drops off.
+
+    ``card`` is ``None`` for a nudge whose card is not to hand (a truncated
+    report, a card file missing or refused): its text is stored as it is, and
+    the earlier messages' items are still kept under it.
+    """
+    current = thread_context(card, fallback) if card is not None else fallback
+    if not stored:
+        return current
+    # The same message again (a retried relay, a repeat of the hour before): what is
+    # stored already holds it, with the earlier messages at their positions.
+    if stored.partition(f"{BLOCK_END}{EARLIER_HEADER}\n")[0] == current:
+        return stored
+    named = {_item_id(line) for line in _metadata_lines(current)[1]}
+    before = [(1, _message_items(stored)), *((position + 1, lines) for position, lines in _earlier_messages(stored))]
+    kept: list[tuple[int, list[str]]] = []
+    for position, message in before:
+        lines = [line for line in message if _item_id(line) not in named]
+        named.update(_item_id(line) for line in lines)
+        if lines and position <= EARLIER_MESSAGES_MAX:
+            kept.append((position, lines))
+    if not kept:
+        return current
+    parts = [current, "", EARLIER_HEADER]
+    for position, lines in kept:
+        parts.append(EARLIER_MESSAGE_LINE.format(position=position))
+        parts.extend(lines)
+    return "\n".join(parts)
