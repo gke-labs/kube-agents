@@ -104,8 +104,8 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 // read differently.
 func canonicalSkill(skill string, data []byte) ([]byte, error) {
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	if strings.HasPrefix(text, "\ufeff") || strings.Contains(text, "\r") {
-		return nil, fmt.Errorf("skills/%s/SKILL.md: a byte-order mark or a carriage return outside a CRLF line ending", skill)
+	if strings.Contains(text, "\ufeff") || strings.ContainsAny(text, "\r\u0085\u2028\u2029") {
+		return nil, fmt.Errorf("skills/%s/SKILL.md: a byte-order mark or a line break other than LF or CRLF", skill)
 	}
 	lines := strings.SplitAfter(text, "\n")
 	if len(lines) == 0 || strings.TrimRight(lines[0], "\n") != "---" {
@@ -117,7 +117,7 @@ func canonicalSkill(skill string, data []byte) ([]byte, error) {
 		switch {
 		case line == "---":
 			end = i
-		case strings.HasPrefix(line, "---"), strings.HasPrefix(line, "..."), strings.HasPrefix(line, "%"):
+		case strings.Contains(line, "---"), strings.HasPrefix(line, "..."), strings.HasPrefix(line, "%"):
 			return nil, fmt.Errorf("skills/%s/SKILL.md: frontmatter line %q is an ambiguous YAML delimiter or directive", skill, line)
 		}
 	}

@@ -231,6 +231,8 @@ func TestWhatCoreAgentCantTakeIsRefused(t *testing.T) {
 		{"a YAML directive", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\n%YAML 1.2\nname: s\ndescription: d\n---\n")}), "ambiguous"},
 		{"a closing --- with trailing space", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n--- \n---\n")}), "ambiguous"},
 		{"a byte-order mark", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("\ufeff---\nname: s\ndescription: d\n---\n")}), "byte-order mark"},
+		{"a next-line character", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\u0085...\u0085allowed-tools: [Bash]\ndescription: d\n---\n")}), "line break"},
+		{"--- inside a frontmatter line", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: a---b\n---\n")}), "ambiguous"},
 		{"a repeated key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\ndescription: e\n---\nbody\n")}), "frontmatter"},
 		{"unterminated", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\n")}), "unterminated"},
 		{"a merge key smuggling allowed-tools", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n<<: {allowed-tools: [Bash]}\n---\n")}), "allowed-tools"},
