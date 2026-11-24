@@ -339,7 +339,8 @@ _FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
 # carried into this check's advice rather than read as an unread role.
 FLEET_STATE_UNASSERTED_MARK = "was not asserted"
 # The fourth count: a role that is not yet ready is planted and in shape, and
-# its audit's age gate (the orphaned-snapshot roles' 91 days) has not passed;
+# its audit's age gate (the orphaned-snapshot roles' 91 days, the finished-Job
+# family's 7) has not passed;
 # it fails nothing here.
 _FLEET_STATE_SUMMARY = re.compile(
     r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "

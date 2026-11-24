@@ -408,6 +408,32 @@ def test_the_server_certificate_is_refused_as_the_ca(private_ca_server):
         forges.forge_ssl_context({forges.FORGE_CA_FILE_ENV_VAR: str(leaf)})
 
 
+def test_make_certs_asks_for_a_named_curve_in_each_key(tmp_path):
+    """LibreSSL, the openssl of macOS, writes a key's curve parameters in full
+    unless the key options ask for the curve's name, and a TLS client on
+    OpenSSL 3 refuses such a key. OpenSSL names the curve by default, so on
+    Linux only the options show that the script asks. The encoding option
+    must come after the curve option."""
+    real = shutil.which("openssl")
+    if not real:
+        pytest.skip("openssl is not on PATH")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    log = tmp_path / "openssl.log"
+    (fake / "openssl").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexec "{real}" "$@"\n')
+    (fake / "openssl").chmod(0o755)
+    subprocess.run(
+        ["bash", str(REPO_ROOT / "hack" / "ghes-proxy" / "make-certs.sh"), "localhost", str(tmp_path / "out")],
+        check=True,
+        capture_output=True,
+        env={"PATH": f"{fake}:/usr/bin:/bin"},
+    )
+    new_keys = [call for call in log.read_text().splitlines() if "-newkey ec" in call]
+    assert len(new_keys) == 2, new_keys
+    for call in new_keys:
+        assert "-pkeyopt ec_paramgen_curve:prime256v1 -pkeyopt ec_param_enc:named_curve" in call, call
+
+
 def test_make_certs_shows_why_openssl_failed(tmp_path):
     """A failed openssl step prints openssl's own message, not nothing."""
     fake = tmp_path / "bin"

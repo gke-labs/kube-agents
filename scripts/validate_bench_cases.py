@@ -640,6 +640,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: "this run's report is in the store" is the assertion, and
     # `status` and `required_finding_phrases` only narrow it.
     "audit_report_stored": (),
+    # Likewise: "this run's shadow report is on its shadow stream, marked
+    # shadow" is the assertion. `required_finding_phrases` is required by the
+    # verifier's own model.
+    "shadow_report_stored": (),
     # The audits whose part of the reply is graded against the store.
     "report_store_reply": ("audits",),
     # No field, deliberately: the freshness binding is the assertion and every
@@ -703,6 +707,14 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading. No field: "no row of the audit's
+    # changed since the stack's snapshot" is the whole assertion; `source`
+    # (required by the verifier's model) and `check_prefix` say whose rows.
+    "findings_queue_untouched": (),
+    # This repository, schedule-status-reading. No field: "the fired run's
+    # report went to no chat" is the whole assertion; `schedule` names the
+    # AgentSchedule whose fired run is graded.
+    "schedule_report_not_posted": (),
     # This repository, agent-pod-reading: how many of a workload's events the
     # session daemon folded into its newest incident. The count is the
     # assertion; min_folded is at least 1, so it cannot pass on nothing folded.

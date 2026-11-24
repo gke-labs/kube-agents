@@ -1636,6 +1636,69 @@ def local_render(argv: list[str]) -> bool:
     return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
 
 
+# The kubectl verbs that change state (``debug`` starts a pod or container), and
+# the verbs whose second word decides. A ``kubernetes.read-only`` refusal of one
+# of these, not a local render, is a definitive write refusal: the broker marks
+# its refusal body so (credential_proxy.read_only_refusal, ``write_refusal``),
+# and a profile worker stops its task on the in-pod client's record of it. The
+# Hermes runtime's text stop holds the same two tables
+# (deploy/docker/patches/permission_refusal_stop.py MUTATING_VERBS and
+# MUTATING_SUBVERBS); test_permission_refusal_stop holds them equal.
+KUBECTL_MUTATING_VERBS = frozenset({
+    "scale", "patch", "edit", "apply", "replace", "autoscale", "annotate", "label", "create",
+    "delete", "set", "run", "expose", "cordon", "uncordon", "drain", "taint", "debug",
+})
+KUBECTL_MUTATING_SUBVERBS: dict[str, frozenset[str]] = {
+    "rollout": frozenset({"restart", "undo", "pause", "resume"}),
+    "auth": frozenset({"reconcile"}),
+    "certificate": frozenset({"approve", "deny"}),
+}
+
+
+def _short_help_cluster(token: str) -> bool:
+    """Whether ``token`` is a short-flag cluster carrying the help letter (`-hv=9`).
+
+    Plain string parsing: one dash, then ASCII letters up to an optional `=`.
+    """
+    if not token.startswith("-") or token.startswith("--"):
+        return False
+    letters = token[1:].split("=", 1)[0]
+    return letters.isascii() and letters.isalpha() and "h" in letters
+
+
+def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
+    """The verb words of a kubectl ``argv`` that tries a change, or None.
+
+    A mutating verb as the policy resolves it, that is not a local render.
+    The verb words alone (one, or two for a verb whose second word decides),
+    never the object they name. A policy rule that refuses such an argv has
+    refused a write outright, whichever rule it is.
+    """
+    if not argv or argv[0] != "kubectl" or local_render(argv):
+        return None
+    own = argv[: argv.index("--")] if "--" in argv else argv
+    # The verb parser stops at the first flag it can't size, so `apply -f m.yaml
+    # view-last-applied` reads as `apply`, though kubectl skips the flag and
+    # runs the read. A help flag inside a short cluster (`-hv=9`) also only
+    # prints help. Neither is marked: a missed mark only lets the task run on.
+    if _LOCAL_RENDER_SUBCOMMAND in own[1:] or any(_short_help_cluster(t) for t in own[1:]):
+        return None
+    verb, _ = _kubectl_verb_and_flag(argv)
+    if not kubectl_verb_is_mutating(verb):
+        return None
+    return verb[:2] if verb[0] in KUBECTL_MUTATING_SUBVERBS else verb[:1]
+
+
+def kubectl_verb_is_mutating(verb_words) -> bool:
+    """Whether the kubectl verb the policy resolved (``Decision.verb_tuple``) changes state."""
+    if not verb_words:
+        return False
+    head = verb_words[0]
+    if head in KUBECTL_MUTATING_SUBVERBS:
+        return len(verb_words) > 1 and verb_words[1] in KUBECTL_MUTATING_SUBVERBS[head]
+    return head in KUBECTL_MUTATING_VERBS
+
+
 def _refused_flags(tool: str) -> frozenset[str]:
     """Every flag the policy refuses by name for `tool`, whatever the command."""
     if tool == "kubectl":

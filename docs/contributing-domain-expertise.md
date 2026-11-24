@@ -8,7 +8,7 @@ Because `kube-agents` runs inside a user's own cluster with their credentials, e
 
 Place each operational scenario on two axes before building: whether a machine can verify the outcome (offline manifest/schema checks pass, Pods stay `Ready` after GitOps sync, an audit rerun clears), and what a wrong answer costs (whether a Git revert PR undoes it cleanly and how much of the fleet it touches). Execution and token cost weigh alongside blast radius so frequent checks stay economical.
 
-The four quadrants below define each scenario's target operating mode. Today on `main`, every agent-authored pull request stops at human review; post-merge health checks, corrective revert pull requests, and customer CI auto-merge policies are roadmap or external-pipeline layers built on top of validated pull request proposals:
+The four quadrants below define each scenario's target operating mode. kube-agents never merges a pull request itself. For one kind of fix (a missing PodDisruptionBudget), an install that turns auto-merge on labels a qualifying pull request for the customer's pipeline to merge, checks it after merge, and opens a revert when the problem is still there ([automation rules](site/src/content/docs/reference/automation-rules.md)); every other agent-authored pull request stops at human review:
 
 | Cost if wrong \ Machine checkable? | Judgment call                                                                                                                           | Clear pass/fail signal                                                                                                                                                                                        |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -16,6 +16,8 @@ The four quadrants below define each scenario's target operating mode. Today on 
 | **Cheap to undo**                  | **Agent recommends:** Agent reports reproducible findings in the audit ledger or proposes scoped sizing pull requests for human review. | **Run unattended (target):** Agent opens narrow, pre-flight-verified pull requests designed for policy-gated GitOps merge, post-merge health verification, and corrective revert pull requests on regression. |
 
 Adding deterministic verifiers moves scenarios rightward; adding canary waves, dry-run soak gates, or reversible GitOps scoping moves scenarios downward.
+
+A run-unattended fix ships as a fix recipe: a generator, safety checks and an end-to-end case, described in [Adding a fix recipe](contributing-fix-recipes.md).
 
 ## Two ways to contribute
 
