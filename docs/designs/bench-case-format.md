@@ -129,6 +129,16 @@ task, then its answer
 ([`bench/kube_agents_bench/session_cap.py`](../../bench/kube_agents_bench/session_cap.py)). A cap
 above `max-cap`, or one the fillers did not hold, is infrastructure; the ask's POST refused with the
 cap's own text is the graded red. Inject transport only.
+A first line of `[bench:burst-reads]`, optionally with `levels=<n>,<n>,...` (strictly ascending,
+default `1,3,6`), with a `/session` ask under it, measures concurrent sessions: for each level in
+turn the harness opens that many conversations through the inject door at once, each with the ask,
+follows every one to its terminal, cancels any still running at `AGENT_INJECT_TIMEOUT`, and starts
+the next level only when this one has ended. It writes `harness_burst_reads`, completed when every
+conversation ended completed, with the per-level and per-conversation record (keys, task ids,
+terminal states, submit and end times) as its arguments
+([`bench/kube_agents_bench/burst_reads.py`](../../bench/kube_agents_bench/burst_reads.py)). A
+session cap below the highest level, a conversation queued or refused at submit or never started,
+and a door outage are infrastructure. Inject transport only.
 
 A first line that opens with `[bench:` and names none of these directives is infrastructure: the
 harness does not send a directive it does not know to the agent as text. A pull request is graded
