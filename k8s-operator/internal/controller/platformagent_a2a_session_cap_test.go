@@ -569,11 +569,6 @@ func TestTheSessionCapSignalIsGatedOnChange(t *testing.T) {
 	}
 }
 
-// Through Reconcile, on an existing (provisioned) install that opts into the
-// session route: with the bus's width unreadable and no stored cap, the
-// provision Job is not created and the gateway routes to session at
-// maxSessions; once the width reads, the Job is created at the fitted cap
-// and the gateway's cap follows it.
 // A provisioned bus that answers without TASKS (deleted for recreation, as
 // the provision Job's refusal tells an admin to do) and no stored cap: the
 // provision Job is the one thing that creates TASKS, so it is not held. The
@@ -626,6 +621,11 @@ func TestAProvisionedBusWithoutTasksRunsTheProvisionJob(t *testing.T) {
 	}
 }
 
+// Through Reconcile, on an existing (provisioned) install that opts into the
+// session route: with the bus's width unreadable and no stored cap, the
+// provision Job is not created and the gateway routes to session at
+// maxSessions; once the width reads, the Job is created at the fitted cap
+// and the gateway's cap follows it.
 func TestTheProvisionJobWaitsForTheBusWidth(t *testing.T) {
 	agent := sessionRouteTestAgent()
 	// An existing install, provisioned before it opted in.
@@ -856,11 +856,33 @@ func TestAPrunedSessionCapHoldsThePlatformRoute(t *testing.T) {
 		r.sessionCapReadings.Clear()
 	}
 
-	first := storedCapAgent(t, cl, agent)
-	r.resolveA2ASessionCap(ctx, first, nil)
+	// The pass that sees the prune takes no status from the write's echo, on
+	// the render copy or on instance. Each holds status the store doesn't:
+	// the render copy the universe domain Reconcile stamps on it, and
+	// instance, here, a source no write has stored. Taking the echo's status
+	// drops both. Both end the pass at the stored version; on instance the
+	// hold's own write sets it too, so that check does not tell the two
+	// carries apart.
+	first, instance := storedCapAgent(t, cl, agent), storedCapAgent(t, cl, agent)
+	first.Status.ResolvedUniverseDomain = testCustomUniverseDomain
+	instance.Status.UniverseDomainSource = universeDomainSourceDiscovered
+	r.resolveA2ASessionCap(ctx, first, instance)
 	held("the pass that sees the prune", first)
+	held("the pass that sees the prune, on instance", instance)
 	if !r.sessionCapStatusPruned(first) {
 		t.Fatal("the echo without the cap was not noticed")
+	}
+	if first.Status.ResolvedUniverseDomain != testCustomUniverseDomain {
+		t.Errorf("the render copy's resolvedUniverseDomain = %q after the pruned write, want %q: the echo's status is not taken",
+			first.Status.ResolvedUniverseDomain, testCustomUniverseDomain)
+	}
+	if instance.Status.UniverseDomainSource != universeDomainSourceDiscovered {
+		t.Errorf("instance's universeDomainSource = %q after the pruned write, want %q: the echo's status is not taken",
+			instance.Status.UniverseDomainSource, universeDomainSourceDiscovered)
+	}
+	if want := storedCapAgent(t, cl, agent).ResourceVersion; first.ResourceVersion != want || instance.ResourceVersion != want {
+		t.Errorf("after the pass that sees the prune the render copy is at version %q and instance at %q, want the stored %q",
+			first.ResourceVersion, instance.ResourceVersion, want)
 	}
 
 	before := patches
@@ -989,11 +1011,12 @@ func TestTheRefusalNamesTheFittedCap(t *testing.T) {
 	}
 }
 
-// The operator's A2A_SESSION_CLUSTER_VIEW doesn't hold the session route off:
-// since 2026-11-20 the cluster view is on by default for the session route
-// (#6538), so an explicit session routes to session on both containers with
-// the view on, and the cap is fitted to TASKS as with it off. Off, it is
-// session too. (An unset field is platform either way, and writes nothing:
+// The operator's A2A_SESSION_CLUSTER_VIEW doesn't change the route: an
+// explicit session routes to session on both containers with the view on,
+// and the cap is fitted to TASKS as with it off. Off, it is session too. The
+// view is on only where that flag is `true`; nothing sets it from
+// defaultRoute, and making it the session route's default is a later step of
+// #6538. (An unset field is platform either way, and writes nothing:
 // TestTheDefaultPlatformRouteDoesNothingNew.)
 func TestTheClusterViewDoesNotHoldTheSessionRouteOff(t *testing.T) {
 	ctx := context.Background()

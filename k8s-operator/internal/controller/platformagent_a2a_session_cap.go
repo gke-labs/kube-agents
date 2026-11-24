@@ -110,7 +110,7 @@ const (
 	// conversations go to platform.
 	sessionCapNoRoomReason = "NoRoomForASession"
 	// sessionCapWaitingReason: the bus's width has not been read yet, so
-	// the provision Job waits and routing stays as it was.
+	// the provision Job waits and the session route renders at maxSessions.
 	sessionCapWaitingReason = "WaitingOnBusWidth"
 	// sessionCapPrunedReason: the served PlatformAgent CRD drops
 	// status.effectiveSessionCap, so the session route can't keep its cap,
@@ -169,11 +169,11 @@ type a2aTasksWidthReading struct {
 
 // a2aTasksLiveWidth is TASKS' max_consumers as the bus reports it. known is
 // false when the width can't be trusted from this pass: the read failed, a
-// migration is reshaping the bus, the report carried no config for TASKS,
-// or TASKS is missing from a bus that has been provisioned. present is
-// false on a known reading of a bus with no TASKS yet. With reuse set (a cap
-// is stored), a known reading younger than sessionCapReadingTTL answers
-// without reading the bus.
+// migration is reshaping the bus, or the report carried no config for TASKS.
+// present is false on a known reading of a bus that answers without TASKS,
+// provisioned or not; what that means on a provisioned bus is
+// fitA2ASessionCap's to decide. With reuse set (a cap is stored), a known
+// reading younger than sessionCapReadingTTL answers without reading the bus.
 func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reuse bool) (width int, present, known bool) {
 	if busMigrationHoldsProvision(agent) {
 		return 0, false, false
