@@ -475,3 +475,32 @@ func TestAnAgyDeniedActionWithNoNameIsStillCounted(t *testing.T) {
 		t.Errorf("deniedDetail = %q", got)
 	}
 }
+
+// TestAnAgyToolStepsResultIsReportedOnce: a tool step's terminal state is
+// one EventToolResult however often agy repeats it, and each step index gets
+// its own.
+func TestAnAgyToolStepsResultIsReportedOnce(t *testing.T) {
+	d := agyDriver{}.NewDecoder()
+	got := 0
+	for _, l := range []string{
+		`{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command"}}`,
+		`{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command"}}`,
+		`{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command"}}`,
+		`{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"view_file"}}`,
+		`{"event":"step_update","step_update":{"step_index":3,"state":"ERROR","step_type":"tool","tool_name":"view_file"}}`,
+		`{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"agent_response"}}`,
+	} {
+		evs, err := d.Decode([]byte(l))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ev := range evs {
+			if ev.Kind == EventToolResult {
+				got++
+			}
+		}
+	}
+	if got != 2 {
+		t.Errorf("%d EventToolResult, want 2 (steps 2 and 3, once each)", got)
+	}
+}

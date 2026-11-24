@@ -743,7 +743,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		spawn.live = 1
 		spawn.setSessionPods(sessionPod{PodName: "chat-vole-held", SessionKey: held.Key, Reuse: true})
 		say(r, "discord:g1/t-blocked", "m1", "anyone home?")
-		waitFor(t, "the cap refusal", postedContaining(r, "not started"))
+		waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 		if d := spawn.deleted(); len(d) != 0 {
 			t.Fatalf("evicted %v from a conversation whose lock was held", d)
 		}
@@ -759,7 +759,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		spawn.live = 1
 		spawn.setSessionPods(sessionPod{PodName: "chat-vole-busy", SessionKey: busy.Key, Reuse: true})
 		say(r, "discord:g1/t-refused", "m1", "anyone home?")
-		waitFor(t, "the cap refusal", postedContaining(r, "not started"))
+		waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 		if d := spawn.deleted(); len(d) != 0 {
 			t.Fatalf("evicted %v; a pod with a running task must stay", d)
 		}

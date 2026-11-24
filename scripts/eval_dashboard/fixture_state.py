@@ -103,7 +103,8 @@ ROLE_NOT_CHECKED = "not_checked"
 ROLE_ABSENT = "absent"
 # The fixture is planted and in shape, and its audit's age gate has not
 # passed (the orphaned-snapshot roles, which the GCE compute audit ignores
-# for 91 days): the state script's `not_ready` verdict, whose detail line
+# for 91 days, and the finished-Job family, which the waste audit ignores
+# for 7): the state script's `not_ready` verdict, whose detail line
 # names the time the clock passes. Read, not drifted, and no re-apply moves
 # it, so neither the drift condition nor the reconcile's --drifted reads it.
 ROLE_NOT_READY = "not_ready"

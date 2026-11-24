@@ -1971,11 +1971,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying ${DEPLOY_SOURCE} to Names
 # ─── 3. Cluster Auth ──────────────────────────────────────────────────────────
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG
+get_cluster_credentials "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────

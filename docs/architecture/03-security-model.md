@@ -380,6 +380,12 @@ Two details that the trust-boundary and defense tables above rely on:
   virtual keys and its database and is a later decision; physically separate proxies only if data
   sensitivity later requires it.
 
+  A class key gives attribution and refusal, not isolation. Unless
+  `spec.security.disallowSecretsRead` is set, the platform agent can read every class key and the
+  master key. A worker or session pod holds its own class's key in its environment, where the
+  model's shell can read it. A steered worker can therefore call the gateway as any caller of its
+  class, and a steered platform agent as any class.
+
 ## 11. Verification
 
 The load-bearing security properties are checked with concrete, mostly-**negative** tests; the harness

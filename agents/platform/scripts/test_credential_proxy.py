@@ -2866,10 +2866,12 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual("kubernetes.read-only", body["rule"])
         self.assertEqual(["scale"], body["verb"], "the positional after the verb is the caller's and stays out of the body")
         self.assertFalse(body["local_render"])
+        self.assertIs(True, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
         self.assertEqual(403, status)
         self.assertEqual(["create"], body["verb"])
         self.assertTrue(body["local_render"])
+        self.assertIs(False, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "rollout", "restart", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
         self.assertEqual(["rollout", "restart"], body["verb"])
         status, body = self.post({"argv": ["kubectl", "certificate", "approve", "csr-tenant-b"], "cwd": "/tmp"})
@@ -10973,6 +10975,30 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertEqual("kubernetes.read-only", refusal["rule"])
         self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
 
+    def test_only_a_refused_kubectl_write_is_marked_a_write_refusal(self):
+        # The mark the in-pod client records for a profile worker's stop
+        # (credential_proxy_client.record_write_refusal).
+        writes = (
+            ["kubectl", "delete", "ns", "prod"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3"],
+            ["kubectl", "rollout", "restart", "deploy/x"],
+            ["kubectl", "certificate", "approve", "csr-1"],
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=server"],
+        )
+        for argv in writes:
+            with self.subTest(argv=argv):
+                self.assertIs(True, self._decide(argv)[credential_proxy.WRITE_REFUSAL_KEY])
+        not_writes = (
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"],  # a local render
+            ["kubectl", "exec", "web-0", "--", "sh"],  # refused, but not a state change the runtime stops on
+            ["kubectl", "rollout", "csr-tenant-b", "deploy/x"],  # a positional, not a subverb
+            ["kubectl", "--as=admin", "get", "pods"],  # a flag rule
+            ["gcloud", "container", "clusters", "delete", "prod"],  # gcp.read-only: also refuses unlisted reads
+        )
+        for argv in not_writes:
+            with self.subTest(argv=argv):
+                self.assertIs(False, self._decide(argv).get(credential_proxy.WRITE_REFUSAL_KEY, False))
+
     def test_the_gate_can_be_switched_off(self):
         CredentialProxyHandler.enforce_read_only = False
         self.assertIsNone(self._decide(["kubectl", "delete", "ns", "prod"]))
@@ -13699,6 +13725,45 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
                 with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=answer):
                     with self.assertRaises(credential_proxy.AuthenticationError):
                         self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_body_that_the_parser_refuses_for_its_depth_is_a_rejection(self):
+        # The depth that the JSON parser refuses is the interpreter's and differs
+        # between Python versions, so the parser's refusal is given directly.
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(urllib.request.OpenerDirector, "open", return_value=Response(b"[]")), \
+                mock.patch.object(credential_proxy.json, "load", side_effect=RecursionError("too deep")):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_status_with_a_value_of_the_wrong_type_is_a_rejection(self):
+        for label, overrides in (
+            ("the user is a string", {"user": "system:serviceaccount:kubeagents-system:agent"}),
+            ("the user is a list", {"user": [self.CALLER]}),
+            ("the username is a list", {"user": {"username": [self.CALLER]}}),
+            ("the audiences are a number", {"audiences": 1}),
+            ("the audiences are a mapping", {"audiences": {self.AUDIENCE: True}}),
+            ("the groups are a number", {"user": {"username": self.CALLER, "groups": 1}}),
+            ("the groups are a mapping", {"user": {"username": self.CALLER, "groups": {"system:serviceaccounts": True}}}),
+            ("the groups are text", {"user": {"username": self.CALLER, "groups": "system:serviceaccounts"}}),
+            ("the uid is a list", {"user": {"username": self.CALLER, "uid": ["sa-uid"]}}),
+        ):
+            with self.subTest(label):
+                authenticator = self._with_review(self._authenticator(), self._ok_status(**overrides))
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_an_own_token_file_that_is_not_utf8_is_a_rejection(self):
+        self.own_token.write_bytes(b"\xff\xfe not text")
+        with mock.patch.object(urllib.request.OpenerDirector, "open") as opened:
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+        opened.assert_not_called()
 
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
