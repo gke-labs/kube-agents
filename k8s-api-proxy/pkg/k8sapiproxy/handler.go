@@ -57,6 +57,9 @@ type Config struct {
 	// Exclusions refuses every request to a cluster spec.scope.exclude.clusters names,
 	// before policy, cache or upstream; nil excludes nothing.
 	Exclusions *Exclusions
+	// Holds refuses every request to a cluster spec.hold names, at the same point;
+	// nil holds nothing.
+	Holds *Holds
 	// CallerPartition names the upstream credential an authenticated caller's requests use,
 	// for an Upstream that chooses a credential per caller or tenant. Its value is part of
 	// the cache key and the in-flight coalescing key, so requests share a cached response or
@@ -81,6 +84,7 @@ type auditEventKey struct{}
 type handler struct {
 	authenticator    CallerAuthenticator
 	exclusions       *Exclusions
+	holds            *Holds
 	policy           Policy
 	defaultClusterID string
 	audit            AuditSink
@@ -149,6 +153,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	return &handler{
 		authenticator:    cfg.Authenticator,
 		exclusions:       cfg.Exclusions,
+		holds:            cfg.Holds,
 		policy:           cfg.Policy,
 		defaultClusterID: cfg.DefaultClusterID,
 		audit:            audit,
@@ -299,8 +304,15 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	ev.ClusterID, ev.Path = clusterID, apiPath
 	// Before anything reads the request or a cached answer: an excluded cluster's API is
 	// never reached, whatever the request asks of it.
+	// On a discovery path the refusal is plain text (refuseScope), which kubectl's
+	// discovery client shows; it can't decode a Status there.
 	if perr := h.exclusions.check(clusterID); perr != nil {
-		refuse(w, ev, perr)
+		refuseScope(w, ev, perr, apiPath)
+		return
+	}
+	// A held cluster likewise: an operator paused the agents' access to it.
+	if perr := h.holds.check(clusterID); perr != nil {
+		refuseScope(w, ev, perr, apiPath)
 		return
 	}
 

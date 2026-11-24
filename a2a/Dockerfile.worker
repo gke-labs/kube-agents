@@ -49,8 +49,12 @@ WORKDIR /app
 # The agent SDK's platform package carries the harness as a native binary at
 # node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude, the path
 # DefaultHarnessPath in worker-adapter/harness.go names. Pinned to the
-# version these stream-json shapes were proved against.
-RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
+# version these stream-json shapes were proved against, and installed from the
+# committed lockfile in a2a/worker-harness with `npm ci`, so the SDK's own
+# dependencies are the reviewed set rather than whatever the registry serves at
+# build time (#6948). Dependabot proposes bumps to that directory.
+COPY a2a/worker-harness/package.json a2a/worker-harness/package-lock.json ./
+RUN npm ci \
     && npm cache clean --force
 
 # The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
@@ -142,7 +146,8 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 # the others when the persona's skill runs `python3 /opt/kube-agents/scripts/fleet-audit/
 # audit_report.py`. They're the closure audit_report.py imports on its
 # `finish --dry-run` path (a live finish needs more, which the PR that runs one
-# adds); the RUN below fails the build if one no longer imports from here alone,
+# adds), and, from collect.py on, the compliance collector's (below); the RUN
+# below fails the build if one no longer imports from here alone,
 # and tests/test_worker_fleet_audit_scripts.py runs that finish on a document.
 # Every worker carries them; they act only with the task's own confined
 # credential, so a cluster or tse worker gains nothing it couldn't already do.
@@ -158,10 +163,37 @@ COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
      agents/platform/scripts/gitops_preflight.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/vcs_client.py \
+     agents/platform/skills/fleet-audit/scripts/collect.py \
+     agents/platform/skills/fleet-audit/scripts/kcc_health.py \
+     agents/platform/scripts/fleet_scope_args.py \
+     agents/platform/scripts/collector_run.py \
+     agents/platform/scripts/broker_admission.py \
      /opt/kube-agents/scripts/fleet-audit/
+# The compliance audit's collector (collect.py and its closure, #5623): each
+# fan-out child runs it for its one cluster (--project with --cluster),
+# read-only, on its confined
+# credential, so the canary is collected the way the platform job collects.
+# Its webhook check imports the fleet-upgrade-verification readiness modules
+# from parents[2]/fleet-upgrade-verification/scripts, relative to collect.py,
+# so they go there as in the skill's own layout. Same tests and drift check.
+COPY --chmod=0644 agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py \
+     agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_shape_tables.py \
+     agents/platform/skills/fleet-upgrade-verification/scripts/known_issues.json \
+     agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json \
+     /opt/kube-agents/fleet-upgrade-verification/scripts/
+# A directory copy takes no --chmod (it would set the directories' mode too,
+# and a 0644 directory can't be entered); the RUN makes it readable by all
+# and enterable (directories 0755), writable by root alone, and the last check imports it as the worker's own user.
+COPY agents/platform/skills/fleet-upgrade-verification/scripts/readiness_rules/ \
+     /opt/kube-agents/fleet-upgrade-verification/scripts/readiness_rules/
+# Its own RUN: a mode change beside a path under the helper script root is one
+# deploy/docker/test_script_root_ownership.py can't vouch for.
+RUN chmod -R u=rwX,go=rX /opt/kube-agents/fleet-upgrade-verification
 RUN cd /opt/kube-agents/scripts/fleet-audit \
-    && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report" \
-    && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run
+    && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report, collect; assert collect._upgrade_readiness() is not None" \
+    && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run \
+    && PYTHONDONTWRITEBYTECODE=1 python3 collect.py --help | grep -q -- compliance-audit \
+    && su node -s /bin/sh -c 'cd /opt/kube-agents/scripts/fleet-audit && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = [\".\"]; import collect; assert collect._upgrade_readiness() is not None"'
 # git for that skill's local half: the working copy `clone` unpacks from a
 # bundle, and `commit` and `publish` on it. It holds no credential; the profile
 # namespace's NetworkPolicy bounds the pod's egress. deploy/shared/worker-gitconfig,
@@ -238,6 +270,9 @@ RUN mkdir -p /home/node/.claude /scratch \
 # from being changed by accident, and is not a boundary against the harness.
 COPY --from=build /out/claude/CLAUDE.md /home/node/.claude/CLAUDE.md
 COPY --from=build /out/claude/skills/ /home/node/.claude/skills/
+# The build-time content manifest of the two above; the worker checks them
+# against it at start (worker-adapter CheckSessionHome).
+COPY --from=build /out/claude/skills_manifest.sha256 /home/node/.claude/skills_manifest.sha256
 USER node
 # vcs_client's git and working copies: the image's git, and the worker's
 # scratch volume, which the worker empties after every task (the root

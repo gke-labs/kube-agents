@@ -192,6 +192,8 @@ func TestTaskTerminalsAreCountedByStateAndSource(t *testing.T) {
 		`kubeagents_a2a_gateway_task_terminals_total{source="other",state="other"} 0`,
 		`kubeagents_a2a_gateway_gchat_events_received_total 0`,
 		`kubeagents_a2a_gateway_gchat_pulls_total{outcome="empty"} 0`,
+		`kubeagents_a2a_gateway_teams_events_received_total 0`,
+		`kubeagents_a2a_gateway_teams_pulls_total{outcome="empty"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics does not carry %q:\n%s", want, body)

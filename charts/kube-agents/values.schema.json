@@ -201,6 +201,15 @@
         "envFromSecret": {
           "type": "string"
         },
+        "masterKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "generate": {
+              "type": "boolean"
+            }
+          }
+        },
         "maxTokens": {
           "type": "integer",
           "minimum": 0
@@ -2188,6 +2197,15 @@
                 },
                 "tenantId": {
                   "type": "string"
+                },
+                "inbound": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  }
                 },
                 "allowedUsers": {
                   "type": "array",

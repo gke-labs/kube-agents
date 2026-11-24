@@ -247,6 +247,64 @@ class C1IsolationIsStructural(unittest.TestCase):
                 f"{fixture}: a watcher-audience token is mounted in {sorted(mounts)}",
             )
 
+    # The inference gateway's master key: the Secret the chart generates, the
+    # one workload and container allowed to read it, and the chart values that
+    # add workloads beside the gateway.
+    _GATEWAY_MASTER_KEY_SECRET = "litellm-master-key"
+    _GATEWAY_MASTER_KEY_READER = ("litellm", "litellm-container")
+    _GATEWAY_RENDER_SETS = ((), ("webConsole.enabled=true",), ("litellm.redaction.enabled=true",))
+    _POD_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "Job")
+
+    def _secret_readers(self, documents, secret: str) -> set:
+        """(workload, container) pairs that read `secret` by env, envFrom or a volume."""
+        readers = set()
+        workloads = [d for kind in self._POD_WORKLOAD_KINDS for d in h.objects_of_kind(documents, kind)]
+        for cron in h.objects_of_kind(documents, "CronJob"):
+            workloads.append({"metadata": cron["metadata"], "spec": cron["spec"]["jobTemplate"]["spec"]})
+        for workload in workloads:
+            spec = workload["spec"]["template"]["spec"]
+            volumes = set()
+            for volume in spec.get("volumes") or []:
+                if (volume.get("secret") or {}).get("secretName") == secret:
+                    volumes.add(volume["name"])
+                for source in (volume.get("projected") or {}).get("sources") or []:
+                    if (source.get("secret") or {}).get("name") == secret:
+                        volumes.add(volume["name"])
+            for container in h.containers_of(workload):
+                reads = any(m["name"] in volumes for m in container.get("volumeMounts") or [])
+                reads |= any(
+                    ((e.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name") == secret
+                    for e in container.get("env") or []
+                )
+                reads |= any((s.get("secretRef") or {}).get("name") == secret for s in container.get("envFrom") or [])
+                if reads:
+                    readers.add((workload["metadata"]["name"], container["name"]))
+        return readers
+
+    def test_C1_the_gateway_master_key_reaches_only_the_gateway_container(self) -> None:
+        """The master key makes its holder the gateway's admin: key management,
+        config and every route. Callers authenticate with their own keys, so the
+        Secret is read by the LiteLLM container alone, in every chart render
+        checked, and no operator-rendered workload names it at all. The
+        gateway's ConfigMap names the variable, never the value."""
+        for sets in self._GATEWAY_RENDER_SETS:
+            with self.subTest(sets=sets):
+                documents = h.helm_rendered(*sets)
+                self.assertEqual(
+                    self._secret_readers(documents, self._GATEWAY_MASTER_KEY_SECRET),
+                    {self._GATEWAY_MASTER_KEY_READER},
+                )
+                secret = next(
+                    d for d in h.objects_of_kind(documents, "Secret")
+                    if d["metadata"]["name"] == self._GATEWAY_MASTER_KEY_SECRET
+                )
+                value = next(iter(secret["stringData"].values()))
+                for configmap in h.objects_of_kind(documents, "ConfigMap"):
+                    self.assertNotIn(value, json.dumps(configmap), configmap["metadata"]["name"])
+        for fixture, documents in h.golden_documents().items():
+            with self.subTest(fixture=fixture):
+                self.assertNotIn(self._GATEWAY_MASTER_KEY_SECRET, json.dumps(documents))
+
     def test_C1_the_watcher_cluster_read_never_relays_a_client_credential(self) -> None:
         """A GKE clusters.get answer carries masterAuth's client certificate and key
         on a cluster with issuance on: a credential for that API server, wider
@@ -3301,6 +3359,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("apps", "statefulsets"),
         ("batch", "jobs"),
         ("coordination.k8s.io", "leases"),
+        ("kubeagents.x-k8s.io", "agentschedules"),
         ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
         ("networking.gke.io", "fqdnnetworkpolicies"),
         ("networking.k8s.io", "networkpolicies"),

@@ -74,6 +74,8 @@ func (claudeDecoder) Decode(line []byte) ([]Event, error) {
 		return []Event{{Kind: EventInit, Session: ev.SessionID, Model: model, ModelDropped: dropped}}, nil
 	case "assistant":
 		return ev.assistantEvents(), nil
+	case "user":
+		return ev.toolResultEvents(), nil
 	case "result":
 		// The model is the init line's, which the adapter keeps; the
 		// telemetry here carries the turn's own figures.
@@ -87,6 +89,25 @@ func (claudeDecoder) Decode(line []byte) ([]Event, error) {
 	}
 	return nil, nil
 }
+
+// toolResultEvents is one EventToolResult per tool_result block on a user
+// line: a line carries one block per tool call it answers, and parallel calls
+// share a line. Nothing of the result is carried.
+func (ev harnessEvent) toolResultEvents() []Event {
+	if ev.Message == nil {
+		return nil
+	}
+	var out []Event
+	for _, b := range ev.Message.Content {
+		if b.Type == toolResultBlockType {
+			out = append(out, Event{Kind: EventToolResult})
+		}
+	}
+	return out
+}
+
+// toolResultBlockType is a user line's content block that answers a tool call.
+const toolResultBlockType = "tool_result"
 
 // assistantEvents maps one assistant message's content blocks onto events:
 // thinking, the model's prose, and tool invocations. A block with nothing in
