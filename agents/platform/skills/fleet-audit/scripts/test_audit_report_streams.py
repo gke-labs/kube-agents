@@ -4,9 +4,10 @@ Run:
   python3 -m unittest discover -s agents/platform/skills/fleet-audit/scripts \
       -p 'test_audit_report_streams.py' -v
 
-Both tests need no cluster and no forge. The dry run starts the script as a child
+No test here needs a cluster or a forge. The dry run starts the script as a child
 process and reads the ledger it prints. The lifecycle test calls `main` in this
-process with the forge verbs and `run_cmd` replaced by recorders.
+process with the forge verbs and `run_cmd` replaced by recorders. A third test
+holds `AUDIT_STREAMS` to the streams in `audit_report.AUDITS`.
 
 `finish` runs here with no `start` record before it. A finding whose check is in
 the stream's `declarable` set then has no declared-intent search on record, and
