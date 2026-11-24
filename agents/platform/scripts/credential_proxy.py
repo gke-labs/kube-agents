@@ -2525,6 +2525,8 @@ CALLER_ROLE_CURATOR = "curator"
 # token for token (scope_policy.SHAPES), and the reconcile leaves excluded
 # clusters out by itself.
 LISTING_FILTERED_ROLES = frozenset({CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE})
+# The project segment of a relayed GKE path (v1/projects/<project>/...).
+API_RELAY_PROJECT_SEGMENT = 2
 CALLER_ROLE_TEAMS_INBOUND = "teams-inbound"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -16784,12 +16786,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             upstream = replace(upstream, body=projected)
-            if decision.rule_id == api_policy.GKE_CLUSTER_LIST_RULE and CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES:
+            relay_exclusions = getattr(self, "exclusions", None)
+            if (decision.rule_id == api_policy.GKE_CLUSTER_LIST_RULE and relay_exclusions is not None
+                    and CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES):
                 # The relay is the shell's: its listing drops excluded clusters
                 # only when the shell is among the filtered callers (#7031).
+                # The route's pattern fixes the path: v1/projects/<project>/...
                 try:
                     upstream = replace(upstream, body=cluster_metadata_scope.filtered_cluster_list(
-                        upstream.body, path.split("/")[2], self.exclusions,
+                        upstream.body, path.split("/")[API_RELAY_PROJECT_SEGMENT], relay_exclusions,
                     ))
                 except scope_exclude.ExcludedCluster as exc:
                     self._refuse_excluded_cluster(exc, request_id, audit, lambda _status: None)
@@ -17055,7 +17060,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         ):
             # A gke listing drops the install's excluded clusters for these
             # callers (#7031); a reply the broker can't read is refused while
-            # any cluster is excluded rather than relayed whole.
+            # any cluster is excluded rather than relayed whole. Unreachable
+            # today: this relay admits chat and profile, and profile workers are
+            # refused the gke server, so it applies only if chat joins the set.
             try:
                 if self.exclusions.excluded_names_pattern() is not None:
                     filtered = mcp_policy.filter_listing_reply(

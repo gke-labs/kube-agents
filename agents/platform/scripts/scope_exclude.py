@@ -9,7 +9,9 @@ mint or use, a `get-credentials`, the watcher's cluster relay. A metadata read
 that names it (`clusters describe`, a node-pool read, the gke MCP tools that
 read one cluster) is refused too, and a logging read leaves out its entries
 (cluster_metadata_scope). The project-wide reads (`clusters list`, the
-operations list, the relay's existence check) stay allowed.
+operations list, the relay's existence check) stay allowed for every caller but
+sessions and profile tasks, whose `clusters list` and `operations list` leave
+excluded clusters out.
 
 Matching is exact, field by field. A cluster's location is the one GKE gives it,
 a zone or a region, so a zonal name never matches a regional entry. A project

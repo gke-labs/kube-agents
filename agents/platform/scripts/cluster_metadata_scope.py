@@ -3,8 +3,9 @@
 The broker refuses an excluded cluster on every path to its Kubernetes
 API (scope_exclude). A gcloud read about a cluster through the GKE or Logging
 API is a separate path, and before this it was held to the install's scope only
-by a profile task's single-cluster confinement. Here it is held for every
-caller. spec.hold is not consulted: a hold pauses the agents' reach into a
+by a profile task's single-cluster confinement. Here the reads that name a
+cluster are held for every caller, and the project-wide listings for sessions
+and profile tasks. spec.hold is not consulted: a hold pauses the agents' reach into a
 cluster and leaves its metadata readable (scope_exclude.Exclusions.check's
 include_holds).
 
@@ -21,6 +22,13 @@ include_holds).
     (an open string, a single quote, a `--` comment or unbalanced parentheses,
     any of which could swallow the clause) is refused while anything is
     excluded.
+
+  - `container clusters list` and `container operations list`, for the callers
+    credential_proxy.LISTING_FILTERED_ROLES names (sessions and profile tasks),
+    get a `--filter` clause that drops excluded clusters by name, in any
+    project and location (scoped_listing_argv). A filter the clause can't be
+    ANDed onto safely is refused. The relay's cluster list has a matching hook
+    (filtered_cluster_list), unused while the shell isn't a filtered caller.
 
 Every other command, and every command on an install that excludes
 nothing, is returned unchanged.
@@ -97,7 +105,7 @@ UNREADABLE_FILTER = (
 )
 UNREADABLE_LISTING_FILTER = (
     "this install excludes clusters, and the broker can't add its exclusion to this listing's --filter"
-    " safely (an open string, a single quote, a -- or unbalanced parentheses); fix the filter"
+    " safely (an open string or unbalanced parentheses); fix the filter"
 )
 UNREADABLE_COMMAND = (
     "this install excludes clusters, and the broker can't read this command's flags"
@@ -218,6 +226,35 @@ def filter_is_appendable(text: str) -> bool:
             if depth < 0:
                 return False
     return not in_string and depth == 0
+
+
+def gcloud_filter_is_appendable(text: str) -> bool:
+    """Whether a gcloud `--filter` is safe to wrap in parentheses and AND onto:
+    every string closed (gcloud takes double and single quotes alike) and
+    parentheses outside strings balanced and never closing below zero. gcloud's
+    filter language has no comments, so `--` (as in a cluster name) is
+    ordinary text here."""
+    depth = 0
+    quote = ""
+    escaped = False
+    for char in text:
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == _ESCAPE:
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in (_QUOTE, _SINGLE_QUOTE):
+            quote = char
+        elif char == _OPEN:
+            depth += 1
+        elif char == _CLOSE:
+            depth -= 1
+            if depth < 0:
+                return False
+    return not quote and depth == 0
 
 
 def _combine(text: str, clause: str) -> str:
@@ -376,7 +413,7 @@ def scoped_listing_argv(argv: list[str], exclusions: scope_exclude.Exclusions) -
     names = pattern[len(scope_exclude.LOG_REGEX_OPEN):-len(scope_exclude.LOG_REGEX_CLOSE)]
     clause = template.format(pattern=pattern, names=names)
     caller_filter = flags.get(FILTER_FLAG, "")
-    if caller_filter.strip() and not filter_is_appendable(caller_filter):
+    if caller_filter.strip() and not gcloud_filter_is_appendable(caller_filter):
         raise scope_exclude.ExcludedCluster(scope_exclude.RULE_EXCLUDED_CLUSTER, UNREADABLE_LISTING_FILTER)
     combined = f"({caller_filter}){LISTING_FILTER_JOIN}{clause}" if caller_filter.strip() else clause
     return [*_without_flag(argv, FILTER_FLAG), f"{FILTER_FLAG}={combined}"]

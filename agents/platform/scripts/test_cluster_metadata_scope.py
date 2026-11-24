@@ -320,9 +320,6 @@ class MetadataScopeTest(unittest.TestCase):
                 self.assertEqual(filter_is_appendable(text), want)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class ListingScopeTest(unittest.TestCase):
     """Project-wide listings (#7031): gcloud's --filter drops excluded clusters."""
@@ -355,10 +352,19 @@ class ListingScopeTest(unittest.TestCase):
 
     def test_a_filter_that_could_swallow_the_clause_is_refused(self):
         exclusions = self.exclusions(EXCLUDED)
-        for text in ('name="open', "name='x'", "status=RUNNING) OR (name=scratch", "a -- b"):
+        for text in ('name="open', "name='open", "status=RUNNING) OR (name=scratch", "(a"):
             with self.subTest(filter=text):
                 with self.assertRaises(ExcludedCluster):
                     self.listing(["gcloud", "container", "clusters", "list", f"--filter={text}"], exclusions)
+
+    def test_gcloud_quotes_and_double_hyphens_are_ordinary_in_a_listing_filter(self):
+        # gcloud's filter language takes single quotes and has no comments, so a
+        # name with `--` and a single-quoted value wrap like any other filter.
+        exclusions = self.exclusions(EXCLUDED)
+        for text in ("name=prod--east", "name='prod'", "labels.team='a b'"):
+            with self.subTest(filter=text):
+                out = self.listing(["gcloud", "container", "clusters", "list", f"--filter={text}"], exclusions)
+                self.assertEqual(out[-1], f'--filter=({text}) AND NOT name~"^(scratch)$"')
 
     def test_listings_are_unchanged_with_nothing_excluded_and_on_help(self):
         for exclusions, argv in (
@@ -391,3 +397,7 @@ class ListingScopeTest(unittest.TestCase):
         out = json.loads(cluster_metadata_scope.filtered_cluster_list(body, PROJECT, exclusions))
         self.assertEqual([c["id"] for c in out["clusters"]], ["2", "3"])
         self.assertEqual(out["missingZones"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
