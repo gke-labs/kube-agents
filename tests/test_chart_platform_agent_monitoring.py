@@ -155,6 +155,19 @@ _POD_MONITORING_SCRAPES = _SCRAPES + (_CURATOR_SCRAPE, _NATS_SCRAPE)
 _WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 
 
+_OPERATOR_TEAMS_INBOUND_SOURCE = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_teams_inbound.go"
+)
+
+
+def _teams_inbound_status_port():
+    """The receiver's status port, from the operator's constant: no golden renders the receiver."""
+    match = re.search(r"^\s*teamsInboundStatusPort\s+int32\s*=\s*(\d+)\s*$",
+                      _OPERATOR_TEAMS_INBOUND_SOURCE.read_text(), re.MULTILINE)
+    assert match, "teamsInboundStatusPort not found in the operator source"
+    return int(match.group(1))
+
+
 def _scrape_port(scrape):
     """The port a row's PodMonitoring has to scrape, from the golden, fixture, or operator source."""
     if "operator_source" in scrape:
@@ -250,10 +263,26 @@ class MonitoringShapeTest(unittest.TestCase):
             if scrape["suffix"] == "-credential-proxy-monitoring":
                 want.append(str(_manifest_port(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier",
                                                "envoy-credential-proxy", "cred-metrics")))
-        # The curator's and NATS exporter's PodMonitorings follow _SCRAPES.
+        # The curator's PodMonitoring follows _SCRAPES.
         want.append(str(_scrape_port(_CURATOR_SCRAPE)))
+        # The Teams inbound receiver's PodMonitoring follows the curator's,
+        # rendered only while the receiver is on, so it is not a _SCRAPES row.
+        want.append(str(_teams_inbound_status_port()))
+        # The NATS exporter's PodMonitoring is the template's last.
         want.append(str(_scrape_port(_NATS_SCRAPE)))
         self.assertEqual(ports, want)
+
+    def test_the_teams_inbound_scrape_is_gated_on_both_switches_and_the_operators_port(self):
+        """The receiver renders only under spec.integration.teams.inbound, so its
+        scrape is gated on the chart's two Teams switches in every section, and its
+        port and labels are the operator's constants (platformagent_teams_inbound.go)."""
+        gate = ('{{- if and .Values.platformAgent.integration.teams.enabled '
+                '(dig "inbound" "enabled" false .Values.platformAgent.integration.teams) }}')
+        # PodMonitoring, ServiceMonitor, VMPodScrape and the scraper-namespace NetworkPolicy.
+        self.assertEqual(self.template.count(gate), 4)
+        self.assertIn("app: {{ .Values.platformAgent.name }}-teams-inbound\n      kubeagents.x-k8s.io/component: teams-inbound", self.template)
+        self.assertIn(f"- port: {_teams_inbound_status_port()}\n      path: /metrics", self.template)
+        self.assertIn("- name: status\n      port: 9094", self.template)
 
     def test_the_nats_port_is_the_operators_constant(self):
         # The golden is rendered from a2aNATSMetricsPort; reading the
