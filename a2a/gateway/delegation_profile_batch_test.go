@@ -847,3 +847,97 @@ func TestAWithdrawnProfileBatchSendsAnUnsentEndAsRecorded(t *testing.T) {
 		})
 	}
 }
+
+// TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing: a profile
+// parent stays open after its delegate request, so it can ask again after
+// one that ended with no batch on the bus. That repeat mints nothing: its
+// ends would all be held back by the first request's mark (DelegationEnd),
+// leaving the parent waiting on children that never report. Both ways the
+// first can end: refused before anything was minted, and withdrawn after a
+// cut-short mint.
+func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T) {
+	t.Parallel()
+	two := func(t *testing.T) lib.Artifact {
+		return delegateBatchArtifact(t,
+			lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+			lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	}
+	for _, tc := range []struct {
+		name string
+		// first makes the parent's first request end with no batch on the
+		// bus, and returns the record's child count after it.
+		first func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int
+	}{
+		{"refused", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int {
+			r.g.cfg.DelegationWidthMax = 1 // two tasks are too wide
+			if err := parent.PublishArtifact(context.Background(), two(t)); err != nil {
+				t.Fatal(err)
+			}
+			waitForRecord(t, r, conv, "the refusal's mark", func(rec *SessionRecord) bool {
+				ref, _ := rec.TaskRefFor(originID)
+				return ref.DelegationEnd != ""
+			})
+			r.g.cfg.DelegationWidthMax = 10
+			return 0
+		}},
+		{"withdrawn", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int {
+			r.g.cfg.DelegationWidthMax = 10
+			r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+			art := two(t)
+			if err := parent.PublishArtifact(context.Background(), art); err != nil {
+				t.Fatal(err)
+			}
+			submissionOn(t, r, "cluster")
+			waitForRecord(t, r, conv, "the cut-short mint", func(rec *SessionRecord) bool {
+				ref, _ := rec.TaskRefFor(originID)
+				return ref.BatchSize == 2 && len(ref.Children) == 1
+			})
+			card, _ := r.g.profiles.lookup("cluster")
+			r.g.profiles.put("cluster", nil)
+			if err := parent.PublishArtifact(context.Background(), art); err != nil {
+				t.Fatal(err)
+			}
+			waitForRecord(t, r, conv, "the withdrawal's mark", func(rec *SessionRecord) bool {
+				ref, _ := rec.TaskRefFor(originID)
+				return ref.DelegationEnd != ""
+			})
+			r.g.profiles.put("cluster", &card)
+			r.g.beforeBatchChild = nil
+			rec, _ := r.g.reg.Get(context.Background(), conv)
+			ref, _ := rec.TaskRefFor(originID)
+			return len(ref.Children)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := startProfileRig(t)
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+			ctx := context.Background()
+			conv := "console:tab-profile-batch-repeat-" + tc.name
+			turn := profileTurn(conv, "chat", nil)
+			turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+			r.adapter.inbox <- turn
+			origin := submissionOn(t, r, "chat")
+			parent := r.execFor(t, origin, "chat")
+			if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+				t.Fatal(err)
+			}
+			kids := tc.first(t, r, parent, conv, origin.TaskID)
+			// The repeat, which every check would now pass.
+			if err := parent.PublishArtifact(ctx, two(t)); err != nil {
+				t.Fatal(err)
+			}
+			// A marker after it on the same stream: once the gateway has
+			// handled the marker, it has handled the repeat.
+			if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(500 * time.Millisecond)
+			rec, _ := r.g.reg.Get(ctx, conv)
+			ref, _ := rec.TaskRefFor(origin.TaskID)
+			if len(ref.Children) != kids {
+				t.Fatalf("children after the repeat = %v, want the %d from before it", ref.Children, kids)
+			}
+		})
+	}
+}

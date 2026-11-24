@@ -205,6 +205,17 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// children already on the bus, so a batch is whole or not run. minting
 	// is set once the request reaches mintBatch, which then finishes the
 	// batch or withdraws it itself.
+	// A profile parent stays open after its request, so it can ask again
+	// after one that ended with no batch on the bus (refused, or withdrawn
+	// with nothing kept). That request is its one, too: minting it would
+	// send none of its ends, since the parent's mark (DelegationEnd) holds
+	// them back (profileBatchChildEnded), and a batch minted beside one a
+	// withdrawal kept would mix with it. The worker makes one delegate call
+	// per task, so nothing waits on a repeat.
+	if profileParent && parent.DelegationEnd != "" {
+		ignore(ruleDelegationBusy, "delegationEnd", parent.DelegationEnd)
+		return
+	}
 	resuming, minting := false, false
 	if len(parent.Children) > 0 {
 		if parent.batchComplete() || parent.DelegationEnd != "" {
