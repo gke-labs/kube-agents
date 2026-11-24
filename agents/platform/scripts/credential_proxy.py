@@ -11170,7 +11170,11 @@ class CommandExecutor:
         queues, and asked again by `_admit`, so the degenerate admit-alone
         branch of `_fits_budget` never takes such a read."""
         budget = self.children_budget_bytes
-        if charge is None or budget is None or charge.child_bytes <= budget:
+        # The whole cost admission books (the charge plus the output
+        # allowance of a slot), so a read admission could only take alone,
+        # with every other request drained, is refused here rather than left
+        # at the head of the queue.
+        if charge is None or budget is None or self._request_cost_bytes(True, charge.child_bytes) <= budget:
             return
         raise KubectlCapacityExceeded(
             f"capacity: `{charge.command}` at this install's size is measured at about "
@@ -11562,6 +11566,14 @@ class CommandExecutor:
         for ahead in self._slot_queue:
             if ahead is ticket:
                 return True
+            # A kubectl read charged above the flat reserve waits for its
+            # memory without holding back a flat request behind it: before
+            # the charge every request cost the same, so a request that fits
+            # never waited on one that does not. The charged read keeps its
+            # place, still bounded by the slot wait.
+            if (ahead.klass == ticket.klass and ahead.child_bytes > REQUEST_CHILD_MEMORY_RESERVE_BYTES
+                    and ticket.child_bytes <= REQUEST_CHILD_MEMORY_RESERVE_BYTES):
+                continue
             if ahead.klass == ticket.klass:
                 return False
             if ticket.klass == CLASS_BACKGROUND and not (interactive_full and ahead.takes_slot):

@@ -263,6 +263,63 @@ class KubectlChargeAdmissionTest(_GateFixture):
         with executor.request_slot(charge=charge):
             self.assertEqual(1000 * MEBIBYTE, executor.reserved_bytes)
 
+    def test_a_read_that_fits_only_without_the_output_allowance_is_refused_at_once(self):
+        # 1000 MiB fits the 1024 MiB budget, but not with the six 8 MiB output
+        # copies a slot also books: no wait admits it short of a drained broker.
+        executor = self.executor()
+        executor.max_output_bytes = 8 * MEBIBYTE
+        charge = executor.kubectl_charge(["kubectl", "get", "events", "-A", "-o", "json"])
+        started = time.monotonic()
+        with self.assertRaises(credential_proxy.KubectlCapacityExceeded):
+            with executor.request_slot(charge=charge):
+                self.fail("admitted a read only a drained broker could take")
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(0, executor.queued_requests)
+
+    def test_a_flat_request_that_fits_is_not_held_behind_a_waiting_charged_read(self):
+        executor = self.executor()
+        release = threading.Event()
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        charge = executor.kubectl_charge(["kubectl", "get", "events", "-A", "-o", "json"])
+        waiting = threading.Event()
+        big_done = threading.Event()
+
+        def big():
+            waiting.set()
+            try:
+                with executor.request_slot(charge=charge):
+                    pass
+            except credential_proxy.CommandSlotUnavailable:
+                pass
+            big_done.set()
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
+            reader = threading.Thread(target=big)
+            reader.start()
+            self.addCleanup(reader.join)
+            self.assertTrue(waiting.wait(5))
+            deadline = time.monotonic() + 2
+            while executor.queued_requests < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(1, executor.queued_requests)
+            started = time.monotonic()
+            with executor.request_slot():
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertFalse(big_done.is_set())
+            release.set()
+            self.assertTrue(big_done.wait(5))
+
     def test_budget_off_charges_nothing_and_never_loads_the_gate(self):
         executor = self.executor(budget=False, tier="fleet")
         self.assertIsNone(executor.kubectl_charge(["kubectl", "get", "pods", "-A", "-o", "json"]))
