@@ -413,6 +413,12 @@ class TestRedactText(unittest.TestCase):
                 r'"url": "amqp://svc\u003cx\u003e:Synth\\Example@mq/vhost"',
                 r'"url": "amqp://svc\u003cx\u003e:[REDACTED_SECRET]@mq/vhost"',
             ),
+            # A dotted host: decoded, the line after the `\"` would read as an
+            # email address, so the password is masked before decoding.
+            (
+                r'{"DATABASE_URL": "postgres://admin:synth\u0026Example\"Pw@db.shop.svc.cluster.local:5432/o"}',
+                r'{"DATABASE_URL": "postgres://admin:[REDACTED_SECRET]@db.shop.svc.cluster.local:5432/o"}',
+            ),
             (
                 r'"a": "x\u0026' + "s" * 30 + r'://u:SynthExamplePw@h"',
                 r'"a": "x\u0026' + "s" * 30 + r'://u:[REDACTED_SECRET]@h"',

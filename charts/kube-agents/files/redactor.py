@@ -590,7 +590,11 @@ class AuditRedactor:
             return text
 
         def redact_string(match: "re.Match[str]") -> str:
-            literal = match.group(0)
+            # A URL password first, on the literal itself, where it is still
+            # escaped: decoded, a `\"` in it is a raw quote the URL shape
+            # stops at, and the rest of the line would then read as an email
+            # address with part of the password left before it.
+            literal = cls.URL_PASSWORD_PATTERN.sub(cls._mask_url_password, match.group(0))
             if not any(escape in literal for escape in cls.JSON_NESTED_ESCAPES):
                 return literal
             try:
