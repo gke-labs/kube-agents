@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _shell_argvs_and_unread, _shell_argvs_first_read, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2621,6 +2621,35 @@ _SHELL_READ_LIMIT_REASON = (
 )
 #: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
 _UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
+#: A worker command with a part that the shell reader refuses (quotes that do not balance, a
+#: redirect with no target, a substitution that does not close) has no argvs for that part and
+#: what follows it (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). The reader
+#: cannot tell if bash refuses the part too. When the part holds the words of a run that decides
+#: a check (:func:`_refused_part_can_hold`), the check cannot be evaluated: not a pass and not
+#: a fail.
+_SHELL_UNREAD_PART_REASON = (
+    "the shell reader refuses a part of worker command {shown!r} (quotes that do not balance, a "
+    "redirect with no target, or a substitution that does not close), and that part holds the "
+    "words of a run of {script}, so its runs cannot be read and this check could not be evaluated"
+)
+#: The shell's escape character, and a line continuation: bash removes the pair before it reads
+#: a word.
+_SHELL_QUOTING_ESCAPE = "\\"
+_SHELL_LINE_CONTINUATION = "\\\n"
+#: The characters a shell word loses when its quotes come off: the words of a part that was not
+#: read are looked for with these removed.
+_SHELL_QUOTING_CHARS_OFF = str.maketrans("", "", "'\"\\")
+#: What splits the text of a refused part into words: blanks, and the characters of the shell's
+#: operators and substitutions.
+_SHELL_BARE_WORD_SPLIT_RE = re.compile(r"[\s;&|()<>`]+")
+#: What joins the parts of one line that the reader refuses, for the search of a run's words.
+_SHELL_PARTS_JOIN = "\n"
+#: The interpreter flag that runs a module by its stem (``python3 -m <stem>``).
+_INTERPRETER_MODULE_FLAG = "-m"
+#: What parts a script's stem from its suffix.
+_SCRIPT_SUFFIX_SEPARATOR = "."
+#: The quotes that the pod's clip can leave open in a command that it cut, in the order tried.
+_CUT_COMMAND_QUOTES = ('"', "'")
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2681,18 +2710,85 @@ class WorkerRun(BaseModel):
         return flags
 
 
-def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
-    """The argvs of each line that the shell reader reads, and the first line that is past its
-    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
-    Each line is read by itself, so one unread line does not take the others' argvs."""
+def _argvs_and_first_unread(
+    lines: list[str], cut: frozenset[str] = frozenset(), programs: frozenset[str] = frozenset()
+) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None, list[tuple[str, str]]]:
+    """The argvs of each line that the shell reader reads; the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None;
+    and each line with parts that the reader refuses, with those parts
+    (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). Each line is read by
+    itself, so one unread line does not take the others' argvs.
+
+    A line of ``cut`` is a command that the pod's clip cut (:func:`_cut_command_texts`). It is
+    read as if the quote that the cut left open closed at the cut (:func:`_cut_command_read`).
+    What the clip removed is not in the text, and this verifier does not report it: the cut
+    tail of a clipped command is a limit of the capture. So a forbidden run in the cut tail
+    still passes, while ``tool_called`` with an ``arguments`` pattern on the cut argument gives
+    ``error`` for the same call.
+
+    A line of ``programs``, the text of an ``execute_code`` program (:func:`_program_texts`),
+    is not a shell call. It is read as shell lines with the reader's first read alone, as
+    before the second read, and it is not in the third value."""
     argvs: list[list[str]] = []
     first_unread = None
+    refused: list[tuple[str, str]] = []
     for line in lines:
         try:
-            argvs.extend(_shell_argvs(line))
+            line_argvs, parts = (_shell_argvs_first_read(line), []) if line in programs else _shell_argvs_and_unread(line)
+            if parts and line in cut:
+                line_argvs, parts = _cut_command_read(line, line_argvs, parts)
         except ShellReadLimitError as limit:
             first_unread = first_unread or (line, limit)
-    return argvs, first_unread
+            continue
+        argvs.extend(line_argvs)
+        if parts:
+            refused.append((line, _SHELL_PARTS_JOIN.join(parts)))
+    return argvs, first_unread, refused
+
+
+def _cut_command_read(line: str, argvs: list[list[str]], parts: list[str]) -> tuple[list[list[str]], list[str]]:
+    """The argvs and the refused parts of a command that the pod's clip cut, of which the reader
+    gave ``argvs`` and refused ``parts``. The clip often falls inside a quoted value, so the
+    command is read again as if that quote closed at the cut, as the write attribution reads it
+    (:func:`kube_agents_bench.github_writes.writing_segments`): the first closing quote that
+    gives an argv more, or leaves fewer refused parts, gives the result. A part that is still
+    refused is text that the capture holds, so it follows the rule of each refused part
+    (:func:`_refused_part_can_hold`), also when the cut is its cause: a cut inside a
+    substitution, or inside two quotes."""
+    for quote in _CUT_COMMAND_QUOTES:
+        # A trailing backslash would escape the quote that closes the value.
+        closed_argvs, closed_parts = _shell_argvs_and_unread(line.rstrip(_SHELL_QUOTING_ESCAPE) + quote)
+        added = [argv for argv in closed_argvs if argv not in argvs]
+        if added or len(closed_parts) < len(parts):
+            return argvs + added, closed_parts
+    return argvs, parts
+
+
+def _refused_part_can_hold(part: str, run: WorkerRun) -> bool:
+    """Whether a part that the reader refuses can hold ``run``. A run is an argv with the script
+    as a word (by its basename, or its module stem after ``-m``), each flag as a word, and for
+    each word pattern a word that matches it. So the part can hold the run only when its text,
+    with the line continuations and the quoting characters off, has all of those words. The
+    limit of this test: a run that reaches the script by another spelling (through a variable,
+    or with a word that holds a blank or an operator character inside quotes) is not found,
+    and the check is graded on what was read."""
+    bare = part.replace(_SHELL_LINE_CONTINUATION, "").translate(_SHELL_QUOTING_CHARS_OFF)
+    words = [word for word in _SHELL_BARE_WORD_SPLIT_RE.split(bare) if word]
+    stem = run.script.rsplit(_SCRIPT_SUFFIX_SEPARATOR, 1)[0]
+    named = any(os.path.basename(word) == run.script for word in words) or any(
+        flag == _INTERPRETER_MODULE_FLAG and module == stem for flag, module in zip(words, words[1:])
+    )
+    return named and _words_after_carry(words, run)
+
+
+def _refused_part_naming(refused: list[tuple[str, str]], runs: list[WorkerRun]) -> tuple[str, str] | None:
+    """The first line of ``refused`` whose refused parts can hold one of ``runs``
+    (:func:`_refused_part_can_hold`), with that run's script, or None."""
+    for line, part in refused:
+        for run in runs:
+            if _refused_part_can_hold(part, run):
+                return line, run.script
+    return None
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -2826,6 +2922,30 @@ def _clipped_cards(trajectory: list[Any]) -> set[str]:
         and isinstance(entry.get("args"), dict)
         and set(entry["args"]) == {_CLIPPED_ARGS_KEY}
     }
+
+
+def _program_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged ``execute_code`` program, as :func:`_code_call_text` reads it."""
+    texts = (_code_call_text(entry) for entry in trajectory if isinstance(entry, dict) and entry.get("agent") and entry.get("name") != _TERMINAL_TOOL)
+    return frozenset(text for text in texts if text is not None)
+
+
+def _cut_command_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged code-tool call whose command the pod's clip cut: the head that
+    :func:`_code_call_text` reads when the clipped arguments hold no whole command."""
+    cut: set[str] = set()
+    for entry in trajectory:
+        if not (isinstance(entry, dict) and entry.get("agent") and entry.get("name") in _CODE_TOOLS):
+            continue
+        args = entry.get("args")
+        if not (isinstance(args, dict) and set(args) == {_CLIPPED_ARGS_KEY} and isinstance(args[_CLIPPED_ARGS_KEY], str)):
+            continue
+        if _clipped_string_args(args[_CLIPPED_ARGS_KEY], {_COMMAND_ARG: "", _CODE_ARG: ""}):
+            continue
+        command = _code_call_text(entry)
+        if command is not None:
+            cut.add(command)
+    return frozenset(cut)
 
 
 def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
@@ -3021,9 +3141,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     closes the chain gap, and the split stays. ``required_runs``
     reads each flag as the exact word, so a script a case names this way is
     built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
-    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a line bash refuses
-    (an unclosed quote) yields no words, so no run is credited from it
-    (``forbidden_patterns`` read the text and still match it); and no shell
+    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a command that the
+    reader refuses (an unclosed quote) has no argv, so no run is credited from
+    it or from the commands after it, while the commands before it are read
+    (the last paragraph has the error rule; ``forbidden_patterns`` read the
+    text and still match it); and no shell
     expansion is resolved, so a run spelled through a variable that holds the
     whole path (``python3 "$SCRIPT" ...``) is not read as one -- the dictated
     command spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or
@@ -3078,6 +3200,23 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``status="error"`` when a line of the commands was not read, and a clean read of the
     forbidden runs is when a typed line was not read. A check with patterns alone reads no
     argv and is graded as before the limit.
+
+    A call is read a command at a time, as bash reads it
+    (:func:`kube_agents_bench.shell_words._shell_argvs`): a quote in a heredoc body opens
+    nothing (a body line that reads as a command is still an argv), and the commands before
+    one that the reader refuses (quotes that do not balance, a redirect with no target, a
+    substitution that does not close) are read. The refused command and what follows it have
+    no argvs, and the reader cannot tell if bash refuses that part too. So the part follows
+    the rule above for the runs that it can hold (:func:`_refused_part_can_hold`): a required
+    run that is still missing, or a clean read of the forbidden runs, is ``status="error"``
+    when the part has the run's words, which are the script as a word, each flag, and a word
+    for each word pattern. A refused part that reaches the script by another spelling is not
+    found, and the check is graded on what was read. A command that the pod clipped is read as
+    if the quote that the cut left open closed at the cut. What the clip removed is not
+    reported: a forbidden run in the cut tail still passes, while ``tool_called`` with an
+    ``arguments`` pattern on the cut argument gives ``error`` for the same call. An
+    ``execute_code`` program is not a shell call: it is read as shell lines with the reader's
+    first read alone, as before.
     """
 
     type: Literal["worker_commands"]
@@ -3368,9 +3507,11 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         # The argvs serve the runs only: the commands' for the required runs, the typed calls'
         # for the forbidden runs. A check with patterns alone reads none. Each line is read by
-        # itself; a line past the reader's limit has no argvs.
-        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
-        typed_argvs, typed_unread = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [])
+        # itself; a line past the reader's limit has no argvs, and a part that the reader
+        # refuses has none either.
+        cut, programs = _cut_command_texts(snap.trajectory), _program_texts(snap.trajectory)
+        argvs, unread, refused = _argvs_and_first_unread(commands if self.required_runs else [], cut, programs)
+        typed_argvs, typed_unread, typed_refused = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [], cut, programs)
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
@@ -3390,6 +3531,20 @@ class WorkerCommandsVerifier(BaseVerifier):
                 status="error",
                 elapsed_time=time.monotonic() - start,
                 reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
+        # A part that the reader refuses follows the same rule, for the runs that it can hold:
+        # a required run that is still missing, when a refused part of the commands has its
+        # words; a clean read of the forbidden runs, when a refused part of a typed line has
+        # the words of one of them.
+        not_read = None
+        if not (hits or ran or missing):
+            not_read = _refused_part_naming(refused, unrun) if unrun else _refused_part_naming(typed_refused, self.forbidden_runs)
+        if not_read is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_UNREAD_PART_REASON.format(shown=not_read[0][:_SHOWN_COMMAND_CHARS], script=not_read[1]),
             )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []

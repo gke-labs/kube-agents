@@ -5243,6 +5243,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		// One that could set the hold file would lift an operator's hold.
+		credentialProxyHoldFileEnvVar,
 		credentialProxyCuratorAudienceEnvVar,
 		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,

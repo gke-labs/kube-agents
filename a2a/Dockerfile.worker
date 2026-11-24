@@ -238,6 +238,9 @@ RUN mkdir -p /home/node/.claude /scratch \
 # from being changed by accident, and is not a boundary against the harness.
 COPY --from=build /out/claude/CLAUDE.md /home/node/.claude/CLAUDE.md
 COPY --from=build /out/claude/skills/ /home/node/.claude/skills/
+# The build-time content manifest of the two above; the worker checks them
+# against it at start (worker-adapter CheckSessionHome).
+COPY --from=build /out/claude/skills_manifest.sha256 /home/node/.claude/skills_manifest.sha256
 USER node
 # vcs_client's git and working copies: the image's git, and the worker's
 # scratch volume, which the worker empties after every task (the root

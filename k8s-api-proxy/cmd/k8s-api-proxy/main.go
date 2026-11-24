@@ -62,6 +62,7 @@ const (
 	cacheResourceTTLEnv   = "KUBE_PROXY_CACHE_RESOURCE_TTL"
 	cacheDiscoveryTTLEnv  = "KUBE_PROXY_CACHE_DISCOVERY_TTL"
 	scopeFileEnv          = "KUBE_PROXY_SCOPE_FILE"
+	holdFileEnv           = "KUBE_PROXY_HOLD_FILE"
 	excludeHostClusterEnv = "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID"
 	wifServiceAccountEnv  = "CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT"
 	// #nosec G101 -- environment variable name, not a credential.
@@ -129,6 +130,7 @@ type proxyConfig struct {
 	cacheResourceTTL         time.Duration
 	cacheDiscoveryTTL        time.Duration
 	scopeFile                string
+	holdFile                 string
 	excludeHostCluster       string
 	universeDomainRaw        string
 	containerAPIURLOverride  string
@@ -163,6 +165,7 @@ func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
 	fs.Int64Var(&cfg.cacheMaxEntryBytes, "cache-max-entry-bytes", envInt64OrDefault(cacheMaxEntryBytesEnv, k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
 	fs.DurationVar(&cfg.cacheResourceTTL, "cache-resource-ttl", envDurationOrDefault(cacheResourceTTLEnv, k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
 	fs.StringVar(&cfg.scopeFile, "scope-file", envOrDefault(scopeFileEnv, ""), "The install's scope.json; every request to a cluster its exclude.clusters names is refused (empty excludes nothing)")
+	fs.StringVar(&cfg.holdFile, "hold-file", envOrDefault(holdFileEnv, ""), "The install's hold.json (spec.hold); every request to a cluster it holds is refused, re-read on change (empty holds nothing)")
 	fs.StringVar(&cfg.excludeHostCluster, "exclude-host-cluster-id", envOrDefault(excludeHostClusterEnv, ""), "gke_ ID of the cluster the proxy runs in, which in-cluster is checked against the exclusions as; routing is unaffected")
 	fs.StringVar(&cfg.universeDomainRaw, "universe-domain", envOrDefault(universeDomainEnv, envOrDefault(googleCloudUniverseEnv, "")), "Google Cloud API universe domain (auto-detected from GKE metadata when unset on GKE, defaulting to googleapis.com)")
 	fs.StringVar(&cfg.containerAPIURLOverride, "container-api-url", envOrDefault(containerAPIURLEnv, ""), "Optional override for the GKE Container API base URL (derived from --universe-domain when empty)")
@@ -372,8 +375,8 @@ func buildHandler(
 		if strings.TrimSpace(cfg.containerAPIURLOverride) != "" {
 			return nil, errors.New("--upstream-url cannot be combined with --container-api-url")
 		}
-		if strings.TrimSpace(cfg.scopeFile) != "" || strings.TrimSpace(cfg.excludeHostCluster) != "" {
-			return nil, errors.New("--upstream-url cannot be combined with --scope-file or --exclude-host-cluster-id")
+		if strings.TrimSpace(cfg.scopeFile) != "" || strings.TrimSpace(cfg.holdFile) != "" || strings.TrimSpace(cfg.excludeHostCluster) != "" {
+			return nil, errors.New("--upstream-url cannot be combined with --scope-file, --hold-file or --exclude-host-cluster-id")
 		}
 		st, err := upstream.NewStatic(upstream.StaticConfig{URL: staticURL})
 		if err != nil {
@@ -450,6 +453,7 @@ func buildHandler(
 		DefaultClusterID: defaultClusterID,
 		Cache:            cacheCfg,
 		Exclusions:       k8sapiproxy.NewExclusions(cfg.scopeFile, cfg.excludeHostCluster),
+		Holds:            k8sapiproxy.NewHolds(cfg.holdFile, cfg.excludeHostCluster),
 		Logger:           logger,
 		Metrics:          metrics,
 		TracerProvider:   tp,
