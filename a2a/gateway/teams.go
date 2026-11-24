@@ -259,6 +259,12 @@ type TeamsAdapter struct {
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
 	countInterval time.Duration
+	// typing is the conversations a task is running in, each with the
+	// loop that keeps Teams's typing indicator on (teams_typing.go);
+	// typingInterval and typingMax pace and bound it (tests shorten both).
+	typing         map[string]*teamsTyping
+	typingInterval time.Duration
+	typingMax      time.Duration
 }
 
 // NewTeamsAdapter builds the adapter against the credential proxy's relay
@@ -272,17 +278,20 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		return nil, fmt.Errorf("teams: relay token path is required")
 	}
 	return &TeamsAdapter{
-		relayURL:      strings.TrimSuffix(relayURL, "/"),
-		tokenPath:     tokenPath,
-		tenantID:      strings.TrimSpace(tenantID),
-		adaptiveCards: adaptiveCards,
-		client:        &http.Client{Timeout: teamsRelayTimeout},
-		log:           log,
-		seen:          map[string]bool{},
-		serviceURLs:   map[string]string{},
-		rated:         map[string]teamsRated{},
-		allowed:       map[string]bool{},
-		countInterval: teamsEventCountInterval,
+		relayURL:       strings.TrimSuffix(relayURL, "/"),
+		tokenPath:      tokenPath,
+		tenantID:       strings.TrimSpace(tenantID),
+		adaptiveCards:  adaptiveCards,
+		client:         &http.Client{Timeout: teamsRelayTimeout},
+		log:            log,
+		seen:           map[string]bool{},
+		serviceURLs:    map[string]string{},
+		rated:          map[string]teamsRated{},
+		allowed:        map[string]bool{},
+		countInterval:  teamsEventCountInterval,
+		typing:         map[string]*teamsTyping{},
+		typingInterval: teamsTypingInterval,
+		typingMax:      teamsTypingMax,
 	}, nil
 }
 

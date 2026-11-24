@@ -1,0 +1,120 @@
+package gateway
+
+import (
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+const testTeamsTypingInterval = 10 * time.Millisecond
+
+func typingTeamsAdapter(t *testing.T) (*TeamsAdapter, *fakeTeamsRelay) {
+	t.Helper()
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	a.typingInterval = testTeamsTypingInterval
+	return a, relay
+}
+
+func teamsTypingCount(relay *fakeTeamsRelay) int {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	return len(relay.typing)
+}
+
+// teamsTypingSettled waits until no typing post has arrived for several
+// intervals and returns the count it settled at.
+func teamsTypingSettled(t *testing.T, relay *fakeTeamsRelay) int {
+	t.Helper()
+	last, quiet := teamsTypingCount(relay), 0
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(5 * testTeamsTypingInterval)
+		now := teamsTypingCount(relay)
+		if now == last {
+			if quiet++; quiet >= 3 {
+				return now
+			}
+			continue
+		}
+		last, quiet = now, 0
+	}
+	t.Fatalf("typing posts never settled; last count %d", last)
+	return 0
+}
+
+// A task starting in a conversation turns the typing indicator on there, as
+// a typing activity posted to that conversation and posted again while the
+// task runs; the task ending turns it off.
+func TestTeamsTypesWhileATaskRuns(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	waitFor(t, "the indicator posted more than once", func() bool { return teamsTypingCount(relay) >= 3 })
+	relay.mu.Lock()
+	first := relay.typing[0]
+	relay.mu.Unlock()
+	payload, _ := first["payload"].(map[string]any)
+	if first["method"] != http.MethodPost || first["endpoint"] != teamsConversationsPath+testTeamsChannel+teamsActivitiesSuffix || payload["type"] != teamsTypingActivityType || len(payload) != 1 {
+		t.Fatalf("typing post %v, want a typing activity posted to the conversation", first)
+	}
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	settled := teamsTypingSettled(t, relay)
+	time.Sleep(10 * testTeamsTypingInterval)
+	if now := teamsTypingCount(relay); now != settled {
+		t.Fatalf("typing posts went on after the task ended: %d then %d", settled, now)
+	}
+	if n := teamsCallCount(relay); n != 0 {
+		t.Fatalf("the indicator posted %d messages, want none", n)
+	}
+}
+
+// The indicator stays on until the conversation's last task ends, and a
+// task ending in another conversation does not stop it.
+func TestTeamsKeepsTypingUntilTheLastTaskEnds(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	a.TaskStarted(conversation, "task-2")
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	a.TaskTerminal("teams:19:another@thread.tacv2", "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+	before := teamsTypingCount(relay)
+	waitFor(t, "the indicator kept posting for the second task", func() bool { return teamsTypingCount(relay) >= before+3 })
+	a.TaskTerminal(conversation, "task-2", lib.StateCanceled, TerminalFromExecutor, "")
+	settled := teamsTypingSettled(t, relay)
+	time.Sleep(10 * testTeamsTypingInterval)
+	if now := teamsTypingCount(relay); now != settled {
+		t.Fatalf("typing posts went on after the last task ended: %d then %d", settled, now)
+	}
+}
+
+// A task that never reports an end does not keep the indicator on for
+// ever: the loop stops at its bound, and the end arriving late is harmless.
+func TestTeamsStopsTypingAtItsBound(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 8 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 1 })
+	settled := teamsTypingSettled(t, relay)
+	if settled > 20 {
+		t.Fatalf("%d typing posts before the bound stopped them, want about 8", settled)
+	}
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	a.TaskStarted(conversation, "task-2")
+	waitFor(t, "a new task turned the indicator on again", func() bool { return teamsTypingCount(relay) > settled })
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+}
+
+// A typing post the broker refuses is dropped and the next one still goes.
+func TestTeamsTypingSurvivesARefusedPost(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	relay.mu.Lock()
+	relay.apiStatus = http.StatusBadGateway
+	relay.mu.Unlock()
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	waitFor(t, "the indicator kept posting", func() bool { return teamsTypingCount(relay) >= 3 })
+	a.TaskTerminal(conversation, "task-1", lib.StateFailed, TerminalFromExecutor, "")
+}
