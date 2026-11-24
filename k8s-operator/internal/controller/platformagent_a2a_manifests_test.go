@@ -1353,10 +1353,11 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	}
 }
 
-// TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag: the spawner widens
-// the session pod only when the operator says so, and it needs the broker
-// URL to do it.
-func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
+// TestGatewayIsToldAboutTheClusterViewUnderTheFlagOnThePlatformRoute: on the
+// platform route the spawner widens the session pod only when the operator's
+// flag says so, and it needs the broker URL to do it. (On the session route
+// the view is on by default: TestTheSessionRouteRendersTheClusterViewWithNoFlag.)
+func TestGatewayIsToldAboutTheClusterViewUnderTheFlagOnThePlatformRoute(t *testing.T) {
 	agent := a2aTestAgent()
 	envOf := func() map[string]corev1.EnvVar {
 		env := map[string]corev1.EnvVar{}
@@ -7510,6 +7511,12 @@ func TestTheSessionClusterViewFollowsTheRouteAndTheFlagOverridesIt(t *testing.T)
 		"platform":                    a2aTestAgent(),
 		"session":                     sessionRouteAgent(4),
 		"session falling to platform": sessionRouteAgent(0),
+		"session held by a pruned CRD": func() *agentv1alpha1.PlatformAgent {
+			a := sessionRouteAgent(4)
+			a.Status.EffectiveSessionCap = nil
+			apimeta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{Type: sessionCapFittedConditionType, Status: metav1.ConditionTrue, Reason: sessionCapPrunedReason})
+			return a
+		}(),
 	}
 	for _, tc := range []struct {
 		flag, route string
@@ -7518,6 +7525,7 @@ func TestTheSessionClusterViewFollowsTheRouteAndTheFlagOverridesIt(t *testing.T)
 		{"", "platform", false},
 		{"", "session", true},
 		{"", "session falling to platform", false},
+		{"", "session held by a pruned CRD", false},
 		{"true", "platform", true},
 		{"true", "session", true},
 		{"true", "session falling to platform", true},
@@ -7570,5 +7578,28 @@ func TestTheSessionRouteRendersTheClusterViewWithNoFlag(t *testing.T) {
 	t.Setenv(a2aSessionClusterViewEnvVar, "false")
 	if _, ok := envOf(agent)["A2A_SESSION_CLUSTER_VIEW"]; ok {
 		t.Error("the cluster view rendered on the session route with the flag \"false\"")
+	}
+}
+
+// TestTheSessionCapResolvesBeforeAnythingRendersFromTheRoute: the session
+// pods' cluster view reads the resolved route, so the pass resolves the
+// session cap before kube-proxy and the broker render, not only before the
+// workload and the gateway. Otherwise one pass could render the view on the
+// broker from the stored status and off on the gateway from this pass's
+// reading (#6987).
+func TestTheSessionCapResolvesBeforeAnythingRendersFromTheRoute(t *testing.T) {
+	src, err := os.ReadFile("platformagent_controller.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	resolve := strings.Index(text, "r.resolveA2ASessionCap(ctx, renderAgent, instance)")
+	if resolve < 0 || strings.Count(text, "r.resolveA2ASessionCap(ctx, renderAgent, instance)") != 1 {
+		t.Fatal("the reconcile resolves the session cap other than once")
+	}
+	for _, render := range []string{"r.reconcileKubeProxy(ctx, renderAgent", "r.reconcileCredentialProxy(ctx, renderAgent", "r.reconcileWorkload(ctx, renderAgent"} {
+		if at := strings.Index(text, render); at < 0 || at < resolve {
+			t.Errorf("%s renders before the session cap is resolved", render)
+		}
 	}
 }

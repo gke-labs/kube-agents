@@ -1163,8 +1163,10 @@ type TuningSpec struct {
 	// and keeps its history, and on any bus a new value on the
 	// kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
 	// rendered width. On an existing install, until the operator has read the bus's
-	// width once, the provision Job waits. On `platform` none of this
-	// applies.
+	// width once, the provision Job waits. On the session route the session
+	// pods also get the read-only cluster view by default; the operator's
+	// A2A_SESSION_CLUSTER_VIEW overrides it ("false" keeps it off). On
+	// `platform` none of this applies.
 	// +kubebuilder:validation:Enum=session;platform
 	// +optional
 	DefaultRoute *string `json:"defaultRoute,omitempty"`

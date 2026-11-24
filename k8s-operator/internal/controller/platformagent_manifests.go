@@ -4983,8 +4983,9 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		envVars = append(envVars, corev1.EnvVar{Name: watcherSubscriptionEnvVar, Value: watcherPubsubSubscription(agent)})
 	}
 	if a2aSessionClusterViewEnabled(agent) {
-		// The session pods' audience. Rendered only with the flag, so a
-		// broker on an install without it has no session role to confer
+		// The session pods' audience. Rendered only under the session pods'
+		// cluster view (the session route's default, or the operator's flag),
+		// so a broker on an install without it has no session role to confer
 		// and a stray session token is "another audience", 401.
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience},

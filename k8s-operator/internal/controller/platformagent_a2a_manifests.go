@@ -1975,7 +1975,7 @@ func a2aChatDisplayMode(mode string) string {
 // a2aSessionClusterViewEnabled reports whether this install's session pods
 // get the temporary cluster view (#6538, #6987). Since 2026-11-20 the view is
 // on by default for the session route: with the operator's
-// A2A_SESSION_CLUSTER_VIEW unset, it is on exactly when the resolved route is
+// A2A_SESSION_CLUSTER_VIEW unset (or empty), it is on exactly when the resolved route is
 // session (resolveA2ADefaultRoute, so its fallbacks to platform turn it off
 // too). The flag overrides it until the view is replaced by the profile path
 // (#6483): "true" turns it on whatever the route, as before, and "false"
@@ -3524,7 +3524,7 @@ func buildA2ANATSPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruption
 // the operator, so it uses the standard key; operator-rendered pieces carry
 // a2aComponentLabel). Everything that selects session pods must agree on this
 // pair: the bus fence's session peer, the session fence's own podSelector,
-// the broker fence's session peer under the cluster-view flag, and the
+// the broker fence's session peer under the session pods' cluster view, and the
 // gateway's session cap and sweeper, which count and list pods by it. The
 // operator's selectors all come from a2aSessionPodSelector so they cannot
 // drift apart.
@@ -3555,7 +3555,7 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 //
 // Deny-by-default with three destinations, which is the whole of a worker's
 // job description (plus a fourth, the credential broker on its one port, only
-// under the operator's cluster-view flag; see the rule at the end):
+// under the session pods' cluster view; see the rule at the end):
 //
 //	DNS       — name resolution for the two peers below, same peer set the
 //	            agent's egress policy uses so the two cannot drift on what DNS
@@ -3629,7 +3629,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The credential broker (and its exec tier while it renders) for gcloud,
-		// plus kube-proxy for kubectl, under the cluster-view flag. Both
+		// plus kube-proxy for kubectl, under the session pods' cluster view. Both
 		// authenticate the session pod's projected token.
 		to := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
 		if credentialProxyExecTierEnabled(agent) {
@@ -3661,8 +3661,8 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 			// PlatformAgent per cluster, so two agents' session pods never
 			// share a namespace; were that rule ever relaxed, each agent's
 			// fence would select the other's pods too, and what would then
-			// separate them is the bus grants at auth and, under the
-			// cluster-view flag, the broker's CREDENTIAL_PROXY_ALLOWED_CALLERS
+			// separate them is the bus grants at auth and, under the session
+			// pods' cluster view, the broker's CREDENTIAL_PROXY_ALLOWED_CALLERS
 			// and session-callers binding — not this selector.
 			PodSelector: metav1.LabelSelector{
 				MatchLabels: a2aSessionPodSelector(),

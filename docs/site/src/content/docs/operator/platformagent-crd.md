@@ -616,8 +616,7 @@ and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-ow
 The view follows the route the operator resolved, so an install held on `platform` (no room for a
 session, or a CRD that prunes the cap) gets none. The operator's `A2A_SESSION_CLUSTER_VIEW` overrides
 it, set as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes:
-`"true"` turns the view on on any route, and `"false"` turns it off on the session route too. Any
-other value is off. The flag doesn't change the route itself. On a `fleet`-tier install, a session
+`"true"` turns the view on on any route, and `"false"` turns it off on the session route too. Unset or empty, it follows the route, and any other value is off. The flag doesn't change the route itself. Whoever can set `spec.harness.tuning.defaultRoute` on the PlatformAgent turns the view on with it; whoever runs the operator can turn it off for every install with `"false"`. On a `fleet`-tier install, a session
 pod's cluster-wide `kubectl` lists need more than the default session memory limit ([What each pod
 needs](/kube-agents/deploy/fleet-sizing/#what-each-pod-needs)).
 
