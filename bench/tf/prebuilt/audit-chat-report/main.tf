@@ -12,19 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/fleet-audit-chat-report-is-the-report: run
-# one scheduled fleet audit for real and let its report reach the chat relay, so
-# the verifier can read what the channel got.
+# The scenario driver for two cases: run one scheduled fleet audit for real.
+# bench/tasks/fleet-audit-chat-report-is-the-report reads what the chat relay
+# stored for the run's report, which is what the channel got;
+# bench/tasks/fleet-audit-scheduled-run-files-the-finding reads the report the
+# run stored on the install.
 #
-# The run must not be silent, or nothing reaches the channel to grade. Before it
-# fires, the stack renames the stream's `latest.json` in the report store on the
-# shell sandbox (to `latest.json.bench-moved`): with no trusted memory of the
-# previous run, `finish` answers `silent_ok: false` whatever the fleet holds
-# (fleet-audit SKILL.md, "lost memory"). A run that reaches `finish` writes a new
-# `latest.json`, the store's record from then on, and the renamed copy is
-# deleted; where no new one was written, the teardown, or the exit trap on a
-# failed apply, puts the renamed copy back (store.sh), so the stream keeps its
-# memory.
+# The run must be a full one that speaks: a silent run sends the channel
+# nothing to grade, and a run closed from a stored document reports what an
+# earlier run found. Before it fires, the stack renames files on the shell
+# sandbox (to `<name>.bench-moved`). Each `latest.json` in the stream's report
+# store: with no trusted memory of the previous run, `finish` answers
+# `silent_ok: false` whatever the fleet holds (the fleet-audit skill's
+# references/clean-run.md). And the digest record the last scheduled run
+# left: without it `precheck` reads a first run and closes nothing, where
+# with it an unchanged fleet is closed from the newest stored document, which
+# the run ring keeps when `latest.json` is gone. A run that reaches `finish`
+# writes a new `latest.json`, and a new digest record when it had a collector
+# manifest; the renamed copy of each file the run wrote anew is deleted, and
+# the teardown, or the exit trap on a failed apply, puts back the copy of
+# each it did not (store.sh), so the stream keeps its memory.
 #
 # arm.py (beside this file) marks the job due with Hermes' own `trigger_job`, as
 # the `oobe` job's first-run audits stage does, and waits for the run to end. The
@@ -32,13 +39,15 @@
 # the job's `deliver` leg, so the report takes the path every scheduled report
 # takes. A run of the job already claimed or running is waited out first, up to
 # `own_wait`, and only a run claimed after the mark is read as the fired one
-# (both from the scheduler's own `cron/executions.db`).
+# (both from the scheduler's own `cron/executions.db`). An eval run pauses the
+# clock-started audits: the fire lifts that pause, and the wait, the teardown
+# and the exit trap on a failed apply each put it back.
 #
 # On an install with a chat platform the report is posted to the home channel,
 # and the audit writes its ledger issue in the install's GitOps repository.
 #
-# The teardown removes the state file and restores or deletes the renamed store
-# files as above.
+# The teardown pauses the job again where that is still owed, removes the
+# state file, and restores or deletes the renamed files as above.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -56,7 +65,9 @@ locals {
   arm_b64   = base64encode(file("${path.module}/arm.py"))
   store_b64 = base64encode(file("${path.module}/store.sh"))
   # audit_report.py: REPORTS_DIR.
-  store    = "/opt/data/fleet-audit/reports/${var.audit_job}"
+  store = "/opt/data/fleet-audit/reports/${var.audit_job}"
+  # manifest_delta.py: SCRATCH_DIR and DIGEST_FILE_TEMPLATE.
+  digest   = "/opt/data/scratch/last_scheduled_digest_${var.audit_job}.json"
   pod_wait = 5
 }
 
@@ -75,6 +86,7 @@ resource "null_resource" "audit_chat_report" {
     home              = local.home
     python            = local.python
     store             = local.store
+    digest            = local.digest
     arm_b64           = local.arm_b64
     store_b64         = local.store_b64
   }
@@ -87,12 +99,18 @@ resource "null_resource" "audit_chat_report" {
       kubeconfig_dir="$(mktemp -d)"
       # Terraform taints a resource whose create-time provisioner failed and
       # skips its destroy-time provisioners, so a failure after the rename puts
-      # the store back here. errexit stays in force inside a trap, hence `set +e`.
+      # the store back here, and a failure after the fire pauses the job again
+      # where the fire lifted an eval run's pause. errexit stays in force
+      # inside a trap, hence `set +e`.
       moved=""
+      fired=""
       on_exit() {
         status=$?
         trap '' TERM INT
         set +e
+        if [ "$status" -ne 0 ] && [ -n "$fired" ]; then
+          arm clean "${local.home}" >&2 || echo "WARNING: could not clean the arm state; the next apply removes it first." >&2
+        fi
         if [ "$status" -ne 0 ] && [ -n "$moved" ]; then
           echo "Apply failed (exit $status); restoring the report store." >&2
           store restore >&2 || echo "WARNING: could not restore the report store." >&2
@@ -124,7 +142,7 @@ resource "null_resource" "audit_chat_report" {
       store() {
         printf '%s' '${local.store_b64}' | base64 -d | \
           kubectl exec -i -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- \
-            sh -s "$1" "${local.store}"
+            sh -s "$1" "${local.store}" "${local.digest}"
       }
 
       arm clean "${local.home}"
@@ -134,8 +152,9 @@ resource "null_resource" "audit_chat_report" {
       moved=1
       store move
 
+      fired=1
       arm fire "${local.home}" "${local.python}" "${var.audit_job}"
-      arm wait "${local.home}" "${var.audit_job}" "${var.run_wait}"
+      arm wait "${local.home}" "${var.audit_job}" "${var.run_wait}" ${var.unfinished_run_is_a_result ? "result" : ""}
     EOT
   }
 
@@ -165,7 +184,7 @@ resource "null_resource" "audit_chat_report" {
         || echo "WARNING: could not remove the state file; the next run removes it first." >&2
       printf '%s' '${self.triggers.store_b64}' | base64 -d \
         | kubectl exec -i -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" -c "${self.triggers.sandbox_container}" -- \
-          sh -s restore "${self.triggers.store}" \
+          sh -s restore "${self.triggers.store}" "${self.triggers.digest}" \
         || echo "WARNING: could not restore the renamed store files." >&2
     EOT
   }

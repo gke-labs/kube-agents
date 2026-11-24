@@ -289,7 +289,8 @@ starting it; every pause pass applies
 that, and a watch through the fan-out repeats it every few minutes, except while the
 `oobe-first-run-audits` stack has the stage armed. Until then a write from one of them mid-eval
 is still possible. `hack/ci_pause_scheduled_audits.py`'s header has the rule in full. An audit case starts its own run from its
-prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
+prompt, which a paused schedule doesn't affect; a case whose stack fires a scheduled job fires it
+through the pause and pauses it again after the run. A pause that still fails after its attempts
 stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
 charged to the cases.
 
@@ -507,7 +508,7 @@ sandbox, then in the agent container, and passes when a `latest.json` for its `a
 the run started (or, with `since_state_file`, since the `fired_at` a case's stack recorded in that
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
-value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
+value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key; a key the envelope lacks reads `null`, so `precheck: null` holds a run to not having been closed by `precheck`), and, for each
 `required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `shadow_report_stored`, in its own module
 (`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, on the run's shadow
 stream (`stream`, required: the AgentSchedule's name for a scheduled canary, or `<audit>-shadow` for a run
