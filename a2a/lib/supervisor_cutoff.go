@@ -286,6 +286,14 @@ func StartProfileNames(ctx context.Context, getenv func(string) string, log *slo
 	return p
 }
 
+// LoadFile reads the names file at path into the set now, as
+// StartProfileNames' poll does every profileNamesPollInterval. Tests use it
+// to load the names at a moment they choose.
+func (p *ProfileNames) LoadFile(path string) error {
+	_, err := p.load(path)
+	return err
+}
+
 func (p *ProfileNames) reload(path string, log *slog.Logger) {
 	changed, err := p.load(path)
 	switch {
@@ -560,10 +568,92 @@ func (c *Client) taskReplayHeads(ctx context.Context, stream jetstream.Stream, a
 	return heads, nil
 }
 
-// lastBySubjectWait bounds the consumer read lastBySubject makes. The
-// message was there a moment ago, so the delivery is one round trip; a
-// read that takes longer than this has failed.
+// lastBySubjectWait bounds the consumer read lastBySubject makes, and how
+// long a caller with no deadline of its own waits for a slot
+// (StoredTimeReadSlots). The message was there a moment ago, so the delivery
+// is one round trip; a read that takes longer than this has failed.
 const lastBySubjectWait = 2 * time.Second
+
+// StoredTimeReadSlots is how many of lastBySubject's consumers one process
+// holds on TASKS at once. Each read opens an ephemeral consumer that nothing
+// deletes and the server reaps EphemeralConsumerInactiveThreshold after its
+// last fetch, and TASKS' max_consumers is fixed when the stream is created,
+// so a fan-out's status answer and a heal pass, each reading many profile
+// tasks, could otherwise hold dozens of slots for five seconds. A slot is
+// taken before the consumer is made and given back that threshold after the
+// read returns (lastBySubjectHold), so this is a bound on the consumers
+// alive, not only on the reads running. A caller that gets no slot within
+// its deadline (lastBySubjectWait at most) has a failed read, which every
+// caller already takes as the task still running, the safe side.
+//
+// These slots are not in the operator's TASKS reserve table
+// (a2aTasksReservedConsumersFor in k8s-operator's
+// platformagent_a2a_manifests.go). A row there raises the width every
+// install's provision check requires, and an existing TASKS stream, created
+// at the old width, can't grow to it, so the check would refuse it on the
+// upgrade. Today they come out of the stream's slack, at most this many per
+// gateway process.
+//
+// The bound costs throughput: at most this many such reads per threshold.
+// A later improvement could drop the consumer altogether: a STREAM.MSG.GET
+// through the stream's API rather than the direct get returns the stored
+// time in its reply, but the gateway holds no grant for that subject on
+// TASKS today, and adding one is a grant change, not a fix here.
+const StoredTimeReadSlots = 4
+
+// storedTimeReadSlots is the process-wide semaphore StoredTimeReadSlots
+// sizes.
+var storedTimeReadSlots = make(chan struct{}, StoredTimeReadSlots)
+
+// lastBySubjectHold gives a slot back once the consumer lastBySubject made
+// can no longer be on the server: EphemeralConsumerInactiveThreshold after
+// the read returned. Tests shorten it.
+var lastBySubjectHold = func(release func()) { time.AfterFunc(EphemeralConsumerInactiveThreshold, release) }
+
+// SetStoredTimeReadHoldForTest replaces how a stored-time read slot is given
+// back (lastBySubjectHold) and returns the function that restores it. For
+// tests in other packages that read many pre-cutoff terminals in a few
+// seconds and are not testing the bound; nothing else calls it.
+func SetStoredTimeReadHoldForTest(hold func(release func())) (restore func()) {
+	prev := lastBySubjectHold
+	lastBySubjectHold = hold
+	return func() { lastBySubjectHold = prev }
+}
+
+// lastBySubjectCreating, when set, runs right before lastBySubject makes its
+// consumer, with the slots in use at that moment. Tests set it to count;
+// it is nil otherwise.
+var lastBySubjectCreating func(inUse int)
+
+// acquireStoredTimeRead takes one of the StoredTimeReadSlots, waiting at
+// most until ctx's deadline, or lastBySubjectWait when ctx has none. An
+// error is no slot, and the read failing.
+func acquireStoredTimeRead(ctx context.Context, subject string) error {
+	select {
+	case storedTimeReadSlots <- struct{}{}:
+		return nil
+	default:
+	}
+	wait := lastBySubjectWait
+	if deadline, ok := ctx.Deadline(); ok {
+		wait = min(wait, time.Until(deadline))
+	}
+	if wait <= 0 {
+		return fmt.Errorf("stored time of %s: no read slot: %w", subject, context.DeadlineExceeded)
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case storedTimeReadSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("stored time of %s: no read slot: %w", subject, ctx.Err())
+	case <-timer.C:
+		return fmt.Errorf("stored time of %s: no read slot in %s: %w", subject, wait, context.DeadlineExceeded)
+	}
+}
+
+func releaseStoredTimeRead() { <-storedTimeReadSlots }
 
 // lastBySubject reads the newest message on subject through an ephemeral
 // pull consumer that delivers the last message per subject, and returns its
@@ -578,12 +668,33 @@ const lastBySubjectWait = 2 * time.Second
 // EphemeralConsumerInactiveThreshold gives: neither holds CONSUMER.DELETE on
 // TASKS. It is reaped by that same threshold, and it is a plain pull
 // consumer, not an ordered one, because an ordered consumer's fetch resets
-// it, and the reset deletes the consumer it replaces.
+// it, and the reset deletes the consumer it replaces. How many are alive at
+// once is bounded by StoredTimeReadSlots, and the deadline is checked before
+// the consumer is made, so a caller out of time opens none.
 //
 // A message gone between the direct get and this read (aged out, or a
 // subject purged) is the read failing, not the subject being empty: a caller
 // takes it as it takes any failed read.
 func (c *Client) lastBySubject(ctx context.Context, subject string) ([]byte, time.Time, uint64, error) {
+	if err := acquireStoredTimeRead(ctx, subject); err != nil {
+		return nil, time.Time{}, 0, err
+	}
+	wait := lastBySubjectWait
+	if deadline, ok := ctx.Deadline(); ok {
+		wait = min(wait, time.Until(deadline))
+	}
+	if wait <= 0 || ctx.Err() != nil {
+		// No consumer was made, so the slot goes straight back.
+		releaseStoredTimeRead()
+		return nil, time.Time{}, 0, fmt.Errorf("stored time of %s: %w", subject, context.DeadlineExceeded)
+	}
+	// From here a consumer may exist on the server (a create that errors on
+	// a timeout can still have made it), so the slot is held for its
+	// threshold however the read ends.
+	defer lastBySubjectHold(releaseStoredTimeRead)
+	if lastBySubjectCreating != nil {
+		lastBySubjectCreating(len(storedTimeReadSlots))
+	}
 	_, js := c.conn()
 	cons, err := js.CreateConsumer(ctx, TasksStream, jetstream.ConsumerConfig{
 		FilterSubject:     subject,
@@ -596,7 +707,6 @@ func (c *Client) lastBySubject(ctx context.Context, subject string) ([]byte, tim
 	if err != nil {
 		return nil, time.Time{}, 0, fmt.Errorf("consumer on %s for its stored time: %w", subject, err)
 	}
-	wait := lastBySubjectWait
 	if deadline, ok := ctx.Deadline(); ok {
 		wait = min(wait, time.Until(deadline))
 	}

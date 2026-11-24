@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -947,5 +948,134 @@ func TestAnUnparseableHeaderBlockFailsTheRead(t *testing.T) {
 	}
 	if empty, err := c.TaskReplayEmpty(ctx, nil, cutoffProfileName, "task-garbled"); err == nil {
 		t.Errorf("TaskReplayEmpty: %v with no error; want the read to fail", empty)
+	}
+}
+
+// storedTimeReadHook sets lastBySubjectHold to give a slot back after hold
+// and lastBySubjectCreating to record the most slots in use at a create and
+// how many creates there were, and restores both at cleanup. It waits for
+// every slot to come back first, so no earlier test's hold leaks in.
+func storedTimeReadHook(t *testing.T, hold time.Duration) (maxInUse, creates func() int) {
+	t.Helper()
+	waitFor(t, 10*time.Second, "every stored-time read slot free", func() bool { return len(storedTimeReadSlots) == 0 })
+	var mu sync.Mutex
+	var most, n int
+	prevHold, prevCreating := lastBySubjectHold, lastBySubjectCreating
+	lastBySubjectHold = func(release func()) { time.AfterFunc(hold, release) }
+	lastBySubjectCreating = func(inUse int) {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		most = max(most, inUse)
+	}
+	t.Cleanup(func() {
+		lastBySubjectHold, lastBySubjectCreating = prevHold, prevCreating
+		waitFor(t, 10*time.Second, "every stored-time read slot back", func() bool { return len(storedTimeReadSlots) == 0 })
+	})
+	return func() int { mu.Lock(); defer mu.Unlock(); return most },
+		func() int { mu.Lock(); defer mu.Unlock(); return n }
+}
+
+// The stored-time reads a process makes hold at most StoredTimeReadSlots
+// consumers at once, however many callers read at the same moment: twenty
+// readers of twenty pre-cutoff profile terminals all get their answer, and
+// no create runs with more than the bound in use. The hold is shortened so
+// the test does not wait out five seconds per slot.
+func TestStoredTimeReadsNeverExceedTheirSlots(t *testing.T) {
+	s := startServer(t)
+	url := clientURL(s)
+	provisionCutoffTasksStream(t, url, true)
+	const readers = 20
+	for i := range readers {
+		id := fmt.Sprintf("task-%d", i)
+		publishRaw(t, url, TaskSupervisorSubject(cutoffProfileName, id), cutoffEnvelope(t, DispatcherSession, id, StateFailed, true))
+	}
+	time.Sleep(20 * time.Millisecond)
+	c := cutoffReader(t, url, time.Now(), NewProfileNames(cutoffProfileName))
+	maxInUse, creates := storedTimeReadHook(t, 100*time.Millisecond)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, readers)
+	for i := range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			heads, err := c.TaskReplayHeads(ctx, nil, cutoffProfileName, fmt.Sprintf("task-%d", i))
+			if err == nil && len(heads) != 1 {
+				err = fmt.Errorf("task-%d: %d heads, want the pre-cutoff terminal", i, len(heads))
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if n := creates(); n != readers {
+		t.Errorf("%d consumers made, want one per reader (%d)", n, readers)
+	}
+	if got := maxInUse(); got > StoredTimeReadSlots || got < 1 {
+		t.Errorf("most slots in use at a create = %d, want 1..%d", got, StoredTimeReadSlots)
+	}
+}
+
+// A caller out of time opens no consumer: one whose deadline has passed is
+// refused before the create, and so is one that waits for a slot while all
+// are held and runs out of time waiting. Both are failed reads, which every
+// caller takes as the task still running.
+func TestAStoredTimeReadPastItsDeadlineMakesNoConsumer(t *testing.T) {
+	s := startServer(t)
+	url := clientURL(s)
+	provisionCutoffTasksStream(t, url, true)
+	publishRaw(t, url, TaskSupervisorSubject(cutoffProfileName, "task-old"), cutoffEnvelope(t, DispatcherSession, "task-old", StateFailed, true))
+	time.Sleep(20 * time.Millisecond)
+	c := cutoffReader(t, url, time.Now(), NewProfileNames(cutoffProfileName))
+	_, creates := storedTimeReadHook(t, 100*time.Millisecond)
+	_, js := c.conn()
+	consumers := func() int {
+		st, err := js.Stream(testCtx(t), TasksStream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := st.Info(testCtx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.State.Consumers
+	}
+	subject := TaskSupervisorSubject(cutoffProfileName, "task-old")
+
+	past, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, _, _, err := c.lastBySubject(past, subject); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("read past its deadline: %v, want DeadlineExceeded", err)
+	}
+
+	for range StoredTimeReadSlots {
+		storedTimeReadSlots <- struct{}{}
+	}
+	short, cancelShort := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelShort()
+	_, _, _, err := c.lastBySubject(short, subject)
+	for range StoredTimeReadSlots {
+		releaseStoredTimeRead()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("read with every slot held: %v, want DeadlineExceeded", err)
+	}
+
+	if n := creates(); n != 0 {
+		t.Errorf("%d consumers made by reads out of time, want none", n)
+	}
+	if n := consumers(); n != 0 {
+		t.Errorf("TASKS holds %d consumers after reads out of time, want none", n)
+	}
+	if len(storedTimeReadSlots) != 0 {
+		t.Errorf("%d slots still held after reads that made no consumer", len(storedTimeReadSlots))
 	}
 }
