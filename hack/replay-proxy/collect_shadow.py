@@ -46,7 +46,7 @@ Rollout step 2):
   again), and
   keeps a copy of every line and stored request it fetched. Every
   `--publish-interval` seconds, and once in the last pass, publish_cache.py
-  uploads the answers from runs that passed, as graded so far under
+  uploads the answers graded runs gave, passing or failing, as graded so far under
   `--verdicts-dir`, to the shared cache bucket, each record naming the
   checkout's commit (`--commit`). The cache never goes to the shadow bucket.
 - `replay`, in the replay lane: each pass seeds any proxy pod that has not got

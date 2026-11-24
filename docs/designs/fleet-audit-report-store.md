@@ -445,6 +445,14 @@ deletes `<audit-id>/<owner>/<name>/` from the store. `report_status.py` therefor
 library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
 not grow two parsers of the same files.
 
+A shadow run's stream (#5623) holds a canary's results, not a live audit's. `report_status.project`
+leaves it out and counts it as `shadow_hidden`, so the board snapshot and the status view never show
+it, and `report_query.py` leaves it out of `streams` and refuses a question about one of its runs,
+unless `--include-shadow` asks for it. That flag is for the canary's comparison and its eval, never
+for an answer to a person. A stream is a shadow run's when its newest envelope carries `shadow: true`,
+which is enough because a shadow run never writes to a live audit's stream. The broker's raw routes
+don't filter; a reader that goes around these two must check the key itself.
+
 ## 7. Rejected alternatives
 
 - **A ConfigMap.** Findings documents at 60,000-character scale, times every stream, times history,

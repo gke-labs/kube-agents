@@ -1,0 +1,8 @@
+{"event":"init","conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","init":{"cwd":"/tmp/agy6709-ws","tools":["ask_custom_permission","ask_permission","ask_question"],"permission_mode":"request-review"}}
+{"event":"step_update","step_update":{"conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","step_index":1,"state":"DONE","step_type":"error_message","duration_seconds":0}}
+{"event":"step_update","step_update":{"conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","step_index":2,"state":"DONE","step_type":"error_message","duration_seconds":0}}
+{"event":"step_update","step_update":{"conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","step_index":3,"state":"DONE","step_type":"error_message","duration_seconds":0}}
+{"event":"step_update","step_update":{"conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","step_index":4,"state":"DONE","step_type":"error_message","duration_seconds":0}}
+{"event":"step_update","step_update":{"conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","step_index":5,"state":"DONE","step_type":"error_message","duration_seconds":0}}
+{"event":"result","result":{"conversation_id":"a422f461-bb41-4cf0-afc0-5c6e65d01314","status":"ERROR","response":"","error":"API error (attempt 5): request failed (code 500): fake gateway","duration_seconds":49.585082161,"num_turns":1,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"finished_reason":"error"}}
