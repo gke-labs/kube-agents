@@ -731,6 +731,9 @@ func (s *podSpawner) sessionPodSpec(rec *SessionRecord, taskID, primer string, o
 			if s.cfg.KubeProxyHostContext != "" {
 				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
 			}
+			if s.cfg.KubeProxyMode != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_MODE", Value: s.cfg.KubeProxyMode})
+			}
 			// The kubectl admission's tier (a2a/Dockerfile.worker runs the
 			// admission only when KUBE_PROXY_URL is set), always named: the
 			// wrapper skips the admission for every command only on a tier it

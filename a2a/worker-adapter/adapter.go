@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -173,14 +175,23 @@ type Config struct {
 
 	// StopOnWriteRefusal stops the harness at the first definitive write
 	// refusal the broker client recorded in WriteRefusalFile (refusal.go)
-	// and ends the task rejected with the refused rule and verb. No tool
-	// output is read for it. applyDefaults sets it for a profile pod
-	// (ProfileExecutor); a test sets it directly.
+	// and ends the task failed with the refused verb, and the rule where
+	// the reason names one. No tool output is read for it. applyDefaults sets
+	// it for a profile pod (ProfileExecutor) and for a session pod with a
+	// WriteRefusalDir; a test sets it directly.
 	StopOnWriteRefusal bool
 	// WriteRefusalFile is the task's record file (EnvWriteRefusalFile),
-	// which the profile worker makes beside the task token. Empty reads
-	// nothing, and the task is never stopped at a refusal.
+	// which the profile worker makes beside the task token, or the adapter
+	// makes per turn in WriteRefusalDir. Empty reads nothing, and the task
+	// is never stopped at a refusal.
 	WriteRefusalFile string
+	// WriteRefusalDir is a session pod's directory for each turn's record
+	// file: the adapter makes the file empty there before every turn's
+	// harness starts and names it, with the turn's task id, in the harness's
+	// environment, so a record from one turn never stops the next. Setting
+	// it on a session pod turns StopOnWriteRefusal on (applyDefaults). Empty
+	// on a profile pod, whose worker makes its file beside the task token.
+	WriteRefusalDir string
 
 	// TaskDeadline bounds the harness wall clock below the pod's own
 	// activeDeadlineSeconds so the failure is ours to report, not the
@@ -294,7 +305,7 @@ func (c *Config) applyDefaults() {
 	if c.Scope == "" {
 		c.Scope = capability.NamespaceScope(c.Namespace)
 	}
-	if c.ProfileExecutor {
+	if c.ProfileExecutor || (c.Session != "" && c.WriteRefusalDir != "") {
 		c.StopOnWriteRefusal = true
 	}
 }
@@ -909,6 +920,24 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		}
 	}
 
+	if cfg.StopOnWriteRefusal && cfg.WriteRefusalDir != "" {
+		path, err := makeTurnWriteRefusalFile(cfg.WriteRefusalDir)
+		if err != nil {
+			// Fails safe: with no record file the turn just runs on, and
+			// every write it attempts is still refused.
+			log.Warn("could not make the turn's write-refusal record; the turn won't stop at a write refusal", "task", a.taskID, "err", err)
+		} else {
+			a.cfg.WriteRefusalFile = path
+			base := env
+			if base == nil {
+				// A nil HarnessEnv means the harness inherits this process's
+				// environment; adding to it must not replace that.
+				base = os.Environ()
+			}
+			env = append(slices.Clone(base), EnvWriteRefusalFile+"="+path, EnvWriteRefusalTask+"="+a.taskID)
+		}
+	}
+
 	// The listener is up before the harness starts, so the tool can never
 	// race it, and down when this task returns, so an ask from this task's
 	// harness can never be answered by the next task's turn. Under an
@@ -1083,7 +1112,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
 						continue
 					}
-					r, err := readWriteRefusal(a.cfg.WriteRefusalFile, a.taskID)
+					r, err := readWriteRefusalFor(a.cfg.WriteRefusalFile, a.taskID, a.cfg.WriteRefusalDir != "")
 					if err != nil && !refusalReadFailed {
 						refusalReadFailed = true
 						log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
@@ -1357,7 +1386,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 // endRefused publishes the terminal of a task stopped at a definitive write
 // refusal: failed (work ran first, so not rejected), which no supervisor
 // retries and the gateway renders with its reason's detail, carrying the
-// refused rule and verb and no other output.
+// refused verb, and the rule where the reason names one, and no other output.
 func (a *adapter) endRefused(r *writeRefusal) (Result, error) {
 	// failed, not rejected: work ran before the refusal, and rejected means
 	// refused before the start (spec-a2a-payloads.md).

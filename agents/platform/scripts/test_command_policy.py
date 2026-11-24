@@ -3001,6 +3001,73 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class KubectlWriteAttemptTest(unittest.TestCase):
+    """command_policy.kubectl_write_attempt: what a session pod's kubectl wrapper
+    counts as an attempted change under a read-only kube-proxy."""
+
+    RO, RODR = command_policy.KUBE_PROXY_MODE_READ_ONLY, command_policy.KUBE_PROXY_MODE_READ_ONLY_DRY_RUN
+
+    def attempt(self, line, mode):
+        return command_policy.kubectl_write_attempt(shlex.split(line), mode)
+
+    def test_a_mutating_verb_is_an_attempt_under_both_read_only_modes(self):
+        for line, verb in (
+            ("kubectl scale deploy/x --replicas=2", ("scale",)),
+            ("kubectl -n kube-system delete pod p", ("delete",)),
+            ("kubectl rollout restart deploy/x", ("rollout", "restart")),
+            ("kubectl apply -f x.yaml --dry-run=server --dry-run=none", ("apply",)),
+        ):
+            for mode in (self.RO, self.RODR):
+                with self.subTest(line=line, mode=mode):
+                    self.assertEqual(verb, self.attempt(line, mode))
+
+    def test_reads_and_local_renders_are_not_attempts(self):
+        for line in (
+            "kubectl get pods -A",
+            "kubectl rollout status deploy/x",
+            "kubectl apply -f x.yaml --dry-run=client",
+            "kubectl create deploy x --image=nginx -o yaml --dry-run=client",
+            "kubectl scale --help",
+        ):
+            for mode in (self.RO, self.RODR):
+                with self.subTest(line=line, mode=mode):
+                    self.assertIsNone(self.attempt(line, mode))
+
+    def test_a_server_dry_run_is_an_attempt_only_where_the_proxy_refuses_it(self):
+        line = "kubectl apply -f x.yaml --dry-run=server"
+        self.assertIsNone(self.attempt(line, self.RODR))
+        self.assertEqual(("apply",), self.attempt(line, self.RO))
+
+    def test_a_server_dry_run_the_proxy_still_refuses_is_an_attempt(self):
+        # kube-proxy lets a server dry run through under read-only-dry-run only
+        # for create, update and patch, and on the scale subresource
+        # (policy.go's dryRunVerbs). A DELETE, an eviction or a certificate
+        # approval is refused there too, so it is still an attempted change.
+        for line, verb in (
+            ("kubectl delete pod p --dry-run=server", ("delete",)),
+            ("kubectl drain node-1 --ignore-daemonsets --dry-run=server", ("drain",)),
+            ("kubectl certificate approve csr-1 --dry-run=server", ("certificate", "approve")),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(verb, self.attempt(line, self.RODR))
+        for line in (
+            "kubectl scale deploy/x --replicas=2 --dry-run=server",
+            "kubectl annotate deploy/x a=b --dry-run=server",
+            "kubectl create deploy x --image=nginx --dry-run=server",
+            "kubectl rollout restart deploy/x --dry-run=server",
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(self.attempt(line, self.RODR))
+
+    def test_no_attempt_unless_the_proxy_is_read_only(self):
+        for mode in ("read-write", "", "READ-ONLY", "unknown"):
+            with self.subTest(mode=mode):
+                self.assertIsNone(self.attempt("kubectl delete pod p", mode))
+
+    def test_the_verb_carries_no_object_name(self):
+        self.assertEqual(("scale",), self.attempt("kubectl scale deploy/secret-name --replicas=0", self.RODR))
+
+
 class KubectlDefinitiveWriteTest(unittest.TestCase):
     """command_policy.kubectl_definitive_write: which argvs the broker marks as a write."""
 
