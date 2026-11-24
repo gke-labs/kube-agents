@@ -49,8 +49,8 @@ def _from_the_parser(validator, problems: list[str]) -> list[str]:
 
 
 def test_the_parser_is_importable_in_this_job(validator):
-    """Without it, or with another checkout's, the rule does not run, and every test below would
-    pass on nothing."""
+    """Without it, with another checkout's, or with installed data behind bench/pyproject.toml,
+    the rule does not run, and every test below would pass on nothing."""
     assert not isinstance(validator.spec_parser(), str)
 
 
