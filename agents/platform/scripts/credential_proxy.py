@@ -54,6 +54,7 @@ import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
+import cluster_metadata_scope
 import scope_exclude
 import scope_policy
 import scoped_sa_pool
@@ -15990,6 +15991,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        # A GCP metadata read about a cluster is held to the install's
+        # exclusions and holds for every caller, before confinement and policy
+        # read it, so each judges the command that will run: a describe of an
+        # excluded or held cluster is refused, and a `logging read` filter gets
+        # the clause that drops those clusters' entries (cluster_metadata_scope).
+        exclusions = getattr(self, "exclusions", None)
+        if exclusions is not None:
+            try:
+                argv = cluster_metadata_scope.scoped_argv(argv, exclusions)
+            except scope_exclude.ExcludedCluster as exc:
+                self._refuse_excluded_cluster(exc, request_id, audit, count)
+                return
         # A profile caller's argv is held to its task's target before any
         # policy reads it, so every check below judges the command that will
         # run: the injected --project, the target's context.
@@ -16833,6 +16846,20 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return None
+        exclusions = getattr(self, "exclusions", None)
+        if rule_id == api_policy.LOGGING_ENTRIES_LIST_RULE and exclusions is not None:
+            # The same clause `gcloud logging read` gets (cluster_metadata_scope):
+            # an excluded or held cluster's entries never come back.
+            try:
+                caller_filter = parsed.get(api_policy.LOGGING_FILTER, "")
+                scoped_filter = cluster_metadata_scope.filter_with_exclusion(caller_filter, exclusions)
+                if scoped_filter != caller_filter:
+                    parsed[api_policy.LOGGING_FILTER] = scoped_filter
+            except scope_exclude.ExcludedCluster as exc:
+                self._refuse_excluded_cluster(
+                    exc, request_id, audit, lambda _status: None,
+                )
+                return None
         return json.dumps(parsed, separators=(",", ":")).encode(), api_policy.body_resource(rule_id, parsed)
 
     def _handle_mcp_relay(self) -> None:
@@ -18784,12 +18811,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _mcp_exclusion_decision(
         self, server_name: str, message: dict[str, Any] | None,
     ) -> "command_policy.Decision | None":
-        """A refusal for a gke in-cluster tool call on an excluded cluster, or None.
+        """A refusal for a gke tool call on an excluded or held cluster, or None:
+        an in-cluster tool, or a control-plane tool that reads one named cluster
+        or its node pools.
 
-        The tool names its cluster in its arguments (mcp_policy.k8s_tool_clusters).
-        One the broker can't tie to a cluster is refused while any is excluded.
+        The tool names its cluster in its arguments (mcp_policy.k8s_tool_clusters,
+        mcp_policy.metadata_tool_clusters). One the broker can't tie to a cluster
+        is refused while any is excluded or held.
         """
         clusters = mcp_policy.k8s_tool_clusters(server_name, message)
+        if clusters is None:
+            clusters = mcp_policy.metadata_tool_clusters(server_name, message)
         if clusters is None:
             return None
         try:

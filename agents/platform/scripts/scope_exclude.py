@@ -124,6 +124,35 @@ def _matches(triples: frozenset[tuple[str, str, str]], project: str, location: s
     )
 
 
+def _name_matches(triples: frozenset[tuple[str, str, str]], project: str, cluster: str) -> list[str]:
+    """The locations of the triples a cluster named without its location could be:
+    its name in its project, or in an entry spelled by project number."""
+    return sorted(
+        {l for p, l, c in triples if c == cluster and (p == project or PROJECT_NUMBER.match(p))}
+    )
+
+
+# Cloud Logging's resource labels for a GKE cluster's entries (the k8s_* and
+# gke_cluster resource types carry all three).
+LOG_PROJECT_LABEL = "resource.labels.project_id"
+LOG_LOCATION_LABEL = "resource.labels.location"
+LOG_CLUSTER_LABEL = "resource.labels.cluster_name"
+
+
+def _log_terms(triples: frozenset[tuple[str, str, str]]) -> list[str]:
+    """One Logging query term per triple, matching that cluster's entries. An entry
+    spelled by project number matches the location and name in any project, as
+    _matches does, since entries carry the project's ID. The parts are held to the
+    GKE name grammar by _parse_cluster_refs, so they need no escaping in quotes."""
+    terms = []
+    for project, location, cluster in sorted(triples):
+        parts = [f'{LOG_LOCATION_LABEL}="{location}"', f'{LOG_CLUSTER_LABEL}="{cluster}"']
+        if not PROJECT_NUMBER.match(project):
+            parts.insert(0, f'{LOG_PROJECT_LABEL}="{project}"')
+        terms.append("(" + " AND ".join(parts) + ")")
+    return terms
+
+
 class HoldState:
     """A parsed hold.json: every cluster, these clusters, and the operator's reason."""
 
@@ -234,6 +263,25 @@ class Holds:
                 " clusters by project ID; name the project by its ID",
             )
 
+    def check_name(self, project: str, cluster: str) -> None:
+        """Raise HeldCluster when a cluster named without its location could be held."""
+        state, error = self._load()
+        if error is not None or state.held_all:
+            self.check(project, "", cluster)
+        for location in _name_matches(state.triples, project, cluster):
+            self.check(project, location, cluster)
+        if state.triples and PROJECT_NUMBER.match(project):
+            self.check(project, "", cluster)
+
+    def log_terms(self) -> list[str] | None:
+        """The held clusters' Logging terms; None when every cluster is held."""
+        state, error = self._load()
+        if error is not None:
+            raise HeldCluster(RULE_HOLD_UNREADABLE, f"{error}, so the broker reaches no cluster until it can")
+        if state.held_all:
+            return None
+        return _log_terms(state.triples)
+
 
 class Exclusions:
     """The broker's view of the excluded clusters, re-read when the file changes.
@@ -315,3 +363,36 @@ class Exclusions:
                 " clusters by project ID; name the project by its ID",
             )
         self.holds.check(project, location, cluster)
+
+    def check_name(self, project: str, cluster: str) -> None:
+        """Raise ExcludedCluster when a cluster named without its location (a
+        metadata read that leaves the location to gcloud's defaults) could be one
+        the broker must not reach: any excluded or held cluster of that name in
+        that project, whatever its location."""
+        triples, error = self._load()
+        if error is not None:
+            self.check(project, "", cluster)
+        for location in _name_matches(triples, project, cluster):
+            self.check(project, location, cluster)
+        if triples and PROJECT_NUMBER.match(project):
+            self.check(project, "", cluster)
+        self.holds.check_name(project, cluster)
+
+    def log_exclusion_clause(self) -> str | None:
+        """A Cloud Logging query clause that drops every excluded or held
+        cluster's entries, to AND onto a `logging read` filter; None when nothing
+        is excluded or held. While every cluster is held, it drops every entry
+        that names a cluster. A file the broker can't read refuses the read."""
+        triples, error = self._load()
+        if error is not None:
+            raise ExcludedCluster(
+                RULE_EXCLUDE_UNREADABLE,
+                f"{error}, so the broker can't tell which clusters' logs to leave out and reads none until it can",
+            )
+        held = self.holds.log_terms()
+        if held is None:
+            return f"NOT {LOG_CLUSTER_LABEL}:*"
+        terms = _log_terms(triples) + held
+        if not terms:
+            return None
+        return "NOT (" + " OR ".join(terms) + ")"

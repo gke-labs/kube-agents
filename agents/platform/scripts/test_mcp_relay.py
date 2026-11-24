@@ -305,18 +305,45 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
                 self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, reply["result"]["content"][0]["text"])
         self.assertEqual(self.upstream_requests, [])
 
+    def metadata_call(self, tool, name, request_id=6):
+        return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                "params": {"name": tool, "arguments": {"name": name}}}
+
+    def test_a_metadata_tool_on_an_excluded_cluster_never_reaches_the_upstream(self):
+        import scope_exclude
+
+        self.exclude(("p", "us-east4", "scratch"))
+        for message in (
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/scratch"),
+            self.metadata_call("get_node_pool", "projects/p/locations/us-east4/clusters/scratch/nodePools/default-pool"),
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "list_node_pools",
+                                                                            "arguments": {"parent": "projects/p/locations/us-east4/clusters/scratch"}}},
+            # One the broker can't tie to a cluster, while any is excluded.
+            self.metadata_call("get_cluster", "projects/p/locations/-/clusters/scratch"),
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/%73cratch"),
+            tools_call("get_cluster"),
+        ):
+            with self.subTest(message=message):
+                status, _, body = self._request(message=message)
+                self.assertEqual(status, 200)
+                reply = json.loads(body)
+                self.assertTrue(reply["result"]["isError"], reply)
+                self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, reply["result"]["content"][0]["text"])
+        self.assertEqual(self.upstream_requests, [])
+
     def test_control_plane_tools_and_other_clusters_still_reach_the_upstream(self):
         self.exclude(("p", "us-east4", "scratch"))
         for message in (
             self.k8s_call("projects/p/locations/us-east4/clusters/other"),
-            tools_call("get_cluster"),
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/other"),
+            self.metadata_call("get_node_pool", "projects/p/locations/us-east4/clusters/other/nodePools/default-pool"),
             tools_call("list_clusters"),
         ):
             with self.subTest(message=message):
                 status, _, body = self._request(message=message)
                 self.assertEqual(status, 200, body)
                 self.assertNotIn("isError", json.loads(body).get("result", {}))
-        self.assertEqual(len(self.upstream_requests), 3)
+        self.assertEqual(len(self.upstream_requests), 4)
 
     def test_a_write_tool_never_reaches_the_upstream(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
