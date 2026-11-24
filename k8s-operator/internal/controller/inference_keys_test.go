@@ -612,8 +612,10 @@ func appliedDispatchConfigObject(t *testing.T, agent *agentv1alpha1.PlatformAgen
 		t.Fatal(err)
 	}
 	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)},
-		Data:       map[string]string{a2aDispatchConfigKey: string(body)},
+		ObjectMeta: metav1.ObjectMeta{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent),
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
+				Name: agent.Name, UID: agent.UID, Controller: ptr.To(true)}}},
+		Data: map[string]string{a2aDispatchConfigKey: string(body)},
 	}
 }
 
@@ -690,6 +692,71 @@ func TestADrainingTierKeepsItsKeyUntilTheDrainEnds(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The applied dispatch config only delays a tier key's deletion, and only
+// when this PlatformAgent controls it and the drain's end is one the
+// operator could have written. It never mints a key for a tier it alone
+// names.
+func TestADrainKeepsATierKeyOnlyOnTrustedTerms(t *testing.T) {
+	soon := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	dropUnattended := func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	}
+	drain := func(tier string, until time.Time) a2aDispatchProfile {
+		return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead},
+			DrainingTiers: []a2aDrainingTier{{Tier: tier, Mode: "unattended", Until: until}}}
+	}
+	for _, tc := range []struct {
+		name    string
+		applied func(t *testing.T, agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap
+	}{
+		{"not controlled by this agent", func(t *testing.T, agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+			cm := appliedDispatchConfigObject(t, agent, drain(agentv1alpha1.AgentProfileTierUnattended, soon))
+			cm.OwnerReferences = nil
+			return cm
+		}},
+		{"a drain end past the window", func(t *testing.T, agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+			return appliedDispatchConfigObject(t, agent, drain(agentv1alpha1.AgentProfileTierUnattended, time.Now().Add(a2aDrainingWindow+time.Hour).UTC()))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, cl, agent := inferenceKeysFixture(t)
+			ctx := context.Background()
+			r.reconcileInferenceKeys(ctx, agent)
+			profile := &agentv1alpha1.AgentProfile{}
+			if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+				t.Fatal(err)
+			}
+			dropUnattended(profile)
+			if err := cl.Update(ctx, profile); err != nil {
+				t.Fatal(err)
+			}
+			if err := cl.Create(ctx, tc.applied(t, agent)); err != nil {
+				t.Fatal(err)
+			}
+			r.reconcileInferenceKeys(ctx, agent)
+			if err := cl.Get(ctx, tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+				t.Errorf("the config kept the dropped tier's key: %v", err)
+			}
+		})
+	}
+
+	t.Run("a tier only the config names", func(t *testing.T) {
+		r, cl, agent := inferenceKeysFixture(t)
+		ctx := context.Background()
+		if err := cl.Create(ctx, appliedDispatchConfigObject(t, agent, drain("phantom", soon))); err != nil {
+			t.Fatal(err)
+		}
+		r.reconcileInferenceKeys(ctx, agent)
+		if err := cl.Get(ctx, tierInferenceKeyClass(agent, "phantom").secret, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Errorf("a key was minted for a tier only the dispatch config names: %v", err)
+		}
+		entries, _ := readCallerKeysMap(t, cl, agent)
+		if slices.Contains(slices.Collect(maps.Values(entries)), "tier-phantom") {
+			t.Error("the map names a tier only the dispatch config names")
+		}
+	})
 }
 
 // A tier key of the same name that this agent didn't label as its own is

@@ -541,9 +541,15 @@ func tiersInUse(profiles []agentv1alpha1.AgentProfile, draining []string) []stri
 // drains: a tier a live profile dropped, and every tier of a profile that has
 // left the install (agentprofile_tier_drain.go). A task already running at
 // one still sends its tier's key until the drain ends, so the key stays, in
-// its Secret and in the map, until then. A drain whose end has passed keeps
-// nothing. No applied config drains nothing; a read that fails otherwise is
-// an error, so no tier key is deleted on a pass that can't tell.
+// its Secret and in the map, until then. No applied config drains nothing; a
+// read that fails otherwise is an error, so no tier key is deleted on a pass
+// that can't tell.
+//
+// The config only delays a deletion. It is read as dispatchDraining reads it,
+// with the same trust, and no more: only a config controlled by this
+// PlatformAgent counts, a drain whose end has passed or lies beyond
+// a2aDrainingWindow from now keeps nothing, and the caller keeps only tiers
+// that already have a recorded key, so nothing in it mints a key.
 func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
 	cm := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
@@ -552,6 +558,9 @@ func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context,
 		}
 		return nil, err
 	}
+	if ref := metav1.GetControllerOf(cm); ref == nil || ref.UID != agent.UID {
+		return nil, nil
+	}
 	var applied a2aDispatchConfig
 	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
 		// dispatchDraining reports an undecodable config; it drains nothing
@@ -559,14 +568,24 @@ func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context,
 		return nil, nil
 	}
 	now := time.Now()
+	draining := func(until time.Time) bool {
+		return now.Before(until) && !until.After(now.Add(a2aDrainingWindow))
+	}
 	var out []string
+	keep := func(tier string) {
+		if isDNS1123LabelToken(tier) {
+			out = append(out, tier)
+		}
+	}
 	for _, p := range applied.Profiles {
-		if !p.DrainingUntil.IsZero() && now.Before(p.DrainingUntil) {
-			out = append(out, p.Tiers...)
+		if draining(p.DrainingUntil) {
+			for _, tier := range p.Tiers {
+				keep(tier)
+			}
 		}
 		for _, d := range p.DrainingTiers {
-			if now.Before(d.Until) {
-				out = append(out, d.Tier)
+			if draining(d.Until) {
+				keep(d.Tier)
 			}
 		}
 	}
@@ -714,6 +733,9 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		if err != nil {
 			return notWritten("the applied dispatch config could not be read for the draining tiers: "+apiFailure(err), true)
 		}
+		// A draining tier only keeps a key it already has.
+		haveKey := recordedTiers(agent, recorded)
+		draining = slices.DeleteFunc(draining, func(tier string) bool { return !slices.Contains(haveKey, tier) })
 		tiers, tiersKnown, profileNamespaceReady = nil, true, ready
 		if ready {
 			tiers = tiersInUse(profiles, draining)
