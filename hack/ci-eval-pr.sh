@@ -4557,7 +4557,9 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # pull request. It is not a legitimate default: at 1 the collapse rung
 # degenerates to "the single run failed", which is exactly the trigger-happy
 # rule this change exists to replace.
-EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
+# harness A/B twin (never merges): forced to 5, whatever the job sets.
+unset EVAL_REPETITIONS
+EVAL_REPETITIONS="${EVAL_REPETITIONS:-5}"
 if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
   echo "Zero repetitions would run nothing and report green -- refusing." >&2
