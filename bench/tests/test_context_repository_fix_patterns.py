@@ -237,12 +237,13 @@ def test_the_write_paths_are_forbidden():
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py push',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr create --title t --body-file /tmp/b.md',
         "python3 /opt/data/profiles/platform/skills/version-control/scripts/vcs.py proposal open --title t",
-        # The verb straight after the noun is what is read, however the title is spelled.
+        # `open` needs `--title`, which argparse takes as `--title=t` and by any prefix from `--ti`.
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py mr create --repo acme/infra --title=t',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py proposal open --ti t',
-        # A quote closing the path, and a command the pod's clip cut before its title.
-        'python3 "$HERMES_HOME/skills/version-control/scripts/vcs.py" pr open --title t --draft',
-        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py proposal create --repo acme/infra --body "a body the clip',
+        'python3 "$HERMES_HOME/skills/version-control/scripts/vcs.py" pr open --titl=t --draft',
+        # A create chained behind another command is still a run.
+        "git -C /tmp/infra status && python3 /opt/data/profiles/platform/skills/version-control/scripts/vcs.py "
+        "proposal create --body-file /tmp/b.md --title t",
         "python3 audit_report.py remediate --finding f-1",
     ):
         assert _command_forbidden(command), command
@@ -257,8 +258,9 @@ def test_the_read_paths_are_not_forbidden():
         # The recorded spelling: `open` is the value of `--state`, not the `create` alias.
         "python3 $HERMES_HOME/skills/version-control/scripts/vcs.py proposal list --repo acme/infra --state open",
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr list --state open --target main',
-        # `--t` is `list`'s `--target` abbreviated; no flag after the verb makes a read a write.
+        # `--t` is `list`'s `--target` abbreviated, so the `open` run cannot read it as a title.
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr list --state open --t main',
+        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr create --help',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py discard --repo acme/infra --branch platform-agent/x',
         "python3 inspect_repository.py clone --repo acme/charts --ref v1 --into /tmp/c",
     ):
