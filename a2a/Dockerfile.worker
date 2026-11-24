@@ -182,8 +182,10 @@ COPY --chmod=0644 agents/platform/skills/fleet-upgrade-verification/scripts/upgr
 # and enterable (directories 0755), writable by root alone, and the last check imports it as the worker's own user.
 COPY agents/platform/skills/fleet-upgrade-verification/scripts/readiness_rules/ \
      /opt/kube-agents/fleet-upgrade-verification/scripts/readiness_rules/
-RUN chmod -R u=rwX,go=rX /opt/kube-agents/fleet-upgrade-verification \
-    && cd /opt/kube-agents/scripts/fleet-audit \
+# Its own RUN: a mode change beside a path under the helper script root is one
+# deploy/docker/test_script_root_ownership.py can't vouch for.
+RUN chmod -R u=rwX,go=rX /opt/kube-agents/fleet-upgrade-verification
+RUN cd /opt/kube-agents/scripts/fleet-audit \
     && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report, collect; assert collect._upgrade_readiness() is not None" \
     && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run \
     && PYTHONDONTWRITEBYTECODE=1 python3 collect.py --help | grep -q -- compliance-audit \
