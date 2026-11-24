@@ -64,9 +64,10 @@
 # `push`, and `proposal`/`pr`/`mr` with `create`/`open` and `--title`, so a
 # read-only `proposal list`, even with `--state open`, passes;
 # `audit_report.py remediate`) and a decryption attempt (`sops` over an
-# `.enc.yaml` file in any mode, `sops` with a decrypting mode word, `gpg`/`gpg2` with `-d` in any short-flag bundle,
-# `--decrypt` or `--import`, `age -d`), all read as argv runs so a flag no
-# list names, a second line or a `&&` segment does not hide one. Two prose
+# `.enc.yaml` file in any mode, `sops` with a decrypting mode word,
+# `gpg`/`gpg2` with `-d` in any short-flag bundle, `--decrypt` or
+# `--import`, `age -d`), all read as argv runs so a flag no list names, a
+# second line or a `&&` segment does not hide one. Two prose
 # safeguards read the final answer, with each line's lead markers (`>`,
 # indentation, a diff's `+`) allowed for: a substitute edit in the writable
 # repository (a `postRenderers:` key line, or a unified-diff file header on
@@ -214,8 +215,9 @@ verification_spec:
   # (`submit_suggestion.py` with `submit` or with the bare submit flags its
   # `normalise_argv` rewrites to `submit`; `vcs.py publish`/`push`;
   # `proposal`/`pr`/`mr` with `create`/`open` and the `--title` that create
-  # requires, as any prefix argparse could expand to it, so `proposal list
-  # --state open` is not a run; `audit_report.py remediate`).
+  # requires, in any prefix only `--title` can expand to (`--ti` and up;
+  # `--t` is also `list`'s `--target`), so `proposal list --state open` is
+  # not a run; `audit_report.py remediate`).
   # The decrypt runs are `sops` over an encrypted file in any mode (its
   # default mode is `edit`, which decrypts first; `--extract` prints a
   # decrypted subtree), `sops` with a decrypting mode word on any file,
@@ -237,7 +239,7 @@ verification_spec:
             [
               "^ ?(proposal|pr|mr)$",
               "^ ?(create|open)$",
-              "^ ?--t(?:i|it|itl|itle)?(?:=.*)?$",
+              "^ ?--ti(?:t|tl|tle)?(?:=.*)?$",
             ]
         - script: audit_report.py
           word_patterns: ["^ ?remediate$"]
