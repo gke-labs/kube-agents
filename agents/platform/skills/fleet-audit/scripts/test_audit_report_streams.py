@@ -175,6 +175,7 @@ class TestFinishOnEveryStream(unittest.TestCase):
         env = {
             **os.environ,
             "CREDENTIAL_PROXY_URL": "",
+            "FLEET_AUDIT_REPORT_STORE": "",
             no_live_kubectl.STATE_PATH_ENV: str(state_dir / gitops_workspace.MANAGED_REPOS_KEY),
             "FLEET_AUDIT_SCRATCH_DIR": str(self.tmp_path / "scratch"),
             "FLEET_AUDIT_GITOPS_ROOT": str(self.tmp_path / "gitops"),
@@ -263,11 +264,31 @@ class TestFinishOnEveryStream(unittest.TestCase):
         findings_file.write_text(
             json.dumps(_sample_document(audit_id, human_name, valid_check)), encoding="utf-8"
         )
+        # An install with `_REPOSITORY` registered: `finish` takes the forge path.
+        state_file = root / "state" / gitops_workspace.MANAGED_REPOS_KEY
+        state_file.parent.mkdir()
+        state_file.write_text(
+            json.dumps([{"type": "github", "url": f"https://github.com/{_REPOSITORY}"}]), encoding="utf-8"
+        )
 
         with contextlib.ExitStack() as stack:
             forget_run_state()
             stack.callback(forget_run_state)
-            stack.enter_context(patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": str(root / "reports")}))
+            # The run takes directory mode, the file store and the repository list
+            # from here, not from the host. `GITOPS_STATE_DIR` names no directory,
+            # so a host with the operator's mount reads the same state file.
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {
+                        "CREDENTIAL_PROXY_URL": "",
+                        "FLEET_AUDIT_REPORT_STORE": "",
+                        "FLEET_AUDIT_REPORTS_DIR": str(root / "reports"),
+                        no_live_kubectl.STATE_PATH_ENV: str(state_file),
+                    },
+                )
+            )
+            stack.enter_context(patch.object(gitops_workspace, "GITOPS_STATE_DIR", str(root / "no-such-mount")))
             stack.enter_context(patch.object(audit_report, "GITOPS_WORKSPACE", str(root)))
             stack.enter_context(patch.object(audit_report, "SCRATCH_DIR", str(root)))
             stack.enter_context(patch.object(audit_report, "run_cmd", record_run_cmd))
