@@ -9,8 +9,9 @@ and runs `npm ci`. These tests hold the pieces together: the Dockerfile, the
 manifest, the lock, and the dependabot entry that proposes bumps.
 
 The Dockerfile is read as instructions, not as text, so a comment can neither
-fail nor satisfy a check. The lock is held to a registry URL and a sha512 hash
-on every entry, since `npm ci` accepts an entry that carries no hash.
+fail nor satisfy the check of the install. The lock is held to a registry URL
+and a sha512 hash on every entry, since `npm ci` accepts an entry that carries
+no hash.
 """
 
 import copy
@@ -58,15 +59,16 @@ _SHELL_KEYWORDS = ("RUN", "ONBUILD")
 # either one changes what `npm ci` installs with the RUN line unchanged.
 _NPM_SETTING = re.compile(r"npm_config_|npmrc", re.IGNORECASE)
 # A here-document puts shell lines where _instructions expects instructions.
-# Not a here-string (<<<) and not a shift in shell arithmetic (1<<2); a
-# here-document this pattern misses leaves a body line with no known keyword.
+# Not a here-string (<<<) and not a shift by a number (1<<2). A here-document
+# this pattern misses is refused only when a body line starts with no keyword.
 _HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*[\"'\\]?[A-Za-z_]")
 _KEYWORDS = frozenset(
     "ADD ARG CMD COPY ENTRYPOINT ENV EXPOSE FROM HEALTHCHECK LABEL MAINTAINER "
     "ONBUILD RUN SHELL STOPSIGNAL USER VOLUME WORKDIR".split()
 )
-# The parser directive that replaces the continuation character.
-_ESCAPE_DIRECTIVE = re.compile(r"^#\s*escape\s*=", re.IGNORECASE | re.MULTILINE)
+# The parser directive that replaces the continuation character. It counts
+# only in the comment lines that open the file.
+_ESCAPE_DIRECTIVE = re.compile(r"^#\s*escape\s*=", re.IGNORECASE)
 _MOVED = "a2a/Dockerfile.worker no longer spells this line as the changed copies below expect"
 
 
@@ -75,11 +77,15 @@ def _instructions(dockerfile_text):
 
     Continuation lines are joined with nothing between them, and comment and
     blank lines are dropped, including inside a continued instruction. A
-    Dockerfile this does not read (an escape directive, a here-document, a line
-    that starts with no instruction) is refused, not misread.
+    Dockerfile this does not read is refused where the reader can tell: an
+    escape directive, a here-document that _HEREDOC matches, and a line that
+    starts with no instruction.
     """
-    if _ESCAPE_DIRECTIVE.search(dockerfile_text):
-        raise ValueError("_instructions does not read an escape directive")
+    for line in dockerfile_text.splitlines():
+        if not line.startswith(_COMMENT):
+            break
+        if _ESCAPE_DIRECTIVE.match(line):
+            raise ValueError("_instructions does not read an escape directive")
     instructions = []
     pending = []
     for raw in dockerfile_text.splitlines():
@@ -358,18 +364,27 @@ class HarnessInstallCheckTest(unittest.TestCase):
                 self.assertEqual(_harness_install_problems(text), [f"an npm setting outside the lock: {setting}"])
 
     def test_a_here_document_is_refused_rather_than_misread(self):
+        # Each body is an instruction, so only _HEREDOC refuses these.
         for run in (
-            "RUN <<EOF\nnpm install\nEOF",
-            "RUN <<-'EOF'\nnpm install\nEOF",
-            "RUN <<\\EOF\nnpm install\nEOF",
-            "RUN <<9\nnpm install\n9",
+            "RUN <<RUN\nENV A=1\nRUN",
+            "RUN <<-'RUN'\nENV A=1\nRUN",
+            "RUN <<\\RUN\nENV A=1\nRUN",
         ):
-            with self.subTest(run=run), self.assertRaisesRegex(ValueError, "here-document"):
+            with self.subTest(run=run), self.assertRaisesRegex(ValueError, "does not read here-documents"):
                 self._problems_with_run(run)
+
+    def test_a_line_that_starts_with_no_instruction_is_refused(self):
+        # A here-document _HEREDOC does not match, by its body and its last line.
+        with self.assertRaisesRegex(ValueError, "not a Dockerfile instruction"):
+            self._problems_with_run("RUN <<9\nnpm install\n9")
 
     def test_an_escape_directive_is_refused_rather_than_misread(self):
         with self.assertRaisesRegex(ValueError, "escape directive"):
-            _harness_install_problems("# escape=`\n" + self.text)
+            _harness_install_problems("# syntax=docker/dockerfile:1\n# escape=`\n" + self.text)
+
+    def test_a_later_comment_that_names_the_escape_directive_is_not_one(self):
+        text = self.text.replace(self._COPY, "# escape=` is not set in this file\n" + self._COPY)
+        self.assertEqual(_harness_install_problems(text), [])
 
     def test_a_here_string_or_a_shift_is_not_a_here_document(self):
         for run in ("RUN cat <<<hello", "RUN echo $((1<<2))", "RUN echo $((1 << 2))"):
