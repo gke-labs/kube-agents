@@ -120,12 +120,10 @@ func (ev harnessEvent) assistantEvents() []Event {
 
 // toolResultEvents is one EventToolResult per tool_result block on a user
 // line: a line carries one block per tool call it answers, and parallel calls
-// share a line. Each carries its result's content for the seen-values set
-// (adapter: answerscrub.Seen.CollectToolResult). The harness reports the
-// content as a JSON string, which goes in as it is, or as a list of content
-// blocks, whose text blocks go in as one JSON list of strings (an image's
-// data is not read). A result with no content is still an event, with no
-// ToolResult: its tool step has ended all the same.
+// share a line. A block's content goes on the event as the answer's scrub
+// reads it (toolResultRaw): a JSON string as it is, a list of content blocks
+// as one JSON list of its text blocks' texts (an image's data is not read).
+// A block with no content is still an event, with none.
 func (ev harnessEvent) toolResultEvents() []Event {
 	if ev.Message == nil {
 		return nil

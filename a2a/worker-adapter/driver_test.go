@@ -43,8 +43,8 @@ func TestTheClaudeDecoderMapsEachLine(t *testing.T) {
 		{"assistant with no message", `{"type":"assistant"}`, nil},
 		// Every tool_result on a user message is one event, its content as
 		// the seen set reads it: a string as it is, a block list as its text
-		// blocks' texts. A result with no content is an event with no
-		// ToolResult (its tool step ended); any other block is no event.
+		// blocks' texts. A result with no content is an event with none;
+		// any other block is no event.
 		{"user tool results", `{"type":"user","message":{"role":"user","content":[` +
 			`{"type":"tool_result","tool_use_id":"t1","content":"one"},` +
 			`{"type":"text","text":"not a result"},` +
@@ -221,7 +221,12 @@ func (toyDecoder) Decode(line []byte) ([]Event, error) {
 	case "A":
 		return []Event{{Kind: EventActivity, Tool: rest, Input: json.RawMessage(`{}`)}}, nil
 	case "R":
-		return []Event{{Kind: EventToolResult, ToolResult: json.RawMessage(rest)}}, nil
+		// "R" alone is a result with no content; "R <json>" carries one.
+		var content json.RawMessage
+		if rest != "" {
+			content = json.RawMessage(rest)
+		}
+		return []Event{{Kind: EventToolResult, ToolResult: content}}, nil
 	case "OK":
 		return []Event{{Kind: EventResult, Text: rest}}, nil
 	case "ERR":
@@ -642,12 +647,16 @@ sleep 30
 // productionDriverToolSteps is, for each driver a task can run on, a
 // recorded stream of known tool steps. A driver added to the registry adds
 // its row here (the agy driver with #6745), so the write-refusal stop, which
-// runs on EventToolResult, applies to it.
+// runs on EventToolResult, applies to it, and so does the answer's scrub,
+// which reads the event's content. contents is, step by step, a piece of
+// text the step's event must carry for the scrub, or "" for a step that
+// reported no content.
 var productionDriverToolSteps = []struct {
-	name   string
-	driver Driver
-	lines  []string
-	steps  int
+	name     string
+	driver   Driver
+	lines    []string
+	steps    int
+	contents []string
 }{
 	{"claude", claudeDriver{}, []string{
 		`{"type":"system","subtype":"init","session_id":"s","model":"m"}`,
@@ -656,11 +665,11 @@ var productionDriverToolSteps = []struct {
 		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}},{"type":"tool_use","id":"t3","name":"Read","input":{}}]}}`,
 		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2"},{"type":"tool_result","tool_use_id":"t3"}]}}`,
 		`{"type":"result","subtype":"success","result":"done"}`,
-	}, 3},
+	}, 3, []string{"ok", "", ""}},
 	// agy 1.5.13 as recorded: one shell step that ends DONE, across two
 	// turns, and one that ends ERROR when headless approval was refused.
-	{"agy done", agyDriver{}, agyFixtureLines("tool"), 1},
-	{"agy error", agyDriver{}, agyFixtureLines("deny"), 1},
+	{"agy done", agyDriver{}, agyFixtureLines("tool"), 1, []string{"slept"}},
+	{"agy error", agyDriver{}, agyFixtureLines("deny"), 1, []string{""}},
 }
 
 // agyFixtureLines is testdata/agy/<name>.jsonl's lines, read when the table
@@ -682,12 +691,14 @@ func agyFixtureLines(name string) []string {
 // TestEveryDriverEmitsOneToolResultPerToolStep: the write-refusal stop reads
 // its record on EventToolResult, so a driver that emits none would never
 // stop a task, and nothing would say so. Each production driver emits
-// exactly one per recorded tool step.
+// exactly one per recorded tool step, and that one event carries the step's
+// content for the answer's scrub, or none when the step reported none (a
+// refused step, which the stop still needs).
 func TestEveryDriverEmitsOneToolResultPerToolStep(t *testing.T) {
 	for _, tc := range productionDriverToolSteps {
 		t.Run(tc.name, func(t *testing.T) {
 			dec := tc.driver.NewDecoder()
-			got := 0
+			var got []Event
 			for _, line := range tc.lines {
 				evs, err := dec.Decode([]byte(line))
 				if err != nil {
@@ -695,12 +706,18 @@ func TestEveryDriverEmitsOneToolResultPerToolStep(t *testing.T) {
 				}
 				for _, ev := range evs {
 					if ev.Kind == EventToolResult {
-						got++
+						got = append(got, ev)
 					}
 				}
 			}
-			if got != tc.steps {
-				t.Fatalf("%d EventToolResult for %d tool steps", got, tc.steps)
+			if len(got) != tc.steps {
+				t.Fatalf("%d EventToolResult for %d tool steps", len(got), tc.steps)
+			}
+			for i, want := range tc.contents {
+				content := string(got[i].ToolResult)
+				if want == "" && content != "" || !strings.Contains(content, want) {
+					t.Errorf("step %d's content %q, want it to carry %q", i, content, want)
+				}
 			}
 		})
 	}

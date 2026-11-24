@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -552,6 +553,57 @@ echo 'OK The database secret decodes to `+synthSeenValue+`.'
 		got := artifactText(task, artifact)
 		if strings.Contains(got, synthSeenValue) || !strings.Contains(got, answerscrub.Redacted) {
 			t.Errorf("%s artifact = %q, want the seen value redacted", artifact, got)
+		}
+	}
+}
+
+// An agy tool step's output feeds the seen set as Claude's tool_result does:
+// a Secret the tool printed, echoed in agy's streamed prose and its result,
+// is redacted from both, and the output itself is never published.
+func TestAnAgyToolOutputFeedsTheSeenSet(t *testing.T) {
+	const conv = "6bd4ed09-0000-4000-8000-000000000001"
+	line := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	step := func(su map[string]any) string {
+		su["conversation_id"] = conv
+		return line(map[string]any{"event": "step_update", "step_update": su})
+	}
+	manifest := secretManifest(t, synthSeenValue)
+	lines := []string{
+		line(map[string]any{"event": "init", "conversation_id": conv, "init": map[string]any{"model": "model-default"}}),
+		step(map[string]any{"step_index": 0, "state": "DONE", "step_type": "user_input"}),
+		step(map[string]any{"step_index": 1, "state": "ACTIVE", "step_type": "tool", "tool_name": "run_command",
+			"tool_info": map[string]any{"name": "run_command", "parameters": map[string]any{"CommandLine": "kubectl get secret app-db -o json"}}}),
+		step(map[string]any{"step_index": 1, "state": "DONE", "step_type": "tool", "tool_name": "run_command",
+			"tool_info": map[string]any{"name": "run_command", "parameters": map[string]any{"CommandLine": "kubectl get secret app-db -o json"},
+				"output": "Command exited with code 0.\n\nCommand output:\n" + manifest}}),
+		step(map[string]any{"step_index": 2, "state": "ACTIVE", "step_type": "agent_response", "text_delta": "the stored value is " + synthSeenValue}),
+		line(map[string]any{"event": "result", "result": map[string]any{"conversation_id": conv, "status": "SUCCESS",
+			"response": "The database secret decodes to " + synthSeenValue + "."}}),
+	}
+	path := filepath.Join(t.TempDir(), "out.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := stub(t, fmt.Sprintf("read first || exit 1\ncat %q\n", path))
+	out, events, task := runAgyTask(t, "chat-agy-scrub-a1", "task-agy-scrub-1", harness)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("state=%q err=%v", out.res.State, out.err)
+	}
+	for _, artifact := range []string{lib.ArtifactResult, lib.ArtifactProgress} {
+		got := artifactText(task, artifact)
+		if strings.Contains(got, synthSeenValue) || !strings.Contains(got, answerscrub.Redacted) {
+			t.Errorf("%s artifact = %q, want the seen value redacted", artifact, got)
+		}
+	}
+	for _, env := range events {
+		if b, _ := json.Marshal(env); strings.Contains(string(b), "Command output:") {
+			t.Errorf("the tool's output was published: %s", b)
 		}
 	}
 }

@@ -91,12 +91,11 @@ const (
 	// EventActivity is a tool invocation (Event.Tool, Event.Input).
 	EventActivity
 	// EventToolResult marks that one tool step's result is in, so the call
-	// that ran it has exited, and carries the result the harness fed back to
-	// the model (Event.ToolResult) when the driver can read it. A driver
-	// emits exactly one per tool step. Nothing of it is published: the
-	// adapter reads the write-refusal record on it (refusal.go), and feeds
-	// Event.ToolResult only into the task's seen-values set for the answer's
-	// scrub (answerscrub.Seen).
+	// that ran it has exited; a driver emits exactly one per tool step. The
+	// adapter reads the write-refusal record on it (refusal.go). Its
+	// Event.ToolResult, when the harness reported content, is the result as
+	// the answer's scrub reads it: the adapter feeds it into the task's
+	// seen-values set (answerscrub.Seen) and never publishes it.
 	EventToolResult
 	// EventResult ends a turn: Event.Text is the deliverable, Event.Failed
 	// and Event.Token whether it failed and the reason token, and
@@ -120,7 +119,8 @@ type Event struct {
 
 	// ToolResult is a tool result's content as answerscrub.Seen's
 	// CollectToolResult reads it: a JSON string, or a JSON list of strings
-	// for a result made of several text pieces.
+	// for a result made of several text pieces. Empty for a result with no
+	// content.
 	ToolResult json.RawMessage
 
 	// Failed is a turn the harness reported as failed. Token is the reason

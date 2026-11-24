@@ -1134,11 +1134,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				}
 				switch ev.Kind {
 				case EventToolResult:
-					// Fed to the seen-values set, never published.
+					// A tool step's result is in. Its content, when the
+					// driver carries one, feeds the seen-values set for the
+					// answer's scrub and is never published. And the call
+					// that wrote a write-refusal record has exited, so the
+					// record is read.
 					a.seen.CollectToolResult(ev.ToolResult)
-					// A tool step's result is in: the call that wrote a
-					// record has exited. Only the record is read for the
-					// refusal check, never the result.
 					if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
 						continue
 					}
