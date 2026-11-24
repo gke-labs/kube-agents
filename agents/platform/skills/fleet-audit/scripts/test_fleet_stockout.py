@@ -38,6 +38,7 @@ os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
 import audit_report  # noqa: E402
+import manifest_delta  # noqa: E402
 
 # The longest identifiers a recorded command can carry in its kubeconfig path
 # under the shipped platform profile: a 30-character project id, a 40-character
@@ -135,6 +136,18 @@ def pod(name, node_selector=None, *, phase="Pending", scheduled="False", reason=
         "spec": {"nodeSelector": dict(node_selector or {}), "tolerations": [dict(t) for t in tolerations]},
         "status": {"phase": phase, "conditions": [condition]},
     }
+
+
+def running_pod(name, node_name, *, namespace="shop", owner=("ReplicaSet", "web-7d9f8b6c4"), template_hash="7d9f8b6c4", phase="Running", containers=None, init_containers=None):
+    """A pod as a read of one node's pods returns it: placed on `node_name`,
+    by default a Deployment's pod that requests no GPU."""
+    meta = {"name": name, "namespace": namespace, "labels": {"pod-template-hash": template_hash} if template_hash else {}}
+    if owner:
+        meta["ownerReferences"] = [{"kind": owner[0], "name": owner[1]}]
+    spec = {"nodeName": node_name, "containers": containers or [{"name": "app"}]}
+    if init_containers:
+        spec["initContainers"] = init_containers
+    return {"kind": "Pod", "metadata": meta, "spec": spec, "status": {"phase": phase}}
 
 
 def capacity_history(rates, machine_type="n2-standard-8", price=None):
@@ -1467,6 +1480,142 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=1))
 
 
+class GpuPoolMissingTaintTest(unittest.TestCase):
+    """§3.14. The shapes are the ones read from two throwaway clusters (GKE
+    1.36.4) on 2026-11-23: a GPU pool added beside a pool without GPUs carries
+    `nvidia.com/gpu=present:NO_SCHEDULE` in its settings, and the default GPU
+    pool of a cluster created with one carried no taint, also when read 300
+    seconds after a pool without GPUs was added."""
+
+    GKE_TAINT = {"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}
+
+    @staticmethod
+    def gpu_pool(name="gpu", taints=None, machine_type="n1-standard-4", labels=None):
+        config = {"machineType": machine_type, "accelerators": [{"acceleratorType": "nvidia-tesla-t4", "acceleratorCount": "1"}]}
+        if taints is not None:
+            config["taints"] = taints
+        if labels is not None:
+            config["labels"] = labels
+        return {"name": name, "config": config}
+
+    def check(self, pool, plain_pools=("default-pool",), live=0, stray=(), read=0):
+        # The pool's taints as the collector hands them over: the settings'
+        # taints in the scheduler's shape.
+        taints = fs.pool_taint_records([pool])[pool["name"]]["taints"]
+        return fs.check_gpu_pool_missing_taint(pool, taints, list(plain_pools), live, None if stray is None else list(stray), read)
+
+    def test_flags_an_untainted_gpu_pool_beside_a_pool_without_gpus(self):
+        hit = self.check(self.gpu_pool())
+        self.assertEqual(hit["object"], "NodePool/gpu")
+        self.assertIn("1 x nvidia-tesla-t4 on n1-standard-4", hit["excerpt"])
+        self.assertIn("no NoSchedule or NoExecute taint in the pool's settings", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith("; the pool has no node now, so no pod runs on it; the cluster also has an untainted node pool without accelerators (default-pool)"), hit["excerpt"])
+        # The settings alone: the grade is `SEVERITY`'s.
+        self.assertNotIn("severity", hit)
+        self.assertEqual(fs._emit(fs.GPU_POOL_MISSING_TAINT, hit)["severity"], "minor")
+
+    def test_does_not_flag_a_cluster_with_gpu_pools_only(self):
+        """There GKE adds no taint and every pod has nowhere else to go."""
+        self.assertIsNone(self.check(self.gpu_pool(), plain_pools=()))
+
+    def test_does_not_flag_gke_s_own_taint(self):
+        self.assertIsNone(self.check(self.gpu_pool(taints=[self.GKE_TAINT])))
+
+    def test_does_not_flag_an_owner_s_own_blocking_taint(self):
+        for effect in ("NO_SCHEDULE", "NO_EXECUTE"):
+            with self.subTest(effect=effect):
+                self.assertIsNone(self.check(self.gpu_pool(taints=[{"key": "dedicated", "value": "gpu", "effect": effect}])))
+
+    def test_a_preference_taint_does_not_protect_the_pool(self):
+        hit = self.check(self.gpu_pool(taints=[{"key": "dedicated", "value": "gpu", "effect": "PREFER_NO_SCHEDULE"}]))
+        self.assertEqual(hit["object"], "NodePool/gpu")
+
+    def test_the_procedure_carries_the_headline_and_the_impact_sentence(self):
+        """The ledger title comes from the procedure and the chat summary from
+        the renderer; one sentence, held in step here. So is the impact."""
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.GPU_POOL_MISSING_TAINT}`)")[1].split("\n### ")[0]
+        remediation_line = next(line for line in section.splitlines() if line.startswith("- **Remediation:**"))
+        self.assertIn(audit_report.CHECK_PHRASES[fs.GPU_POOL_MISSING_TAINT].format(object="<name>"), remediation_line)
+        impact_line = next(line for line in section.splitlines() if line.startswith("- **Impact:**"))
+        self.assertIn(f'"{fs.IMPACT[fs.GPU_POOL_MISSING_TAINT]}"', impact_line)
+
+    def test_a_node_pool_finding_is_filed_without_a_namespace(self):
+        """The excerpt names workloads by namespace; the pool itself is in none.
+        A namespace on the finding would give the pool a second identity."""
+        self.assertIn(fs.GPU_POOL_MISSING_TAINT, audit_report.UNNAMESPACED_CHECKS)
+        self.assertEqual(audit_report.GPU_POOL_TAINT_CHECK, fs.GPU_POOL_MISSING_TAINT)
+
+    def test_the_procedure_s_node_count_is_the_collector_s(self):
+        """The procedure writes the number of nodes read as a word; it is the collector's constant."""
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.GPU_POOL_MISSING_TAINT}`)")[1].split("\n### ")[0]
+        self.assertEqual(fs.GPU_POOL_NODES_READ_MAX, 5)
+        self.assertIn("for up to five of that pool's nodes", section)
+        self.assertIn("on five nodes of a pool at most", section)
+
+    def test_does_not_flag_a_pool_the_owners_opted_out(self):
+        """The standard exclusion S4, read from the node labels in the pool's settings."""
+        self.assertIsNone(self.check(self.gpu_pool(labels={fs.OPT_OUT_LABEL: fs.OPT_OUT_VALUE})))
+        self.assertIsNotNone(self.check(self.gpu_pool(labels={fs.OPT_OUT_LABEL: "no"})))
+
+    def test_other_pools_past_the_named_count_are_counted_and_come_last(self):
+        """A long list of other pools must not push the pods sentence out of a cut excerpt."""
+        pools = [f"web-{i:02d}" for i in range(fs.GPU_POOL_PLAIN_POOLS_NAMED_MAX + 77)]
+        hit = self.check(self.gpu_pool(), plain_pools=pools, live=1, stray=[running_pod("web-1", "n1")], read=1)
+        self.assertLess(len(hit["excerpt"]), audit_report.MAX_EXCERPT_CHARS)
+        self.assertLess(hit["excerpt"].index("that requests no GPU"), hit["excerpt"].index("untainted node pools"))
+        self.assertTrue(hit["excerpt"].endswith("(web-00, web-01, web-02 and 77 more)"), hit["excerpt"])
+
+    def test_does_not_flag_a_pool_without_accelerators(self):
+        self.assertIsNone(self.check({"name": "web", "config": {"machineType": "e2-standard-4"}}))
+
+    def test_pods_that_request_no_gpu_make_it_major(self):
+        stray = [running_pod("web-1", "n1", owner=("ReplicaSet", "web-7d9f8b6c4")), running_pod("web-2", "n1", owner=("ReplicaSet", "web-7d9f8b6c4")), running_pod("job-x", "n2", owner=None, template_hash="")]
+        hit = self.check(self.gpu_pool(), live=2, stray=stray, read=2)
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("3 pods that request no GPU run on its nodes now (nodes read: 2 of 2): shop/web (2), shop/job-x (1)", hit["excerpt"])
+
+    def test_one_such_pod_and_one_other_pool_read_as_one(self):
+        hit = self.check(self.gpu_pool(), live=1, stray=[running_pod("web-1", "n1")], read=1)
+        self.assertIn("1 pod that requests no GPU runs on its nodes now (nodes read: 1 of 1): shop/web (1)", hit["excerpt"])
+        self.assertIn("an untainted node pool without accelerators (default-pool)", hit["excerpt"])
+
+    def test_no_such_pod_leaves_the_configuration_grade(self):
+        hit = self.check(self.gpu_pool(), live=3, stray=[], read=3)
+        self.assertNotIn("severity", hit)
+        self.assertIn("no pod that requests no GPU runs on its nodes now (nodes read: 3 of 3; DaemonSet pods, system pods, finished pods and pods with a resource claim are not counted)", hit["excerpt"])
+
+    def test_an_unread_pod_list_is_said_and_not_graded_up(self):
+        hit = self.check(self.gpu_pool(), live=1, stray=None, read=1)
+        self.assertNotIn("severity", hit)
+        self.assertIn("the pods on its nodes were not read", hit["excerpt"])
+
+    def test_workloads_past_the_named_count_are_counted(self):
+        stray = [running_pod(f"p{i}", "n1", owner=("StatefulSet", f"db{i}"), template_hash="") for i in range(fs.GPU_POOL_WORKLOADS_NAMED_MAX + 2)]
+        hit = self.check(self.gpu_pool(), live=1, stray=stray, read=1)
+        self.assertIn(" and 2 more", hit["excerpt"])
+
+    def test_only_workload_pods_that_request_no_gpu_on_the_pool_s_nodes_count(self):
+        gpu_request = running_pod("train", "n1", containers=[{"name": "c", "resources": {"requests": {"nvidia.com/gpu": "1"}}}])
+        gpu_limit = running_pod("infer", "n1", containers=[{"name": "c", "resources": {"limits": {"nvidia.com/gpu": "1"}}}])
+        gpu_init = running_pod("warm", "n1", init_containers=[{"name": "i", "resources": {"limits": {"nvidia.com/gpu": "1"}}}])
+        # NVIDIA's device plugin can be set to advertise a MIG slice or a shared GPU
+        # under other names of its domain (`mixed` MIG strategy, `renameByDefault=true`).
+        gpu_slice = running_pod("mig-train", "n1", containers=[{"name": "c", "resources": {"limits": {"nvidia.com/mig-1g.5gb": "1"}}}])
+        gpu_shared = running_pod("shared-infer", "n1", containers=[{"name": "c", "resources": {"requests": {"nvidia.com/gpu.shared": "1"}}}])
+        daemon = running_pod("agent", "n1", owner=("DaemonSet", "agent"), template_hash="")
+        system = running_pod("dns", "n1", namespace="kube-system")
+        finished = running_pod("done", "n1", phase="Succeeded")
+        elsewhere = running_pod("web-9", "other-node")
+        # A pod with a resource claim may take its GPU through the claim.
+        claimed = running_pod("dra-train", "n1")
+        claimed["spec"]["resourceClaims"] = [{"name": "gpu", "resourceClaimTemplateName": "single-gpu"}]
+        kept = running_pod("web-1", "n1")
+        counted = fs.pods_without_gpu([gpu_request, gpu_limit, gpu_init, gpu_slice, gpu_shared, daemon, system, finished, elsewhere, claimed, kept], ["n1"])
+        self.assertEqual([p["metadata"]["name"] for p in counted], ["web-1"])
+
+
 class ReservationTest(unittest.TestCase):
     def test_flags_mostly_idle_reservation(self):
         r = {"name": "r1", "specificReservation": {"count": 10, "inUseCount": 2}}
@@ -2226,7 +2375,7 @@ class CollectClusterTest(unittest.TestCase):
         declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
         # `spot-scarcity-risk` rides along because this fixture's cluster asks
         # for no Spot capacity at all, which is its own declared non-applicability.
-        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk", fs.UNBACKED_MANUAL_FALLBACK})
+        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk", fs.UNBACKED_MANUAL_FALLBACK, fs.GPU_POOL_MISSING_TAINT})
         self.assertIn("Autopilot", declared["single-zone-nodepool"])
 
     def test_autopilot_never_issues_the_node_pools_read(self):
@@ -2254,6 +2403,127 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("single-zone-nodepool", entry["limitations"])
         self.assertIn("PERMISSION_DENIED", entry["limitations"])
         self.assertIn("rc=1", entry["limitations"])
+
+    UNTAINTED_GPU_POOL = {"name": "gpu", "locations": ["us-central1-a", "us-central1-b"], "config": {"machineType": "n1-standard-4", "accelerators": [{"acceleratorType": "nvidia-tesla-t4", "acceleratorCount": "1"}]}}
+    PLAIN_POOL = {"name": "web", "locations": ["us-central1-a", "us-central1-b"], "config": {"machineType": "e2-standard-4"}}
+
+    def gpu_taint_candidates(self, entry):
+        return [c for c in entry["candidates"] if c["check"] == fs.GPU_POOL_MISSING_TAINT]
+
+    def test_an_untainted_gpu_pool_is_reported_with_the_pods_on_its_nodes(self):
+        items = [node("gke-gpu-1", "gpu"), node("gke-web-1", "web"), running_pod("web-1", "gke-gpu-1"), running_pod("web-2", "gke-web-1")]
+        entry = self.run_with(dump_items=items, pools=[self.UNTAINTED_GPU_POOL, self.PLAIN_POOL])
+        (candidate,) = self.gpu_taint_candidates(entry)
+        self.assertEqual(candidate["object"], "NodePool/gpu")
+        self.assertEqual(candidate["severity"], "major")
+        self.assertIn("1 pod that requests no GPU runs on its nodes now (nodes read: 1 of 1): shop/web (1)", candidate["excerpt"])
+        # The count comes from the pods read, so the command names that read
+        # too: once, with the procedure's `<node>` and no node's name, because
+        # a command that named the nodes would change with every replaced node.
+        self.assertIn("node-pools", candidate["command"])
+        self.assertTrue(candidate["command"].endswith("kubectl get --raw '/api/v1/pods?limit=500&fieldSelector=spec.nodeName%3D<node>'"), candidate["command"])
+        self.assertEqual(len(candidate["command"].split(fs.CHAIN_SEPARATOR)), 2, candidate["command"])
+        self.assertNotIn("gke-gpu-1", candidate["command"])
+        self.assertNotIn(fs.NODE_NAME_PLACEHOLDER, candidate["command"])
+        self.assertEqual(candidate["command"], audit_report.validate_check_command(candidate["command"], "clusters[0]", fs.GPU_POOL_MISSING_TAINT))
+        self.assertIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_pods_read_is_not_an_empty_pool(self):
+        """The finding files on the settings alone and says the pods were not
+        read; one limitation says so for the cluster, with no exit code and no
+        tool output, because the sentence is read in chat."""
+        second = {**self.UNTAINTED_GPU_POOL, "name": "gpu-b"}
+        items = [node("gke-gpu-1", "gpu"), node("gke-gpu-b-1", "gpu-b"), node("gke-web-1", "web"), running_pod("web-1", "gke-gpu-1")]
+        with patch.object(fs, "read_pods_on_nodes", return_value=(None, "rc=1: Error from server (Forbidden): pods is forbidden")) as read:
+            entry = self.run_with(dump_items=items, pools=[self.UNTAINTED_GPU_POOL, second, self.PLAIN_POOL])
+        self.assertEqual(read.call_count, 2)
+        candidates = self.gpu_taint_candidates(entry)
+        self.assertEqual({c["object"] for c in candidates}, {"NodePool/gpu", "NodePool/gpu-b"})
+        for candidate in candidates:
+            self.assertEqual(candidate["severity"], "minor")
+            self.assertIn("the pods on its nodes were not read", candidate["excerpt"])
+            self.assertNotIn("no pod that requests no GPU", candidate["excerpt"])
+            # No pods read to name: the cluster's node pools read stands for the finding.
+            self.assertNotIn("command", candidate)
+        self.assertEqual(entry["limitations"].count(fs.GPU_POOL_PODS_UNREAD_LIMITATION), 1, entry["limitations"])
+        self.assertNotIn("rc=", fs.GPU_POOL_PODS_UNREAD_LIMITATION)
+        # A cluster's gaps are joined with a semicolon, so one gap holds none.
+        self.assertNotIn(";", fs.GPU_POOL_PODS_UNREAD_LIMITATION)
+        self.assertNotIn("Forbidden", entry["limitations"])
+        # The ledger's limitations cell is the tighter of the two places it is read; the chat card's line is 300.
+        self.assertLessEqual(len(fs.GPU_POOL_PODS_UNREAD_LIMITATION), audit_report.MAX_CELL_CHARS)
+
+    def test_the_pods_are_read_on_five_nodes_at_most_and_the_excerpt_says_how_many(self):
+        items = [node(f"gke-gpu-{i:02d}", "gpu") for i in range(12)] + [node("gke-web-1", "web")]
+        with patch.object(fs, "read_pods_on_nodes", return_value=([running_pod("web-1", "gke-gpu-00")], "")) as read:
+            entry = self.run_with(dump_items=items, pools=[self.UNTAINTED_GPU_POOL, self.PLAIN_POOL])
+        (call,) = read.call_args_list
+        self.assertEqual(call.args[0], [f"gke-gpu-{i:02d}" for i in range(fs.GPU_POOL_NODES_READ_MAX)])
+        (candidate,) = self.gpu_taint_candidates(entry)
+        self.assertIn("(nodes read: 5 of 12)", candidate["excerpt"])
+
+    def test_no_pod_is_read_for_a_pool_the_settings_clear(self):
+        """A tainted GPU pool, an opted-out one and a pool without GPUs cost no read."""
+        tainted = {**self.UNTAINTED_GPU_POOL, "name": "gpu-t", "config": {**self.UNTAINTED_GPU_POOL["config"], "taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}]}}
+        opted_out = {**self.UNTAINTED_GPU_POOL, "name": "gpu-o", "config": {**self.UNTAINTED_GPU_POOL["config"], "labels": {fs.OPT_OUT_LABEL: fs.OPT_OUT_VALUE}}}
+        items = [node("gke-gpu-t-1", "gpu-t"), node("gke-gpu-o-1", "gpu-o"), node("gke-web-1", "web")]
+        with patch.object(fs, "read_pods_on_nodes", return_value=([], "")) as read:
+            entry = self.run_with(dump_items=items, pools=[tainted, opted_out, self.PLAIN_POOL])
+        read.assert_not_called()
+        self.assertEqual(self.gpu_taint_candidates(entry), [])
+
+    def test_an_untainted_gpu_pool_at_zero_nodes_is_the_configuration_grade(self):
+        entry = self.run_with(dump_items=[node("gke-web-1", "web")], pools=[self.UNTAINTED_GPU_POOL, self.PLAIN_POOL])
+        (candidate,) = self.gpu_taint_candidates(entry)
+        self.assertEqual(candidate["severity"], "minor")
+        self.assertIn("the pool has no node now", candidate["excerpt"])
+        self.assertNotIn("command", candidate)
+
+    def test_a_first_or_a_last_node_alone_does_not_change_what_the_digest_counts(self):
+        """A GPU pool that scales to zero crosses it often. With no pod that
+        requests no GPU on it, the finding differs between the two states
+        in its excerpt only, which the run's digest does not count; a
+        command of its own would move the digest at each crossing."""
+        pools = [self.UNTAINTED_GPU_POOL, self.PLAIN_POOL]
+        gpu_pod = running_pod("train", "gke-gpu-1", containers=[{"name": "c", "resources": {"limits": {"nvidia.com/gpu": "1"}}}])
+        (empty,) = self.gpu_taint_candidates(self.run_with(dump_items=[node("gke-web-1", "web")], pools=pools))
+        (in_use,) = self.gpu_taint_candidates(self.run_with(dump_items=[node("gke-gpu-1", "gpu"), node("gke-web-1", "web"), gpu_pod], pools=pools))
+        self.assertIn("no pod that requests no GPU runs on its nodes now (nodes read: 1 of 1", in_use["excerpt"])
+        self.assertNotIn("command", in_use)
+        counted_empty, counted_in_use = (
+            {key: value for key, value in candidate.items() if key not in manifest_delta.VOLATILE_CANDIDATE_KEYS} for candidate in (empty, in_use)
+        )
+        self.assertEqual(counted_empty, counted_in_use)
+
+    def test_a_gpu_pool_gke_tainted_or_a_cluster_of_gpu_pools_only_is_not_reported(self):
+        tainted = {**self.UNTAINTED_GPU_POOL, "config": {**self.UNTAINTED_GPU_POOL["config"], "taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}]}}
+        for pools in ([tainted, self.PLAIN_POOL], [self.UNTAINTED_GPU_POOL]):
+            with self.subTest(pools=[p["name"] for p in pools]):
+                entry = self.run_with(pools=pools)
+                self.assertEqual(self.gpu_taint_candidates(entry), [])
+                self.assertIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
+
+    def test_a_gpu_pool_beside_tainted_pools_only_is_not_reported(self):
+        """A pod with no toleration has no other pool to run on, so the GPU
+        pool is the cluster's general pool."""
+        dedicated = {**self.PLAIN_POOL, "config": {**self.PLAIN_POOL["config"], "taints": [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}]}}
+        entry = self.run_with(pools=[self.UNTAINTED_GPU_POOL, dedicated])
+        self.assertEqual(self.gpu_taint_candidates(entry), [])
+
+    def test_autopilot_declares_the_gpu_taint_check_not_applicable(self):
+        entry = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
+        self.assertIn("Autopilot", declared[fs.GPU_POOL_MISSING_TAINT])
+        self.assertNotIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_pools_read_leaves_the_gpu_taint_check_unevaluated(self):
+        entry = self.run_with(pools_rc=1, pools_stderr="PERMISSION_DENIED on container.nodePools.list")
+        unevaluated = {e["check"]: e["reason"] for e in entry["checks_unevaluated"]}
+        self.assertIn("PERMISSION_DENIED", unevaluated[fs.GPU_POOL_MISSING_TAINT])
+        # The procedure tells the agent that the cluster's limitation names each such check.
+        self.assertIn(fs.GPU_POOL_MISSING_TAINT, fs.GPU_POOL_POOLS_UNREAD_CLAUSE)
+        self.assertIn(fs.GPU_POOL_POOLS_UNREAD_CLAUSE, entry["limitations"])
+        self.assertNotIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
 
     def test_a_standard_cluster_with_no_pools_ran_the_check(self):
         """The other half of the same conflation: zero pools is an answer, and
@@ -2648,7 +2918,7 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
         self.assertEqual(
             {e["check"] for e in entry["checks_unevaluated"]},
-            {"reservation-mismatch-risk", "single-zone-nodepool", "spot-scarcity-risk"},
+            {"reservation-mismatch-risk", "single-zone-nodepool", "spot-scarcity-risk", fs.GPU_POOL_MISSING_TAINT},
         )
         self.assertIn("spot-scarcity-risk read no Spot node pool", entry["limitations"])
 
@@ -4704,6 +4974,37 @@ class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
         text = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}"
         self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
         self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
+
+
+class GpuPoolPodReadTest(unittest.TestCase):
+    """`read_pods_on_nodes` over the real paged read: one server-filtered read a node."""
+
+    def read(self, answers):
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            for node_name, answer in answers.items():
+                if f"spec.nodeName%3D{node_name}" in argv[-1]:
+                    return answer
+            raise AssertionError(f"an unexpected read was issued: {argv}")
+
+        with patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            return fs.read_pods_on_nodes(list(answers), run=run, env={}), issued
+
+    def test_each_node_is_one_paged_read_filtered_to_that_node(self):
+        page = lambda *names: run_of(0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": n}} for n in names]}))  # noqa: E731
+        (pods, why), issued = self.read({"n1": page("a", "b"), "n2": page("c")})
+        self.assertEqual(why, "")
+        self.assertEqual([p["metadata"]["name"] for p in pods], ["a", "b", "c"])
+        self.assertEqual([a[:3] for a in issued], [["kubectl", "get", "--raw"]] * 2)
+        self.assertEqual(issued[0][3], "/api/v1/pods?limit=500&fieldSelector=spec.nodeName%3Dn1")
+
+    def test_one_failed_read_fails_the_whole_read(self):
+        page = run_of(0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": "a"}}]}))
+        (pods, why), _issued = self.read({"n1": page, "n2": run_of(1, "", "Error from server (Forbidden): pods is forbidden")})
+        self.assertIsNone(pods)
+        self.assertIn("rc=1", why)
 
 
 def manual_pool(name, machine_type, compute_class_label=None):

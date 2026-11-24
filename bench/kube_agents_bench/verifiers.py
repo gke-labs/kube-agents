@@ -9149,7 +9149,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
-        "autoscaler-out-of-resources", "dangling-compute-class", "ccc-unbacked-manual-fallback",
+        "autoscaler-out-of-resources", "dangling-compute-class", "ccc-unbacked-manual-fallback", "gpu-pool-missing-taint",
     ),
     "upgrade-retrospective": (
         "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
