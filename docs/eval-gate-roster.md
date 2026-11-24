@@ -815,7 +815,8 @@ on the blocking roster, but it runs nowhere in CI until its entry goes: every la
 the door.
 An entry also leaves what can red a pull request: `hack/ci-eval-pr.sh` drops it
 from the matrix and from `BOOTSTRAP_ADMITTED` there. No roster case is listed, so the
-merge-blocking run grades delegation through the chat front door with `agent-kanban-smoke`.
+merge-blocking run grades the front door's live fleet read with `agent-kanban-smoke`: a delegated
+specialist's result through the chat front door, or a session's own read on the session route.
 `scripts/test_eval_rosters.py` pins that set, so listing a roster case is a decision made in that
 test and on this page, not a side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
@@ -918,8 +919,9 @@ The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
 project's GitLab repository instead of its GitHub one, in a run of its own beside the GitHub
 presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 `presubmit-cases.txt`: registered cases that grade the forge, a `pull_request_opened` or
-`pull_request_diff_contains` check (a merge request) or a `ledger_issue_contains` check (a ledger
-issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
+`pull_request_diff_contains` check (a merge request), a `ledger_issue_contains` check (a ledger
+issue) or a `forge_issue_state` check (the issue the reply names), since a chat probe passes the
+same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
 (`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode weekly job, around the

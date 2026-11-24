@@ -2,6 +2,7 @@ package authcallout
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strconv"
 	"testing"
@@ -23,6 +24,58 @@ const (
 	// renderedConsolePassword is the console's in the rendered nats.conf.
 	renderedConsolePassword = "pw-console"
 )
+
+// The boundary probe is a control-plane principal that only
+// TestAccountBoundaryIsolatesControlPlaneSubjects adds to the rendered map.
+// The rendered grants let no control-plane principal subscribe to a task's
+// .in, a submission, or the cap, runtime-state and PROFILE_LEASES buckets, so
+// a rendered principal's subscription there is refused and sees nothing,
+// whatever crosses the boundary. The probe listens on those subjects, and
+// publishes the canary that proves every target's subscription is live.
+const (
+	boundaryProbeUser  = "boundary-probe"
+	boundaryProbeSA    = "system:serviceaccount:kubeagents-system:test-boundary-probe"
+	tokenBoundaryProbe = "token-for-the-test-only-boundary-probe-serviceaccount-padded"
+	boundaryCanary     = "canary-from-the-boundary-probe"
+	// The probe's grant on each side. Its grants are not under test: it is a
+	// listener inside TRUSTED, and what reaches it is.
+	boundaryProbeGrant = ">"
+)
+
+// withBoundaryProbe returns the rendered map with the probe added to the
+// control-plane account.
+func withBoundaryProbe(t *testing.T, rendered string) string {
+	t.Helper()
+	m, err := ParseIdentityMap([]byte(rendered))
+	if err != nil {
+		t.Fatalf("parsing the rendered map: %v", err)
+	}
+	m.Identities = append(m.Identities, Identity{
+		ServiceAccount: boundaryProbeSA,
+		User:           boundaryProbeUser,
+		Account:        AccountControl,
+		Grants:         Grants{Publish: []string{boundaryProbeGrant}, Subscribe: []string{boundaryProbeGrant}},
+	})
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("encoding the map with the boundary probe: %v", err)
+	}
+	return string(raw)
+}
+
+// requireNoViolations fails the test for every permission violation, or other
+// asynchronous error, the server has reported to a connection.
+func requireNoViolations(t *testing.T, who string, violations chan error) {
+	t.Helper()
+	for {
+		select {
+		case e := <-violations:
+			t.Errorf("%s got an unexpected asynchronous error: %v", who, e)
+		default:
+			return
+		}
+	}
+}
 
 func renderedDispatcherMap(t *testing.T) string {
 	t.Helper()
@@ -79,11 +132,12 @@ func TestAccountBoundaryIsolatesControlPlaneSubjects(t *testing.T) {
 		tokenPodA:        {ServiceAccount: sessionSA, PodName: podA, PodUID: "uid-a"},
 		tokenAuditorPod1: {ServiceAccount: "system:serviceaccount:kubeagents-system-profiles:agentprofile-tse-read", PodName: "tse-read-7f9c", PodUID: "uid-tse"},
 	}
-	h := startHarness(t, renderedDispatcherMap(t), hooks)
+	hooks[tokenBoundaryProbe] = Attested{ServiceAccount: boundaryProbeSA}
+	h := startHarness(t, withBoundaryProbe(t, renderedDispatcherMap(t)), hooks)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	seed, _ := connectStatic(t, h, "seed", renderedSeedPassword)
+	seed, seedViolations := connectStatic(t, h, "seed", renderedSeedPassword)
 	seedJS, err := jetstream.New(seed)
 	if err != nil {
 		t.Fatal(err)
@@ -114,11 +168,25 @@ func TestAccountBoundaryIsolatesControlPlaneSubjects(t *testing.T) {
 		}
 	}
 
-	disp, _ := h.connectAs(t, "dispatcher", tokenDispatcher)
-	verif, _ := h.connectAs(t, "verifier", tokenVerifier)
-	prov, _ := h.connectAs(t, "provision", tokenProvision)
-	opConn, _ := h.connectAs(t, "operator", tokenRenderedOperator)
-	gw, _ := connectStatic(t, h, "gateway", "pw-gateway")
+	disp, dispViolations := h.connectAs(t, "dispatcher", tokenDispatcher)
+	verif, verifViolations := h.connectAs(t, "verifier", tokenVerifier)
+	prov, provViolations := h.connectAs(t, "provision", tokenProvision)
+	opConn, opViolations := h.connectAs(t, "operator", tokenRenderedOperator)
+	gw, gwViolations := connectStatic(t, h, "gateway", "pw-gateway")
+	probe, probeViolations := h.connectAs(t, boundaryProbeUser, tokenBoundaryProbe)
+	controlPlane := []struct {
+		name       string
+		conn       *nats.Conn
+		violations chan error
+	}{
+		{"gateway", gw, gwViolations},
+		{"dispatcher", disp, dispViolations},
+		{"verifier", verif, verifViolations},
+		{"operator", opConn, opViolations},
+		{"provision", prov, provViolations},
+		{"seed", seed, seedViolations},
+		{boundaryProbeUser, probe, probeViolations},
+	}
 	agentConn, agentViolations := h.connectAs(t, "agent", agentToken)
 	worker, workerViolations := h.connectAs(t, "tse-read-7f9c", tokenAuditorPod1)
 	sess, sessViolations := h.connectAs(t, podA, tokenPodA)
@@ -170,22 +238,24 @@ func TestAccountBoundaryIsolatesControlPlaneSubjects(t *testing.T) {
 	// Every subject any TRUSTED principal (gateway, dispatcher, verifier,
 	// operator, provision, seed) subscribes to or trusts by publisher, plus
 	// every TRUSTED-only stream/KV subject and every TRUSTED _INBOX.*.>.
+	// A rendered principal listens where its grants let it; the probe listens
+	// on the five subjects no rendered principal may subscribe to.
 	targets := []struct {
 		subject string
 		subConn *nats.Conn
 	}{
-		{"a2a.tasks.platform.t-victim.in", gw},
+		{"a2a.tasks.platform.t-victim.in", probe},
 		{"a2a.tasks.platform.t-victim.supervisor", gw},
 		{"a2a.tasks.tse.t-victim.events", gw},
-		{"a2a.submit.tse.read.top.t-forged", gw},
+		{"a2a.submit.tse.read.top.t-forged", probe},
 		{"a2a.agents.forged", gw},
 		{"agents.hb.forged", gw},
 		{"a2a.topics.shared.annotations", seed},
-		{"$KV.cap.root.forged", verif},
+		{"$KV.cap.root.forged", probe},
 		{"$KV.session-state.forged", gw},
 		{"$KV.feedback.forged", gw},
-		{"$KV.runtime-state.forged", gw},
-		{"$KV.PROFILE_LEASES.tse.read.pod.t1", disp},
+		{"$KV.runtime-state.forged", probe},
+		{"$KV.PROFILE_LEASES.tse.read.pod.t1", probe},
 		{"chat.console.c1.in", gw},
 		{"chat.console.c1.confirm", gw},
 		{"chat.notify.gchat", gw},
@@ -234,10 +304,28 @@ func TestAccountBoundaryIsolatesControlPlaneSubjects(t *testing.T) {
 			t.Fatalf("%s was allowed to subscribe to a2a.cap.reply.dispatcher.>", caller.name)
 		}
 	}
-	for _, c := range []*nats.Conn{gw, disp, verif, opConn, prov, seed} {
-		if err := c.Flush(); err != nil {
+	for _, c := range controlPlane {
+		if err := c.conn.Flush(); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Every target's subscription is live: a canary published inside TRUSTED
+	// arrives on it. A subscription the server refused gets nothing, and
+	// would make its row below pass whatever crosses the boundary.
+	for i, tgt := range targets {
+		if err := probe.Publish(tgt.subject, []byte(boundaryCanary)); err != nil {
+			t.Fatal(err)
+		}
+		msg, err := subs[i].NextMsg(2 * time.Second)
+		if err != nil {
+			t.Fatalf("the subscription in TRUSTED to %s is not live, so its row cannot fail: %v", tgt.subject, err)
+		}
+		if string(msg.Data) != boundaryCanary {
+			t.Fatalf("the subscription in TRUSTED to %s got %q before the canary", tgt.subject, msg.Data)
+		}
+	}
+	for _, c := range controlPlane {
+		requireNoViolations(t, c.name, c.violations)
 	}
 
 	// Positive sanity checks that the seeded messages in TOPICS-STATE and
@@ -328,6 +416,11 @@ func TestAccountBoundaryIsolatesControlPlaneSubjects(t *testing.T) {
 				tgt.subject, msg.Subject, msg.Reply, msg.Header, msg.Data)
 		}
 		_ = subs[i].Unsubscribe()
+	}
+	// The server refused nothing a control-plane connection did, so no
+	// listener above was a refused subscription.
+	for _, c := range controlPlane {
+		requireNoViolations(t, c.name, c.violations)
 	}
 
 	// 1. Dispatcher (TRUSTED) -> worker (APP) offer, and worker (APP) ->

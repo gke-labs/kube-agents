@@ -38,6 +38,8 @@ Each tool call becomes one devops-bench trajectory entry in the same shape
 ``parsing.parse_response`` emits (``name`` / ``args`` / ``result`` /
 ``status``) plus four tags: ``agent`` (the profile that made the call),
 ``task`` (the card it was working), ``session`` and ``at`` (epoch seconds).
+A ``tool_call`` wrapper's entry also carries ``wrapped``, the tool names its
+arguments held before they were clipped (:func:`wrapped_tool_names`).
 Results and arguments are scrubbed and clipped inside the pod, in that order,
 so nothing credential-shaped leaves it and a chatty worker cannot make the exec
 output unbounded. The rules are the shared transcript reader's
@@ -118,12 +120,24 @@ CAPTURE_PRESENT = "__WORKER_TRAJECTORY__"
 
 # Dispatch wrapper name Hermes uses when recording MCP tool calls
 TOOL_CALL_WRAPPER = "tool_call"
+# The key of a worker's wrapper entry that holds the tool names the pod read
+# from its arguments before clipping them.
+WRAPPED_NAMES_KEY = "wrapped"
 
 
 def wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
-    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
+    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other.
+
+    A worker's entry carries them under :data:`WRAPPED_NAMES_KEY`, read in the
+    pod before the arguments were clipped, so a wrapper too long to parse
+    still names its tool. An entry without the key -- the router's own, or a
+    worker's whose arguments were not a JSON object -- is read from ``args``.
+    """
     if entry.get("name") != TOOL_CALL_WRAPPER:
         return set()
+    recorded = entry.get(WRAPPED_NAMES_KEY)
+    if isinstance(recorded, list):
+        return {str(name) for name in recorded if name}
     args = entry.get("args")
     if not isinstance(args, dict):
         return set()
@@ -273,6 +287,22 @@ JSON_PREFIX = "\x00json:"
 WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
 WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
 TOOL_ERROR_PREFIX = "Error executing tool"
+# The envelope hermes puts round a result it does not trust -- an MCP tool's,
+# reached through the ``tool_call`` wrapper or by name -- when the result is
+# 32 characters or longer (``agent/tool_dispatch_helpers._maybe_wrap_untrusted``):
+# the opening tag naming the tool, one paragraph of notice, a blank line, the
+# result, the closing tag.
+ENVELOPE_OPEN = "<untrusted_tool_result "
+ENVELOPE_CLOSE = "</untrusted_tool_result>"
+ENVELOPE_NOTICE_END = "\n\n"
+# The key hermes' MCP handlers answer a tool's text under: ``{"result": text}``.
+MCP_RESULT_KEY = "result"
+# hermes' dispatch wrapper, and the keys of its arguments that name the tools
+# it invokes (``tools/tool_search_validation.normalize_tool_call_entries``):
+# one tool under ``name``, or a batch under ``calls``, each with its ``name``.
+WRAPPER = "tool_call"
+WRAPPED_NAME = "name"
+WRAPPED_CALLS = "calls"
 # hermes' usage columns, on the ``sessions`` row as aggregates and, in a
 # hermes that attributes usage per model, on ``session_model_usage`` rows.
 TOKEN_COLUMNS = (
@@ -335,9 +365,46 @@ def scrub(value, kind):
     return wt.scrub_step_text(redactor, kind, text, WITHHELD)
 
 
+# What hermes' untrusted-result envelope holds, or None for a result that is
+# not one. The notice is hermes' own fixed text and has no blank line in it,
+# so the first blank line ends it.
+def enveloped(result):
+    text = result.strip()
+    if not (text.startswith(ENVELOPE_OPEN) and text.endswith(ENVELOPE_CLOSE)):
+        return None
+    _, notice_end, body = text[:-len(ENVELOPE_CLOSE)].partition(ENVELOPE_NOTICE_END)
+    return body if notice_end else None
+
+
 def failed(result):
-    # parsing._output_failed, on the result before it is clipped: a clipped
-    # JSON failure no longer parses, so the verdict has to be taken here.
+    # The verdict is taken here, on the result before it is clipped: a clipped
+    # JSON failure no longer parses. A result in hermes' untrusted-result
+    # envelope is judged on what the envelope holds, and an MCP answer there,
+    # ``{"result": ...}``, on the tool's own text or object as well: read as it
+    # stands the envelope starts with ``<``, and every refused call through it
+    # was recorded as completed. The answer is the JSON value the body opens
+    # with: hermes may append a note of its own after it, inside the envelope.
+    # A result of several text parts is one envelope per part, joined: only the
+    # first part's answer is read.
+    if failure(result):
+        return True
+    body = enveloped(result) if isinstance(result, str) else None
+    if body is None:
+        return False
+    try:
+        if failure(body):
+            return True
+        answer, _ = json.JSONDecoder().raw_decode(body.strip())
+    except (ValueError, RecursionError):
+        return False
+    if not isinstance(answer, dict):
+        return False
+    inner = answer.get(MCP_RESULT_KEY)
+    return failure(answer) or (isinstance(inner, (str, dict)) and failure(inner))
+
+
+def failure(result):
+    # parsing._output_failed.
     if isinstance(result, str):
         if result.startswith(TOOL_ERROR_PREFIX):
             return True
@@ -355,6 +422,39 @@ def failed(result):
     return bool(result.get("error")) and not (
         result.get("content") or result.get("result") or result.get("structuredContent")
     )
+
+
+# The tools a ``tool_call`` wrapper names, read from its arguments before they
+# are clipped: a clipped wrapper no longer parses, and its tool was then
+# invisible by name. None for any other call and for arguments that are not a
+# JSON object, which hermes refuses to run. hermes runs ``calls`` when the
+# wrapper carries one, as an array or as one object, and ``name`` only when it
+# does not, and strips each name. Every name is scrubbed as the arguments are,
+# so a withheld capture withholds these too, and names that together run past
+# the arguments' own cap are not recorded: the entry is then read as it was
+# before the names were, from its clipped arguments.
+def wrapped_names(name, arguments):
+    if name != WRAPPER:
+        return None
+    try:
+        args = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(args, dict):
+        return None
+    calls = args.get(WRAPPED_CALLS)
+    if calls is None:
+        found = [args.get(WRAPPED_NAME)]
+    else:
+        batch = [calls] if isinstance(calls, dict) else calls if isinstance(calls, list) else []
+        found = [c.get(WRAPPED_NAME) for c in batch if isinstance(c, dict)]
+    names = []
+    for raw in found:
+        text = str(raw).strip() if raw else ""
+        if text and text not in names:
+            names.append(text)
+    names = [scrub(n, CALL_KIND) for n in names]
+    return names if sum(len(n) for n in names) <= MAX_ARGS else None
 
 
 def clip(text, limit, tail=0):
@@ -499,6 +599,7 @@ def read_session(conn, card, profile, sid):
                 entry = {
                     "name": str(fn.get("name") or ""),
                     "args": clip_args(scrub(arguments, CALL_KIND), MAX_ARGS) if arguments is not None else None,
+                    "wrapped": wrapped_names(str(fn.get("name") or ""), arguments),
                     "result": None,
                     "failed": None,
                     "agent": profile,
@@ -785,7 +886,7 @@ def runs(summary: dict[str, Any] | None) -> list[dict[str, Any]] | None:
     ``None`` when the read did not run. Each row is the card's ``run_outcomes``
     entry (``profile``, ``status``, ``outcome``, ``error``) plus ``task``; a
     summary without card records yields an empty list. ``worker_budget`` reads the rows for the
-    turn budget a worker ran out of.
+    turn budget a worker ran out of, beside the checkpoint notice in the calls' results.
     """
     if not isinstance(summary, dict):
         return None
@@ -815,7 +916,7 @@ def _entry(call: dict[str, Any]) -> dict[str, Any]:
         status = "error"
     else:
         status = "completed"
-    return {
+    entry = {
         "name": str(call.get("name") or ""),
         "args": _call_args(call.get("args")),
         "result": result,
@@ -825,6 +926,11 @@ def _entry(call: dict[str, Any]) -> dict[str, Any]:
         "session": str(call.get("session") or ""),
         "at": call.get("at"),
     }
+    # Only a `tool_call` wrapper carries the key, so every other entry keeps its shape.
+    wrapped = call.get(WRAPPED_NAMES_KEY)
+    if isinstance(wrapped, list):
+        entry[WRAPPED_NAMES_KEY] = [str(name) for name in wrapped]
+    return entry
 
 
 def command(task_ids: list[str]) -> str:

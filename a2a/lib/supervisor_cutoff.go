@@ -545,7 +545,7 @@ func (c *Client) taskReplayHeads(ctx context.Context, stream jetstream.Stream, a
 		}
 		data, storedAt := msg.Data, storedTimeOf(msg, direct)
 		if c.storedTimeDecides(subject, storedAt) {
-			if data, storedAt, err = c.lastBySubject(ctx, subject); err != nil {
+			if data, storedAt, _, err = c.lastBySubject(ctx, subject); err != nil {
 				return nil, err
 			}
 		}
@@ -567,8 +567,8 @@ const lastBySubjectWait = 2 * time.Second
 
 // lastBySubject reads the newest message on subject through an ephemeral
 // pull consumer that delivers the last message per subject, and returns its
-// data and the stored time from the delivery's metadata, which the server
-// writes (the reply subject, not the message's headers). It is the time the
+// data, the stored time and the stream sequence from the delivery's metadata,
+// which the server writes (the reply subject, not the message's headers). It is the time the
 // direct get can't give (storedTimeOf).
 //
 // The consumer is the replay's kind, made with the grant the replay uses:
@@ -583,7 +583,7 @@ const lastBySubjectWait = 2 * time.Second
 // A message gone between the direct get and this read (aged out, or a
 // subject purged) is the read failing, not the subject being empty: a caller
 // takes it as it takes any failed read.
-func (c *Client) lastBySubject(ctx context.Context, subject string) ([]byte, time.Time, error) {
+func (c *Client) lastBySubject(ctx context.Context, subject string) ([]byte, time.Time, uint64, error) {
 	_, js := c.conn()
 	cons, err := js.CreateConsumer(ctx, TasksStream, jetstream.ConsumerConfig{
 		FilterSubject:     subject,
@@ -594,25 +594,25 @@ func (c *Client) lastBySubject(ctx context.Context, subject string) ([]byte, tim
 		Replicas:          1,
 	})
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("consumer on %s for its stored time: %w", subject, err)
+		return nil, time.Time{}, 0, fmt.Errorf("consumer on %s for its stored time: %w", subject, err)
 	}
 	wait := lastBySubjectWait
 	if deadline, ok := ctx.Deadline(); ok {
 		wait = min(wait, time.Until(deadline))
 	}
 	if wait <= 0 {
-		return nil, time.Time{}, fmt.Errorf("stored time of %s: %w", subject, context.DeadlineExceeded)
+		return nil, time.Time{}, 0, fmt.Errorf("stored time of %s: %w", subject, context.DeadlineExceeded)
 	}
 	msg, err := cons.Next(jetstream.FetchMaxWait(wait))
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("stored time of %s: %w", subject, err)
+		return nil, time.Time{}, 0, fmt.Errorf("stored time of %s: %w", subject, err)
 	}
 	meta, err := msg.Metadata()
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("stored time of %s: %w", subject, err)
+		return nil, time.Time{}, 0, fmt.Errorf("stored time of %s: %w", subject, err)
 	}
 	if msg.Subject() != subject {
-		return nil, time.Time{}, fmt.Errorf("stored time of %s: the consumer delivered %s", subject, msg.Subject())
+		return nil, time.Time{}, 0, fmt.Errorf("stored time of %s: the consumer delivered %s", subject, msg.Subject())
 	}
-	return msg.Data(), meta.Timestamp, nil
+	return msg.Data(), meta.Timestamp, meta.Sequence.Stream, nil
 }

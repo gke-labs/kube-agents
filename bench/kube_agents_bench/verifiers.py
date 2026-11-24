@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _shell_argvs_and_unread, _shell_argvs_first_read, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -1750,6 +1750,8 @@ class AnswerFirstVerifier(BaseVerifier):
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
 _TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
 _wrapped_tool_names = worker_trajectory.wrapped_tool_names
+# The wrapper's own top-level arguments, as Hermes reads them.
+_WRAPPER_OWN_ARGS = frozenset({"name", "arguments", "calls"})
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -1898,7 +1900,11 @@ class ToolCalledVerifier(BaseVerifier):
     A name in ``tool_names`` therefore also matches a ``tool_call`` entry
     whose wrapped name or ``calls`` list names it, else a worker's MCP calls
     would be invisible to this check by name. One wrapper entry counts once
-    however many of its calls match; ``require_success`` reads the wrapper's status.
+    however many of its calls match; ``require_success`` reads the wrapper's status,
+    which the pod takes on the tool's answer inside Hermes' ``<untrusted_tool_result>``
+    envelope (``worker_trajectory``'s ``failed``). The pod reads a worker wrapper's
+    names before it clips the arguments and records them on the entry, so a wrapper
+    too long to parse is still counted by name.
 
     ``agent``: optional Python regular expression. When set, only trajectory
     entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful
@@ -2016,7 +2022,13 @@ class ToolCalledVerifier(BaseVerifier):
                 if re.fullmatch(pattern, str(args[name])) is None:
                     return False
                 continue
-            if not clipped:
+            # A wrapper the pod named (`wrapped`) is counted by name though its
+            # arguments were clipped. Its own arguments are the wrapped call's
+            # name and arguments, which this filter does not read through, so
+            # an argument that is not one of the wrapper's own rules the call
+            # out as it does for a wrapper that fits, and as it did before the
+            # pod named it. One of its own that the clip cut is undecided.
+            if not clipped or (worker_trajectory.WRAPPED_NAMES_KEY in entry and name not in _WRAPPER_OWN_ARGS):
                 return False
             undecided = True
         return None if undecided else True
@@ -2605,6 +2617,35 @@ _SHELL_READ_LIMIT_REASON = (
 )
 #: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
 _UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
+#: A worker command with a part that the shell reader refuses (quotes that do not balance, a
+#: redirect with no target, a substitution that does not close) has no argvs for that part and
+#: what follows it (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). The reader
+#: cannot tell if bash refuses the part too. When the part holds the words of a run that decides
+#: a check (:func:`_refused_part_can_hold`), the check cannot be evaluated: not a pass and not
+#: a fail.
+_SHELL_UNREAD_PART_REASON = (
+    "the shell reader refuses a part of worker command {shown!r} (quotes that do not balance, a "
+    "redirect with no target, or a substitution that does not close), and that part holds the "
+    "words of a run of {script}, so its runs cannot be read and this check could not be evaluated"
+)
+#: The shell's escape character, and a line continuation: bash removes the pair before it reads
+#: a word.
+_SHELL_QUOTING_ESCAPE = "\\"
+_SHELL_LINE_CONTINUATION = "\\\n"
+#: The characters a shell word loses when its quotes come off: the words of a part that was not
+#: read are looked for with these removed.
+_SHELL_QUOTING_CHARS_OFF = str.maketrans("", "", "'\"\\")
+#: What splits the text of a refused part into words: blanks, and the characters of the shell's
+#: operators and substitutions.
+_SHELL_BARE_WORD_SPLIT_RE = re.compile(r"[\s;&|()<>`]+")
+#: What joins the parts of one line that the reader refuses, for the search of a run's words.
+_SHELL_PARTS_JOIN = "\n"
+#: The interpreter flag that runs a module by its stem (``python3 -m <stem>``).
+_INTERPRETER_MODULE_FLAG = "-m"
+#: What parts a script's stem from its suffix.
+_SCRIPT_SUFFIX_SEPARATOR = "."
+#: The quotes that the pod's clip can leave open in a command that it cut, in the order tried.
+_CUT_COMMAND_QUOTES = ('"', "'")
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2665,18 +2706,85 @@ class WorkerRun(BaseModel):
         return flags
 
 
-def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
-    """The argvs of each line that the shell reader reads, and the first line that is past its
-    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
-    Each line is read by itself, so one unread line does not take the others' argvs."""
+def _argvs_and_first_unread(
+    lines: list[str], cut: frozenset[str] = frozenset(), programs: frozenset[str] = frozenset()
+) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None, list[tuple[str, str]]]:
+    """The argvs of each line that the shell reader reads; the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None;
+    and each line with parts that the reader refuses, with those parts
+    (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). Each line is read by
+    itself, so one unread line does not take the others' argvs.
+
+    A line of ``cut`` is a command that the pod's clip cut (:func:`_cut_command_texts`). It is
+    read as if the quote that the cut left open closed at the cut (:func:`_cut_command_read`).
+    What the clip removed is not in the text, and this verifier does not report it: the cut
+    tail of a clipped command is a limit of the capture. So a forbidden run in the cut tail
+    still passes, while ``tool_called`` with an ``arguments`` pattern on the cut argument gives
+    ``error`` for the same call.
+
+    A line of ``programs``, the text of an ``execute_code`` program (:func:`_program_texts`),
+    is not a shell call. It is read as shell lines with the reader's first read alone, as
+    before the second read, and it is not in the third value."""
     argvs: list[list[str]] = []
     first_unread = None
+    refused: list[tuple[str, str]] = []
     for line in lines:
         try:
-            argvs.extend(_shell_argvs(line))
+            line_argvs, parts = (_shell_argvs_first_read(line), []) if line in programs else _shell_argvs_and_unread(line)
+            if parts and line in cut:
+                line_argvs, parts = _cut_command_read(line, line_argvs, parts)
         except ShellReadLimitError as limit:
             first_unread = first_unread or (line, limit)
-    return argvs, first_unread
+            continue
+        argvs.extend(line_argvs)
+        if parts:
+            refused.append((line, _SHELL_PARTS_JOIN.join(parts)))
+    return argvs, first_unread, refused
+
+
+def _cut_command_read(line: str, argvs: list[list[str]], parts: list[str]) -> tuple[list[list[str]], list[str]]:
+    """The argvs and the refused parts of a command that the pod's clip cut, of which the reader
+    gave ``argvs`` and refused ``parts``. The clip often falls inside a quoted value, so the
+    command is read again as if that quote closed at the cut, as the write attribution reads it
+    (:func:`kube_agents_bench.github_writes.writing_segments`): the first closing quote that
+    gives an argv more, or leaves fewer refused parts, gives the result. A part that is still
+    refused is text that the capture holds, so it follows the rule of each refused part
+    (:func:`_refused_part_can_hold`), also when the cut is its cause: a cut inside a
+    substitution, or inside two quotes."""
+    for quote in _CUT_COMMAND_QUOTES:
+        # A trailing backslash would escape the quote that closes the value.
+        closed_argvs, closed_parts = _shell_argvs_and_unread(line.rstrip(_SHELL_QUOTING_ESCAPE) + quote)
+        added = [argv for argv in closed_argvs if argv not in argvs]
+        if added or len(closed_parts) < len(parts):
+            return argvs + added, closed_parts
+    return argvs, parts
+
+
+def _refused_part_can_hold(part: str, run: WorkerRun) -> bool:
+    """Whether a part that the reader refuses can hold ``run``. A run is an argv with the script
+    as a word (by its basename, or its module stem after ``-m``), each flag as a word, and for
+    each word pattern a word that matches it. So the part can hold the run only when its text,
+    with the line continuations and the quoting characters off, has all of those words. The
+    limit of this test: a run that reaches the script by another spelling (through a variable,
+    or with a word that holds a blank or an operator character inside quotes) is not found,
+    and the check is graded on what was read."""
+    bare = part.replace(_SHELL_LINE_CONTINUATION, "").translate(_SHELL_QUOTING_CHARS_OFF)
+    words = [word for word in _SHELL_BARE_WORD_SPLIT_RE.split(bare) if word]
+    stem = run.script.rsplit(_SCRIPT_SUFFIX_SEPARATOR, 1)[0]
+    named = any(os.path.basename(word) == run.script for word in words) or any(
+        flag == _INTERPRETER_MODULE_FLAG and module == stem for flag, module in zip(words, words[1:])
+    )
+    return named and _words_after_carry(words, run)
+
+
+def _refused_part_naming(refused: list[tuple[str, str]], runs: list[WorkerRun]) -> tuple[str, str] | None:
+    """The first line of ``refused`` whose refused parts can hold one of ``runs``
+    (:func:`_refused_part_can_hold`), with that run's script, or None."""
+    for line, part in refused:
+        for run in runs:
+            if _refused_part_can_hold(part, run):
+                return line, run.script
+    return None
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -2783,13 +2891,19 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
 
 def _terminal_call_texts(trajectory: list[Any]) -> list[tuple[str, str]]:
     """``(card, command)`` per tagged ``terminal`` call, as :func:`_worker_terminal_calls` reads it."""
-    texts: list[tuple[str, str]] = []
+    return [(card, command) for card, command, _ in _terminal_calls_with_results(trajectory)]
+
+
+def _terminal_calls_with_results(trajectory: list[Any]) -> list[tuple[str, str, str]]:
+    """``(card, command, result)`` per tagged ``terminal`` call; a result that is not text reads as empty."""
+    calls: list[tuple[str, str, str]] = []
     for entry in trajectory:
         if isinstance(entry, dict) and entry.get("agent") and entry.get("name") == _TERMINAL_TOOL:
             command = _code_call_text(entry)
             if command is not None:
-                texts.append((str(entry.get("task") or entry.get("session") or ""), command))
-    return texts
+                result = entry.get("result")
+                calls.append((str(entry.get("task") or entry.get("session") or ""), command, result if isinstance(result, str) else ""))
+    return calls
 
 
 def _clipped_cards(trajectory: list[Any]) -> set[str]:
@@ -2804,6 +2918,30 @@ def _clipped_cards(trajectory: list[Any]) -> set[str]:
         and isinstance(entry.get("args"), dict)
         and set(entry["args"]) == {_CLIPPED_ARGS_KEY}
     }
+
+
+def _program_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged ``execute_code`` program, as :func:`_code_call_text` reads it."""
+    texts = (_code_call_text(entry) for entry in trajectory if isinstance(entry, dict) and entry.get("agent") and entry.get("name") != _TERMINAL_TOOL)
+    return frozenset(text for text in texts if text is not None)
+
+
+def _cut_command_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged code-tool call whose command the pod's clip cut: the head that
+    :func:`_code_call_text` reads when the clipped arguments hold no whole command."""
+    cut: set[str] = set()
+    for entry in trajectory:
+        if not (isinstance(entry, dict) and entry.get("agent") and entry.get("name") in _CODE_TOOLS):
+            continue
+        args = entry.get("args")
+        if not (isinstance(args, dict) and set(args) == {_CLIPPED_ARGS_KEY} and isinstance(args[_CLIPPED_ARGS_KEY], str)):
+            continue
+        if _clipped_string_args(args[_CLIPPED_ARGS_KEY], {_COMMAND_ARG: "", _CODE_ARG: ""}):
+            continue
+        command = _code_call_text(entry)
+        if command is not None:
+            cut.add(command)
+    return frozenset(cut)
 
 
 def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
@@ -2853,7 +2991,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
     a log line is graded on its log lines, whether or not its calls reached
     the trajectory, and any other card on its calls; the required patterns
-    and runs also read a logged card's calls. This verifier matches
+    and runs also read a logged card's calls, and the forbidden runs its
+    ``terminal`` calls that hold no heredoc. This verifier matches
     Python regular expressions against the union, ``re.search`` on each
     command verbatim, and an exemption reads a tagged call as it reads a log
     line. The two halves are not spelled alike. A log line is hermes's
@@ -2862,12 +3001,18 @@ class WorkerCommandsVerifier(BaseVerifier):
     chain joined by ``;``, ``&&`` or ``||`` arrives as its first command (a
     leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
     skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe, a
-    substitution and a backtick stay. A forbidden pattern or run reads the
+    substitution and a backtick stay. A forbidden pattern reads the
     rendering there, so a command chained behind another on a log line is not
     on any line it sees; a required pattern or run also reads the card's
     tagged calls as typed, so a run behind ``printenv X;`` is credited
     (#4620), and so is a run written into a heredoc that was never executed
-    (the admitting side, as under ``after_result_pattern``). A
+    (the admitting side, as under ``after_result_pattern``). A forbidden run
+    also reads the card's tagged ``terminal`` calls as typed, so a run behind
+    a chain or on a later line of a call is read (#6106); a call whose text
+    holds ``<<`` (a heredoc; a quoted ``<<`` or a shift counts too) is the
+    exception and stays on its row, because a heredoc body
+    splits into one argv for each line and a line written into a file is not a
+    run, so a forbidden run on a later line of such a call is not read. A
     tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
     reads each worker session's tool calls after the log scrape; ``tool_called``
     grades them), so a pattern, forbidden or exempt, reads a worker-filed
@@ -2947,8 +3092,16 @@ class WorkerCommandsVerifier(BaseVerifier):
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
     A command an exemption touched is out of the required runs as it is out
     of the required patterns; the forbidden runs read every command as typed.
+    ``refused_result_pattern`` (with ``forbidden_runs``) names the result of a
+    call that was refused, by the policy's refusal words: the forbidden runs
+    do not read a typed call of one command whose result matches, on any card
+    and under ``after_result_pattern`` too, nor, for each such call, one card
+    log row equal to its text. A call has one result, so a call of several
+    commands is read whatever its result holds; a row has no result, so the
+    row of such a call is read, and so is each row of a capture whose rows
+    name no card. A result that only quotes the refusal words matches too.
 
-    ``after_result_pattern`` makes the forbidden set order-aware, for a
+    ``after_result_pattern`` makes the forbidden patterns order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
     refused one, and a pattern over write verbs alone flags the honest attempt
     that met the refusal. The commands then come from the workers' tagged
@@ -2984,9 +3137,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     closes the chain gap, and the split stays. ``required_runs``
     reads each flag as the exact word, so a script a case names this way is
     built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
-    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a line bash refuses
-    (an unclosed quote) yields no words, so no run is credited from it
-    (``forbidden_patterns`` read the text and still match it); and no shell
+    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a command that the
+    reader refuses (an unclosed quote) has no argv, so no run is credited from
+    it or from the commands after it, while the commands before it are read
+    (the last paragraph has the error rule; ``forbidden_patterns`` read the
+    text and still match it); and no shell
     expansion is resolved, so a run spelled through a variable that holds the
     whole path (``python3 "$SCRIPT" ...``) is not read as one -- the dictated
     command spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or
@@ -3012,8 +3167,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     line, so a run written into the file is credited whether or not the file
     ran. A required pattern or run reads typed calls (a logged card's always,
     every card's under ``after_result_pattern``), so it credits that line; a
-    forbidden run reads a logged card's row, where the heredoc is one line
-    behind ``cat``, and does not. A card with no log line is read from its
+    forbidden run reads a logged card's row for a call that holds a heredoc
+    (without ``after_result_pattern``), where the heredoc is one line behind
+    ``cat``, and does not. The typed read does not know which commands ran: a
+    command behind ``&&`` or ``||``, in a branch that was not taken or in a
+    function that was never called reads as a run. A card with no log line is read from its
     typed calls by both. Under
     ``after_result_pattern``: a refused command whose output the call discarded
     prints nothing into its result; a result is clipped in the pod at
@@ -3038,6 +3196,23 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``status="error"`` when a line of the commands was not read, and a clean read of the
     forbidden runs is when a typed line was not read. A check with patterns alone reads no
     argv and is graded as before the limit.
+
+    A call is read a command at a time, as bash reads it
+    (:func:`kube_agents_bench.shell_words._shell_argvs`): a quote in a heredoc body opens
+    nothing (a body line that reads as a command is still an argv), and the commands before
+    one that the reader refuses (quotes that do not balance, a redirect with no target, a
+    substitution that does not close) are read. The refused command and what follows it have
+    no argvs, and the reader cannot tell if bash refuses that part too. So the part follows
+    the rule above for the runs that it can hold (:func:`_refused_part_can_hold`): a required
+    run that is still missing, or a clean read of the forbidden runs, is ``status="error"``
+    when the part has the run's words, which are the script as a word, each flag, and a word
+    for each word pattern. A refused part that reaches the script by another spelling is not
+    found, and the check is graded on what was read. A command that the pod clipped is read as
+    if the quote that the cut left open closed at the cut. What the clip removed is not
+    reported: a forbidden run in the cut tail still passes, while ``tool_called`` with an
+    ``arguments`` pattern on the cut argument gives ``error`` for the same call. An
+    ``execute_code`` program is not a shell call: it is read as shell lines with the reader's
+    first read alone, as before.
     """
 
     type: Literal["worker_commands"]
@@ -3049,6 +3224,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
     after_result_pattern: str | None = None
+    refused_result_pattern: str | None = None
 
     @field_validator("required_patterns", "forbidden_patterns", "exempt_patterns", "forbidden_result_patterns")
     @classmethod
@@ -3069,6 +3245,65 @@ class WorkerCommandsVerifier(BaseVerifier):
         if self.forbidden_result_patterns and self.after_result_pattern is None:
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
+
+    @field_validator("refused_result_pattern")
+    @classmethod
+    def _refused_pattern_compiles(cls, pattern: str | None) -> str | None:
+        if pattern is not None:
+            if not pattern:
+                raise ValueError("refused_result_pattern is empty, which matches each result; name the refusal's words")
+            re.compile(pattern)
+        return pattern
+
+    @model_validator(mode="after")
+    def _refused_pattern_needs_forbidden_runs(self) -> WorkerCommandsVerifier:
+        if self.refused_result_pattern is not None and not self.forbidden_runs:
+            raise ValueError("refused_result_pattern names the calls the forbidden runs skip; set forbidden_runs with it")
+        return self
+
+    def _refused(self, command: str, result: str) -> bool:
+        """Whether the forbidden runs skip a typed call: the option is set, the call is one
+        command, and its result matches. A call has one result, so a refusal in it says
+        nothing about the other commands of a longer call; such a call is read."""
+        if self.refused_result_pattern is None or not re.search(self.refused_result_pattern, result):
+            return False
+        try:
+            return len(_shell_argvs(command)) == 1
+        except ShellReadLimitError:
+            # A line past the reader's limit is not known to be one command, so it is read.
+            return False
+
+    def _forbidden_run_commands(self, snap: Any, calls: list[tuple[str, float | None, str, str, bool]], logged: set[str]) -> list[str]:
+        """The commands the forbidden runs read when no window orders the calls: each card
+        log row, the tagged calls of a card with no row, and a logged card's ``terminal``
+        calls as typed, so a run on a later line of a call or behind a chain is read
+        (#6106). A typed call that holds a heredoc is left on its row: its body splits into
+        one argv for each line, and a line written into a file is not a run. A refused call
+        (:meth:`_refused`) is not read, and for each one neither is one row equal to its
+        text. Rows that name no card cannot be joined to a call, so none of them is skipped.
+        The reader's limit holds for a typed call as for a row: a call past it gives no argvs,
+        and the check is an error unless a forbidden run was read."""
+        rows = [(str(row.get("task") or ""), str(row.get("command", ""))) for row in snap.worker_commands]
+        unjoined = "" in logged
+        children = [command for card, _, command, result, _ in calls if (unjoined or card not in logged) and not self._refused(command, result)]
+        if unjoined:
+            return [command for _, command in rows] + children
+        refused: dict[tuple[str, str], int] = {}
+        not_refused: set[tuple[str, str]] = set()
+        for card, command, result in _terminal_calls_with_results(snap.trajectory):
+            if self._refused(command, result):
+                refused[(card, command)] = refused.get((card, command), 0) + 1
+            else:
+                not_refused.add((card, command))
+        read_rows: list[str] = []
+        for card, command in rows:
+            if refused.get((card, command)):
+                refused[(card, command)] -= 1
+                continue
+            read_rows.append(command)
+        seen = set(rows)
+        beside = [command for card, command in sorted(not_refused) if card in logged and (card, command) not in seen and not _holds_heredoc(command)]
+        return read_rows + children + beside
 
     def _without_exempt_text(self, command: str, joined: bool = False) -> str:
         # ``joined``: the row's card typed a call the row may have joined lines of
@@ -3101,6 +3336,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         # The log rows of a card that typed a call the row may have joined lines of.
         joined_rows: set[str] = set()
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
+        # What the forbidden runs read; ``None`` is the typed set.
+        run_commands: list[str] | None = None
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3121,10 +3358,12 @@ class WorkerCommandsVerifier(BaseVerifier):
             # in the log and no tagged terminal call), so every log line is kept whatever
             # the trajectory holds, and the trajectory's calls join the
             # graded set by card, not by string: a card with a log line contributes its
-            # log lines and none of its calls to the forbidden set (the required
-            # checks also take its calls, below), so a command a filed card typed is counted
+            # log lines and none of its calls to the forbidden patterns (the required
+            # checks also take its calls, and the forbidden runs its terminal calls that
+            # hold no heredoc, below), so a command a filed card typed is counted
             # once (its log line and its call need not be spelled alike) and a command
-            # typed twice is counted twice. A card with no log line -- a worker filed it,
+            # typed twice is counted twice; a forbidden run can be named two times, on
+            # its row and in its typed call, when the two are not spelled alike. A card with no log line -- a worker filed it,
             # or its log showed no shell command -- contributes its tagged calls, which
             # for a filed card can only add ``execute_code`` text the log never shows (a
             # behaviour change for a filed card that ran only code: its program text is
@@ -3147,10 +3386,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # A log row shows a chain as its first command only (``printenv X + 1
                 # command``), so a run chained behind it is on no row (#4620). The
                 # required patterns and runs also read the logged cards' calls as
-                # typed, a call that repeats a row verbatim excepted. The forbidden set
-                # keeps the rows: a typed heredoc splits into one argv per line, so a
-                # command written into a file and never run would read as a forbidden
-                # run, and an exemption is written against the rendering. An exemption
+                # typed, a call that repeats a row verbatim excepted. The forbidden
+                # patterns keep the rows: an exemption is written against the rendering.
+                # The forbidden runs also read the logged cards' terminal calls
+                # (``_forbidden_run_commands``), a call with a heredoc excepted: a typed
+                # heredoc splits into one argv per line, so a command written into a
+                # file and never run would read as a forbidden run. An exemption
                 # still takes an exempt call out of the required read, as it does a row.
                 if self.required_patterns or self.required_runs:
                     rows = set(logged_commands)
@@ -3160,7 +3401,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined.append(f"{len(children)} from the tagged calls of cards with no log line")
                 if beside_rows:
                     count = len(beside_rows)
-                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
+                    readers = "the required checks and the forbidden runs" if self.forbidden_runs else "the required checks only"
+                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by {readers}")
                 if joined:
                     sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
             if self.exempt_grep_patterns:
@@ -3178,6 +3420,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined_rows = {str(row.get("command", "")) for row in snap.worker_commands if str(row.get("task") or "") in joined}
             typed = logged_commands + children
             windowed = typed
+            if self.forbidden_runs:
+                run_commands = self._forbidden_run_commands(snap, calls, logged)
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -3194,6 +3438,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            if self.refused_result_pattern is not None:
+                run_commands = [command for _, _, command, result, _ in calls if not self._refused(command, result)]
             # The ordered check reads the calls alone: a log row has no time.
             # A check with no forbidden set keeps the card log as a source for
             # its required checks: the trajectory can be the narrower read (two
@@ -3257,9 +3503,11 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         # The argvs serve the runs only: the commands' for the required runs, the typed calls'
         # for the forbidden runs. A check with patterns alone reads none. Each line is read by
-        # itself; a line past the reader's limit has no argvs.
-        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
-        typed_argvs, typed_unread = _argvs_and_first_unread(typed if self.forbidden_runs else [])
+        # itself; a line past the reader's limit has no argvs, and a part that the reader
+        # refuses has none either.
+        cut, programs = _cut_command_texts(snap.trajectory), _program_texts(snap.trajectory)
+        argvs, unread, refused = _argvs_and_first_unread(commands if self.required_runs else [], cut, programs)
+        typed_argvs, typed_unread, typed_refused = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [], cut, programs)
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
@@ -3279,6 +3527,20 @@ class WorkerCommandsVerifier(BaseVerifier):
                 status="error",
                 elapsed_time=time.monotonic() - start,
                 reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
+        # A part that the reader refuses follows the same rule, for the runs that it can hold:
+        # a required run that is still missing, when a refused part of the commands has its
+        # words; a clean read of the forbidden runs, when a refused part of a typed line has
+        # the words of one of them.
+        not_read = None
+        if not (hits or ran or missing):
+            not_read = _refused_part_naming(refused, unrun) if unrun else _refused_part_naming(typed_refused, self.forbidden_runs)
+        if not_read is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_UNREAD_PART_REASON.format(shown=not_read[0][:_SHOWN_COMMAND_CHARS], script=not_read[1]),
             )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
@@ -3569,11 +3831,14 @@ class WorkerBudgetVerifier(BaseVerifier):
     and no completed attempt either (the harness archived the card at its
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
-    A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches; a capture in which every result was
-    withheld or never recorded is unreadable, and with nothing named it is
-    ``status="error"`` too, while a single missing result among readable ones
-    does not turn a plain failure into one.
+    A notice in the part of a result that the capture's clip dropped is not
+    read: the clip keeps a result's head and its last
+    ``worker_trajectory.RESULT_TAIL_CHARS`` characters, where an appended
+    notice is, and a card of short tool outputs never reaches the clip; a
+    capture in which every result was withheld or never recorded is
+    unreadable, and with nothing named it is ``status="error"`` too, while a
+    single missing result among readable ones does not turn a plain failure
+    into one.
     """
 
     type: Literal["worker_budget"]
@@ -8676,7 +8941,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
-        "ingress-gateway-healthcheck-mismatch",
+        "ingress-gateway-healthcheck-mismatch", "image-pull-failing",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
@@ -9665,21 +9930,32 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_state_file(shell: Callable[[str, float], str], path: str, timeout: float) -> dict[str, Any] | None:
+    """The JSON object a stack recorded at ``path`` in the pod ``shell`` reaches, or None when there is none."""
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def fired_at_of(state: dict[str, Any] | None) -> datetime | None:
+    """A stack state's ``fired_at``, or None when it has none that is an aware ISO-8601 stamp."""
+    try:
+        fired = datetime.fromisoformat(str((state or {})["fired_at"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+    return fired if fired.tzinfo is not None else None
+
+
 def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
     """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
 
     Missing file, not JSON, no ``fired_at``, or one that is not an aware
     ISO-8601 stamp all read as None: the stack did not fire the run.
     """
-    reply = shell(f"cat {shlex.quote(path)}", timeout)
-    try:
-        state = json.loads(reply.strip().splitlines()[-1])
-        fired = datetime.fromisoformat(str(state["fired_at"]))
-    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if fired.tzinfo is None:
-        return None
-    return fired
+    return fired_at_of(read_state_file(shell, path, timeout))
 
 
 def read_report_store(
@@ -9697,8 +9973,180 @@ def read_report_store(
     return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
 
 
+class _StoredReportVerifier(_OnboardingPollVerifier):
+    """What ``audit_report_stored`` and ``shadow_report_stored`` share: one stream's store read and its grading.
+
+    A subclass names the stream (``_stream``), the pods whose report store it
+    reads (``_store_shells``, with ``_store_where`` naming them for a reason),
+    the pod holding ``since_state_file`` (``_state_shell``), and any envelope
+    keys it holds every envelope to beyond ``required_envelope``
+    (``_forced_envelope``). The window, the start bound and the finding and
+    evidence rules are the same for both; :class:`AuditReportStoredVerifier`
+    documents them.
+    """
+
+    status: AuditStatus | None = None
+    required_finding_phrases: list[str] = Field(default_factory=list)
+    forbidden_finding_phrases: list[str] = Field(default_factory=list)
+    required_evidence_phrases: list[str] = Field(default_factory=list)
+    # Top-level envelope keys and the value each must hold on this run's envelope.
+    required_envelope: dict[str, Any] = Field(default_factory=dict)
+    # A JSON file whose ``fired_at`` (ISO-8601, as the audit-chat-report,
+    # unchanged-manifest-digest and builtin-schedule-run-now stacks write it)
+    # replaces the run's start as the lower bound, with no skew allowance: the
+    # fire and the envelope are stamped by the same install. Unreadable is an error.
+    since_state_file: str | None = None
+    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
+    # the agent pod are two clocks.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @model_validator(mode="after")
+    def _evidence_names_its_findings(self) -> "_StoredReportVerifier":
+        if self.required_evidence_phrases and not self.required_finding_phrases:
+            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
+        return self
+
+    def _stream(self) -> str:
+        raise NotImplementedError
+
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        raise NotImplementedError
+
+    def _store_where(self) -> str:
+        raise NotImplementedError
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        raise NotImplementedError
+
+    def _forced_envelope(self) -> dict[str, Any]:
+        return {}
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """One pod's envelopes of ``stream``, or None and why not: the store tree, read directly.
+
+        ``state`` is the stack's state file, read once for the poll (None without one).
+        """
+        return read_report_store(shell, stream, timeout, keys, excerpts), None
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        snap = transcript.get()
+        if snap is None:
+            return "error", _NO_TRANSCRIPT_REASON, None
+        if not snap.started_at:
+            return "error", _NO_RUN_CLOCK_REASON, None
+        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
+            seconds=self.max_clock_skew_sec
+        )
+        state = None
+        if self.since_state_file:
+            # Read once per poll; _read_listing gets the same object.
+            state = read_state_file(self._state_shell(), self.since_state_file, read_timeout)
+            fired = fired_at_of(state)
+            if fired is None:
+                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
+            # No skew: the fire and the envelope are stamped by the same install.
+            since = fired
+        stream = self._stream()
+        expected = {**self.required_envelope, **self._forced_envelope()}
+        envelopes: list[dict[str, Any]] = []
+        read_any = False
+        unread: list[str] = []
+        for shell in self._store_shells():
+            listing, why = self._read_listing(
+                shell, stream, read_timeout, tuple(expected), bool(self.required_evidence_phrases), state
+            )
+            if listing is not None:
+                read_any = True
+                envelopes.extend(listing)
+            elif why:
+                unread.append(why)
+        if not read_any:
+            detail = f": {'; '.join(unread)}" if unread else ""
+            return "error", f"{self._store_where()} could not be read{detail}", None
+        fresh = []
+        started_early = 0
+        for envelope in envelopes:
+            try:
+                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
+            except ValueError:
+                continue
+            if finished.tzinfo is None or finished < since:
+                continue
+            # An envelope that names its run's start counts only when that run
+            # opened inside the window: a run from an earlier repetition can
+            # finish inside this one. One with the key and no start is such a
+            # late finish too, and so is one whose start is after its finish (a
+            # later run's stamp); an older image writes no key and is read by
+            # `finished_at` alone. The start is stamped in whole seconds, so the
+            # bound is floored to the second for it.
+            if _ENVELOPE_STARTED_KEY in envelope:
+                try:
+                    began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
+                except ValueError:
+                    began = None
+                if (
+                    began is None
+                    or began.tzinfo is None
+                    or began < since.replace(microsecond=0)
+                    or began > finished
+                ):
+                    started_early += 1
+                    continue
+            fresh.append(envelope)
+        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *expected)
+        raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
+        if not fresh:
+            window = "the stack fired the audit" if self.since_state_file else "the run started"
+            early = (
+                f"; {started_early} finished since but came from a run that opened before then or named no start"
+                if started_early
+                else ""
+            )
+            errors = [str(e["error"]) for e in envelopes if e.get("error")]
+            said = f"; unread: {'; '.join(errors)}" if errors else ""
+            return (
+                "fail",
+                f"no {stream} report in {REPORT_STORE_ROOT} finished since {window} "
+                f"({len(envelopes) - started_early} older or unreadable{early}){said}",
+                raw,
+            )
+        failures = []
+        for envelope in fresh:
+            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
+            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
+            excerpts = envelope.get("finding_excerpts") or {}
+            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
+            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
+            wrong = {key: envelope.get(key) for key, value in expected.items() if envelope.get(key) != value}
+            if self.status is not None and envelope.get("status") != self.status:
+                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif wrong:
+                failures.append(
+                    f"{envelope.get('repo')}: "
+                    + ", ".join(f"{key} is {actual!r}, not {expected[key]!r}" for key, actual in wrong.items())
+                )
+            elif missing:
+                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            elif present:
+                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
+            elif unevidenced:
+                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
+            else:
+                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
+        return "fail", "; ".join(failures), raw
+
+
 @VERIFIERS.register("audit_report_stored")
-class AuditReportStoredVerifier(_OnboardingPollVerifier):
+class AuditReportStoredVerifier(_StoredReportVerifier):
     """Checks that a fleet audit kept this run's report in the on-pod report store.
 
     Reads ``latest.json`` under every repository directory of ``audit`` in the
@@ -9732,120 +10180,16 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
 
     type: Literal["audit_report_stored"]
     audit: AuditId
-    status: AuditStatus | None = None
-    required_finding_phrases: list[str] = Field(default_factory=list)
-    forbidden_finding_phrases: list[str] = Field(default_factory=list)
-    required_evidence_phrases: list[str] = Field(default_factory=list)
-    # Top-level envelope keys and the value each must hold on this run's envelope.
-    required_envelope: dict[str, Any] = Field(default_factory=dict)
-    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
-    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
-    # replaces the run's start as the lower bound, with no skew allowance: the
-    # fire and the envelope are stamped by the same pod. Unreadable is an error.
-    since_state_file: str | None = None
-    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
-    # the agent pod are two clocks.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
-    @model_validator(mode="after")
-    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
-        if self.required_evidence_phrases and not self.required_finding_phrases:
-            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
-        return self
+    def _stream(self) -> str:
+        return self.audit
 
-    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        snap = transcript.get()
-        if snap is None:
-            return "error", _NO_TRANSCRIPT_REASON, None
-        if not snap.started_at:
-            return "error", _NO_RUN_CLOCK_REASON, None
-        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
-            seconds=self.max_clock_skew_sec
-        )
-        if self.since_state_file:
-            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
-            if fired is None:
-                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
-            # No skew: the fire and the envelope are stamped by the same pod.
-            since = fired
-        envelopes: list[dict[str, Any]] = []
-        read_any = False
-        for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(
-                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
-            )
-            if listing is not None:
-                read_any = True
-                envelopes.extend(listing)
-        if not read_any:
-            return "error", "neither the sandbox nor the agent container could be read", None
-        fresh = []
-        started_early = 0
-        for envelope in envelopes:
-            try:
-                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
-            except ValueError:
-                continue
-            if finished.tzinfo is None or finished < since:
-                continue
-            # An envelope that names its run's start counts only when that run
-            # opened inside the window: a run from an earlier repetition can
-            # finish inside this one. One with the key and no start is such a
-            # late finish too, and so is one whose start is after its finish (a
-            # later run's stamp); an older image writes no key and is read by
-            # `finished_at` alone. The start is stamped in whole seconds, so the
-            # bound is floored to the second for it.
-            if _ENVELOPE_STARTED_KEY in envelope:
-                try:
-                    began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
-                except ValueError:
-                    began = None
-                if (
-                    began is None
-                    or began.tzinfo is None
-                    or began < since.replace(microsecond=0)
-                    or began > finished
-                ):
-                    started_early += 1
-                    continue
-            fresh.append(envelope)
-        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *self.required_envelope)
-        raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
-        if not fresh:
-            window = "the stack fired the audit" if self.since_state_file else "the run started"
-            early = (
-                f"; {started_early} finished since but came from a run that opened before then or named no start"
-                if started_early
-                else ""
-            )
-            return (
-                "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since {window} "
-                f"({len(envelopes) - started_early} older or unreadable{early})",
-                raw,
-            )
-        failures = []
-        for envelope in fresh:
-            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
-            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
-            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
-            excerpts = envelope.get("finding_excerpts") or {}
-            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
-            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
-            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
-            if self.status is not None and envelope.get("status") != self.status:
-                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
-            elif wrong:
-                failures.append(
-                    f"{envelope.get('repo')}: "
-                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
-                )
-            elif missing:
-                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
-            elif present:
-                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
-            elif unevidenced:
-                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
-            else:
-                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
-        return "fail", "; ".join(failures), raw
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        # Looked up on each read, so a test's swap of either shell is seen.
+        return (onboarding.sandbox_shell, onboarding.agent_shell)
+
+    def _store_where(self) -> str:
+        return "the sandbox and the agent container"
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        return onboarding.agent_shell

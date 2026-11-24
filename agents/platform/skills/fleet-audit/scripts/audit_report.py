@@ -258,6 +258,7 @@ AUDITS: dict[str, AuditSpec] = {
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
             "ingress-gateway-healthcheck-mismatch",
+            "image-pull-failing",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -1294,6 +1295,7 @@ CHECK_PHRASES = {
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
+    "image-pull-failing": "{object} cannot pull its image",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -3267,6 +3269,7 @@ TRIAGE_REASONS = {
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
     "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
     "manual-pool-fallback": "creates node pools or turns on automatic node pool creation, and which of the two is the owners' call",
+    "image-pull": "follows from why the pull fails, which the alert's triage establishes and this audit does not",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
@@ -4806,17 +4809,22 @@ def report_envelope(
     }
 
 
-def _adopt_owner(path: Path, owner: os.stat_result) -> None:
-    """Give `path` to `owner`'s uid and gid when this run is root.
+def _adopt_owner(descriptor: int, owner: os.stat_result) -> None:
+    """Give the open file or directory `descriptor` to `owner`'s uid and gid
+    when this run is root.
 
     Mode alone cannot fix a root hand-run: uid 1000 can read a root-owned 0755
     directory but cannot create the temp file or rename over `latest.json` in
     it, so every later run would lose its memory and fail its write. Root is
     the one writer that can hand what it creates to the store's owner, and
     any other uid creates what it owns.
+
+    Through a descriptor, never a name: the store's directories are the store
+    owner's, so an entry root just made can be swapped for a link before the
+    chown, and a chown by name would follow it to the link's target.
     """
     if os.geteuid() == ROOT_UID:
-        os.chown(path, owner.st_uid, owner.st_gid)
+        os.fchown(descriptor, owner.st_uid, owner.st_gid)
 
 
 def _make_store_dirs(path: Path) -> None:
@@ -4834,8 +4842,18 @@ def _make_store_dirs(path: Path) -> None:
         except FileExistsError:
             # A rival run made it, and chose its ownership then.
             continue
-        os.chmod(directory, REPORT_DIR_MODE)
-        _adopt_owner(directory, owner)
+        _settle_new_dir(directory, owner)
+
+
+def _settle_new_dir(directory: Path, owner: os.stat_result) -> None:
+    """Set a just-made directory's mode and owner through a no-follow open of
+    it, so neither lands on a link swapped in since the mkdir."""
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(descriptor, REPORT_DIR_MODE)
+        _adopt_owner(descriptor, owner)
+    finally:
+        os.close(descriptor)
 
 
 def _ownership_note(exc: BaseException) -> str:
@@ -4871,9 +4889,11 @@ def _atomic_write(path: Path, text: str) -> None:
     )
     try:
         with handle:
+            # Mode and owner through the open descriptor, not the name, which
+            # can be swapped for a link before the rename.
+            os.fchmod(handle.fileno(), REPORT_FILE_MODE)
+            _adopt_owner(handle.fileno(), path.parent.stat())
             handle.write(text)
-        os.chmod(handle.name, REPORT_FILE_MODE)
-        _adopt_owner(Path(handle.name), path.parent.stat())
         os.replace(handle.name, path)
     except BaseException:
         # Anything that leaves the temp file behind leaves it in the store,

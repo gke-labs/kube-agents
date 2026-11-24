@@ -400,28 +400,55 @@ func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, e
 	if err != nil {
 		return nil, fmt.Errorf("stream %s: %w", TasksStream, err)
 	}
+	env, _, err := c.LastEnvelopeOn(ctx, stream, subject)
+	return env, err
+}
+
+// LastEnvelopeOn is LastEnvelope on a TASKS stream handle the caller already
+// holds, with the message's stream sequence: a caller reading several
+// subjects in one pass looks the stream up once, and can order what it reads
+// across subjects (they share the stream's sequence). The envelope is
+// screened as LastEnvelope screens it; nil when the subject is empty or its
+// newest message is dropped. The supervisor cutoff applies as
+// TaskReplayHeads applies it: a refused newest message reads as an empty
+// subject (sequence 0). As there, a direct get gives no stored time
+// (storedTimeOf), so where the time decides, the subject is read again on
+// lastBySubject's consumer for the server's time.
+func (c *Client) LastEnvelopeOn(ctx context.Context, stream jetstream.Stream, subject string) (*Envelope, uint64, error) {
 	msg, err := stream.GetLastMsgForSubject(ctx, subject)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("newest message on %s: %w", subject, err)
+		return nil, 0, fmt.Errorf("newest message on %s: %w", subject, err)
 	}
-	env, err := ParseEnvelope(msg.Data)
+	data, seq, storedAt := msg.Data, msg.Sequence, storedTimeOf(msg, directGets(stream))
+	if c.storedTimeDecides(subject, storedAt) {
+		if data, storedAt, seq, err = c.lastBySubject(ctx, subject); err != nil {
+			return nil, 0, err
+		}
+	}
+	// The cutoff, as TaskReplayHeads applies it: a profile task's five-token
+	// supervisor message stored past it isn't the task's, so the subject
+	// reads as empty (the conservative reading TaskReplayHeads names).
+	if !c.AcceptSupervisorEvent(subject, storedAt) {
+		return nil, 0, nil
+	}
+	env, err := ParseEnvelope(data)
 	if err != nil {
 		c.log.Error("a2a newest-message read skipping unparseable envelope", "subject", subject, "err", err)
-		return nil, nil
+		return nil, seq, nil
 	}
 	if aerr := CheckSubjectAgreement(subject, env, c.opts.agreement); aerr != nil {
 		c.protocolViolations.Add(1)
 		if !IsAdvisoryDisagreement(aerr) {
 			c.log.Error("a2a newest-message read skipping envelope that disagrees with its subject", "subject", subject, "err", aerr)
-			return nil, nil
+			return nil, seq, nil
 		}
 		// The advisory writer check, as in the replay: counted, returned.
 		c.log.Warn("a2a newest-message read returning envelope whose writer disagrees with its subject (advisory)", "subject", subject, "err", aerr)
 	}
-	return env, nil
+	return env, seq, nil
 }
 
 // IsFinalStatus reports whether env is a status-update carrying final=true,

@@ -3,7 +3,6 @@ Subject: Have the agent read the code through inspect-repository instead of clon
 Why: This install's terminal has no `git` and cannot clone or fetch from GitHub itself, so the CODE-FIRST rule sends the agent to the `inspect-repository` skill, which copies one revision's files (or one `--prefix` of them) at a cited `sha` but no history; `git log -S` and `git blame` are handed to the user, and the agent never states a version or date it has not read. The code index's clone preamble is rewritten to `inspect-repository`'s use (copy the indexed package with `--prefix`, then search the copy, and copy the parent when a prefix names nothing, since upstream's paths move), its verification steps are addressed to the user for the same reason, and its `groupRulesByScore` symbol, which the upstream source does not have, is dropped so the agent does not hand the user a symbol to search for that is not there.
 Local-Issue: #2692
 Eval-Case: compute-class-canary-active-migration-pdb-probe, inspect-repository-unmanaged-and-context-read
-Upstream-Issue: none (specific to this repository)
 Retire-When: never; the install's terminal has no GitHub egress or `git` by design
 
 diff --git a/SKILL.md b/SKILL.md

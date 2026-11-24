@@ -880,15 +880,23 @@ resource "google_container_cluster" "seeded_c" {
 # and `kubelet-config`. Every other pool in this stack runs a 20 GB boot
 # disk of the default type with no kubelet block; this one runs 50 GB (type
 # unchanged: size alone differed in the incident behind the facets) and
-# sets one kubelet key, cpu_cfs_quota, to false. False rather than the
-# default true, so the facet reads a difference whether it treats an absent
-# key as unset or as the default; CFS quota off on a node that runs only
-# system pods changes nothing anyone measures. Both fields update in place
-# on the pinned provider (8.4.0): GKE recreates the pool's one node, the
-# pool keeps its identity, and the cluster's createTime does not move, so
-# the drift SOP's 24-hour cohort gate is untouched and no reconcile-allow
-# entry is needed. The fixture role is drift-pool-outlier (fixtures.json);
-# the facets and the case that reads it are the follow-up.
+# sets one kubelet key, pod_pids_limit, to 4096. GKE sets no pod PID limit
+# unless asked, so the facet reads a difference whether it treats an absent
+# key as unset or as the default, and a PID cap on a node whose only
+# workload pods are the pause containers defects-c.tf plants changes
+# nothing anyone measures. An integer and not the cpu_cfs_quota = false
+# this block first carried: the pinned provider (8.4.0) force-sends an
+# explicit false only when it creates a pool, reads a pool without the key
+# as false, and so planned nothing and sent nothing on a pool that already
+# existed; the key never reached a project older than the block. A
+# non-zero integer is sent on create and on update alike. A pool created
+# with the earlier key may keep it beside this one: the update request
+# leaves it out, and no assertion reads it. Both fields update in place:
+# GKE recreates the pool's one node, the pool keeps its identity, and the
+# cluster's createTime does not move, so the drift SOP's 24-hour cohort
+# gate is untouched and no reconcile-allow entry is needed. The fixture
+# role is drift-pool-outlier (fixtures.json); the facets and the case that
+# reads it are the follow-up.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
   location   = var.zone
@@ -941,7 +949,7 @@ resource "google_container_node_pool" "seeded_c_default" {
     }
 
     kubelet_config {
-      cpu_cfs_quota = false
+      pod_pids_limit = 4096
     }
 
     workload_metadata_config {
@@ -1213,6 +1221,104 @@ resource "google_compute_instance" "startup_fail" {
     block-project-ssh-keys = "true"
     enable-oslogin         = "TRUE"
     startup-script         = "#!/bin/bash\necho 'eval fixture: planted startup-script failure'\nexit 1\n"
+  }
+
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+
+  labels = local.fleet_labels
+}
+
+# Defect (compute): a standalone VM whose serial console rotates minutes
+# after boot. The GCE compute audit reads the serial console of RUNNING
+# instances, and a console can have rotated past the boot: the buffer keeps
+# about 1 MiB, so a busy guest leaves no startup lines to read, and the
+# audit's notes must say the console rotated rather than report a clean
+# boot (#5389; the startup-fail VM above is the same check's unrotated
+# shape). This VM plants that state on a clock of minutes, not weeks. Its
+# startup script prints its own failure line, installs a oneshot systemd
+# service with a timer, and exits 1, so the guest agent prints
+# `Script "startup-script" failed with error: exit status 1` as it does on
+# the startup-fail VM. Two minutes after boot, and every 24 hours after,
+# the service writes 40960 counted filler lines (about 2 MiB, twice the
+# buffer) to serial port 1 and stops: the flood is bounded by the fixed
+# count on every pass, never a loop, and nothing secret goes to the serial
+# console -- each line is a fixed literal plus its index. The daily repeat
+# keeps the fixture healthy: the guest agent's own output (about 1 MiB in
+# three weeks on a VM with no service account) would otherwise rotate the
+# filler out, and nothing reboots this VM. hack/fleet_reconcile.py resets
+# only the exact state address `google_compute_instance.startup_fail`, so
+# it never resets this one -- by design, because the rotated console IS
+# this fixture's designed state, and a reset would put a fresh failure
+# line on it for the minutes before the next flood pass. The fixture-state
+# scan asserts the filler on the console (fixtures.json,
+# rotated-console-vm): one pass is twice the buffer, so filler in the
+# buffer means the boot's lines are out. Otherwise the startup-fail VM's
+# shape: an e2-micro, no external IP, no service account, and the name
+# leads with `serial-flood-` so a case can grade the finding's object path.
+resource "google_compute_instance" "serial_flood" {
+  name         = "serial-flood-${var.cluster_prefix}"
+  machine_type = "e2-micro"
+  zone         = var.zone
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+
+  network_interface {
+    network = "default"
+  }
+
+  metadata = {
+    block-project-ssh-keys = "true"
+    enable-oslogin         = "TRUE"
+    startup-script         = <<-EOT
+      #!/bin/bash
+      # Eval fixture. The serial console gets only fixed literals and a line
+      # counter; nothing secret is written to it.
+      cat >/usr/local/sbin/serial-flood <<'FLOOD'
+      #!/bin/bash
+      # One bounded pass: FLOOD_LINES counted filler lines, about 2 MiB, to
+      # serial port 1, then stop. Twice the 1 MiB console buffer, so one
+      # pass pushes every earlier line out.
+      readonly FLOOD_LINES=40960
+      for i in $(seq 1 "$FLOOD_LINES"); do
+        printf 'eval fixture: serial-flood filler %05d of %d\n' "$i" "$FLOOD_LINES"
+      done > /dev/ttyS0
+      FLOOD
+      chmod 0755 /usr/local/sbin/serial-flood
+      cat >/etc/systemd/system/serial-flood.service <<'UNIT'
+      [Unit]
+      Description=eval fixture: one bounded serial-console flood pass
+
+      [Service]
+      Type=oneshot
+      # A real 16550 pace (115200 baud) takes about three minutes for the
+      # pass; the default 90 s start timeout would cut it short.
+      TimeoutStartSec=30min
+      ExecStart=/usr/local/sbin/serial-flood
+      UNIT
+      cat >/etc/systemd/system/serial-flood.timer <<'UNIT'
+      [Unit]
+      Description=eval fixture: flood the serial console after boot, then daily
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=24h
+
+      [Install]
+      WantedBy=timers.target
+      UNIT
+      systemctl daemon-reload
+      systemctl enable --now serial-flood.timer
+      echo 'eval fixture: planted rotated-console failure'
+      exit 1
+    EOT
   }
 
   shielded_instance_config {

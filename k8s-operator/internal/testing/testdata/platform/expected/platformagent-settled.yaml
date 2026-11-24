@@ -1,4 +1,25 @@
 apiVersion: v1
+data:
+  hold.json: |
+    {}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-hold
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   annotations:
@@ -833,6 +854,8 @@ spec:
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
             - name: KUBE_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
               value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
@@ -881,6 +904,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-hold-vol
+              readOnly: true
       dnsConfig:
         options:
           - name: ndots
@@ -911,6 +937,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-hold
+            optional: true
+          name: platform-agent-hold-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -1505,6 +1539,8 @@ spec:
               value: system:serviceaccount:kubeagents-system:platformagent-a2a-mcp
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
               value: kubeagents-credential-proxy-a2a-reports
             - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
@@ -1603,6 +1639,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-hold-vol
+              readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
               readOnly: true
@@ -1677,6 +1716,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-hold
+            optional: true
+          name: platform-agent-hold-vol
         - name: audit-report-store-ksa
           projected:
             defaultMode: 256
@@ -6076,6 +6123,106 @@ spec:
       app: platformagent-a2a-gateway
   policyTypes:
     - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway-egress
+  name: platformagent-a2a-gateway-egress
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    - ports:
+        - port: 4222
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: nats
+    - ports:
+        - port: 8765
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy
+              kubeagents.x-k8s.io/component: credential-proxy
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10
+              - ff00::/8
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-gateway
+  policyTypes:
+    - Egress
 ---
 apiVersion: apps/v1
 kind: Deployment

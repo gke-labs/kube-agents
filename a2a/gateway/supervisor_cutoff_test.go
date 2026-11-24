@@ -281,10 +281,30 @@ func TestTheFanOutHealIgnoresAFiveTokenTerminalOnAProfileChildAfterTheCutoff(t *
 			t.Fatal(err)
 		}
 	}
-	if r.g.healBatchChild(ctx, rec, profKid) {
+	stream, err := r.g.tasksStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both of the heal's reads (#6646): the probe, which drives it, and the
+	// full replay the pass's spot check makes for one running child.
+	probe := func(k TaskRef) taskProbe {
+		p, err := r.g.probeTask(ctx, stream, k.Addressee, k.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if p := probe(profKid); p.final {
+		t.Errorf("the probe read the profile child's five-token write after the cutoff as its terminal: %+v", p)
+	} else if r.g.healBatchChild(ctx, rec, profKid, p, false) {
 		t.Error("the profile child healed on a five-token write after the cutoff")
 	}
-	if !r.g.healBatchChild(ctx, rec, sessKid) {
+	if r.g.healBatchChild(ctx, rec, profKid, taskProbe{}, true) {
+		t.Error("the spot check's replay healed the profile child on a five-token write after the cutoff")
+	}
+	if p := probe(sessKid); !p.final {
+		t.Errorf("the probe missed the session child's supervisor terminal: %+v", p)
+	} else if !r.g.healBatchChild(ctx, rec, sessKid, p, false) {
 		t.Error("the session child did not heal on its supervisor's terminal")
 	}
 	if got := r.terminalsFor(cutoffProfileTask); len(got) != 0 {

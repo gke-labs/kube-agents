@@ -40,7 +40,7 @@ const (
 	// proposeOnlyNote precedes a code block that changes a cluster or a
 	// project. The session's broker refuses writes anyway; the note is what
 	// keeps the model from trying, and from presenting the step as done.
-	proposeOnlyNote = "> **Propose this to the operator; do not run it.** It changes a cluster or a project, and this session is read-only. Write it out as a proposal, or delegate it to `platform` if the person wants it done."
+	proposeOnlyNote = "> **Propose this to the operator; do not run it.** It changes a cluster or a project, and this session is read-only. Write it out as a proposal, or, if the person wants it done, delegate the whole ask to `platform` when the delegate tool lists it, in the turn it is asked and with the reads it depends on."
 	// unavailableNote precedes a code block that runs a program the
 	// session can't: Bash is limited to kubectl and gcloud, and the scripts
 	// the skills name are not shipped.

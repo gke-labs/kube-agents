@@ -1261,6 +1261,10 @@ type turnWatch struct {
 	unpin func()
 	// resultSeen is signalled on each result frame recorded in results.
 	resultSeen chan struct{}
+	// beforeSnapshot, when set, runs in gatherReports between its read of
+	// what ends the gathering and its read of the buffer. Tests set it, to
+	// place a report, a result or the end of the wait between the two.
+	beforeSnapshot func()
 	// release hands back the conversation's send lock. A turn holds it from
 	// before it is sent until the watch closes, after its answer is read, so
 	// a second turn on the conversation is sent only once this one is done:
@@ -2587,6 +2591,12 @@ func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) 
 // nothing reliable about whether it is the last, so nothing in its text ends
 // the gathering. When the tasks had not ended, it takes what is already
 // here.
+//
+// Whatever ends the gathering is read before the buffer is, so a report the
+// listener kept before the root's result was noted, the wait ran out or the
+// quiet period passed is among the reports returned. Read the other way
+// round, a report kept between the two reads was left out of a turn that
+// had heard it.
 func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutcome, ended bool) {
 	if b.events == nil {
 		return
@@ -2594,7 +2604,16 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 	quiet := time.NewTimer(reportQuiet)
 	defer quiet.Stop()
 	var last uint64
+	quietOver := false
 	for {
+		// The root's result says whether the chain handed work to cards:
+		// without it nothing more is coming, with it a card's report may
+		// take a while. With no result heard, the quiet period decides.
+		seen, pending := w.rootResult(out.Root.TaskID)
+		waitOver := ctx.Err() != nil
+		if w.beforeSnapshot != nil {
+			w.beforeSnapshot()
+		}
 		page, changed := b.events.snapshot(w.token)
 		out.Reports, out.ReportCursor = nil, page.Cursor
 		out.ReportsDropped = page.Dropped > 0 && page.DroppedNewest > w.since
@@ -2610,15 +2629,12 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 		if newest > last {
 			last = newest
 			quiet.Reset(reportQuiet)
+			quietOver = false
 		}
 		if !ended {
 			out.ReportsEnd = reportsRunning
 			return
 		}
-		// The root's result says whether the chain handed work to cards:
-		// without it nothing more is coming, with it a card's report may
-		// take a while. With no result heard, the quiet period decides.
-		seen, pending := w.rootResult(out.Root.TaskID)
 		if pending {
 			out.Cards = cardsPending
 		}
@@ -2626,19 +2642,21 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 		case seen && !pending:
 			out.Cards, out.ReportsEnd = cardsNone, reportsNoCards
 			return
-		case ctx.Err() != nil:
+		case waitOver:
 			out.ReportsEnd = reportsWaitOver
 			return
+		case quietOver:
+			out.ReportsEnd = reportsQuiet
+			return
 		}
+		// Each of these goes round again, so that the buffer is read after
+		// what ends the gathering.
 		select {
 		case <-changed:
 		case <-w.resultSeen:
 		case <-quiet.C:
-			out.ReportsEnd = reportsQuiet
-			return
+			quietOver = true
 		case <-ctx.Done():
-			out.ReportsEnd = reportsWaitOver
-			return
 		}
 	}
 }
