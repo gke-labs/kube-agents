@@ -464,7 +464,8 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	requester := TaskRequester{Backend: triggerRequesterBackend, Subject: s.Trigger.Name}
 	prevActive, prevTasks := rec.ActiveTask, rec.Tasks
 	now := time.Now()
-	rec.Delivery = &s.Delivery
+	delivery := s.Delivery
+	rec.Delivery = &delivery
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: run.CorrelationID, Ask: truncateRunes(s.Prompt, askCap),
 		SubmittedAt: now, Capability: run.Capability}
 	if !rec.hasTask(taskID) {
@@ -472,6 +473,7 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 			ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
 			Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
 			RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
+			Delivery: &delivery, TriggerStream: s.Trigger.Stream, TriggerOrigin: s.Trigger.Origin,
 			// Its scope, recorded as a profile task's is: the scope its
 			// children are held to when it fans out (#6744).
 			Scope: string(route.Scope),
@@ -577,7 +579,18 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	out := lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	if task.Final {
+		// How the run's report was delivered, from its SCHEDULED_REPORTS
+		// record (scheduled_reports.go): omitted while there is none or it
+		// can't be read, so the reconciler asks again.
+		if delivery, err := g.scheduledRunStatus(ctx, rec, q.TaskID); err != nil {
+			g.log.Warn("scheduled report status unreadable; the status reply omits it", "taskId", q.TaskID, "err", err)
+		} else {
+			out.Delivery = delivery
+		}
+	}
+	return out
 }
 
 // triggerAuthority is the authority a trigger's task rides: the trigger as
@@ -707,8 +720,9 @@ func triggerConversationKey(source string, s lib.ScheduleRef) string {
 
 // unpostableTrigger reports whether conversation is a trigger's own, which
 // no chat backend owns: the relay posts nothing there (a backend handed the
-// key would refuse it, or worse, read it as one of its own). Where an
-// unattended result goes is Track 3's (#5618), from the record's Delivery.
+// key would refuse it, or worse, read it as one of its own). A schedule's
+// result goes to the home channel, or nowhere, by the record's Delivery
+// (deliverScheduledReport, from relayTerminal).
 func (g *Gateway) unpostableTrigger(conversation string) bool {
 	if !strings.HasPrefix(conversation, triggerConversationPrefix) {
 		return false

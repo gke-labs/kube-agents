@@ -320,7 +320,11 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// lead is all of the gateway's work: the chat.notify routes and Run.
 	// Under the election it runs only while this replica holds the lease.
 	lead := func(ctx context.Context, opts gateway.RunOptions) error {
-		for _, notifier := range chatNotifiers(cfg, backendAdapters, gw.Conversations, log) {
+		notifiers := chatNotifiers(cfg, backendAdapters, gw.Conversations, log)
+		// A schedule trigger's report posts to the home channel through the
+		// same routes (gateway/scheduled_reports.go).
+		gw.SetHomeReporters(notifiers...)
+		for _, notifier := range notifiers {
 			// Home posts refused for want of a home channel are kept in the
 			// session-state bucket and digested when a channel arrives
 			// (gateway/notify_refused.go), each backend in its own store.

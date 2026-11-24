@@ -131,6 +131,16 @@ const (
 	a2aBridgeMemoryLimitEnvVar   = "BRIDGE_MEMORY_LIMIT_BYTES"
 	a2aBridgeMemoryLimitResource = "limits.memory"
 
+	// The channels this install's chat backend serves, which an incident
+	// write over the incident route must name before the bridge stores it
+	// (a2a/hermes-bridge/report_incident.go): the CR's Slack and Google
+	// Chat home channels, and the projected file a gateway's learned Slack
+	// home is read from. Rendered only when there is one, and set here
+	// rather than inherited, so an AgentPlugin's env cannot widen them.
+	a2aBridgeIncidentSlackHomeEnvVar = "A2A_BRIDGE_SLACK_HOME_CHANNEL"
+	a2aBridgeIncidentGchatHomeEnvVar = "A2A_BRIDGE_GCHAT_HOME_CHANNEL"
+	a2aBridgeIncidentSlackFileEnvVar = "A2A_BRIDGE_SLACK_HOME_FILE"
+
 	// The rendered bridge's default pair; a2aRenderedBridgeDefaultResources
 	// says how they were sized. Named so the install prerequisites page's
 	// check can read them (tests/test_quota_preflight.py).
@@ -371,6 +381,27 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	if executor := a2aRenderedBridgeExecutor(); executor != "" {
 		env = append(env, corev1.EnvVar{Name: a2aBridgeExecutorEnvVar, Value: executor})
 	}
+	env = append(env, a2aBridgeIncidentEnv(agent)...)
+	return env
+}
+
+// a2aBridgeIncidentEnv names the channels an incident write may name: the
+// CR's Slack home, the projected learned Slack home (mounted into the agent
+// container, whose mounts the bridge copies, whenever Slack is armed), and
+// the CR's Google Chat home.
+func a2aBridgeIncidentEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	if a2aSlackArmed(agent) {
+		if home := a2aSlackHomeChannel(agent); home != "" {
+			env = append(env, corev1.EnvVar{Name: a2aBridgeIncidentSlackHomeEnvVar, Value: home})
+		}
+		env = append(env, corev1.EnvVar{Name: a2aBridgeIncidentSlackFileEnvVar, Value: agentChatHomeDir + "/" + homeChannelProjectionKey})
+	}
+	if a2aChatArmed(agent) {
+		if home := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel); home != "" {
+			env = append(env, corev1.EnvVar{Name: a2aBridgeIncidentGchatHomeEnvVar, Value: home})
+		}
+	}
 	return env
 }
 
@@ -406,6 +437,9 @@ var a2aBridgeDroppedAgentEnv = map[string]bool{
 	a2aBridgeAPIServerKeyEnvVar:      true,
 	a2aBridgeMemoryLimitEnvVar:       true,
 	memlimit.GoMemLimitEnv:           true,
+	a2aBridgeIncidentSlackHomeEnvVar: true,
+	a2aBridgeIncidentGchatHomeEnvVar: true,
+	a2aBridgeIncidentSlackFileEnvVar: true,
 }
 
 // buildA2ABridgeContainer renders the bridge from the finished agent

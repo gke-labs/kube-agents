@@ -441,6 +441,129 @@ class TestSessionKvServerApi(unittest.TestCase):
         self.assertEqual(data["thread_id"], "test-thread")
         self.assertEqual(data["report"], "This is a test report with Option A and Option B")
 
+    def test_a_second_incident_for_a_thread_keeps_the_first_by_default(self):
+        # The kanban notifier's writes: the first report, the one carrying
+        # the options, is the one a reply reads.
+        for report in ("first, with Option A", "second"):
+            resp = self.client.post("/v1/incidents", json={"chat_id": "c1", "thread_id": "t1", "report": report})
+            self.assertEqual(resp.status_code, 200)
+        resp = self.client.post(
+            "/v1/incidents", json={"chat_id": "c1", "thread_id": "t1", "report": "third", "replace": False}
+        )
+        self.assertEqual(resp.status_code, 200)
+        got = self.client.get("/v1/incidents/by-thread?chat_id=c1&thread_id=t1").json()
+        self.assertEqual(got["report"], "first, with Option A")
+
+    def test_a_replacing_incident_keeps_the_newest_and_restarts_its_age(self):
+        # The gateway's scheduled reports: one thread per schedule per day,
+        # and a reply reads the newest, aged from when it was stored, on a
+        # row the same source wrote.
+        import sqlite3
+        from datetime import datetime, timedelta, timezone
+
+        old_time = (datetime.now(timezone.utc) - timedelta(days=13)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO incidents (chat_id, thread_id, report, created_at, source) VALUES (?, ?, ?, ?, ?)",
+                    ("C0HOME", "1763100000.000100", "the day's first report", old_time, "a2a-schedule"),
+                )
+        resp = self.client.post(
+            "/v1/incidents",
+            json={"chat_id": "C0HOME", "thread_id": "1763100000.000100", "report": "the newest",
+                  "replace": True, "source": "a2a-schedule"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "stored"})
+        got = self.client.get("/v1/incidents/by-thread?chat_id=C0HOME&thread_id=1763100000.000100").json()
+        self.assertEqual(got["report"], "the newest")
+        with sqlite3.connect(temp_db_path) as conn:
+            (created_at,) = conn.execute(
+                "SELECT created_at FROM incidents WHERE chat_id = ? AND thread_id = ?",
+                ("C0HOME", "1763100000.000100"),
+            ).fetchone()
+        self.assertGreater(created_at, old_time, "the replaced report kept the old report's age")
+        # A first write with replace stores as any first write does.
+        resp = self.client.post(
+            "/v1/incidents",
+            json={"chat_id": "C0HOME", "thread_id": "1763100000.000200", "report": "x", "replace": True,
+                  "source": "a2a-schedule"},
+        )
+        self.assertEqual(resp.json(), {"status": "stored"})
+
+    def test_a_replacing_incident_leaves_another_writers_row(self):
+        # A row the relay, the notifier or a triage card stored (source ''),
+        # or another named source, stays first-write-wins under replace.
+        for thread, (first_source, first_body) in {
+            "t-legacy": ("", {}),
+            "t-other": ("other-writer", {"replace": True, "source": "other-writer"}),
+        }.items():
+            resp = self.client.post(
+                "/v1/incidents", json={"chat_id": "C0HOME", "thread_id": thread, "report": "the first", **first_body}
+            )
+            self.assertEqual(resp.json(), {"status": "stored"}, thread)
+            resp = self.client.post(
+                "/v1/incidents",
+                json={"chat_id": "C0HOME", "thread_id": thread, "report": "the gateway's", "replace": True,
+                      "source": "a2a-schedule"},
+            )
+            self.assertEqual(resp.status_code, 200, thread)
+            self.assertEqual(resp.json(), {"status": "kept"}, thread)
+            got = self.client.get(f"/v1/incidents/by-thread?chat_id=C0HOME&thread_id={thread}").json()
+            self.assertEqual(got["report"], "the first", f"{thread} (first written by {first_source!r})")
+
+    def test_an_incident_replace_that_is_not_a_boolean_is_refused(self):
+        for value in ("true", 1, None, [True]):
+            resp = self.client.post(
+                "/v1/incidents",
+                json={"chat_id": "c2", "thread_id": "t2", "report": "r", "replace": value, "source": "a2a-schedule"},
+            )
+            self.assertEqual(resp.status_code, 400, f"replace={value!r}")
+        self.assertEqual(
+            self.client.get("/v1/incidents/by-thread?chat_id=c2&thread_id=t2").status_code, 404,
+            "a refused write stored something",
+        )
+
+    def test_an_incident_replace_needs_a_valid_source(self):
+        for body, why in (
+            ({"replace": True}, "replace with no source"),
+            ({"replace": True, "source": ""}, "replace with an empty source"),
+            ({"replace": True, "source": "A2A_Schedule"}, "a source outside a-z0-9-"),
+            ({"replace": True, "source": "x" * 33}, "a source over 32 characters"),
+            ({"source": 7}, "a source that is not a string"),
+        ):
+            resp = self.client.post("/v1/incidents", json={"chat_id": "c3", "thread_id": "t3", "report": "r", **body})
+            self.assertEqual(resp.status_code, 400, why)
+        self.assertEqual(self.client.get("/v1/incidents/by-thread?chat_id=c3&thread_id=t3").status_code, 404)
+
+    def test_init_db_adds_the_incident_source_column_to_an_existing_table(self):
+        # A database from before `source`: init_db adds it, keeps the rows,
+        # reads them back as '' (never replaceable), and runs again cleanly.
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        legacy_db = Path(tempfile.mkdtemp()) / "legacy.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute(
+                "CREATE TABLE incidents (chat_id TEXT NOT NULL, thread_id TEXT NOT NULL, report TEXT NOT NULL, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (chat_id, thread_id))"
+            )
+            conn.execute("INSERT INTO incidents (chat_id, thread_id, report) VALUES ('C0HOME', 't1', 'legacy')")
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(legacy_db)):
+            session_kv_server.init_db()
+            session_kv_server.init_db()
+            with sqlite3.connect(legacy_db) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(incidents)")}
+                rows = conn.execute("SELECT report, source FROM incidents").fetchall()
+            self.assertIn("source", columns)
+            self.assertEqual(rows, [("legacy", "")])
+            resp = self.client.post(
+                "/v1/incidents",
+                json={"chat_id": "C0HOME", "thread_id": "t1", "report": "new", "replace": True, "source": "a2a-schedule"},
+            )
+            self.assertEqual(resp.json(), {"status": "kept"})
+
     def test_get_incident_not_found(self):
         get_resp = self.client.get("/v1/incidents/by-thread?chat_id=missing&thread_id=missing")
         self.assertEqual(get_resp.status_code, 404)

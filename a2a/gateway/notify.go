@@ -465,6 +465,11 @@ type notifyJob struct {
 	// when it carried none; reply draws it once the request is answered
 	// with a post, and never for a request that posted nothing.
 	mark *MarkState
+	// dropLate drops the job unposted once its deadline has passed, rather
+	// than posting it for a requester that stopped waiting: a scheduled
+	// report's (postHomeReport), whose caller records a late post as one
+	// whose outcome is unknown. A chat.notify request posts late, as before.
+	dropLate bool
 	// rootTask is the root of the task the request's reply_to named, as
 	// postConsole resolved it for the frame; "" when it named none. reply
 	// keeps the post under it.
@@ -642,6 +647,10 @@ func (n *Notifier) work() {
 	for job := range n.jobs {
 		if n.isStopping() {
 			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
+			continue
+		}
+		if job.dropLate && !job.deadline.IsZero() && time.Now().After(job.deadline) {
+			job.answer(lib.NotifyReply{Error: "dropped unposted: its requester stopped waiting"})
 			continue
 		}
 		n.post(job)

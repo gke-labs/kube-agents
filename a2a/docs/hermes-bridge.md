@@ -250,6 +250,15 @@ Drop, or a tap on the Home tab's autonomy dial. The
 bridge relays its known fields to session-kv's `POST /v1/board/actions` on a goroutine of its own,
 so a snapshot is not held behind it, and answers with what session-kv said, or the error.
 
+The incident route keeps a scheduled report the gateway posted against the thread it landed
+in, so a reply there is answered with it: the bridge subscribes `chat.incident`, checks the
+request names a channel this install's chat backend serves (the CR's Slack or Google Chat home
+channel, or the Slack home a gateway learned, read from its projected file:
+`A2A_BRIDGE_SLACK_HOME_CHANNEL`, `A2A_BRIDGE_GCHAT_HOME_CHANNEL`, `A2A_BRIDGE_SLACK_HOME_FILE`),
+stores it with session-kv's `POST /v1/incidents` under the address its own lookup reads, and
+answers under `chat.incident.reply.gateway.`. A request naming any other channel is refused.
+It is bound on the same condition as the board route.
+
 Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
 subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,
 and that is load-bearing twice over. The verifier reads its caller off the last token of
