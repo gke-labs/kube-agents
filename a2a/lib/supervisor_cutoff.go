@@ -445,7 +445,8 @@ func (c *Client) CountProfileSupervisorDrop() { c.profileSupervisorDrops.Add(1) 
 func (c *Client) ProfileSupervisorDrops() int64 { return c.profileSupervisorDrops.Load() }
 
 // ReplayHead is the newest message on one of a task's replay subjects, as a
-// direct get returns it.
+// direct get returns it, or, for the five-token subject the cutoff decides, as
+// lastBySubject returns it.
 type ReplayHead struct {
 	Subject  string
 	Data     []byte
@@ -592,7 +593,7 @@ const lastBySubjectWait = 2 * time.Second
 // install's provision check requires, and an existing TASKS stream, created
 // at the old width, can't grow to it, so the check would refuse it on the
 // upgrade. Today they come out of the stream's slack, at most this many per
-// gateway process.
+// reader process (gateway or MCP server).
 //
 // The bound costs throughput: at most this many such reads per threshold.
 // A later improvement could drop the consumer altogether: a STREAM.MSG.GET

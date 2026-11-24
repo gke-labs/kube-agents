@@ -532,7 +532,8 @@ func (g *Gateway) taskStreamEmpty(ctx context.Context, addressee, taskID string)
 }
 
 // taskProbe is what the newest message on each of a task's replay subjects
-// says, read with direct gets and no consumer (probeTask).
+// says, read with direct gets, and a stored-time consumer only for the
+// five-token subject lib.TaskReplayHeads names (probeTask).
 type taskProbe struct {
 	// empty is nothing on any of the subjects in the retention window.
 	empty bool
@@ -653,9 +654,10 @@ func (g *Gateway) sessionPruneDue(rec *SessionRecord, now time.Time) bool {
 // record, bounded for the notice: when the active task is past the grace,
 // inside the ceiling (withinNoticeCeiling), and the record is not about to
 // be pruned (sessionPruneDue), it asks the stream whether the task has a
-// first event (taskStreamEmpty, no consumer) and applies the test. A read
-// and nothing else: no lock, no post, no write. A task outside that window
-// is answered without touching the stream. A read that fails answers false.
+// first event (taskStreamEmpty, no consumer but the one it names) and
+// applies the test. A read and nothing else: no lock, no post, no write. A
+// task outside that window is answered without touching the stream. A read
+// that fails answers false.
 func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) bool {
 	active := rec.ActiveTask
 	now := time.Now()

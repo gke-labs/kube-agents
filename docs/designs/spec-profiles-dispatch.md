@@ -553,7 +553,8 @@ leave open:
   given `A2A_PROFILE_SUPERVISOR_CUTOFF` stops taking the five-token form as a profile task's
   terminal when the server stored it after that time; contract addendum 6, #5301). The operator
   renders that env on the gateway and the MCP server once the `ProfileSupervisorForm` condition
-  has latched True, as the condition's `lastTransitionTime` plus ten minutes, in RFC3339 UTC; an
+  has latched True, as the condition's `lastTransitionTime` plus ten minutes, in RFC3339 UTC (on
+  an install that latched earlier, that time may already be in the past at the upgrade); an
   unlatched install renders none, so its readers take both forms and nothing rolls. The gate
   holds against the gateway, whose grant still reaches the five-token form, so both its inputs
   are the operator's: which addressees are profiles comes only from the profile names file it

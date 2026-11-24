@@ -356,7 +356,8 @@ type Gateway struct {
 	// fanOutReplayHook is an optional test hook, called with the task id each
 	// time a fan-out path replays a task's stream in full (fanOutReplay),
 	// so a test can tell those reads from the direct gets that open no
-	// consumer (#6646). Read under mu.
+	// consumer, but for a profile's five-token supervisor subject on a reader
+	// with a cutoff (lib.Client.LastEnvelopeOn) (#6646). Read under mu.
 	fanOutReplayHook func(taskID string)
 	// fanOutSpotChecks is, per fan-out parent, the running child the heal
 	// replayed in full last (nextFanOutSpotCheck). Read under mu; in memory,

@@ -1184,7 +1184,7 @@ Lifecycle:
    `…events`. A task whose only event is its supervisor's terminal (the executor never
    ran) is the one exception, and it is terminal at its first event, unless it is a
    five-token supervisor terminal on a profile task stored after the install's
-   `A2A_PROFILE_SUPERVISOR_CUTOFF`: that one is not folded, and the task reads as
+   `A2A_PROFILE_SUPERVISOR_CUTOFF`, or at a time the server doesn't give: that one is not folded, and the task reads as
    `TaskNotFound` or empty. A replay can also
    open past the `submitted` without any publisher breaking the rule: `TASKS` carries a
    per-subject message limit with `discard: old`, so a task that outruns the limit loses

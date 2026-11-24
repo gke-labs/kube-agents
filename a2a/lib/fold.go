@@ -18,9 +18,10 @@ const (
 
 	// EphemeralConsumerInactiveThreshold is how long the server keeps an
 	// ephemeral consumer this module creates on TASKS after its last client
-	// went away. TasksGet sets it on the replay's ordered consumer and the
-	// worker adapter sets it on a session's named consumers, so the two
-	// reap on the same clock.
+	// went away. TasksGet sets it on the replay's ordered consumer,
+	// lastBySubject on its stored-time consumer (supervisor_cutoff.go), and
+	// the worker adapter on a session's named consumers, so all three reap on
+	// the same clock.
 	//
 	// It is set explicitly because nats.go's ordered-consumer default is five
 	// MINUTES (v1.53.1, jetstream/ordered.go:635; the caller's value replaces
@@ -390,9 +391,10 @@ func (c *Client) TaskInReplay(ctx context.Context, addressee, taskID string) (ev
 // returns it parsed and screened the way the replay screens: nil, with no
 // error, when the subject holds nothing in the retention window or when its
 // newest message is one the replay would have dropped (unparseable, or in
-// disagreement with its subject). It opens no consumer, which is the point: a
-// caller whose question the newest message answers does not pay the replay's
-// five-second ephemeral for it. An error is the read failing, not the subject
+// disagreement with its subject). It opens no consumer, but for a profile's
+// five-token supervisor subject on a reader with a cutoff (LastEnvelopeOn),
+// which is the point: a caller whose question the newest message answers does
+// not pay the replay's five-second ephemeral for it. An error is the read failing, not the subject
 // being empty.
 func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, error) {
 	_, js := c.conn()
@@ -414,6 +416,18 @@ func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, e
 // subject (sequence 0). As there, a direct get gives no stored time
 // (storedTimeOf), so where the time decides, the subject is read again on
 // lastBySubject's consumer for the server's time.
+//
+// The sequence is the direct get's Nats-Sequence header, which sits after the
+// publisher's own header block and so can be forged (the replay's horizon
+// note says how), except on that stored-time path, where it is the consumer's
+// delivery metadata, which the server writes. So it is fit for present /
+// absent, and for ordering subjects only the executor or the dispatcher can
+// write (`.events`, the six-token supervisor subject), not the
+// gateway-writable five-token supervisor subject, whose order comes from the
+// consumer path when the cutoff decides. Where no cutoff decides (none set,
+// or an addressee that isn't a listed profile), that subject is the task's
+// legitimate supervisor's, and probeTask orders it by the direct get's
+// sequence like the others.
 func (c *Client) LastEnvelopeOn(ctx context.Context, stream jetstream.Stream, subject string) (*Envelope, uint64, error) {
 	msg, err := stream.GetLastMsgForSubject(ctx, subject)
 	if err != nil {
@@ -422,6 +436,8 @@ func (c *Client) LastEnvelopeOn(ctx context.Context, stream jetstream.Stream, su
 		}
 		return nil, 0, fmt.Errorf("newest message on %s: %w", subject, err)
 	}
+	// seq is the direct get's header, forgeable; where the cutoff decides,
+	// lastBySubject replaces it with the consumer's, which the server writes.
 	data, seq, storedAt := msg.Data, msg.Sequence, storedTimeOf(msg, directGets(stream))
 	if c.storedTimeDecides(subject, storedAt) {
 		if data, storedAt, seq, err = c.lastBySubject(ctx, subject); err != nil {
