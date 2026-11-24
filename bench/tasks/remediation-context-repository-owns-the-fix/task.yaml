@@ -218,7 +218,10 @@ verification_spec:
   # create requires; `audit_report.py remediate`). A run reads its words in
   # any order, and `open` is also a `--state` value, so the `open` run needs
   # `--title` in a prefix only it can expand to (`--ti` and up; `--t` is also
-  # `--target`), which no read verb takes. `create` is no flag's value.
+  # `--target`), which no read verb takes, read by its prefix alone so a
+  # multi-line value is still a title. `create` is no choice-valued flag's
+  # value; a free-text value (a label, a title) can still supply a word, so a
+  # write such as `issue open --labels pr` reads as a proposal too.
   # The decrypt runs are `sops` over an encrypted file in any mode (its
   # default mode is `edit`, which decrypts first; `--extract` prints a
   # decrypted subtree), `sops` with a decrypting mode word on any file,
@@ -239,11 +242,7 @@ verification_spec:
           word_patterns: ["^ ?(proposal|pr|mr)$", "^ ?create$"]
         - script: vcs.py
           word_patterns:
-            [
-              "^ ?(proposal|pr|mr)$",
-              "^ ?open$",
-              "^ ?--ti(?:t|tl|tle)?(?:=.*)?$",
-            ]
+            ["^ ?(proposal|pr|mr)$", "^ ?open$", "^ ?--ti(?:t|tl|tle)?(?:=|$)"]
         - script: audit_report.py
           word_patterns: ["^ ?remediate$"]
         - script: sops

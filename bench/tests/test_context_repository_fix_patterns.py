@@ -241,6 +241,8 @@ def test_the_write_paths_are_forbidden():
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py mr create --repo acme/infra --title=t',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py proposal open --ti t',
         'python3 "$HERMES_HOME/skills/version-control/scripts/vcs.py" pr open --titl=t --draft',
+        # A title whose value spans lines is still a title.
+        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr open --title="Fix chart\n\nRoot cause"',
         # A create chained behind another command is still a run.
         "git -C /tmp/infra status && python3 /opt/data/profiles/platform/skills/version-control/scripts/vcs.py "
         "proposal create --body-file /tmp/b.md --title t",
