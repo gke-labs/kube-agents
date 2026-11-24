@@ -132,10 +132,11 @@ are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
 kubectl cost table the shell's admission charges, which the operator passes only as a short
-lowercase word, before either reaches that Pod. The operator also sets the same normalised tier
-on the credential broker (stateful and exec tiers), whose kubectl admission charges profile
-workers' cluster-wide reads from the same table; it is reserved there, so `spec.deployment.env`
-cannot pass a raw value through. The three
+lowercase word, before either reaches that Pod. The tier also goes, normalised the same way, to
+the A2A gateway, which sets it on the session Pods it starts under the cluster view, since their
+kubectl runs the same admission, and to the credential broker (stateful and exec tiers), whose
+kubectl admission charges profile workers' cluster-wide reads from the same table; it is reserved
+there, so `spec.deployment.env` cannot pass a raw value through. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
@@ -260,11 +261,12 @@ caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-pr
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
 broker's watcher routes), `kubeagents-credential-proxy-a2a-reports` for the A2A gateway's
-audit-report reader on every install and, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
-for the A2A gateway) as a bearer header, and the
+audit-report reader on every install, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
+for the A2A gateway, and, when the Teams inbound receiver is enabled, `kubeagents-credential-proxy-teams-inbound`
+for that receiver, which reaches one route by one method) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
-install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience

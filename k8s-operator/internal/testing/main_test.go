@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 )
 
 // operatorEnv is the operator environment outside the A2A_ flags that a render
@@ -33,5 +35,9 @@ func TestMain(m *testing.M) {
 	for _, name := range operatorEnv {
 		_ = os.Unsetenv(name)
 	}
+	// No golden runs a bus: a golden on the session route reads a fresh one,
+	// with no TASKS stream yet, so its cap renders at maxSessions. The
+	// platform route, every golden's today, reads none.
+	controller.UseA2ABusWithoutTasksForTesting()
 	os.Exit(m.Run())
 }

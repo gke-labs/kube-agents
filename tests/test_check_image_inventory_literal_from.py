@@ -42,6 +42,7 @@ _CALL_SITES = (
     # A persona image: the persona directory is the context, the payload /files/.
     "check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/",
     "check_literal_from busybox a2a/Dockerfile.persona-tse . /files/",
+    "check_literal_from busybox a2a/Dockerfile.persona-fleet-audit . /files/",
 )
 
 # The sweep after the call sites: a plugin Dockerfile the fence never saw is

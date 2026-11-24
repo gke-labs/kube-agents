@@ -28,6 +28,11 @@
 #
 #     python3 scripts/check_image_layers.py
 #
+# Comments below that put the chain at the ceiling, or a layer or three under
+# the budget, date from when the Hermes base added its own layers to it. agent-base now
+# copies the Hermes files in as one layer, so the chain has more room than
+# those comments say; the checker's output is the present figure.
+#
 # Every base image is a build arg so this can be rebuilt behind a firewall,
 # where the public registries are unreachable and the bases have been copied
 # into an approved one. Each takes a full reference rather than a shared
@@ -37,7 +42,7 @@
 #
 # HERMES_AGENT_TAG has no default — the image-build workflows read the one pin
 # from tags.env, and the root Makefile `include`s it — so a direct docker build has
-# to pass it too, or the agent-base stage resolves to a reference with an empty
+# to pass it too, or the hermes-upstream stage resolves to a reference with an empty
 # tag:
 #
 #   docker build -f deploy/docker/Dockerfile --target platform \
@@ -116,9 +121,134 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/bin/curator ./cmd/curator/
 
-FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
+# The Hermes image as published. Nothing ships FROM it: agent-base copies its
+# files instead, because the copy leaves two packages out: GSAP and
+# python-telegram-bot (below). Hermes' dashboard workspace installs GSAP
+# (/opt/hermes/node_modules/gsap), which is under Webflow's "no charge" licence
+# rather than an open-source one. Hermes' built dashboard does not contain it
+# and nothing imports it at run time, but an `rm` in a later layer of a shipped
+# image would leave the bytes in the base layers of every image pushed. So
+# hermes-pruned, a stage nothing ships, holds a copy of the tree without the
+# package, and agent-base copies that: no layer of a pushed image ever holds
+# it. That is a claim about the images; a registry build cache written with
+# mode=max keeps the upstream stage's layers, the package included.
+#
+# python-telegram-bot is the second. Hermes' venv installs it for the Telegram
+# platform adapter, under LGPL-3.0-only. It sits in three places: the venv's
+# site-packages (the `telegram` package and its dist-info), the same files
+# hard-linked in uv's cache under /root/.cache/uv/archive-v0, and that cache's
+# pointer directory for the wheel. No install here configures Telegram. The
+# gateway and the tools reach the package in two places, that adapter and the
+# send path, each behind an ImportError guard; `hermes doctor` probes for it
+# behind a guard of its own, and one script under evals/ imports it unguarded
+# and is not run here. So the copy leaves all three out.
+FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS hermes-upstream
+
+# The copy is made with tar from a read-only mount of the upstream tree into
+# /out, not by deleting from the tree in place, for two reasons. `COPY
+# --exclude` would do it in one line, but Cloud Build's Docker (20.10) rejects
+# the flag. And a RUN changes its own root: the delete moves node_modules'
+# time, and BuildKit's resolv.conf and hosts mounts move /etc's, to the time of
+# the build. The copied layer, about a gigabyte, would then differ on every
+# uncached build, so each release would push it again and each node pull it
+# again. Under /out every entry keeps the time Hermes' build gave it, and the
+# layer changes only when the Hermes pin does.
+#
+# The exclusion names the package, not the one path it sits at today: npm
+# decides where a workspace's dependency lands, so a Hermes bump can move it
+# under another node_modules. The checks are wider than the exclusion on
+# purpose, so that what it misses fails the build: any package whose name
+# starts with gsap or sits in the @gsap scope, and GSAP's own globals in the
+# JavaScript Hermes has already built, which is where the library would land
+# if the dashboard began to use it. For python-telegram-bot the exclusions name
+# each of its three places, with `*` held to one path component so that
+# archive-v0/*/telegram cannot reach a `telegram` directory nested inside some
+# other cached package. Its check is wider too: any entry named for the
+# distribution, and the package's own telegram/ext/_application.py wherever a
+# copy lands. File capabilities are the only extended
+# attribute carried; the pinned image has none, and copying every attribute
+# would also try to copy a builder's SELinux labels. The mount is on /mnt and
+# the `touch` puts /etc's time back so that this stage's own layer, which a
+# mode=max build cache stores, is the same on every build too (Docker 20.10
+# moves /etc's time once more after the step, so there it is not).
+FROM hermes-upstream AS hermes-pruned
+RUN --mount=type=bind,from=hermes-upstream,source=/,target=/mnt \
+    mkdir /out && \
+    bash -o pipefail -c "tar -C /mnt --numeric-owner --xattrs --xattrs-include=security.capability --exclude=node_modules/gsap --no-wildcards-match-slash --exclude='python_telegram_bot-*.dist-info' --exclude=site-packages/telegram --exclude='archive-v0/*/telegram' --exclude=wheels-v6/pypi/python-telegram-bot -cf - . | tar -C /out --numeric-owner --xattrs --xattrs-include=security.capability -xpf -" && \
+    test -z "$(find /out \( -path '*/node_modules/gsap*' -o -path '*/node_modules/@gsap' \) -print -quit)" && \
+    { grep -rqE 'gsapVersions|GreenSock' /out/opt/hermes/hermes_cli/web_dist /out/opt/hermes/ui-tui/dist /out/opt/hermes/plugins; test $? -eq 1; } && \
+    test -z "$(find /out \( -iname 'python_telegram_bot*' -o -iname 'python-telegram-bot*' -o -path '*/telegram/ext/_application.py' \) -print -quit)" && \
+    test -x /out/usr/bin/python3 && \
+    touch -r /mnt/etc /etc
+
+# A copy of files does not carry the image config, so agent-base re-declares
+# what Hermes' sets. This stage records what the pinned image really has, read
+# from inside it, and agent-base's check fails the build when the two differ:
+# a Hermes bump that adds or changes an ENV or the WORKDIR shows up there, not
+# at run time. The shell's own variables are dropped on both sides, and so is
+# the trace context a container-driver builder gives each step, which differs
+# from one step to the next. A build
+# cannot read the rest of the config, so the check does not cover it: VOLUME is
+# carried by hand below, ENTRYPOINT, CMD and USER are this file's own, and
+# Hermes' revision label is not carried. Compare `docker inspect` of the new
+# pin with the old when bumping Hermes.
+FROM hermes-upstream AS hermes-upstream-config
+RUN mkdir /hermes-config && \
+    env | grep -vE '^(HOSTNAME|PWD|OLDPWD|SHLVL|_|TRACEPARENT|TRACESTATE)=' | sort > /hermes-config/env && \
+    pwd > /hermes-config/workdir
+
+FROM scratch AS agent-base
+COPY --from=hermes-pruned /out/ /
+
+ENV PATH=/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright \
+    npm_config_install_links=false \
+    HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist \
+    HERMES_TUI_DIR=/opt/hermes/ui-tui \
+    HERMES_HOME=/opt/data \
+    HERMES_WRITE_SAFE_ROOT=/opt/data \
+    HERMES_DISABLE_LAZY_INSTALLS=1 \
+    HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
+WORKDIR /opt/hermes
+VOLUME /opt/data
 
 USER root
+
+RUN --mount=type=bind,from=hermes-upstream-config,source=/hermes-config,target=/mnt \
+    test -z "$(find / -xdev \( -path '*/node_modules/gsap*' -o -path '*/node_modules/@gsap' \) -print -quit)" && \
+    test -z "$(find / -xdev \( -iname 'python_telegram_bot*' -o -iname 'python-telegram-bot*' -o -path '*/telegram/ext/_application.py' \) -print -quit)" && \
+    env | grep -vE '^(HOSTNAME|PWD|OLDPWD|SHLVL|_|TRACEPARENT|TRACESTATE)=' | sort | diff /mnt/env - && \
+    pwd | diff /mnt/workdir -
+
+# Licensing: configuring Telegram does not fetch python-telegram-bot. The copy
+# above leaves the package out, but Hermes keeps an allowlist of packages it
+# installs on demand (tools/lazy_deps.py), HERMES_LAZY_INSTALL_TARGET points
+# those installs at the data volume, and the Telegram adapter asks for its
+# entry when someone configures that platform. The applier removes the entry.
+# That closes the one path Hermes takes on its own. It does not stop a person:
+# an operator who installs the package onto the data volume by hand gets it,
+# since Hermes puts that directory on sys.path. The same RUN proves the three
+# things the removal rests on: the venv cannot import the package, the
+# allowlist refuses the feature, and Hermes' Telegram adapter and send path
+# still import without it and report the dependency as absent. This stage's
+# later installs could bring the package back as a dependency, so the last RUN
+# of `platform` and of `credential-proxy` looks for it again.
+COPY deploy/docker/patches/apply_no_telegram_lazy_install.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/no-telegram/
+RUN /opt/hermes/.venv/bin/python3 /tmp/no-telegram/apply_no_telegram_lazy_install.py /opt/hermes && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+import importlib.util; \
+assert importlib.util.find_spec('telegram') is None, 'python-telegram-bot is importable'; \
+from tools import lazy_deps; \
+assert 'platform.telegram' not in lazy_deps.LAZY_DEPS; \
+assert not [s for specs in lazy_deps.LAZY_DEPS.values() for s in specs if 'telegram' in s.lower()], 'a lazy-install spec still names the package'; \
+import tools.send_message_senders; \
+from plugins.platforms.telegram import adapter; \
+assert adapter.TELEGRAM_AVAILABLE is False and adapter.check_telegram_requirements() is False" && \
+    rm -rf /tmp/no-telegram
 
 # 1. Install all common system utilities and dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -175,7 +305,7 @@ RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/her
 # Exact-count guarded like the step above.
 #
 # Anchor the launchctl approval pattern -- a second edit in this layer, because the agent-base -> platform
-# chain sits within a few layers of the budget scripts/check_image_layers.py gates. v2026.9.14's
+# chain is held to the budget scripts/check_image_layers.py gates. v2026.9.14's
 # tools/approval_detection.py opens the "stop/restart hermes launchd service" rule with two unanchored
 # whole-input lookaheads, so re.search retries them at every position of a command that does not match,
 # once per normalised variant the detector generates for the command (one per word whose deobfuscation
@@ -711,8 +841,11 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # /setup-files in their own DM every attachment reaches this method, and on the
 # install where this was reported no user had. The second half of the fix is the
 # advice itself: agents/platform/scripts/google_chat_relay_patch.py stubs
-# /setup-files out, and the operator sets GOOGLE_CHAT_RELAY_URL on every install
-# with Google Chat enabled, so on all of them that instruction is a dead end. The
+# /setup-files out where the relay patch is armed (GOOGLE_CHAT_RELAY_URL set, and
+# sitecustomize.py on PYTHONPATH), so there that instruction is a dead end. (The
+# operator set the variable on every install with Google Chat enabled. It renders
+# it no longer: the A2A gateway is Google Chat's one consumer, and the Hermes
+# google_chat platform does not run on an operator install.) The
 # notice branches on the _credential_proxy_relay_patched marker that patch leaves
 # on the class, and gives the reason instead. The direct branch is for an image
 # run outside the operator; it is kept rather than folded away because deleting
@@ -2490,9 +2623,8 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 # with the platform config. It checks the relay patches copied to
 # /opt/defaults/scripts above against the Hermes tree they monkeypatch, which
 # is why it cannot run in CI: this is the `platform` chain that
-# `scripts/check_image_layers.py` measures, and it sits at 114 of the 120 layers
-# that check allows, so a COPY/RUN pair of its own spends a third of what is
-# left. See the
+# `scripts/check_image_layers.py` measures, so a COPY/RUN pair of its own spends
+# two of the layers that check allows. See the
 # module docstring for what a failure here means.
 #
 # verify_card_stop.py rides along too, for the same layer budget, and runs here
@@ -2809,6 +2941,8 @@ RUN set -eu; \
 # moves it has to move the mirror with it rather than leave the preflight to be
 # killed by the tool before it prints its JSON.
 RUN set -eu; \
+    test -z "$(find / -xdev \( -iname 'python_telegram_bot*' -o -iname 'python-telegram-bot*' -o -path '*/telegram/ext/_application.py' \) -print -quit)"; \
+    /opt/hermes/.venv/bin/python3 -c "import importlib.util; assert importlib.util.find_spec('telegram') is None, 'python-telegram-bot is importable'"; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
       exit 1; \
@@ -2979,6 +3113,12 @@ FROM proxy-tools AS credential-proxy
 # secret: it is the same scripts the agent image ships, world-readable one level
 # down. Ahead of the COPY so an agent source edit does not invalidate it.
 RUN chmod 0755 /opt/defaults
+
+# The package the Hermes copy leaves out has not come back through an install
+# in agent-base or proxy-tools (see the no-telegram block in agent-base). A RUN
+# of its own: one that also set a mode could not name `/`.
+RUN test -z "$(find / -xdev \( -iname 'python_telegram_bot*' -o -iname 'python-telegram-bot*' -o -path '*/telegram/ext/_application.py' \) -print -quit)" && \
+    /opt/hermes/.venv/bin/python3 -c "import importlib.util; assert importlib.util.find_spec('telegram') is None, 'python-telegram-bot is importable'"
 
 # The same set the `platform` stage lays down at /opt/defaults/scripts, with the
 # same ownership and mode, so the directory is identical in both images. That

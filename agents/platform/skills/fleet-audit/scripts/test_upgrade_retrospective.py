@@ -1811,6 +1811,55 @@ class OwnerResolutionTest(unittest.TestCase):
         self.assertEqual((resolver.resolve("apps", "Pod", "db-7"), resolver.resolve("apps", "Pod", "web-zzzzz")), (("StatefulSet", "db"), ("ReplicaSet", "web")))
         self.assertEqual((resolver.pods_of.get("apps/Pod/db-1"), resolver.pods_of.get("apps/Pod/web-abcde"), resolver.pods_of.get("apps/StatefulSet/db")), (["db-1"], ["web-abcde"], ["db-0"]))
 
+    @staticmethod
+    def cut_pod_name(controller, suffix):
+        """The pod name that Kubernetes generates for a long controller name:
+        58 characters of `<controller>-`, then the five."""
+        return f"{controller}-"[:58] + suffix
+
+    @staticmethod
+    def owner(kind, name, parent=None):
+        return {"kind": kind, "metadata": {"name": name, "namespace": "apps", "ownerReferences": [{"kind": parent[0], "name": parent[1]}] if parent else []}}
+
+    def test_a_gone_pod_whose_name_kubernetes_cut(self):
+        """Every pod name here is built by the cut rule (`cut_pod_name`), not typed."""
+        deployment = "d" * 50
+        replica_set = f"{deployment}-55c6d97c65"
+        job, edge_job = "j" * 60, "e" * 58
+        resolver = ur.Resolver([], [self.owner("ReplicaSet", replica_set, ("Deployment", deployment)), self.owner("Job", job), self.owner("Job", edge_job), self.owner("Job", "web")])
+        gone, gone_job, gone_edge = self.cut_pod_name(replica_set, "q5rwx"), self.cut_pod_name(job, "x7k2p"), self.cut_pod_name(edge_job, "x7k2p")
+        self.assertEqual((len(gone), len(gone_job), len(gone_edge)), (63, 63, 63))
+        self.assertEqual(resolver.resolve("apps", "Pod", gone), ("Deployment", deployment))
+        self.assertEqual(resolver.resolve("apps", "Pod", gone_job), ("Job", job))
+        # A name of exactly 58 characters is the first that the generator cuts: no hyphen is left.
+        self.assertEqual((gone_edge, resolver.resolve("apps", "Pod", gone_edge)), (edge_job + "x7k2p", ("Job", edge_job)))
+        # The five characters must be there: a shorter or longer tail is another name.
+        for other in (self.cut_pod_name(job, "x7k2"), self.cut_pod_name(job, "x7k2pz"), self.cut_pod_name(job, "X7K2P")):
+            self.assertEqual(resolver.resolve("apps", "Pod", other), ("Pod", other))
+        # A controller with a short name has no cut form: a 63-character name that starts with
+        # `web-` is not its pod.
+        stranger = "web-" + "z" * 54 + "abcde"
+        self.assertEqual((len(stranger), resolver.resolve("apps", "Pod", stranger)), (63, ("Pod", stranger)))
+        # A StatefulSet names its pods by ordinal, and no generator cuts them.
+        long_set = "s" * 60
+        resolver = ur.Resolver([], [], [self.owner("StatefulSet", long_set)])
+        self.assertEqual(resolver.resolve("apps", "Pod", self.cut_pod_name(long_set, "abcde")), ("Pod", self.cut_pod_name(long_set, "abcde")))
+
+    def test_a_cut_name_that_fits_two_controllers(self):
+        # Two ReplicaSets of one Deployment with a long name: the cut name is
+        # the same for both, and both lead to the same Deployment.
+        deployment = "d" * 57
+        sets = [self.owner("ReplicaSet", f"{deployment}-{pod_hash}", ("Deployment", deployment)) for pod_hash in ("55c6d97c65", "7d9f8b6c54")]
+        resolver = ur.Resolver([], sets)
+        gone = self.cut_pod_name(f"{deployment}-55c6d97c65", "q5rwx")
+        self.assertEqual(gone, self.cut_pod_name(f"{deployment}-7d9f8b6c54", "q5rwx"))
+        self.assertEqual(resolver.resolve("apps", "Pod", gone), ("Deployment", deployment))
+        # Two Jobs whose names differ only after character 58: nothing in the
+        # cut name says which one the pod was, so it is charged to neither.
+        resolver = ur.Resolver([], [self.owner("Job", "j" * 58 + tail) for tail in ("-a", "-b")])
+        gone = self.cut_pod_name("j" * 58 + "-a", "x7k2p")
+        self.assertEqual(resolver.resolve("apps", "Pod", gone), ("Pod", gone))
+
     def test_a_node_owned_mirror_pod_stays_a_pod(self):
         # A static pod's mirror (`kube-proxy-<node>`) is owned by its Node, which controls nothing: it
         # stays a Pod, so its symptom and guard key on the pod rather than on a node name the next pool

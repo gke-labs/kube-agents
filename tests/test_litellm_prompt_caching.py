@@ -110,7 +110,9 @@ class TestKustomize(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         documents = [d for d in yaml.safe_load_all(proc.stdout) if d]
         configmap = next(d for d in documents if d["kind"] == "ConfigMap")
-        self.assertEqual(sorted(configmap["data"]), ["config.yaml", "litellm_thinking_replay_callback.py"])
+        self.assertEqual(
+            sorted(configmap["data"]), ["config.yaml", "litellm_caller_auth.py", "litellm_thinking_replay_callback.py"]
+        )
         self.assertIn("router_settings", yaml.safe_load(configmap["data"]["config.yaml"]))
         deployment = next(d for d in documents if d["kind"] == "Deployment")
         volumes = {v["name"]: v for v in deployment["spec"]["template"]["spec"]["volumes"]}

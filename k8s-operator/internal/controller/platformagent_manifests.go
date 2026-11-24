@@ -4937,10 +4937,12 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// The kubectl cost tier, for the broker's kubectl cost gate: a brokered
 	// cluster-wide read reserves its profiled peak from this column of the
 	// cost table, beside the output cap above in the child memory budget's
-	// terms. Normalised as the shell sandbox's copy is (kubectlCostTierEnv),
+	// terms. Normalised as the shell sandbox's copy is (kubectlCostTier),
 	// and reserved in mergeCredentialProxyEnv, so a value the normalisation
 	// refuses never reaches the broker raw.
-	envVars = append(envVars, kubectlCostTierEnv(agent)...)
+	if tier, ok := kubectlCostTier(agent); ok {
+		envVars = append(envVars, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
+	}
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
@@ -5121,6 +5123,10 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 			if teams.TenantId != "" {
 				envVars = append(envVars, corev1.EnvVar{Name: "TEAMS_TENANT_ID", Value: teams.TenantId})
 			}
+			// The inbound receiver's audience and caller binding, while it runs
+			// (platformagent_teams_inbound.go): the one caller of the Teams
+			// intake that is not a chat consumer.
+			envVars = append(envVars, teamsInboundBrokerEnv(agent)...)
 		}
 	}
 	// Rendered here, in the broker's managed env and nowhere else: the broker
@@ -5219,6 +5225,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// the a2a-chat role. Rendered only while a relay is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
+		// The Teams inbound receiver's audience and callers: one that could
+		// set them would choose who may post onto the Teams queue.
+		credentialProxyTeamsInboundAudienceEnvVar,
+		credentialProxyTeamsInboundCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
 		// (a2a_report_reader.go, a2aReportsEnvNames).
 		credentialProxyA2AReportsAudienceEnvVar,
@@ -5250,6 +5260,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		// One that could set the hold file would lift an operator's hold.
+		credentialProxyHoldFileEnvVar,
 		credentialProxyCuratorAudienceEnvVar,
 		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
@@ -5321,7 +5333,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_ENFORCE_READ_ONLY",
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		// In `managed` only when spec.deployment.env names a tier the
-		// normalisation keeps (kubectlCostTierEnv); reserved by name so a
+		// normalisation keeps (kubectlCostTier); reserved by name so a
 		// valueFrom or an unnormalised literal never reaches the broker.
 		envKubectlCostTier,
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
@@ -7483,25 +7495,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
 	// so domain-level filtering is strictly enforced by FQDNNetworkPolicy.
 	if !fqdnEnabled {
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
-			},
-			To: []networkingv1.NetworkPolicyPeer{
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "0.0.0.0/0",
-						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"},
-					},
-				},
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "::/0",
-						Except: []string{"fc00::/7", "fe80::/10", "ff00::/8"},
-					},
-				},
-			},
-		})
+		egressRules = append(egressRules, publicHTTPSEgressRule())
 	}
 
 	// 8. GKE Managed OpenTelemetry Collector (Trace Export). Skipped when the agent is

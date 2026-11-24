@@ -2,8 +2,10 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +26,10 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// triggerScriptNamesPath is the script-name case list a2a/lib's trigger test
+// and the AgentProfile CRD's spec.scripts test read too.
+const triggerScriptNamesPath = "../../../a2a/lib/testdata/trigger-script-names.json"
+
 // fakeScheduleGateway is the gateway as the reconciler sees it: the same
 // idempotency key returns the same task, as the gateway's KV record does.
 type fakeScheduleGateway struct {
@@ -32,6 +38,8 @@ type fakeScheduleGateway struct {
 	tasks   map[string]string
 	sends   []string
 	origins []string
+	// subs are the submissions as the bus submitter would send them.
+	subs []triggerSubmitWire
 	// onSubmit, when set, runs at each submission, before it is answered.
 	onSubmit func(ScheduleSubmission)
 }
@@ -44,6 +52,9 @@ func (g *fakeScheduleGateway) Submit(_ context.Context, sub ScheduleSubmission) 
 	defer g.mu.Unlock()
 	g.sends = append(g.sends, sub.IdempotencyKey)
 	g.origins = append(g.origins, sub.Origin)
+	if sub.Schedule != nil {
+		g.subs = append(g.subs, triggerSubmitFor(sub))
+	}
 	if g.err != nil {
 		return "", g.err
 	}
@@ -176,6 +187,25 @@ func (f *scheduleFixture) get(t *testing.T) *agentv1alpha1.AgentSchedule {
 		t.Fatal(err)
 	}
 	return &s
+}
+
+// listScripts sets the fixture profile's spec.scripts to names, the
+// allowlist a script schedule's script must be on.
+func (f *scheduleFixture) listScripts(t *testing.T, names ...string) {
+	t.Helper()
+	var p agentv1alpha1.AgentProfile
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.key.Namespace, Name: "fleet-audit"}, &p); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Scripts = nil
+	for _, n := range names {
+		p.Spec.Scripts = append(p.Spec.Scripts, agentv1alpha1.AgentProfileScript{
+			Name: n, Path: agentv1alpha1.AgentProfileScriptRoot + n + ".py", TimeoutSeconds: 300,
+		})
+	}
+	if err := f.c.Update(context.Background(), &p); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func hourAt(h, m int) time.Time { return time.Date(2026, 11, 11, h, m, 0, 0, time.UTC) }
@@ -745,6 +775,222 @@ func TestAgentScheduleNoScheduleIsBuiltinUntilTheOperatorRendersOne(t *testing.T
 	}
 }
 
+// A built-in schedule's script reaches the gateway on the run's trigger.
+func TestAgentScheduleABuiltinScriptIsForwarded(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+		s.Spec.Prompt, s.Spec.Script = "", "stall-watch"
+	})
+	f.listScripts(t, "stall-watch")
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	if len(f.gw.subs) != 1 {
+		t.Fatalf("submitted %d runs, want 1", len(f.gw.subs))
+	}
+	if sub := f.gw.subs[0]; sub.Skills != nil || sub.MaxTurns != 0 {
+		t.Errorf("a script run's submission carries skills %v and maxTurns %d", sub.Skills, sub.MaxTurns)
+	}
+	got := f.gw.subs[0].Trigger
+	if got != (triggerClaimWire{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "stall-watch"}) {
+		t.Fatalf("trigger = %+v, want the script on the built-in trigger", got)
+	}
+	c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("Accepted = %+v", c)
+	}
+}
+
+// Only a built-in schedule may name a script: any other one that does reads
+// Accepted=False, InvalidSchedule, whatever else would have held it back,
+// and nothing is submitted. So does one naming both a prompt and a script,
+// or neither, which the CRD refuses but a stored object might carry.
+func TestAgentScheduleAScriptOffABuiltinIsNotAccepted(t *testing.T) {
+	script := func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt, s.Spec.Script = "", "stall-watch" }
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.AgentSchedule)
+		notIn  bool
+	}{
+		{"a user schedule", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Labels[agentv1alpha1.AgentScheduleOriginLabel] = agentv1alpha1.AgentScheduleOriginUser
+			s.OwnerReferences = nil
+		}, false},
+		{"labelled builtin, not controlled", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.OwnerReferences = nil
+		}, false},
+		{"controlled and labelled, not one the install renders", script, true},
+		{"a prompt and a script", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Script = "stall-watch" }, false},
+		{"neither", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "" }, false},
+		// The fake client stores what the CRD's CEL rule would refuse: a
+		// script beside skills or maxTurns, on a built-in schedule whose
+		// profile lists the script.
+		{"a script with skills", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Spec.Skills = []string{"fleet-audit"}
+		}, false},
+		{"a script with maxTurns", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Spec.MaxTurns = ptr.To[int32](5)
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScheduleFixture(t, tc.mutate)
+			f.listScripts(t, "stall-watch")
+			if tc.notIn {
+				f.r.BuiltinNames = func(*agentv1alpha1.PlatformAgent) []string { return nil }
+			}
+			f.at(t, hourAt(0, 45))
+			f.at(t, hourAt(1, 0))
+			if len(f.gw.sends) != 0 {
+				t.Fatalf("submitted %v", f.gw.sends)
+			}
+			c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+			if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonInvalidSchedule {
+				t.Fatalf("Accepted = %+v, want False/%s", c, agentScheduleReasonInvalidSchedule)
+			}
+		})
+	}
+}
+
+// A built-in schedule's script must be on its profile's spec.scripts: one the
+// profile doesn't list reads Accepted=False, ProfileScriptUnknown, and
+// nothing is submitted.
+func TestAgentScheduleAScriptTheProfileDoesNotListIsNotAccepted(t *testing.T) {
+	for _, listed := range [][]string{nil, {"other-script"}} {
+		f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+			s.Spec.Prompt, s.Spec.Script = "", "stall-watch"
+		})
+		if listed != nil {
+			f.listScripts(t, listed...)
+		}
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		if len(f.gw.sends) != 0 {
+			t.Fatalf("listed %v: submitted %v", listed, f.gw.sends)
+		}
+		c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonProfileScriptUnknown ||
+			!strings.Contains(c.Message, `"stall-watch"`) {
+			t.Fatalf("listed %v: Accepted = %+v, want False/%s naming the script", listed, c, agentScheduleReasonProfileScriptUnknown)
+		}
+	}
+}
+
+// A built-in schedule with no script sends what it sent before spec.script
+// existed, byte for byte: the operator's prompt-run fixture, which predates
+// the field, with only the reconciler's own slot key and schedule.
+func TestAgentScheduleAPromptRunIsUnchanged(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	if len(f.gw.subs) != 1 {
+		t.Fatalf("submitted %d runs, want 1", len(f.gw.subs))
+	}
+	got, err := json.Marshal(f.gw.subs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(`{"trigger":{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"},`+
+		`"idempotencyKey":"schedule/kubeagents-system/compliance-audit/%d",`+
+		`"schedule":{"namespace":"kubeagents-system","name":"compliance-audit"},"profile":"fleet-audit",`+
+		`"prompt":"Run the compliance audit.","activeDeadlineSeconds":3600,`+
+		`"delivery":{"mode":"chat","jobKey":"compliance-audit"}}`, hourAt(1, 0).Unix())
+	if string(got) != want {
+		t.Fatalf("submission =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestAgentScheduleScriptNamesEnvtest holds spec.script to the names
+// lib.ValidateTrigger takes, on the one case list a2a/lib's
+// TestValidateTriggerScriptNamesMatchTheCRD reads, and holds prompt and
+// script to exactly one.
+func TestAgentScheduleScriptNamesEnvtest(t *testing.T) {
+	raw, err := os.ReadFile(triggerScriptNamesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names struct {
+		Accepted []string `json:"accepted"`
+		Refused  []string `json:"refused"`
+	}
+	if err := json.Unmarshal(raw, &names); err != nil {
+		t.Fatal(err)
+	}
+	if len(names.Accepted) == 0 || len(names.Refused) == 0 {
+		t.Fatalf("the case list is empty: %+v", names)
+	}
+	cl, _ := startEnvtest(t)
+	ctx := context.Background()
+	if err := cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kubeagents-system"}}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	mk := func(prompt, script string) *agentv1alpha1.AgentSchedule {
+		n++
+		return &agentv1alpha1.AgentSchedule{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("s-%d", n), Namespace: "kubeagents-system"},
+			Spec: agentv1alpha1.AgentScheduleSpec{
+				Schedule: "20 6 * * *", ProfileRef: agentv1alpha1.AgentScheduleProfileRef{Name: "helpers"},
+				Prompt: prompt, Script: script,
+			},
+		}
+	}
+	for _, name := range names.Accepted {
+		s := mk("", name)
+		if err := cl.Create(ctx, s); err != nil {
+			t.Errorf("script %q refused: %v", name, err)
+			continue
+		}
+		var back agentv1alpha1.AgentSchedule
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(s), &back); err != nil || back.Spec.Script != name {
+			t.Errorf("script %q read back as %q (%v)", name, back.Spec.Script, err)
+		}
+	}
+	for _, name := range names.Refused {
+		if err := cl.Create(ctx, mk("", name)); err == nil || !apierrors.IsInvalid(err) {
+			t.Errorf("script %q: create = %v, want refused as invalid", name, err)
+		}
+	}
+	if err := cl.Create(ctx, mk("Run the audit.", "stall-watch")); err == nil || !apierrors.IsInvalid(err) ||
+		!strings.Contains(err.Error(), "exactly one of spec.prompt and spec.script") {
+		t.Errorf("a prompt and a script: create = %v, want the CEL rule's refusal", err)
+	}
+	if err := cl.Create(ctx, mk("", "")); err == nil || !apierrors.IsInvalid(err) ||
+		!strings.Contains(err.Error(), "exactly one of spec.prompt and spec.script") {
+		t.Errorf("neither: create = %v, want the CEL rule's refusal", err)
+	}
+	// skills and maxTurns shape a model run: beside a script they are
+	// refused, and on a prompt run (an object as it was before script
+	// existed) they still validate.
+	turns := int32(5)
+	withSkills := mk("", "stall-watch")
+	withSkills.Spec.Skills = []string{"fleet-audit"}
+	withTurns := mk("", "stall-watch")
+	withTurns.Spec.MaxTurns = &turns
+	for what, s := range map[string]*agentv1alpha1.AgentSchedule{"skills": withSkills, "maxTurns": withTurns} {
+		if err := cl.Create(ctx, s); err == nil || !apierrors.IsInvalid(err) ||
+			!strings.Contains(err.Error(), "a script run takes neither") {
+			t.Errorf("a script with %s: create = %v, want the CEL rule's refusal", what, err)
+		}
+	}
+	promptRun := mk("Run the audit.", "")
+	promptRun.Spec.Skills = []string{"fleet-audit"}
+	promptRun.Spec.MaxTurns = &turns
+	if err := cl.Create(ctx, promptRun); err != nil {
+		t.Errorf("a prompt run with skills and maxTurns: create = %v, want accepted", err)
+	}
+	// An empty script sent explicitly is refused too, not read as absent.
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": agentv1alpha1.GroupVersion.String(), "kind": "AgentSchedule",
+		"metadata": map[string]any{"name": "empty-script", "namespace": "kubeagents-system"},
+		"spec":     map[string]any{"schedule": "0 * * * *", "profileRef": map[string]any{"name": "helpers"}, "prompt": "no-op", "script": ""},
+	}}
+	if err := cl.Create(ctx, u); err == nil || !apierrors.IsInvalid(err) {
+		t.Errorf("an explicit empty script: create = %v, want refused as invalid", err)
+	}
+}
+
 // Editing the schedule moves the next slot to the new schedule's.
 func TestAgentScheduleASpecEditMovesTheNextSlot(t *testing.T) {
 	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "0 0 1 1 *" })
@@ -1153,5 +1399,29 @@ func TestAgentScheduleAControllerOfAnotherKindIsNotThePlatformAgent(t *testing.T
 	cond := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
 	if len(f.gw.sends) != 0 || cond == nil || cond.Reason != agentScheduleReasonBuiltinNotFromOperator {
 		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
+	}
+}
+
+// run-now runs a suspended schedule. A run-now-only built-in (the onboarding
+// row, builtinSchedule.RunNowOnly) renders suspended on a nominal schedule
+// and relies on this: the reconciler handles a run-now token before it skips
+// a suspended slot. Reordering those two turns onboarding off with nothing to
+// show for it, so this pins the order.
+func TestARunNowRunsASuspendedSchedule(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Suspend = true })
+	f.at(t, hourAt(0, 45))
+	s := f.get(t)
+	s.Annotations = map[string]string{agentv1alpha1.AgentScheduleRunNowAnnotation: "once"}
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(0, 50))
+	if s = f.get(t); len(f.gw.sends) != 1 || s.Status.LastHandledRunNow != "once" {
+		t.Fatalf("a run-now on a suspended schedule ran nothing: sends = %v, status = %+v", f.gw.sends, s.Status)
+	}
+	// Its slots stay skipped.
+	f.at(t, hourAt(2, 0))
+	if s = f.get(t); s.Status.SkipCounts.Suspended == 0 {
+		t.Fatalf("a suspended schedule's slot wasn't skipped: %+v", s.Status)
 	}
 }

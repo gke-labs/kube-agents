@@ -3,7 +3,6 @@ Subject: Rank Developer Knowledge first for GKE facts
 Why: upstream ranks only the interfaces for live cluster operations, so a GKE fact the agent needs (a field, a version lifecycle, a quota) falls through to web search. This repository ranks Developer Knowledge first for those lookups and web search as the fallback, in cli-reference.md and in the Reference Directory entries that describe it and mcp-usage.md.
 Local-Issue: none (#945, #2357)
 Eval-Case: none (came with the migration to overlays, a byte-identical move)
-Upstream-Issue: none filed yet
 Retire-When: upstream ranks Developer Knowledge first for GKE facts
 
 diff --git a/SKILL.md b/SKILL.md

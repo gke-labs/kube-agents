@@ -547,8 +547,7 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. Two more, `ci-kube-agents-validated-capabilities-1` and `-2`, are
 not pool jobs but the validated-capabilities lane's weekly slices, one a suite part, watched here because
-their record is their logs bucket and nothing else reads a failed build of them. The first slice is
-also watched as `ci-kube-agents-certification-1`, the name its job has until `oss-test-infra` renames it. Another,
+their record is their logs bucket and nothing else reads a failed build of them. Another,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
 and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
 `ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
@@ -1090,9 +1089,11 @@ with two identities:
   from GitHub; and the candidate fixes, open pull requests touching the same
   files and commits on those files merged since the first red night. It writes
   only to the runner's disk.
-- **Route**, as the publisher (`CI_HEALTH_SA`): one call to Gemini on Vertex AI
-  through the job's Workload Identity, model `NIGHTLY_TRIAGE_MODEL`
-  (`gemini-4-argon` unless the repository variable names another), billed to
+- **Route**, as the publisher (`CI_HEALTH_SA`): one call on Vertex AI through
+  the job's Workload Identity to the model the repository secret
+  `NIGHTLY_TRIAGE_MODEL` names (a secret, not a variable, so the public job
+  log prints it as `***`; no default: the workflow file is public and names
+  no model), billed to
   `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
   capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
   then grading lines) and the answer at 16,384, thinking included. The model returns a
@@ -1138,13 +1139,18 @@ meanwhile stays. The filer files for triage only into a separate issues
 repository, the route step writes to no other, and the job's own token holds
 no issue write.
 
-Unarmed, the job dry-runs on the issues the filer filed that tick (which the
-filer assigned as before) and prints what it would assign; a manual run of the
+Unarmed, with a model named, the job dry-runs on the issues the filer filed
+that tick (which the filer assigned as before) and prints what it would assign; a manual run of the
 workflow with `triage_issues` set to issue numbers of the issues repository
 does the same for those issues. Setting the repository variable
-`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true`;
-`CI_HEALTH_MUTE=true` disarms both. Switched off while issues still wait,
-the tick routes each by the rule without a model call. The call needs
+`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true` and
+a model named in the `NIGHTLY_TRIAGE_MODEL` secret; without the name the
+filer keeps assigning by its rule, the job dry-runs by the rule, and the
+comment each waiting issue gets names the switch when it is off and the
+missing model name when the switch is on;
+`CI_HEALTH_MUTE=true` disarms the filer and the triage alike. Switched off, or with no model named,
+while issues still wait, the tick routes each by the rule without a model
+call. The call needs
 `roles/aiplatform.user` for `CI_HEALTH_SA` on `NIGHTLY_TRIAGE_PROJECT`, with
 the Vertex AI API enabled there; until then every call fails and every issue
 goes by the rule.
@@ -1570,7 +1576,8 @@ observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gatew
 status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
 warning that the fixture is not there (never planted, or no cluster for its
 slot), a rollout the next reconcile finishes; for one not ready (the orphaned-snapshot
-roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours` line
+roles, which the GCE compute audit ignores for 91 days, and the finished-Job family, which the
+waste audit ignores for 7), the `ready_after_hours` line
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
@@ -1583,7 +1590,7 @@ which this document does not carry; the note is judged at lease time by the
 presubmit and the nightly, never here, and a stale note surfaces as
 `fixture-drift:<role>` on their runs, with the replace command's printer in
 the drift line. The digest's fixture line and `health.json`'s `fixture_state` block carry
-drifted, absent and unread roles only, so a project whose two snapshots are young reads
+drifted, absent and unread roles only, so a project whose two snapshots or three finished Jobs are young reads
 there as every fixture in its designed state; the document's `summary` and each project's
 carry `not_ready` beside the other counts. `summary` counts projects, projects checked (at least one role
 read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
@@ -1597,7 +1604,7 @@ impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
 firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots list`,
 `gcloud compute disks list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress`,
+reads of the project-scoped roles (`startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`,
 `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and the `gcloud compute reservations list` read of the
@@ -1682,7 +1689,12 @@ merged, beside the re-apply line when a planted role drifts too, and the issue c
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
 applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
 failure line gone from its serial buffer, is cleared by the re-apply too, because the
-reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
+reconcile resets the VM after each project; a `rotated-console-vm` line reading
+`serial_contains`, the flood filler gone from the serial-flood VM's buffer, is the one
+`serial_contains` drift a re-apply does not clear — the reconcile plans nothing for a VM
+that is already there and never resets this one — and the remedy is a one-off hand reset
+(`gcloud compute instances reset serial-flood-<prefix>`), which re-runs the startup script
+and whose flood pass restores the designed state within about five minutes; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time

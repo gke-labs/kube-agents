@@ -14,8 +14,9 @@
 # in neither file and on a file that names nothing.
 #
 # WHAT BELONGS HERE. Cases that grade the forge: a `pull_request_opened` or
-# `pull_request_diff_contains` check (a merge request on GitLab) or a
-# `ledger_issue_contains` check (a ledger issue). A chat probe passes the
+# `pull_request_diff_contains` check (a merge request on GitLab), a
+# `ledger_issue_contains` check (a ledger issue) or a `forge_issue_state`
+# check (the issue the reply names). A chat probe passes the
 # same on either forge and proves nothing about GitLab; the GitHub run
 # already grades it on every pull request. scripts/test_eval_rosters.py pins
 # the set, and that each entry requires a positive forge check (not under a

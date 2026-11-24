@@ -126,7 +126,8 @@ verification_spec:
   # `cd x &&`, an exec wrapper, `bash -c` or `$(…)`. It does not match the same
   # words in a quoted string: hermes writes a multi-line command on one log
   # line, so a recommendation in a `python3 -c` body or a heredoc is text on
-  # the line of its first command.
+  # the line of its first command. The card's typed call is read too: there a
+  # `python3 -c` body is one word, and a call with a heredoc is left on its row.
   - name: the-audit-changed-no-cluster
     role: safeguard
     severity: recoverable

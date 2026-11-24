@@ -1289,6 +1289,9 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     each for the rules it has and asserts a failure now for the live rules alone. `namespaces`
     are the Namespace objects read, whose labels the `namespaceSelector` is judged on for
     `kube-system` and `kube-public` (`bootstrap_namespace_labels`).
+    `answered`: the fail-closed webhooks whose backend this read found reachable, by the
+    identity keys of a finding and nothing else, so a reader can name every webhook whose
+    backend was checked; `evaluated` counts the three lists together.
     Fail-open webhooks are counted
     (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
     which nothing read here can check, and fail-closed webhooks with no `rules` (`no_rules`),
@@ -1296,7 +1299,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     it fails nothing now and blocks nothing (a policy engine's configuration before any policy
     selects a resource is the usual shape).
     """
-    result = {"blocking": [], "outage": [], "evaluated": 0, "fail_open": 0, "url_backends": 0, "no_rules": 0}
+    result = {"blocking": [], "outage": [], "answered": [], "evaluated": 0, "fail_open": 0, "url_backends": 0, "no_rules": 0}
     namespace_labels = bootstrap_namespace_labels(namespaces)
     for config in configs:
         config_kind = config.get("kind")
@@ -1315,8 +1318,16 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 result["no_rules"] += 1
                 continue
             result["evaluated"] += 1
+            identity = {
+                "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
+                "config_kind": config_kind,
+                "config": config_name,
+                "name": hook.get("name", ""),
+                "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
+            }
             reason = backend_problem(service_ref, services, slices)
             if reason is None:
+                result["answered"].append(identity)
                 continue
             matches = upgrade_path_matches(hook) + kube_system_write_matches(hook, namespace_labels)
             # Every rule is classed by what the server serves it, whichever bucket the finding
@@ -1328,11 +1339,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 (live if served == RULE_LIVE else pinned if served == RULE_PINNED else unknown).append(rule)
             version_pinned, unserved_pairs = _pinned_labels(pinned, hook, namespace_labels)
             finding = {
-                "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
-                "config_kind": config_kind,
-                "config": config_name,
-                "name": hook.get("name", ""),
-                "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
+                **identity,
                 "reason": reason,
                 "upgrade_path": matches,
                 "version_pinned": version_pinned,

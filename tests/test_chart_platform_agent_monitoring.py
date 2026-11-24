@@ -42,6 +42,9 @@ _GOLDEN = (
 _OPERATOR_A2A_SOURCE = (
     _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 )
+_OPERATOR_CURATOR_SOURCE = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_curator.go"
+)
 _KIND_UP = _REPO_ROOT / "hack" / "kind-up.sh"
 _A2A_FIXTURE = (
     _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "testdata" / "a2a-gateway-ingress.yaml"
@@ -124,6 +127,14 @@ _SCRAPES = (
 )
 
 
+# The OKF memory curator's row: rendered behind A2A_CURATOR, so no golden
+# carries the Deployment; its port and pod labels come from the operator's
+# curator builder constants directly.
+_CURATOR_SCRAPE = {
+    "suffix": "-curator-monitoring",
+    "operator_source": _OPERATOR_CURATOR_SOURCE,
+    "selector_keys": ("app", "kubeagents.x-k8s.io/component"),
+}
 # The NATS exporter's row: a StatefulSet in the golden, scraped by a
 # PodMonitoring with no ServiceMonitor or VMPodScrape beside it, so it sits
 # outside _SCRAPES (whose rows all carry both).
@@ -139,13 +150,30 @@ _NATS_SCRAPE = {
     "metric_relabeling": [{"sourceLabels": ["__name__"], "regex": "jetstream_consumer_.*", "action": "drop"}],
 }
 # Every row with a PodMonitoring, in template order.
-_POD_MONITORING_SCRAPES = _SCRAPES + (_NATS_SCRAPE,)
+_POD_MONITORING_SCRAPES = _SCRAPES + (_CURATOR_SCRAPE, _NATS_SCRAPE)
 # The workload kinds a row's pod template can come from.
 _WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 
 
+_OPERATOR_TEAMS_INBOUND_SOURCE = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_teams_inbound.go"
+)
+
+
+def _teams_inbound_status_port():
+    """The receiver's status port, from the operator's constant: no golden renders the receiver."""
+    match = re.search(r"^\s*teamsInboundStatusPort\s+int32\s*=\s*(\d+)\s*$",
+                      _OPERATOR_TEAMS_INBOUND_SOURCE.read_text(), re.MULTILINE)
+    assert match, "teamsInboundStatusPort not found in the operator source"
+    return int(match.group(1))
+
+
 def _scrape_port(scrape):
-    """The port a row's PodMonitoring has to scrape, from the golden or the A2A fixture."""
+    """The port a row's PodMonitoring has to scrape, from the golden, fixture, or operator source."""
+    if "operator_source" in scrape:
+        match = re.search(r"^\s*a2aCuratorStatusPort\s*=\s*(\d+)\s*$", scrape["operator_source"].read_text(), re.MULTILINE)
+        assert match, f"a2aCuratorStatusPort not found in {scrape['operator_source']}"
+        return int(match.group(1))
     fixture = scrape.get("fixture", _GOLDEN)
     return _manifest_port(fixture, scrape["deployment"], scrape["container"], scrape["port_name"])
 
@@ -178,6 +206,16 @@ def _manifest_pod_labels(fixture, deployment):
 def _selector(scrape, name):
     """The selector the PodMonitoring has to carry for agent `name`: the manifest's
     values for the keys the row names, with the manifest's agent name replaced."""
+    if "operator_source" in scrape:
+        src = scrape["operator_source"].read_text()
+        suffix = re.search(r'^\s*a2aCuratorNameSuffix\s*=\s*"([^"]+)"', src, re.MULTILINE)
+        component = re.search(r'^\s*a2aCuratorComponent\s*=\s*"([^"]+)"', src, re.MULTILINE)
+        assert suffix and component, f"curator selector constants missing in {scrape['operator_source']}"
+        raw = {
+            "app": name + suffix.group(1),
+            "kubeagents.x-k8s.io/component": component.group(1),
+        }
+        return {key: raw[key] for key in scrape["selector_keys"]}
     fixture = scrape.get("fixture", _GOLDEN)
     agent_name = scrape.get("agent_name", _GOLDEN_AGENT)
     labels = _manifest_pod_labels(fixture, scrape["deployment"])
@@ -225,9 +263,26 @@ class MonitoringShapeTest(unittest.TestCase):
             if scrape["suffix"] == "-credential-proxy-monitoring":
                 want.append(str(_manifest_port(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier",
                                                "envoy-credential-proxy", "cred-metrics")))
+        # The curator's PodMonitoring follows _SCRAPES.
+        want.append(str(_scrape_port(_CURATOR_SCRAPE)))
+        # The Teams inbound receiver's PodMonitoring follows the curator's,
+        # rendered only while the receiver is on, so it is not a _SCRAPES row.
+        want.append(str(_teams_inbound_status_port()))
         # The NATS exporter's PodMonitoring is the template's last.
         want.append(str(_scrape_port(_NATS_SCRAPE)))
         self.assertEqual(ports, want)
+
+    def test_the_teams_inbound_scrape_is_gated_on_both_switches_and_the_operators_port(self):
+        """The receiver renders only under spec.integration.teams.inbound, so its
+        scrape is gated on the chart's two Teams switches in every section, and its
+        port and labels are the operator's constants (platformagent_teams_inbound.go)."""
+        gate = ('{{- if and .Values.platformAgent.integration.teams.enabled '
+                '(dig "inbound" "enabled" false .Values.platformAgent.integration.teams) }}')
+        # PodMonitoring, ServiceMonitor, VMPodScrape and the scraper-namespace NetworkPolicy.
+        self.assertEqual(self.template.count(gate), 4)
+        self.assertIn("app: {{ .Values.platformAgent.name }}-teams-inbound\n      kubeagents.x-k8s.io/component: teams-inbound", self.template)
+        self.assertIn(f"- port: {_teams_inbound_status_port()}\n      path: /metrics", self.template)
+        self.assertIn("- name: status\n      port: 9094", self.template)
 
     def test_the_nats_port_is_the_operators_constant(self):
         # The golden is rendered from a2aNATSMetricsPort; reading the

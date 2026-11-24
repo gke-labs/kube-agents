@@ -179,8 +179,9 @@ its budget function; until it exists, a fixed conservative default behind a knob
 3. **Fan-out with a wait.** A profile can start several child tasks and wait on their
    results. **Each child gets a fresh root grant, minted by the gateway** for the child's
    profile. It is not an attenuated copy of the parent's grant. The gateway enforces the
-   narrowing when it mints: the child's tier equals the parent's (and the child's profile must
-   allow it), and the child's scope must lie inside the parent's. The gateway stays the only
+   narrowing when it mints: the child's tier equals the parent's, or is `read` with no trigger below an `unattended`
+   parent, whose child's profile must also list `unattended` (#6744) (and the child's profile must
+   allow its tier), and the child's scope must lie inside the parent's. The gateway stays the only
    publisher of submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and the
    ancestor-chain rule in [Scale rules](#scale-rules) applies (only a chain's head nests its own
    profile, once; no profile repeats otherwise). Entries a broker adds to a grant chain never change
@@ -419,15 +420,24 @@ leave open:
   - its task credential verifies against `A2A_TASK_SIGNING_PUBLIC_KEYS`, which the operator renders into
     each Job template from the key the callout and the proxy use;
   - the credential names this task and pod, and a trigger whose `script` is the confirm's;
-  - the path resolves to a regular file under the script root, owned by root and writable by no group
-    or other, in directories that are the same on both the named path and the resolved one, and the
-    worker isn't its owner. The file itself may be a symlink within the root; no directory on the named
-    path may be.
+  - the path resolves to a regular file under the script root, owned by root, writable by no group
+    or other, and neither setuid nor setgid, in directories that are the same on both the named path
+    and the resolved one, and the worker isn't its owner. The file itself may be one symlink within
+    the root whose target, as written, is where it resolves: a link to another link, or through a
+    symlinked directory that changes where it leads, is refused. No directory on the named path may be a symlink.
 
   The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
   broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
-  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. Its bound is
-  its `timeoutSeconds` within the task's deadline, and its process group is killed at the bound. Its
+  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. (A model
+  turn's harness, unlike a script, also gets a triggered task's stream and origin as
+  `PROFILE_TRIGGER_STREAM` and `PROFILE_TRIGGER_ORIGIN`, read from the submission's authority block,
+  which the dispatcher held to the grant; the broker still decides any report write from the signed
+  credential's trigger.) Its bound is
+  its `timeoutSeconds` within the task's deadline. It starts in a session of its own, and its kill (at
+  the bound, on a cancel, abandon or SIGTERM, and once more after it exits) SIGKILLs its process group
+  and every process `/proc` lists in its session; where the worker is the container's pid 1, as the
+  worker image's entrypoint is, it also kills every other process in the pod's pid namespace, which
+  reaches a process that started a session of its own, and reaps them. Its
   stdout, capped at 64 KiB, is the text result. Its stderr is read, capped at 16 KiB, and only its size is logged: a script can print a credential, and the log is not where a redactor's misses should land. Exit 0
   completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
   A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose
@@ -436,6 +446,30 @@ leave open:
   submission's authority block can't be read: a script task never runs as a model turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
   refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
   SIGTERM ends it as `worker-evicted`.
+
+- **Write refusals.** A model-turn task's worker stops at the first write refusal the broker
+  marked definitive, and reads no tool output to find it. The broker marks its 403 body
+  `write_refusal: true` when a policy rule refuses a mutating kubectl verb that is not a local
+  render: the `kubernetes.read-only` rule, or the profile caller's flag rule
+  (`caller.kubectl-flag`), which reads a profile write's flags first. A busy, rate or timeout
+  answer is never marked, and neither is a version-control refusal: the version-control skill's
+  answer to a missing permit is the patch, which the task still gives. On such a refusal the in-pod broker client
+  appends one JSON record (task, rule, verb, route, time) to the file the worker names in
+  `CREDENTIAL_PROXY_REFUSAL_FILE`: `write-refusals` on the task token's tmpfs, made empty before
+  the harness starts and removed after. The client opens it append-only, without following a
+  symlink and without creating it, and a missing or unwritable file is a line on stderr. After
+  each tool-result line the worker reads the file. At the first record it stops the harness
+  (closed stdin, SIGTERM to its process group, SIGKILL after the kill grace) and ends the task
+  `failed` (work ran first, so not `rejected`) with `reason: write-refused`, whose detail names
+  the record's rule and verb and carries no other output. Only a record naming one of those two
+  rules, with a verb of one or two lowercase words, counts. A `gcp.read-only` refusal, a refused read spelling, a local render, an
+  MCP relay refusal and an API 403 don't stop the task. The broker refuses the write whether or
+  not the task stops, so a lost record only lets the task run on. Every route a definitive write
+  refusal can take to the model runs through the client: `kubectl` and `gcloud` on a profile
+  worker are the broker shim. The
+  routes that don't (the MCP relay, the stock kubectl binary run directly, a direct HTTP call to
+  the broker or the cluster API, local git, the harness's file and web tools) carry no definitive
+  write refusal; `a2a/worker-adapter/refusal.go` lists them.
 
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
@@ -515,8 +549,9 @@ leave open:
   so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
-  the dispatch config's `profileSupervisorForm` is `profile`; readers read both; contract
-  addendum 6, #5301), never its `.events`, which stays
+  the dispatch config's `profileSupervisorForm` is `profile`; readers read both, until a reader
+  given `A2A_PROFILE_SUPERVISOR_CUTOFF` stops taking the five-token form as a profile task's
+  terminal when the server stored it after that time; contract addendum 6, #5301), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
