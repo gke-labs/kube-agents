@@ -14,8 +14,10 @@ import (
 // TestTheHarnessSelectorReadsOneNameForBothWorkerKinds: A2A_HARNESS picks the
 // harness for a session pod and a profile worker alike. PROFILE_HARNESS, its
 // older name, counts only on a profile worker and only when A2A_HARNESS is
-// unset. Unset is Claude Code. A value the worker can't run is an error that
-// names it, never Claude Code in its place.
+// unset. Unset is refused, since the worker image carries no harness of its
+// own (#6707), and so is claude-code, the prototype harness removed from it.
+// A value the worker can't run is an error that names it, never another
+// harness in its place.
 func TestTheHarnessSelectorReadsOneNameForBothWorkerKinds(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -23,12 +25,14 @@ func TestTheHarnessSelectorReadsOneNameForBothWorkerKinds(t *testing.T) {
 		want    persona.Harness
 		wantErr string
 	}{
-		{"unset", nil, persona.ClaudeCode, ""},
-		{"claude on a session pod", map[string]string{lib.EnvHarness: "claude-code"}, persona.ClaudeCode, ""},
-		{"claude on a profile worker", map[string]string{lib.EnvHarness: "claude-code", lib.EnvProfileWorker: "true"}, persona.ClaudeCode, ""},
-		{"the older name on a profile worker", map[string]string{lib.EnvProfileHarness: "claude-code", lib.EnvProfileWorker: "true"}, persona.ClaudeCode, ""},
-		{"the older name on a session pod is not read", map[string]string{lib.EnvProfileHarness: "nonsense"}, persona.ClaudeCode, ""},
-		{"the new name wins over the older", map[string]string{lib.EnvHarness: "claude-code", lib.EnvProfileHarness: "nonsense", lib.EnvProfileWorker: "true"}, persona.ClaudeCode, ""},
+		{"unset", nil, "", "no harness is available in this worker image"},
+		{"claude on a session pod", map[string]string{lib.EnvHarness: "claude-code"}, "", "the claude-code harness was removed"},
+		{"claude on a profile worker", map[string]string{lib.EnvHarness: "claude-code", lib.EnvProfileWorker: "true"}, "", "the claude-code harness was removed"},
+		{"the older name on a profile worker", map[string]string{lib.EnvProfileHarness: "claude-code", lib.EnvProfileWorker: "true"}, "", "the claude-code harness was removed"},
+		{"the older name on a session pod is not read", map[string]string{lib.EnvProfileHarness: "antigravity"}, "", "no harness is available in this worker image"},
+		{"the new name wins over the older", map[string]string{lib.EnvHarness: "claude-code", lib.EnvProfileHarness: "antigravity", lib.EnvProfileWorker: "true"}, "", "the claude-code harness was removed"},
+		{"a whole-argv override doesn't bring claude back", map[string]string{lib.EnvHarness: "claude-code", "A2A_HARNESS_CMD": "stub"}, "", "the claude-code harness was removed"},
+		{"a whole-argv override doesn't stand in for a harness", map[string]string{"A2A_HARNESS_CMD": "stub"}, "", "no harness is available in this worker image"},
 		{"antigravity without the isolation waiver", map[string]string{lib.EnvHarness: "antigravity", "A2A_HARNESS_PATH": "/bin/agy"}, "", `harness "antigravity" runs without its isolation until #6710`},
 		{"antigravity through the older name without the waiver", map[string]string{lib.EnvProfileHarness: "antigravity", lib.EnvProfileWorker: "true", "A2A_HARNESS_PATH": "/bin/agy"}, "", `harness "antigravity" runs without its isolation until #6710`},
 		{"the waiver is the literal allow", map[string]string{lib.EnvHarness: "antigravity", lib.EnvHarnessUnisolated: "true", "A2A_HARNESS_PATH": "/bin/agy"}, "", `A2A_HARNESS_UNISOLATED=allow`},
@@ -41,7 +45,7 @@ func TestTheHarnessSelectorReadsOneNameForBothWorkerKinds(t *testing.T) {
 		{"core-agent's waiver is the literal allow", map[string]string{lib.EnvHarness: "core-agent", lib.EnvHarnessUnisolated: "true"}, "", `A2A_HARNESS_UNISOLATED=allow`},
 		{"core-agent's waiver's case matters", map[string]string{lib.EnvHarness: "core-agent", lib.EnvHarnessUnisolated: "Allow"}, "", `A2A_HARNESS_UNISOLATED=allow`},
 		{"core-agent with the waiver, on the image's path", map[string]string{lib.EnvHarness: "core-agent", lib.EnvHarnessUnisolated: "allow"}, persona.CoreAgent, ""},
-		{"the waiver doesn't change Claude Code", map[string]string{lib.EnvHarnessUnisolated: "allow"}, persona.ClaudeCode, ""},
+		{"the waiver alone selects nothing", map[string]string{lib.EnvHarnessUnisolated: "allow"}, "", "no harness is available in this worker image"},
 		{"a typo", map[string]string{lib.EnvHarness: "claude"}, "", `unknown harness "claude"`},
 		{"case matters", map[string]string{lib.EnvHarness: "Claude-Code"}, "", `unknown harness "Claude-Code"`},
 		{"no trimming before", map[string]string{lib.EnvHarness: " claude-code"}, "", `unknown harness " claude-code"`},
@@ -64,7 +68,7 @@ func TestTheHarnessSelectorReadsOneNameForBothWorkerKinds(t *testing.T) {
 			if h != c.want || driver.Harness() != c.want {
 				t.Errorf("harness %q, driver %q; want %q", h, driver.Harness(), c.want)
 			}
-			want := harnessBuilder(claudeBuilder{})
+			var want harnessBuilder
 			switch c.want {
 			case persona.Antigravity:
 				want = agyBuilder{}
@@ -93,34 +97,24 @@ func TestAWorkerWhoseHarnessItCantRunRefusesToStart(t *testing.T) {
 		t.Error("configFromEnv accepted an unknown harness")
 	}
 
-	t.Setenv(lib.EnvHarness, "")
-	// configFromEnv installs the builder the rest of main reads.
 	was := activeHarness
 	t.Cleanup(func() { activeHarness = was })
-	activeHarness = nil
-	cfg, ok := configFromEnv(log)
-	if !ok {
-		t.Fatal("configFromEnv refused the default harness")
-	}
-	if cfg.Driver == nil || cfg.Driver.Harness() != persona.ClaudeCode {
-		t.Errorf("driver %v, want Claude Code's", cfg.Driver)
-	}
-	if _, ok := activeHarness.(claudeBuilder); !ok {
-		t.Errorf("activeHarness %T after configFromEnv, want claudeBuilder", activeHarness)
+	for _, h := range []string{"", "claude-code"} {
+		t.Setenv(lib.EnvHarness, h)
+		if _, ok := configFromEnv(log); ok {
+			t.Errorf("configFromEnv started with %s=%q; the worker image carries no harness for it", lib.EnvHarness, h)
+		}
 	}
 }
 
-// TestAHarnessWithoutABuilderIsRefused: a harness that has a driver but no
-// argv builder is an error, not Claude Code's argv and env. Each harness the
-// worker knows has its own.
+// TestAHarnessWithoutABuilderIsRefused: a harness the worker can't build an
+// argv for is an error, never another harness's argv and env. claude-code has
+// none: its builder is dormant (#6707).
 func TestAHarnessWithoutABuilderIsRefused(t *testing.T) {
-	if b, err := builderFor(persona.ClaudeCode); err != nil || b == nil {
-		t.Fatalf("builderFor(claude-code) = %v, %v", b, err)
-	}
 	if b, err := builderFor(persona.Antigravity); err != nil || b != (agyBuilder{}) {
 		t.Fatalf("builderFor(antigravity) = %v, %v", b, err)
 	}
-	for _, h := range []persona.Harness{"", "nonsense"} {
+	for _, h := range []persona.Harness{"", persona.ClaudeCode, "nonsense"} {
 		if b, err := builderFor(h); err == nil || b != nil {
 			t.Errorf("builderFor(%q) = %v, %v; want an error and no builder", h, b, err)
 		}

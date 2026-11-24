@@ -55,12 +55,16 @@ type harnessBuilder interface {
 }
 
 // activeHarness is the pod's harness builder, chosen once by selectHarness
-// before anything is built from it. Claude Code until then, as for a test
-// that builds an argv directly.
+// before anything is built from it. The worker never runs with it unset:
+// configFromEnv refuses to start when selectHarness finds no harness. The
+// initial value serves only tests that build an argv directly.
 var activeHarness harnessBuilder = claudeBuilder{}
 
-// claudeBuilder is Claude Code's argv and env: the native binary driven over
-// the headless stream-json contract.
+// claudeBuilder is the argv and env of the prototype harness removed from the
+// worker image (#6707). It is dormant: selectHarness never returns it and the
+// image carries no binary for it (defaultPath is empty), so no worker starts
+// it. Kept, with claudeDriver, for the tests that drive fakes over the same
+// stream-json contract, until they move to another harness's fakes.
 type claudeBuilder struct{}
 
 const (
@@ -98,7 +102,7 @@ const (
 	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
-func (claudeBuilder) defaultPath() string { return workeradapter.DefaultHarnessPath }
+func (claudeBuilder) defaultPath() string { return "" }
 
 func (claudeBuilder) command(spec harnessSpec) []string {
 	argv := []string{

@@ -9,9 +9,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
-// claudeDriver is Claude Code's headless stream-json contract: the native
-// binary driven with --print and stream-json in and out (the argv
-// cmd/worker-adapter builds).
+// claudeDriver is the headless stream-json contract of the prototype harness
+// removed from the worker image (#6707). It is dormant: DriverFor never
+// returns it, so no worker drives a harness with it. Kept for the tests that
+// drive fakes over the same contract, until they move to another harness's
+// fakes.
 type claudeDriver struct{}
 
 const (

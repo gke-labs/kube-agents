@@ -3,6 +3,7 @@ package workeradapter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -164,22 +165,34 @@ func (a *adapter) turnDirs(env []string) TurnDirs {
 	return dirs
 }
 
+// ErrNoHarness is DriverFor's answer for a selector that names no harness:
+// the worker image carries none until another harness is available (#6707).
+var ErrNoHarness = errors.New("no harness is available in this worker image")
+
+// ErrHarnessRemoved is DriverFor's answer for claude-code, the prototype
+// harness removed from the worker image (#6707). A pod or an older image tag
+// that still names it is refused rather than started.
+var ErrHarnessRemoved = errors.New("the claude-code harness was removed from the worker image")
+
 // DriverFor is the driver for harness h, the value of the worker's harness
-// selector. Empty means Claude Code. Antigravity is agyDriver; the worker
-// refuses it without its isolation waiver (cmd/worker-adapter's
-// selectHarness). Anything else is refused as unknown. A worker
-// never falls back to Claude Code for a value it does not know: a typo would
-// otherwise run the wrong harness without a word.
+// selector. Antigravity is agyDriver and core-agent is coreAgentDriver; the
+// worker refuses either without its isolation waiver (cmd/worker-adapter's
+// selectHarness). Empty is
+// ErrNoHarness and claude-code is ErrHarnessRemoved: neither starts a
+// harness. Anything else is refused as unknown, never a fall back to another
+// harness: a typo would otherwise run the wrong harness without a word.
 func DriverFor(h persona.Harness) (Driver, error) {
 	switch h {
-	case "", persona.ClaudeCode:
-		return claudeDriver{}, nil
+	case "":
+		return nil, ErrNoHarness
+	case persona.ClaudeCode:
+		return nil, ErrHarnessRemoved
 	case persona.Antigravity:
 		return agyDriver{}, nil
 	case persona.CoreAgent:
 		return newCoreAgentDriver(), nil
 	}
-	return nil, fmt.Errorf("unknown harness %q (want %q, %q or %q)", h, persona.ClaudeCode, persona.Antigravity, persona.CoreAgent)
+	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.Antigravity, persona.CoreAgent)
 }
 
 // turnRestarter is implemented by a driver whose harness takes one user

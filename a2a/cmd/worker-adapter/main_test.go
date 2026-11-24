@@ -357,6 +357,7 @@ func TestOriginSeqReadsThePodEnv(t *testing.T) {
 // an unset variable fail-open. configFromEnv exists so this reaches the real
 // mapping.
 func TestTheWorkerBinaryRequiresACapabilityUnlessExactlyFalse(t *testing.T) {
+	useTestHarness(t)
 	for _, tc := range []struct {
 		name  string
 		value string
@@ -399,6 +400,7 @@ func TestTheWorkerBinaryRequiresACapabilityUnlessExactlyFalse(t *testing.T) {
 // the two executors sharing a security parser but not a validation is how the
 // pair drifts. Unset stays legitimate.
 func TestAMalformedAuthorityScopeRefusesToStart(t *testing.T) {
+	useTestHarness(t)
 	for _, tc := range []struct {
 		scope  string
 		wantOK bool
@@ -449,6 +451,7 @@ func TestAMalformedAuthorityScopeRefusesToStart(t *testing.T) {
 // A2A_AUTHORITY_SCOPE — and why the rows below describe a hand-run harness
 // or a Deployment the operator did not render.
 func TestAMalformedPodNamespaceRefusesToStart(t *testing.T) {
+	useTestHarness(t)
 	for _, tc := range []struct {
 		namespace string
 		wantOK    bool
@@ -668,6 +671,7 @@ func TestAProfileWorkersBaseArgvLeavesToolsToThePersona(t *testing.T) {
 // persona's, which carries no delegate MCP server, so a listener would serve
 // a tool the harness is never told of.
 func TestAProfileWorkerBindsNoDelegateSocket(t *testing.T) {
+	useTestHarness(t)
 	t.Setenv("TASK_ID", "task-profile")
 	t.Setenv("PROFILE", "chat")
 	t.Setenv("NATS_URL", "nats://127.0.0.1:1")

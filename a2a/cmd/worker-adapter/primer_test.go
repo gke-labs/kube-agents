@@ -35,6 +35,7 @@ func TestReadPrimer(t *testing.T) {
 // configFromEnv is where the worker's config is built; the primer has to
 // make it into Config, or readPrimer is dead code.
 func TestConfigFromEnvCarriesThePrimer(t *testing.T) {
+	useTestHarness(t)
 	path := filepath.Join(t.TempDir(), "primer")
 	if err := os.WriteFile(path, []byte("The user said: hi\n"), 0o600); err != nil {
 		t.Fatal(err)

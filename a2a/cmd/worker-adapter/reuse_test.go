@@ -16,6 +16,7 @@ import (
 // under A2A_DELEGATE_TOOL=off, and building it leaves the pod's own argv,
 // and the switch, as they were.
 func TestConfigFromEnvCarriesTheReuseFlagAndANoDelegateArgv(t *testing.T) {
+	useTestHarness(t)
 	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvClusterView, lib.EnvPrimerFile} {
 		t.Setenv(key, "")
 	}
@@ -35,12 +36,17 @@ func TestConfigFromEnvCarriesTheReuseFlagAndANoDelegateArgv(t *testing.T) {
 		}
 	}
 
-	cfg, _ := configFromEnv(log)
-	with, without := strings.Join(cfg.HarnessCommand, " "), strings.Join(cfg.HarnessCommandNoDelegate, " ")
-	if !strings.Contains(with, delegateToolID) || !slices.Contains(cfg.HarnessCommand, "--mcp-config") {
+	// The two argvs are the stream-json builder's, the dormant one that
+	// offers the delegate tool: the test harness above offers none.
+	was := activeHarness
+	t.Cleanup(func() { activeHarness = was })
+	activeHarness = claudeBuilder{}
+	withArgv := harnessCommand()
+	with, without := strings.Join(withArgv, " "), strings.Join(harnessCommandWithoutDelegate(), " ")
+	if !strings.Contains(with, delegateToolID) || !slices.Contains(withArgv, "--mcp-config") {
 		t.Fatalf("the pod's argv lost the delegate tool: %q", with)
 	}
-	if strings.Contains(without, delegateToolID) || slices.Contains(cfg.HarnessCommandNoDelegate, "--mcp-config") ||
+	if strings.Contains(without, delegateToolID) || strings.Contains(without, "--mcp-config") ||
 		strings.Contains(without, delegatePrompt) {
 		t.Fatalf("the no-delegate argv still offers the tool: %q", without)
 	}

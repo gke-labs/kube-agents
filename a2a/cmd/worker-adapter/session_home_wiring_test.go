@@ -78,8 +78,10 @@ func runChild(t *testing.T, args string, env ...string) (int, string) {
 // A session worker checks its shipped tree before anything else that
 // needs the bus, and a difference exits 1 naming the file.
 func TestRunChecksTheSessionHomeInSessionMode(t *testing.T) {
+	useTestHarness(t)
 	home := changedSessionHome(t)
-	code, stderr := runChild(t, "", "TASK_ID=task-wiring", "PROFILE=p", "NATS_URL=nats://127.0.0.1:1", claudeConfigDirEnv+"="+home, "A2A_WORKDIR="+t.TempDir())
+	code, stderr := runChild(t, "", "TASK_ID=task-wiring", "PROFILE=p", "NATS_URL=nats://127.0.0.1:1", claudeConfigDirEnv+"="+home, "A2A_WORKDIR="+t.TempDir(),
+		lib.EnvHarness+"=antigravity", lib.EnvHarnessUnisolated+"="+lib.HarnessUnisolatedAllow, "A2A_HARNESS_PATH=/bin/true")
 	if code != 1 || !strings.Contains(stderr, sessionHomeFailure) || !strings.Contains(stderr, "triage/SKILL.md") {
 		t.Errorf("session mode: exit %d, stderr %q; want 1 and the session-home check's error", code, stderr)
 	}

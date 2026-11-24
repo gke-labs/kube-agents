@@ -25,11 +25,6 @@ import (
 	"time"
 )
 
-// DefaultHarnessPath is where the worker image carries the harness: the
-// native binary shipped inside the agent SDK's platform package (a
-// self-contained executable, not a cli.js).
-const DefaultHarnessPath = "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
-
 const (
 	// stderrTailBytes is how much of the harness's stderr is kept for a
 	// failure message. A tail rather than the whole stream: the useful part
