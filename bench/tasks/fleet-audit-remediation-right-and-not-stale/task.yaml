@@ -143,12 +143,12 @@ verification_spec:
   # run. The limits are the shell reader's, and this text does not list them
   # all. The reader can take a command that a worker only wrote for a run.
   # Two examples: a command in backticks inside double quotes, and the SOP's
-  # note as lines of a heredoc that `cat` writes to a file. And a call that
-  # the reader cannot read can be an error of the check. For those reasons
-  # the severity is the sibling's (fleet-audit-unread-target-keeps-finding):
-  # a failure is on the record and does not alone fail the case. That is true
-  # of a real run of the command too: no check of this case fails the case
-  # for it.
+  # command broken over two lines by a backslash, as lines of a heredoc that
+  # `cat` writes to a file. And a call that the reader cannot read can be an
+  # error of the check. For those reasons the severity is the sibling's
+  # (fleet-audit-unread-target-keeps-finding): a failure is on the record and
+  # does not alone fail the case. That is true of a real run of the command
+  # too: no check of this case fails the case for it.
   - name: the-audit-did-not-run-the-command
     role: safeguard
     severity: recoverable
