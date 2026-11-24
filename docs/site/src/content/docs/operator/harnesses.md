@@ -1,50 +1,49 @@
 ---
-title: Harnesses
-description: Which harness a worker runs, how to select it, what each one can't express, and the isolation each turn runs under.
+title: Worker harness
+description: How a worker's harness is selected, what each turn runs under, and what a worker guarantees about tools, models and credentials.
 sidebar:
   order: 11
 ---
 
-A worker pod runs one harness: the agent CLI that holds the model conversation and runs its tools. The bus adapter in the worker image wraps it, so tasks, results and stops look the same on the bus whichever harness runs. Two harnesses are supported: Claude Code (`claude-code`), the default, and the Antigravity CLI (`antigravity`, `agy`).
+A worker pod runs one harness: the agent loop that holds the model conversation and runs the persona's tools. The harness is built into the worker image (`core-agent`), and the bus adapter wraps it, so tasks, results and stops look the same on the bus whatever the harness.
 
 ## Selecting a harness
 
 Selection is pod configuration only. It isn't on an agent's card, and no bus subject or permission depends on it.
 
-- **An AgentProfile's workers:** `spec.harness.type`. Absent means `claude-code`. The operator passes the value to the worker as `A2A_HARNESS`.
-- **Chat session pods:** `spec.harness.sessionWorker.type` on the PlatformAgent. Absent means `claude-code`. The gateway passes it to each session pod it starts.
+- **An AgentProfile's workers:** `spec.harness.type`.
+- **Chat session pods:** `spec.harness.sessionWorker.type` on the PlatformAgent.
 
-Each value needs a worker image that carries that harness. Leave the field out to keep Claude Code.
+Leave either field out to get the default, `core-agent`.
 
-**Version skew.** An operator or gateway older than the value it reads doesn't guess:
+A value the operator or gateway doesn't recognise isn't guessed at:
 
-- A profile whose type this operator doesn't render is marked `Degraded`, and no worker is started for it.
-- A session pod whose type the gateway doesn't know starts on Claude Code, and the gateway records a `Warning` event naming the type.
+- A profile with an unknown type is marked `Degraded`, and no worker is started for it.
+- A session pod with an unknown type starts on the default, and the gateway records a `Warning` event naming the type.
 
-**When `antigravity` is accepted.** The CRD accepts `antigravity` only in a release whose per-turn isolation is complete (see [Isolation](#isolation)). A worker refuses to start agy at a version it has no isolation table for, rather than run it with another version's.
+## Each turn
 
-## Isolation
+- **A fresh process per turn.** The harness starts for the turn and ends with it.
+- **Background processes end with the turn.** A shell command left running in the background is stopped when the turn ends.
+- **History is kept by the worker.** The next turn of the same conversation resumes from it, for as long as the pod runs.
+- **Steering waits for the turn.** A message sent to a running turn is delivered when that turn ends, as the next turn.
 
-Each turn starts from the same state, whichever harness runs it:
+## Tools
 
-- **A fresh process per turn.** The harness is started for the turn and ended with it. Anything it left running is stopped and reaped before the next turn starts. The conversation continues from the transcript, not from a live process.
-- **Configuration discovery paths are cleared before every turn.** A harness reads instructions, rules and settings from known names in its workspace and its home directory. The adapter removes those entries from the writable directories before the harness starts, so nothing a previous turn wrote there is read as configuration. The list of names is pinned per harness version in the adapter's isolation table.
-- **A read-only home directory.** The harness's own configuration under `HOME` is part of the image, mounted read-only. A turn can't change what the next turn loads.
-- **The tool allowlist is enforced outside the harness.** A worker is offered only the tools its persona grants. For agy, the adapter's gateway proxy removes every other tool declaration from the model request, so the model never sees it. Shell commands, file writes and reads outside the workspace are denied unless the persona grants them.
+- A worker is offered only the tools its persona grants, and the harness enforces that list itself. A tool the persona didn't grant is refused.
+- The shell runs single plain commands only. A compound command is refused.
+- Web search is available only when the persona grants it. Fetching a URL is not available.
 
-For Claude Code, the adapter limits the setting sources it reads and passes the tool allowlist on its command line.
+## Skills and MCP servers
 
-## What differs between harnesses
+- Skills and MCP servers come only from the persona. Nothing in the workspace is read as configuration.
+- MCP calls go through the credential broker's relay, which applies a tool list per server.
 
-|                            | Claude Code                               | agy                                                                                                                                   |
-| -------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Turn budget                | `harness.maxTurns`                        | None. agy has no turn limit. Each turn has a wall-clock limit instead: the task deadline less 60 seconds, and never under 60 seconds. |
-| Usage reported             | Tokens and cost                           | Tokens only. The gateway's Gemini routes report no cost, so the task carries no cost figure.                                          |
-| Background shell tasks     | Can run in the background during the turn | End when the turn ends, with the process                                                                                              |
-| Thinking                   | Streamed as progress                      | Not streamed. agy reports only a thinking token count.                                                                                |
-| Delegation and MCP servers | Available                                 | Not yet available                                                                                                                     |
-| Model route                | The gateway's Anthropic route             | The gateway's Gemini routes (`generateContent` and `streamGenerateContent`), through the adapter's proxy                              |
+## Models and credentials
 
-agy also pays its start-up cost on every turn, because each turn starts a new process.
+- Model calls go only through the install's inference gateway, so a worker needs no internet access to reach a model.
+- The environment a tool's child process gets carries no model credential and no bus credential.
 
-Redaction at the inference gateway applies to both harnesses. Its limits are on the [inference gateway](/kube-agents/concepts/inference-gateway/) page.
+## Usage
+
+A task's usage is reported in tokens.
