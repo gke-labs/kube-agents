@@ -1733,7 +1733,7 @@ fi
 # its turns; shipped leaves the cap at the install default, what a customer
 # install gets, and an eviction, a wait or a refusal there is a finding about
 # that default.
-EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
+EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-session}" # DO NOT MERGE: twin-only, the session front door
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
 platform | session) ;;
@@ -2059,6 +2059,7 @@ A2A_OPERATOR_ENV_ARGS=(
   --set-string "profiles.cluster.persona.image.tag=${TAG}"
   --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
   --set-string "profiles.cluster.harness.image.tag=${TAG}"
+  --set "profiles.cluster.concurrency=4" # DO NOT MERGE: twin-only, #7014 concurrency arm
   --set-string "profiles.tse.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}"
   --set-string "profiles.tse.persona.image.tag=${TAG}"
   --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
