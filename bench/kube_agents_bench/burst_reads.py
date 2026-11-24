@@ -25,8 +25,10 @@ For each level L in turn the harness opens L conversations through the
 inject door, each on its own key (:func:`conversation_key`) with its own
 message id, submits them together, and follows every one to its terminal
 inside ``AGENT_INJECT_TIMEOUT``. A conversation still running at that
-deadline is cancelled, and the next level starts only once every
-conversation of this one has ended or been cancelled, so levels never
+deadline is cancelled and fails the run, and the next level starts only
+once every conversation of this one has ended and each cancelled one's
+session has been released (waited for up to
+:data:`STRAGGLER_RELEASE_SECONDS`, else infrastructure), so levels never
 overlap. Whatever happens, anything still running when the run ends is
 cancelled.
 
@@ -214,6 +216,10 @@ class ConversationRecord:
     # published that cancel.
     cancelled: bool = False
     cancel_published: bool = False
+    # Whether it was still running at AGENT_INJECT_TIMEOUT. Such a
+    # conversation fails the run even if it ended completed during the
+    # cancel's settle: it waited out the budget.
+    timed_out: bool = False
     # Why this conversation's run cannot be graded, or "".
     infrastructure: str = ""
 
@@ -232,8 +238,14 @@ class ConversationRecord:
             "refused": self.refused,
             "cancelled": self.cancelled,
             "cancel_published": self.cancel_published,
+            "timed_out": self.timed_out,
             "infrastructure": self.infrastructure or None,
         }
+
+
+#: How long the harness waits, after a level, for its cancelled stragglers'
+#: sessions to be released before the next level starts.
+STRAGGLER_RELEASE_SECONDS = 120.0
 
 
 @dataclass
@@ -297,7 +309,12 @@ def assess(levels: list[LevelRecord], planned: Iterable[int]) -> dict[str, Any]:
         problems.append(f"levels {list(planned)} were planned and {list(ran)} ran")
     for level in levels:
         for conv in level.conversations:
-            if conv.terminal_state != STATE_COMPLETED:
+            if conv.timed_out:
+                problems.append(
+                    f"level {level.level} conversation {conv.index} ({conv.task_id or 'no task'}) was still "
+                    "running at the deadline"
+                )
+            elif conv.terminal_state != STATE_COMPLETED:
                 problems.append(
                     f"level {level.level} conversation {conv.index} ({conv.task_id or 'no task'}) ended "
                     f"{conv.terminal_state or conv.outcome or 'without a terminal'}"

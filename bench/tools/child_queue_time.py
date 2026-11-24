@@ -50,11 +50,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +93,9 @@ def parse_time(value: str) -> datetime:
     text = _SUB_MICRO.sub(r"\1", value.strip())
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    return datetime.fromisoformat(text)
+    parsed = datetime.fromisoformat(text)
+    # A timestamp with no zone is read as UTC, so mixed lines still subtract.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def log_records(lines: Iterable[str]) -> Iterable[dict[str, Any]]:
@@ -130,7 +133,7 @@ def stats(values: list[float]) -> dict[str, Any]:
     n = len(ordered)
     out: dict[str, Any] = {"n": n}
     for name, q in PERCENTILES:
-        out[name] = ordered[min(n - 1, int(q * n))] if n else None
+        out[name] = ordered[max(0, math.ceil(q * n) - 1)] if n else None
     out["max"] = ordered[-1] if n else None
     out["over_600s"] = sum(v > LONG_WAIT_SECONDS for v in ordered)
     return out

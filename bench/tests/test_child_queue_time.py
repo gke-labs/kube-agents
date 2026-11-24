@@ -185,3 +185,16 @@ def test_the_cli_needs_both_logs(tmp_path):
     (tmp_path / "a2a-gateway-x.log").write_text("")
     with pytest.raises(SystemExit):
         cqt.main([str(tmp_path)])
+
+
+def test_percentiles_are_nearest_rank():
+    got = cqt.stats([float(v) for v in range(1, 11)])
+    assert (got["p50"], got["p90"], got["p95"], got["max"]) == (5.0, 9.0, 10.0, 10.0)
+    assert cqt.stats([7.0])["p50"] == 7.0
+
+
+def test_a_timestamp_without_a_zone_is_utc():
+    naive = cqt.parse_time("2026-11-24T02:05:29.025947723")
+    aware = cqt.parse_time("2026-11-24T02:05:30.025947Z")
+    assert (aware - naive).total_seconds() == 1.0
+

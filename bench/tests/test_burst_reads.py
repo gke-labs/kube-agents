@@ -233,6 +233,12 @@ class _FakeTask(_RealInjectTask):
         self.left += 1
         return True
 
+    def still_running(self, task_id):
+        # A cancelled straggler's session is released at once, unless the
+        # plan says it sticks.
+        self._note("still_running")
+        return self.what == "stuck"
+
 
 @pytest.fixture
 def fake(monkeypatch):
@@ -365,3 +371,40 @@ def test_the_entry_is_graded_on_every_record():
     from kube_agents_bench import cases
 
     assert burst_reads.ENTRY in cases.HARNESS_WRITTEN_ENTRIES
+
+
+def test_the_next_level_waits_for_a_cancelled_straggler_to_be_released(fake):
+    fake.plan = {"L3-1": "deadline"}
+    _run()
+    assert fake.log.index(("still_running", "L3-1")) < fake.log.index(("submit", "L6-0"))
+
+
+def test_a_straggler_never_released_is_infrastructure(fake, monkeypatch):
+    monkeypatch.setattr(burst_reads, "STRAGGLER_RELEASE_SECONDS", 0.0)
+    fake.plan = {"L3-1": "stuck"}
+    original = _FakeTask.await_terminal
+
+    def deadline_then_stuck(self, task_id, *, deadline, on_poll=None):
+        if self.suffix == "L3-1":
+            fold = inject.Fold(task_id)
+            fold.apply(entry(1, "task", taskId=task_id))
+            fold.note_executor_state(inject.STATE_WORKING)
+            return inject.Exchange(fold, inject.OUTCOME_DEADLINE, self.conversation, task_id)
+        return original(self, task_id, deadline=deadline, on_poll=on_poll)
+
+    monkeypatch.setattr(_FakeTask, "await_terminal", deadline_then_stuck)
+    why = _infra(_run())
+    assert "still running" in why and "after its cancel" in why
+    assert not any(what == "submit" and suffix.startswith("L6") for what, suffix in fake.log)
+
+
+def test_a_conversation_past_the_deadline_fails_even_if_it_then_completed():
+    level = burst_reads.LevelRecord(level=1)
+    level.conversations.append(
+        burst_reads.ConversationRecord(
+            level=1, index=0, conversation="c", task_id="t", terminal_state=burst_reads.STATE_COMPLETED, timed_out=True
+        )
+    )
+    got = burst_reads.assess([level], [1])
+    assert got["status"] == "error" and "still running at the deadline" in got["result"]
+

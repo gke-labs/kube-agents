@@ -4046,7 +4046,8 @@ class KubeAgentsHarness(AgentHarness):
                 if reset and time.monotonic() - last_respawn[0] < _BURST_RESPAWN_DEBOUNCE_SECONDS:
                     return
                 _forward_inject_door(local_port, agent_service, service, reset=reset, after_standby=after_standby)
-                last_respawn[0] = time.monotonic()
+                if reset:
+                    last_respawn[0] = time.monotonic()
 
         if own_tunnel:
             failures = 0
@@ -4128,16 +4129,23 @@ class KubeAgentsHarness(AgentHarness):
             rec.ended_at = burst_reads.utc_stamp()
             leaves_active = exchange.outcome in _BURST_LEAVES_ACTIVE
             timed_out, stop_pending = _bound_stray(task, exchange)
+            rec.timed_out = timed_out
             rec.outcome = exchange.outcome
             rec.terminal_state = exchange.fold.terminal
             if leaves_active and not stop_pending:
                 rec.cancelled = True
+                if not task.cancel_sent:
+                    # Once more, as the session-cap fillers' release does.
+                    task.cancel(task_id, settle=0)
                 rec.cancel_published = task.cancel_sent
                 if not task.cancel_sent:
                     rec.infrastructure = (
                         f"task {task_id} was still active at the deadline and no cancel was published, "
                         "so the next level would overlap it"
                     )
+            if stop_pending:
+                rec.cancelled = True
+                rec.cancel_published = True
             infrastructure = _inject_infrastructure(task, exchange, timeout, timed_out, stop_pending)
             if infrastructure is not None and not rec.infrastructure:
                 rec.infrastructure = str(infrastructure.metadata.get("infra_failure") or infrastructure.errors[0])
@@ -4179,6 +4187,31 @@ class KubeAgentsHarness(AgentHarness):
                 record.wall_seconds = time.monotonic() - started
                 if burst_reads.infrastructure([record]):
                     break
+                # A cancelled straggler still holds its session worker (and
+                # its children the profile pool) until the gateway confirms
+                # the end, and the next level would be refused at the cap or
+                # measured behind it. Wait for each to be released, bounded.
+                release_by = time.monotonic() + burst_reads.STRAGGLER_RELEASE_SECONDS
+                for task, rec in pairs:
+                    if not (rec.cancelled and rec.task_id):
+                        continue
+                    while True:
+                        try:
+                            running = task.still_running(rec.task_id)
+                        except inject.InjectUnavailable:
+                            running = True
+                        if not running:
+                            break
+                        if time.monotonic() >= release_by:
+                            rec.infrastructure = (
+                                f"cancelled task {rec.task_id} was still running "
+                                f"{burst_reads.STRAGGLER_RELEASE_SECONDS:.0f}s after its cancel, so the next level "
+                                "would overlap it"
+                            )
+                            break
+                        time.sleep(2)
+                if burst_reads.infrastructure([record]):
+                    break
         finally:
             _stop_all()
 
@@ -4201,6 +4234,7 @@ class KubeAgentsHarness(AgentHarness):
             errors=[] if entry["status"] == inject.STATE_COMPLETED else [entry["result"]],
             metadata=metadata,
         )
+        _fold_worker_total(result.tokens)
         return result
 
     def _execute_card_wait(self, prompt: str) -> AgentResult:
