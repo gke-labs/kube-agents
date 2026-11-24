@@ -791,7 +791,11 @@ what the renderer does with them.
   note. Its runs' `job` is always the prefix's last segment, and they count
   as the writers part only when that segment is
   `ci-kube-agents-eval-nightly-writers` (`nightly.NIGHTLY_WRITERS_JOB`);
-  any other is warned about and reported as the main part.
+  any other is warned about and reported as the main part. Among
+  `--nightly-prefix` and the part flags, each job and each prefix is listed
+  once, under the first flag that names it, `--nightly-prefix` first: a part
+  flag that names a job or a prefix an earlier flag already lists is warned
+  about and not read. A trailing `/` does not make a prefix another one.
 - `--nightly-main-b-prefix [<gs prefix>]` — the same for the periodic that
   runs the main part's main-b shard; given without a value it is
   `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/`.
