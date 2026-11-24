@@ -52,8 +52,11 @@ the shape anywhere, and a guess encoded as tested code looks like a fact:
 
 - **3.10(b)**, a `ComputeClass` targeting a reservation that does not exist or
   sits in an unreachable zone. `check_reservation_affinity` covers 3.10(a) and
-  `check_reservation` covers 3.10(c); resolving a ComputeClass's named
-  reservation against the zones a cluster can actually reach is the part
+  `check_reservation` covers 3.10(c). `check_class_reservation_status` covers
+  the part of 3.10(b) that GKE reports in the class's own status
+  (`ReservationNotFound`, read from a class with node pool auto-creation on).
+  Where the status does not name the reservation, resolving a ComputeClass's
+  named reservation against the zones a cluster can actually reach is the part
   nothing here does. The node pool form is 3.10(d), `file_reserved_pools`: its
   pool and reservation shapes
   are pinned by `test_fleet_stockout.py` against responses read from a
@@ -217,6 +220,17 @@ CONDITION_TRUE = "True"
 # pool with autoscaling off), beside the summary condition `Health` at False.
 CCC_MISCONFIGURED_SUFFIX = "Misconfigured"
 CCC_HEALTH_CONDITION = "Health"
+# §3.10(b), as read live from a throwaway cluster (GKE 1.35.8-gke.1796000) on
+# 2026-11-24: for a class with node pool auto-creation on whose rule names a
+# reservation that does not exist, a `...Misconfigured` condition is True with
+# this reason, and its message names the reservation. GKE then does not use
+# that rule. With auto-creation off and no matching node pool the reason is
+# `NapDisabledAndNoMatchingNodegroups`, and the reservation is not named.
+CCC_RESERVATION_NOT_FOUND_REASON = "ReservationNotFound"
+CLASS_RESERVATION_NOT_FOUND_IMPACT = (
+    "GKE reports that a reservation named by a rule of this ComputeClass does not exist or cannot be used, so GKE "
+    "does not use that rule: its workloads get nodes from the rules below it, and wait if no rule is below it."
+)
 CCC_CONDITION_EXCERPT = "status condition {type} is {state} ({reason}): {message}"
 CCC_CONDITION_JOINER = "; "
 # A condition message is GKE's text; this bounds what one excerpt quotes of it.
@@ -1598,11 +1612,9 @@ def _reads_pool_labels(workload: dict, compute_classes_by_name: dict[str, dict])
     return cc is not None and ((cc.get("spec") or {}).get("nodePoolAutoCreation") or {}).get("enabled") is not True
 
 
-def check_compute_class_status(cc: dict) -> dict | None:
-    """SOP 3.12(b): GKE's own verdict on the class. One hit when the status
-    carries a `...Misconfigured` condition as `True` or `Health` as `False`,
-    with each such condition's reason and message as the excerpt. A class with
-    no status yet, or with no condition in that state, is not judged."""
+def _reported_class_conditions(cc: dict) -> list[tuple[str, str, str]]:
+    """`(type, reason, excerpt)` of each status condition in which GKE reports
+    the class: a `...Misconfigured` condition as `True`, or `Health` as `False`."""
     reported = []
     for condition in (cc.get("status") or {}).get("conditions") or []:
         if not isinstance(condition, dict):
@@ -1610,13 +1622,52 @@ def check_compute_class_status(cc: dict) -> dict | None:
         kind, state = condition.get("type"), condition.get("status")
         misconfigured = str(kind or "").endswith(CCC_MISCONFIGURED_SUFFIX) and state == CONDITION_TRUE
         if misconfigured or (kind == CCC_HEALTH_CONDITION and state == CONDITION_FALSE):
+            reason = condition.get("reason") or ""
             message = " ".join(str(condition.get("message") or "").split())[:CCC_CONDITION_MESSAGE_CHARS]
-            reported.append(CCC_CONDITION_EXCERPT.format(type=kind, state=state, reason=condition.get("reason") or "", message=message))
+            reported.append((kind, reason, CCC_CONDITION_EXCERPT.format(type=kind, state=state, reason=reason, message=message)))
+    return reported
+
+
+def _names_missing_reservation(kind: str, reason: str) -> bool:
+    return kind != CCC_HEALTH_CONDITION and reason == CCC_RESERVATION_NOT_FOUND_REASON
+
+
+def check_class_reservation_status(cc: dict) -> dict | None:
+    """SOP 3.10(b), from GKE's own verdict on the class: one hit when a
+    `...Misconfigured` condition is `True` with the reason
+    `ReservationNotFound`. The message names the reservation."""
+    reported = [excerpt for kind, reason, excerpt in _reported_class_conditions(cc) if _names_missing_reservation(kind, reason)]
     if not reported:
         return None
     return {
         "object": f"ComputeClass/{cc['metadata']['name']}",
         "excerpt": CCC_CONDITION_JOINER.join(reported),
+        "severity": "critical",
+        "impact": CLASS_RESERVATION_NOT_FOUND_IMPACT,
+        "needs_triage": CLASS_STATUS_TRIAGE,
+    }
+
+
+def check_compute_class_status(cc: dict, *, reservation_filed: bool = False) -> dict | None:
+    """SOP 3.12(b): GKE's own verdict on the class. One hit when the status
+    carries a `...Misconfigured` condition as `True` or `Health` as `False`,
+    with each such condition's reason and message as the excerpt. A class with
+    no status yet, or with no condition in that state, is not judged.
+
+    `reservation_filed` says that `check_class_reservation_status` filed the
+    class's missing reservation under 3.10(b). Those conditions are then left
+    out here, and so is `Health` when no other condition says that the class
+    is misconfigured: one fault is one finding."""
+    reported = _reported_class_conditions(cc)
+    if reservation_filed:
+        reported = [c for c in reported if not _names_missing_reservation(c[0], c[1])]
+        if all(kind == CCC_HEALTH_CONDITION for kind, _, _ in reported):
+            return None
+    if not reported:
+        return None
+    return {
+        "object": f"ComputeClass/{cc['metadata']['name']}",
+        "excerpt": CCC_CONDITION_JOINER.join(excerpt for _, _, excerpt in reported),
         "needs_triage": CLASS_STATUS_TRIAGE,
     }
 
@@ -3076,7 +3127,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                     # Stamped: an unread pool list or an unread owner project
                     # drops this slug's record (§3.10(d)).
                     candidates.append(_emit("reservation-mismatch-risk", {**hit, "command": dump_record["command"]}))
-        for hit in [check_compute_class_status(cc)]:
+        # §3.10(b) from the class's own status; §3.10 does not flag non-production.
+        reservation_hit = None if non_production else check_class_reservation_status(cc)
+        if reservation_hit:
+            candidates.append(_emit("reservation-mismatch-risk", {**reservation_hit, "command": dump_record["command"]}))
+        for hit in [check_compute_class_status(cc, reservation_filed=bool(reservation_hit))]:
             if hit:
                 # Stamped, as the workload arms below are: a failed pool list pops
                 # this slug's record, and the class's own status does not need the pools.

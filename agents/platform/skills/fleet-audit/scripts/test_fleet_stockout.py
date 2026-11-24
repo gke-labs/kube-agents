@@ -858,6 +858,97 @@ class DanglingComputeClassTest(unittest.TestCase):
         excerpt = fs.check_compute_class_status(self.class_with_status(long_message))["excerpt"]
         self.assertLess(len(excerpt), 300)
 
+    # The conditions of two classes on a throwaway cluster (GKE
+    # 1.35.8-gke.1796000) on 2026-11-24, with the names replaced. Capture
+    # `d.computeclass-status.yaml`: node pool auto-creation on, and the first
+    # rule names a reservation that does not exist.
+    RESERVATION_NOT_FOUND = (
+        "CrdMisconfigured", "True", "ReservationNotFound",
+        'Reservation "acme/no-such-reservation" either does not exist or not accessible.',
+    )
+    # Capture `d.fixture-class-status.yaml`: the same rule, auto-creation off
+    # and no matching node pool. GKE does not name the reservation here.
+    NO_MATCHING_POOL = (
+        "CrdMisconfigured", "True", "NapDisabledAndNoMatchingNodegroups",
+        "Crd with NAP disabled should have at least one matching nodepool with autoscaling enabled.",
+    )
+    RESERVATION_EXCERPT = (
+        "status condition CrdMisconfigured is True (ReservationNotFound): "
+        'Reservation "acme/no-such-reservation" either does not exist or not accessible.'
+    )
+
+    def test_a_reservation_that_gke_does_not_find_is_a_reservation_hit(self):
+        """SOP 3.10(b), from GKE's own verdict on the class."""
+        hit = fs.check_class_reservation_status(self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY))
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertEqual(hit["excerpt"], self.RESERVATION_EXCERPT)
+        self.assertEqual(hit["severity"], "critical")
+        self.assertEqual(hit["impact"], fs.CLASS_RESERVATION_NOT_FOUND_IMPACT)
+        # As before the move: the sweep opens no pull request for a class that
+        # GKE reports. A fix can be a new reservation, which is billed.
+        self.assertEqual(hit["needs_triage"], fs.CLASS_STATUS_TRIAGE)
+
+    def test_other_conditions_are_not_a_reservation_hit(self):
+        for conditions in (
+            (self.TAINT_MISSING, self.NOT_HEALTHY),
+            (self.NO_MATCHING_POOL, self.NOT_HEALTHY),
+            (("CrdMisconfigured", "False", "ReservationNotFound", ""),),
+            (),
+        ):
+            with self.subTest(conditions=conditions):
+                self.assertIsNone(fs.check_class_reservation_status(self.class_with_status(*conditions)))
+        self.assertIsNone(fs.check_class_reservation_status(compute_class("cc1", [{"machineFamily": "n4"}])))
+        self.assertIsNone(fs.check_class_reservation_status({**compute_class("cc1", []), "status": {"conditions": ["junk", None]}}))
+
+    def test_one_fault_is_one_finding(self):
+        """`Health` at False is the summary of the reservation fault when no
+        other condition says that the class is misconfigured."""
+        only_reservation = self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY)
+        self.assertIsNone(fs.check_compute_class_status(only_reservation, reservation_filed=True))
+        both = self.class_with_status(self.RESERVATION_NOT_FOUND, self.TAINT_MISSING, self.NOT_HEALTHY)
+        excerpt = fs.check_compute_class_status(both, reservation_filed=True)["excerpt"]
+        self.assertIn("(TaintMissing)", excerpt)
+        self.assertIn("status condition Health is False", excerpt)
+        self.assertNotIn("ReservationNotFound", excerpt)
+
+    def test_a_reservation_fault_that_was_not_filed_stays_in_the_status_hit(self):
+        """A non-production class: 3.10 does not flag it, and 3.12(b) reports
+        the class as it did before."""
+        excerpt = fs.check_compute_class_status(self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY))["excerpt"]
+        self.assertEqual(excerpt, f"{self.RESERVATION_EXCERPT}; status condition Health is False (Health): Crd is not healthy.")
+
+    def test_the_fixture_shape_is_a_status_hit_and_no_reservation_hit(self):
+        cc = self.class_with_status(self.NO_MATCHING_POOL, self.NOT_HEALTHY)
+        self.assertIsNone(fs.check_class_reservation_status(cc))
+        self.assertIn("(NapDisabledAndNoMatchingNodegroups)", fs.check_compute_class_status(cc, reservation_filed=False)["excerpt"])
+
+    def filed_for_class(self, cc):
+        entry = CollectClusterTest().run_with(dump_items=[cc])
+        name = f"ComputeClass/{cc['metadata']['name']}"
+        return [c for c in entry["candidates"] if c["object"] == name and c["check"] in ("dangling-compute-class", "reservation-mismatch-risk")]
+
+    def test_the_collector_files_the_reservation_fault_under_the_reservation_check(self):
+        [candidate] = self.filed_for_class(self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY))
+        self.assertEqual((candidate["check"], candidate["severity"]), ("reservation-mismatch-risk", "critical"))
+        self.assertEqual(candidate["excerpt"], self.RESERVATION_EXCERPT)
+        self.assertTrue(candidate["impact_authoritative"])
+        # Stamped with the read of the classes.
+        self.assertIn("kubectl get", candidate["command"])
+
+    def test_the_collector_keeps_the_status_finding_for_the_other_conditions(self):
+        both = self.class_with_status(self.RESERVATION_NOT_FOUND, self.TAINT_MISSING, self.NOT_HEALTHY)
+        self.assertEqual(sorted(c["check"] for c in self.filed_for_class(both)), ["dangling-compute-class", "reservation-mismatch-risk"])
+        fixture = self.class_with_status(self.NO_MATCHING_POOL, self.NOT_HEALTHY)
+        self.assertEqual([c["check"] for c in self.filed_for_class(fixture)], ["dangling-compute-class"])
+
+    def test_a_non_production_class_keeps_the_status_finding_only(self):
+        """§3.10 does not flag non-production."""
+        cc = self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY)
+        cc["metadata"]["name"] = "dev-ccc"
+        [candidate] = self.filed_for_class(cc)
+        self.assertEqual(candidate["check"], "dangling-compute-class")
+        self.assertIn("(ReservationNotFound)", candidate["excerpt"])
+
     def test_the_collector_files_the_class_and_stamps_the_read(self):
         cc = self.class_with_status(self.TAINT_MISSING, self.NOT_HEALTHY)
         for pools_rc in (0, 1):
