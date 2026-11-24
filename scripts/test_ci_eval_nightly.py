@@ -719,6 +719,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "stockout-pinned-pool",
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
+            "consistency-boot-disk-pool-outlier",
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
             "gce-startup-script-failure",

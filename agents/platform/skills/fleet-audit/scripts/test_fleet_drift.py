@@ -2624,6 +2624,10 @@ class BootDiskPoolVoteTest(unittest.TestCase):
             entry["limitations"],
         )
 
+    def test_no_votes_span_no_clusters(self):
+        self.assertEqual(fd.pool_baseline_span({}), (0, 0))
+        self.assertFalse(fd.pool_baseline_spans_cohort({}))
+
     def test_a_baseline_held_in_two_thirds_of_the_clusters_stands(self):
         fleet = [
             cluster("a", nodePools=[pool(f"p{j}") for j in range(10)]),
