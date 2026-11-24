@@ -3254,13 +3254,8 @@ def _cut_command_texts(trajectory: list[Any]) -> frozenset[str]:
     for entry in trajectory:
         if not (isinstance(entry, dict) and entry.get("agent") and entry.get("name") in _CODE_TOOLS):
             continue
-        args = entry.get("args")
-        if not (isinstance(args, dict) and set(args) == {_CLIPPED_ARGS_KEY} and isinstance(args[_CLIPPED_ARGS_KEY], str)):
-            continue
-        if _clipped_string_args(args[_CLIPPED_ARGS_KEY], {_COMMAND_ARG: "", _CODE_ARG: ""}):
-            continue
-        command = _code_call_text(entry)
-        if command is not None:
+        command, is_clipped = _code_call_text_and_clip(entry)
+        if is_clipped and command is not None:
             cut.add(command)
     return frozenset(cut)
 
@@ -3877,13 +3872,25 @@ class WorkerCommandsVerifier(BaseVerifier):
         cut, programs = _cut_command_texts(snap.trajectory), _program_texts(snap.trajectory)
         argvs, unread, refused = _argvs_and_first_unread(commands if self.required_runs else [], cut, programs)
         typed_argvs, typed_unread, typed_refused = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [], cut, programs)
+        card_commands = [
+            c for c in [row.get("command", "") for row in (snap.worker_commands or []) if row.get("command")]
+            if self._without_exempt_text(c, c in joined_rows) == c
+        ]
+        card_argvs, _, _ = _argvs_and_first_unread(card_commands if self.required_runs else [], cut, programs)
 
         traj_eligible = [(cmd, succ, is_clipped) for _, _, cmd, _, succ, is_clipped in traj_calls if cmd is not None and self._without_exempt_text(cmd) == cmd]
         traj_argv_entries: list[tuple[list[str], bool, bool, bool]] = []
         traj_unread: tuple[str, ShellReadLimitError] | None = None
         for cmd_text, call_succeeded, is_clipped in traj_eligible:
             try:
-                for argv, carries_exit in _shell_argvs_with_exit_propagation(cmd_text):
+                entries = _shell_argvs_with_exit_propagation(cmd_text)
+                if not entries and is_clipped:
+                    for quote in _CUT_COMMAND_QUOTES:
+                        closed_entries = _shell_argvs_with_exit_propagation(cmd_text.rstrip(_SHELL_QUOTING_ESCAPE) + quote)
+                        if closed_entries:
+                            entries = closed_entries
+                            break
+                for argv, carries_exit in entries:
                     traj_argv_entries.append((argv, call_succeeded, carries_exit, is_clipped))
             except ShellReadLimitError as limit:
                 traj_unread = traj_unread or (cmd_text, limit)
@@ -3931,7 +3938,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                             unrun_failed.append(run)
                     elif matched_clipped:
                         unrun_failed.append(run)
-                    elif any(_argv_runs(argv, run) for argv in argvs):
+                    elif any(_argv_runs(argv, run) for argv in card_argvs):
                         # The card log carries the command, but the trajectory capture missed it.
                         # Discrepancy between capture sources: cannot verify exit code.
                         traj_missing.append(run)
@@ -3961,6 +3968,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                     break
                 try:
                     argv_entries = _shell_argvs_with_exit_propagation(cmd)
+                    if not argv_entries:
+                        for quote in _CUT_COMMAND_QUOTES:
+                            closed_entries = _shell_argvs_with_exit_propagation(cmd.rstrip(_SHELL_QUOTING_ESCAPE) + quote)
+                            if closed_entries:
+                                argv_entries = closed_entries
+                                break
                 except ShellReadLimitError as limit:
                     traj_unread = traj_unread or (cmd, limit)
                     argv_entries = []
@@ -3990,7 +4003,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         # read of the forbidden runs is not when a typed line was not read. Not a pass and not a
         # fail; a capture with gaps keeps its own error, below.
         effective_unread = unread or traj_unread
-        past_limit = None if hits or ran or missing else (effective_unread if (unrun_missing or unrun_failed or unrun_masked) else typed_unread)
+        unrun_candidates = [*unrun_missing, *unrun_failed, *unrun_masked, *unrun_clipped, *traj_missing]
+        past_limit = None if hits or ran or missing else (effective_unread if unrun_candidates else typed_unread)
         if past_limit is not None and not partial:
             return VerificationResult(
                 success=False,
@@ -4004,7 +4018,6 @@ class WorkerCommandsVerifier(BaseVerifier):
         # the words of one of them.
         not_read = None
         if not (hits or ran or missing):
-            unrun_candidates = [*unrun_missing, *unrun_failed, *unrun_masked, *unrun_clipped, *traj_missing]
             not_read = _refused_part_naming(refused, unrun_candidates) if unrun_candidates else _refused_part_naming(typed_refused, self.forbidden_runs)
         if not_read is not None and not partial:
             return VerificationResult(
@@ -4045,7 +4058,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                     parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
                 if traj_missing:
-                    parts.append(_format_traj_missing_reason(traj_missing, argvs))
+                    parts.append(_format_traj_missing_reason(traj_missing, card_argvs))
                 filtered_unseen = [r for r in unrun_missing if r.succeeded]
                 if filtered_unseen:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in filtered_unseen)
@@ -4069,7 +4082,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                     parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
                 if traj_missing:
-                    parts.append(_format_traj_missing_reason(traj_missing, argvs))
+                    parts.append(_format_traj_missing_reason(traj_missing, card_argvs))
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -4121,7 +4134,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                             named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                             details.append(_UNRUN_CLIPPED_REASON.format(named=named))
                         if traj_missing:
-                            details.append(_format_traj_missing_reason(traj_missing, argvs))
+                            details.append(_format_traj_missing_reason(traj_missing, card_argvs))
                         if not_seen:
                             reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(
                                 gaps=gaps_str,
@@ -4150,7 +4163,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                             named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
                             unrun_parts.append(f"required run(s) {named} not seen in what was read")
                         if traj_missing:
-                            unrun_parts.append(_format_traj_missing_reason(traj_missing, argvs))
+                            unrun_parts.append(_format_traj_missing_reason(traj_missing, card_argvs))
                         unrun_extra = ("; " + "; ".join(unrun_parts)) if unrun_parts else ""
                         reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + unrun_extra + window
                     return VerificationResult(
@@ -4177,7 +4190,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                     details.append(_UNRUN_CLIPPED_REASON.format(named=named))
                 if traj_missing:
-                    details.append(_format_traj_missing_reason(traj_missing, argvs))
+                    details.append(_format_traj_missing_reason(traj_missing, card_argvs))
                 unseen_succeeded = [r for r in unrun_missing if r.succeeded]
                 if unseen_succeeded:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unseen_succeeded)
@@ -4199,7 +4212,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if no_traj_for_succeeded:
                     reasons.append(_NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON)
                 else:
-                    reasons.append(_format_traj_missing_reason(traj_missing, argvs))
+                    reasons.append(_format_traj_missing_reason(traj_missing, card_argvs))
             if unrun_clipped:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                 reasons.append(_UNRUN_CLIPPED_REASON.format(named=named))

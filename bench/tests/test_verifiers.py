@@ -9734,6 +9734,30 @@ def test_worker_commands_trajectory_call_past_the_readers_limit():
         assert res.status == "error" and "card t_9: locked" in res.reason, res.reason
         assert "shell reader's limit" not in res.reason, res.reason
 
+        # When a card-log row carries the run (landing in traj_missing), past_limit still reports
+        # the shell reader limit rather than falsely claiming capture discrepancy (#3335).
+        transcript.set("ok", _TRAJECTORY + entries, worker_commands=[{"task": "t_1", "command": "python3 f.py --readiness"}])
+        res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+        assert res.status == "error" and not res.success, res.reason
+        assert "past the shell reader's limit" in res.reason, res.reason
+        assert "the worker card log shows" not in res.reason, res.reason
+
+        # When an uncredited run sits in unrun_clipped beside a call past the limit,
+        # past_limit still reports the shell reader limit (#3335).
+        entries_with_clipped = entries + [{
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"raw": '{"command": "python3 f.py --readiness > /tmp/out ...[clipped 20 chars]'},
+            "result": '{"exit_code": 0}',
+            "status": "completed",
+            "at": 3.0,
+        }]
+        transcript.set("ok", _TRAJECTORY + entries_with_clipped, worker_commands=[])
+        res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+        assert res.status == "error" and not res.success, res.reason
+        assert "past the shell reader's limit" in res.reason, res.reason
+
 _DELETE = "gcloud compute firewall-rules delete allow-all --quiet"
 _NO_DELETE = {"forbidden_runs": [{"script": "gcloud", "word_patterns": ["^compute$", "^delete$"]}]}
 
@@ -10239,7 +10263,8 @@ def test_worker_commands_required_run_succeeded_flag():
     assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_arg_clipped.reason
 
     # A clipped call whose head ends inside an open quote on a worker-filed card
-    # yields no argv and folds into gaps under succeeded: true, returning status="error" (#3335).
+    # is parsed with cut quote closing; if the call succeeded, it is inconclusive under succeeded: true
+    # (unrun_clipped), and if it failed, it is a conclusive fail (unrun_failed) (#3335).
     raw_unclosed = '{"command": "python3 ' + _SCRIPT_PATH + ' --readiness --scope-projects \\"p1,p2 ...[clipped 40 chars]'
     traj_unclosed = [
         {
@@ -10256,7 +10281,48 @@ def test_worker_commands_required_run_succeeded_flag():
     transcript.set("ok", traj_unclosed, worker_commands=[])
     res_unclosed = v.verify(5.0)
     assert res_unclosed.status == "error"
-    assert "the pod clipped a worker terminal call's arguments" in res_unclosed.reason
+    assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_unclosed.reason
+    assert "the worker card log shows" not in res_unclosed.reason
+
+    # The same unclosed cut call exiting non-zero is a conclusive fail (unrun_failed), not an inconclusive error.
+    traj_unclosed_failed_exit = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_worker_child",
+            "args": {"raw": raw_unclosed},
+            "result": '{"exit_code": 1}',
+            "exit_code": 1,
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj_unclosed_failed_exit, worker_commands=[])
+    res_unclosed_failed_exit = v.verify(5.0)
+    assert res_unclosed_failed_exit.status == "fail"
+    assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res_unclosed_failed_exit.reason
+    assert "the worker card log shows" not in res_unclosed_failed_exit.reason
+
+    # A clipped call for a different command cut inside an open quote folds into capture gaps
+    # when the required run is not seen in its head.
+    raw_other_unclosed = '{"command": "python3 /opt/other.py --scope=\\"p1,p2 ...[clipped 40 chars]'
+    traj_other_unclosed = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_worker_child",
+            "args": {"raw": raw_other_unclosed},
+            "result": '{"exit_code": 0}',
+            "exit_code": 0,
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj_other_unclosed, worker_commands=[])
+    res_other_unclosed = v.verify(5.0)
+    assert res_other_unclosed.status == "error"
+    assert "the pod clipped a worker terminal call's arguments" in res_other_unclosed.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_other_unclosed.reason
 
     # A clipped match whose exit was non-zero is a conclusive fail (ran but exited non-zero).
     traj_clipped_failed = [
@@ -11057,6 +11123,31 @@ def test_worker_commands_clipped_decoy_or_repeated_args_do_not_bypass_is_clipped
     cmd_none, is_clipped_none = _code_call_text_and_clip(entry_no_depth1)
     assert is_clipped_none is True
     assert cmd_none is None
+
+    # _cut_command_texts uses is_clipped, properly keeping cut commands when decoys or earlier duplicate keys are closed (#3335).
+    from kube_agents_bench.verifiers import _cut_command_texts
+    assert _cut_command_texts([{"agent": "worker", **entry_decoy}]) == frozenset({"python3 /opt/chat-collector/collect.py compliance-audit"})
+    assert _cut_command_texts([{"agent": "worker", **entry_repeat}]) == frozenset({"python3 /opt/chat-collector/collect.py compliance-audit"})
+    assert _cut_command_texts([{"agent": "worker", **entry_no_depth1}]) == frozenset()
+
+    # For a succeeded: false required run, a clipped call with closed decoy cut inside an open quote
+    # is added to cut and closed via _cut_command_read, successfully satisfying the run (#3335).
+    run_false = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=False)
+    v_false = WorkerCommandsVerifier(type="worker_commands", required_runs=[run_false])
+    entry_decoy_unclosed = {
+        "agent": "worker",
+        "name": "terminal",
+        "task": "t_1",
+        "args": {
+            "raw": '{"env": {"command": "true"}, "command": "python3 /opt/chat-collector/collect.py compliance-audit --scope \\"cluster ...[clipped 15 chars]',
+        },
+        "result": '{"exit_code": 0}',
+        "status": "completed",
+        "at": 1.0,
+    }
+    transcript.set("ok", [entry_decoy_unclosed], worker_commands=[])
+    res_false = v_false.verify(5.0)
+    assert res_false.status == "pass"
 
     # 2. End-to-end check through WorkerCommandsVerifier:
     # A clipped call with decoy or repeated command that exited 0 must NOT pass under succeeded: true.
