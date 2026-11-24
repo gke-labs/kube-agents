@@ -43,7 +43,7 @@ jobs:
       # 39443755214 and 39443830971); `auto_request_review.yml` reacts with
       # both scopes and does not.
       pull-requests: write # the pull request's head commit, and the reaction on its comment
-      issues: write # 👀 (re-ran) or 😕 (nothing to re-run) on the comment that asked
+      issues: write # 👀 or 😕 on the comment that asked; the reopen advice for a lost run
     # The command, on a pull request, from someone with a standing in the
     # repository. `COLLABORATOR` is any invited collaborator whatever their
     # level, which is the Triage set this exists for.

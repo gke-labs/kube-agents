@@ -732,6 +732,44 @@ class MainTest(unittest.TestCase):
         self.assertIn("Cancelled stuck Python Unit Tests (run 1", out)
         self.assertIn("This workflow run cannot be rerun.", out)
 
+    NOT_YET_QUEUED = b'{"message": "Cannot cancel a workflow run that has not been queued yet."}'
+    COMMENTS_PATH = "/repos/gke-labs/kube-agents/issues/3245/comments"
+
+    def cancel_paths(self, *run_ids):
+        return {f"/repos/gke-labs/kube-agents/actions/runs/{run_id}/cancel" for run_id in run_ids}
+
+    def test_runs_github_lost_before_queueing_stop_at_the_first_refusal_and_the_pull_request_is_told_to_reopen(self):
+        """#5606: GitHub answered every cancel and force-cancel on its lost runs with 409, not yet queued."""
+        api = self.stuck_api(refusing=self.cancel_paths(1, 2), refusal_body=self.NOT_YET_QUEUED)
+        with mock.patch.object(rfc.time, "sleep") as sleep:
+            code, out, err = self.run_main(api)
+        self.assertEqual(1, code)
+        sleep.assert_not_called()
+        self.assertEqual([], [path for path, _ in api.posts if "/actions/" in path])  # no force-cancel, no re-run
+        ((path, payload),) = [(path, payload) for path, payload in api.posts if path == self.COMMENTS_PATH]
+        self.assertIn(rfc.LOST_RUN_ADVICE, payload["body"])
+        self.assertIn("Python Unit Tests (run 1", payload["body"])
+        self.assertIn("Merge Gate (run 2", payload["body"])
+        self.assertEqual(rfc.REACTION_DECLINED, api.posts[-1][1]["content"])
+        self.assertIn("GitHub lost Python Unit Tests (run 1", out)
+
+    def test_a_lost_run_beside_one_that_cancels_is_the_only_one_named_and_the_other_is_still_cleared(self):
+        api = self.stuck_api(refusing=self.cancel_paths(1), refusal_body=self.NOT_YET_QUEUED)
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(1, code)
+        self.assertEqual(["runs/2/cancel"], [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path])
+        ((path, payload),) = [(path, payload) for path, payload in api.posts if path == self.COMMENTS_PATH]
+        self.assertIn("Python Unit Tests (run 1", payload["body"])
+        self.assertNotIn("Merge Gate", payload["body"])
+        self.assertIn("Cleared superseded stuck Merge Gate (run 2", pathlib.Path(self.summary.name).read_text())
+
+    def test_a_refused_reopen_comment_is_a_warning(self):
+        api = self.stuck_api(refusing=self.cancel_paths(1, 2) | {self.COMMENTS_PATH}, refusal_body=self.NOT_YET_QUEUED)
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(1, code)
+        self.assertIn("Could not comment on #3245", out)
+        self.assertIn(rfc.LOST_RUN_ADVICE, pathlib.Path(self.summary.name).read_text())
+
     def test_a_red_run_and_a_stuck_run_are_both_handled_in_one_command(self):
         api = FakeAPI(
             runs=[run(1, "failure", 10, name="Docs Build"), run(2, None, 20, status="queued", created=LONG_AGO)],
