@@ -14881,6 +14881,15 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def _mcp_listing_tool(server_name: str, message: Any) -> str | None:
+    """The gke listing tool a tools/call names (mcp_policy.GKE_LISTING_TOOLS), or None."""
+    if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    name = params.get("name") if isinstance(params, dict) else None
+    return name if name in mcp_policy.GKE_LISTING_TOOLS else None
+
+
 def mcp_relay_decision(
     principal: Principal | None, server_name: str, message: dict[str, Any] | None
 ) -> tuple[command_policy.Decision, frozenset[str] | None]:
@@ -17036,6 +17045,28 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
                 reply_body = filtered
+        listing_tool = _mcp_listing_tool(server_name, message)
+        if (
+            refused is None
+            and listing_tool is not None
+            and principal is not None
+            and principal.role in LISTING_FILTERED_ROLES
+            and upstream.status < HTTPStatus.MULTIPLE_CHOICES
+        ):
+            # A gke listing drops the install's excluded clusters for these
+            # callers (#7031); a reply the broker can't read is refused while
+            # any cluster is excluded rather than relayed whole.
+            try:
+                if self.exclusions.excluded_names_pattern() is not None:
+                    filtered = mcp_policy.filter_listing_reply(
+                        listing_tool, reply_body, self._is_excluded_cluster,
+                    )
+                    if filtered is None:
+                        refused = ("UPSTREAM_UNREADABLE", "the upstream listing reply could not be read")
+                    else:
+                        reply_body = filtered
+            except scope_exclude.ExcludedCluster:
+                refused = ("UPSTREAM_UNREADABLE", "the install's scope file can't be read, so the listing isn't relayed")
         if refused is not None:
             code, reason = refused
             LOGGER.warning(
@@ -18871,6 +18902,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         except scope_exclude.ExcludedCluster as exc:
             return command_policy.Decision(allowed=False, rule_id=exc.rule, message=str(exc))
         return None
+
+    def _is_excluded_cluster(self, project: str, location: str, cluster: str) -> bool:
+        """Whether the install excludes this cluster (holds aside), for a listing filter."""
+        try:
+            self.exclusions.check(project, location, cluster, include_holds=False)
+        except scope_exclude.ExcludedCluster as exc:
+            if exc.rule == scope_exclude.RULE_EXCLUDE_UNREADABLE:
+                raise
+            return True
+        return False
 
     def _refuse_excluded_cluster(
         self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,
