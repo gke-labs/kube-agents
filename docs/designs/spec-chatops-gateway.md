@@ -3167,6 +3167,9 @@ turns it off with `spec.integration.googleChat.answerFeedback: false` (default `
 operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. Either name is
 one switch for every backend the gateway holds (`AnswerFeedbackOff`); a tap or note
 click on a Google Chat message already posted is logged and acked and changes nothing.
+Teams has no CR field yet: `A2A_TEAMS_ANSWER_FEEDBACK=false` on the controller-manager Deployment
+is carried to a gateway that holds Teams under the same name (`a2aTeamsAnswerFeedbackEnvVar`),
+and is the same one switch.
 
 ## The Teams adapter (added 11/16)
 
@@ -3255,6 +3258,21 @@ and the answer on the line are the ones "Who may press Stop" and "The Stop butto
 plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`
 is the way to stop there. A typed `stop` on a task with a line is answered on the line as a
 press is (`isChatTypedStop`), so a line never keeps a live button beside a posted "cancel sent".
+
+An answer the relay marked for feedback carries its rating controls on the same card
+(`teams_feedback.go`; "Answer feedback" above), and Teams answers whole on the task's line, so
+`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. 👍 is an `Action.Submit`
+like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
+alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
+the note as an input beside the rating. Teams has neither Slack's modal nor Google Chat's private
+card, since both need an answer to the press the queue cannot give; so a 👎 is recorded when it
+is sent, with a note or without one, and has no Cancel. The adapter checks the presser as the
+gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the pull loop, and
+redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
+rating because the card is the conversation's. It remembers the last 512 rated messages
+(`teamsRatedCap`); a press on an older one is recorded without the answer's text and without
+the redraw. Alerts and reports on Teams carry no controls (`metricsAnswerRatedPlatforms` has
+Teams, `metricsRatedPlatforms` does not).
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
