@@ -3584,6 +3584,9 @@ class KubeAgentsHarness(AgentHarness):
         super().__init__(config)
         if os.environ.get(SKIP_REPORT_ONLY_JUDGES_ENV) == "1":
             _skip_report_only_judges()
+        from kube_agents_bench.cancel import install_cancel_scoring_guard
+
+        install_cancel_scoring_guard()
 
     # The purge's floor (:func:`_pod_start`), set by :meth:`run`; ``None`` for
     # a run that could not read it, or an ``_execute`` called without ``run``.

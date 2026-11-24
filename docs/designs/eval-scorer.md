@@ -1156,7 +1156,8 @@ graded cases into `eval-verdict.md` under a PARTIAL banner and prints a cut-off 
 deliberately not a verdict line, so the Nightly report counts the cases and still calls the night
 truncated. The presubmit grades per case too and gets the same table on a deadline kill, holding
 the cases graded before the SIGTERM: on a presubmit or batch run the TERM trap stops the stackless
-units and scales LiteLLM to zero at once, since a cancelled run's verdict is discarded. Its store
+units, drops a cancellation marker under STATE_DIR so in-flight stack units skip judge scoring,
+and scales LiteLLM to zero at once, since a cancelled run's verdict is discarded. Its store
 stays read-only, as `PULL_NUMBER` and the viewer-only identity already guarantee.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is
