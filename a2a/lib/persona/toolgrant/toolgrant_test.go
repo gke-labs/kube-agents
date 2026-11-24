@@ -207,14 +207,14 @@ func TestASkillScriptIsRunDirectlyByItsPath(t *testing.T) {
 }
 
 // TestAGrantedMCPToolHasItsGateRule: the gate checks an MCP call by the key
-// "<server>_<tool>(<args>)", so each granted tool gets "mcp:<name>(*" and
-// nothing broader.
+// "<server>_<tool>" plus a space and its JSON arguments, so each granted
+// tool gets "mcp:<name>" and "mcp:<name> *" and nothing broader.
 func TestAGrantedMCPToolHasItsGateRule(t *testing.T) {
 	g, err := Policy{MCP: []MCPGrant{{Server: "srv", Tools: []string{"query", "a"}}}}.CoreAgent(ws)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"mcp:srv_query(*", "mcp:srv_a(*"} {
+	for _, want := range []string{"mcp:srv_query", "mcp:srv_query *", "mcp:srv_a", "mcp:srv_a *"} {
 		if !slices.Contains(g.Allow, want) {
 			t.Errorf("allow %q lacks %s", g.Allow, want)
 		}

@@ -270,8 +270,8 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 
 // TestAGrantedMCPToolPassesTheGateAndNoOtherDoes: through core-agent's real
 // gate in allow mode, as it checks an MCP call (namespace "mcp", key
-// "<server>_<tool>(<args>)"), a granted MCP tool passes and a neighbour's
-// name does not.
+// "<server>_<tool>" plus a space and its JSON arguments), a granted MCP tool
+// passes and a neighbour's name does not.
 func TestAGrantedMCPToolPassesTheGateAndNoOtherDoes(t *testing.T) {
 	g, err := toolgrant.Policy{MCP: []toolgrant.MCPGrant{{Server: "fake", Tools: []string{"a"}}}}.CoreAgent("/scratch")
 	if err != nil {
@@ -283,10 +283,25 @@ func TestAGrantedMCPToolPassesTheGateAndNoOtherDoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	gate := permissions.New(opts)
-	for tool, want := range map[string]bool{"fake_a": true, "fake_ab": false, "fake_b": false, "other_a": false} {
-		err := gate.CheckToolCallWithArgs(context.Background(), "mcp", tool, tool+"({})", map[string]any{})
-		if got := err == nil; got != want {
-			t.Errorf("gate on %s: allowed=%v (%v), want %v", tool, got, err, want)
+	// The keys as core-agent's summarizeRequest builds them: the name alone
+	// for untyped nil args, "name null" for the typed nil map ADK passes,
+	// otherwise "name <json>".
+	for _, c := range []struct {
+		tool, key string
+		want      bool
+	}{
+		{"fake_a", "fake_a", true},
+		{"fake_a", "fake_a null", true},
+		{"fake_a", `fake_a {"q":"x"}`, true},
+		{"fake_ab", "fake_ab", false},
+		{"fake_ab", "fake_ab null", false},
+		{"fake_ab", `fake_ab {"q":"x"}`, false},
+		{"fake_b", "fake_b {}", false},
+		{"other_a", "other_a {}", false},
+	} {
+		err := gate.CheckToolCallWithArgs(context.Background(), "mcp", c.tool, c.key, map[string]any{})
+		if got := err == nil; got != c.want {
+			t.Errorf("gate on %q: allowed=%v (%v), want %v", c.key, got, err, c.want)
 		}
 	}
 }

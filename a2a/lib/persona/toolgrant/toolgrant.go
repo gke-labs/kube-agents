@@ -221,9 +221,11 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		}
 		g.Allow = append(g.Allow, "bash:"+script, "bash:"+script+" *")
 	}
-	// The gate checks an MCP call as namespace "mcp" with the key
-	// "<server>_<tool>(<args>)": "mcp:<server>_<tool>(*" allows that tool
-	// and no other (the "(" keeps srv_a from matching srv_ab).
+	// The gate checks an MCP call as namespace "mcp" with the key core-agent's
+	// summarizeRequest builds: the tool's name, then a space and its
+	// arguments as JSON ("srv_a null" for a call ADK passes with nil args).
+	// "mcp:<server>_<tool>" and "mcp:<server>_<tool> *" allow that tool and
+	// no other (the space keeps srv_a from matching srv_ab).
 	for _, m := range p.MCP {
 		if !mcpName.MatchString(m.Server) {
 			return CoreAgentGrant{}, fmt.Errorf("MCP server name %q", m.Server)
@@ -243,7 +245,8 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		slices.Sort(tools)
 		g.MCP[m.Server] = slices.Compact(tools)
 		for _, t := range g.MCP[m.Server] {
-			g.Allow = append(g.Allow, "mcp:"+m.Server+"_"+t+"(*")
+			name := m.Server + "_" + t
+			g.Allow = append(g.Allow, "mcp:"+name, "mcp:"+name+" *")
 		}
 	}
 	// core-agent registers an MCP tool as <server>_<tool> (its server part
