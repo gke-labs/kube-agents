@@ -30,10 +30,10 @@ func (s *fakeSpawner) setLiveErr(err error) {
 
 // TestDelegateRefusedAtSessionCap: "Delegate:" makes pod creation
 // user-triggerable and threads are free, so the cap is the gateway's
-// usability bound. At the cap the delegation is refused with a reply naming
-// the numbers - never silently queued, never dropped - and nothing is
-// spawned or published. When capacity frees, the same conversation
-// delegates normally.
+// usability bound. At the cap with nothing to evict the delegation waits in
+// line with a queued notice - never dropped - and nothing is spawned or
+// published. When capacity frees, the same turn delegates normally, without
+// being sent again.
 func TestDelegateRefusedAtSessionCap(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 2, nil)
 	spawn.setLive(2)
@@ -42,15 +42,8 @@ func TestDelegateRefusedAtSessionCap(t *testing.T) {
 		Conversation: conv, Kind: "group",
 		AuthorID: "1001", MessageID: "c-100", Text: "Delegate: write a haiku",
 	}
-	waitFor(t, "refusal names the numbers", func() bool {
-		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "2 session workers") && strings.Contains(p, "cap 2") {
-				return true
-			}
-		}
-		return false
-	})
-	// The refusal post is ordered after the check, so by now a spawn or a
+	waitFor(t, "the queued notice", postedContaining(r, sessionQueuedNext))
+	// The notice is posted after the check, so by now a spawn or a
 	// placeholder would already be visible.
 	if got := len(spawn.calls()); got != 0 {
 		t.Fatalf("spawned %d pods at the cap", got)
@@ -62,10 +55,7 @@ func TestDelegateRefusedAtSessionCap(t *testing.T) {
 	}
 
 	spawn.setLive(1)
-	r.adapter.inbox <- InboundMessage{
-		Conversation: conv, Kind: "group",
-		AuthorID: "1001", MessageID: "c-101", Text: "Delegate: write a haiku",
-	}
+	r.g.kickCapQueue()
 	waitFor(t, "spawn under the cap", func() bool { return len(spawn.calls()) == 1 })
 }
 
@@ -98,7 +88,7 @@ func TestDelegateReplacementNotDoubleCounted(t *testing.T) {
 
 // TestSessionRouteRefusedAtSessionCap: with the default route on session
 // pods, a plain first ask spawns - so the cap must hold there too, or
-// Delegate refusals just push the flood one affordance over.
+// Delegate's line just pushes the flood one affordance over.
 func TestSessionRouteRefusedAtSessionCap(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, RouteSession, 1, nil)
 	spawn.setLive(1)
@@ -107,23 +97,13 @@ func TestSessionRouteRefusedAtSessionCap(t *testing.T) {
 		Conversation: conv, Kind: "group",
 		AuthorID: "1001", MessageID: "c-120", Text: "check the fleet",
 	}
-	waitFor(t, "refusal names the numbers", func() bool {
-		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "1 session worker") && strings.Contains(p, "cap 1") {
-				return true
-			}
-		}
-		return false
-	})
+	waitFor(t, "the queued notice", postedContaining(r, sessionQueuedNext))
 	if got := len(spawn.calls()); got != 0 {
 		t.Fatalf("spawned %d pods at the cap", got)
 	}
 
 	spawn.setLive(0)
-	r.adapter.inbox <- InboundMessage{
-		Conversation: conv, Kind: "group",
-		AuthorID: "1001", MessageID: "c-121", Text: "check the fleet",
-	}
+	r.g.kickCapQueue()
 	waitFor(t, "spawn under the cap", func() bool { return len(spawn.calls()) == 1 })
 }
 

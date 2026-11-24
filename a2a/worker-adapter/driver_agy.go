@@ -127,6 +127,7 @@ type agyInit struct {
 }
 
 type agyStepUpdate struct {
+	StepIndex *int         `json:"step_index"`
 	StepType  string       `json:"step_type"`
 	State     string       `json:"state"`
 	TextDelta string       `json:"text_delta"`
@@ -168,6 +169,10 @@ type agyDecoder struct {
 	input    float64
 	output   float64
 	duration float64
+	// toolDone is the tool steps, by step_index, whose result is already
+	// in: a step's terminal state is reported once however often agy
+	// repeats it.
+	toolDone map[int]bool
 }
 
 var errNotAgyLine = errors.New("not an agy stream-json line")
@@ -196,10 +201,12 @@ func (d *agyDecoder) Decode(line []byte) ([]Event, error) {
 	return nil, nil
 }
 
-// step maps a step_update onto progress and activity. The model's prose
-// streams as agent_response text deltas; a tool step is announced once, when
-// it starts. User input, system messages, error messages and a tool step's
-// later states carry nothing the artifacts show; the result decides failure.
+// step maps a step_update onto progress, activity and tool results. The
+// model's prose streams as agent_response text deltas; a tool step is
+// announced once, when it starts, and its result is in when it first reaches
+// DONE or ERROR (EventToolResult, once per step_index: the write-refusal
+// check runs on it). User input, system messages and error messages carry
+// nothing the artifacts show; the result decides failure.
 func (d *agyDecoder) step(s *agyStepUpdate) []Event {
 	if s == nil {
 		return nil
@@ -213,6 +220,17 @@ func (d *agyDecoder) step(s *agyStepUpdate) []Event {
 			input = s.ToolInfo.Parameters
 		}
 		return []Event{{Kind: EventActivity, Tool: s.ToolName, Input: input}}
+	case s.StepType == "tool" && (s.State == "DONE" || s.State == "ERROR"):
+		if s.StepIndex != nil {
+			if d.toolDone[*s.StepIndex] {
+				return nil
+			}
+			if d.toolDone == nil {
+				d.toolDone = map[int]bool{}
+			}
+			d.toolDone[*s.StepIndex] = true
+		}
+		return []Event{{Kind: EventToolResult}}
 	}
 	return nil
 }

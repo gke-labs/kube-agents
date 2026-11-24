@@ -106,7 +106,9 @@ sandbox's memory limit: at the default 2 GiB, 13 kubectl reads run at once and 1
 The shell's kubectl admission refuses such a read before it starts, with a reason that names a
 narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet
 whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
-[`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
+the chart value `platformAgent.deployment.env`; [Applying it](#applying-it) shows the `install.env` line that carries such an entry. A hand edit of the CR's [`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment) can be lost at the next chart apply.
+
+The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
 
 The operator passes the tier to the shell sandbox and, under the session cluster view, to the
 session Pods the A2A gateway starts. On the `default` tier at the default session memory limit

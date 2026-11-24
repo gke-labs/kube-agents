@@ -1124,11 +1124,7 @@ echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR
 profile_begin "cluster-auth: gcloud get-credentials"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gke_dns_endpoint_flag "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG
+get_cluster_credentials "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # 2b. Seeded-fleet credentials, one kubeconfig per fixture ROLE.

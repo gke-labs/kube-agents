@@ -3104,7 +3104,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     row of such a call is read, and so is each row of a capture whose rows
     name no card. A result that only quotes the refusal words matches too.
 
-    ``after_result_pattern`` makes the forbidden set order-aware, for a
+    ``after_result_pattern`` makes the forbidden patterns order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
     refused one, and a pattern over write verbs alone flags the honest attempt
     that met the refusal. The commands then come from the workers' tagged
@@ -3834,11 +3834,14 @@ class WorkerBudgetVerifier(BaseVerifier):
     and no completed attempt either (the harness archived the card at its
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
-    A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches; a capture in which every result was
-    withheld or never recorded is unreadable, and with nothing named it is
-    ``status="error"`` too, while a single missing result among readable ones
-    does not turn a plain failure into one.
+    A notice in the part of a result that the capture's clip dropped is not
+    read: the clip keeps a result's head and its last
+    ``worker_trajectory.RESULT_TAIL_CHARS`` characters, where an appended
+    notice is, and a card of short tool outputs never reaches the clip; a
+    capture in which every result was withheld or never recorded is
+    unreadable, and with nothing named it is ``status="error"`` too, while a
+    single missing result among readable ones does not turn a plain failure
+    into one.
     """
 
     type: Literal["worker_budget"]
@@ -9949,21 +9952,32 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_state_file(shell: Callable[[str, float], str], path: str, timeout: float) -> dict[str, Any] | None:
+    """The JSON object a stack recorded at ``path`` in the pod ``shell`` reaches, or None when there is none."""
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def fired_at_of(state: dict[str, Any] | None) -> datetime | None:
+    """A stack state's ``fired_at``, or None when it has none that is an aware ISO-8601 stamp."""
+    try:
+        fired = datetime.fromisoformat(str((state or {})["fired_at"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+    return fired if fired.tzinfo is not None else None
+
+
 def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
     """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
 
     Missing file, not JSON, no ``fired_at``, or one that is not an aware
     ISO-8601 stamp all read as None: the stack did not fire the run.
     """
-    reply = shell(f"cat {shlex.quote(path)}", timeout)
-    try:
-        state = json.loads(reply.strip().splitlines()[-1])
-        fired = datetime.fromisoformat(str(state["fired_at"]))
-    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if fired.tzinfo is None:
-        return None
-    return fired
+    return fired_at_of(read_state_file(shell, path, timeout))
 
 
 def read_report_store(
@@ -10107,10 +10121,193 @@ class StoredFindingCheck(BaseModel):
         if missing:
             found.append(f"its title does not hold {missing}")
         return found
+class _StoredReportVerifier(_OnboardingPollVerifier):
+    """What ``audit_report_stored`` and ``shadow_report_stored`` share: one stream's store read and its grading.
+
+    A subclass names the stream (``_stream``), the pods whose report store it
+    reads (``_store_shells``, with ``_store_where`` naming them for a reason),
+    the pod holding ``since_state_file`` (``_state_shell``), and any envelope
+    keys it holds every envelope to beyond ``required_envelope``
+    (``_forced_envelope``). The window, the start bound and the finding and
+    evidence rules are the same for both; :class:`AuditReportStoredVerifier`
+    documents them.
+    """
+
+    status: AuditStatus | None = None
+    required_finding_phrases: list[str] = Field(default_factory=list)
+    forbidden_finding_phrases: list[str] = Field(default_factory=list)
+    required_evidence_phrases: list[str] = Field(default_factory=list)
+    # Top-level envelope keys and the value each must hold on this run's envelope.
+    required_envelope: dict[str, Any] = Field(default_factory=dict)
+    # A JSON file whose ``fired_at`` (ISO-8601, as the audit-chat-report,
+    # unchanged-manifest-digest and builtin-schedule-run-now stacks write it)
+    # replaces the run's start as the lower bound, with no skew allowance: the
+    # fire and the envelope are stamped by the same install. Unreadable is an error.
+    since_state_file: str | None = None
+    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
+    # the agent pod are two clocks.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @model_validator(mode="after")
+    def _evidence_names_its_findings(self) -> "_StoredReportVerifier":
+        if self.required_evidence_phrases and not self.required_finding_phrases:
+            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
+        return self
+
+    def _stream(self) -> str:
+        raise NotImplementedError
+
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        raise NotImplementedError
+
+    def _store_where(self) -> str:
+        raise NotImplementedError
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        raise NotImplementedError
+
+    def _forced_envelope(self) -> dict[str, Any]:
+        return {}
+
+    def _store_problem(self, envelopes: list[dict[str, Any]]) -> str:
+        """Why the store as it was read cannot be graded at all, or "": an error, not a fail."""
+        return ""
+
+    def _envelope_problem(self, envelope: dict[str, Any]) -> str:
+        """What a fresh envelope that passed every rule above still lacks, or ""."""
+        return ""
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """One pod's envelopes of ``stream``, or None and why not: the store tree, read directly.
+
+        ``state`` is the stack's state file, read once for the poll (None without one).
+        """
+        return read_report_store(shell, stream, timeout, keys, excerpts), None
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        snap = transcript.get()
+        if snap is None:
+            return "error", _NO_TRANSCRIPT_REASON, None
+        if not snap.started_at:
+            return "error", _NO_RUN_CLOCK_REASON, None
+        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
+            seconds=self.max_clock_skew_sec
+        )
+        state = None
+        if self.since_state_file:
+            # Read once per poll; _read_listing gets the same object.
+            state = read_state_file(self._state_shell(), self.since_state_file, read_timeout)
+            fired = fired_at_of(state)
+            if fired is None:
+                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
+            # No skew: the fire and the envelope are stamped by the same install.
+            since = fired
+        stream = self._stream()
+        expected = {**self.required_envelope, **self._forced_envelope()}
+        envelopes: list[dict[str, Any]] = []
+        read_any = False
+        unread: list[str] = []
+        for shell in self._store_shells():
+            listing, why = self._read_listing(
+                shell, stream, read_timeout, tuple(expected), bool(self.required_evidence_phrases), state
+            )
+            if listing is not None:
+                read_any = True
+                envelopes.extend(listing)
+            elif why:
+                unread.append(why)
+        if not read_any:
+            detail = f": {'; '.join(unread)}" if unread else ""
+            return "error", f"{self._store_where()} could not be read{detail}", None
+        store_problem = self._store_problem(envelopes)
+        if store_problem:
+            return "error", store_problem, None
+        fresh = []
+        started_early = 0
+        for envelope in envelopes:
+            try:
+                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
+            except ValueError:
+                continue
+            if finished.tzinfo is None or finished < since:
+                continue
+            # An envelope that names its run's start counts only when that run
+            # opened inside the window: a run from an earlier repetition can
+            # finish inside this one. One with the key and no start is such a
+            # late finish too, and so is one whose start is after its finish (a
+            # later run's stamp); an older image writes no key and is read by
+            # `finished_at` alone. The start is stamped in whole seconds, so the
+            # bound is floored to the second for it.
+            if _ENVELOPE_STARTED_KEY in envelope:
+                try:
+                    began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
+                except ValueError:
+                    began = None
+                if (
+                    began is None
+                    or began.tzinfo is None
+                    or began < since.replace(microsecond=0)
+                    or began > finished
+                ):
+                    started_early += 1
+                    continue
+            fresh.append(envelope)
+        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *expected)
+        raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
+        if not fresh:
+            window = "the stack fired the audit" if self.since_state_file else "the run started"
+            early = (
+                f"; {started_early} finished since but came from a run that opened before then or named no start"
+                if started_early
+                else ""
+            )
+            errors = [str(e["error"]) for e in envelopes if e.get("error")]
+            said = f"; unread: {'; '.join(errors)}" if errors else ""
+            return (
+                "fail",
+                f"no {stream} report in {REPORT_STORE_ROOT} finished since {window} "
+                f"({len(envelopes) - started_early} older or unreadable{early}){said}",
+                raw,
+            )
+        failures = []
+        for envelope in fresh:
+            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
+            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
+            excerpts = envelope.get("finding_excerpts") or {}
+            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
+            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
+            wrong = {key: envelope.get(key) for key, value in expected.items() if envelope.get(key) != value}
+            if self.status is not None and envelope.get("status") != self.status:
+                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif wrong:
+                failures.append(
+                    f"{envelope.get('repo')}: "
+                    + ", ".join(f"{key} is {actual!r}, not {expected[key]!r}" for key, actual in wrong.items())
+                )
+            elif missing:
+                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            elif present:
+                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
+            elif unevidenced:
+                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
+            elif lacking := self._envelope_problem(envelope):
+                failures.append(f"{envelope.get('repo')}: {lacking}")
+            else:
+                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
+        return "fail", "; ".join(failures), raw
 
 
 @VERIFIERS.register("audit_report_stored")
-class AuditReportStoredVerifier(_OnboardingPollVerifier):
+class AuditReportStoredVerifier(_StoredReportVerifier):
     """Checks that a fleet audit kept this run's report in the on-pod report store.
 
     Reads ``latest.json`` under every repository directory of ``audit`` in the
@@ -10146,147 +10343,54 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
 
     type: Literal["audit_report_stored"]
     audit: AuditId
-    status: AuditStatus | None = None
-    required_finding_phrases: list[str] = Field(default_factory=list)
-    forbidden_finding_phrases: list[str] = Field(default_factory=list)
-    required_evidence_phrases: list[str] = Field(default_factory=list)
-    # Top-level envelope keys and the value each must hold on this run's envelope.
-    required_envelope: dict[str, Any] = Field(default_factory=dict)
     finding: StoredFindingCheck | None = None
-    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
-    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
-    # replaces the run's start as the lower bound, with no skew allowance: the
-    # fire and the envelope are stamped by the same pod. Unreadable is an error.
-    since_state_file: str | None = None
-    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
-    # the agent pod are two clocks.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
-    @model_validator(mode="after")
-    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
-        if self.required_evidence_phrases and not self.required_finding_phrases:
-            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
-        return self
+    def _stream(self) -> str:
+        return self.audit
 
-    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        snap = transcript.get()
-        if snap is None:
-            return "error", _NO_TRANSCRIPT_REASON, None
-        if not snap.started_at:
-            return "error", _NO_RUN_CLOCK_REASON, None
-        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
-            seconds=self.max_clock_skew_sec
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        # Looked up on each read, so a test's swap of either shell is seen.
+        return (onboarding.sandbox_shell, onboarding.agent_shell)
+
+    def _store_where(self) -> str:
+        return "the sandbox and the agent container"
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        return onboarding.agent_shell
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        # With a `finding` block the listing also carries the selected finding
+        # and the count of the envelopes that hold the planted mark.
+        if not self.finding:
+            return super()._read_listing(shell, stream, timeout, keys, excerpts, state)
+        listing = read_report_store(
+            shell, stream, timeout, keys, excerpts, tuple(self.finding.id_contains), self.finding.planted_mark or ""
         )
-        if self.since_state_file:
-            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
-            if fired is None:
-                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
-            # No skew: the fire and the envelope are stamped by the same pod.
-            since = fired
-        envelopes: list[dict[str, Any]] = []
-        read_any = False
-        for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(
-                shell,
-                self.audit,
-                read_timeout,
-                tuple(self.required_envelope),
-                bool(self.required_evidence_phrases),
-                tuple(self.finding.id_contains) if self.finding else (),
-                (self.finding.planted_mark or "") if self.finding else "",
-            )
-            if listing is not None:
-                read_any = True
-                envelopes.extend(listing)
-        if not read_any:
-            return "error", "neither the sandbox nor the agent container could be read", None
+        return listing, None
+
+    def _store_problem(self, envelopes: list[dict[str, Any]]) -> str:
         if self.finding and self.finding.planted_mark and not any(e.get(_LISTED_MARK_ENVELOPES_KEY) for e in envelopes):
             return (
-                "error",
                 f"no stored {self.audit} envelope holds {self.finding.planted_mark!r}: the previous run the "
-                "stack planted is gone, so this run was not measured against it",
-                None,
+                "stack planted is gone, so this run was not measured against it"
             )
-        fresh = []
-        started_early = 0
-        for envelope in envelopes:
-            try:
-                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
-            except ValueError:
-                continue
-            if finished.tzinfo is None or finished < since:
-                continue
-            # An envelope that names its run's start counts only when that run
-            # opened inside the window: a run from an earlier repetition can
-            # finish inside this one. One with the key and no start is such a
-            # late finish too, and so is one whose start is after its finish (a
-            # later run's stamp); an older image writes no key and is read by
-            # `finished_at` alone. The start is stamped in whole seconds, so the
-            # bound is floored to the second for it.
-            if _ENVELOPE_STARTED_KEY in envelope:
-                try:
-                    began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
-                except ValueError:
-                    began = None
-                if (
-                    began is None
-                    or began.tzinfo is None
-                    or began < since.replace(microsecond=0)
-                    or began > finished
-                ):
-                    started_early += 1
-                    continue
-            fresh.append(envelope)
-        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *self.required_envelope)
-        raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
-        if not fresh:
-            window = "the stack fired the audit" if self.since_state_file else "the run started"
-            early = (
-                f"; {started_early} finished since but came from a run that opened before then or named no start"
-                if started_early
-                else ""
-            )
-            return (
-                "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since {window} "
-                f"({len(envelopes) - started_early} older or unreadable{early})",
-                raw,
-            )
-        failures = []
-        for envelope in fresh:
-            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
-            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
-            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
-            excerpts = envelope.get("finding_excerpts") or {}
-            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
-            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
-            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
-            if self.status is not None and envelope.get("status") != self.status:
-                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
-            elif wrong:
-                failures.append(
-                    f"{envelope.get('repo')}: "
-                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
-                )
-            elif missing:
-                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
-            elif present:
-                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
-            elif unevidenced:
-                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
-            elif self.finding and not envelope.get(_LISTED_FINDINGS_KEY):
-                failures.append(
-                    f"{envelope.get('repo')}: no finding in its document has an id containing every one of "
-                    f"{self.finding.id_contains}"
-                )
-            elif self.finding and (
-                wrong_findings := [
-                    f"{finding.get('id')}: {'; '.join(problems)}"
-                    for finding in envelope[_LISTED_FINDINGS_KEY]
-                    if (problems := self.finding.problems(finding))
-                ]
-            ):
-                failures.append(f"{envelope.get('repo')}: " + " | ".join(wrong_findings))
-            else:
-                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
-        return "fail", "; ".join(failures), raw
+        return ""
+
+    def _envelope_problem(self, envelope: dict[str, Any]) -> str:
+        if not self.finding:
+            return ""
+        if not envelope.get(_LISTED_FINDINGS_KEY):
+            return f"no finding in its document has an id containing every one of {self.finding.id_contains}"
+        return " | ".join(
+            f"{finding.get('id')}: {'; '.join(problems)}"
+            for finding in envelope[_LISTED_FINDINGS_KEY]
+            if (problems := self.finding.problems(finding))
+        )
