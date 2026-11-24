@@ -91,14 +91,19 @@ ROW_LINE_PREFIX = "- "
 EARLIER_HEADER = "[Items of earlier messages in this thread, newest first. A reply or a click may mean one of them.]"
 EARLIER_MESSAGE_LINE = "(message {position} before the newest)"
 EARLIER_MESSAGE_RE = re.compile(r"\(message (\d+) before the newest\)")
-EARLIER_ITEM_LINE = "{row} [id={id} covers={covers}]"
+# An earlier item line ends in its id and what it covers. The three parts below spell that
+# tail once, for the line's format and for reading it back with plain string cuts: a pattern
+# search over the stored text would take quadratic time on a line made to provoke it.
+EARLIER_ID_OPEN = " [id="
+EARLIER_COVERS_OPEN = " covers="
+EARLIER_ITEM_CLOSE = "]"
+EARLIER_ITEM_LINE = "{row}" + EARLIER_ID_OPEN + "{id}" + EARLIER_COVERS_OPEN + "{covers}" + EARLIER_ITEM_CLOSE
 # An item whose row could not be read back keeps its id under these words.
 EARLIER_ROW_UNREAD = ROW_LINE_PREFIX + "(its words were not kept)"
 # How many earlier messages' items the newest context keeps; older ones drop off.
 EARLIER_MESSAGES_MAX = 4
-# The id of an item: in a metadata line of the nudge (findings_nudge.METADATA_LINE), and at the end of an earlier item line.
+# The id of an item in a metadata line of the nudge (findings_nudge.METADATA_LINE); anchored at the line's start.
 METADATA_ID_RE = re.compile(r"^\d+\. \[[^\]]*\] id=(\S+)")
-EARLIER_ID_RE = re.compile(r"\[id=(\S+) covers=\d+\]$")
 ITEM_COVERS_RE = re.compile(r"\bcovers=(\d+)")
 ITEM_COVERS_DEFAULT = "1"
 # What ends a block of lines in a stored context.
@@ -396,8 +401,21 @@ def thread_context(card: dict, fallback: str) -> str:
     return stored if stored else fallback
 
 
+def _earlier_item_id(line: str) -> str:
+    """The id at the end of an earlier item line, or "" when ``line`` does not end as one."""
+    _, opened, tail = line.rpartition(EARLIER_ID_OPEN)
+    finding_id, covered, covers = tail.partition(EARLIER_COVERS_OPEN)
+    count = covers.removesuffix(EARLIER_ITEM_CLOSE)
+    whole = opened and covered and covers.endswith(EARLIER_ITEM_CLOSE) and count.isdigit()
+    return finding_id if whole and finding_id and not any(c.isspace() for c in finding_id) else ""
+
+
 def _item_id(line: str) -> str:
-    found = EARLIER_ID_RE.search(line) or METADATA_ID_RE.match(line)
+    """The id of an item line: an earlier item's, or a metadata line's."""
+    earlier = _earlier_item_id(line)
+    if earlier:
+        return earlier
+    found = METADATA_ID_RE.match(line)
     return found.group(1) if found else ""
 
 

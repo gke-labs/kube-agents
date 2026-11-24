@@ -176,6 +176,22 @@ class FindingsNudgeCardTests(unittest.TestCase):
         self.assertEqual(card_mod.thread_context(card, "fallback"), "fallback")
         self.assertIn("id=urr-pdb.1", card_mod.thread_context(sample_card(), "fallback"))
 
+    def test_an_item_lines_id_is_read_in_linear_time_and_only_from_its_end(self):
+        """The stored context is read back line by line. A pattern search for the id took
+        quadratic time on a line of repeated "[id=" (about half a minute at this length);
+        string cuts from the line's end do not."""
+        import time
+
+        hostile = "[id=" + "[id=!" * 40000
+        start = time.perf_counter()
+        self.assertEqual(card_mod._item_id(hostile), "")
+        self.assertLess(time.perf_counter() - start, 1.0)
+        self.assertEqual(card_mod._item_id("- critical · a row [id=x.1 covers=3]"), "x.1")
+        # Words of a row that look like the tail do not replace it, and a tail that is not whole gives no id.
+        self.assertEqual(card_mod._item_id("- a row with [id=fake covers=9] in it [id=real.2 covers=1]"), "real.2")
+        self.assertEqual(card_mod._item_id("- a row [id=x covers=two]"), "")
+        self.assertEqual(card_mod._item_id("1. [new] id=m.1 members=m.1 location=p covers=1 unreported=0"), "m.1")
+
 
 if __name__ == "__main__":
     unittest.main()
