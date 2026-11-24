@@ -18,8 +18,8 @@ spec's layout wins and this doc binds to its subjects and topic classes.
 ## What we deploy
 
 NATS 2.10 or later (auth callout requires it), JetStream enabled, file storage on a PV.
-The operator renders the whole deployment from the mode switch: `mode: next` gets a NATS
-cluster, the default gets nothing. Dark until promoted.
+The operator renders the whole deployment for every `PlatformAgent`; the `spec.mode` switch
+that once held it dark is gone, and the field is deprecated and ignored.
 
 Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run a single
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
@@ -34,6 +34,15 @@ routes Service on 6222, authenticated to each other by mutual TLS under the bus 
 a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
 clients off a stopping server rather than dropping them.
 
+**Amended 11/13 (#5708):** with `A2A_NATS_DEBUG=true` in the operator's own environment, the
+bus config carries `debug: true`. CI sets it through `operator.extraEnv`, so a failing run's
+server logs show the meta group's raft votes, terms and peer updates. It is never a CR field
+or a chart value of its own; only the chart's general `operator.extraEnv` reaches it. It is debug and never trace, because trace logs protocol frames and
+payloads and CI logs are public; debug names connections and the public keys they
+authenticated with. CI's failure collector keeps the first 2 MiB of each server's current log file beside the
+tail, since a long debug run can push the bring-up out of the tail. A file the kubelet rotated
+at 10Mi has lost the bring-up, and the head file then says so.
+
 **Changing the server count empties the bus.** A server that restarts in cluster mode
 finds its standalone streams unassigned in the new metadata layer and deletes them as
 orphans; going back, a standalone server refuses to load an R3 stream. Either way the
@@ -47,6 +56,99 @@ count it runs: a `busReplicas` that asks for another count is held to the runnin
 with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
 refuses the edit with the same message. #4225 lifts that refusal in the same change that
 adds the migration, so no release can convert without it.
+
+**Amended 10/31 (#4225):** the refusal is gone, and a change between one server and three
+starts a migration that keeps the bus's data. The operator runs it as phases on
+`status.busMigration`, reported by the `A2ABusMigrating` condition, and the webhook refuses
+another `busReplicas` change while one runs.
+
+- **Three to one**, in place: the operator's pin Job moves every stream's leader to server 0
+  and scales it to one replica while the bus is still a cluster, then the bus renders one
+  server. Writes keep flowing.
+- **One to three**, by copy: writes are frozen (no workload but the migration reaches the bus; console
+  and web logins drop, and the gateway and bridge cannot publish), the operator's pods
+  snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
+  snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
+  stream, checked against the operator's policy for it before and after, raises it to
+  three replicas, and waits (up to 5 minutes for all streams) until every replica is
+  current and every restored durable consumer answers from its leader. Each stream comes back
+  at the rendered `max_bytes` and `max_age`, and its `max_consumers` is widened to the render's
+  but never narrowed: JetStream fixes it when a stream is created, so the restore is the one
+  moment it can grow, and a wider stream's consumers must still fit (amended 11/18). The way
+  back restores each stream as the snapshot recorded it, its width included.
+- **A failure** turns the run back: before the shrink, the pinned streams go back to three
+  replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
+  restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
+  A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
+  it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
+  does neither.
+- **Reshape**, on request only (the `kubeagents.x-k8s.io/bus-reshape` annotation): TASKS alone is
+  snapshotted, deleted and restored at the width the CR renders, at the count the bus runs,
+  behind the same write freeze as one to three, with the same way back. It starts only on a
+  provisioned bus whose live TASKS is narrower than the render, and never twice for one
+  annotation value, which the bus StatefulSet records. The run's phases are only names the hold below
+  knows, so an operator rolled back to the release that added the hold holds a reshape too
+  (amended 11/19).
+- **A run of a leg this operator does not run** (one a later release started, found after a
+  rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
+  the bus keeps its count, until the operator that started it is back or a person gives it up
+  with the same abandon annotation. It is never retried. `Reshape` is reserved in the leg enum
+  for such a leg (amended 11/19).
+
+**Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
+The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
+leader exists, so the first two elect a leader and the third joins later. Twice in CI, on GKE
+Standard, the third never joined although every server held its routes. The leader then refused
+every R3 stream with a bare "no suitable peers for placement", and the provision Job retried until
+the run timed out. So before the provision Job is created, the operator reads each server's `/jsz`
+at its pod IP: the bus pods have no per-pod DNS names, and the client Service would answer from one
+server at random. The group counts as formed when a quorum of servers report one leader and that
+leader lists every other server as a current peer. Until then the Job waits, and the
+`A2ABusMetaGroup` condition names the server outside.
+
+A server still outside after 3 minutes is restarted once, under every one of these guards:
+
+- it is the only server outside;
+- the rest are a quorum without it;
+- the bus hasn't been provisioned yet, and no server holds a stream or consumer, so no only copy of
+  anything can be on the stray;
+- the stray's own meta node has started (it reports the group's size), which nats-server does only
+  after recovering its store from disk;
+- the bus StatefulSet doesn't already record it as restarted.
+
+The record is an annotation the operator writes before the delete, with its own patch, so the
+StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
+its one restart stays named in the condition, for a person.
+
+**Amended 11/18 (#6273): a fresh bus that agrees no meta leader at all is restarted whole, once.**
+Once in a nightly, one server campaigned alone and its peers' votes never reached it, so no leader was
+ever agreed, and there was no single stray to restart. After the same 3 minutes, every server is
+restarted once, under the same guards: the bus hasn't been provisioned, no server holds a stream or
+consumer, every server's meta node has started, and the record names none of them yet. The record is
+written first, with every server, so a pass that dies part-way, or an operator restarted mid-way,
+never tries again: a partial restart counts as the one attempt. An `A2ABusMetaGroupRestarted`
+Warning names the servers. A bus still without a leader after that keeps the condition, which says
+every server was restarted once and leaves it for a person.
+
+If a server isn't running while the others are (its pod absent, being deleted, or not Running,
+as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
+is restarted on that account. If a running server's view can't be read, or no server is
+running at all, the verdict is unknown: nothing is held or restarted, and the condition names
+the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
+digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
+has been provisioned. It doesn't repair a server that drops out of a running bus.
+
+**Amended 11/17 (#6147): a one-server bus says it is not highly available.** On `busReplicas: 1` the operator
+writes a Normal `A2ABusSingleServer` Event once per episode: each bus pod first seen Running under a new UID,
+and once per operator start (an in-memory record per agent, so a restart or leader failover repeats it once,
+which is accepted). The Event names the outage a drain or upgrade causes, typically about two minutes and longer after
+a node scale-down, and links the conversion
+to three servers. Ready and Degraded are untouched, and none is written mid-migration. The lone pod gets no
+PodDisruptionBudget and no `safe-to-evict: "false"`. #6040 found that on GKE Autopilot that annotation holds
+scale-down and node auto-upgrade for at least seven days, per GKE's extended-duration Pods page, and the
+operator can't tell Autopilot from Standard.
+After a node scale-down, GCE can keep the released disk attached to the node being deleted for tens of
+minutes, so the replacement waits in `FailedAttachVolume`; on three servers the bus serves on two meanwhile.
 
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
@@ -71,7 +173,7 @@ Streams bind to the payload spec's subjects and topic classes:
 | Stream            | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | :---------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TASKS`           | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
-| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. No other principal holds a consumer verb here; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                                                               |
+| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. A bus migration deletes and recreates them with the stream, and its restore reads them; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                      |
 | `DISPATCH_STOPS`  | `a2a.stop.>`         | 24h, `max_msgs_per_subject: 1`, 64MiB (amended 10/30, #3655)     | The gateway's stop records for AgentProfile tasks, one per task, written only by the gateway (its grant comes with #4127) and read by the dispatcher by subject, per profile it dispatches for. Outside `a2a.dispatch.`, because the dispatcher publishes there. No consumers. The browser credentials are denied it, and the dispatch subjects.                                                                                                                         |
 | `DIRECTORY`       | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `TOPICS-STATE`    | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -89,8 +191,9 @@ the tempting place for a cheaper R1 class, but they are also the replay and audi
 and R1 loses them to a single node failure. Audit wins. The cost knob is W, not replicas.
 
 Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
-limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`
-and `DIRECTORY`). A runaway telemetry flood drops oldest chunks early; it never fills
+limit (dev defaults: 8GiB `TASKS`, 1GiB each for `TOPICS-JOURNAL`, `TOPICS-STATE`
+and `DIRECTORY`; an existing stream keeps its cap, and the provision Job reports the edit that lowers
+it and whether that is safe yet). A runaway telemetry flood drops oldest chunks early; it never fills
 the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
 `session-state`, and discovery down with it. The honest cost: under byte pressure,
 replay completeness degrades oldest-first - a running task's early events can age out of
@@ -99,7 +202,7 @@ before it is reached.
 
 `TASKS` carries one further limit, `max_msgs_per_subject` (4096; amended 9/16). The cap
 above is stream-wide, so one runaway task - a looping harness, a gigabyte of streamed
-artifact text - could consume the whole 20GiB budget and, under `discard: old`, evict
+artifact text - could consume the whole 8GiB budget and, under `discard: old`, evict
 every other session's history on the way out. The per-subject cap makes a runaway pay
 for its own runaway and nobody else's. Be precise about what it is not: a session's
 publish grant is `a2a.tasks.<pod>.*.events` - the task id is not part of the attested
@@ -118,8 +221,9 @@ the sibling of `PostFinalDropped` for assertion 10, so a truncated replay is a
 degradation a reader can see rather than a short history it cannot distinguish from a
 real one. On the number, sized against the publisher that means it rather than the
 well-behaved one: the render sets no `max_payload`, so NATS' 1MiB default is the
-per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - a fifth of
-the stream. The worker adapter's own result chunks are 256KiB, so a task built out of
+per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - half of
+the 8GiB stream since #4476, so a subject that means it can still evict half the other
+sessions' history; the per-subject cap bounds a runaway, not a determined publisher. The worker adapter's own result chunks are 256KiB, so a task built out of
 those reaches nearer 1GiB at the same count, but that is a property of one publisher and
 not a bound the bus enforces. A chat-driven task emits single digits to low hundreds of
 events; reaching 4096 is already a loop or a gigabyte of streamed artifact text. The
@@ -325,9 +429,29 @@ every spawned session pod, the platform agent container, the capability verifier
 (the chart's `operator.profileDispatcher.enabled`).
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
-running across the reconnect. With a dispatcher the
-operator principal also creates and deletes those durables, and it is the only principal
-with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
+running across the reconnect. Listing them all in its map entry grows the entry about
+1.1 KB per profile tier, and past about 1,000 profiles no single user JWT can carry them (#5381).
+By default (`A2A_DISPATCHER_BUCKETED_GRANTS` on the operator, which only `false` turns off) the
+entry narrows on `dispatcher` instead. It carries only the fixed grants, which are its control connection's,
+and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
+CONNECT password beside the token gets the per-profile grants, draining profiles' included,
+of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
+from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+entry also lists, as `held`, the bound profiles the profile hold keeps out of the dispatcher
+until every bus server has loaded their config; their entries stay in the map, and a bucket's
+grants skip them until the hold lifts (#5935). The
+password picks a slice of what the token already allows; it is not a credential. A bucket the
+callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
+names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
+profiles. The operator renders the same switch onto the dispatcher, which then opens one
+connection per bucket beside its control connection, and is Ready only with all of them up. A
+profile the config adds reconnects only its own bucket. The dispatcher's image has to move with
+the operator's: one from before the bucket connections ignores the switch, binds no durable on
+its control connection, and stays not Ready. With a dispatcher the
+operator principal also creates and deletes those durables, and outside a bus migration it is
+the only principal that creates or deletes a consumer on that stream. A migration's clear deletes
+them with the stream, and its restore recreates them from the snapshot and lists and reads their
+info. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web` and `console`, because a browser never can;
@@ -368,7 +492,8 @@ this stack, not one function - the rollout hash on the NATS pod template is over
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
 without a credential reaching the digest. The gateway's per-profile deny is left out of
-that hash, since a reload applies it (below).
+that hash on every server count, since a reload applies it and is confirmed server by
+server (below).
 
 Layout:
 
@@ -419,8 +544,8 @@ Layout:
   which have no validator - a side left empty beside a populated one renders an explicit
   `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
   ships, still gets no permissions block at all. A principal that must not publish cannot be
-  expressed by omission - there is no deny list in the map
-  - so it has to be left unrendered rather than rendered empty.
+  expressed by omission - the map's deny lists (#5301) only subtract from an allow and never
+  stand in for an empty one - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
@@ -436,7 +561,9 @@ Layout:
   not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
   (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
   static render cannot express. The render subtracts each bound or draining profile by name
-  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny), so the gateway cannot
+  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny; #5301 moves profile
+  supervisors to the six-token `a2a.tasks.p.<profile>.*.supervisor`, which the gateway
+  subscribes to read only and can never publish), so the gateway cannot
   publish directly to a profile's supervisor subject. The deny covers direct publishes
   only, so a profile task's `…supervisor` must still not be modelled as unreachable. Second, the class
   that is not yet single-writer is `…events`, and the holder is the static `worker`
@@ -678,6 +805,14 @@ Layout:
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
 
+  **Amended 10/30 (#3993):** a confirm has a subject of its own, `chat.console.*.confirm`:
+  a frame there is the same ask as one on `.in`, which the gateway submits with
+  `TaskParameters.ChangeRequested`, the one way a task is granted the permit to make a
+  change. `console` is its only publisher and the gateway its only subscriber (the grants
+  arrive with the account split; see the 11/3 amendment below for `console-mcp`, which holds
+  `.in` and not `.confirm`). The gateway's console adapter subscribes it beside `.in`. A
+  frame on `.in` never carries a confirm, whatever its `kind` says.
+
   **Amended 9/24:** the page is served by an operator-rendered console server
   (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
   `console` password from the creds Secret, and proxies the page's websocket to 9222. It is
@@ -711,13 +846,15 @@ Layout:
   `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
+  **Amended:** the MCP server now runs by default unless `A2A_MCP_DOOR` is `false` (set by
+  the chart's `operator.mcpServer.enabled: false`).
 
-- **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
+- **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
-  publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
+  publish on `chat.notify.gchat`, `chat.notify.slack`, `chat.notify.teams` and `chat.notify.console` (one subject per
   backend the gateway can hold, and the console's) and subscribe on `chat.notify.reply.agent.>`;
-  the gateway user gains the matching grants (subscribe on the three request subjects, publish on
+  the gateway user gains the matching grants (subscribe on the four request subjects, publish on
   the reply namespace). No other
   principal holds either subject. The reply namespace is its own rather than the agent's
   `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream
@@ -769,7 +906,11 @@ keyed on the agent's own ServiceAccount and carries the blackboard grants and no
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the
 gateway - also a static `nats.conf` user for now - and there is no audit exporter or
-janitor yet. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
+janitor yet. **Amended 11/16 (#5301):** the gateway has an entry too, keyed on its own
+ServiceAccount. Its grants carry deny lists, a shape the map gained for it: the only thing
+keeping its consumer-create wildcard on `TASKS` off the pre-created durables is a publish
+deny naming them. It uses the entry only at `A2A_GATEWAY_BUS_AUTH=token`; its static user
+stays until a release after that flip, so rolling back across it is the flag. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
 operator has one for itself, keyed on the manager's own ServiceAccount: publish on
 `a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. Each
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
@@ -812,7 +953,8 @@ changed value changes the pod template, which rolls the callout. The same check 
 refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
 `agent`, `verifier`, `session`, and any user the map gains), because the callout mints
 each entry that is not narrowed under its `user` and that entry's grants carry
-`_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
+`_INBOX.<user>.>` (the dispatcher's entry, though narrowed, is minted under its `user` too,
+and its bucket users `<user>-b0` to `<user>-b31` are reserved with the rest); the narrowed entry's own user, `session`, is never minted and is
 reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved
@@ -831,14 +973,19 @@ pod may publish, the consumers it may create over `.in`, and its capability veri
 reply subjects on that name, so a pod named after another addressee would be handed that
 addressee's task subjects. The gateway never mints such a name, but anyone who can create a
 pod under a narrowed ServiceAccount can, so the same check refuses a narrowed pod whose name
-is a fixed-name addressee. Today that is `platform`: the gateway's default addressee, which
-the operator leaves unset so the gateway keeps its own default, and the only addressee the
-bridge's grants name. The operator renders the list into the callout's
+is a fixed-name addressee. Today that is `platform` and `session`. `platform` is the only
+addressee the bridge's grants name, and the gateway's default addressee unless the
+PlatformAgent's `spec.harness.tuning.defaultRoute` says `session`; the operator renders that
+default as `A2A_DEFAULT_ADDRESSEE`. `session` is the gateway's session route: a sentinel it
+routes on rather than an addressee it publishes to, reserved so nothing holds the name. The
+operator renders the list into the callout's
 `A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
 labels. Session addressees need no entry, since each is the name of the pod that is that
-addressee. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
+addressee. The callout also refuses the pod name `p`, the marker of a profile task's six-token
+supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`, #5301), as defence in depth:
+no session grant reaches a six-token subject today, and gateway-minted names carry hyphens. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
 sets, which leaves the bridge unable to publish its own events because its grants still
 name `platform`. The other is `AgentProfile` addressees, which come and go with their CRs:
 a narrowed pod named after a profile would be handed that profile's task subjects, so
@@ -943,9 +1090,8 @@ no current-template replica serving, and a gateway let through beside a `False` 
 has a serving replica to mint against. The stale-true paragraph above no longer applies
 to the gate: it reads the Deployment from the informer rather than a condition written a
 pass earlier, and the `Generation` check is what keeps a stale informer copy from
-standing in for a stale condition; the live read for "already there" is unchanged. The
-delay also stopped being invisible. Under
-`mode: next` the A2A gateway is one of the workloads `Ready` is computed from
+standing in for a stale condition; the live read for "already there" is unchanged. The delay also stopped being invisible. The A2A
+gateway is one of the workloads `Ready` is computed from
 (`readSplitWorkloads`), so an install held at the gate reads `Provisioning` with a
 message naming the Deployment - rather than a `Ready: True` sitting above an absent
 dispatcher.
@@ -1048,16 +1194,13 @@ route, leaves the cheap ones, and names the class while doing it.
 Two layers, and they are not the same layer. The admission refusal is unconditional, is
 the only one that tells the CR's author why, and covers mounts as well as volumes:
 `extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
-against the reserved names. The render strip is gated on the A2A surface, so it runs
-under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
-recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
-on that function). On the mounts it goes further than admission does: besides the
+against the reserved names. The render strip runs on every CR, since every install renders the A2A stack. On the mounts it goes further than admission does: besides the
 reserved names it drops any mount naming a volume it has just dropped by source, because
 a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
 layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
 at all; that is deliberate, because it is the supported route for a CR-declared Hermes
 bridge sidecar, which is meant to hold `bridge-password`. The bridge the operator renders
-under `next` gets the same key as a `secretKeyRef` the operator writes itself.
+gets the same key as a `secretKeyRef` the operator writes itself.
 
 Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
 pod-scoped and the callout cannot see which container presented one, so this is a guard
@@ -1103,13 +1246,19 @@ process, with concurrent presentations of one token sharing one review; a failur
 never remembered, and the identity-map lookup is not cached, so a map change reaches the
 next connection as before. A reconnecting fleet therefore costs one review per distinct
 token per thirty seconds, its retries are free, and the log line for an authorized
-connection says whether its review was `fresh` or `cached`. Measured, not read off the
-code, by two tests in `a2a/authcallout`: `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
+connection says whether its review was `fresh` or `cached`. Three tests in
+`a2a/authcallout` measure the pool. `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
 connects sixty-four clients with distinct tokens to the operator's rendered server, holds
-every review until sixteen are in flight, and asserts the peak is exactly sixteen; and
-`TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast` hands sixty-four requests to the
-handler directly with a 50ms review each and asserts every one is answered inside a
-second, sixteen abreast. Before this the
+every review until sixteen are in flight, and asserts the peak is exactly sixteen.
+`TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast` starts sixty-four decisions
+with no server and no handler in front of them, holds every review, and releases the
+reviews one round at a time; it asserts that each round is exactly sixteen reviews, that
+no request waiting behind a held round is reviewed or answered, and that sixty-four
+requests take four rounds. `TestHandleReturnsBeforeTheDecisionIsMade` asserts that the
+handler returns while its request's review is still waiting. No test asserts a wall
+clock. Sixty-four connections answered inside a second at a 50ms review is derived from
+the four rounds, which are 200ms of review against 3.2s one at a time; what a decision
+costs outside its review is logged by the round test and has no bound. Before this the
 handler did its TokenReview inline and a replica answered one request at a time, and
 twelve A2A workers reconnecting per replica were enough to queue past the first-ping
 timer, each failed connect reconnecting and reviewing again; that outage was the
@@ -1131,21 +1280,69 @@ writes a new `nats.conf` into the pod, the reloader sends nats-server the reload
 and the server applies the new users and permissions to the connections it already holds.
 It also runs the auth callout again for each connection the callout authenticated; on
 2.10.29 those connections dropped at the reload and reconnected within a second.
-The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
-added, removed or done draining changes the config Secret and not the template: the bus is
-reloaded, not rolled. Every other config change still rolls it. The operator records the
-reload it asked for on the Secret, with the `config_load_time` it read just before writing,
-and confirms the reload when that value moves. If it hasn't moved within three minutes, or
-can't be read, the operator deletes the bus pod so it restarts onto the new config, and
-writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+The pod template's config hash leaves out the per-profile gateway deny, on one server and
+on a cluster alike, so an AgentProfile added, removed or done draining changes the config
+Secret and not the template: every server is reloaded, and none is restarted or rolled.
+Every other config change still rolls the bus. The operator records the reload it asked for
+on the Secret, with each server's pod UID, `start` and `config_load_time` read from its
+`/varz` just before writing, by pod IP (a Service answers from whichever server it picks,
+and the per-pod names under the routes Service don't resolve), and only from a server whose
+`server_name` is its pod's. A server on the same pod and start confirms when its load time
+has moved. A server restarted in place (a new `start`) reloads whatever file the kubelet last
+synced, which can be the old one, so it confirms only when a load time later than its start
+arrives, or when it started more than the kubelet's sync window (90 seconds: the sync period
+plus the Secret cache's lag) after the write. A new pod confirms when the API server created
+it after the write, by the operator's own managedFields entry on the live Secret (another manager's later edit doesn't move it). A change to the bus's TLS Secret while a reload is pending (a renewed certificate, which the reloader also acts on) folds every server, so the move that follows re-arms the wait. A reload sent by hand can't be told apart, and is left to whoever sends it. nats-server 2.10 serves no
+config digest to compare instead. A server it can't read, or can't show holds the newest
+write, hasn't loaded the config: the reload stays pending, and so does the profile hold
+below, until every server is confirmed. A pod at an ordinal past what the StatefulSet asks
+for (a scale-down under way), or under a server's name but not the StatefulSet's (a Warning
+names it), keeps it pending too. The single-server path an earlier operator shipped took any
+moved load time as the reload, a restart included; this closes that on one server as on
+three. For a rolled-back operator, the key it reads keeps its old shape: pod -0's load time
+alone. A config written while a reload is still
+pending can't be confirmed by that move, which may be the earlier write landing, so the move
+restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
+kubelet write, so a restarted wait usually sees no further move, and nothing the server
+reports says whether the newest write was in the one it saw. If the value hasn't moved
+within three minutes, or can't be read, the operator deletes that server's pod so it restarts
+onto the new config: one server per pass, only once every other server has been Ready for
+30 seconds, so a cluster keeps quorum, and none while a scale-down is under way. When exactly
+one server isn't Ready and hasn't confirmed, it goes first, since restarting it costs no
+quorum. A server that can never start (unschedulable, or crash-looping) is deleted once per bound
+while it stays unconfirmed, with a Warning each time, and the profile stays held throughout.
+An upgrade that lands in the middle of a reload: on three servers there is nothing in flight
+to carry over, since the earlier operator rolled the bus rather than reloading it and kept no
+reload record. On one server, a reload the earlier operator left pending can't be confirmed in
+place, because its record carries no pod UID or start time, so the server is restarted at that
+operator's original bound, with a `BusConfigReloadFailed` Warning, and the new pod confirms by
+its creation after the write. The fresh pod mounts the current Secret, so its creation after the write confirms
+it, and the pending record stays until it is read. A pod created after the write is given a
+full three minutes from its own creation to come up before it can be restarted. That is a `BusConfigReloadFailed` Warning, or a Normal
+`BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
+restart is kept even then: confirming by the absence of a move would admit a profile whose
+deny the server might not hold. The kubelet takes up to about a minute to write
 an updated Secret into a running pod, so a newly added profile's deny lands that long after
 the profile does. On the roll path it landed when the new pod came up, tens of seconds
 later, with the bus down for the roll. The websocket listener on 9222, the console's
 door, serves the same certificate from the same files (below).
 
+**A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
+grant and the agent card take a newly bound AgentProfile only once every bus server has
+loaded the config carrying its deny; until then the profile's `CardPublished` condition is
+`False` with reason `BusConfigPending`. The config Secret records the previous list while a
+reload is pending on any server or a server restarts, and the profile counts as loaded once
+every server is on the new config. An earlier operator rolled a cluster onto each profile
+change instead and recorded the list on the pod template; while any server still runs, or
+the StatefulSet's update revision is, a revision carrying that list (an upgrade's roll
+unfinished), the loaded set is also narrowed to what every such revision lists, read from
+the StatefulSet's ControllerRevisions (the operator's one `get` on them).
+Only the way in waits: a profile the dispatch config already lists live, or whose card is
+already published, stays, and a removed profile keeps its deny while it drains, as before.
+
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
-`PlatformAgent` and removed with the stack on a flip to `today`:
+`PlatformAgent`:
 
 | Object                                             | Holds                                                  |
 | -------------------------------------------------- | ------------------------------------------------------ |

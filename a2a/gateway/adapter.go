@@ -54,12 +54,13 @@ type InboundMessage struct {
 	// bare quote that could not be read is no turn (gchat.go, quotedAsk).
 	QuotedUnread bool
 
-	// Backend names the ingress this message arrived through, and empty
-	// means the gateway's own configured backend. It exists because one
-	// gateway can now have two ingresses: the inject side door may be armed
-	// beside a real backend, and attribution is a property of the message
-	// rather than of the process. A message that says nothing is attributed
-	// to the configured backend, which is every chat backend's case.
+	// Backend names the ingress this message arrived through. It exists
+	// because one gateway has several ingresses: every armed chat backend
+	// runs behind the mux, and the side doors sit beside them, so
+	// attribution is a property of the message rather than of the process.
+	// Behind the mux every chat message carries its adapter's key (mux.go,
+	// Run). Empty means the gateway's own configured backend, which is only
+	// the case for a hand-built single-adapter gateway with no mux.
 	Backend string
 
 	// Profile, when set, addresses this turn to an AgentProfile, with
@@ -69,6 +70,10 @@ type InboundMessage struct {
 	// turns go to the conversation's route.
 	Profile    string
 	Parameters map[string]string
+	// ReplyTo, when set, is the task whose stored report this message
+	// answers, carried on the submission as a replyTo part
+	// (lib.ReplyToPart). The console door sets it from its frame's replyTo.
+	ReplyTo string
 
 	// Intent, when set, is a control action the backend expressed directly
 	// rather than a message to be understood. Empty is an ordinary message.
@@ -104,6 +109,10 @@ type InboundMessage struct {
 	// settles on the answer, and the ask keeps ⏸️. False on every backend
 	// but Slack.
 	Answer bool
+	// ArrivedAt is when the adapter received the message, set by the Slack
+	// adapter only: the start of slack_first_ack_seconds, which ends when the
+	// gateway has drawn the ask's arrival reaction (drawArrivalMark).
+	ArrivedAt time.Time
 	// Unaddressed marks a message the sender did not address to the bot,
 	// delivered only because of where it was typed: today an unmentioned
 	// Slack reply under one of the bot's own posts (an alert, or another
@@ -126,9 +135,18 @@ type InboundMessage struct {
 	// name, so nothing is addressed to a name that is not a user's; empty
 	// on a typed message, and on every backend but Google Chat.
 	Viewer string
+
+	// capRetry is set by the gateway, never an adapter: the id of one try
+	// of a session-cap waiter (session_cap_queue.go), the parked turn
+	// re-delivered to try for a slot again. Zero on every message a backend
+	// delivers. capReplay marks any message the line delivers again, the
+	// parked turn and the follow-ups behind it, which were counted as
+	// inbound when they first arrived.
+	capRetry  uint64
+	capReplay bool
 }
 
-// IntentCancel is the only Intent today: stop the conversation's running
+// IntentCancel stops the conversation's running
 // task. A chat message cannot express it -- a human types "stop" and the
 // text matcher reads it -- but a program should not have to spell a phrase
 // to reach a control path, and a phrase that changes meaning is a class of
@@ -136,6 +154,18 @@ type InboundMessage struct {
 // Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
 // as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
+
+// IntentConfirm confirms a change the agent proposed: the message is a new
+// ask, as any other, and its task (and every child it delegates) is
+// submitted with TaskParameters.ChangeRequested, the one way a worker is
+// granted the permit to open a pull request. Free text never expresses it,
+// so a reply that merely says "yes, do it" gets an answer, not a change.
+// The console sends it as a frame on chat.console.<token>.confirm, a
+// subject only the human console user may publish on, and the inject door as
+// intent "confirm"; no chat backend has a confirm button yet. A confirm
+// while a task runs is refused rather than steered, since a steer cannot
+// change what the running task was granted.
+const IntentConfirm = "confirm"
 
 // Adapter is the five-operation backend interface from the gateway design:
 // inbound message with verified sender, conversation and thread identity
@@ -237,7 +267,9 @@ type VerifiedObserver interface {
 // adapter does, with Agent Sessions' Working… status, the ask's reaction and
 // the plan rows, as the today path shows no receipt either. With it true the
 // gateway posts no placeholder for a task, so the relay has no line to edit
-// and every line edit is skipped; the notices that stand on their own (the
+// and every line edit is skipped, except for a session turn's child
+// delegated to an AgentProfile, whose progress nothing else shows
+// (childKeepsLine, #6532); the notices that stand on their own (the
 // queue notice, a publish failure, a failed or canceled task) still post.
 // Asked per conversation, so a wrapper (the mux, the side door) answers for
 // the backend that owns it.
@@ -283,6 +315,37 @@ type LineAnswerer interface {
 	AnswersOnLine(conversation string) bool
 }
 
+// WholeLineAnswerer is a LineAnswerer that takes a completed task's whole
+// answer on the task's live message when it fits one piece (PieceSizer):
+// the line becomes the answer, in place of a post under a bare mark. Teams
+// implements it: it draws no reaction, so without it every direct answer
+// sits under a card holding ✅ alone. An answer past the piece size posts
+// as on any backend, and the line ends as lineDoneMark. An edit raises no
+// notification where a post does; a backend takes that trade knowingly.
+type WholeLineAnswerer interface {
+	AnswersWholeOnLine(conversation string) bool
+}
+
+// PieceSizer names the most bytes one post or edit to conversation carries
+// A backend that does not implement it takes discordChunk, Discord's cap,
+// which every other backend fits under; one whose cap is far above it
+// (Teams, 28 KiB an activity) says so, and a table that fits one card is not
+// cut into two. The relay splits posts at it (Gateway.post) and truncates
+// line edits to it; the notifier splits home and conversation posts at it.
+type PieceSizer interface {
+	PieceSize(conversation string) int
+}
+
+// pieceSizeOf is the backend's PieceSize for conversation, or discordChunk.
+func pieceSizeOf(a any, conversation string) int {
+	if sizer, ok := a.(PieceSizer); ok {
+		if n := sizer.PieceSize(conversation); n > 0 {
+			return n
+		}
+	}
+	return discordChunk
+}
+
 // OutMessage is one post or edit as a value: the text, and the chat message
 // that lays the same content out (spec-a2a-payloads.md, "Chat messages").
 type OutMessage struct {
@@ -305,6 +368,16 @@ type OutMessage struct {
 	// this message, naming that task, and an edit without Stop takes it
 	// off, which is the terminal edit; every other backend ignores it.
 	Stop string
+	// Profile, on a top-level profile task's status line (Stop set), is the
+	// AgentProfile the task was published to. A console client cannot see
+	// a profile's submission (a2a.submit is not on its account), so the
+	// console door names the task and its profile on the frame for it to
+	// follow; every other backend ignores it.
+	Profile string
+	// InReplyTo, on that same line, is the backend message id of the turn
+	// that started the task, so a console client takes the task its own turn
+	// started and not another turn's on the same conversation.
+	InReplyTo string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message
@@ -423,6 +496,19 @@ type TaskObserver interface {
 // drives, and the side-door composite forwards it to the owning door.
 type DeliverableObserver interface {
 	TaskDelivered(conversation, taskID, result string)
+}
+
+// CardStopObserver is told a canceled task's card-stop result before the
+// terminal, when the executor's canceled result carries the cardStop part
+// (#5528): the gateway's text for it and the part re-encoded from the parsed
+// result (observeCardStop). Nothing else of a canceled result is handed
+// over, since a canceled turn's partial output stays away from a program's
+// caller, as DeliverableObserver keeps it to completed tasks. The relay and
+// the heal path may both tell it; a second call replaces the first.
+// Optional, like the observers above, and forwarded by the side-door
+// composite to the owning door.
+type CardStopObserver interface {
+	TaskCardStop(conversation, taskID, text string, cardStop lib.Part)
 }
 
 // InboundObserver is the optional extension an Adapter implements when it has

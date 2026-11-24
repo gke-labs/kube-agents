@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
@@ -63,8 +63,26 @@ except Exception:  # pragma: no cover
     sys.modules["mcp.server"] = _stub
 
 import chat_notify
+import no_live_kubectl
 import session_kv_server
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+
+
+def tearDownModule():
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 class ParkedTriagePool:
@@ -143,6 +161,47 @@ class TestSessionKvServerUtils(unittest.TestCase):
         self.assertEqual(clean_workload_name("Pod", "ingest-queue"), "ingest")
         # Only Pod names change.
         self.assertEqual(clean_workload_name("Deployment", "ingest-batch"), "ingest-batch")
+
+    def test_clean_workload_name_reads_a_deployment_pod_name_that_kubernetes_cut(self):
+        """Kubernetes cuts a generated pod name at 63 characters: it keeps 58
+        characters of `<deployment>-<hash>-` and adds five. Every name here is
+        built by that rule (`cut_pod_name`), not typed. If the cleaner changes,
+        change these cases and the design doc together.
+        """
+
+        def cut_pod_name(deployment, pod_hash="55c6d97c65", suffix="q5rwx"):
+            return f"{deployment}-{pod_hash}-"[:58] + suffix
+
+        # With a ten-character hash the hyphen before the five is gone from 47
+        # characters; at 53, four characters of the hash are left. Those fold
+        # into the Deployment.
+        for length in (47, 48, 53):
+            deployment = "billing-" + "x" * (length - 8)
+            name = cut_pod_name(deployment)
+            self.assertEqual(len(name), 63)
+            self.assertEqual(clean_workload_name("Pod", name), deployment, length)
+        # A nine-character hash is cut the same way.
+        deployment = "billing-" + "x" * 40
+        self.assertEqual(clean_workload_name("Pod", cut_pod_name(deployment, pod_hash="5c6d97c65")), deployment)
+        # With fewer than four characters of the hash left, the start of a
+        # name segment passes for a hash, so the name stays as it is.
+        for length in (54, 56):
+            name = cut_pod_name("billing-" + "x" * (length - 8))
+            self.assertEqual(clean_workload_name("Pod", name), name, length)
+        # At 57 the hyphen is back, and the five-character rule applies.
+        deployment = "billing-" + "x" * 49
+        self.assertEqual(clean_workload_name("Pod", cut_pod_name(deployment)), deployment)
+        # Only a name of exactly 63 characters can be a cut name: the same
+        # ending on a shorter name and on a longer, typed name stays.
+        self.assertEqual(clean_workload_name("Pod", "web-55c6d97c65q5rwx"), "web-55c6d97c65q5rwx")
+        typed = "x" * 48 + "-55c6d97c65q5rwx"
+        self.assertEqual((len(typed), clean_workload_name("Pod", typed)), (64, typed))
+        # A 63-character name whose tail is no hash stays: a character that no
+        # pod-template hash has, and more characters than a hash has.
+        no_hash = "x" * 47 + "-0123456789q5rwx"
+        self.assertEqual((len(no_hash), clean_workload_name("Pod", no_hash)), (63, no_hash))
+        too_long = "x" * 46 + "-55c6d97c65fq5rwx"
+        self.assertEqual((len(too_long), clean_workload_name("Pod", too_long)), (63, too_long))
 
     def test_clean_reason_label_camel_case(self):
         self.assertEqual(clean_reason_label("FailedToDrainNode"), "Failed to drain node")
@@ -1225,10 +1284,141 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
 
     def test_under_next_a_google_chat_thread_gets_the_title(self):
         # The title heads the plan the cards draw, which the gateway lays out on
-        # Google Chat under next.
+        # Google Chat, which the gateway holds.
         with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat"}):
             self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         session_kv_server._record_alert_title.assert_called_once()
+
+    def test_the_alert_goes_to_one_platform_when_both_are_routed(self):
+        # both routed: _trigger_agent_troubleshooter posts the initial alert to google_chat only (CHAT_PLATFORMS order),
+        # registers one session route, and logs the "will not receive it" warning naming slack.
+        argvs = []
+
+        def notify(argv, **_kwargs):
+            argvs.append(argv)
+            return session_kv_server.subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": "spaces/AAA/threads/T1"}), stderr="")
+
+        pool = park_triage_starts()
+        with patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack"}), \
+             patch.object(session_kv_server.subprocess, "run", side_effect=notify), \
+             self.assertLogs("session_kv_server", level="WARNING") as logs:
+            session_kv_server.trigger_agent_troubleshooter("s1", "alert", {}, 7, slack_alert_msg="slack alert")
+            pool.run()
+        self.assertEqual([argv[:4] for argv in argvs], [[chat_notify.A2A_CLI, "notify", "--platform", "google_chat"]])
+        session_kv_server._register_session_routing.assert_called_once_with("s1", "google_chat", "spaces/AAA/threads/T1")
+        self.assertTrue(any("slack will not receive it" in line for line in logs.output), logs.output)
+
+
+class TestAlertGoesToTheFirstHomePostPlatform(unittest.TestCase):
+    """The alert picks the first platform chat_notify.routed_platforms()
+    names, Chat first: Slack alone when no CR home is set and the projected
+    file names a channel, and Chat (kept for its digest) when no platform
+    has a home."""
+
+    def setUp(self):
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            p = patch.object(session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_register_session_routing", "_record_alert_title", "mark_delivery_failed"):
+            p = patch.object(session_kv_server, name)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_create_gateway_session", "_start_agent_turn"):
+            p = patch.object(session_kv_server, name, return_value=STARTED)
+            p.start()
+            self.addCleanup(p.stop)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        p = patch.object(chat_notify, "HOME_FILE_DIR", self.dir)
+        p.start()
+        self.addCleanup(p.stop)
+        env = patch.dict(os.environ, {
+            chat_notify.NOTIFY_PLATFORM_ENV: "",
+            chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+            "GOOGLE_CHAT_HOME_CHANNEL": "",
+            "SLACK_HOME_CHANNEL": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "SLACK_RELAY_URL", "SLACK_BOT_TOKEN"):
+            os.environ.pop(name, None)
+
+    def _run(self, notify):
+        argvs = []
+
+        def run(argv, **_kwargs):
+            argvs.append(argv)
+            return notify(argv)
+
+        pool = park_triage_starts()
+        with patch.object(session_kv_server.subprocess, "run", side_effect=run):
+            session_kv_server.trigger_agent_troubleshooter("s1", "alert", {}, 7, slack_alert_msg="slack alert")
+            pool.run()
+        return [argv[:4] for argv in argvs]
+
+    def _write_home_file(self, text):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_projected_slack_channel_takes_the_alert_when_no_cr_home_is_set(self):
+        self._write_home_file("C1\n")
+        legs = self._run(lambda argv: session_kv_server.subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"message_id": "1712345678.000100", "thread_id": "1712345678.000100"}), stderr=""))
+        self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", "slack"]])
+        session_kv_server._register_session_routing.assert_called_once()
+        self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], "slack")
+
+    # (A2A_NOTIFY_PLATFORM, slack_home, gchat_home, the platform picked): a
+    # configured home before a learned one, Chat before Slack when alike.
+    PICKS = (
+        ("slack", "", "spaces/AAA\n", "slack"),
+        ("google_chat", "C1\n", "", "google_chat"),
+        ("", "C1\n", "spaces/AAA\n", "google_chat"),
+        ("google_chat,slack", "", "", "google_chat"),
+    )
+
+    def _homes(self, listed, slack_file, gchat_file):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = listed
+        self._write_home_file(slack_file)
+        with open(os.path.join(self.dir, chat_notify.GCHAT_HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(gchat_file)
+
+    def test_the_alert_takes_a_configured_home_ahead_of_a_learned_one(self):
+        for listed, slack_file, gchat_file, picked in self.PICKS:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._homes(listed, slack_file, gchat_file)
+                session_kv_server._register_session_routing.reset_mock()
+                thread = "spaces/AAA/threads/T1" if picked == "google_chat" else "1712345678.000100"
+                legs = self._run(lambda argv: session_kv_server.subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": thread}), stderr=""))
+                self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", picked]])
+                self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], picked)
+
+    def test_every_single_destination_reader_takes_the_same_platform(self):
+        # The pick the alert and the drift digest make, and the first platform
+        # the data-volume warning and send_notification try.
+        import chat_platforms
+        for listed, slack_file, gchat_file, picked in self.PICKS:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._homes(listed, slack_file, gchat_file)
+                platforms = session_kv_server.enabled_chat_platforms()
+                self.assertEqual(platforms, chat_notify.routed_platforms())
+                self.assertEqual(session_kv_server.get_active_platform(platforms), picked)
+                with patch.object(chat_platforms, "MANAGED_CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+                     patch.object(chat_platforms, "CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"):
+                    self.assertEqual(chat_platforms.enabled_chat_platforms()[0], picked)
+
+    def test_with_no_home_the_alert_goes_to_chat_and_is_kept(self):
+        self._write_home_file("")
+
+        def kept(argv):
+            raise session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, argv, stderr="kept")
+
+        legs = self._run(kept)
+        self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", "google_chat"]])
+        session_kv_server._register_session_routing.assert_not_called()
 
 
 class TestAlertTitleRecord(unittest.TestCase):
@@ -1347,6 +1537,8 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/tasks/t-1", None),
         ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
         ("GET", "/v1/sessions/sess-1/origin", None),
+        ("PUT", "/v1/sessions/sess-1/eval-run", {"eval_run": "devops-bench-abc/case-a/1"}),
+        ("GET", "/v1/sessions/sess-1/eval-run", None),
         ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
@@ -1766,6 +1958,21 @@ class TestActivePlatformFallback(unittest.TestCase):
     def test_an_install_with_neither_falls_back_to_google_chat(self):
         self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
 
+    def test_teams_is_a_platform_only_through_the_gateway_route(self):
+        # The gateway's Teams backend is a destination through its chat.notify
+        # route (A2A_NOTIFY_PLATFORM names it when the CR sets a home); the
+        # Hermes teams platform never was one here, and stays that way.
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "teams"
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "teams"
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["teams"])
+        self.assertEqual(session_kv_server.get_active_platform(), "teams")
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,teams"
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["google_chat", "teams"])
+        os.environ.pop(chat_notify.NOTIFY_PLATFORM_ENV)
+        os.environ.pop(chat_notify.NOTIFY_CONVERSATIONS_ENV)
+        os.environ["TEAMS_HOME_CHANNEL"] = "19:abc@thread.tacv2"
+        self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
+
     def test_an_absent_config_falls_back_rather_than_raising(self):
         # setUp writes an unparseable file; a missing one takes a different
         # branch of the same `except` and must not escape to the caller.
@@ -2072,9 +2279,9 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
     def test_a_mounted_projection_outranks_the_config_files(self):
-        # Under `next` the operator projects the home channel into a file the
-        # kubelet refreshes in place, and the gateway posts into that value. A
-        # `/sethome` channel left in the data volume by today mode must not
+        # The operator projects the home channel into a file the kubelet
+        # refreshes in place, and the gateway posts into that value. A
+        # `/sethome` channel an earlier release's Hermes Slack platform left in the data volume must not
         # make the agent name a different channel than the gateway, so a
         # mounted file decides, empty or not; the config files count only
         # where no file is mounted.
@@ -4163,7 +4370,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
 
     def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
-        # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With
+        # A /sethome on an earlier release's Hermes Slack platform left SLACK_HOME_CHANNEL in the PVC .env. With
         # the operator's projection mounted the file is the home channel the
         # gateway posts into, so the mirror is skipped; without it, it loads.
         with tempfile.TemporaryDirectory() as directory:
@@ -5211,8 +5418,9 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
 
     The case that found it: `spec.mode: next`, the gateway holding Slack, no
     home channel. The managed scope turns both Hermes platforms off and
-    `A2A_NOTIFY_PLATFORM` is absent, so the platform walk resolves nothing and
-    the fallback used to post the report to Google Chat.
+    `A2A_NOTIFY_PLATFORM` is absent; the fallback used to post the report to
+    Google Chat. Now every armed route takes the home posts when no platform
+    has a home, so only an install with no armed route reaches the refusal.
     """
 
     SLACK_REFUSAL = (
@@ -5270,24 +5478,15 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
                 patcher.stop()
         return response, mocks
 
-    def test_slack_with_no_home_channel_sends_nothing_and_names_the_field(self):
-        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
-        response, mocks = self._post()
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()["detail"], f"chat relay failed: {self.SLACK_REFUSAL}")
-        for name, mock in mocks.items():
-            mock.assert_not_called()
-
-    def test_google_chat_with_no_home_channel_names_its_own_field(self):
-        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat"
-        response, mocks = self._post()
-        self.assertEqual(response.status_code, 502)
-        self.assertIn(
-            "composed but not delivered to google_chat (no home channel: set "
-            "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL)",
-            response.json()["detail"],
-        )
-        mocks["_send_to_chat"].assert_not_called()
+    def test_an_armed_route_with_no_home_channel_takes_the_report(self):
+        # No platform has a home, so every armed route takes the home posts:
+        # the report goes to the gateway, which keeps it for its digest.
+        for platform in ("slack", "google_chat"):
+            with self.subTest(platform=platform):
+                os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = platform
+                _, mocks = self._post()
+                mocks["_send_to_chat"].assert_called_once()
+                self.assertEqual(mocks["_send_to_chat"].call_args.args[0], platform)
 
     def test_no_gateway_backend_gets_the_neutral_refusal(self):
         """No chat at all and a malformed home channel both leave the variable
@@ -5311,6 +5510,9 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
 
         self.assertEqual(chat_delivery_watch.platforms_from(self.SLACK_REFUSAL), ["slack"])
         self.assertEqual(chat_delivery_watch.platforms_from(session_kv_server.NO_CHAT_ROUTE_ERROR), [])
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat,slack"
+        self.assertEqual(
+            chat_delivery_watch.platforms_from(session_kv_server._no_chat_route_error()), ["google_chat", "slack"])
 
     def test_a_routed_platform_is_not_refused(self):
         """The control: with a home channel the operator renders
@@ -5320,6 +5522,47 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
         _, mocks = self._post()
         self.assertEqual(
             [call.args[0] for call in mocks["_send_to_chat"].call_args_list], ["slack"])
+
+    def test_the_no_route_error_names_every_gateway_platform_without_a_home(self):
+        with patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+                                     chat_notify.NOTIFY_PLATFORM_ENV: ""}, clear=False):
+            msg = session_kv_server._no_chat_route_error()
+        self.assertIn("not delivered to google_chat (no home channel: set", msg)
+        self.assertIn("not delivered to slack (no home channel: set", msg)
+        self.assertIn("; ", msg)
+        with patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "teams",
+                                     chat_notify.NOTIFY_PLATFORM_ENV: ""}, clear=False):
+            msg = session_kv_server._no_chat_route_error()
+        self.assertIn("not delivered to teams (no home channel: set spec.integration.teams.homeChannel)", msg)
+
+    def test_the_relay_posts_one_leg_per_routed_platform(self):
+        # both platforms routed, no earlier delivery: relay_cron_report sends one leg to google_chat and one to slack,
+        # each through the gateway (`a2a notify --platform <p>`), and never two legs to one platform.
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat,slack"
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,slack"
+        argvs = []
+
+        def notify(argv, **_kwargs):
+            argvs.append(argv)
+            return session_kv_server.subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": "t1"}), stderr="")
+
+        outbound = [
+            patch.object(session_kv_server, name, return_value=None)
+            for name in ("_post_audit_blocks", "_post_failed_audit_via_gateway", "_slack_audit_headline",
+                         "_failed_audit_line")
+        ]
+        for patcher in outbound:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with patch.object(session_kv_server.subprocess, "run", side_effect=notify):
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "fleet-wide-cost-analysis", "profile": "platform", "report": "finding"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(all(argv[:3] == [chat_notify.A2A_CLI, "notify", "--platform"] for argv in argvs), argvs)
+        self.assertEqual(sorted(argv[3] for argv in argvs), ["google_chat", "slack"])
 
     def test_an_install_no_source_describes_keeps_the_fallback(self):
         """No file says anything, so nothing is explicitly off: the relay still
@@ -6306,7 +6549,7 @@ class TestBoardHealthCardRelay(unittest.TestCase):
     """The kanban-board-health job's Slack leg posts its card, with Retry and Drop on each row.
 
     Only for the report the card was said with, with KAGE_SLACK_UX on: as Block
-    Kit through the Slack relay, or under next as a chat message through the
+    Kit through the Slack relay, or as a chat message through the
     gateway. Everywhere else, and whenever the card does not post, the report
     goes out as written.
     """
@@ -6380,7 +6623,7 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.REPORT)])
 
     def test_under_next_the_card_goes_to_the_gateway_on_google_chat_too(self):
-        # The gateway lays the card out on Google Chat under next; under today the
+        # The gateway lays the card out on Google Chat; without the gateway the
         # report goes as text there (test_flag_off_another_job_or_google_chat_posts_the_report).
         os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
         with patch.object(
@@ -6678,7 +6921,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(text, self.FAILED.strip())
 
     def test_under_next_a_failed_audit_whose_card_did_not_post_goes_out_whole(self):
-        # A reply cannot bring the report back under next, so the line alone would lose it.
+        # A reply cannot bring the report back through the gateway, so the line alone would lose it.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
         with patch.object(session_kv_server, "_post_audit_chat_via_gateway", return_value=None):
@@ -6786,7 +7029,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(via.call_args.args[0], "slack")
 
     def test_under_next_the_headline_card_goes_to_the_gateway_on_google_chat(self):
-        # The gateway lays the card out on Google Chat under next, as on Slack, and
+        # The gateway lays the card out on Google Chat, as on Slack, and
         # posts into its home space itself, so no home channel env is needed here.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
@@ -7944,6 +8187,21 @@ class TestDriftInject(unittest.TestCase):
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
 
+    def test_the_card_titles_the_two_ways_out_as_the_buttons_read(self):
+        """slack_ux_incident turns each option's title into its button, so the card fixes the two usual ones.
+
+        The "What's wrong" section is a headline paragraph and a what-who-when
+        paragraph, which the drift layout shows under the headline, and "Why"
+        opens on the diff the layout's "diff" fold is named for.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("the revert is `Put Git's version back`", card)
+        self.assertIn("is `Keep it · update Git`", card)
+        self.assertIn("## What's wrong\n\n<object> on <cluster> was changed outside Git.\n\n<1-2 sentences:", card)
+        self.assertIn("## Why\n\n```diff\n- <field>:", card)
+        without = session_kv_server._drift_task_body_without_gitops(self._payload())
+        self.assertNotIn(session_kv_server.DRIFT_REVERT_TITLE, without)
+
     def test_the_card_handles_an_object_git_does_not_declare(self):
         """No declared state means no revert, and the card has to say so twice.
 
@@ -8673,6 +8931,78 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         )
         self.assertEqual(polled["next_since_id"], polled["events"][-1]["id"])
 
+    def _ledger_row_aged(self, session_id, hours_ago):
+        """One suppressed row, dated `hours_ago` back in the ledger's own clock."""
+        row_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1", namespace="prod", workload=session_id, object_uid=session_id,
+            object_kind="Pod", reason="BackOff", message="m", severity="Warning",
+            occurrences=1, notified=False, session_id=session_id,
+        )
+        with closing_db() as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE id = ?",
+                (f"-{hours_ago} hours", row_id),
+            )
+            conn.commit()
+        return row_id
+
+    def test_intercepted_events_since_filters_the_newest_first_page(self):
+        for session_id, hours_ago in (("old-a", 72), ("old-b", 48), ("new-c", 1), ("new-d", 0)):
+            self._ledger_row_aged(session_id, hours_ago)
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+        page = self.client.get(f"/v1/intercepted-events?since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in page["events"]], ["new-d"])
+        # `truncated` counts the window's rows only: one more inside it, two outside.
+        self.assertTrue(page["truncated"])
+        full = self.client.get(f"/v1/intercepted-events?since={since}&limit=10").json()
+        self.assertEqual([e["session_id"] for e in full["events"]], ["new-d", "new-c"])
+        self.assertFalse(full["truncated"])
+        self.assertEqual(full["next_since_id"], full["events"][0]["id"])
+        # Without `since` the page is what it always was.
+        self.assertEqual(len(self.client.get("/v1/intercepted-events?limit=10").json()["events"]), 4)
+
+    def test_intercepted_events_since_filters_the_cursor_page(self):
+        ids = {}
+        for session_id, hours_ago in (("old-a", 72), ("old-b", 48), ("new-c", 1), ("new-d", 0)):
+            ids[session_id] = self._ledger_row_aged(session_id, hours_ago)
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+        first = self.client.get(f"/v1/intercepted-events?since_id=0&since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in first["events"]], ["new-c"])
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["next_since_id"], ids["new-c"])
+        rest = self.client.get(f"/v1/intercepted-events?since_id={first['next_since_id']}&since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in rest["events"]], ["new-d"])
+        self.assertFalse(rest["truncated"])
+        # An empty filtered page keeps the cursor where it was.
+        none = self.client.get(f"/v1/intercepted-events?since_id={ids['new-d']}&since={since}").json()
+        self.assertEqual(none, {"events": [], "truncated": False, "next_since_id": ids["new-d"]})
+        # Without `since` the cursor walk starts at the oldest row, as before.
+        self.assertEqual(
+            self.client.get("/v1/intercepted-events?since_id=0&limit=1").json()["events"][0]["session_id"], "old-a"
+        )
+
+    def test_intercepted_events_unpadded_since_is_normalised_before_the_compare(self):
+        """`strptime` takes `9:00:00`; the string compare against zero-padded `created_at`
+        would not (`'12' < '9:'`), so the route re-renders `since` before binding it."""
+        row_id = self._ledger_row_aged("noon", 0)
+        with closing_db() as conn:
+            conn.execute("UPDATE intercepted_events SET created_at = '2026-01-01 12:00:00' WHERE id = ?", (row_id,))
+            conn.commit()
+        for since in ("2026-01-01 9:00:00", "2026-01-01 09:00:00"):
+            with self.subTest(since=since):
+                page = self.client.get("/v1/intercepted-events", params={"since": since}).json()
+                self.assertEqual([e["session_id"] for e in page["events"]], ["noon"])
+
+    def test_intercepted_events_bad_since_is_a_400(self):
+        for bad in ("yesterday", "2026-11-16T00:00:00Z", "2026-11-16", "2026-13-01 00:00:00"):
+            with self.subTest(bad=bad):
+                response = self.client.get(f"/v1/intercepted-events?since={bad}")
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("YYYY-MM-DD HH:MM:SS", response.json()["detail"])
+        self.assertEqual(self.client.get("/v1/intercepted-events?since=2026-11-16 00:00:00").status_code, 200)
+
     def test_kanban_task_feeds_and_detail(self):
         # Before kanban.db exists: empty list feed with board=False, 404 on detail
         empty_sess = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
@@ -8723,6 +9053,19 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         self.assertEqual(len(detail["events"]), 1)
         self.assertEqual(len(detail["comments"]), 1)
         self.assertEqual(self.client.get("/v1/tasks/no-such-task").status_code, 404)
+
+    def test_init_db_adds_changed_paths_to_an_existing_post_merge_records(self):
+        import sqlite3
+
+        legacy_db = self.root / "legacy_post_merge.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute("CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, repo TEXT, number INTEGER)")
+            conn.execute("INSERT INTO post_merge_records VALUES ('u', 'r', 1)")
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(legacy_db)):
+            session_kv_server.init_db()
+            session_kv_server.init_db()
+        with sqlite3.connect(legacy_db) as conn:
+            self.assertEqual(conn.execute("SELECT url, changed_paths FROM post_merge_records").fetchall(), [("u", None)])
 
     def test_init_db_adds_session_id_column_idempotently_to_legacy_ledger(self):
         import sqlite3
@@ -9762,6 +10105,22 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "printf secret/db | xargs kubectl get -n prod -o yaml",
             "aws secretsmanager batch-get-secret-value --secret-id-list db",
             "gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}",
+            # a token print, and a dump of the environment (#5484)
+            "gcloud auth print-access-token",
+            "gcloud config config-helper --format=json",
+            "env | grep PATH",
+            "printenv GITHUB_TOKEN",
+            "kubectl exec deploy/api -- env",
+            "cat /proc/self/environ",
+            'echo "$(env)"',
+            "sh -c env arg0",
+            # another tool's token printer, and another language's print of its environment (#5803)
+            "gh auth token",
+            "kubectl create token builder",
+            # forms that the rule's second read withholds
+            "find . -exec true \\; -exec env \\;",
+            "env$(true)",
+            "python3 -c 'import os; print(os.environ)'",
         ]
         served = [
             "kubectl get secrets -n kube-system",
@@ -9780,6 +10139,12 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "az keyvault secret list --vault-name kv",
             "kubectl exec deploy/api -- cat /opt/data/report.txt",
             "kubectl exec deploy/secrets-api -- cat /opt/data/report.txt",
+            "gcloud auth list",
+            "env FOO=1 python3 x.py",
+            "printenv HOME",
+            "kubectl get pods -n env",
+            "gh auth status",
+            "python3 -c 'import os; print(os.environ[\"HOME\"])'",
         ]
         for cmd in withheld:
             with self.subTest(cmd=cmd):
@@ -9886,6 +10251,41 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         steps = self.client.get("/v1/tasks/t_d1c3323e").json()["steps"]
         self.assertEqual([s["preview"] for s in steps if s["kind"] == "tool_result"], [session_kv_server.WORKER_STEP_WITHHELD])
         self.assertNotIn(secret_val, json.dumps(steps))
+
+    def test_a_token_print_and_an_environment_dump_are_withheld(self):
+        # The output of `gcloud auth print-access-token` and of `env` is the
+        # credential itself; the feed withholds it whatever shape it has.
+        token_val = "opaque-token-with-no-known-shape-0042"
+        print_args = json.dumps({"command": "gcloud auth print-access-token"})
+        dump_args = json.dumps({"command": "env | sort"})
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-print", "user", "work kanban task t_d1c3323e", None, None, 101.0, None, None),
+                (
+                    "sess-print",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {"id": "c1", "function": {"name": "terminal", "arguments": print_args}},
+                        {"id": "c2", "function": {"name": "terminal", "arguments": dump_args}},
+                    ],
+                    102.0,
+                    None,
+                    None,
+                ),
+                ("sess-print", "tool", f"{token_val}\n", "terminal", None, 103.0, None, "c1"),
+                ("sess-print", "tool", f"HOME=/root\nSERVICE_CREDENTIAL={token_val}\n", "terminal", None, 104.0, None, "c2"),
+            ],
+            with_tool_call_id=True,
+        )
+        steps = self.client.get("/v1/tasks/t_d1c3323e").json()["steps"]
+        self.assertEqual(
+            [s["preview"] for s in steps if s["kind"] == "tool_result"],
+            [session_kv_server.WORKER_STEP_WITHHELD, session_kv_server.WORKER_STEP_WITHHELD],
+        )
+        self.assertNotIn(token_val, json.dumps(steps))
 
     def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):
         rows: list[tuple] = [
@@ -10820,6 +11220,10 @@ class TestCardStop(unittest.TestCase):
         self.addCleanup(modules.stop)
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        # Each test is its own conversation's stops: no joined result carries
+        # over from another test's stop on the same session (#5528).
+        session_kv_server._card_stop_flights.clear()
+        self.addCleanup(session_kv_server._card_stop_flights.clear)
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
 
     # -- the stub Hermes ---------------------------------------------------
@@ -11242,14 +11646,201 @@ class TestCardStop(unittest.TestCase):
         body = self.stop().json()
         self.assertEqual((body["stopped"], body["rounds"], self.sleeps), ([], 0, []))
 
-    def test_a_second_call_stops_nothing(self):
+    def test_a_second_call_past_the_join_window_stops_nothing(self):
         self.the_tree()
         first = self.stop().json()
         self.assertEqual(len(first["stopped"]), 4)
-        second = self.stop()
+        with patch.object(session_kv_server, "CARD_STOP_JOIN_WINDOW_S", 0.0):
+            second = self.stop()
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json()["stopped"], [])
         self.assertEqual(second.json()["rounds"], 0)
+        self.assertNotIn("joined", second.json())
+
+    def test_a_second_call_inside_the_join_window_gets_the_first_answer(self):
+        # #5528: the gateway's card-stop control and the bridge's cancel
+        # archive both stop one session; the later one must not read
+        # "stopped 0" against the cards the earlier one stopped.
+        # Filed a while before the stop, as real cards are: one filed in the
+        # stop's own second counts as possibly new (whole-second stamps).
+        self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
+        self.card("t_b", "todo", session=self.SESSION, created=time.time() - 10)
+        first = self.stop().json()
+        self.assertEqual(self.stopped_ids(first), ["t_a", "t_b"])
+        second = self.stop()
+        self.assertEqual(second.status_code, 200)
+        body = second.json()
+        self.assertTrue(body["joined"])
+        self.assertEqual(self.stopped_ids(body), self.stopped_ids(first))
+        self.assertNotIn("joined", first)
+
+    def test_a_card_filed_after_the_first_stop_began_gets_a_fresh_stop(self):
+        # The planner's correction to #5528: a joined answer is stale once the
+        # conversation has a card the first scan could not have seen.
+        self.the_tree()
+        first = self.stop().json()
+        self.card("t_new", "running", session=self.SESSION, created=time.time() + 1)
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+        self.assertEqual(self.stopped_ids(second), ["t_new"])
+        self.assertEqual(self.status("t_new"), "archived")
+        self.assertNotIn("t_new", self.stopped_ids(first))
+
+    def test_a_card_filed_in_the_same_second_the_first_stop_began_gets_a_fresh_stop(self):
+        # Hermes stamps created_at in whole seconds, so a card filed just
+        # after the first scan began can carry a stamp below it. It is open,
+        # and an open card after a complete stop is new: a fresh stop.
+        import math
+
+        self.the_tree()
+        first_stamp = math.floor(time.time())
+        self.stop()
+        self.card("t_same_second", "running", session=self.SESSION, created=first_stamp)
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+        self.assertEqual(self.stopped_ids(second), ["t_same_second"])
+
+    def test_a_done_card_filed_just_before_the_first_stop_still_joins(self):
+        # As verify_card_stop.py runs it against real Hermes: an earlier
+        # answer's card, done, filed in the first stop's own second. It is
+        # not open, so a second stop at once joins the first.
+        self.card("t_earlier", "done", session=self.SESSION, created=time.time())
+        first = self.stop().json()
+        second = self.stop().json()
+        self.assertTrue(second.get("joined"), second)
+        self.assertEqual(second["settled"], first["settled"])
+
+    def test_concurrent_stops_for_one_conversation_scan_once_and_answer_alike(self):
+        import threading as _threading
+
+        release, entered = _threading.Event(), _threading.Event()
+        calls = []
+
+        def run(deadline=None):
+            calls.append(1)
+            entered.set()
+            release.wait(5)
+            return {"session_id": self.SESSION, "stopped": [{"id": "t_1"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        a = _threading.Thread(target=caller, args=("a",))
+        a.start()
+        self.assertTrue(entered.wait(5))
+        b = _threading.Thread(target=caller, args=("b",))
+        b.start()
+        time.sleep(0.2)
+        release.set()
+        a.join(5)
+        b.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["a"]["stopped"], out["b"]["stopped"])
+        self.assertNotIn("joined", out["a"])
+        self.assertTrue(out["b"]["joined"])
+
+    def test_a_partial_first_stop_is_never_reused(self):
+        # A card archived mid-claim (unresolved) may still get a worker: the
+        # second stop runs afresh rather than repeating a partial answer.
+        self.card("t_claimed", "running", session=self.SESSION, created=time.time() - 10)
+        first = self.stop().json()
+        self.assertEqual([c["id"] for c in first["unresolved"]], ["t_claimed"])
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+
+    def test_joining_a_running_stop_rescans_when_a_card_was_filed_since(self):
+        import threading as _threading
+
+        release, entered = _threading.Event(), _threading.Event()
+        calls = []
+
+        def run(deadline=None):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+            return {"session_id": self.SESSION, "stopped": [{"id": f"t_{len(calls)}"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        with patch.object(session_kv_server, "_card_stop_tree_has_open_card", lambda *a: True):
+            a = _threading.Thread(target=caller, args=("a",))
+            a.start()
+            self.assertTrue(entered.wait(5))
+            b = _threading.Thread(target=caller, args=("b",))
+            b.start()
+            time.sleep(0.2)
+            release.set()
+            a.join(5)
+            b.join(5)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("joined", out["b"])
+
+    def test_a_join_and_its_own_stop_share_one_deadline(self):
+        # A call that joins a running stop whose answer can't be reused stops
+        # for itself on what is left of its own deadline, not a fresh one, so
+        # the whole call stays inside CARD_STOP_JOIN_WORST_CASE_S.
+        import threading as _threading
+
+        clock = [1000.0]
+        release, entered = _threading.Event(), _threading.Event()
+        deadlines = []
+
+        def run(deadline=None):
+            deadlines.append(deadline)
+            if len(deadlines) == 1:
+                entered.set()
+                release.wait(5)
+                return {"session_id": self.SESSION, "stopped": [], "unresolved": [{"id": "t_1"}]}
+            return {"session_id": self.SESSION, "stopped": [{"id": "t_1"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        with patch.object(session_kv_server, "_card_stop_clock", lambda: clock[0]):
+            a = _threading.Thread(target=caller, args=("a",))
+            a.start()
+            self.assertTrue(entered.wait(5))
+            clock[0] = 1005.0
+            b = _threading.Thread(target=caller, args=("b",))
+            b.start()
+            time.sleep(0.2)
+            clock[0] = 1015.0
+            release.set()
+            a.join(5)
+            b.join(5)
+        deadline = session_kv_server.CARD_STOP_DEADLINE_S
+        self.assertEqual(deadlines, [1000.0 + deadline, 1005.0 + deadline])
+        self.assertNotIn("joined", out["b"])
+
+    def test_a_joined_stop_answers_inside_the_bridges_timeout(self):
+        # The bridge's POST bound, DefaultCardStopTimeout in
+        # a2a/hermes-bridge/cardstop.go (35 s), must cover a joined stop.
+        self.assertLess(session_kv_server.CARD_STOP_JOIN_WORST_CASE_S, 35.0)
+
+    def test_a_truncated_tree_read_counts_as_a_new_card(self):
+        self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
+        truncated = session_kv_server._CardTree({}, [], True)
+        with patch.object(session_kv_server, "_collect_card_tree", lambda *a, **k: truncated):
+            self.assertTrue(session_kv_server._card_stop_tree_has_open_card(self.SESSION, self.CONVERSATION))
+
+    def test_another_conversation_never_joins(self):
+        calls = []
+
+        def run(deadline=None):
+            calls.append(1)
+            return {"stopped": []}
+
+        session_kv_server._card_stop_single_flight(self.SESSION, "slack:C1/1", run)
+        session_kv_server._card_stop_single_flight(self.SESSION, "slack:C1/2", run)
+        self.assertEqual(len(calls), 2)
 
     def test_the_set_is_capped_and_says_so(self):
         import sqlite3
@@ -12059,6 +12650,21 @@ class TestBoardAction(unittest.TestCase):
     def act(self, action, tasks, by="Jayanti"):
         return self.client.post("/v1/board/actions", json={"action": action, "tasks": tasks, "by": by})
 
+    def test_a_dial_action_is_the_dials_and_touches_no_card(self):
+        seen = []
+
+        def handle(action, payload):
+            seen.append((action, payload.get("user"), payload.get("level")))
+            return {"action": action, "ok": True, "message": "Set to Explain."}
+
+        self.card("t_a", "blocked")
+        with patch.object(session_kv_server.dial_state, "handle", handle):
+            response = self.client.post("/v1/board/actions", json={"action": "dial.level", "user": "U0ADMIN01", "level": "explain"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"action": "dial.level", "ok": True, "message": "Set to Explain."})
+        self.assertEqual(seen, [("dial.level", "U0ADMIN01", "explain")])
+        self.assertEqual((self.calls, self.status("t_a")), ([], "blocked"))
+
     def test_retry_unblocks_a_blocked_card(self):
         self.card("t_a", "blocked", "Investigate payments-api")
         response = self.act("retry", ["t_a"])
@@ -12394,6 +13000,26 @@ class TestDriftBacklog(unittest.TestCase):
         self.addCleanup(enabled.stop)
         self.addCleanup(off.stop)
 
+    def test_the_digest_takes_a_configured_home_ahead_of_a_learned_one(self):
+        # Slack's home on the CR, Chat's only learned: the digest goes to Slack.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        with open(os.path.join(directory, chat_notify.GCHAT_HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write("spaces/AAA\n")
+        with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write("")
+        self._burst()
+        sent = []
+        with patch.object(chat_notify, "HOME_FILE_DIR", directory), \
+             patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "slack",
+                                     chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack"}), \
+             patch.object(session_kv_server, "MANAGED_CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+             patch.object(session_kv_server, "CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+             patch.object(session_kv_server, "_send_drift_backlog_digest",
+                          side_effect=lambda platform, _message: sent.append(platform) or True):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual(sent, ["slack"])
+
     def test_one_digest_names_the_count_and_the_principals(self):
         self._chat()
         for i in range(7):
@@ -12467,17 +13093,16 @@ class TestDriftBacklog(unittest.TestCase):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         stamp.assert_called_once_with("t_digest1", "drift", "")
 
-    def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
+    def test_a_next_install_with_no_armed_route_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
-        the gateway holding Slack with no home channel. The operator renders
-        both Hermes platforms off and `A2A_NOTIFY_CONVERSATIONS` without
-        `A2A_NOTIFY_PLATFORM`, which it sets only with a home channel."""
+        both Hermes platforms off, and no route armed on the gateway, so
+        neither notify variable is rendered. An armed route with no home
+        channel is not headless: it takes the home posts for the digest."""
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        for key in PLATFORM_SIGNAL_KEYS + (chat_notify.NOTIFY_PLATFORM_ENV,):
+        for key in PLATFORM_SIGNAL_KEYS + (chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV):
             os.environ.pop(key, None)
-        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         managed = os.path.join(tmp.name, "config.yaml")
@@ -13897,6 +14522,62 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
             self.assertIsNone(os.environ.get(self.LIMIT))
 
 
+class TestSessionEvalRun(unittest.TestCase):
+    """The session's eval run tag (deploy/docker/patches/eval_run_tag.py): first write wins, read through compression."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS session_eval_runs")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_no_table_reads_as_no_tag(self):
+        self.assertEqual(self.client.get("/v1/sessions/ev-none/eval-run").status_code, 404)
+
+    def test_the_first_write_wins(self):
+        first = self.client.put("/v1/sessions/ev-1/eval-run", json={"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put("/v1/sessions/ev-1/eval-run", json={"eval_run": "devops-bench-bb/case-b/2"})
+        self.assertEqual(second.json(), {"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(self.client.get("/v1/sessions/ev-1/eval-run").json(), {"eval_run": "devops-bench-aa/case-a/1"})
+
+    def test_a_malformed_tag_is_refused(self):
+        for bad in ("", "no-slashes", "a/b/c", "a/b/1\nX: y", 7, None):
+            response = self.client.put("/v1/sessions/ev-bad/eval-run", json={"eval_run": bad})
+            self.assertEqual(response.status_code, 400, bad)
+        self.assertEqual(self.client.get("/v1/sessions/ev-bad/eval-run").status_code, 404)
+
+    def test_the_session_metadata_row_is_not_touched(self):
+        self.client.put("/v1/sessions/ev-meta/eval-run", json={"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(session_kv_server._session_metadata("ev-meta"), {})
+
+    def test_a_compressed_child_reads_its_parents_tag(self):
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('ev-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('ev-child', 'ev-root', NULL);
+                INSERT INTO sessions VALUES ('ev-other', 'ev-lone', NULL);
+                INSERT INTO sessions VALUES ('ev-lone', NULL, 'user_exit');
+                """
+            )
+        self.client.put("/v1/sessions/ev-root/eval-run", json={"eval_run": "devops-bench-aa/case-a/3"})
+        self.client.put("/v1/sessions/ev-lone/eval-run", json={"eval_run": "devops-bench-aa/case-b/1"})
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            child = self.client.get("/v1/sessions/ev-child/eval-run")
+            self.assertEqual(child.json(), {"eval_run": "devops-bench-aa/case-a/3"})
+            # A parent that did not end in compression is another conversation.
+            self.assertEqual(self.client.get("/v1/sessions/ev-other/eval-run").status_code, 404)
+
+
 class TestProposalOrigin(unittest.TestCase):
     """The origin record, the per-job origin table and the proposals ledger: docs/designs/proposal-origin.md §2.1-§2.2."""
 
@@ -14134,6 +14815,7 @@ class TestProposalOrigin(unittest.TestCase):
                        "followup_state", "followup_attempts", "followup_detail"):
             self.assertIn(column, row)
         self.assertIsNone(row["outcome"])
+        self.assertIsNone(row["environment"])
 
     def test_post_merge_record_leaves_project_empty_for_an_unknown_or_ambiguous_cluster(self):
         import sqlite3
@@ -14209,7 +14891,8 @@ class TestProposalOrigin(unittest.TestCase):
         )
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
-        self.assertEqual(set(plugin.POST_MERGE_KINDS), set(session_kv_server.POST_MERGE_KINDS))
+        self.assertEqual(plugin.post_merge_kinds(), frozenset(session_kv_server.POST_MERGE_KINDS))
+        self.assertIn("no-pdb", session_kv_server.POST_MERGE_KINDS)
         self.assertEqual(plugin.POST_MERGE_PATH, "/v1/post-merge/records")
 
     def test_post_merge_record_refuses_what_is_not_a_known_fix_pull_request(self):

@@ -175,6 +175,7 @@ func agentProfileSpecPaths() []string {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "cluster", Required: true}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Harness.Type = agentv1alpha1.AgentProfileHarnessClaudeCode
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage
@@ -436,7 +437,7 @@ func TestAForeignServiceAccountIsNotAdopted(t *testing.T) {
 	if sa.Annotations[agentProfileUIDAnnotation] != "" {
 		t.Errorf("the foreign ServiceAccount was adopted: %v", sa.Annotations)
 	}
-	bound, err := boundAgentProfiles(context.Background(), h.c, agent)
+	bound, err := boundAgentProfiles(context.Background(), h.c, agent, false)
 	if err != nil || len(bound) != 0 {
 		t.Errorf("boundAgentProfiles = %v, %v; want the profile left out of the map", bound, err)
 	}
@@ -684,13 +685,19 @@ type fakeDirectory struct {
 	// it fail as a connection opened under an older map would.
 	durables        map[string][]profileDurable
 	durablesRefused bool
+	// durablesRechecking makes it answer as a durable held back for a
+	// re-check does (errDurableAwaitingRecheck).
+	durablesRechecking bool
 }
 
 func (f *fakeDirectory) forget(namespace string) { f.forgets = append(f.forgets, namespace) }
 
-func (f *fakeDirectory) SyncDurables(_ context.Context, _ *agentv1alpha1.PlatformAgent, profile string, want []profileDurable) error {
+func (f *fakeDirectory) SyncDurables(_ context.Context, _ *agentv1alpha1.PlatformAgent, profile string, want []profileDurable, _ []string) error {
 	if f.down || f.durablesRefused {
 		return errors.New("permissions violation")
+	}
+	if f.durablesRechecking {
+		return errors.Join(errors.New("durable profile-"+profile+"-read-top"), errDurableAwaitingRecheck)
 	}
 	if f.durables == nil {
 		f.durables = map[string][]profileDurable{}
@@ -789,32 +796,6 @@ func condition(p *agentv1alpha1.AgentProfile, typ string) metav1.Condition {
 		return *c
 	}
 	return metav1.Condition{}
-}
-
-// On a today install the same CR renders nothing: no ServiceAccount, no card,
-// and conditions that say why.
-func TestAnAgentProfileOnATodayInstallRendersNothing(t *testing.T) {
-	withOperatorBusPrincipal(t)
-	agent := a2aTestAgent()
-	agent.Spec.Mode = ptr.To("today")
-	p := testAgentProfile(agent.Namespace, "auditor")
-	h := newProfileHarness(t, agent, &p)
-
-	h.reconcile(agent.Namespace, "auditor")
-
-	if _, ok := h.serviceAccount(profileNamespaceName(agent), "agentprofile-auditor-read"); ok {
-		t.Error("a today install created the profile's ServiceAccount")
-	}
-	if len(h.dir.publishes) != 0 {
-		t.Errorf("a today install published %v", h.dir.publishes)
-	}
-	got := h.profile(agent.Namespace, "auditor")
-	if c := condition(got, agentv1alpha1.AgentProfileConditionIdentityReady); c.Status != metav1.ConditionFalse || c.Reason != reasonAgentProfileNotNext {
-		t.Errorf("IdentityReady = %s/%s, want False/%s", c.Status, c.Reason, reasonAgentProfileNotNext)
-	}
-	if slices.Contains(got.Finalizers, agentProfileFinalizer) {
-		t.Error("a today install holds the profile with a finalizer it will never need")
-	}
 }
 
 // On a next install: the ServiceAccount (owned, no automount), the card, the
@@ -961,36 +942,6 @@ func TestARefusedProfileRendersNothingAndWithdrawsItsCard(t *testing.T) {
 	}
 }
 
-// A flip to today removes the operator-created ServiceAccount and nothing it
-// does not own.
-func TestAFlipToTodayRemovesTheProfilesServiceAccount(t *testing.T) {
-	withOperatorBusPrincipal(t)
-	agent := a2aTestAgent()
-	p := testAgentProfile(agent.Namespace, "auditor")
-	h := newProfileHarness(t, agent, &p)
-	h.reconcile(agent.Namespace, "auditor")
-	if _, ok := h.serviceAccount(profileNamespaceName(agent), "agentprofile-auditor-read"); !ok {
-		t.Fatal("precondition: no ServiceAccount on next")
-	}
-
-	var live agentv1alpha1.PlatformAgent
-	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &live); err != nil {
-		t.Fatal(err)
-	}
-	live.Spec.Mode = ptr.To("today")
-	if err := h.c.Update(context.Background(), &live); err != nil {
-		t.Fatal(err)
-	}
-	h.reconcile(agent.Namespace, "auditor")
-	if _, ok := h.serviceAccount(profileNamespaceName(agent), "agentprofile-auditor-read"); ok {
-		t.Error("the profile's ServiceAccount survived a flip to today")
-	}
-	// today tears the bus down, so the connection held for it goes too.
-	if !slices.Contains(h.dir.forgets, agent.Namespace) {
-		t.Errorf("the bus connection was kept after a flip to today: forgets = %v", h.dir.forgets)
-	}
-}
-
 // With no PlatformAgent, or two, a profile cannot bind and renders nothing.
 func TestAProfileWithNoSinglePlatformAgentRendersNothing(t *testing.T) {
 	withOperatorBusPrincipal(t)
@@ -1015,7 +966,7 @@ func TestAProfileWithNoSinglePlatformAgentRendersNothing(t *testing.T) {
 	if entries := renderedMapEntries(t, a1, nil); len(entries) == 0 {
 		t.Fatal("precondition")
 	}
-	profiles, err := boundAgentProfiles(context.Background(), h2.c, a1)
+	profiles, err := boundAgentProfiles(context.Background(), h2.c, a1, false)
 	if err != nil || len(profiles) != 0 {
 		t.Errorf("boundAgentProfiles with two agents = %v, %v; want none", profiles, err)
 	}
@@ -1078,7 +1029,7 @@ func TestEnsureServiceAccountSettlesACreateCollisionUncached(t *testing.T) {
 			},
 		})
 		r := &AgentProfileReconciler{Client: cached, APIReader: base, Scheme: scheme, Cards: newFakeDirectory()}
-		err := r.ensureServiceAccount(context.Background(), &p, profileNamespaceName(agent), agentProfileTierIdentity{tier: agentv1alpha1.AgentProfileTierRead, serviceAccount: landed.Name})
+		err := r.ensureServiceAccount(context.Background(), &p, profileNamespaceName(agent), agentProfileTierIdentity{tier: agentv1alpha1.AgentProfileTierRead, serviceAccount: landed.Name}, tierModeInteractive)
 		switch {
 		case !created:
 			t.Error("the Create path was never reached; the test is not exercising the race")
@@ -1235,42 +1186,6 @@ func TestAMalformedProfileIsReportedAsInvalid(t *testing.T) {
 	}
 }
 
-// Under version skew the bus is frozen, not torn down: a deleting profile
-// still gets its tombstone and its finalizer released.
-func TestAProfileDeletedUnderVersionSkewIsStillFinalized(t *testing.T) {
-	withOperatorBusPrincipal(t)
-	agent := a2aTestAgent()
-	p := testAgentProfile(agent.Namespace, "auditor")
-	h := newProfileHarness(t, agent, &p)
-	h.reconcile(agent.Namespace, "auditor")
-
-	var live agentv1alpha1.PlatformAgent
-	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &live); err != nil {
-		t.Fatal(err)
-	}
-	live.Spec.Mode = ptr.To("later")
-	if err := h.c.Update(context.Background(), &live); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "auditor")); err != nil {
-		t.Fatal(err)
-	}
-	h.dir.forgets = nil
-	h.reconcile(agent.Namespace, "auditor")
-	if e := h.dir.entries["auditor"]; e.kind != a2aKindAgentClosed {
-		t.Errorf("no tombstone under skew: %+v", e)
-	}
-	// The frozen bus is still running and the tombstone needs it, so the
-	// connection is kept; dropping it here redials on every retry.
-	if len(h.dir.forgets) != 0 {
-		t.Errorf("the bus connection was dropped under skew: %v", h.dir.forgets)
-	}
-	var gone agentv1alpha1.AgentProfile
-	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, &gone); !apierrors.IsNotFound(err) {
-		t.Errorf("the profile is still held under skew: %v", err)
-	}
-}
-
 // With no profile left in a namespace, an event there enqueues the
 // namespace-only request that drops the bus connection.
 func TestAnEmptyNamespaceEnqueuesTheConnectionDrop(t *testing.T) {
@@ -1396,24 +1311,12 @@ func TestEnabledAgentProfileNamesAndPodEnvWiring(t *testing.T) {
 		t.Errorf("heldEnabledProfiles = %v, %v; want [tse], nil", held, err)
 	}
 
-	// 2. Delete the `tse` AgentProfile from the fake client, then verify both hold branches
-	// (mode skew and agentProfilesUnreadable) preserve KUBE_AGENTS_ENABLED_PROFILES=tse on
-	// the live gateway Deployment before the healthy removal pass clears it.
+	// 2. Delete the `tse` AgentProfile from the fake client, then verify the hold branch
+	// (agentProfilesUnreadable) preserves KUBE_AGENTS_ENABLED_PROFILES=tse on the live
+	// gateway Deployment before the healthy removal pass clears it.
 	if err := h.c.Delete(context.Background(), &tse); err != nil {
 		t.Fatalf("deleting tse AgentProfile: %v", err)
 	}
-	skewedAgent := agent.DeepCopy()
-	skewedAgent.Spec.Mode = ptr.To("quantum")
-	if err := reconciler.reconcileWorkload(context.Background(), skewedAgent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
-		t.Fatalf("reconcileWorkload under mode skew: %v", err)
-	}
-	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
-		t.Fatalf("getting applied gateway Deployment after skew reconcile: %v", err)
-	}
-	if got, _ := envValue(containerNamed(t, &liveDep, appNamePlatformAgent), enabledProfilesEnvVar); got != "tse" {
-		t.Errorf("gateway Deployment %s after mode-skew reconcileWorkload = %q, want %q", enabledProfilesEnvVar, got, "tse")
-	}
-
 	reconciler.agentProfilesUnreadable = true
 	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
 		t.Fatalf("reconcileWorkload under agentProfilesUnreadable: %v", err)
@@ -1720,6 +1623,97 @@ func TestAFailedDurableSyncDropsTheBusConnection(t *testing.T) {
 	h.reconcile(agent.Namespace, "auditor")
 	if got := h.dir.durables["auditor"]; len(got) != 2 {
 		t.Errorf("after the reconnect the durables = %+v, want read top and child", got)
+	}
+}
+
+// A durable held back for a re-check keeps the bus connection, which
+// answered: only a refused sync drops it (#6283). The pass comes back on the
+// bus retry.
+func TestADurableReCheckKeepsTheBusConnection(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.dir.durablesRechecking = true
+	res := h.reconcile(agent.Namespace, "auditor")
+	if slices.Contains(h.dir.forgets, agent.Namespace) {
+		t.Errorf("a durable re-check dropped the connection: forgets = %v", h.dir.forgets)
+	}
+	if res.RequeueAfter != agentProfileBusRetry {
+		t.Errorf("RequeueAfter %s, want the bus retry %s", res.RequeueAfter, agentProfileBusRetry)
+	}
+}
+
+// status.durableTiers is written by a pass whose durable sync succeeded,
+// and left as it was by one the bus refused, as during a bus migration's
+// write freeze: a refused pass must not erase the record that the durables
+// existed (#6283).
+func TestDurableTiersAreWrittenOnlyBySuccessfulSync(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Fatalf("after a successful sync durableTiers = %v, want [read]", got)
+	}
+	h.dir.durablesRefused = true
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Errorf("after a refused sync durableTiers = %v, want [read] kept", got)
+	}
+}
+
+// A profile reconciled before the upgrade has every compared status field
+// already current, so a status write that skipped on "nothing changed" would
+// never record durableTiers: it is part of the comparison (#6283).
+func TestDurableTiersAreWrittenOnAnOtherwiseUnchangedStatus(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	// As an older operator left it: everything else current, no record.
+	live := h.profile(agent.Namespace, "auditor")
+	live.Status.DurableTiers = nil
+	if err := h.c.Status().Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Errorf("durableTiers = %v after a pass that changed nothing else, want [read]", got)
+	}
+}
+
+// A card withdrawn with the dispatcher on deletes the profile's durables, so
+// it clears durableTiers: a profile that recovers gets its durables at once,
+// not after a re-check of durables the operator deleted itself (#6283).
+func TestAWithdrawnCardClearsDurableTiers(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Fatalf("precondition: durableTiers = %v", got)
+	}
+	// Refused: an identity naming the session ServiceAccount.
+	live := h.profile(agent.Namespace, "auditor")
+	live.Spec.Identity.ServiceAccountName = a2aSessionServiceAccountName(agent)
+	if err := h.c.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	got := h.profile(agent.Namespace, "auditor")
+	if c := condition(got, agentv1alpha1.AgentProfileConditionCardPublished); c.Reason != reasonAgentProfileIdentityMissing {
+		t.Fatalf("card reason = %q, want %q (the withdraw path)", c.Reason, reasonAgentProfileIdentityMissing)
+	}
+	if len(got.Status.DurableTiers) != 0 {
+		t.Errorf("durableTiers = %v after the withdraw deleted the durables, want none", got.Status.DurableTiers)
 	}
 }
 

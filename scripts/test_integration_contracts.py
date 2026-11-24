@@ -82,9 +82,6 @@ RELEASE_STAGE_WATCHED_WORKFLOWS = (
 # substrings have to select, so a rename of any of them reds the test.
 RELEASE_STAGE_COMPENSATION_JOBS = (
     "Step 5 - Tear Down RC Environment",
-    "Today mode (non-gating) - Step 6 - Provision RC Environment",
-    "Today mode (non-gating) - Step 7 - Run E2E Tests",
-    "Today mode (non-gating) - Step 8 - Tear Down RC Environment",
     "Step 3b - Roll Back to the Previous GA and Forward Again",
     "Step 5b - Withdraw an Unsettled Nomination",
     "Step 7 - Tear Down Nightly Environment",
@@ -226,6 +223,18 @@ class SpecToolRegistryTest(unittest.TestCase):
         ("gke", "list_k8s_events"),
         ("gke", "get_k8s_logs"),
         ("gke", "get_k8s_rollout_status"),
+        # list-gitops-repos: read-only GKE MCP discovery tools forbidden on a
+        # managed-repo inventory ask (documented in gke-basics/references/mcp-usage.md).
+        ("gke", "check_k8s_auth"),
+        ("gke", "get_cluster"),
+        ("gke", "get_k8s_cluster_info"),
+        ("gke", "get_k8s_version"),
+        ("gke", "get_node_pool"),
+        ("gke", "get_operation"),
+        ("gke", "list_clusters"),
+        ("gke", "list_k8s_api_resources"),
+        ("gke", "list_node_pools"),
+        ("gke", "list_operations"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",
@@ -283,7 +292,9 @@ class SpecToolRegistryTest(unittest.TestCase):
     HARNESS_ENTRY_MODULES = {
         "harness_stop_sent": "bench/kube_agents_bench/stop_hook.py",
         "harness_cards_stopped": "bench/kube_agents_bench/stop_hook.py",
+        "harness_cancel_reported": "bench/kube_agents_bench/stop_hook.py",
         "harness_pushed_report_stored": "bench/kube_agents_bench/pushed_report.py",
+        "harness_session_cap_queued": "bench/kube_agents_bench/session_cap.py",
     }
     HARNESS_ENTRIES = frozenset(HARNESS_ENTRY_MODULES)
     HARNESS = "bench/kube_agents_bench/harness.py"
@@ -836,8 +847,8 @@ class WorkflowNameJoinTest(unittest.TestCase):
     def test_the_release_stage_notifier_knows_every_compensation_job(self):
         """The jobs API carries neither `if:` nor `continue-on-error`, so the
         notifier tells a compensation job (a withdrawal that runs because the
-        eval did not settle, a teardown, a rollback leg, a non-gating next-mode
-        leg) from a gating stage by its name. The markers have to select
+        eval did not settle, a teardown, a rollback leg) from a gating stage by
+        its name. The markers have to select
         exactly the jobs named above, and every job the workflow files mark as
         running after a failure or without failing the run has to be among
         them, or a renamed leg is named as the stage and holds its issue open

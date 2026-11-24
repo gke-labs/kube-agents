@@ -117,7 +117,11 @@ Sources:
               last segment. nightly.py files a run as the writers part only
               under DEFAULT_NIGHTLY_WRITERS_JOB, so a prefix ending in any
               other job is collected but reported as the main part, and is
-              warned about.
+              warned about. Among --nightly-prefix and the part flags, each
+              job and each prefix is listed once, under the first flag that
+              names it, --nightly-prefix first: a part flag naming a job or
+              a prefix an earlier flag already lists is warned about and not
+              read (a trailing `/` does not make a prefix another one).
   --nightly-main-b-prefix  the same, for the periodic that runs the
               main part's main-b shard (EVAL_NIGHTLY_PART=main-b; the main
               job runs main-a). Given without a value it is
@@ -280,6 +284,17 @@ DEFAULT_NIGHTLY_WRITERS_C_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITER
 # archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
 DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
+# The Slack lane's nightly (oss-test-infra: ci-kube-agents-eval-nightly-slack)
+# writes the night's Slack overhead (hack/slack-lane/overhead.py) into its
+# artifacts; slack_overheads_from_gcs reads the newest SLACK_OVERHEAD_NIGHTS of
+# them into data.json's slack_overhead (SCHEMA.md), which nightly.py turns into
+# each case's estimated end-to-end Slack time (slack_estimate.py). Read only
+# with --slack-lane-prefix, and carried forward from --merge-with's file.
+SLACK_LANE_JOB = "ci-kube-agents-eval-nightly-slack"
+SLACK_LANE_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{SLACK_LANE_JOB}/"
+SLACK_OVERHEAD_FILE = "artifacts/slack-lane/slack-overhead.json"
+SLACK_OVERHEAD_NIGHTS = 14
+SLACK_OVERHEAD_KEYS = ("delivery_lag_s", "post_s", "first_ack_p50_s", "first_ack_p95_s")
 # Where Prow's Spyglass shows a build directory (links.py).
 SPYGLASS_VIEW = links.SPYGLASS_VIEW
 # What `gcloud storage ls` says about a prefix that exists but holds nothing
@@ -323,6 +338,10 @@ INDEX_POINTER_SUFFIX = ".txt"
 # does not is quoted in the warning.
 GS_SCHEME = links.GS_SCHEME
 POINTER_EXCERPT_CHARS = 80
+
+# What separates the segments of a gs:// path. A prefix names one place in the
+# bucket with or without a trailing one.
+GS_PATH_SEPARATOR = "/"
 
 # Every bucket read is `gcloud storage ls` or `gcloud storage cat` through
 # this binary (--gcloud overrides it; the tests point it at a fake).
@@ -572,7 +591,7 @@ _FINAL_VERDICT = re.compile(
 # The release-candidate banner hack/ci-eval-rc.sh prints once per run, between
 # two rules of `=`:
 #   🏷️ RELEASE CANDIDATE EVAL
-#   Candidate:   staging_2609092307_5b5ad10 (5b5ad10163cf10c73871b279518c7165c098bec9)
+#   Candidate:   staging_2609092307_0707070 (0707070707070707070707070707070707070707)
 #   Tier:        nightly
 #   Verdict:     GREEN (GREEN promotes this candidate to staging)
 #   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>
@@ -1689,6 +1708,38 @@ def _gcs_reader(base: str, gcloud: str):
     return reader
 
 
+def slack_overheads_from_gcs(gcloud: str = DEFAULT_GCLOUD, prefix: str = SLACK_LANE_PREFIX,
+                             limit: int = SLACK_OVERHEAD_NIGHTS, known: frozenset = frozenset()) -> list[dict]:
+    """The Slack lane's recorded overhead per build, newest first: ``{build_id, date, ...}``
+    with SLACK_OVERHEAD_KEYS. A build with no overhead file, one that records an error, or
+    no lane at all yields nothing, so the pages stay quiet until the lane runs. A build in
+    ``known`` (already in the prior data.json) is not read again."""
+    listing = _gcloud_storage(["ls", prefix], gcloud)
+    out = []
+    newest = sorted(_build_dirs(listing or ""), key=lambda b: int(b[0]), reverse=True)[:limit]
+    for build_id, base in [(b, base) for b, base in newest if b not in known]:
+        read = _gcs_reader(base, gcloud)
+        started, text = _started_at(read("started.json")), read(SLACK_OVERHEAD_FILE)
+        try:
+            doc = json.loads(text) if started and text else None
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and "error" not in doc:
+            # Dated as the nightlies are (nightly.night_day), so it meets its own night.
+            day = nightly.night_day(started)
+            out.append(_slack_overhead_entry(build_id, day.isoformat(), doc))
+    return out
+
+
+def _slack_overhead_entry(build_id: str, date, doc: dict) -> dict:
+    """One slack_overhead entry, each SLACK_OVERHEAD_KEYS value a finite number or None:
+    json.loads accepts NaN and Infinity, and json.dumps would write them into the inlined
+    page, where JSON.parse refuses them (trend._mean's rule)."""
+    def finite(value):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+    return {"build_id": build_id, "date": date, **{k: finite(doc.get(k)) for k in SLACK_OVERHEAD_KEYS}}
+
+
 def records_location(base: str) -> bool:
     """Whether a run read from `base` carries `gcs_base`: only for a bucket
     Deck cannot read (PRIVATE_LOG_BUCKETS); elsewhere Spyglass still renders
@@ -1966,6 +2017,11 @@ def _build_dirs_in_listing(
 def _periodic_job(prefix: str) -> str:
     """A periodic's job name: its log prefix's last segment."""
     return prefix.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _prefix_key(prefix: str) -> str:
+    """What two spellings of one log prefix share: it without a trailing separator."""
+    return prefix.rstrip(GS_PATH_SEPARATOR)
 
 
 def runs_from_periodic(
@@ -2478,6 +2534,7 @@ def collect(
     gitlab_nightly_prefix: str | None = None,
     lane_globs: dict[str, list[str]] | None = None,
     lane_nightly_prefixes: dict[str, list[str]] | None = None,
+    slack_lane_prefix: str | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -2537,27 +2594,39 @@ def collect(
         ["--nightly-writers-b-prefix", nightly_writers_b_prefix, writers_b_job, DEFAULT_NIGHTLY_WRITERS_B_JOB],
         ["--nightly-writers-c-prefix", nightly_writers_c_prefix, writers_c_job, DEFAULT_NIGHTLY_WRITERS_C_JOB],
     ]
-    for flag, prefix, job, expected in part_sources:
-        if job != expected:
-            # nightly.py tells the part by this job name alone.
-            part = nightly.night_part({"job": job})
-            print(
-                f"warning: {flag} {prefix} names job {job}, not {expected};"
-                f" the report files its runs as the {part} part",
-                file=sys.stderr,
-            )
     # A part flag naming a job an earlier flag already lists (the main
     # job, or the writers job under --nightly-main-b-prefix) would list it
     # twice and take that job's runs out of its own watermark: list each
     # job once, under the first flag that names it, and drop the later one.
+    # --nightly-job renames the main flag's job, so a part flag can name the
+    # main flag's prefix under another job: list that prefix once as well,
+    # or its runs are read twice and filed under the part flag's job. Only
+    # the main flag can collide this way: a part flag's job is its prefix's
+    # last segment, so two part flags naming one prefix name one job. The
+    # runs of a flag dropped for its prefix are the main flag's, under the
+    # main flag's job, so that flag gets no warning about the part its
+    # runs file as.
     main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
+    main_prefix_key = _prefix_key(nightly_prefix) if nightly_prefix else None
     listed_by: dict[str, str] = {main_job: "--nightly-prefix"} if main_job is not None else {}
     for source in part_sources:
         flag, prefix, job, default = source
         if not prefix:
             continue
+        names_main_prefix = job not in listed_by and _prefix_key(prefix) == main_prefix_key
+        if job != default and not names_main_prefix:
+            # nightly.py tells the part by this job name alone.
+            part = nightly.night_part({"job": job})
+            print(
+                f"warning: {flag} {prefix} names job {job}, not {default};"
+                f" the report files its runs as the {part} part",
+                file=sys.stderr,
+            )
         if job in listed_by:
             print(f"warning: {flag} names job {job}, as {listed_by[job]} does; listing it once", file=sys.stderr)
+            source[1], source[2] = None, default
+        elif names_main_prefix:
+            print(f"warning: {flag} names prefix {prefix}, as --nightly-prefix does; listing it once", file=sys.stderr)
             source[1], source[2] = None, default
         else:
             listed_by[job] = flag
@@ -2582,6 +2651,7 @@ def collect(
     # their own schedules, so one watermark per tier would skip the slower
     # job's builds once the faster one is past them.
     lane_after: dict[tuple[str, str | None, bool], int | None] = {}
+    prior_data: dict | None = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gcloud)
         if prior_data is not None:
@@ -2870,6 +2940,15 @@ def collect(
         # Trimmed as well as read-bounded: without this the carried-forward
         # list grows without limit as the RC archive does.
         data["releases"] = sorted(by_id.values(), key=_release_sort_key, reverse=True)[:rc_limit]
+    # The Slack lane's overhead, newest first: this scan's read merged over the
+    # prior file's by build, so a failed read keeps what was there.
+    prior_overhead = (prior_data or {}).get("slack_overhead")
+    known = [_slack_overhead_entry(o["build_id"], o.get("date"), o) for o in prior_overhead if isinstance(o, dict)
+             and isinstance(o.get("build_id"), str) and o["build_id"].isdecimal()] if isinstance(prior_overhead, list) else []
+    fresh = slack_overheads_from_gcs(gcloud, slack_lane_prefix, known=frozenset(o["build_id"] for o in known)) if slack_lane_prefix else []
+    by_build = {o["build_id"]: o for o in known} | {o["build_id"]: o for o in fresh}
+    if by_build:
+        data["slack_overhead"] = sorted(by_build.values(), key=lambda o: int(o["build_id"]), reverse=True)[:SLACK_OVERHEAD_NIGHTS]
     return data
 
 
@@ -3026,6 +3105,16 @@ def main(argv: list[str] | None = None) -> int:
         " job, on a watermark of their own",
     )
     parser.add_argument(
+        "--slack-lane-prefix",
+        nargs="?",
+        const=SLACK_LANE_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also read the Slack lane's per-night overhead (slack-overhead.json) from this"
+        f" Prow log prefix into slack_overhead. Given without a value: {SLACK_LANE_PREFIX}."
+        " Omitted: none read, and --merge-with's list is carried forward",
+    )
+    parser.add_argument(
         "--nightly-writers-c-prefix",
         nargs="?",
         const=DEFAULT_NIGHTLY_WRITERS_C_PREFIX,
@@ -3162,6 +3251,7 @@ def main(argv: list[str] | None = None) -> int:
         gcloud=args.gcloud,
         gh=args.gh or None,
         merge_with=args.merge_with,
+        slack_lane_prefix=args.slack_lane_prefix,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
         index_prefix=args.index_prefix,

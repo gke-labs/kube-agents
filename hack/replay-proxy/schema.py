@@ -63,6 +63,13 @@ DIAG_MESSAGE_HASHES = "diag_message_hashes"
 DIAG_SETTINGS_HASH = "diag_settings_hash"
 ROLES = "roles"
 ANSWER_HASH = "answer_hash"
+# In record mode: replay_cache.stored_hash of the answer as it would be saved,
+# on every line with an answer, saved or not: the name of its alternate.
+STORED_ANSWER_HASH = "stored_answer_hash"
+# On a line the model answered (not a served one): the response's raw
+# finish_reason, null when it named none, so cut-off and filtered replies can be
+# counted from the lines.
+FINISH_REASON = "finish_reason"
 # Why replay would not have saved the answer; empty on a served line, whose
 # answer is a saved one and is never judged as a new one.
 UNSTORABLE = "unstorable"
@@ -95,6 +102,11 @@ UNSTORABLE_OBSERVE_TOO_LARGE = "observe_too_large"
 UNSTORABLE_UPSTREAM_INCOMPLETE = "upstream_incomplete"
 UNSTORABLE_CLIENT_DISCONNECTED = "client_disconnected"
 UNSTORABLE_NO_ANSWER = "no_answer"
+# The response names a finish_reason other than `stop` or `tool_calls`
+# (replay_proxy.STORABLE_FINISH_REASONS): cut off at the token limit
+# (`length`), filtered (`content_filter`), a reply the model did not finish.
+# A response naming none is stored, served as `stop`.
+UNSTORABLE_UNFINISHED = "unfinished_reply"
 UNSTORABLE_NO_MODEL_GROUP = "no_model_group_header"
 UNSTORABLE_OTHER_MODEL_GROUP = "answered_by_other_model_group"
 UNSTORABLE_FALLBACK = "fallback_attempted"
@@ -108,6 +120,15 @@ UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
 # Normalized, the answer still holds an identifier shape (a card, a pod, a
 # session) the request never bound, so it would be served as recorded.
 UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
+# The answer names a file the request's read_file `similar_files` listed, which
+# the key drops: served to a run whose list lacked it, it would act on a file
+# that run was never shown.
+UNSTORABLE_NAMES_DROPPED_FILE = "names_dropped_similar_file"
+# The answer talks about a queue or a slot (`queued`, `frees up`, `slot`, `in
+# use`) after a kanban_create result whose `queued` the key drops: served to a
+# run whose card had a free slot, it would tell the user of a wait that run
+# does not have.
+UNSTORABLE_TALKS_ABOUT_DROPPED_QUEUE = "talks_about_dropped_queue"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
@@ -134,10 +155,37 @@ SERVED = "served"
 SERVED_FROM = "served_from"
 # How a served answer matched: the exact key, or the answer-slot key.
 SERVED_VIA = "served_via"
+# On every request line: the eval run, case and repetition the request serves
+# (`<run>/<case>/<rep>`, from X-Kube-Agents-Eval-Run) and the agent that sent
+# it (`<profile>;<source>`, from X-Kube-Agents-Eval-Agent), as the agent's
+# eval_run_tag plugin set them; null when the request carried none or a
+# malformed one. Neither is forwarded upstream or read by the key.
+EVAL_RUN = "eval_run"
+EVAL_AGENT = "eval_agent"
 VIA_EXACT = "exact"
 VIA_ANSWER_SLOTS = "answer_slots"
-# In record mode: whether this request's answer was saved (false when the key
-# was already there, or the answer was unstorable).
+# On a served line: which of the key's saved answers was served (the
+# alternate's name, the STORED_ANSWER_HASH of the line that saved it; empty for the
+# older layout's single answer), and how
+# many answers the key had. Replay picks among a key's answers by a seeded weighted draw.
+SERVED_ALTERNATE = "served_alternate"
+ALTERNATES = "alternates"
+# On a served line: the key the answer was served from, its own FINGERPRINT on
+# an exact hit and the slot's key on an answer_slots hit; the key whose
+# answers SERVED_ALTERNATE and ALTERNATES count.
+SERVED_KEY = "served_key"
+# On a served line: the served answer's weight, how often graded runs
+# produced it (1 when the replay cache gave no count), and the sum over the
+# key's answers. Replay draws each answer in proportion to its weight, so over
+# many lookups an answer's share is about SERVED_WEIGHT / ALTERNATES_WEIGHT.
+SERVED_WEIGHT = "served_weight"
+ALTERNATES_WEIGHT = "alternates_weight"
+# On a served line: what seeded the draw (replay_proxy.SEED_EVAL_RUN, the
+# request's eval run tag, the key and the pod's count of that pair's lookups;
+# replay_proxy.SEED_TURN, the key and the pod's count of untagged lookups of it).
+SERVED_SEED = "served_seed"
+# In record mode: whether this request's answer was saved (false when the same
+# answer to the key was already saved, or the answer was unstorable).
 RECORDED = "recorded"
 # In record mode, when writing the cache failed: the exception's type name, or
 # RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
@@ -147,7 +195,9 @@ RECORD_ERROR_BUDGET = "budget_spent"
 # later request's history holds it (normalizer.answer_variant), and the same
 # pair for the last assistant message this request holds. A later request's
 # PRIOR_ANSWER equal to an earlier line's ANSWER_VARIANT says its conversation
-# went on from that very answer (hack/replay-proxy/run_attribution.py).
+# went on from that answer, up to what answer_variant renames. Diagnostic only:
+# nothing reads PRIOR_ANSWER now that run_attribution.py ties lines to runs by
+# card and eval run tag.
 ANSWER_VARIANT = "answer_variant"
 PRIOR_ANSWER = "prior_answer"
 # On a replay miss: the closest saved request and where this one differed.
@@ -167,6 +217,9 @@ MISS_SIGNATURE = "signature"
 MISS_REFUSED = "refused"
 REFUSED_VIA = "via"
 REFUSED_GUARD = "guard"
+# When the key had several saved answers and guards refused every one: how
+# many. REFUSED_GUARD is then the first one's guard.
+REFUSED_ALTERNATES = "alternates"
 # A slot held an answer no recording stored for its context.
 GUARD_ANSWER_NOT_RECORDED = "answer_not_recorded"
 # Through a slot, the saved answer names a value only an assistant message binds.
@@ -175,6 +228,10 @@ GUARD_VALUE_ONLY_IN_ANSWERS = "value_only_in_answers"
 GUARD_UNBOUND_PLACEHOLDER = "unbound_placeholder"
 # The saved answer is missing or not an answer.
 GUARD_UNREADABLE_ENTRY = "unreadable_entry"
+# The saved answer names a file this request's read_file `similar_files`
+# listed, which the key drops: the recording may have acted on that file not
+# being there (written it, reported it missing).
+GUARD_NAMES_DROPPED_FILE = "names_dropped_similar_file"
 # Where the first difference is when it is not a message.
 MISS_ROLE_SETTINGS = "settings"
 MISS_ROLE_NONE = "none"

@@ -61,11 +61,11 @@ not post (in a recorded conversation, a card that did not post is posted again o
 later tick, below). On a Slack
 origin with the credential proxy's Slack relay in the environment it is posted
 here as Block Kit through ``slack_blocks_post``, because the scheduler's delivery
-takes text only. Under ``spec.mode: next``, on an install whose job was linked to a Slack chat before
-the switch and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
+takes text only. On an install whose job was linked to a Slack chat before the gateway
+held Slack and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
 (``_posted_through_gateway``).
 
-Under ``spec.mode: next`` the plugin may instead have recorded the conversation the user first
+The plugin may instead have recorded the conversation the user first
 wrote in (``CONVERSATION_FILE``, with ``CONVERSATION_ALIGNED_MARKER`` as the human-present marker).
 That record wins over a job origin. The run then never prints the report, since the scheduler
 cannot reach a gateway conversation: it checks before the claim that this child's env carries the
@@ -142,6 +142,7 @@ from typing import NamedTuple
 import bootstrap_handoff  # beside this script in the pod
 import chat_notify  # beside this script in the pod
 import findings_queue as fq  # beside this script in the pod
+import first_run_report  # beside this script in the pod
 import forge  # beside this script in the pod
 import gitops_workspace  # beside this script in the pod
 import inventory_card  # beside this script in the pod
@@ -155,17 +156,20 @@ SCAN_JOB_ID = "bootstrap-inventory-scan"
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 # The job that runs this stage, and so the one the plugin links to the chat.
 OOBE_JOB_ID = "oobe"
+# What a reason prints for an empty served-platform list.
+UNSET_LABEL = "<unset>"
 
 # The delivered report is renamed here rather than deleted. It is the only copy
 # of a sweep that can take many minutes over a whole fleet, and a chat message
 # is easy to lose; keeping it means a re-send is a `cat`, not a re-scan.
-DELIVERED_REPORT_NAME = "INVENTORY.delivered.md"
-REPORT_NAME = "INVENTORY.md"
+# The names are first_run_report.py's, which the on-demand read shares.
+DELIVERED_REPORT_NAME = first_run_report.DELIVERED_REPORT_NAME
+REPORT_NAME = first_run_report.REPORT_NAME
 # Touched once the sweep's findings are in the findings queue (or the sweep found
 # none), before the claim: the record that the fleet was checked, which the
 # Slack Home tab's board reads (agents/platform/scripts/board_snapshot.py) so a
 # clean cluster is not drawn as unchecked after a delivery that never posts.
-FINDINGS_REGISTERED_MARKER = ".bootstrap_findings_registered"
+FINDINGS_REGISTERED_MARKER = first_run_report.FINDINGS_REGISTERED_MARKER
 
 # The items the report lists, written by ``inventory_findings.py select``
 # (its DEFAULT_SHOWN_PATH and the keys below; test_bootstrap_onboarding_scripts.py
@@ -212,7 +216,7 @@ MARK_TIMEOUT_SECONDS = 5
 # The sandbox's data volume, whatever HERMES_HOME says on this side: the same
 # path by construction (deploy/sandbox/Dockerfile), and a separate constant
 # because it names a directory on the far side of the connection.
-SANDBOX_HOME = "/opt/data"
+SANDBOX_HOME = first_run_report.SANDBOX_HOME
 
 # Far above the report the prioritization stage writes, which is sized for one
 # chat message. It bounds what one tick moves over ssh; a report past it is
@@ -245,12 +249,12 @@ STALE_CLAIM_SECONDS = CONVERSATION_POST_MAX_SECONDS + CLAIM_MARGIN_SECONDS
 # place), so the lock and its holder are one file. An empty file is a claim from before the
 # tag (an older build, or a hand); ``_claim_path`` reads it as "", or as the no-human path's
 # when that path's old marker is beside it.
-COMPLETED_FILE = ".bootstrap_completed"
-CLAIM_PATH_ORIGIN = "origin"
-CLAIM_PATH_CONVERSATION = "conversation"
-CLAIM_PATH_NO_HUMAN = "no-human"
+COMPLETED_FILE = first_run_report.COMPLETED_FILE
+CLAIM_PATH_ORIGIN = first_run_report.CLAIM_PATH_ORIGIN
+CLAIM_PATH_CONVERSATION = first_run_report.CLAIM_PATH_CONVERSATION
+CLAIM_PATH_NO_HUMAN = first_run_report.CLAIM_PATH_NO_HUMAN
 # A claim that is there but could not be read this tick: nothing settles or releases on it.
-CLAIM_PATH_UNREADABLE = "unreadable"
+CLAIM_PATH_UNREADABLE = first_run_report.CLAIM_PATH_UNREADABLE
 # The marker builds before the tag wrote beside a no-human claim. Read only beside an empty claim
 # (one such build took and a restart left), so an upgrade mid-claim does not settle it unfiled;
 # removed with the claim.
@@ -264,8 +268,8 @@ REMOTE_MV = "/bin/mv"
 
 # The only surface the reshaped report is written for; every other one gets it as written.
 PRESENTED_PLATFORM = "slack"
-# Google Chat's platform name. Its card goes only through the gateway (spec.mode: next),
-# which lays the chat message out; Hermes's own Chat adapter under today takes text.
+# Google Chat's platform name. Its card goes only through the gateway, which lays the
+# chat message out; Hermes's own Chat adapter takes text.
 GCHAT_PLATFORM = "google_chat"
 # Why the first report went as text and not as the card, one line in the oobe stage log
 # (_stage_note), which an operator reads; the scheduler keeps a zero-exit run's stderr nowhere.
@@ -403,8 +407,8 @@ class LostRun(NamedTuple):
     crashed: bool
     claimed_at: float
 
-# The sentence that names the home channel, and what replaces it where the gateway has none to post
-# to (no A2A_NOTIFY_PLATFORM on the conversation path).
+# The sentence that names the home channel, and what replaces it where no platform has one
+# (``chat_notify.home_platforms()`` empty on the conversation path).
 AUDITS_HOME_SENTENCE = "Each posts a summary to the home channel when it finds something new."
 AUDITS_NO_HOME_SENTENCE = (
     "Each one's summary goes to the home channel, and this install has none yet, so those summaries "
@@ -445,7 +449,7 @@ RESENT_FILE = ".oobe_summaries_resent.json"
 RESENT_TRIES_KEY = "tries"
 RESENT_POSTED_KEY = "posted"
 
-# Under spec.mode next the plugin records the conversation the report goes to (its
+# On the conversation path the plugin records the conversation the report goes to (its
 # CONVERSATION_FILE) and touches CONVERSATION_ALIGNED_MARKER in place of .user_aligned. Either one
 # present puts the run on the conversation path, which never prints the report: the scheduler
 # cannot post to a gateway conversation.
@@ -476,7 +480,7 @@ CONVERSATION_REPORT_UPDATE = "onboarding-report"
 NOTIFY_EDIT_FAILED_PREFIX = "edit failed:"
 # Written right after the report's post answers, with the outcome: the
 # conversation path's "delivered", which the stale-claim rule and retirement wait on.
-CONVERSATION_DONE_FILE = ".bootstrap_conversation_done"
+CONVERSATION_DONE_FILE = first_run_report.CONVERSATION_DONE_FILE
 # A conversation post's outcome: posted; posted nothing as far as can be told
 # (exit 1, a route absent through the retries, a CLI that could not start); or
 # may have posted (exit 3, a killed CLI, any other exit).
@@ -536,7 +540,7 @@ REPORT_ISSUE_MARKER = "<!-- onboarding-first-report -->"
 REPORT_ISSUE_SWEEP_MARKER = "<!-- onboarding-first-report sweep={sweep} -->"
 # Written by the retire path beside the claim; with REPORT_FILED_FILE it is
 # what tells a claim this path kept from one its run died holding.
-REPORT_RETIRED_FILE = ".bootstrap_report_retired"
+REPORT_RETIRED_FILE = first_run_report.REPORT_RETIRED_FILE
 REPORT_ISSUE_TITLE = "First-run inventory report ({date} UTC)"
 REPORT_ISSUE_INTRO = (
     "Onboarding's first-run inventory report, filed here on {date} UTC because no chat thread could take it: "
@@ -553,11 +557,11 @@ REPORT_FORGE_CALLS_BEFORE_RECORD = 4
 REPORT_ISSUE_DATE_FMT = "%Y-%m-%d %H:%M"
 # Where this stage records the issue it filed (repository, number, when), read
 # by a later run's log line and by an operator asking where the report went.
-REPORT_FILED_FILE = ".bootstrap_report_filed"
-FILED_REPO = "repo"
-FILED_NUMBER = "number"
-FILED_URL = "url"
-FILED_AT = "filed_at"
+REPORT_FILED_FILE = first_run_report.REPORT_FILED_FILE
+FILED_REPO = first_run_report.FILED_REPO
+FILED_NUMBER = first_run_report.FILED_NUMBER
+FILED_URL = first_run_report.FILED_URL
+FILED_AT = first_run_report.FILED_AT
 # The issue's web address when the broker's answer carries none: github.com for
 # an `owner/name` slug, the named host for a GitHub Enterprise Server
 # `host/owner/name` one (gitops_workspace.get_managed_github_repo_names).
@@ -616,6 +620,8 @@ HOME_LINE_POSTED = "was posted"
 HOME_LINE_KEPT = "was kept by the gateway for its digest (no home channel yet)"
 HOME_LINE_FAILED = "was not posted (a2a notify exited {code}: {detail})"
 HOME_LINE_NO_EXIT = "none"
+# Leads each home-line note when more than one platform is routed, so each names its platform.
+HOME_LINE_PLATFORM_PREFIX = "{platform}: "
 REPORT_TOO_LONG_REASON = (
     "the first-run report is longer than an issue body may be ({chars} characters, limit {limit}); not filing it"
 )
@@ -818,10 +824,10 @@ def _conversation_ready(data_dir: Path, conversation: dict) -> bool:
     platform = conversation["platform"]
     if not all(conversation.values()):
         reason = f"{CONVERSATION_FILE} is missing or incomplete; the report waits"
-    elif chat_notify.gateway_platform() != platform:
+    elif platform not in (served := chat_notify.gateway_platforms()):
         reason = (
             f"the gateway does not serve {platform} conversations to this run "
-            f"({chat_notify.NOTIFY_CONVERSATIONS_ENV}={chat_notify.gateway_platform()!r}); the report waits"
+            f"({chat_notify.NOTIFY_CONVERSATIONS_ENV}={chat_notify.PLATFORM_LIST_SEPARATOR.join(served) or UNSET_LABEL}); the report waits"
         )
     else:
         reason = chat_notify.bus_unreachable_reason()
@@ -1275,10 +1281,10 @@ def _origin() -> dict:
 
 def _card_platform(platform: str | None) -> bool:
     """Whether the first report's card goes to ``platform``: Slack, or Google Chat where the
-    gateway serves it (``spec.mode: next``), home posts or conversations, and lays the card out."""
+    gateway serves it, home posts or conversations, and lays the card out."""
     if platform == PRESENTED_PLATFORM:
         return True
-    return platform == GCHAT_PLATFORM and (chat_notify.routes(platform) or chat_notify.gateway_platform() == platform)
+    return platform == GCHAT_PLATFORM and (chat_notify.routes(platform) or platform in chat_notify.gateway_platforms())
 
 
 def _origin_platform() -> str | None:
@@ -1703,16 +1709,17 @@ def resend_lost_summaries(data_dir: Path, now: float) -> None:
     """The ``oobe`` stage that posts the first-run audit summaries the want of a home channel lost.
 
     A first-run audit that ends before anyone has opened the chat finds no home channel: under
-    ``spec.mode: next`` the gateway keeps the post for its digest, the run is recorded failed, and
+    the gateway keeps the post for its digest, the run is recorded failed, and
     nothing posts the summary once the channel is learned minutes later. This stage watches the home
-    channel the operator projects into the pod (``chat_notify.home_file``: Slack under next; today mode
-    and Google Chat project none, and get no re-send) and, once it names a channel, asks the chat relay
+    channels the operator projects into the pod (``chat_notify.any_home_file_value``: Slack's and Google
+    Chat's, where the gateway holds the platform; Slack on the Hermes adapter projects none, and gets no
+    re-send) and, once either names a channel, asks the chat relay
     to post each pending run's report through the route a scheduled run's delivery leg takes, so the
     relay reads the audit's own chat report record, posts it the same way, and records the post. The
     relay's answer settles the audit in ``RESENT_FILE``; for a request whose answer was lost the relay's
     record decides. Each outcome goes to the stage log.
     """
-    if not chat_notify.home_file_value():
+    if not chat_notify.any_home_file_value():
         return
     pending = pending_resends(data_dir, oobe.read_state(data_dir), now)
     if not pending:
@@ -1748,7 +1755,7 @@ def _first_report_card(
     why the text goes instead.
 
     The card needs all of: ``KAGE_SLACK_UX`` on; a card platform as the destination (``platform``:
-    Slack, or Google Chat through the gateway under ``spec.mode: next``); a hand-off
+    Slack, or Google Chat through the gateway); a hand-off
     that filed a prioritization card (``no_ranking`` False: otherwise the files beside the report
     are an earlier sweep's, or that cannot be told); the items and shown files there and readable,
     and the scores file readable when an item is listed; and a card the builder accepts, which recomputes
@@ -1789,7 +1796,7 @@ def _first_report_card(
 
 def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
     """Whether the report was posted as the card, to Slack or to Google Chat through
-    the gateway under ``spec.mode: next``; False posts nothing.
+    the gateway; False posts nothing.
 
     False, and the caller prints the text, with no card (``_first_report_card``
     said why), an origin that is not a card platform with a chat id, or no relay. Any
@@ -1831,7 +1838,7 @@ def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
 
 
 def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, platform: str, channel: str, thread: str) -> bool:
-    """Under ``spec.mode: next``, whether the card posted as a chat message through the gateway.
+    """Whether the card posted as a chat message through the gateway.
 
     The gateway holds the chat platform there, Slack or Google Chat, and the
     broker's relay is gone, so the card goes as ``a2a notify --chat-file``
@@ -2164,16 +2171,22 @@ def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: f
 
 
 def _post_home_line(data_dir: Path, url: str, now: float) -> None:
-    """One line naming the filed report, to the platform whose home posts route through the gateway.
+    """One line naming the filed report, to each platform whose home posts route through the gateway.
 
     After the claim and the issue, so best effort: the issue is the record. ``NOTIFY_KEPT`` is
     the gateway holding the line for its digest, which is where a channel set later reads it.
+    Each platform is posted and noted on its own; a failure on one does not skip the next.
     """
-    platform = chat_notify.routed_platform()
-    if not platform:
-        return
+    platforms = chat_notify.routed_platforms()
     text = REPORT_ISSUE_HOME_POST.format(url=url, date=_utc(now))
-    argv = chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS)
+    for platform in platforms:
+        prefix = HOME_LINE_PLATFORM_PREFIX.format(platform=platform) if len(platforms) > 1 else ""
+        outcome = _home_line_outcome(chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS))
+        _stage_note(data_dir, prefix + REPORT_HOME_LINE_NOTE.format(outcome=outcome))
+
+
+def _home_line_outcome(argv: list[str]) -> str:
+    """How one home-line post ended, as a ``HOME_LINE_*`` outcome."""
     # A route that is not there right now (a gateway roll) is waited out as
     # the conversation path waits it out; one that stays away is a log line.
     for delay in (*chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS, None):
@@ -2183,19 +2196,16 @@ def _post_home_line(data_dir: Path, url: str, now: float) -> None:
                 timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
-            _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code=HOME_LINE_NO_EXIT, detail=e)))
-            return
+            return HOME_LINE_FAILED.format(code=HOME_LINE_NO_EXIT, detail=e)
         if not chat_notify.route_unavailable(res.returncode) or delay is None:
             break
         time.sleep(delay)
     if res.returncode == 0:
-        outcome = HOME_LINE_POSTED
-    elif chat_notify.kept(res.returncode):
-        outcome = HOME_LINE_KEPT
-    else:
-        detail = _gateway_error(res.stdout) or (res.stderr or "").strip()
-        outcome = HOME_LINE_FAILED.format(code=res.returncode, detail=detail)
-    _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=outcome))
+        return HOME_LINE_POSTED
+    if chat_notify.kept(res.returncode):
+        return HOME_LINE_KEPT
+    detail = _gateway_error(res.stdout) or (res.stderr or "").strip()
+    return HOME_LINE_FAILED.format(code=res.returncode, detail=detail)
 
 
 def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
@@ -2213,7 +2223,7 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
     if not _claim_delivery(data_dir, CLAIM_PATH_NO_HUMAN):
         return 0
     if _someone_is_here(data_dir):
-        # A human arrived during the reads above (a today platform has no sweep-age guard): their
+        # A human arrived during the reads above (a platform the Hermes adapter holds has no sweep-age guard): their
         # thread takes the report, late as it is.
         _release_claim(data_dir)
         return 0
@@ -2327,7 +2337,7 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     # Sized as filed (markers, intro, report, note), before the second sandbox read and the
     # findings registration; counted, so a report that will never fit stops after the waits.
     no_ranking = _no_ranking(data_dir)
-    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
+    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.home_platforms()))
     body = _with_note(content, note)
     composed = len(_issue_text(body, sweep, filed_at, now))
     if composed > ISSUE_BODY_MAX_CHARS:
@@ -2492,7 +2502,7 @@ def main(data_dir: Path | None = None) -> int:
     platform = conversation["platform"] if conversation is not None else _origin_platform()
     card, text_reason = _first_report_card(platform, no_ranking, files, suppressed)
     # Also before the claim, so its reads cannot cost the report once the claim is taken.
-    home = bool(chat_notify.routed_platform()) if conversation is not None else True
+    home = bool(chat_notify.home_platforms()) if conversation is not None else True
     note = _safe_audits_note(data_dir, no_ranking is True, home)
 
     # The cheap check above is advisory; this is the decision. Nothing may be

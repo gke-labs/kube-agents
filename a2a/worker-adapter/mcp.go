@@ -87,23 +87,69 @@ const (
 	addresseeTruncatedNote = " The list is cut short: if the person asks by name for an agent not on it, address it by that name and the gateway will say whether it can be reached."
 )
 
+// The batch's wording, offered only when the turn's targets advertise a width
+// over one (delegateToolSchema). %d is the width.
+const (
+	delegateToolBatchDescription = " To hand several independent tasks out at once, send tasks instead of addressee and text: at most %d entries, each with its own addressee, text and parameters. They run side by side, and their results arrive together as your next turn."
+	tasksDescription             = "Several tasks to hand out at once, instead of addressee and text: 2 to %d entries, each shaped like a single call. Use it when the work splits into independent pieces (one per cluster, say)."
+	textDescription              = "The task, as you would state it to that agent."
+	parametersDescription        = "The task parameters the agent profile declares, by name, as its entry in the addressee list gives them. A profile that works on any cluster takes project, location and cluster; one pinned to a cluster needs none. Leave out for platform. The gateway refuses a name the profile does not declare, or a required one left out, and its refusal names the ones the profile takes."
+)
+
+// batchMinItems is the smallest batch the tool offers: one task is the single
+// shape.
+const batchMinItems = 2
+
 // delegateToolSchema is the tool as tools/list reports it, its addressee
-// description built from the turn's targets (nil for none).
+// description built from the turn's targets (nil for none). A width over one
+// adds the tasks list; otherwise the schema is the single-child one, exactly,
+// so a pod talking to a gateway built before batches is unchanged.
 func delegateToolSchema(targets *lib.DelegateTargets) map[string]any {
+	entry := func() map[string]any {
+		return map[string]any{
+			"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},
+			"text":      map[string]any{"type": "string", "description": textDescription},
+			"parameters": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"},
+				"description": parametersDescription},
+		}
+	}
+	required := []string{"addressee", "text"}
+	props := entry()
+	description := delegateToolDescription
+	if width := delegateWidth(targets); width > 1 {
+		props["tasks"] = map[string]any{
+			"type":        "array",
+			"minItems":    batchMinItems,
+			"maxItems":    width,
+			"description": fmt.Sprintf(tasksDescription, width),
+			"items": map[string]any{
+				"type":       "object",
+				"properties": entry(),
+				"required":   required,
+			},
+		}
+		// Either shape is a whole call, so neither's fields are required at
+		// the top; the adapter refuses a call that sets both or neither.
+		required = []string{}
+		description += fmt.Sprintf(delegateToolBatchDescription, width)
+	}
 	return map[string]any{
 		"name":        DelegateToolName,
-		"description": delegateToolDescription,
+		"description": description,
 		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},
-				"text":      map[string]any{"type": "string", "description": "The task, as you would state it to that agent."},
-				"parameters": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"},
-					"description": "The task parameters the agent profile declares, by name, as its entry in the addressee list gives them. A profile that works on any cluster takes project, location and cluster; one pinned to a cluster needs none. Leave out for platform. The gateway refuses a name the profile does not declare, or a required one left out, and its refusal names the ones the profile takes."},
-			},
-			"required": []string{"addressee", "text"},
+			"type":       "object",
+			"properties": props,
+			"required":   required,
 		},
 	}
+}
+
+// delegateWidth is the batch width the turn's targets advertise: one for none.
+func delegateWidth(targets *lib.DelegateTargets) int {
+	if targets == nil {
+		return 1
+	}
+	return targets.Width()
 }
 
 func addresseeDescription(targets *lib.DelegateTargets) string {

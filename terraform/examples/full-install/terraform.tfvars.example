@@ -70,8 +70,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # chart ships selects agent bindings by that suffix, so a name outside it goes
 # unselected; the plan is refused instead (variables.tf has the detail).
 # The installer front doors regenerate this file on every run, so through
-# install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME and
-# LITELLM_GSA_NAME in install.env instead of editing here. The KSA name has no
+# install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME,
+# GITHUB_MINTER_KSA_NAME and LITELLM_GSA_NAME in install.env instead of editing
+# here (install.sh names and records a new install's minter KSA itself). The KSA name has no
 # install.env key of its own yet, so it goes in the same file as
 # TF_VAR_agent_ksa_name=... — the generator never writes agent_ksa_name, so
 # nothing in this file overrides it.
@@ -79,6 +80,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # github_minter_service_account_id = "kubeagents-github-minter-gsa-2"
 # litellm_service_account_id       = "kubeagents-litellm-gsa-2"
 # agent_ksa_name                   = "kubeagents-platform-2-agent"
+# github_minter_ksa_name           = "<cluster>-github-minter"
 
 # Cluster tuning
 # deletion_protection = true
@@ -99,11 +101,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # namespace. Only for a long-lived install whose own state owns the release.
 # helm_upgrade_install = true
 
-# The PlatformAgent's spec.mode: "today" (the default, which renders no mode
-# field) or "next", which puts the NATS bus and the A2A gateway in front of
-# the agent, and is what install.sh records on a first install. Changing it
-# later is a mode switch; see variables.tf.
-# platform_agent_mode = "today"
+# A chat `stop` also stops the conversation's kanban cards (A2A_CARD_STOP on
+# the operator). Off by default.
+# card_stop_enabled = true
 
 # The PlatformAgent's spec.storage.size: the agent's data volume and the shell
 # sandbox's, which the operator gives the same size. The default passes
@@ -111,12 +111,19 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # refused. See variables.tf.
 # platform_agent_storage_size = "50Gi"
 
+# The PlatformAgent's spec.deployment.sizingProfile: auto | small | medium | fleet
+# (or "" to omit). Defaults to "auto", which promotes runtime pods at 10 and 25
+# clusters under namespace quota/LimitRange admission checks. Separate from
+# sizing_profile above, which sizes Standard node pools.
+# platform_agent_sizing_profile = "auto"
+
 # Optional Google Chat backend (Pub/Sub topic + subscription, Chat APIs);
 # the CR's googleChat integration is wired to the created topic/subscription
 # automatically. Only the Chat-app registration in the console stays manual
 # (see the README).
 # enable_google_chat        = true
 # google_chat_allowed_users = ["you@example.com"]
+# google_chat_home_channel_policy = "auto"   # or "manual": with no google_chat_home_channel, "auto" learns it from the first mention in a named space
 
 # Model routing for the bundled LiteLLM gateway (defaults: gemini and the
 # provider's default model; set the matching *_api_key above).
@@ -154,7 +161,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # from a location that serves it. Set a region for a data-residency requirement,
 # or for a Model Garden partner model served only from specific regions.
 # model_provider     = "vertex_ai"
-# model_default_name = "gemini-3.5-flash"
+# model_default_name = "gemini-3.8-flash"
 # vertex_project_id  = ""
 # vertex_location    = ""
 # false when vertex_project_id is a project you cannot administer: you enable the

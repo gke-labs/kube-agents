@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -37,11 +36,10 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// mcpBrokerAgent is a mode-next agent with Chat off, so the callers list is
-// about the MCP flag alone.
+// mcpBrokerAgent is an agent with Chat off, so the callers list is about the
+// MCP flag alone.
 func mcpBrokerAgent() *agentv1alpha1.PlatformAgent {
 	agent := brokerPodAgent()
-	agent.Spec.Mode = ptr.To("next")
 	if agent.Spec.Integration != nil {
 		agent.Spec.Integration.GoogleChat = nil
 	}
@@ -51,7 +49,7 @@ func mcpBrokerAgent() *agentv1alpha1.PlatformAgent {
 func TestTheMCPPodCarriesTheBrokerTokenOnlyUnderItsFlag(t *testing.T) {
 	agent := a2aTestAgent()
 
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	off := buildA2AMCPDeployment(agent).Spec.Template.Spec
 	if off.ServiceAccountName != "" {
 		t.Errorf("flag off: serviceAccountName = %q, want none", off.ServiceAccountName)
@@ -67,7 +65,7 @@ func TestTheMCPPodCarriesTheBrokerTokenOnlyUnderItsFlag(t *testing.T) {
 		}
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "")
 	pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
 	if pod.ServiceAccountName != a2aMCPName(agent) {
 		t.Errorf("serviceAccountName = %q, want %q: the broker's caller must not be the namespace default", pod.ServiceAccountName, a2aMCPName(agent))
@@ -118,43 +116,23 @@ func TestTheMCPPodCarriesTheBrokerTokenOnlyUnderItsFlag(t *testing.T) {
 	}
 }
 
-// The broker renders in both modes; the MCP server only under next. The flag
-// on a today install must confer nothing.
-func TestTheMCPBrokerAccessIsInertOutsideModeNext(t *testing.T) {
-	t.Setenv(a2aMCPDoorEnvVar, "true")
-	agent := brokerPodAgent() // mode unset: today
-	if a2aMCPBrokerEnabled(agent) {
-		t.Fatal("enabled outside mode next")
-	}
-	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), a2aMCPName(agent)) {
-		t.Error("MCP caller named on a today install")
-	}
-	broker := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
-	if _, found := brokerEnvValue(broker.Env, credentialProxyMCPAudienceEnvVar); found {
-		t.Error("MCP audience rendered on a today install")
-	}
-	if _, found := brokerEnvValue(broker.Env, credentialProxyMCPCallersEnvVar); found {
-		t.Error("MCP callers rendered on a today install")
-	}
-}
-
 func TestTheBrokerConfersTheMCPAudienceOnlyUnderTheFlag(t *testing.T) {
 	agent := mcpBrokerAgent()
 	caller := "system:serviceaccount:test-ns:test-agent-a2a-mcp"
 
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), caller) {
-		t.Fatal("the MCP ServiceAccount is a broker caller with the flag unset")
+		t.Fatal("the MCP ServiceAccount is a broker caller with the flag off")
 	}
 	off := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
 	if _, found := brokerEnvValue(off.Env, credentialProxyMCPAudienceEnvVar); found {
-		t.Fatal("the MCP audience is rendered with the flag unset")
+		t.Fatal("the MCP audience is rendered with the flag off")
 	}
 	if _, found := brokerEnvValue(off.Env, "CREDENTIAL_PROXY_MCP_CALLERS"); found {
-		t.Fatal("the MCP callers are rendered with the flag unset")
+		t.Fatal("the MCP callers are rendered with the flag off")
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "")
 	if got := allowedBrokerCallers(agent, allBrokerCallersOwned); !strings.HasSuffix(got, ","+caller) {
 		t.Fatalf("callers = %q, want it to end with %q", got, caller)
 	}
@@ -216,11 +194,11 @@ func TestTheBrokerFenceAdmitsTheMCPPodOnlyUnderTheFlag(t *testing.T) {
 		return false
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	if admitsMCP() {
 		t.Error("the broker fence admits the MCP pod with the flag off")
 	}
-	t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "")
 	if !admitsMCP() {
 		t.Errorf("the broker fence does not admit the MCP pod on %d with the flag on", credentialProxyPort)
 	}
@@ -261,7 +239,7 @@ func TestTheMCPBrokerIdentityFollowsTheFlag(t *testing.T) {
 	ctx := context.Background()
 	key := types.NamespacedName{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}
 
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	if _, err := r.reconcileA2AMCPBrokerIdentity(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +247,7 @@ func TestTheMCPBrokerIdentityFollowsTheFlag(t *testing.T) {
 		t.Fatalf("flag off: ServiceAccount present or unreadable: %v", err)
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "")
 	if _, err := r.reconcileA2AMCPBrokerIdentity(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +259,7 @@ func TestTheMCPBrokerIdentityFollowsTheFlag(t *testing.T) {
 		t.Errorf("owner references %+v, want the PlatformAgent", sa.OwnerReferences)
 	}
 
-	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "false")
 	if _, err := r.reconcileA2AMCPBrokerIdentity(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +301,7 @@ func TestAnUnownedMCPServiceAccountIsSkippedOffAndNotAdoptedOn(t *testing.T) {
 	}
 
 	t.Run("flag off: skipped, not fatal", func(t *testing.T) {
-		t.Setenv(a2aMCPDoorEnvVar, "")
+		t.Setenv(a2aMCPDoorEnvVar, "false")
 		r, cl := setup(t)
 		if _, err := r.reconcileA2AMCPBrokerIdentity(ctx, agent); err != nil {
 			t.Fatalf("an unowned ServiceAccount under the reserved name stopped the reconcile: %v", err)
@@ -332,7 +310,7 @@ func TestAnUnownedMCPServiceAccountIsSkippedOffAndNotAdoptedOn(t *testing.T) {
 	})
 
 	t.Run("flag on: not adopted, not fatal, reported", func(t *testing.T) {
-		t.Setenv(a2aMCPDoorEnvVar, "true")
+		t.Setenv(a2aMCPDoorEnvVar, "")
 		r, cl := setup(t)
 		owned, err := r.reconcileA2AMCPBrokerIdentity(ctx, agent)
 		if err != nil {
@@ -598,10 +576,10 @@ func TestTheBrokerAdmitsTheMCPAccountOnlyWhenOwned(t *testing.T) {
 		sa   *corev1.ServiceAccount
 		want bool
 	}{
-		{"door on, account absent", "true", nil, true},
-		{"door on, account ours", "true", &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}, true},
-		{"door on, account somebody else's", "true", &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}, false},
-		{"door off, account somebody else's", "", &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}, true},
+		{"door on, account absent", "", nil, true},
+		{"door on, account ours", "", &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}, true},
+		{"door on, account somebody else's", "", &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}, false},
+		{"door off, account somebody else's", "false", &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(a2aMCPDoorEnvVar, tc.door)
@@ -609,7 +587,7 @@ func TestTheBrokerAdmitsTheMCPAccountOnlyWhenOwned(t *testing.T) {
 			objs := []client.Object{agent.DeepCopy()}
 			if tc.sa != nil {
 				sa := tc.sa.DeepCopy()
-				if tc.want && tc.door == "true" {
+				if tc.want && tc.door != "false" {
 					if err := ctrl.SetControllerReference(agent, sa, scheme); err != nil {
 						t.Fatal(err)
 					}
@@ -635,7 +613,7 @@ func TestTheBrokerAdmitsTheMCPAccountOnlyWhenOwned(t *testing.T) {
 // door turned on later never finds the name already taken. Taken, the override
 // would put the broker's Workload Identity annotation on the MCP pod's account.
 func TestTheMCPServiceAccountIsReservedWithTheDoorOnOrOff(t *testing.T) {
-	for _, door := range []string{"", "true"} {
+	for _, door := range []string{"false", "", "true"} {
 		t.Run("door="+door, func(t *testing.T) {
 			t.Setenv(a2aMCPDoorEnvVar, door)
 			agent := mcpBrokerAgent()

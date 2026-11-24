@@ -16,12 +16,25 @@
 # that asserts on it; change a name here and that scenario's exact check
 # goes red, which is the intended failure mode -- the names are the test.
 
-data "google_client_config" "default" {}
+# The Kubernetes providers (this one and seeded_b, seeded_c, seeded_d)
+# authenticate through gke-gcloud-auth-plugin, run on every API call, not
+# with a token read at plan time. hack/fleet_reconcile.py saves the plan and
+# applies it, and a Google access token lives one hour: a token baked into
+# the plan expired on the projects whose apply crossed that boundary, and the
+# in-cluster fixtures failed with Unauthorized after the node pools had
+# updated (#5684). The plugin uses gcloud's credential, which in the
+# reconcile jobs is the Workload Identity the google provider also reads, so
+# whoever runs the stack needs the plugin on PATH and gcloud signed in as the
+# identity the apply should run as.
 
 provider "kubernetes" {
   host                   = "https://${google_container_cluster.seeded_a.endpoint}"
-  token                  = data.google_client_config.default.access_token
   cluster_ca_certificate = base64decode(google_container_cluster.seeded_a.master_auth[0].cluster_ca_certificate)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "gke-gcloud-auth-plugin"
+  }
 }
 
 resource "kubernetes_namespace_v1" "seeded_reliability" {
@@ -344,7 +357,8 @@ resource "kubernetes_deployment_v1" "token_sidecar" {
 # default-deny policy and the restricted container settings so no other
 # stream names the namespace. The one declarable cost posture observable
 # on apply day: the other seven are age-gated by a week or more. Its case
-# still needs a ledger to read, which the idle pool supplies from day 7.
+# still needs a ledger to read, which the generated-name family below
+# supplies from its first hour, before the idle pool's day 7.
 resource "kubernetes_namespace_v1" "seeded_headroom" {
   metadata {
     name   = "seeded-headroom"
@@ -417,6 +431,196 @@ resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
       match_labels = { app = "burst-ingest" }
     }
   }
+}
+
+# Posture (waste, generated names): three Deployments that a spawner would
+# make, each named `calibration-<uuid>`, with one common parent label. No
+# file in a GitOps repository declares a member's name; only the parent is a
+# stable object. Each member has burst-ingest's shape (two pause replicas,
+# 10m / 128Mi, a budget, the default-deny policy, the restricted settings), so
+# the cost SOP's 3.1 `overrequest` names each one on memory and no other
+# stream names the namespace. No note declares them: they are findings.
+#
+# The names are literals, not `random_uuid` and not `generate_name`. Each
+# pool project then holds the same three names on each apply, with no state
+# that decides them, so a case and the state assertions can name a member. A
+# changed literal plans as a replace, which the reconciler refuses without a
+# row in reconcile-allow.json. Plant no Deployment with the exact name
+# `calibration` in this namespace: an audit that rolls the family up to its
+# parent takes that name for the parent. Catalogue role:
+# generated-name-family.
+locals {
+  calibration_parent = "calibration"
+  calibration_members = {
+    one   = { name = "calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6" }
+    two   = { name = "calibration-374472b8-d3be-4c23-879f-9a44a5775c2b" }
+    three = { name = "calibration-20192efa-2b20-4f64-87c3-a3919cdcd132" }
+  }
+}
+
+resource "kubernetes_namespace_v1" "seeded_family" {
+  metadata {
+    name   = "seeded-family"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "calibration" {
+  for_each = local.calibration_members
+
+  metadata {
+    name      = each.value.name
+    namespace = kubernetes_namespace_v1.seeded_family.metadata[0].name
+    labels    = { "app.kubernetes.io/part-of" = local.calibration_parent }
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = each.value.name }
+    }
+    template {
+      metadata {
+        labels = {
+          app                         = each.value.name
+          "app.kubernetes.io/part-of" = local.calibration_parent
+        }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = each.value.name }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "calibration"
+          image = "registry.k8s.io/pause:3.9"
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "128Mi" }
+            limits   = { memory = "256Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "calibration" {
+  for_each = local.calibration_members
+
+  metadata {
+    name      = each.value.name
+    namespace = kubernetes_namespace_v1.seeded_family.metadata[0].name
+  }
+  spec {
+    min_available = "1"
+    selector {
+      match_labels = { app = each.value.name }
+    }
+  }
+}
+
+# Posture (waste, generated names, finished Jobs): three Jobs that a spawner
+# would make, each named `reindex-<uuid>`, with one common parent label, no
+# owner and no ttl_seconds_after_finished. Each one ran to completion and
+# stays. The cost SOP's 3.9 `terminal-pods` files a finished Job that has no
+# TTL once it finished 7 days ago: one finding for each member, under a name
+# that no file in a GitOps repository declares. They live in the Deployment
+# family's namespace, so the fleet gets no new namespace and no new policy.
+#
+# The names are literals for the reason the calibration names are. A changed
+# literal plans as a replace, which the reconciler refuses without a row in
+# reconcile-allow.json, and a new Job starts the 7-day clock again: the role
+# is not ready until then (fixtures.json, `ready_after_hours` on
+# status.completionTime). Plant no object with the exact name `reindex` in
+# this namespace: an audit that rolls such a family up to its parent would
+# take that name for the parent, as the waste audit does for the Deployments
+# above. No TTL also keeps each later apply a no-op, as for
+# legacy_endpoints_writer_first_run below.
+#
+# The apply does not wait for the Jobs (wait_for_completion false). A wait
+# that fails or passes its timeout leaves the resource tainted, the next plan
+# is then a replace, and the reconciler refuses that project on each run. A
+# Job needs nothing that an apply must prove, so it finishes by itself, and a
+# Job that cannot finish reads as drift on the fixture-state scan (the role
+# asserts status.succeeded). backoff_limit 2 lets a pod that a node drain cut
+# run again.
+# Catalogue role: generated-name-job-family.
+locals {
+  reindex_parent = "reindex"
+  reindex_jobs = {
+    one   = { name = "reindex-8daede4e-4620-426c-9e07-58f5f0505f39" }
+    two   = { name = "reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041" }
+    three = { name = "reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2" }
+  }
+}
+
+resource "kubernetes_job_v1" "reindex" {
+  for_each = local.reindex_jobs
+
+  metadata {
+    name      = each.value.name
+    namespace = kubernetes_namespace_v1.seeded_family.metadata[0].name
+    labels    = { "app.kubernetes.io/part-of" = local.reindex_parent }
+  }
+  spec {
+    backoff_limit = 2
+    template {
+      metadata {
+        labels = {
+          app                         = each.value.name
+          "app.kubernetes.io/part-of" = local.reindex_parent
+        }
+      }
+      spec {
+        automount_service_account_token = false
+        restart_policy                  = "Never"
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "reindex"
+          image   = "docker.io/library/python:3.14-slim"
+          command = ["python3", "-c", "pass"]
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "20m", memory = "32Mi" }
+            limits   = { memory = "64Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_completion = false
 }
 
 # Posture (rightsizing dependency): a Guaranteed-QoS workload, the second
@@ -778,6 +982,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
     token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
     headroom    = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+    family      = kubernetes_namespace_v1.seeded_family.metadata[0].name
     qos         = kubernetes_namespace_v1.seeded_qos.metadata[0].name
     shapes      = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
     defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name

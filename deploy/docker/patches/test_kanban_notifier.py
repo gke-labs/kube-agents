@@ -50,6 +50,7 @@ from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
 from kanban_notifier import (
     COMPLETION_HEAD,
     chat_ux_on,
+    gateway_serves,
     DEFAULT_WAKE_KINDS,
     EXPLAINED_KINDS,
     HELD_ATTR,
@@ -1691,6 +1692,15 @@ class CompletionTextTest(unittest.TestCase):
         }
         self.assertEqual(kanban_notifier_envs(), (names["NOTIFY_PLATFORM_ENV"], names["NOTIFY_CONVERSATIONS_ENV"]))
 
+    def test_the_gateway_serves_every_platform_a_list_names(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat,slack", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertTrue(gateway_serves("google_chat"))
+            self.assertTrue(gateway_serves("slack"))
+            self.assertFalse(gateway_serves("discord"))
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": "slack, google_chat"}):
+            self.assertTrue(gateway_serves("google_chat"))
+            self.assertTrue(gateway_serves("slack"))
+
     def test_chat_ux_is_on_for_google_chat_only_where_the_gateway_serves_it(self):
         # Under spec.mode: next the gateway lays chat messages out on Google Chat, so the
         # cards' layouts go to it as to Slack; under today (nothing served) it takes text.
@@ -1707,6 +1717,28 @@ class CompletionTextTest(unittest.TestCase):
         _SlackUxFlag(self, False)
         with mock.patch.dict(os.environ, served):
             self.assertFalse(chat_ux_on("google_chat"), "the flag governs Google Chat as it governs Slack")
+
+    def test_chat_ux_is_on_for_teams_only_where_the_gateway_serves_it(self):
+        # The gateway's Teams backend (A2A_TEAMS_BACKEND) renders a card's report as an
+        # Adaptive Card, so the completion leads with the report, as on Slack and Google
+        # Chat; the Hermes Teams adapter takes text and keeps upstream's head line.
+        _SlackUxFlag(self, True)
+        served = {"A2A_NOTIFY_PLATFORM": "slack,teams", "A2A_NOTIFY_CONVERSATIONS": "slack,teams"}
+        with mock.patch.dict(os.environ, served):
+            self.assertTrue(chat_ux_on("teams"))
+            self.assertTrue(chat_ux_on("Teams"))
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "slack", "A2A_NOTIFY_CONVERSATIONS": "slack"}):
+            self.assertFalse(chat_ux_on("teams"), "Teams on Hermes takes text")
+        _SlackUxFlag(self, False)
+        with mock.patch.dict(os.environ, served):
+            self.assertFalse(chat_ux_on("teams"), "the flag governs Teams as it governs Google Chat")
+
+    def test_a_teams_completion_leads_with_the_report_where_the_gateway_serves_it(self):
+        _SlackUxFlag(self, True)
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "teams", "A2A_NOTIFY_CONVERSATIONS": "teams"}):
+            text = completion_text("[default] @platform Kanban t_3a3d8871", "List managed GKE clusters", "**Seven clusters.**\n\n| a | b |", "teams")
+        self.assertTrue(text.startswith("**Seven clusters.**"), text)
+        self.assertNotIn("Kanban t_3a3d8871 done", text)
 
     def test_a_platform_no_presenter_reads_gets_no_step_line(self):
         # The [next: ...] line is plumbing: Google Chat under today, and Slack with the flag off, show the report alone.

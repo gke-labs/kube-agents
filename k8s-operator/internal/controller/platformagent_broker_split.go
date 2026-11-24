@@ -104,9 +104,9 @@ const (
 	// projected into agent-api-auth only, so the Hermes container beside it
 	// holds the chat token and cannot reach these routes. Spelled identically
 	// in credential_proxy.py.
-	credentialProxyWatcherAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	credentialProxyWatcherAudience = agentv1alpha1.WatcherTokenAudience
 	// watcherTokenVolume and watcherTokenMountPath carry that token.
-	watcherTokenVolume    = "watcher-credential-proxy-token"            // #nosec G101 -- Volume name, not a credential
+	watcherTokenVolume    = agentv1alpha1.WatcherTokenVolumeName
 	watcherTokenMountPath = "/var/run/secrets/kubeagents/watcher-proxy" // #nosec G101 -- Mount path, not a credential
 	// watcherBrokerURLEnvVar and watcherBrokerTokenFileEnvVar tell the two
 	// watchers where the broker is and which token to present; the Go side
@@ -210,8 +210,9 @@ var allBrokerCallersOwned = brokerCallerOwnership{mcp: true, scope: true}
 // allowedBrokerCallers is the value of CREDENTIAL_PROXY_ALLOWED_CALLERS: the
 // TokenReview usernames the broker will serve.
 //
-// Two of them on every install; a third when the next stack takes Chat, and a
-// fourth under the cluster-view flag. The sandbox's is the caller that matters —
+// Three of them on every install (the gateway's, the sandbox's and the A2A
+// gateway's), the MCP server's by default (unless A2A_MCP_DOOR=false), and
+// more under their flags. The sandbox's is the caller that matters —
 // the shell is where every credentialed command runs, so a broker that served
 // only the gateway's identity would answer 401 to all of them. The gateway's
 // is there because its chat relays, its Pub/Sub platform adapter and its
@@ -231,13 +232,14 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, gatewayServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
 	}
-	// The A2A gateway, only while it is a caller: its Google Chat adapter
-	// pulls the relay hosted here, and a next install that gives it no Chat
-	// backend has no reason to widen the broker's callers by one.
-	if a2aChatArmed(agent) {
-		callers = append(callers, fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent)))
-	}
-	// The third caller exists only under the cluster-view flag. It is
+	// The A2A gateway, on every install: its report reader reads finished
+	// audit reports through the store routes (a2a_report_reader.go), and its
+	// Google Chat adapter, when armed, pulls the relay hosted here. Held by
+	// CREDENTIAL_PROXY_A2A_REPORTS_CALLERS to the a2a-reports and a2a-chat
+	// audiences, and with Chat armed by CREDENTIAL_PROXY_A2A_CHAT_CALLERS
+	// as well, so it reaches no other role.
+	callers = append(callers, a2aGatewayBrokerCaller(agent))
+	// The session pods' caller exists only under the cluster-view flag. It is
 	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
 	// buildCredentialProxyEnv renders beside it: the broker refuses this
 	// ServiceAccount every audience but the session one, and the session
@@ -245,7 +247,7 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if a2aSessionClusterViewEnabled(agent) {
 		callers = append(callers, a2aSessionBrokerCaller(agent))
 	}
-	// The MCP server's own ServiceAccount, under its flag
+	// The MCP server's own ServiceAccount, unless switched off
 	// (a2aMCPBrokerEnabled) and only while this PlatformAgent owns the
 	// account (a2aMCPIdentityOwned), never the namespace default it ran as
 	// before. Held to the mcp role by CREDENTIAL_PROXY_MCP_CALLERS, which
@@ -261,7 +263,23 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if scopePublisherMayRun(agent, owned.scope) {
 		callers = append(callers, scopePublisherBrokerCaller(agent))
 	}
+	if a2aCuratorEnabled() {
+		callers = append(callers, a2aCuratorBrokerCaller(agent))
+	}
+	// The Teams inbound receiver, while it runs: held to the teams-inbound
+	// audience by CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS, rendered beside it.
+	if teamsInboundEnabled(agent) {
+		callers = append(callers, teamsInboundBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
+}
+
+// a2aGatewayBrokerCaller is the TokenReview username of the A2A gateway's
+// ServiceAccount, as the broker sees it: an allowed caller on every install,
+// the one CREDENTIAL_PROXY_A2A_REPORTS_CALLERS names, and with Chat armed the
+// one CREDENTIAL_PROXY_A2A_CHAT_CALLERS names too.
+func a2aGatewayBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent))
 }
 
 // a2aSessionBrokerCaller is the TokenReview username of the session pods'
@@ -372,7 +390,7 @@ func gatewaySubject(agent *agentv1alpha1.PlatformAgent) rbacv1.Subject {
 // for its ServiceAccount whichever container asks. Unlike that one it is not
 // gated on mode: the watcher token is in every gateway pod.
 func watcherTokenSourceNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
-	names := map[string]bool{watcherTokenVolume: true}
+	names := map[string]bool{agentv1alpha1.WatcherTokenVolumeName: true}
 	if agent.Spec.Deployment == nil {
 		return names
 	}
@@ -389,11 +407,8 @@ func watcherTokenSourceNames(agent *agentv1alpha1.PlatformAgent) map[string]bool
 // projectsWatcherToken reports whether a volume delivers a token for the
 // watcher audience.
 func projectsWatcherToken(v corev1.Volume) bool {
-	if v.Projected == nil {
-		return false
-	}
-	for _, source := range v.Projected.Sources {
-		if source.ServiceAccountToken != nil && source.ServiceAccountToken.Audience == credentialProxyWatcherAudience {
+	for _, route := range agentv1alpha1.BusCredentialRoutes(v, "") {
+		if route.Kind == agentv1alpha1.BusCredentialRouteWatcherAudience {
 			return true
 		}
 	}

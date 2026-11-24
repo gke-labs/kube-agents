@@ -79,8 +79,11 @@ func TestTheDispatcherIsOnByDefaultAndOffAtFalse(t *testing.T) {
 	if want := max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); tasksWithout != want {
 		t.Errorf("TASKS is created at %d, want %d with no dispatcher", tasksWithout, want)
 	}
-	if got := a2aTasksMaxConsumers(&agentv1alpha1.PlatformAgent{}); got != a2aTasksMaxConsumersFloor {
-		t.Errorf("a default install's TASKS is created at %d, want the floor %d", got, a2aTasksMaxConsumersFloor)
+	// A default install: no dispatcher, and the rendered bridge's 10 workers
+	// put the budget (110) above the floor, so TASKS is created at it.
+	def := &agentv1alpha1.PlatformAgent{}
+	if got, want := a2aTasksMaxConsumers(def), a2aTasksConsumerBudget(def); got != want || got <= a2aTasksMaxConsumersFloor {
+		t.Errorf("a default install's TASKS is created at %d, want its budget %d, above the floor %d", got, want, a2aTasksMaxConsumersFloor)
 	}
 
 	scheme := setupScheme()
@@ -233,16 +236,57 @@ func TestTheDispatchConfigIsResolvedAndListsTheDurables(t *testing.T) {
 	}
 }
 
+// A profile's spec.scripts reaches the dispatch config as written, so the
+// dispatcher can hold a task's script to the list and take its path from
+// here (#5622). A timeout over the task's deadline as rendered, which the
+// install's limit caps below spec.lifecycle's, is cut to that deadline, so
+// the config the dispatcher validates always holds it.
+func TestTheDispatchConfigCarriesAProfilesScripts(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(600)}}}
+	helpers := testAgentProfile(agent.Namespace, "helpers", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Lifecycle.ActiveDeadlineSeconds = 1800
+		p.Spec.Scripts = []agentv1alpha1.AgentProfileScript{
+			{Name: "stall-watch", Path: agentv1alpha1.AgentProfileScriptRoot + "stall_watch.py", TimeoutSeconds: 120},
+			{Name: "leeway-watch", Path: agentv1alpha1.AgentProfileScriptRoot + "leeway/watch.py", TimeoutSeconds: 1200},
+		}
+	})
+	plain := testAgentProfile(agent.Namespace, "tse")
+	cfg, err := desiredDispatchConfig(agent, []agentv1alpha1.AgentProfile{helpers, plain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]a2aDispatchProfile{}
+	for _, p := range cfg.Profiles {
+		byName[p.Name] = p
+	}
+	want := []a2aDispatchScript{
+		{Name: "stall-watch", Path: agentv1alpha1.AgentProfileScriptRoot + "stall_watch.py", TimeoutSeconds: 120},
+		{Name: "leeway-watch", Path: agentv1alpha1.AgentProfileScriptRoot + "leeway/watch.py", TimeoutSeconds: 600},
+	}
+	if got := byName["helpers"]; got.ActiveDeadlineSeconds != 600 || !slices.Equal(got.Scripts, want) {
+		t.Errorf("helpers: deadline %d, scripts %+v; want 600 and %+v", got.ActiveDeadlineSeconds, got.Scripts, want)
+	}
+	if got := byName["tse"].Scripts; got != nil {
+		t.Errorf("a profile with no spec.scripts rendered scripts %+v", got)
+	}
+}
+
 // The cross-module fixtures: the identity map with the dispatcher in it,
 // which the callout suite runs a real server against, and the dispatch
 // config, which lib decodes and validates.
 func TestRenderedDispatcherFixtures(t *testing.T) {
 	withDispatcher(t)
+	// The flag-off render: the callout's dispatcher contract suite runs a
+	// real server against these grants (the bucketed render has its own
+	// fixture).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	// With the operator, whose durable grants come with the dispatcher.
 	withOperatorBusPrincipal(t)
 	agent := authMapTestAgent()
 	tse := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
+		p.Spec.Scripts = []agentv1alpha1.AgentProfileScript{{Name: "stall-watch", Path: agentv1alpha1.AgentProfileScriptRoot + "stall_watch.py", TimeoutSeconds: 300}}
 	})
 	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{tse})
 	checkFixture(t, dispatcherMapFixturePath, cm.Data[a2aAuthMapKey])
@@ -692,4 +736,65 @@ func TestARepairedSigningKeyRollsTheDispatcher(t *testing.T) {
 	if after := hash(); after == before {
 		t.Errorf("the signing key was repaired and the dispatcher's pod template didn't change (%s)", after)
 	}
+}
+
+// dispatcherGrantsGoldenPath is the per-profile half of the dispatcher's
+// grants at a small N, as the operator spells it with the bucketed-grants
+// flag off. lib.DispatcherGrants checks the same file
+// (a2a/lib/dispatchgrants_test.go): lib is the one spelling with the flag on
+// (#5381), and this module can't import it, so the file is what holds the
+// two spellings equal until the flag-off render is deleted.
+const dispatcherGrantsGoldenPath = "../../../a2a/lib/testdata/dispatcher-grants-golden.json"
+
+type dispatcherGrantsGoldenProfile struct {
+	Name     string   `json:"name"`
+	Tiers    []string `json:"tiers,omitempty"`
+	Draining bool     `json:"draining,omitempty"`
+}
+
+type dispatcherGrantsGolden struct {
+	Profiles  []dispatcherGrantsGoldenProfile `json:"profiles"`
+	Publish   []string                        `json:"publish"`
+	Subscribe []string                        `json:"subscribe"`
+}
+
+func TestDispatcherGrantsGoldenFixture(t *testing.T) {
+	agent := a2aTestAgent()
+	golden := dispatcherGrantsGolden{Profiles: []dispatcherGrantsGoldenProfile{
+		{Name: "alpha", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}},
+		{Name: "beta", Tiers: []string{agentv1alpha1.AgentProfileTierRead}},
+		{Name: "gone", Draining: true},
+	}}
+	var names, durables []string
+	for _, p := range golden.Profiles {
+		names = append(names, p.Name)
+		for _, tier := range p.Tiers {
+			for _, kind := range a2aSubmitKinds {
+				durables = append(durables, profileDurableName(p.Name, tier, kind))
+			}
+		}
+	}
+	fixed := dispatcherIdentity(agent, agent.Namespace, nil, nil)
+	full := dispatcherIdentity(agent, agent.Namespace, names, durables)
+	golden.Publish = without(full.publish, fixed.publish)
+	golden.Subscribe = without(full.subscribe, fixed.subscribe)
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(golden); err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, dispatcherGrantsGoldenPath, buf.String())
+}
+
+// without is s with every element of drop removed, in s's order.
+func without(s, drop []string) []string {
+	out := []string{}
+	for _, x := range s {
+		if !slices.Contains(drop, x) {
+			out = append(out, x)
+		}
+	}
+	return out
 }

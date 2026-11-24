@@ -2,7 +2,7 @@ Subject: Propose changes as a pull request instead of naming write tools
 
 Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
 Local-Issue: #3185
-Upstream-Issue: none (specific to this repository)
+Eval-Case: scale-request-proposes-pr
 Retire-When: never; kube-agents proposes every change as a pull request
 
 diff --git a/SKILL.md b/SKILL.md

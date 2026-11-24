@@ -1,9 +1,11 @@
 package dispatch
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -77,5 +79,128 @@ func TestTwoProfilesSharingATaskIDEachStoreTheirTerminal(t *testing.T) {
 	}
 	if n := stored("tse"); n != 1 {
 		t.Errorf("a repeat terminal for the same task was stored again: %d stored", n)
+	}
+}
+
+// Under the operator's switch (DispatchConfig.ProfileSupervisorForm, #5301)
+// the terminal goes on the profile's six-token supervisor subject, and the
+// gateway's agreement still takes it; without the switch it stays on the
+// five-token one.
+func TestTheTerminalTakesTheConfiguredSupervisorForm(t *testing.T) {
+	for _, tc := range []struct {
+		form, want string
+	}{
+		{"", lib.TaskSupervisorSubject("tse", "task-form")},
+		{lib.ProfileSupervisorFormProfile, lib.ProfileSupervisorSubject("tse", "task-form")},
+	} {
+		t.Run("form="+tc.form, func(t *testing.T) {
+			b := newBus(t, "tse-0")
+			b.ensure("tse", 2, 0, "read")
+			got := make(chan *nats.Msg, 4)
+			sub, err := b.admin.ChanSubscribe("a2a.tasks.>", got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sub.Unsubscribe() })
+			ti := oneProfile("tse", 2, "tse-0")
+			ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = tc.form })
+			b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+			b.submitWith("tse", "read", lib.SubmitKindTop, "task-form", "", map[string]string{})
+			deadline := time.After(15 * time.Second)
+			for {
+				select {
+				case msg := <-got:
+					if !lib.IsTaskSupervisorSubject(msg.Subject, "tse", "task-form") {
+						continue
+					}
+					if msg.Subject != tc.want {
+						t.Fatalf("terminal on %q, want %q", msg.Subject, tc.want)
+					}
+					env, err := lib.ParseEnvelope(msg.Data)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := lib.CheckSubjectAgreement(msg.Subject, env, gateway.SupervisorAgreement(nil)); err != nil {
+						t.Errorf("the gateway refuses the dispatcher's terminal on %q: %v", msg.Subject, err)
+					}
+					return
+				case <-deadline:
+					t.Fatal("no terminal on a supervisor subject")
+				}
+			}
+		})
+	}
+}
+
+// A dispatcher switched to the six-token form whose connection is refused it
+// (a grant that hasn't reached it, or a partial rollback, #5301) writes the
+// terminal on the five-token form instead, which readers also watch, and
+// counts it, rather than retrying without end while the task holds its slot.
+func TestARefusedSixTokenTerminalFallsBackToTheFiveTokenForm(t *testing.T) {
+	b := newBusWith(t, []*natsserver.User{{Username: "disp-nosix", Password: dispPass, Permissions: &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"a2a.tasks." + lib.TaskProfileSupervisorToken + ".>"}}}}}, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	got := make(chan *nats.Msg, 8)
+	sub, err := b.admin.ChanSubscribe("a2a.tasks.>", got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	var g grantSwitch
+	g.set("disp-nosix")
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
+	d, _ := b.runPrepared(b.connectAs(&g), testConfig(), ti, &fakeVerifier{}, nil)
+	b.submitWith("tse", "read", lib.SubmitKindTop, "task-fallback", "", map[string]string{})
+	deadline := time.After(30 * time.Second)
+	for {
+		select {
+		case msg := <-got:
+			if !lib.IsTaskSupervisorSubject(msg.Subject, "tse", "task-fallback") {
+				continue
+			}
+			if msg.Subject != lib.TaskSupervisorSubject("tse", "task-fallback") {
+				t.Fatalf("terminal on %q, want the five-token fallback", msg.Subject)
+			}
+			if n := d.Health().SupervisorFallbacks; n < 1 {
+				t.Errorf("SupervisorFallbacks = %d, want the fallback counted", n)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no terminal: the refused six-token write was not fallen back from")
+		}
+	}
+}
+
+// The held-task path (publishTerminalRetry) gives a terminal a short deadline.
+// A refused six-token publish draws no ack and waits that deadline out, so the
+// five-token fallback must not inherit it, or it fails at once and the task is
+// retried without end (#5301).
+func TestTheFallbackDoesNotInheritAnExpiredDeadline(t *testing.T) {
+	b := newBusWith(t, []*natsserver.User{{Username: "disp-nosix", Password: dispPass, Permissions: &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"a2a.tasks." + lib.TaskProfileSupervisorToken + ".>"}}}}}, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	var g grantSwitch
+	g.set("disp-nosix")
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
+	d, _ := b.runPrepared(b.connectAs(&g), testConfig(), ti, &fakeVerifier{}, nil)
+	ctx, cancel := context.WithTimeout(b.ctx, 2*time.Second)
+	defer cancel()
+	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-held"}
+	sub := submissionEnv(t, "tse", "task-held", "", map[string]string{})
+	if err := d.publishTerminal(ctx, hk, sub, lib.StateFailed, ReasonNoWorker, ""); err != nil {
+		t.Fatalf("a held task's terminal under a short deadline: %v; the fallback inherited the expired context", err)
+	}
+	info, err := b.js.Stream(b.ctx, "TASKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	si, err := info.Info(b.ctx, jetstream.WithSubjectFilter(lib.TaskSupervisorSubject("tse", "task-held")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if si.State.Subjects[lib.TaskSupervisorSubject("tse", "task-held")] != 1 {
+		t.Errorf("the five-token fallback terminal wasn't stored: %v", si.State.Subjects)
 	}
 }

@@ -2,7 +2,7 @@ Subject: keep deletion protection on in the Terraform example
 
 Why: the Terraform example set `deletion_protection = false` "for testing", and a new cluster written on a Terraform repository came out with protection off in 4 of 5 lane runs on #3691, one of them "for easier lifecycle evaluation". gcp-terraform forbids turning it off; the example now keeps the provider default.
 Local-Issue: #3727
-Upstream-Issue: none
+Eval-Case: terraform-new-cluster-pr
 Retire-When: upstream's example keeps deletion protection on
 
 diff --git a/references/iac-usage.md b/references/iac-usage.md

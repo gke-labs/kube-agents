@@ -1,0 +1,468 @@
+"""The eval job runs every matrix through the inject door.
+
+`hack/ci-eval-pr.sh` exports `AGENT_TRANSPORT=inject` and the door's bearer
+token, read from the Secret the operator renders beside the door, on every
+run: every install runs the A2A stack, so there is no lane that grades over
+the agent API. EVAL_MODE_NEXT, the flag that once chose the door, is read
+nowhere, and EVAL_ROLLBACK_LANE, the flag that once named the lane that rolled
+an install back before grading it, appears nowhere. Section 4 is run against
+a stubbed `kubectl` with the flag in several spellings, unset included, and
+checked for the exact Secret and key the operator writes and the harness reads
+-- three sources that have to agree on two strings, held together here rather
+than in three places by hand. The recorder's decision and the record step are
+run the same way: a run on main records, under the version key's `next` mode.
+
+Lifted from the shipped script and run under bash, the way
+tests/test_ci_deploy_a2a_stack.py does for the deploy, rather than grepped: a
+guard that greps passes for a section someone has commented out.
+"""
+
+import base64
+import pathlib
+import re
+import subprocess
+import tempfile
+import textwrap
+import unittest
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_CI_EVAL = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
+_A2A_MANIFESTS = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
+_HARNESS = _REPO_ROOT / "bench" / "kube_agents_bench" / "harness.py"
+
+_SECTION = (r"^# 4\. Token & Model Configuration\n.*?", r"^export JUDGE_API_KEY=")
+# The retired flag, in the spellings a job environment could still carry.
+_FLAG_SPELLINGS = (None, "", "0", "1", "true", "yes")
+_NAMESPACE = "kubeagents-system"
+_AGENT_TOKEN = "agent-api-key"
+_INJECT_TOKEN = "door-bearer-token"
+_A2A_DOOR_TOKEN = "a2a-door-bearer-token-never-echoed"
+
+# What kubectl prints when it cannot reach the API server, and for an absent Secret.
+_CONNECTION_ERROR = "Unable to connect to the server: net/http: TLS handshake timeout"
+_NOT_FOUND_ERROR = "Error from server (NotFound): secrets not found"
+
+# A kubectl that answers the two Secret reads the section makes, with the
+# encoded values the real API returns for a jsonpath into .data, and records
+# every call. `<NAME>_READ_FAILURES=n` makes the first n reads of that Secret
+# fail as a connection error does; the count is in a file, because each read
+# runs in a subshell. An absent Secret is what kubectl makes of it: a read that
+# succeeds with no output when the call has `--ignore-not-found`, and a
+# NotFound error with exit 1 when it does not. `sleep` only records.
+_KUBECTL_STUB = textwrap.dedent(
+    f"""\
+    sleep() {{ echo "SLEEP $*" >&2; }}
+    absent() {{
+      case "$*" in *" --ignore-not-found "*) return 0 ;; esac
+      echo "{_NOT_FOUND_ERROR}" >&2
+      return 1
+    }}
+    fails_first() {{
+      local limit_name="$1_READ_FAILURES" count_file="${{READ_COUNT_DIR}}/$1" count=0
+      local limit="${{!limit_name:-0}}"
+      [ ! -f "${{count_file}}" ] || count="$(cat "${{count_file}}")"
+      echo "$((count + 1))" > "${{count_file}}"
+      [ "${{count}}" -ge "${{limit}}" ] || {{ echo "{_CONNECTION_ERROR}" >&2; return 1; }}
+    }}
+    kubectl() {{
+      echo "KUBECTL $*" >&2
+      case "$*" in
+        *"secret platform-agent-secrets "*) fails_first AGENT || return 1; [ -z "${{AGENT_SECRET_MISSING:-}}" ] || {{ absent "$@"; return; }}; [ -z "${{AGENT_KEY_EMPTY:-}}" ] || return 0; printf '%s' '{base64.b64encode(_AGENT_TOKEN.encode()).decode()}' ;;
+        *"secret platform-agent-a2a-inject "*) fails_first INJECT || return 1; [ -z "${{INJECT_SECRET_MISSING:-}}" ] || {{ absent "$@"; return; }}; printf '%s' '{base64.b64encode(_INJECT_TOKEN.encode()).decode()}' ;;
+        *"secret platform-agent-a2a-door "*) [ -n "${{DOOR_SECRET_MISSING:-}}" ] && return 1; printf '%s' '{base64.b64encode(_A2A_DOOR_TOKEN.encode()).decode()}' ;;
+        *) echo "unexpected kubectl call: $*" >&2; return 1 ;;
+      esac
+    }}
+    """
+)
+
+
+def text(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def section() -> str:
+    match = re.search(rf"{_SECTION[0]}(?={_SECTION[1]})", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
+    if match is None:  # pragma: no cover - a re-banner should say so loudly
+        raise AssertionError(f"section 4 not found in {_CI_EVAL} between {_SECTION}")
+    return match.group(0)
+
+
+def constants_block() -> str:
+    return "\n".join(line for line in text(_CI_EVAL).splitlines() if line.startswith("readonly "))
+
+
+def lifted_between(start: str, stop: str, what: str) -> str:
+    """The text from the first line equal to `start` through the first line
+    equal to `stop` after it, both included."""
+    lines = text(_CI_EVAL).splitlines()
+    for index, line in enumerate(lines):
+        if line == start:
+            for end in range(index, len(lines)):
+                if lines[end] == stop:
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"{what} not found in {_CI_EVAL}")
+
+
+def recorder_decision() -> str:
+    """EVAL_IS_MAIN_RUN, decided above the fan-out: the JOB_TYPE case and the
+    overrides after it, through the GitLab lane's."""
+    lines = text(_CI_EVAL).splitlines()
+    start = lines.index('case "${JOB_TYPE:-}" in')
+    for end in range(start, len(lines) - 2):
+        if (
+            lines[end] == 'if [ "${EVAL_FORGE:-github}" != "github" ]; then'
+            and lines[end + 1] == '  EVAL_IS_MAIN_RUN="false"'
+            and lines[end + 2] == "fi"
+        ):
+            return "\n".join(lines[start : end + 3])
+    raise AssertionError(f"the recorder decision not found in {_CI_EVAL}")
+
+
+def publisher_gate() -> str:
+    """publish_eval_dashboard(), as written."""
+    match = re.search(r"^publish_eval_dashboard\(\) \{\n.*?^\}$", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"publish_eval_dashboard() not found in {_CI_EVAL}")
+    return match.group(0)
+
+
+def recorder_step_message() -> str:
+    """The record step after the fan-out: the if/elif/else that either
+    records or says why it did not."""
+    return lifted_between('if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then', "fi", "the record step")
+
+
+def constants() -> dict[str, str]:
+    found = {}
+    for line in text(_CI_EVAL).splitlines():
+        match = re.match(r"readonly ([A-Z0-9_]+)=(.*)$", line)
+        if match:
+            found[match.group(1)] = match.group(2).strip("\"'")
+    return found
+
+
+def python_constant(name: str) -> str:
+    match = re.search(rf'^{name}\s*=\s*"([^"]*)"', text(_HARNESS), re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"{name} not found in {_HARNESS}")
+    return match.group(1)
+
+
+def go_constant(name: str) -> str:
+    match = re.search(rf'^\s*{name}\s*=\s*"([^"]+)"', text(_A2A_MANIFESTS), re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"{name} not found in {_A2A_MANIFESTS}")
+    return match.group(1)
+
+
+def flag_lines(mode_next: str | None) -> list[str]:
+    return [] if mode_next is None else [f'export EVAL_MODE_NEXT="{mode_next}"']
+
+
+def run_section(
+    mode_next: str | None,
+    secret_missing: bool = False,
+    door_secret_missing: bool = False,
+    read_failures: dict[str, int] | None = None,
+    agent_secret: str = "",
+) -> subprocess.CompletedProcess:
+    """`agent_secret` is "" for a Secret with its key, or `AGENT_SECRET_MISSING` or `AGENT_KEY_EMPTY`."""
+    with tempfile.TemporaryDirectory() as count_dir:
+        return _run_section(mode_next, secret_missing, door_secret_missing, read_failures or {}, agent_secret, count_dir)
+
+
+def _run_section(
+    mode_next: str | None,
+    secret_missing: bool,
+    door_secret_missing: bool,
+    read_failures: dict[str, int],
+    agent_secret: str,
+    count_dir: str,
+) -> subprocess.CompletedProcess:
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f'export READ_COUNT_DIR="{count_dir}"',
+            *(f'export {name}_READ_FAILURES="{count}"' for name, count in read_failures.items()),
+            f'export {agent_secret}="1"' if agent_secret else "",
+            # "Not exported by the test" has to mean unset, not whatever the
+            # shell running the tests happens to export: the retired flags,
+            # and the three variables the section exports, which a developer
+            # who drove the door by hand has in their shell.
+            "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE AGENT_TRANSPORT AGENT_INJECT_TOKEN AGENT_A2A_DOOR_TOKEN",
+            f'export TARGET_NAMESPACE="{_NAMESPACE}"',
+            'export AGENT_SERVICE_NAME="platform-agent"',
+            *flag_lines(mode_next),
+            'export INJECT_SECRET_MISSING="1"' if secret_missing else "",
+            'export DOOR_SECRET_MISSING="1"' if door_secret_missing else "",
+            _KUBECTL_STUB,
+            constants_block(),
+            section(),
+            'echo "TOKEN=${PLATFORM_AGENT_TOKEN:-<unset>}"',
+            'echo "TRANSPORT=${AGENT_TRANSPORT:-<unset>}"',
+            'echo "INJECT_TOKEN=${AGENT_INJECT_TOKEN:-<unset>}"',
+            '[ -n "${AGENT_A2A_DOOR_TOKEN:-}" ] && echo "DOOR_TOKEN_SET=1" || echo "DOOR_TOKEN_SET=0"',
+            '[ "${AGENT_A2A_DOOR_TOKEN:-}" = "' + _A2A_DOOR_TOKEN + '" ] && echo "DOOR_TOKEN_OK=1" || echo "DOOR_TOKEN_OK=0"',
+        ]
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+
+def exported(result: subprocess.CompletedProcess) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line and not line.startswith("EVAL_MODE_NEXT"))
+
+
+def kubectl_calls(result: subprocess.CompletedProcess) -> list[str]:
+    return [line.removeprefix("KUBECTL ") for line in result.stderr.splitlines() if line.startswith("KUBECTL ")]
+
+
+def error_lines(result: subprocess.CompletedProcess) -> list[str]:
+    """The script's own ERROR lines, not the stub's echo of a kubectl call."""
+    return [line for line in result.stderr.splitlines() if line.startswith("ERROR:")]
+
+
+def waits(result: subprocess.CompletedProcess) -> list[str]:
+    return [line.removeprefix("SLEEP ") for line in result.stderr.splitlines() if line.startswith("SLEEP ")]
+
+
+class EveryRunGoesThroughTheDoorTest(unittest.TestCase):
+    def test_the_matrix_runs_through_the_door_with_its_token_whatever_the_flag_says(self) -> None:
+        for value in _FLAG_SPELLINGS:
+            with self.subTest(EVAL_MODE_NEXT=value):
+                result = run_section(value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                out = exported(result)
+                self.assertEqual(out["TOKEN"], _AGENT_TOKEN, "the agent token is still fetched")
+                self.assertEqual(out["TRANSPORT"], "inject")
+                self.assertEqual(out["INJECT_TOKEN"], _INJECT_TOKEN)
+                calls = kubectl_calls(result)
+                self.assertEqual(len(calls), 3, calls)
+                # No `--ignore-not-found` on this read: with it, an absent Secret goes on with an empty token.
+                self.assertEqual(calls[0], f"get secret platform-agent-secrets -n {_NAMESPACE} -o jsonpath={{.data.API_SERVER_KEY}}")
+                self.assertEqual(
+                    calls[1],
+                    f"get secret platform-agent-a2a-inject -n {_NAMESPACE} --ignore-not-found -o jsonpath={{.data.token}}",
+                )
+                self.assertEqual(waits(result), [], "a read that succeeds is not tried again")
+
+    def test_the_retired_flags_are_read_nowhere(self) -> None:
+        """EVAL_MODE_NEXT once chose the door over the agent API and
+        EVAL_ROLLBACK_LANE named the lane that rolled an install back before
+        grading it. Neither is read on any line that is not a comment: a Prow
+        job that still exports the first is ignored, and nothing keys on the
+        second. The one comment naming the first is the one that says so."""
+        script = text(_CI_EVAL)
+        reads = re.findall(r"^[^#\n]*\$\{?(EVAL_MODE_NEXT|EVAL_ROLLBACK_LANE)\b", script, re.MULTILINE)
+        self.assertEqual(reads, [])
+        self.assertNotIn("EVAL_ROLLBACK_LANE", script)
+        self.assertNotIn("rollback-roundtrip", script)
+        self.assertNotIn("run_rollback_", script)
+        for block in (publisher_gate(), recorder_decision(), recorder_step_message()):
+            self.assertNotIn("EVAL_MODE_NEXT", block)
+            self.assertIn(block, script)
+
+    def test_the_a2a_doors_token_is_exported_for_the_card_wait_stopped_ask(self) -> None:
+        """Only the card-wait stopped ask goes through the A2A door (#5407). Its
+        token is the third Secret the section reads, exported for the harness
+        and never printed."""
+        result = run_section(None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = exported(result)
+        calls = kubectl_calls(result)
+        self.assertEqual(calls[2], f"get secret platform-agent-a2a-door -n {_NAMESPACE} -o jsonpath={{.data.token}}")
+        self.assertEqual((out["DOOR_TOKEN_SET"], out["DOOR_TOKEN_OK"]), ("1", "1"))
+        self.assertNotIn(_A2A_DOOR_TOKEN, result.stdout + result.stderr)
+
+    def test_a_missing_a2a_door_secret_warns_and_runs_on(self) -> None:
+        """Without the door's token that one case is infrastructure, not the run."""
+        result = run_section(None, door_secret_missing=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = exported(result)
+        self.assertEqual(out["TRANSPORT"], "inject")
+        self.assertEqual(out["DOOR_TOKEN_SET"], "0")
+        self.assertIn("platform-agent-a2a-door", result.stderr)
+
+    def test_the_a2a_door_secret_names_are_the_operators_and_the_harnesss(self) -> None:
+        c = constants()
+        self.assertEqual(c["EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX"], "-a2a-door")
+        # The operator names the door's Secret with a2aDoorName.
+        self.assertIn('return agent.Name + "-a2a-door"', text(_A2A_MANIFESTS))
+        self.assertEqual(c["EVAL_A2A_DOOR_TOKEN_SECRET_KEY"], "token")
+
+    def test_the_inject_tunnels_base_is_the_harnesss_variable_and_clear_of_the_api_range(self) -> None:
+        """The harness owns one port-forward per process and tears it down at
+        exit, which is why run_one_unit gives each unit its own agent-API port;
+        the inject door reads a different variable, so it needs the same
+        treatment or every unit rides the first one's listener. That the unit
+        exports it, per unit, is run rather than read in
+        scripts/test_ci_eval_fanout.py (the fan-out's own suite, which runs
+        run_one_unit); what is pinned here is the name the harness reads and
+        the base the export is built from."""
+        harness = text(_HARNESS)
+        self.assertIn('"AGENT_INJECT_LOCAL_PORT"', harness)
+        base = int(constants()["EVAL_INJECT_LOCAL_PORT_BASE"])
+        default = int(re.search(r"^_INJECT_DEFAULT_LOCAL_PORT = (\d+)$", harness, re.MULTILINE).group(1))
+        self.assertNotEqual(base, default, "a base equal to the harness default hides a unit that lost the export")
+        # The two per-unit ranges cannot meet for any seq the matrix can reach.
+        self.assertGreater(abs(base - 28642), 400)
+
+    def test_a_missing_token_secret_stops_the_run_before_the_matrix(self) -> None:
+        result = run_section(None, secret_missing=True)
+        self.assertNotEqual(result.returncode, 0)
+        errors = error_lines(result)
+        self.assertEqual(len(errors), 1, result.stderr)
+        self.assertIn("platform-agent-a2a-inject", errors[0])
+        self.assertIn("missing or empty", errors[0])
+        self.assertNotIn("EVAL_MODE_NEXT", errors[0])
+        self.assertNotIn("TRANSPORT=", result.stdout)
+        # The API server answered, so the read is not tried again.
+        self.assertEqual(waits(result), [])
+        self.assertEqual(len(kubectl_calls(result)), 2, result.stderr)
+
+    def test_the_secret_and_transport_names_are_the_operators_and_the_harnesss(self) -> None:
+        consts = constants()
+        self.assertEqual(consts["EVAL_INJECT_TRANSPORT"], python_constant("TRANSPORT_INJECT"))
+        self.assertEqual(consts["EVAL_INJECT_TOKEN_SECRET_SUFFIX"], python_constant("_INJECT_TOKEN_SECRET_SUFFIX"))
+        self.assertEqual(consts["EVAL_INJECT_TOKEN_SECRET_KEY"], python_constant("_INJECT_TOKEN_SECRET_KEY"))
+        self.assertEqual(consts["EVAL_INJECT_TOKEN_SECRET_KEY"], go_constant("a2aInjectTokenKey"))
+        self.assertRegex(
+            text(_A2A_MANIFESTS),
+            rf'func a2aInjectName\(.*\) string\s*{{\s*return agent\.Name \+ "{re.escape(consts["EVAL_INJECT_TOKEN_SECRET_SUFFIX"])}"',
+        )
+        # The harness reads the token from AGENT_INJECT_TOKEN and the switch from AGENT_TRANSPORT.
+        harness = text(_HARNESS)
+        self.assertIn('os.environ.get("AGENT_INJECT_TOKEN", "")', harness)
+        self.assertIn('os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)', harness)
+        block = section()
+        self.assertIn("export AGENT_INJECT_TOKEN", block)
+        self.assertIn('export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"', block)
+        # Unconditionally: no `if` stands between the section's header and the export.
+        self.assertNotIn("\nif ", block.split("export AGENT_INJECT_TOKEN")[0].split("EVAL_INJECT_TOKEN_SECRET=")[0])
+
+
+class ASecretReadThatFailsTest(unittest.TestCase):
+    """A connection error to the API server is a failure of the read, not a state
+    of the install. One such error ended a nightly lane after its deploy, with a
+    message that the Secret was missing (#6633)."""
+
+    SECRETS = (("AGENT", "platform-agent-secrets"), ("INJECT", "platform-agent-a2a-inject"))
+
+    def test_a_read_that_fails_one_time_is_tried_again_and_the_run_goes_on(self) -> None:
+        c = constants()
+        for name, secret in self.SECRETS:
+            with self.subTest(secret=secret):
+                result = run_section(None, read_failures={name: 1})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                out = exported(result)
+                self.assertEqual((out["TOKEN"], out["INJECT_TOKEN"], out["TRANSPORT"]), (_AGENT_TOKEN, _INJECT_TOKEN, "inject"))
+                self.assertEqual(sum(f"secret {secret} " in call for call in kubectl_calls(result)), 2)
+                self.assertEqual(waits(result), [c["EVAL_SECRET_READ_RETRY_SECONDS"]])
+                self.assertEqual(error_lines(result), [])
+                self.assertIn(_CONNECTION_ERROR, result.stderr)
+
+    def test_a_read_that_always_fails_says_that_the_read_failed(self) -> None:
+        c = constants()
+        attempts = int(c["EVAL_SECRET_READ_ATTEMPTS"])
+        for name, secret in self.SECRETS:
+            with self.subTest(secret=secret):
+                result = run_section(None, read_failures={name: attempts})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(sum(f"secret {secret} " in call for call in kubectl_calls(result)), attempts)
+                self.assertEqual(len(waits(result)), attempts - 1, "no wait after the last try")
+                errors = error_lines(result)
+                self.assertEqual(len(errors), 1, result.stderr)
+                self.assertIn(f"the read of Secret {secret} ", errors[0])
+                self.assertIn(f"failed {attempts} times", errors[0])
+                # The Secret was not read, so the message does not say what the install has.
+                self.assertNotIn("missing or empty", result.stderr)
+                # The error of kubectl is in the log, above the message.
+                self.assertLess(result.stderr.index(_CONNECTION_ERROR), result.stderr.index(errors[0]))
+                self.assertNotIn("TRANSPORT=", result.stdout)
+
+
+    def test_an_absent_agent_secret_is_still_the_end_of_the_run(self) -> None:
+        result = run_section(None, agent_secret="AGENT_SECRET_MISSING")
+        self.assertNotEqual(result.returncode, 0)
+        errors = error_lines(result)
+        self.assertEqual(len(errors), 1, result.stderr)
+        self.assertIn("the read of Secret platform-agent-secrets ", errors[0])
+        # The message names no cause; the error of kubectl above it does.
+        self.assertLess(result.stderr.index(_NOT_FOUND_ERROR), result.stderr.index(errors[0]))
+        self.assertNotIn("not a state of the install", result.stderr)
+        self.assertNotIn("TOKEN=", result.stdout)
+
+    def test_an_agent_secret_with_an_empty_key_goes_on_as_before(self) -> None:
+        result = run_section(None, agent_secret="AGENT_KEY_EMPTY")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = exported(result)
+        self.assertEqual((out["TOKEN"], out["INJECT_TOKEN"]), ("<unset>", _INJECT_TOKEN))
+        self.assertEqual(waits(result), [])
+
+
+class RecordsUnderTheNextKeyTest(unittest.TestCase):
+    """A run on main appends: `bench-gate` files its lines under the version
+    key's `next` mode, the one mode a run grades. Main-branch job types record,
+    a release candidate and a pull request do not, and the retired flags change
+    none of it."""
+
+    def decide(self, mode_next: str | None, job_type: str, rc: str = "") -> str:
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE JOB_TYPE RC_COMMIT_SHA PULL_NUMBER EVAL_FORGE",
+                *flag_lines(mode_next),
+                f'export JOB_TYPE="{job_type}"',
+                f'export RC_COMMIT_SHA="{rc}"',
+                recorder_decision(),
+                'echo "MAIN=${EVAL_IS_MAIN_RUN}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().removeprefix("MAIN=")
+
+    def test_main_branch_job_types_record_whatever_the_flag_says(self) -> None:
+        for value in _FLAG_SPELLINGS:
+            with self.subTest(EVAL_MODE_NEXT=value):
+                self.assertEqual(self.decide(value, "periodic"), "true")
+                self.assertEqual(self.decide(value, "postsubmit"), "true")
+                self.assertEqual(self.decide(value, "presubmit"), "false")
+                self.assertEqual(self.decide(value, ""), "false")
+                self.assertEqual(self.decide(value, "periodic", rc="abc1234"), "false")
+
+    def test_the_record_step_records_on_main_and_says_why_it_did_not_elsewhere(self) -> None:
+        """The record step's else-chain, run with the recorder stubbed: a
+        periodic on main records; a presubmit keeps the line PULL_NUMBER
+        earned it; a release candidate names itself."""
+        for job_type, pull, rc, expect_record, expect_line in (
+            ("periodic", "", "", True, "Recording baseline evidence from main"),
+            ("postsubmit", "", "", True, "Recording baseline evidence from main"),
+            ("presubmit", "1686", "", False, "Not a main-branch recorder run (JOB_TYPE=presubmit)"),
+            ("periodic", "", "abc1234", False, "Release-candidate run (RC_COMMIT_SHA=abc1234)"),
+        ):
+            with self.subTest(JOB_TYPE=job_type, PULL_NUMBER=pull, RC_COMMIT_SHA=rc):
+                script = "\n".join(
+                    [
+                        "set -euo pipefail",
+                        "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE RC_COMMIT_SHA PULL_NUMBER EVAL_FORGE EVAL_REASONING_EFFORT",
+                        f'export JOB_TYPE="{job_type}"',
+                        "" if not pull else f'export PULL_NUMBER="{pull}"',
+                        "" if not rc else f'export RC_COMMIT_SHA="{rc}"',
+                        'BENCH_DIR="." ARTIFACT_DIR="." EVAL_RECORD_COMMIT="" EVAL_RECORDED_MANIFEST="./manifest"',
+                        "CASE_RESULTS=(./case-a.json)",
+                        'uv() { echo "UV $*"; }',
+                        recorder_decision(),
+                        recorder_step_message(),
+                    ]
+                )
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(expect_line, result.stdout)
+                self.assertEqual("UV run bench-gate record" in result.stdout, expect_record, result.stdout)
+        self.assertNotIn("Today-lane run", recorder_step_message())
+
+
+if __name__ == "__main__":
+    unittest.main()

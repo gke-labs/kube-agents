@@ -97,7 +97,8 @@ def _write(audit: str, *, issue_url: str | None, issue_number: int | None, writt
 
 def _verify(reply: str, audits=(COMPLIANCE, COST)):
     transcript.set(output=reply, final_message=reply, trajectory=[], started_at=STARTED)
-    return ReportStoreReplyVerifier(type="report_store_reply", audits=list(audits)).verify(1.0)
+    # A zero budget is one pass, and each read of it gets the library's 30-second floor.
+    return ReportStoreReplyVerifier(type="report_store_reply", audits=list(audits)).verify(0.0)
 
 
 def test_each_audits_ledger_url_passes(root):

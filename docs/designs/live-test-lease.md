@@ -51,13 +51,22 @@ separate holder. The parent-pid fallback is a last resort — it makes the key s
 shell rather than across a session — which is why another harness should set
 `KUBE_AGENTS_LEASE_SESSION` explicitly.
 
-**Not every holder is a person.** The reconcile of `autopush`, `autopush-next` and `staging`
+**Not every holder is a person.** The reconcile of `autopush` and `staging`
 (`scripts/release/reconcile_environment.sh`) takes the same lease before it applies, under
 `KUBE_AGENTS_LEASE_SESSION=gha-<run_id>`, and defers or fails, per its lease policy, rather than
 overwriting an agent's evidence mid-run. So a lease held by `gha-…` is an automated infrastructure
 apply, not a colleague: it releases itself when the run ends, and the run it names is readable in
 the Actions tab. Do not `steal` one — the apply it is protecting is a `terraform apply` against a
 live cluster.
+
+Its release retries (`release --attempts 4 --backoff 10`), keeping the token between attempts, so one
+`kubectl` timeout no longer strands the lease for its TTL. When every attempt fails, the run warns
+and the lease stays held. The next reconcile then takes it over with `takeover`: a compare-and-swap
+that replaces only a lease whose session is exactly that `gha-<run_id>` and whose note is exactly
+`scheduled reconcile of <env>`, after the GitHub API reports that run as completed, in one of the
+workflows that run a reconcile (`scripts/release/reconcile_lease_predecessor.py`). Any other
+holder, a run still going, or an API answer it can't read leaves the lease alone, and the new lease
+records the session it replaced (`takenOverFrom`).
 
 Losing the local token does not lose the install. The record also carries the session id, so the
 hook can tell "another agent holds this" from "you hold this, under a token this machine no longer
@@ -229,7 +238,8 @@ every contributor who has not opted in is in.
   seconds unless a hook asks for more, which is not enough to reach a cluster, and a release that
   never runs strands the lease for its full TTL. Both budgets are asserted against
   `KUBECTL_TIMEOUT` in the tests, because neither failure says anything at the time.
-- **The holder is gone.** Nothing detects that. `steal` goes by the clock alone — it takes over an
+- **The holder is gone.** For a person or an agent, nothing detects that. (A reconcile run is the
+  one exception: its successor checks the run's status, above.) `steal` goes by the clock alone — it takes over an
   expired lease, and refuses an unexpired one without `--force`, so a session that died a minute
   after acquiring holds the install for the rest of its hour unless someone forces it. That is the
   deliberate side to err on: a live holder is an agent mid-test, not a stale lock, and `--force` is

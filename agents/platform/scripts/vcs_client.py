@@ -26,6 +26,7 @@ printed one.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import io
 import json
@@ -130,6 +131,18 @@ SAFE_BARE_REPOSITORY = "safe.bareRepository=explicit"
 # does not answer with a screenful and bury the instruction under it.
 UNTRACKED_FILES_NAMED = 10
 
+DECISION_MEMORY_DIRS = (
+    "knowledge/decision",
+    "knowledge/lesson",
+    "knowledge/decisions",
+    "knowledge/lessons",
+)
+DECISION_MEMORY_SCRIPT_REL = Path("decision-memory/scripts/decision_memory.py")
+DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_MEMORY_VALID_EXIT_CODES = (0, 2)
+DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
+DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
+
 
 class VcsError(RuntimeError):
     """A refusal the caller is meant to read, as JSON on stdout.
@@ -152,7 +165,9 @@ class VcsError(RuntimeError):
         ceiling: int | None = None,
     ):
         super().__init__(message)
-        self.code = code or None
+        # The far side composes a refusal: a `code` that is not a text is no
+        # code. The callers look a code up in a set, which a list cannot enter.
+        self.code = code if isinstance(code, str) and code else None
         self.detail = detail or None
         # The commit the broker read, on a refusal that has one (`PATH_NOT_FOUND`).
         self.revision = revision or None
@@ -174,6 +189,13 @@ class VcsError(RuntimeError):
         return answer
 
 
+class DecisionMemoryBlockedError(VcsError, PermissionError):
+    """Raise when an active Decision Memory guard blocks a change."""
+
+    def __init__(self, message: str, *, detail: str | None = None):
+        super().__init__(message, code=DECISION_MEMORY_BLOCKED, detail=detail)
+
+
 # ---- the broker -----------------------------------------------------------
 
 #: The broker answered and does not route this verb -- an install whose
@@ -188,6 +210,31 @@ BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 #: caller that only wants a hint from the broker tells "no broker here" from a
 #: broker that refused.
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
+
+#: What a caller reads for a 2xx answer that nests deeper than the broker
+#: client's bound (`credential_proxy_client.VcsAnswerTooDeep`). The verb's
+#: request reached the broker, so the text does not say "retry": a caller does
+#: not send a write again without a look.
+ANSWER_TOO_DEEP_TEXT = (
+    "the broker's answer is nested too deep to read; the request reached the broker and may have taken effect"
+)
+
+#: The values of a `publish` answer that must be a text with characters in
+#: it, because they are a key and a value of the working copy's record, and
+#: what a caller reads when one of them is not. The publish was done, so the
+#: text does not say "retry".
+PUBLISH_ANSWER_TEXT_FIELDS = ("branch", "revision")
+PUBLISH_ANSWER_UNUSABLE_TEXT = (
+    "the broker's answer has no usable `{field}`; the request reached the broker and may have taken effect"
+)
+
+#: The values of a `clone` answer that are checked before an existing copy is
+#: removed, and what a caller reads when one of them is not a text with
+#: characters in it, or when the bundle's text does not decode. Each of them
+#: is used after the removal, where a failure leaves a record with no tree.
+CLONE_ANSWER_BUNDLE_FIELD = "bundleBase64"
+CLONE_ANSWER_TEXT_FIELDS = ("branch", "revision", CLONE_ANSWER_BUNDLE_FIELD)
+CLONE_ANSWER_UNUSABLE_TEXT = "the broker's answer has no usable `{field}`; the working copy is as it was"
 
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
 #: when the broker answers it with one: a single compact JSON object on its own
@@ -270,6 +317,8 @@ def call(verb: str, payload: dict, target: dict | None = None) -> dict:
     """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`).
 
     `target` goes on that record only (`TARGET_FIELD`), never to the broker.
+    An answer that the broker client refuses as nested too deep raises before
+    the record: the proposal can be open with no record line.
     """
     answer = _call(verb, payload)
     if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
@@ -316,7 +365,8 @@ def _say_opened(answer: object, claim: object = None, target: dict | None = None
         return
     try:
         print(json.dumps(record, separators=(",", ":")), file=stream, flush=True)
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, RecursionError):
+        # RecursionError: a `target` of the caller that the encoder cannot take.
         pass
 
 
@@ -352,6 +402,8 @@ def _call(verb: str, payload: dict) -> dict:
     except credential_proxy_client.WorkspaceRequestError as exc:
         payload = exc.payload or {}
         code = payload.get("code")
+        if not isinstance(code, str) or not code:
+            code = None
         if code is None and exc.status == 404:
             # This is the version skew, and it is the shape an older broker
             # actually answers with. A credential-proxy that has the `/v1/vcs/`
@@ -427,6 +479,8 @@ def _call(verb: str, payload: dict) -> dict:
             f"answer was complete ({exc}). Retry shortly; if it persists the "
             "broker is restarting under load."
         ) from exc
+    except credential_proxy_client.VcsAnswerTooDeep as exc:
+        raise VcsError(ANSWER_TOO_DEEP_TEXT) from exc
     except ValueError as exc:
         raise VcsError(
             "the broker answered with something that is not JSON; retry, and "
@@ -935,6 +989,19 @@ def clone(
     if branch:
         payload["branch"] = branch
     answer = call("clone", payload)
+    # Read before anything is removed: a `--force` clone takes the existing copy
+    # away, and a value that fails after that leaves a record with no tree.
+    for field in CLONE_ANSWER_TEXT_FIELDS:
+        value = answer.get(field)
+        if not isinstance(value, str) or not value:
+            raise VcsError(CLONE_ANSWER_UNUSABLE_TEXT.format(field=field))
+    try:
+        # `validate`: without it the decoder drops each character that is not base64,
+        # and a text of such characters decodes to no bytes.
+        bundle = base64.b64decode(answer[CLONE_ANSWER_BUNDLE_FIELD], validate=True)
+    except ValueError as exc:
+        # binascii.Error is a ValueError; a text that is not ASCII raises a plain one.
+        raise VcsError(CLONE_ANSWER_UNUSABLE_TEXT.format(field=CLONE_ANSWER_BUNDLE_FIELD)) from exc
 
     # `key` is for the caller that is about to cut a branch this copy is not on
     # yet: `submit-suggestion` clones the base and then switches, and the copy
@@ -956,7 +1023,7 @@ def clone(
     bundle_file = Path(name)
     try:
         with os.fdopen(handle, "wb") as stream:
-            stream.write(base64.b64decode(answer["bundleBase64"]))
+            stream.write(bundle)
         # Cloning from a file gives the copy an `origin` pointing at the bundle.
         # It is removed immediately: a remote is a thing a later command can be
         # talked into fetching from or pushing to, and there is nothing here
@@ -1414,6 +1481,130 @@ def already_published(session: dict, branch: str | None = None) -> bool:
     return (session.get("published") or {}).get(branch) == tip.stdout.strip()
 
 
+def _find_decision_memory_script() -> Path | None:
+    """Locate `decision_memory.py` in a checkout or container image."""
+    candidates = (
+        Path(__file__).resolve().parents[1] / "skills" / DECISION_MEMORY_SCRIPT_REL,
+        Path("/opt/defaults/skills") / DECISION_MEMORY_SCRIPT_REL,
+        Path("/opt/data/skills") / DECISION_MEMORY_SCRIPT_REL,
+        Path("/opt/data/profiles/platform/skills") / DECISION_MEMORY_SCRIPT_REL,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_decision_memory_base(session: dict, ws: Path, base: str) -> str:
+    """Return a revision in `ws` to diff against `HEAD` for Decision Memory checks."""
+    git_bin = LOCAL_GIT if Path(LOCAL_GIT).exists() else "git"
+    for candidate in (base, f"origin/{base}", session.get("baseRevision", "")):
+        if not candidate:
+            continue
+        chk = subprocess.run(
+            [
+                git_bin,
+                "-C",
+                str(ws),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{candidate}^{{commit}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chk.returncode == 0 and chk.stdout.strip():
+            return candidate
+    return session.get("baseRevision") or base
+
+
+def _check_decision_memory(
+    session: dict,
+    base: str,
+    repo: str | None = None,
+    copy_key: str | None = None,
+    *,
+    force: bool = False,
+    log_fn=None,
+) -> dict | None:
+    """Run Decision Memory check on the committed change before publishing."""
+    ws = Path(session["path"])
+    if (
+        not force
+        and not any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS)
+        and not (ws / ".kube-agents" / "intent.yaml").is_file()
+    ):
+        return None
+    dm_script = _find_decision_memory_script()
+    if dm_script is None:
+        return None
+    diff_base = _resolve_decision_memory_base(session, ws, base)
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(dm_script),
+            "--repo",
+            str(ws),
+            "check",
+            "--base",
+            diff_base,
+            "--head",
+            "HEAD",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode not in DECISION_MEMORY_VALID_EXIT_CODES or not res.stdout.strip():
+        detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+        raise VcsError(
+            f"Decision Memory check failed on {ws} (base {diff_base}): {detail}",
+            code=DECISION_MEMORY_CHECK_FAILED,
+        )
+    try:
+        out = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise VcsError(
+            f"Decision Memory check returned invalid JSON: {exc}",
+            code=DECISION_MEMORY_CHECK_FAILED,
+        ) from exc
+    session["decisionMemoryMarkdown"] = (
+        out.get("markdown", "") if out.get("findings") else ""
+    )
+    if session.get("forge") and session.get("repo"):
+        with contextlib.suppress(Exception):
+            save_session(session)
+    if out.get("verdict") == "block":
+        discarded = False
+        if repo and copy_key:
+            with contextlib.suppress(Exception):
+                discard(repo, key=copy_key)
+                discarded = True
+        discard_note = "The working copy has been discarded. " if discarded else ""
+        msg = (
+            "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
+            f"{out.get('markdown', '')}\n\n"
+            f"Do NOT open this Pull Request. {discard_note}"
+            "In your final response (and kanban_complete result), you MUST quote the record IDs "
+            "(DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), Revert/Fix PR (#...), "
+            "and the technical root-cause details from the block above verbatim."
+        )
+        if log_fn is not None:
+            log_fn(msg)
+        raise DecisionMemoryBlockedError(msg, detail=out.get("markdown", ""))
+    elif out.get("findings") and log_fn is not None:
+        log_fn(
+            "DECISION MEMORY CONTEXT (include the record IDs, superseding PR #, and superseded incident/PR # in your final summary):\n"
+            f"{out.get('markdown', '')}"
+        )
+    return out
+
+
+check_decision_memory = _check_decision_memory
+
+
 def publish(
     spec: str | None = None,
     target: str | None = None,
@@ -1507,6 +1698,22 @@ def publish(
             "with `--advance`."
         )
 
+    ws_path = Path(session["path"])
+    base_rev = session.get("baseRevision") or target
+    has_base_dm = False
+    if base_rev:
+        git_bin = LOCAL_GIT if Path(LOCAL_GIT).exists() else "git"
+        probe = subprocess.run(
+            [
+                git_bin, "-C", str(ws_path), "ls-tree", "-r", "--name-only",
+                base_rev, "--", "knowledge", ".kube-agents/intent.yaml",
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        has_base_dm = bool((probe.stdout or "").strip())
+    if has_base_dm or any((ws_path / rel).is_dir() for rel in DECISION_MEMORY_DIRS):
+        _check_decision_memory(session, base_rev, force=has_base_dm)
+
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
     bundle_file = Path(name)
     os.close(handle)
@@ -1523,26 +1730,34 @@ def publish(
                 f"the change is {len(blob)} bytes, over the "
                 f"{MAX_BUNDLE_BYTES}-byte ceiling for one publish"
             )
-        answer = call(
-            "publish",
-            {
-                "repository": session["spec"],
-                "branch": branch,
-                "target": target,
-                "baseRevision": base,
-                "clonedFrom": session["branch"],
-                "advance": advance,
-                "bundleBase64": base64.b64encode(blob).decode("ascii"),
-            },
-        )
+        publish_payload = {
+            "repository": session["spec"],
+            "branch": branch,
+            "target": target,
+            "baseRevision": base,
+            "clonedFrom": session["branch"],
+            "advance": advance,
+            "bundleBase64": base64.b64encode(blob).decode("ascii"),
+        }
+        answer = call("publish", publish_payload)
     finally:
         bundle_file.unlink(missing_ok=True)
+
+    # The record below has the answer's branch as a key and its revision as a
+    # value. One that is not a text, or is empty, cannot go there, and the
+    # record then stays as it was: a made-up name in it is worse than this error.
+    for field in PUBLISH_ANSWER_TEXT_FIELDS:
+        value = answer.get(field)
+        if not isinstance(value, str) or not value:
+            raise VcsError(PUBLISH_ANSWER_UNUSABLE_TEXT.format(field=field))
 
     # The published tip becomes this branch's base. A second publish of the same
     # branch then sends only what came after it, and its ancestry check is
     # against something the remote demonstrably has.
     session.setdefault("published", {})[answer["branch"]] = answer["revision"]
     session["publishedBranch"] = answer["branch"]
+    if answer.get("decisionMemoryMarkdown"):
+        session["decisionMemoryMarkdown"] = str(answer["decisionMemoryMarkdown"])
     save_session(session)
     answer["revisions"] = count
     return answer
@@ -1580,10 +1795,30 @@ def forge(verb: str, payload: dict, repository: str | None = None, target: dict 
     this is, what it calls a change proposal, how to reach its API — is decided
     on the credential side and arrives already translated.
     """
+    payload = dict(payload)
     if repository:
         payload["repository"] = repository
     else:
         payload["repository"] = resolve_session(None)["spec"]
+    if (
+        verb.replace("_", "-") == "proposal-create"
+        and isinstance(payload.get("body"), str)
+        and isinstance(payload.get("source"), str)
+        and payload["source"].strip()
+        and DECISION_MEMORY_HEADING not in payload["body"]
+    ):
+        src_branch = payload["source"].strip()
+        dm_markdown = ""
+        with contextlib.suppress(Exception):
+            sess = resolve_session(payload["repository"], key=src_branch)
+            dm_markdown = str(sess.get("decisionMemoryMarkdown") or "")
+        if not dm_markdown:
+            with contextlib.suppress(Exception):
+                sess = resolve_session(payload["repository"])
+                if sess.get("publishedBranch") == src_branch:
+                    dm_markdown = str(sess.get("decisionMemoryMarkdown") or "")
+        if dm_markdown:
+            payload["body"] = payload["body"].rstrip() + "\n\n" + dm_markdown + "\n"
     sent = {key: value for key, value in payload.items() if value is not None}
     # Only a caller naming a target passes one, so a stand-in for `call` keeps its two arguments.
     return call(verb, sent, target=target) if target else call(verb, sent)

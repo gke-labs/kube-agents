@@ -44,6 +44,10 @@ import upgrade_retrospective as ur  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
 import audit_report  # noqa: E402
 
+# The test-support guards live beside the Platform Agent's shared scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+import no_live_google_auth  # noqa: E402
+
 # The longest identifiers a recorded command can carry in its kubeconfig path
 # under the shipped platform profile: a 30-character project id, a 40-character
 # cluster name, GCP's longest location. A collector's recorded chain is held
@@ -61,14 +65,42 @@ LONGEST_LOCATION = "northamerica-northeast1-a"
 _PAGED_DUMP = mock.patch.object(ur, "paged_dump", _shared_run_tests.paged_dump_over())
 
 
+# `main` opens the gate's Cloud Monitoring session with `default_monitoring_session`, which is
+# `google.auth.default()`. The test requirements hold no google-auth (protobuf is their only
+# Google package), so in CI that import fails and the run goes on with no session. On a machine
+# that has google-auth, the same tests read the developer's credentials and called Cloud
+# Monitoring. Every `main` in this module gets the error CI gives; a test that wants a session
+# passes one to `collect`.
+_NO_MONITORING_SESSION = mock.patch.object(
+    ur, "default_monitoring_session", side_effect=ModuleNotFoundError("No module named 'google.auth'", name="google.auth")
+)
+
+
 def setUpModule():
+    # No test here loads google.auth: an import that a test leaves unstubbed fails as it does in
+    # CI, and fails the module.
+    global _NO_GOOGLE_AUTH
+    _NO_GOOGLE_AUTH = no_live_google_auth.install()
+    _NO_MONITORING_SESSION.start()
     _PAGED_DUMP.start()
 
 
 def tearDownModule():
     _PAGED_DUMP.stop()
+    _NO_MONITORING_SESSION.stop()
+    _NO_GOOGLE_AUTH.uninstall()
 
 ur.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
+
+
+class TestNoLiveGoogleAuth(unittest.TestCase):
+    def test_no_test_in_this_module_can_load_google_auth(self):
+        no_live_google_auth.assert_in_force(self, _NO_GOOGLE_AUTH)
+
+    def test_main_gets_no_monitoring_session(self):
+        with self.assertRaises(ModuleNotFoundError):
+            ur.default_monitoring_session()
+
 
 FIXTURES = Path(__file__).parent / "testdata" / "upgrade_retrospective"
 PROJECT = "example-project"
@@ -1778,6 +1810,55 @@ class OwnerResolutionTest(unittest.TestCase):
         self.assertEqual((resolver.resolve("apps", "Pod", "db-1"), resolver.resolve("apps", "Pod", "web-abcde")), (("Pod", "db-1"), ("Pod", "web-abcde")))
         self.assertEqual((resolver.resolve("apps", "Pod", "db-7"), resolver.resolve("apps", "Pod", "web-zzzzz")), (("StatefulSet", "db"), ("ReplicaSet", "web")))
         self.assertEqual((resolver.pods_of.get("apps/Pod/db-1"), resolver.pods_of.get("apps/Pod/web-abcde"), resolver.pods_of.get("apps/StatefulSet/db")), (["db-1"], ["web-abcde"], ["db-0"]))
+
+    @staticmethod
+    def cut_pod_name(controller, suffix):
+        """The pod name that Kubernetes generates for a long controller name:
+        58 characters of `<controller>-`, then the five."""
+        return f"{controller}-"[:58] + suffix
+
+    @staticmethod
+    def owner(kind, name, parent=None):
+        return {"kind": kind, "metadata": {"name": name, "namespace": "apps", "ownerReferences": [{"kind": parent[0], "name": parent[1]}] if parent else []}}
+
+    def test_a_gone_pod_whose_name_kubernetes_cut(self):
+        """Every pod name here is built by the cut rule (`cut_pod_name`), not typed."""
+        deployment = "d" * 50
+        replica_set = f"{deployment}-55c6d97c65"
+        job, edge_job = "j" * 60, "e" * 58
+        resolver = ur.Resolver([], [self.owner("ReplicaSet", replica_set, ("Deployment", deployment)), self.owner("Job", job), self.owner("Job", edge_job), self.owner("Job", "web")])
+        gone, gone_job, gone_edge = self.cut_pod_name(replica_set, "q5rwx"), self.cut_pod_name(job, "x7k2p"), self.cut_pod_name(edge_job, "x7k2p")
+        self.assertEqual((len(gone), len(gone_job), len(gone_edge)), (63, 63, 63))
+        self.assertEqual(resolver.resolve("apps", "Pod", gone), ("Deployment", deployment))
+        self.assertEqual(resolver.resolve("apps", "Pod", gone_job), ("Job", job))
+        # A name of exactly 58 characters is the first that the generator cuts: no hyphen is left.
+        self.assertEqual((gone_edge, resolver.resolve("apps", "Pod", gone_edge)), (edge_job + "x7k2p", ("Job", edge_job)))
+        # The five characters must be there: a shorter or longer tail is another name.
+        for other in (self.cut_pod_name(job, "x7k2"), self.cut_pod_name(job, "x7k2pz"), self.cut_pod_name(job, "X7K2P")):
+            self.assertEqual(resolver.resolve("apps", "Pod", other), ("Pod", other))
+        # A controller with a short name has no cut form: a 63-character name that starts with
+        # `web-` is not its pod.
+        stranger = "web-" + "z" * 54 + "abcde"
+        self.assertEqual((len(stranger), resolver.resolve("apps", "Pod", stranger)), (63, ("Pod", stranger)))
+        # A StatefulSet names its pods by ordinal, and no generator cuts them.
+        long_set = "s" * 60
+        resolver = ur.Resolver([], [], [self.owner("StatefulSet", long_set)])
+        self.assertEqual(resolver.resolve("apps", "Pod", self.cut_pod_name(long_set, "abcde")), ("Pod", self.cut_pod_name(long_set, "abcde")))
+
+    def test_a_cut_name_that_fits_two_controllers(self):
+        # Two ReplicaSets of one Deployment with a long name: the cut name is
+        # the same for both, and both lead to the same Deployment.
+        deployment = "d" * 57
+        sets = [self.owner("ReplicaSet", f"{deployment}-{pod_hash}", ("Deployment", deployment)) for pod_hash in ("55c6d97c65", "7d9f8b6c54")]
+        resolver = ur.Resolver([], sets)
+        gone = self.cut_pod_name(f"{deployment}-55c6d97c65", "q5rwx")
+        self.assertEqual(gone, self.cut_pod_name(f"{deployment}-7d9f8b6c54", "q5rwx"))
+        self.assertEqual(resolver.resolve("apps", "Pod", gone), ("Deployment", deployment))
+        # Two Jobs whose names differ only after character 58: nothing in the
+        # cut name says which one the pod was, so it is charged to neither.
+        resolver = ur.Resolver([], [self.owner("Job", "j" * 58 + tail) for tail in ("-a", "-b")])
+        gone = self.cut_pod_name("j" * 58 + "-a", "x7k2p")
+        self.assertEqual(resolver.resolve("apps", "Pod", gone), ("Pod", gone))
 
     def test_a_node_owned_mirror_pod_stays_a_pod(self):
         # A static pod's mirror (`kube-proxy-<node>`) is owned by its Node, which controls nothing: it

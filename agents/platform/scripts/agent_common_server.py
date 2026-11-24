@@ -57,6 +57,13 @@ DOTENV_PATH = os.environ.get("PLATFORM_AGENT_DOTENV_PATH", "/opt/data/.env")
 # wrong once already. Pinned by
 # TestNoSubprocessAtImport in test_agent_common_server.py.
 
+# Secret-backed variables the agent container holds for its own process but
+# _run_env withholds from every child it spawns. A2A_ACTIVITY_SECRET is the key
+# hermes signs its tool-call deliveries to the bridge's loopback door with
+# (the operator's a2aActivitySecretEnv); no child needs it.
+_WITHHELD_FROM_CHILDREN = ("A2A_ACTIVITY_SECRET",)
+
+
 def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Build a subprocess env with HOME redirected to /tmp for GKE container compatibility.
 
@@ -66,9 +73,11 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     holding, every call site here becomes a credential leak at once.
 
     1. The sandbox container holds no credentials. The operator gives it exactly
-       two Secret-backed variables — SESSION_KV_API_KEY and SESSION_KV_SALT,
-       both pod-scoped: neither authenticates nor pseudonymises anything outside
-       this Pod. Its API_SERVER_KEY is the non-secret sentinel
+       two Secret-backed variables a child can see — SESSION_KV_API_KEY and
+       SESSION_KV_SALT, both pod-scoped: neither authenticates nor pseudonymises
+       anything outside this Pod. It holds a third, A2A_ACTIVITY_SECRET, the
+       activity signing key hermes itself uses; this function withholds it from
+       every child (_WITHHELD_FROM_CHILDREN), whatever `extra` says. Its API_SERVER_KEY is the non-secret sentinel
        `cluster-internal-trusted`, and the real credentials live in the
        credential-proxy container. See docs/credential-isolation-design.md,
        "The loopback-only exception", which owns this and is the page to change
@@ -81,7 +90,7 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
        child, whose own environment Hermes has already narrowed to an allowlist
        (`_build_safe_env` in hermes tools/mcp_tool.py, and the `env:` blocks in
        agents/platform/config.yaml), or session_kv_server spawning `hermes send`
-       (or `a2a notify`, under next) as the same UID in the same container — a child that could read
+       (or `a2a notify`, for a platform the gateway holds) as the same UID in the same container — a child that could read
        /proc/self/environ anyway. Note that session_kv_server has two shapes:
        the uvicorn instance the entrypoint backgrounds holds the whole container
        environment, while the fallback instance platform_mcp_server spawns
@@ -89,11 +98,15 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
        and not the salt. Narrower, so the argument holds either way — but do not
        read this docstring as a promise that the salt is always present.
 
-    A new caller that spawns across a UID or container boundary, or a third
-    variable added to the sandbox's Secret allowlist, invalidates this. Narrow
+    A new caller that spawns across a UID or container boundary, or another
+    variable added to the sandbox's Secret allowlist and not withheld here,
+    invalidates this. Narrow
     the environment explicitly at that call site rather than reaching for this.
     """
-    return {**os.environ, "HOME": "/tmp", **(extra or {})}
+    env = {**os.environ, "HOME": "/tmp", **(extra or {})}
+    for name in _WITHHELD_FROM_CHILDREN:
+        env.pop(name, None)
+    return env
 
 
 
@@ -110,6 +123,12 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
         )
 
     if agent_id.lower() == "platform":
+        # No profile mounts this tool now, so this default has no caller. It is
+        # a Service URL, which a caller on another pod can use, so it differs
+        # from the loopback default of the callers on the gateway's pod
+        # (session_kv_server's PLATFORM_API_URL_DEFAULT). It does not follow the
+        # endpoint that the operator publishes, which is http with the Service
+        # name and the namespace of the PlatformAgent.
         endpoint = (
             os.environ.get("PLATFORM_API_URL")
             or "https://platform-agent.kubeagents-system.svc.cluster.local:8642"

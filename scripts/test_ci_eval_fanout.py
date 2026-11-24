@@ -179,6 +179,8 @@ class QueueOrderTest(unittest.TestCase):
                 # (the inject lane's second phase); with the list unset every
                 # task is in this queue, as on the api lane.
                 lifted("unit_phase"),
+                lifted("case_repetitions"),
+                lifted("first_queued_rep"),
                 f"EVAL_REPETITIONS={reps}",
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 # compliance carries a 1000 hint, the probe 200: order within a
@@ -241,6 +243,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "gce-startup-script-failure",
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
+            "fleet-audit-manifest-fix-names-stalled-config-connector",
         ):
             with self.subTest(unit=name):
                 self.assertEqual(self.ceiling(name, "2700"), "3000")
@@ -318,7 +321,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["11100", "3600", "22200", "12000", "4500"])
+        self.assertEqual(run_bash(body).stdout.split(), ["12600", "5100", "25200", "13500", "6000"])
 
 
 class PerCaseGradingTest(unittest.TestCase):
@@ -369,6 +372,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # are copied in under.
             lifted_constant("EVAL_TIMING_FILE"),
             lifted_constant("EVAL_SHAPE_FILE"),
+            lifted_constant("EVAL_RUN_TAG_FILE"),
             # The unit resolves the task file it hands the bench through
             # this helper (the inject lane's copy, or the file under
             # bench/tasks/); with no lane directory set it is the identity.
@@ -376,6 +380,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # The count of finished repetitions the unit reads under its
             # task lock, and the unwinding its skip paths share.
             lifted("finished_rep_count"),
+            lifted("case_repetitions"),
             lifted("skip_unit"),
             # What the unit does when the install is gone (#3129): the code
             # wait_platform_runs returns for it and the marker that latches it.
@@ -429,6 +434,21 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertIn('rep 1: {"bot_messages": 1}', result.stdout, result.stdout + result.stderr)
         self.assertIn("rep 2: none", result.stdout)
         self.assertIn('rep 3: {"bot_messages": 3}', result.stdout)
+
+    def test_the_eval_run_tag_lands_beside_each_repetitions_results(self):
+        """The same contract for KUBE_AGENTS_EVAL_RUN_FILE, which names the run id
+        a retried repetition's attempt is told apart by."""
+        runs = 'RUNS="$(mktemp -d)"; : > "${STATE_DIR}/case-x.rep2.eval_run.json"\n'
+        bench = (
+            'uv() { mkdir -p "${RUNS}/run_${rep}"; '
+            '[ "${rep}" = 2 ] || echo "{\\"run_id\\": \\"r${rep}\\"}" > "${KUBE_AGENTS_EVAL_RUN_FILE}"; '
+            'echo "ran 1 task(s); results: ${RUNS}/run_${rep}/results.json"; }\n'
+        )
+        check = 'for r in 1 2 3; do echo "rep ${r}: $(cat "${RUNS}/run_${r}/eval_run.json" 2>/dev/null || echo none)"; done'
+        result = self.run_reps(runs + bench, check)
+        self.assertIn('rep 1: {"run_id": "r1"}', result.stdout, result.stdout + result.stderr)
+        self.assertIn("rep 2: none", result.stdout)
+        self.assertIn('rep 3: {"run_id": "r3"}', result.stdout)
 
     def test_a_repetition_that_gave_up_on_its_lock_leaves_the_case_to_the_loop(self):
         # Rep 2 never gets the task lock: no state file, so the count stops at
@@ -646,7 +666,7 @@ EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EV
         self.assertIn('cat "${block}" >> "${EVAL_GRADING_LOG}"', lifted("finish_case"))
         self.assertIn('--json-out "${ARTIFACT_DIR}/eval-verdict.json") >> "${EVAL_GRADING_LOG}" || SUITE_STATUS=$?', src)
         self.assertIn('sed "s/^/Ledger reset (${label}): /" >> "${EVAL_GRADING_LOG}"', lifted("reset_audit_ledgers"))
-        self.assertIn('expires ${minted##* }" >> "${EVAL_GRADING_LOG}"', lifted("mint_ledger_token"))
+        self.assertIn('expires ${minted##* }${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"', lifted("mint_ledger_token"))
         self.assertEqual(src.count("uv run bench-gate case"), 1, "grade_case is the one caller; both of its call sites redirect")
         # The table pointer is printed only when the table exists; a suite
         # that died before writing it says so instead.
@@ -834,8 +854,10 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted_constant("EVAL_SHAPE_FILE"),
+                lifted_constant("EVAL_RUN_TAG_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -878,8 +900,10 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted_constant("EVAL_SHAPE_FILE"),
+                lifted_constant("EVAL_RUN_TAG_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -921,8 +945,10 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted_constant("EVAL_SHAPE_FILE"),
+                lifted_constant("EVAL_RUN_TAG_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -982,8 +1008,10 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted_constant("EVAL_SHAPE_FILE"),
+                lifted_constant("EVAL_RUN_TAG_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,

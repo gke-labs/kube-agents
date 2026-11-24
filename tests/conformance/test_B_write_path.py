@@ -184,6 +184,29 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
                 decision = command_policy.evaluate(argv)
                 self.assertFalse(decision.allowed, f"{argv} reached the cluster")
 
+    def test_B1_the_broker_marks_only_a_refused_write_as_one(self) -> None:
+        """A profile worker stops its task at the first refusal the broker marks
+        ``write_refusal``, as the in-pod client recorded it, and reads no tool
+        output for it. The mark is the broker's, from its own policy reads: a
+        refused mutating kubectl verb is marked, and a read, a local render and
+        a gcloud refusal (whose rule also refuses unlisted reads) are not.
+        """
+        enforced = h.credential_proxy.CredentialProxyHandler.enforce_read_only
+        h.credential_proxy.CredentialProxyHandler.enforce_read_only = True
+        self.addCleanup(setattr, h.credential_proxy.CredentialProxyHandler, "enforce_read_only", enforced)
+        key = h.credential_proxy.WRITE_REFUSAL_KEY
+        for argv in (["kubectl", "delete", "namespace", "prod"], ["kubectl", "rollout", "undo", "deployment/web"]):
+            with self.subTest(argv=argv):
+                self.assertIs(True, h.credential_proxy.read_only_refusal(argv)[0][key])
+        for argv in (
+            ["kubectl", "apply", "-f", "m.yaml", "--dry-run=client"],
+            ["kubectl", "exec", "web-0", "--", "sh"],
+            ["gcloud", "container", "clusters", "delete", "prod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(h.credential_proxy.read_only_refusal(argv)[0].get(key, False))
+        self.assertIsNone(h.credential_proxy.read_only_refusal(["kubectl", "get", "pods"]))
+
     def test_B1_ordinary_reads_still_work(self) -> None:
         """A read-only gate nobody can work behind gets switched off.
 
@@ -805,7 +828,13 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         write for the bots' issue repository (`KUBE_AGENTS_ISSUES_REPO`, a
         different App and key, `ISSUES_APP_PRIVATE_KEY`), scoped to that one
         repository; it files, edits and closes the bots' own issues and
-        nothing else. A new grant is a red test and
+        nothing else. `release-publish.yml`'s `relabel-upgrade-table` job also
+        mints Pull requests write, with Contents write and without Workflows:
+        after a release it pushes a docs-only branch and opens the pull request
+        that relabels the upgrade table's `pending` rows (#5673). It cannot land
+        that change itself: main takes a pull request only through review and
+        the merge queue, and `lgtm` comes only from the OWNERS file's people,
+        which lists no machine account. A new grant is a red test and
         a conversation, as for the holder list above, and so is a minting step
         that names no scope, which gets every permission the App holds.
         """
@@ -837,6 +866,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         ) for scope in release}
         expected |= {("auto-enqueue.yml", scope) for scope in release | {"permission-pull-requests"}}
         expected.add(("ci-health.yml", "permission-issues"))
+        expected.add(("release-publish.yml", "permission-pull-requests"))
         self.assertEqual(expected, grants)
         self.assertEqual({"auto-enqueue.yml"}, key_readers)
 

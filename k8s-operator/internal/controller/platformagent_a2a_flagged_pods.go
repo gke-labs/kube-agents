@@ -46,12 +46,12 @@ type a2aFlaggedPod struct {
 // A feature that adds a standing pod behind a flag goes here, and leaves when
 // it's on by default: from then on the goldens render it, footprint.yaml
 // counts it, and a2aStandingPods has to count its builder with the
-// unconditional ones (TestA2AStandingPodsMatchTheNextModeGolden). Profile work
+// unconditional ones (TestA2AStandingPodsMatchTheSettledGolden). Profile work
 // doesn't: the warm workers and the Job-mode pods run in the profile
 // namespace, under the pod quota the operator derives for it from the warm
 // pools and the profile ceiling, not in this namespace or its quota.
 var a2aFlaggedPods = []a2aFlaggedPod{
-	{name: "mcp", env: a2aMCPDoorEnvVar, enabled: a2aMCPDoorEnabled, build: buildA2AMCPDeployment}, // #3869
+	{name: "curator", env: a2aCuratorEnvVar, enabled: a2aCuratorEnabled, build: buildA2ACuratorDeployment}, // #5566
 }
 
 // a2aFlaggedStandingPods is the pods the flagged workloads add to the namespace

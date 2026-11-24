@@ -35,7 +35,7 @@ Two ways out, and the cheap one is enough:
 | Option                  | Shape                                                        | Standing cost on top of the management fee | Verdict                                                                            |
 | ----------------------- | ------------------------------------------------------------ | ------------------------------------------ | ---------------------------------------------------------------------------------- |
 | Regional cluster        | Regional control plane, nodes in three zones                 | A three-zone node floor                    | Rejected — the fleet is always on, and nothing here needs a regional control plane |
-| **Multi-zonal cluster** | **Zonal control plane, `node_locations` spanning two zones** | **Two small nodes**                        | **Built** — real per-zone distribution for the smallest node count that gives it   |
+| **Multi-zonal cluster** | **Zonal control plane, `node_locations` spanning two zones** | **Two nodes, one per zone**                | **Built** — real per-zone distribution for the smallest node count that gives it   |
 
 Both options pay the same per-cluster GKE management fee, which is why the table prices only what
 differs. That fee is the larger part of the change and the next section says so.
@@ -95,12 +95,12 @@ dedicated-core nodes (`e2-standard-2`) with about a core to spare on each.
 
 ### Tier 2 — on `seeded-d` (built)
 
-| Check                                          | Fixture                                                                                                                                                                                                                                                                  |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Zonal skew with cause: capacity                | A workload whose replicas request more than the second zone's node can offer, so some stay Pending on insufficient CPU. Two pools at different sizes would be the other way to get this; one balanced pool plus an oversized request is cheaper and needs no second pool |
-| Zonal skew with cause: spread misconfiguration | A Deployment with `whenUnsatisfiable: ScheduleAnyway` and a node selector that only one zone satisfies                                                                                                                                                                   |
-| Zonal skew with cause: zone-pinned volume      | A StatefulSet with a zonal PersistentVolumeClaim, which cannot move                                                                                                                                                                                                      |
-| Blast radius                                   | Falls out of the three above — the share of replicas in the crowded zone is the measure                                                                                                                                                                                  |
+| Check                                          | Fixture                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Zonal skew with cause: capacity                | A workload whose replicas request more CPU than the first zone's node has left, so the ones that run sit in the second zone and the rest stay Pending on insufficient CPU. Seeded-d uses two pools at different sizes, an e2-small and an e2-standard-2, with a sponge Deployment keeping the e2-small below one replica's worth of free CPU. Equal nodes cannot hold the asymmetry, because which node GKE's own Deployments land on flips at creation and after a drain; and every shared-core E2 size reports the same 940m allocatable, so the larger node is a dedicated-core size (the pool comment in `bench/tf/fleet/main.tf`) |
+| Zonal skew with cause: spread misconfiguration | A Deployment with `whenUnsatisfiable: ScheduleAnyway` and a required node affinity that only one zone satisfies                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Zonal skew with cause: zone-pinned volume      | A StatefulSet with a zonal PersistentVolumeClaim, which cannot move                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Blast radius                                   | Falls out of the three above — the share of replicas in the crowded zone is the measure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 One cluster, three roles, each a distinct cause so the check's attribution is what is under test
 rather than its ability to notice imbalance. They are built as `zonal-skew-capacity`,
@@ -110,7 +110,9 @@ plants.
 ### Tier 3 — project-level, no cluster needed
 
 The fleet already carries a pair of these (`orphan_pd`, two unattached disks, catalogued as
-`orphan-disks`), so the pattern exists.
+`orphan-disks`), so the pattern exists, and for the snapshot row the closer precedent is the
+pair of age-gated orphaned snapshots `orphan_snapshot.py` plants (`declared-orphan-snapshot`
+and `orphan-snapshot` in the catalogue).
 
 | Check                             | Fixture                                                    |
 | --------------------------------- | ---------------------------------------------------------- |
@@ -139,7 +141,7 @@ Stated so nobody plans a fixture that cannot exist:
 ### Day-N gates
 
 The catalogue's age rules apply to the new fixtures too
-([`bench-fleet-catalog.md`](bench-fleet-catalog.md), "Day 0, 1, 7, 30"). The Tier 1 workloads are
+([`bench-fleet-catalog.md`](bench-fleet-catalog.md), "Day 0, 1, 7, 30, 91"). The Tier 1 workloads are
 assertable on apply day. The expiry fixtures in Tier 3 are assertable only once their own age
 window passes, and the key-age one has no obvious answer: the catalogue says plainly that backdating is impossible and
 not to try, so this fixture either waits out its own window after a replant or is dropped. Each new role states its day-N gate in the catalogue, and a case that asserts before the
@@ -147,7 +149,7 @@ gate is a case that fails for the environment rather than the agent.
 
 ## Order of work
 
-1. Done: `seeded-d` in `bench/tf/fleet/main.tf`, with the two-zone node pool. Exempt from the
+1. Done: `seeded-d` in `bench/tf/fleet/main.tf`, with one node pool per zone. Exempt from the
    eval-first rule as infrastructure, but not inert: it joins the drift cohort
    on apply, so it needs its authorized-networks block and its catalogue slot in the same change, or
    the runner warns that it matches no declared slot on every presubmit. The catalogue edits a

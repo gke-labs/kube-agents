@@ -23,7 +23,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -44,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
@@ -85,6 +88,19 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	// The operator image also runs the bus migration's own pods (#4225):
+	// the same binary, so their version contract is the operator's.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "bus-migrate":
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			code := busmigrate.Main(ctx, os.Args[2:], os.Stderr)
+			stop()
+			os.Exit(code)
+		case "bus-hash":
+			os.Exit(busmigrate.HashMain(os.Args[2:], os.Stderr))
+		}
+	}
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -238,6 +254,20 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
+		// Step down on shutdown rather than holding the lease until it
+		// expires, so the next pod takes over in seconds, not after the
+		// lease duration (#6217 measured ~45 s from a helm upgrade to the
+		// new pod's first reconcile). controller-runtime releases the lease
+		// after the leader-elected runnables have stopped, or once its
+		// graceful-shutdown timeout (default 30 s) runs out. The pod's
+		// terminationGracePeriodSeconds is 10, so a stop slower than that
+		// is killed first and the lease simply expires, as without this
+		// option: a release never races a reconcile that is still running.
+		// It is safe only because main returns as soon as mgr.Start does:
+		// the Start call is main's last statement, its error branch only
+		// logs and exits, and main has no defer or go statement that could
+		// act after it (manager_wiring_test.go).
+		LeaderElectionReleaseOnCancel: true,
 		// What this process holds in memory; controller.ManagerCacheOptions
 		// says what is in the cache, what is kept out of it, and why.
 		Cache:  controller.ManagerCacheOptions(),
@@ -279,14 +309,16 @@ func main() {
 	// The namespace this pod runs in is read first: the check probes the
 	// namespaced half of the role (the Secret verbs) there. It also feeds the
 	// NetworkPolicy rule that admits the operator to the gateway's and broker's
-	// metrics ports. Both install paths set it from the Downward API; off the
+	// metrics ports, and the webhook's rule that admits a PlatformAgent in
+	// this namespace only. Both install paths set it from the Downward API; off the
 	// cluster, under `make run`, it is unset, the namespaced permissions are
-	// probed cluster-wide, the rule is not rendered, and the poller is not
-	// started: no pod IP is reachable from there, and a poller that ran anyway
+	// probed cluster-wide, the rule is not rendered, the poller is not
+	// started, and the webhook admits a PlatformAgent in any namespace: no
+	// pod IP is reachable from there, and a poller that ran anyway
 	// would record a Warning on every CR blaming a NetworkPolicy for the gap.
 	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
 	if operatorNamespace == "" {
-		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv)
 	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
 		// The value becomes kubernetes.io/metadata.name in the metrics rule's
@@ -296,7 +328,7 @@ func main() {
 		// would have the API server reject the policy on every reconcile. Clear
 		// it either way, so the rule is not rendered and the poller, which could
 		// reach no pod without it, is not started.
-		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
 		operatorNamespace = ""
 	}
@@ -350,6 +382,7 @@ func main() {
 		DNSClusterIPOverride:     dnsClusterIP,
 		MetadataDaemonIPOverride: metadataDaemonIP,
 		OperatorNamespace:        operatorNamespace,
+		UniverseDomainDetector:   controller.ProbeGCEUniverseDomain,
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
@@ -391,6 +424,10 @@ func main() {
 			Client:    mgr.GetClient(),
 			Scheme:    mgr.GetScheme(),
 			APIReader: mgr.GetAPIReader(),
+			Recorder:  mgr.GetEventRecorderFor("agentprofile-controller"),
+			// A role that can't read Tiers lists none: a cached list would
+			// start an informer that never syncs (#3659, #1009's case).
+			TiersUnreadable: len(controller.TierAccessDenied(rbacChecker)) > 0,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
 			os.Exit(1)
@@ -421,12 +458,49 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The AgentSchedule reconciler (#5617), behind A2A_AGENT_SCHEDULES while
+	// scheduled runs are new, and gated as the Tier one is: a missing CRD or
+	// a role that can't read schedules skips it rather than crashlooping. It
+	// also watches and reads AgentProfiles, so it needs the AgentProfile
+	// controller's gate too: without that kind, or a role that can list it,
+	// its informer never syncs and the manager stops.
+	if controller.AgentSchedulesEnabled() {
+		schedGVK := agentv1alpha1.GroupVersion.WithKind("AgentSchedule")
+		_, schedMapErr := mgr.GetRESTMapper().RESTMapping(schedGVK.GroupKind(), schedGVK.Version)
+		schedDenied := controller.AgentScheduleAccessDenied(rbacChecker)
+		switch {
+		case schedMapErr == nil && len(schedDenied) > 0:
+			setupLog.Error(nil, "The operator's role cannot read AgentSchedules; skipping the AgentSchedule controller. Restart the operator after applying the current ClusterRole.", "denied", schedDenied)
+		case schedMapErr == nil && mapErr != nil:
+			// Only "no such kind" gets here: any other discovery error
+			// exited at the AgentProfile controller above.
+			setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentSchedule controller, which reads profiles. Restart the operator after installing the CRD to enable it.")
+		case schedMapErr == nil && len(profileDenied) > 0:
+			setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentSchedule controller, which reads profiles. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
+		case schedMapErr == nil:
+			if err := (&controller.AgentScheduleReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "Failed to create controller", "controller", "agentschedule")
+				os.Exit(1)
+			}
+		case meta.IsNoMatchError(schedMapErr):
+			setupLog.Info("AgentSchedule CRD is not installed on cluster; skipping the AgentSchedule controller. Restart the operator after installing the CRD to enable it.")
+		default:
+			setupLog.Error(schedMapErr, "Failed to discover the AgentSchedule kind")
+			os.Exit(1)
+		}
+	}
+
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		webhooks := []struct {
 			name      string
 			setupFunc func(ctrl.Manager) error
 		}{
-			{"PlatformAgent", agentwebhook.SetupPlatformAgentWebhookWithManager},
+			// The validator holds a PlatformAgent to operatorNamespace, the
+			// namespace the write Role is bound in; empty (off the cluster)
+			// skips that rule.
+			{"PlatformAgent", func(mgr ctrl.Manager) error {
+				return agentwebhook.SetupPlatformAgentWebhookWithManager(mgr, operatorNamespace)
+			}},
 		}
 
 		for _, wh := range webhooks {

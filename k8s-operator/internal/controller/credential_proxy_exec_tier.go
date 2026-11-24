@@ -165,6 +165,31 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	execTierDroppedMinterEnv:        true,
 	"GOOGLE_CHAT_PROJECT_ID":        true,
 	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
+	// The audit-report store's address, token file and profiles
+	// (audit_report_store.go): the store routes are the stateful broker's.
+	auditReportStoreURLEnv:       true,
+	auditReportStoreTokenFileEnv: true,
+	auditReportProfilesEnv:       true,
+	// The A2A gateway's Chat relay settings: the exec tier runs no relay, and
+	// a subscription change must not roll every exec replica.
+	a2aGoogleChatSubscriptionEnvVar:      true,
+	credentialProxyA2AChatAudienceEnvVar: true,
+	// The Teams inbound receiver's audience: the intake is the stateful
+	// broker's route, so an exec pod confers no teams-inbound role. Its
+	// callers binding stays, holding the receiver's account to its audience.
+	credentialProxyTeamsInboundAudienceEnvVar: true,
+	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
+	// allowed callers, the A2A gateway among them on every install, and
+	// the binding is what holds that account to the a2a-chat audience. The
+	// exec tier confers no a2a-chat role, so there it is refused every
+	// audience. The value changes only when the allowed callers do (#6090).
+	// The A2A report reader's audience: the store routes are the stateful
+	// broker's, so an exec pod confers no a2a-reports role. Its callers
+	// binding stays, holding the gateway's account to its own audiences.
+	credentialProxyA2AReportsAudienceEnvVar: true,
+	// The Teams caller word gates the Teams relay routes, which an exec pod
+	// refuses anyway; flipping the Teams switch must not roll every exec replica.
+	credentialProxyTeamsA2ACallerEnvVar: true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {
@@ -313,7 +338,10 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 	dep.Spec.Template.Labels = podLabels
 	delete(dep.Spec.Template.Annotations, secretEnvHashAnnotation)
 
-	dropped := map[string]bool{brokerMinterVolume: true}
+	// The audit-report store's token goes too: a projected ServiceAccount
+	// token, which the by-source filter keeps, and an exec pod runs brokered
+	// commands and never calls the store.
+	dropped := map[string]bool{brokerMinterVolume: true, auditReportStoreTokenVolume: true}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if volumeHoldsSecret(v) {
 			dropped[v.Name] = true

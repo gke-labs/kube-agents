@@ -11,8 +11,7 @@ Addresses Issue #993 (THREAT-002, SKILL-002):
 4. Per-job risk tiers: 'high' applies a fail-closed read-only command policy
    (allowlist of inspection verbs); 'low' retains the denylist-only floor.
 
-Gates 1-3 are unconditional on every cron run. ``approvals.cron_scan`` opts out
-of the Tirith content scan only (see cron_tirith_scan.py), never these.
+Gates 1-3 are unconditional on every cron run; no configuration key opts out of them.
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ logger = logging.getLogger(__name__)
 RISK_LOW = "low"
 RISK_HIGH = "high"
 
-CRON_SCAN_KEY = "cron_scan"
-APPROVALS_KEY = "approvals"
 
 #: Hex digits of the SHA-256 digest a refusal log line uses to identify the
 #: command in place of reproducing it; a refused command is user-authored
@@ -141,7 +138,6 @@ _TOOL_MUTATE_VERBS = {
                "abandon", "cancel", "start", "stop", "suspend", "resume",
                "write", "publish", "cp", "rm", "mv", "call", "untag",
                "add-metadata", "add-iam-policy-binding", "get-credentials"},
-    "gsutil": {"cp", "mv", "rm", "rsync", "mb", "rb", "setmeta", "acl", "iam"},
     "gh": {"create", "delete", "edit", "close", "merge", "comment", "clone"},
     "helm": {"install", "upgrade", "uninstall", "rollback", "delete"},
     "bq": {"insert", "mk", "rm", "update", "cp", "load"},
@@ -245,9 +241,6 @@ _TOOL_FLAGS_WITH_VALUE = {
         "-f", "--values",
         "--revision",
     }),
-    "gsutil": frozenset({
-        "-o", "-h", "-b",
-    }),
     "bq": frozenset({
         "--project_id", "--dataset_id", "--location",
         "--format",
@@ -313,7 +306,6 @@ _TOOL_READ_VERBS = {
         # and networking reads; a cron prompt that spells them is a read here too.
         "get-serial-port-output", "get-status", "list-nodes",
     },
-    "gsutil": {"ls", "stat", "cat", "du", "hash", "ver", "version"},
     "gh": {"view", "list", "status", "diff"},
     "helm": {"list", "get", "status", "history", "show", "search", "version"},
     # 'query' omitted deliberately: `bq query` executes DML (DELETE/UPDATE/MERGE).
@@ -411,18 +403,6 @@ def _load_config_readonly() -> dict:
         return load_config_readonly() or {}
     except Exception:
         return {}
-
-
-def cron_scan_enabled(config: Optional[dict]) -> bool:
-    """Whether ``approvals.cron_scan`` leaves the scan on. Default: yes.
-
-    Anything other than an explicit false-y value keeps the scan, matching the
-    opt-out contract in cron_tirith_scan.py.
-    """
-    approvals = (config or {}).get(APPROVALS_KEY)
-    if not isinstance(approvals, dict):
-        return True
-    return bool(approvals.get(CRON_SCAN_KEY, True))
 
 
 def _lex_segments(command: str) -> Optional[list[list[str]]]:
@@ -560,16 +540,6 @@ def _evaluate_command_tokens(
         cmd_lower = cmd.lower()
         if cmd_lower in _TOOL_READ_VERBS["helm"]:
             if any(p in _TOOL_MUTATE_VERBS["helm"] for p in pos_lower):
-                return False
-            return True
-        return False
-
-    if exe == "gsutil":
-        if not cmd:
-            return False
-        cmd_lower = cmd.lower()
-        if cmd_lower in _TOOL_READ_VERBS["gsutil"]:
-            if any(p in _TOOL_MUTATE_VERBS["gsutil"] for p in pos_lower):
                 return False
             return True
         return False
@@ -770,9 +740,9 @@ def cron_content_block(
 ) -> Optional[dict]:
     """Refuse escape/control-char injection and lookalike-domain evasion.
 
-    Unconditional on every cron run: ``approvals.cron_scan`` gates the Tirith
-    content scan only, not these THREAT-002 evasion classes. ``load_config`` is
-    accepted for backward-compatible call sites and ignored.
+    Unconditional on every cron run: no configuration key opts out of these
+    THREAT-002 evasion classes. ``load_config`` is accepted for
+    backward-compatible call sites and ignored.
     """
     if not command or not isinstance(command, str):
         return None

@@ -45,6 +45,7 @@ func waitIdle(t *testing.T, r *rig, conv string) {
 // same session as its delegate. Then a stop reaches the task that is running
 // in it, not the one before.
 func TestASecondTurnGoesToTheLivePod(t *testing.T) {
+	t.Parallel()
 	r, spawn := startReuseRig(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-reuse-1"
@@ -101,6 +102,7 @@ func TestASecondTurnGoesToTheLivePod(t *testing.T) {
 // Every way the live pod cannot take the turn falls back to today's path:
 // retire it, mint a new incarnation, spawn cold.
 func TestATurnStartsAFreshPodWhenTheLiveOneCannotTakeIt(t *testing.T) {
+	t.Parallel()
 	const pod = "chat-otter-r9"
 	for _, tc := range []struct {
 		name        string
@@ -160,6 +162,7 @@ func TestATurnStartsAFreshPodWhenTheLiveOneCannotTakeIt(t *testing.T) {
 // "/session <text>" turn is an ordinary turn and goes to the live pod the same
 // way.
 func TestASessionCommandTurnGoesToTheLivePod(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, reuseOn)
 	ctx := context.Background()
 	conv := "discord:g1/t-reuse-cmd"
@@ -185,6 +188,7 @@ func TestASessionCommandTurnGoesToTheLivePod(t *testing.T) {
 // author set is the delegating turn's already and nothing is re-seeded, and
 // the wake still carries via, which is what turns its delegate tool off.
 func TestAWakeGoesToTheLivePod(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, reuseOn)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-reuse"
@@ -271,6 +275,7 @@ func TestATurnStampsTheLastUserMessage(t *testing.T) {
 // pod's (which has its own deadline), and a task already final on the stream
 // are left alone.
 func TestAnOverdueTaskOnAReusedPodIsClosedAndThePodRetired(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		age      time.Duration
@@ -352,6 +357,7 @@ func overdueRecord(key, pod, taskID string) *SessionRecord {
 // from the start has passed, and a pod with no start time on record leaves
 // the submission's clock in charge.
 func TestASlowPodStartDoesNotSpendTheOverdueGrace(t *testing.T) {
+	t.Parallel()
 	r, spawn := startReuseRig(t)
 	ctx := context.Background()
 	bound := defaultTaskDeadline + podDeadlineGrace
@@ -387,6 +393,7 @@ func TestASlowPodStartDoesNotSpendTheOverdueGrace(t *testing.T) {
 // A pod read that fails holds the overdue check for the next pass rather
 // than guessing which clock applies.
 func TestAnOverdueCheckWaitsOutAFailedPodRead(t *testing.T) {
+	t.Parallel()
 	r, spawn := startReuseRig(t)
 	ctx := context.Background()
 	rec := overdueRecord("discord:g1/t-overdue-read", "chat-lynx-read", "task-read")
@@ -410,6 +417,7 @@ func TestAnOverdueCheckWaitsOutAFailedPodRead(t *testing.T) {
 // it does not write the terminal the deletion rule pairs with the delete, and
 // the reap does not dereference the missing spawner.
 func TestAnOverdueTaskIsLeftAloneWithoutASpawner(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, reuseOn)
 	ctx := context.Background()
 	pod := "chat-lynx-nil"
@@ -438,6 +446,7 @@ func TestAnOverdueTaskIsLeftAloneWithoutASpawner(t *testing.T) {
 // the reap, but unmarked: once the relay releases the task, the next turn
 // retires the wedged pod and spawns fresh rather than being routed to it.
 func TestAFailedOverdueDeleteUnmarksThePod(t *testing.T) {
+	t.Parallel()
 	r, spawn := startReuseRig(t)
 	ctx := context.Background()
 	pod := "chat-lynx-del"
@@ -590,6 +599,7 @@ func (a *fakeAdapter) postTextsFor(conversation string) []string {
 // later turn, the sweep has to close that turn, which the record holds as
 // active, and not report a clean exit because the first task is final.
 func TestTheSweepClosesTheTaskAReusedPodDiedOn(t *testing.T) {
+	t.Parallel()
 	r, spawn := startReuseRig(t)
 	ctx := context.Background()
 	pod := "chat-heron-sw"
@@ -664,6 +674,7 @@ func TestTheSweepClosesTheTaskAReusedPodDiedOn(t *testing.T) {
 // conversation is running anything is never evicted, and with only those at
 // the cap the turn is refused as before.
 func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
+	t.Parallel()
 	now := time.Now().UTC()
 	idle := func(key, pod string, quiet time.Duration) *SessionRecord {
 		return &SessionRecord{Key: key, ContextID: "ctx-" + pod, Kind: "group", Addressee: pod, BusSession: pod,
@@ -732,7 +743,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		spawn.live = 1
 		spawn.setSessionPods(sessionPod{PodName: "chat-vole-held", SessionKey: held.Key, Reuse: true})
 		say(r, "discord:g1/t-blocked", "m1", "anyone home?")
-		waitFor(t, "the cap refusal", postedContaining(r, "not started"))
+		waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 		if d := spawn.deleted(); len(d) != 0 {
 			t.Fatalf("evicted %v from a conversation whose lock was held", d)
 		}
@@ -748,7 +759,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		spawn.live = 1
 		spawn.setSessionPods(sessionPod{PodName: "chat-vole-busy", SessionKey: busy.Key, Reuse: true})
 		say(r, "discord:g1/t-refused", "m1", "anyone home?")
-		waitFor(t, "the cap refusal", postedContaining(r, "not started"))
+		waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 		if d := spawn.deleted(); len(d) != 0 {
 			t.Fatalf("evicted %v; a pod with a running task must stay", d)
 		}
@@ -757,7 +768,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		}
 	})
 	t.Run("a pod that turned busy after the candidate scan stays", func(t *testing.T) {
-		// evictIdleSession read this conversation idle; a turn then took and
+		// evictIdleSessions read this conversation idle; a turn then took and
 		// released its lock, leaving a task running. evictSession is what
 		// sees the record now, under the lock, so it is called directly:
 		// nothing between the two reads can be hooked.
@@ -768,7 +779,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		if err := r.g.reg.Put(ctx, turned); err != nil {
 			t.Fatal(err)
 		}
-		if r.g.evictSession(ctx, sessionPod{PodName: "chat-vole-turned", SessionKey: turned.Key, Reuse: true}) {
+		if r.g.evictSession(ctx, sessionPod{PodName: "chat-vole-turned", SessionKey: turned.Key, Reuse: true}, r.g.post) {
 			t.Fatal("evictSession evicted a pod whose fresh record has a task running")
 		}
 		if d := spawn.deleted(); len(d) != 0 {
@@ -918,14 +929,6 @@ func TestSessionPodsListsTheLiveOnes(t *testing.T) {
 	slices.Sort(got)
 	if want := []string{"live=conv-live", "pending=conv-pending"}; !slices.Equal(got, want) {
 		t.Fatalf("SessionPods = %v, want %v", got, want)
-	}
-	// The cap counts exactly the pods its eviction can choose from.
-	n, err := s.LiveSessions(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != len(pods) {
-		t.Fatalf("LiveSessions = %d over %d evictable pods; the count and the candidates disagree", n, len(pods))
 	}
 }
 

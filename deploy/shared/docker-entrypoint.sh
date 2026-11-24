@@ -21,11 +21,16 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
-# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
-# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
-readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# The file name of the third-party command scanner earlier images let Hermes
+# download into each home. It is AGPL-licensed and no image runs it any more;
+# step 4.4 removes the copies left on the volume.
+readonly STALE_SCANNER_BINARY=tirith
+# Where that scanner kept its own files under a home: a downloaded threat
+# database, its state, and a log of the commands it scanned. Step 4.4 removes
+# the directory of the scanner's name under each.
+readonly STALE_SCANNER_DATA_PARENTS=".local/share .local/state"
 # The first four bytes of an ELF executable, in hex: step 4.4's check that a file
-# named tirith is a binary before it removes it.
+# of that name is a binary before it removes it.
 readonly ELF_MAGIC_HEX=7f454c46
 # The model-call stale bound (providers.custom.stale_timeout_seconds) every profile
 # shipped with before the kanban workers got a shorter one. The cluster loop moves a
@@ -570,10 +575,16 @@ fi
 # module mid-copy must find the old file whole, never a truncated one that stops the plugin
 # loading. A copy that fails part-way leaves the old file whole for the same reason.
 #
-# Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a volume where the kubelet
-# created it as the parent of a plugin mounted beneath it, and `set -e` would otherwise end
-# the container on the mkdir. The scripts block above guards only its `cp`: step 2's bulk
-# copy has already created `scripts/`, so its bare `mkdir -p` meets an existing directory.
+# Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a new volume where the
+# container runtime created it as the parent of a plugin mounted beneath it (an operator
+# that does not make the folder first), and `set -e` would otherwise end the container on
+# the mkdir. The scripts block above guards only its `cp`: step 2's bulk copy has already
+# created `scripts/`, so its bare `mkdir -p` meets an existing directory.
+#
+# The warning says what the volume is left with. A plugin folder that held a file before
+# the copy keeps the previous image's copy of each file not yet replaced. A folder that
+# held none, as on that new volume, has no copy to keep: the plugin is missing or
+# incomplete, and the agent runs without it.
 if [ -d "$DEFAULTS_PLUGINS_DIR" ]; then
     # shellcheck disable=SC3028 # falls back to $$ where HOSTNAME is unset
     _plugin_refresh_tag="${HOSTNAME:-$$}"
@@ -583,12 +594,22 @@ if [ -d "$DEFAULTS_PLUGINS_DIR" ]; then
         case " $PINNED_EXTERNAL_PLUGINS " in *" $_image_plugin "*) continue ;; esac
         _plugin_dst="$TARGET_DIR/plugins/$_image_plugin"
         [ -L "$_plugin_dst" ] && continue
+        # Before the copy, and a folder only: a file in the folder's place is no copy, and
+        # neither is a temporary file that an earlier failed copy left.
+        _plugin_had_copy=false
+        if [ -d "$_plugin_dst" ] && [ -n "$(find "$_plugin_dst" -type f ! -name '*.refresh.*' 2>/dev/null | head -n 1)" ]; then
+            _plugin_had_copy=true
+        fi
         if ! (cd "$_image_plugin_dir" && find . -type f) | while IFS= read -r _file; do
             _tmp="$_plugin_dst/$_file.refresh.$_plugin_refresh_tag"
             { mkdir -p "$(dirname "$_plugin_dst/$_file")" && cp -p "$_image_plugin_dir$_file" "$_tmp" && mv -f "$_tmp" "$_plugin_dst/$_file"; } 2>/dev/null \
                 || { rm -f "$_tmp" 2>/dev/null; exit 1; }
         done; then
-            echo "WARN: could not refresh $_plugin_dst from the image; each file not yet replaced keeps the previous image's copy" >&2
+            if [ "$_plugin_had_copy" = true ]; then
+                echo "WARN: could not refresh $_plugin_dst from the image; each file not yet replaced keeps the previous image's copy" >&2
+            else
+                echo "WARN: could not refresh $_plugin_dst from the image; the volume had no earlier copy, so the $_image_plugin plugin is missing or incomplete and the agent runs without it" >&2
+            fi
         fi
     done
 fi
@@ -1450,8 +1471,8 @@ fi
 # there puts the original back rather than leaving the gap.
 #
 # $3 is an OPTIONAL second source directory, overlaid onto the staged copy
-# before the swap. It exists for the A2A skill (step 2.6a-bis's gate decides
-# whether to pass it), and it goes through here rather than writing into the
+# before the swap. It exists for the A2A skill (step 2.6a-bis passes it when
+# the image ships it), and it goes through here rather than writing into the
 # live directory afterwards for the reason the staging exists at all: a
 # non-staged writer that lands in another replica's swap window recreates
 # $_dst holding only ITS files, which sends the other pod down the
@@ -1570,89 +1591,23 @@ sync_profile_skills() {
     rm -rf "$_old" 2>/dev/null || true
     return 0
 }
-# 2.6a-bis The A2A topics skill, overlaid into the platform profile only when
-# this install runs the next stack. The skill ships OUTSIDE the platform
-# template (/opt/a2a-template, see the Dockerfile) so that 2.6a's replace
-# never installs it on a today install: the mode switch's promise is that a
-# normal install cannot tell the feature exists, and a skill file in the
-# template would break it on day one. It rides 2.6a's staging as the overlay
-# argument rather than being copied in afterwards — see the note on $3 — so
-# the composed tree lands in one rename. A flip back to today self-cleans:
-# the next boot stages the template alone and renames that over the profile.
-#
-# The gate asks runtime_mode.py, the one agent-side reader the mode spec
-# allows. The mode rides the managed .env, which Hermes applies at load time
-# — it is NOT in this shell's environment — so the helper hands the managed
-# file to Python and lets runtime_mode read it from there.
-#
-# Parsed as the strict KEY=value lines renderManagedEnv writes, never sourced:
-# `.` in a shell would execute anything a value with a space grew, and this
-# script is pid 1.
-#
-# os.environ is CLEARED first, so the managed file is the only thing that can
-# answer. Without that the inherited container env would be a second delivery
-# path for the mode — an AgentPlugin's spec.env is copied into the container
-# verbatim — and the spec's whole point is that one delivery path means one
-# answer. Clearing also keeps this file from naming the key a third time,
-# which is what the grep rule forbids.
-#
-# Exit meanings: 0 next, 1 today (or no managed scope at all — a compose or
-# `docker run` start, not a fault), 2 the managed scope exists but its .env
-# could not be read or the reader is missing. Only 0 overlays; 2 warns,
-# because on an operator-managed install that is a real fault the skill's
-# silent absence would otherwise hide. Guarded like 2.6a: nothing here ever
-# kills the boot.
-a2a_mode_probe() {
-    [ -n "${HERMES_MANAGED_DIR:-}" ] || return 1
-    "$INSTALL_DIR/.venv/bin/python3" - "$HERMES_MANAGED_DIR/.env" <<'A2A_PYEOF'
-import os, sys
-
-try:
-    with open(sys.argv[1]) as f:
-        lines = f.readlines()
-except OSError:
-    sys.exit(2)
-
-os.environ.clear()
-for line in lines:
-    line = line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, _, value = line.partition("=")
-    key = key.strip()
-    # An empty key is not a pin and os.environ refuses it; skipping keeps a
-    # malformed line from being reported as an unreadable file.
-    if key:
-        os.environ[key] = value.strip()
-
-try:
-    sys.path.insert(0, "/opt/defaults/scripts")
-    import runtime_mode
-except Exception:
-    # A missing or broken reader is not "today" — it is an image fault, and
-    # exit 2 is what says so instead of a bare traceback read as a decision.
-    sys.exit(2)
-
-sys.exit(0 if runtime_mode.is_next() else 1)
-A2A_PYEOF
-}
-
+# 2.6a-bis The A2A topics skill, overlaid into the platform profile. The skill
+# ships OUTSIDE the platform template (/opt/a2a-template, see the Dockerfile)
+# and rides 2.6a's staging as the overlay argument rather than being copied in
+# afterwards — see the note on $3 — so the composed tree lands in one rename.
+# Every install runs the A2A stack, so nothing gates the overlay: an image
+# with the template overlays it, and one without (no /opt/a2a-template/skills)
+# syncs the platform template alone. An image from this change pinned under
+# an operator from before it, with a stored `spec.mode: today`, gets the skill
+# with no bus rendered behind it: the `a2a` CLI refuses every call with
+# "NATS_URL is not set", which is degraded, not broken, and the pairing ends
+# with the operator's upgrade. Guarded like 2.6a: nothing here ever kills the
+# boot.
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
-    # is a return value here, not a failure.
     a2a_overlay=""
     if [ -d /opt/a2a-template/skills ]; then
-        a2a_probe_rc=0
-        a2a_mode_probe || a2a_probe_rc=$?
-        case $a2a_probe_rc in
-            0)
-                a2a_overlay=/opt/a2a-template/skills
-                echo "Next stack: overlaying the A2A topics skill into the platform profile"
-                ;;
-            2)
-                echo "WARN: the managed scope has no readable .env; treating the mode as today and skipping the A2A skill overlay" >&2
-                ;;
-        esac
+        a2a_overlay=/opt/a2a-template/skills
+        echo "Overlaying the A2A topics skill into the platform profile"
     fi
     sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform" "$a2a_overlay"
 fi
@@ -1931,8 +1886,7 @@ fi
 
 # 2.6c Reconcile optional built-in specialist profiles declared in KUBE_AGENTS_ENABLED_PROFILES.
 #
-# In `mode: next` (and when explicitly opted in via KUBE_AGENTS_ENABLED_PROFILES),
-# the operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
+# The operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
 # custom resources whose names match a built-in optional specialist template
 # baked into the image (currently `tse`, backed by /opt/tse-template).
 # Profiles marked with `.optional-profile` that are removed from KUBE_AGENTS_ENABLED_PROFILES
@@ -2270,23 +2224,36 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
     fi
 fi
 
-# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
-# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
-# so with the image's copy there a home's bin/tirith is dead cache, never used
-# again, and it was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data
-# volume at 209 clusters (gke-labs#3325). Removed only when PATH resolves the
-# image's copy, and only a regular file named exactly tirith in $TARGET_DIR/bin
-# or a profile's bin/ that starts with the ELF magic. The file is never run: it
-# sits on a volume workers can write, and this is the bootstrap container. Each
+# 4.4 Remove the command scanner copies earlier images left in each home. Hermes
+# downloaded the binary into every profile's bin/ (38 MiB each: 6.5 GiB of a
+# 10 GiB data volume at 209 clusters, gke-labs#3325). This image replaces the
+# module that ran it (deploy/docker/patches/no_external_scanner.py), so a copy
+# on the volume is never used again, and its licence is one the install does not
+# take. Removed: only a regular file of that exact name in $TARGET_DIR/bin or a
+# profile's bin/ that starts with the ELF magic. The file is never run: it sits
+# on a volume workers can write, and this is the bootstrap container. Each
 # removal is logged with its size, so an operator can see where the space went.
-if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
-    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
-        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
-        [ "$(od -An -tx1 -N4 "$stale_tirith" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
-        stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
-        if rm -f "$stale_tirith"; then
-            echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
+# The scanner's data directories go the same way: a real directory of that name
+# under a home's .local/share or .local/state, never a symlink, so the removal
+# stays inside the directory it names.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ]; then
+    for stale_scanner in "$TARGET_DIR/bin/$STALE_SCANNER_BINARY" "$TARGET_DIR"/profiles/*/bin/"$STALE_SCANNER_BINARY"; do
+        [ -f "$stale_scanner" ] && [ ! -L "$stale_scanner" ] || continue
+        [ "$(od -An -tx1 -N4 "$stale_scanner" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
+        stale_bytes="$(stat -c %s "$stale_scanner" 2>/dev/null || echo unknown)"
+        if rm -f "$stale_scanner"; then
+            echo "Removed a per-profile command scanner copy: $stale_scanner ($stale_bytes bytes); this image does not run it"
         fi
+    done
+    for scanner_home in "$TARGET_DIR/home" "$TARGET_DIR"/profiles/*/home; do
+        for scanner_parent in $STALE_SCANNER_DATA_PARENTS; do
+            stale_scanner="$scanner_home/$scanner_parent/$STALE_SCANNER_BINARY"
+            [ -d "$stale_scanner" ] && [ ! -L "$stale_scanner" ] || continue
+            stale_kib="$(du -sk "$stale_scanner" 2>/dev/null | cut -f1)"
+            if rm -rf "$stale_scanner"; then
+                echo "Removed command scanner data: $stale_scanner (${stale_kib:-unknown} KiB); this image does not run it"
+            fi
+        done
     done
 fi
 

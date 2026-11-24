@@ -57,8 +57,8 @@ metadata:
   {{- end }}
   {{- /*
     The chart's pods in this namespace, with the surge pods each one's
-    rollout can add (kube-agents.chartQuotaPods), which share the next-mode
-    namespace pod quota with the session pods; the operator sizes that quota's
+    rollout can add (kube-agents.chartQuotaPods), which share the namespace
+    pod quota with the session pods; the operator sizes that quota's
     headroom from it (#3848). Stamped on the CR rather than the operator, because
     the CR is in the namespace those pods run in and the chart renders it even
     when an operator installed elsewhere reconciles it. Chart-derived like the
@@ -69,11 +69,8 @@ metadata:
   {{- /* The operator discards a count past its cap (a2aMaxChartPods) for its
          default (a2aDefaultChartPods), which would size the session quota
          below what the namespace runs; refuse to stamp one rather than let it
-         be dropped. The quota renders only in next mode, so only a next-mode
-         render is refused; as for the quota preflight, the mode is read from
-         the values, and the operator's A2AQuotaChartPodsDiscarded Warning
-         covers a mode set on the PlatformAgent by hand. */}}
-  {{- if and (eq (toString .Values.platformAgent.mode) "next") (gt (int $chartPods) 64) }}
+         be dropped. */}}
+  {{- if gt (int $chartPods) 64 }}
   {{- fail (printf "the chart would run %s pods at once in this namespace, counting each workload's rollout surge pods, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts or a workload's rollingUpdate.maxSurge, or run some of these components in another namespace." $chartPods) }}
   {{- end }}
   {{- with get $annotations $chartPodsKey }}
@@ -88,18 +85,7 @@ metadata:
   {{- end }}
 spec:
   {{- /*
-    `with`, so the null default renders no field at all: the operator reads an
-    absent mode as "today", and leaving it out keeps the CR of an install that
-    never set the value what it was before the chart knew the key. Helm patches a
-    custom resource from the difference between its renders, so a mode set on the
-    CR by hand survives an upgrade that leaves this null, and a value set here
-    and later cleared removes the field again, which is "today".
-  */}}
-  {{- with .Values.platformAgent.mode }}
-  mode: {{ . | quote }}
-  {{- end }}
-  {{- /*
-    `with`, as for mode: the null default renders no field, and the operator
+    `with`, so the null default renders no field, and the operator
     sizes both data claims from its own default. The schema checks the
     quantity's grammar only, so the range fails here, as the webhook (off by
     default) would refuse it. Zero passes the grammar, and the operator would
@@ -154,6 +140,10 @@ spec:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
     projectId: {{ required "platformAgent.harness.projectId is required" .Values.platformAgent.harness.projectId | quote }}
+    {{- with .Values.platformAgent.harness.universeDomain }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.harness.universeDomain" "path" (list "harness") "field" "universeDomain") }}
+    universeDomain: {{ . | quote }}
+    {{- end }}
     {{- /*
       Every optional field below goes through kube-agents.compactFields, which
       drops null and "" but keeps `false` and `0`, and which renders nothing at
@@ -280,13 +270,39 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") (hasKey $tuning "busReplicas") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
+    {{- /* The session pods' requests and limits go through the sizing overrides' helpers, so a
+      values file's `cpu: 0.5` reaches the CRD as a quoted quantity and a null or empty leaf is
+      dropped (kube-agents.resourcesOverrideQuantities). */}}
+    {{- include "kube-agents.sessionResourcesCheck" (dict "resources" $tuning.sessionResources "prefix" "platformAgent.harness.tuning.sessionResources") }}
+    {{- $sessionQuantities := include "kube-agents.resourcesOverrideQuantities" $tuning.sessionResources | fromJson }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $sessionQuantities (hasKey $tuning "busReplicas") $tuning.defaultRoute $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
       {{- end }}
       {{- if hasKey $tuning "maxSessions" }}
       maxSessions: {{ $tuning.maxSessions }}
+      {{- end }}
+      {{- if $sessionQuantities }}
+      {{- /*
+        A CRD that predates the field prunes it on write, and the release
+        record keeps it, so Helm never re-sends it: the session pods would
+        keep the default requests while the release says otherwise.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "sessionResources") }}
+      {{- fail "platformAgent.harness.tuning.sessionResources is set, but the installed PlatformAgent CRD predates spec.harness.tuning.sessionResources and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      sessionResources:
+        {{- include "kube-agents.resourcesOverrideBlock" $sessionQuantities | nindent 8 }}
       {{- end }}
       {{- if hasKey $tuning "busReplicas" }}
       {{- /*
@@ -309,6 +325,26 @@ spec:
       {{- end }}
       busReplicas: {{ $tuning.busReplicas }}
       {{- end }}
+      {{- if $tuning.defaultRoute }}
+      {{- /*
+        A CRD that predates the field prunes it on write, and the release
+        record keeps it, so Helm never re-sends it: the gateway would keep
+        routing to platform while the release says otherwise.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "defaultRoute") }}
+      {{- fail "platformAgent.harness.tuning.defaultRoute is set, but the installed PlatformAgent CRD predates spec.harness.tuning.defaultRoute and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      defaultRoute: {{ $tuning.defaultRoute | quote }}
+      {{- end }}
       {{- with $tuning.default }}
       default:
         {{- toYaml . | nindent 8 }}
@@ -326,6 +362,19 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with $tuning.admission }}
+      {{- $defaultBudgetMiB := 4096 -}}
+      {{- $defaultRssCapMiB := 1536 -}}
+      {{- $budgetMiB := $defaultBudgetMiB -}}
+      {{- if and (hasKey . "memoryBudgetMiB") (not (kindIs "invalid" .memoryBudgetMiB)) -}}
+      {{- $budgetMiB = int .memoryBudgetMiB -}}
+      {{- end -}}
+      {{- $rssCapMiB := $defaultRssCapMiB -}}
+      {{- if and (hasKey . "workerRssCapMiB") (not (kindIs "invalid" .workerRssCapMiB)) -}}
+      {{- $rssCapMiB = int .workerRssCapMiB -}}
+      {{- end -}}
+      {{- if lt $budgetMiB $rssCapMiB -}}
+      {{- fail (printf "platformAgent.harness.tuning.admission sets effective memoryBudgetMiB (%d) below workerRssCapMiB (%d), so a single worker's RSS cap exceeds the pod's admission budget; raise memoryBudgetMiB to at least %d or lower workerRssCapMiB" $budgetMiB $rssCapMiB $rssCapMiB) -}}
+      {{- end -}}
       {{- /*
         The same CRD guard as retention's above, one level down: an installed CRD
         that predates spec.harness.tuning.admission prunes the block silently while
@@ -489,6 +538,19 @@ spec:
     {{- if not (hasKey $userEnvNames $prLimitName) }}
     {{- $env = append $env (dict "name" $prLimitName "value" ($prLimit | int64 | toString)) }}
     {{- end }}
+    {{- end }}
+    {{- /*
+      deployment.evalRunTags renders KUBEAGENTS_EVAL_RUN_TAGS=1 when true, and
+      nothing when false, so a default render is unchanged. A name that
+      deployment.env also lists is skipped, and a valueFrom entry with the key
+      true fails the render, as for the keys above.
+    */}}
+    {{- $evalRunTagsName := "KUBEAGENTS_EVAL_RUN_TAGS" }}
+    {{- if and .Values.platformAgent.deployment.evalRunTags (hasKey $userValueFromNames $evalRunTagsName) }}
+    {{- fail (printf "platformAgent.deployment.evalRunTags is true, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and tagging stays off. Remove the valueFrom entry or the key." $evalRunTagsName) }}
+    {{- end }}
+    {{- if and .Values.platformAgent.deployment.evalRunTags (not (hasKey $userEnvNames $evalRunTagsName)) }}
+    {{- $env = append $env (dict "name" $evalRunTagsName "value" "1") }}
     {{- end }}
     {{- /*
       The event watcher's settings in deployment.eventWatcher come next, as
@@ -747,9 +809,10 @@ spec:
     {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
-    {{- with .Values.platformAgent.security.serviceAccountAnnotations }}
+    {{- $saAnnotations := include "kube-agents.nonEmptyStringMap" .Values.platformAgent.security.serviceAccountAnnotations }}
+    {{- if $saAnnotations }}
     serviceAccountAnnotations:
-      {{- toYaml . | nindent 6 }}
+      {{- $saAnnotations | nindent 6 }}
     {{- end }}
     {{- /*
       Rendered when the pool is armed or carries members, and omitted otherwise, so
@@ -1108,6 +1171,21 @@ spec:
       {{- if eq (toString $integ.googleChat.answerFeedback) "false" }}
       answerFeedback: false
       {{- end }}
+      {{- with $integ.googleChat.homeChannelPolicy }}
+      {{- $policyCRD := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $policyCRD }}
+      {{- $googleChatProps := dict }}
+      {{- range $policyCRD.spec.versions }}
+      {{- if eq .name "v1alpha1" }}
+      {{- $googleChatProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "integration" "properties" "googleChat" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $googleChatProps "homeChannelPolicy") }}
+      {{- fail "platformAgent.integration.googleChat.homeChannelPolicy needs a PlatformAgent CRD that has spec.integration.googleChat.homeChannelPolicy, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      homeChannelPolicy: {{ . | quote }}
+      {{- end }}
       mode: {{ $integ.googleChat.mode | default "default" | quote }}
     {{- end }}
     {{- if $integ.slack.enabled }}
@@ -1174,6 +1252,11 @@ spec:
       {{- end }}
       {{- if hasKey $integ.teams "adaptiveCards" }}
       adaptiveCards: {{ $integ.teams.adaptiveCards }}
+      {{- end }}
+      {{- if dig "inbound" "enabled" false $integ.teams }}
+      {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.integration.teams.inbound.enabled" "path" (list "integration" "teams") "field" "inbound") }}
+      inbound:
+        enabled: true
       {{- end }}
     {{- end }}
   {{- end }}

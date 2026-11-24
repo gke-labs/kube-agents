@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -47,34 +48,29 @@ func gchatTestAgent(mode string, enabled bool) *agentv1alpha1.PlatformAgent {
 	return agent
 }
 
-// TestChatConsumerIsChosenByMode: the two predicates are exact complements
-// of each other whenever Chat is enabled, and both false when it is not, so
-// an install is never rendered with two Chat consumers or none.
-func TestChatConsumerIsChosenByMode(t *testing.T) {
+// TestChatConsumerIsChosenByTheChatConfig: the A2A gateway is armed exactly
+// when Chat is enabled, whatever spec.mode says (absent, a stored "today",
+// "next"), and the legacy Hermes consumer never renders for Chat, so an
+// install is never rendered with two Chat consumers or none.
+func TestChatConsumerIsChosenByTheChatConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		agent         *agentv1alpha1.PlatformAgent
 		armed, legacy bool
 	}{
-		{"today with chat", gchatTestAgent("", true), false, true},
-		{"today explicit with chat", gchatTestAgent("today", true), false, true},
+		{"no mode with chat", gchatTestAgent("", true), true, false},
+		{"a stored today with chat", gchatTestAgent("today", true), true, false},
 		{"next with chat", gchatTestAgent("next", true), true, false},
 		{"next with chat disabled", gchatTestAgent("next", false), false, false},
-		{"today with chat disabled", gchatTestAgent("", false), false, false},
-		{"next with no integration", a2aTestAgent(), false, false},
-		// Version skew: an unrecognized mode fails closed to today, so the
-		// legacy consumer renders and the A2A side is not armed.
-		{"skew with chat", gchatTestAgent("later", true), false, true},
+		{"no mode with chat disabled", gchatTestAgent("", false), false, false},
+		{"no integration", a2aTestAgent(), false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := a2aChatArmed(tc.agent); got != tc.armed {
 				t.Errorf("a2aChatArmed = %v, want %v", got, tc.armed)
 			}
-			if got := legacyChatConsumer(tc.agent); got != tc.legacy {
-				t.Errorf("legacyChatConsumer = %v, want %v", got, tc.legacy)
-			}
-			if a2aChatArmed(tc.agent) && legacyChatConsumer(tc.agent) {
-				t.Error("both consumers armed: every Chat message would be answered twice")
+			if tc.legacy {
+				t.Fatal("fixture: no Chat consumer but the gateway exists any more")
 			}
 		})
 	}
@@ -113,7 +109,7 @@ func TestTheRelayTokenPathIsTheGatewaysDefault(t *testing.T) {
 
 // TestAnArmedGatewayCarriesTheChatBackend: everything the gateway reads to
 // select and run the Google Chat adapter, and the token it presents to the
-// broker, from one CR under next.
+// broker, from one CR.
 func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := gchatTestAgent("next", true)
@@ -133,12 +129,12 @@ func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
 			t.Errorf("%s = %q (present=%v), want %q", name, got.Value, ok, value)
 		}
 	}
-	// One backend per gateway process: the gateway's guard refuses two, so
-	// the render hands it one. The explicit CR field beats a hand-made
-	// Secret, and the Discord reference is omitted rather than left
-	// optional, because the Secret being present would otherwise arm both.
+	// The Discord reference is the default for a gateway no chat backend
+	// arms. The explicit CR field beats a hand-made Secret: the reference is
+	// omitted rather than left optional, because the Secret being present
+	// would otherwise start a Discord bot the CR never asked for.
 	if _, ok := env["DISCORD_TOKEN"]; ok {
-		t.Error("DISCORD_TOKEN is rendered beside the Chat backend; with the discord-bot Secret present the gateway would refuse to start on two backends")
+		t.Error("DISCORD_TOKEN is rendered beside the Chat backend; a discord-bot Secret left in the namespace would start a backend the CR does not name")
 	}
 
 	var mount *corev1.VolumeMount
@@ -182,9 +178,9 @@ func TestDisplayModeFollowsTheCRField(t *testing.T) {
 	}
 }
 
-// TestAnUnarmedGatewayRendersAsBefore: today with Chat, next without Chat,
-// and next with Chat disabled all render the gateway exactly as main does,
-// Discord reference included. Compared field by field rather than against
+// TestAnUnarmedGatewayRendersAsBefore: an install without Chat, and one with
+// Chat disabled, render the gateway exactly as main does, Discord reference
+// included. Compared field by field rather than against
 // a golden, because the golden path cannot produce a gateway (the callout
 // gate holds it in a fake client).
 func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
@@ -195,9 +191,9 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 		name  string
 		agent *agentv1alpha1.PlatformAgent
 	}{
-		{"next without chat", a2aTestAgent()},
-		{"next with chat disabled", gchatTestAgent("next", false)},
-		{"today with chat", gchatTestAgent("", true)},
+		{"without chat", a2aTestAgent()},
+		{"with chat disabled", gchatTestAgent("next", false)},
+		{"no mode, with chat disabled", gchatTestAgent("", false)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dep := buildA2AGatewayDeployment(tc.agent)
@@ -226,8 +222,9 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			for _, e := range c.Env {
 				names = append(names, e.Name)
 			}
-			want := []string{"NATS_URL", a2aNATSCAFileEnv, a2aNATSCAConfigMapEnv, "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", a2aConsoleDoorEnvVar, "A2A_MAX_SESSIONS", a2aGatewayRelayPrecreatedEnvVar,
-				a2aBusyNoticeAtEnvVar, a2aGatewayMetricsPortEnvVar, "A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, a2aCardStopEnvVar, a2aCardStopTimeoutEnvVar, "POD_NAMESPACE",
+			want := []string{"NATS_URL", a2aNATSCAFileEnv, a2aNATSCAConfigMapEnv, "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", a2aConsoleDoorEnvVar, "A2A_MAX_SESSIONS",
+				"A2A_SESSION_CPU_REQUEST", "A2A_SESSION_MEMORY_REQUEST", "A2A_SESSION_CPU_LIMIT", "A2A_SESSION_MEMORY_LIMIT", a2aGatewayRelayPrecreatedEnvVar,
+				a2aBusyNoticeAtEnvVar, a2aGatewayMetricsPortEnvVar, "A2A_SPAWN_SESSIONS", a2aDefaultAddresseeEnvVar, "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, a2aCardStopEnvVar, a2aCardStopTimeoutEnvVar, "POD_NAMESPACE",
 				"SESSION_KV_SALT", "A2A_OWNER_DEPLOYMENT", "A2A_SESSION_SERVICE_ACCOUNT", a2aGatewayScopeFileEnv, a2aGatewayManagementProjectEnv, a2aPrincipalMapEnvVar}
 			// The delegation target allowlists render from the CR's lists
 			// whether or not Chat is armed; they are not the Chat adapter's
@@ -235,35 +232,40 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			for _, e := range a2aTargetAllowlistEnv(tc.agent) {
 				want = append(want, e.Name)
 			}
-			// The resolved scope's ConfigMap, last, under mode next whether
-			// or not Chat is armed.
+			// The resolved scope's ConfigMap, last, whether or not Chat is
+			// armed.
 			if scopePublisherRendered(tc.agent) {
 				want = append(want, a2aResolvedScopeConfigMapEnvVar)
 			}
+			// The report reader's pair, on every install (a2a_report_reader.go).
+			want = append(want, a2aReportStoreURLEnvVar, a2aReportStoreTokenFileEnvVar)
+			// The tiers file (#3659), appended after the gateway is built.
+			want = append(want, a2aTiersFileEnvVar)
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)
 			}
-			if len(c.VolumeMounts) != 3 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
-				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName {
-				t.Errorf("unarmed mounts %v, want the principal map, the bus CA and the scope file alone", c.VolumeMounts)
+			if len(c.VolumeMounts) != 5 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
+				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName || c.VolumeMounts[3].Name != a2aReportsTokenVolume || c.VolumeMounts[4].Name != a2aTiersVolume {
+				t.Errorf("unarmed mounts %v, want the principal map, the bus CA, the scope file, the report reader's token and the tiers file alone", c.VolumeMounts)
 			}
 		})
 	}
 }
 
-// TestTheBrokerArmsTheA2ARelayUnderNext: one Chat consumer per install. The
-// broker's legacy relay instance is built from GOOGLE_CHAT_SUBSCRIPTION_NAME
-// and the A2A one from A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME; under next the
-// second gets the install's one subscription and the first is not set, so
-// exactly one instance pulls and the proxy's same-name refusal has nothing
-// to refuse. The third audience is what confers the a2a-chat role.
-func TestTheBrokerArmsTheA2ARelayUnderNext(t *testing.T) {
+// TestTheBrokerArmsTheA2ARelay: one Chat consumer per install. The broker's
+// legacy relay instance is built from GOOGLE_CHAT_SUBSCRIPTION_NAME and the
+// A2A one from A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME; the second gets the
+// install's one subscription and the first is not set, so exactly one
+// instance pulls and the proxy's same-name refusal has nothing to refuse.
+// The third audience is what confers the a2a-chat role.
+func TestTheBrokerArmsTheA2ARelay(t *testing.T) {
 	agent := gchatTestAgent("next", true)
 	env := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0].Env
 	want := map[string]string{
 		"GOOGLE_CHAT_PROJECT_ID":             "chat-project",
 		a2aGoogleChatSubscriptionEnvVar:      "projects/chat-project/subscriptions/platform-agent-chat-events-sub",
 		credentialProxyA2AChatAudienceEnvVar: credentialProxyA2AChatAudience,
+		credentialProxyA2AChatCallersEnvVar:  "system:serviceaccount:test-ns:test-agent-a2a-gateway",
 	}
 	for name, expected := range want {
 		if value, found := brokerEnvValue(env, name); !found || value != expected {
@@ -274,44 +276,89 @@ func TestTheBrokerArmsTheA2ARelayUnderNext(t *testing.T) {
 		t.Errorf("GOOGLE_CHAT_SUBSCRIPTION_NAME=%q rendered beside the A2A subscription: two relay instances would split one subscription, and the proxy refuses to start on the pair", value)
 	}
 	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
-	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
-		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third", callers)
+	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway,system:serviceaccount:test-ns:test-agent-a2a-mcp" {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third and the MCP server's fourth", callers)
 	}
 }
 
-// TestTheBrokerKeepsTheLegacyRelayOffNext: today with Chat renders exactly
-// the pair main renders; nothing of the A2A side leaks into a today install.
-func TestTheBrokerKeepsTheLegacyRelayOffNext(t *testing.T) {
+// TestTheA2AChatBindingGoesWithItsAudience: the broker's a2a-chat callers
+// (#6090) are rendered exactly when the a2a-chat audience is, naming the A2A
+// gateway's ServiceAccount alone. Turning Chat off drops both, so no binding
+// is left behind for a role nothing confers, and a CR's env can't set the
+// callers either way: it would choose who holds the role.
+func TestTheA2AChatBindingGoesWithItsAudience(t *testing.T) {
+	gateway := "system:serviceaccount:test-ns:test-agent-a2a-gateway"
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		armed bool
+	}{
+		{"chat on", gchatTestAgent("next", true), true},
+		{"chat off", gchatTestAgent("next", false), false},
+		{"no chat at all", a2aTestAgent(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.agent.Spec.Deployment == nil {
+				tc.agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+			}
+			tc.agent.Spec.Deployment.Env = append(tc.agent.Spec.Deployment.Env,
+				corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: "system:serviceaccount:test-ns:chosen-by-the-cr"})
+			env := buildCredentialProxyDeployment(tc.agent, "policy-hash").Spec.Template.Spec.Containers[0].Env
+			_, audience := brokerEnvValue(env, credentialProxyA2AChatAudienceEnvVar)
+			var callers []string
+			for _, e := range env {
+				if e.Name == credentialProxyA2AChatCallersEnvVar {
+					callers = append(callers, e.Value)
+				}
+			}
+			if tc.armed {
+				if !audience || len(callers) != 1 || callers[0] != gateway {
+					t.Errorf("armed: audience present=%v, callers %q; want the audience and exactly %q", audience, callers, gateway)
+				}
+				return
+			}
+			if audience || len(callers) != 0 {
+				t.Errorf("unarmed: audience present=%v, callers %q; want neither", audience, callers)
+			}
+		})
+	}
+}
+
+// TestTheBrokerArmsTheA2ARelayWhateverTheModeSays: a CR with no spec.mode,
+// and one still carrying the retired "today", render the A2A relay pair and
+// not the legacy subscription: the mode is no longer a switch between the
+// two consumers.
+func TestTheBrokerArmsTheA2ARelayWhateverTheModeSays(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		agent *agentv1alpha1.PlatformAgent
 	}{
-		{"today with chat", gchatTestAgent("", true)},
-		{"skew with chat", gchatTestAgent("later", true)},
+		{"no mode with chat", gchatTestAgent("", true)},
+		{"a stored today with chat", gchatTestAgent("today", true)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := buildCredentialProxyDeployment(tc.agent, "policy-hash").Spec.Template.Spec.Containers[0].Env
-			if value, _ := brokerEnvValue(env, "GOOGLE_CHAT_SUBSCRIPTION_NAME"); value != "projects/chat-project/subscriptions/platform-agent-chat-events-sub" {
-				t.Errorf("legacy subscription = %q", value)
+			if value, found := brokerEnvValue(env, "GOOGLE_CHAT_SUBSCRIPTION_NAME"); found {
+				t.Errorf("legacy subscription %q rendered; spec.mode must not select the legacy consumer", value)
 			}
 			for _, name := range []string{a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar} {
-				if value, found := brokerEnvValue(env, name); found {
-					t.Errorf("%s=%q rendered on a today install", name, value)
+				if _, found := brokerEnvValue(env, name); !found {
+					t.Errorf("%s not rendered; the A2A relay is not armed", name)
 				}
 			}
-			if callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS"); strings.Contains(callers, "a2a-gateway") {
-				t.Errorf("the A2A gateway is a broker caller on a today install: %q", callers)
+			if callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS"); !strings.Contains(callers, "a2a-gateway") {
+				t.Errorf("the A2A gateway is not a broker caller: %q", callers)
 			}
 		})
 	}
 }
 
 // TestNoRenderCarriesBothChatSubscriptions walks every container the
-// operator renders for one CR, under today and under next, and asserts the
+// operator renders for one CR, with and without a spec.mode, and asserts the
 // two subscription variables never meet. This is the double-answer guard
 // in one assertion.
 func TestNoRenderCarriesBothChatSubscriptions(t *testing.T) {
-	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("", true), gchatTestAgent("next", true)} {
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{"no mode": gchatTestAgent("", true), "next": gchatTestAgent("next", true)} {
 		containers := buildCredentialProxyDeployment(agent, "h").Spec.Template.Spec.Containers
 		containers = append(containers, buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers...)
 		containers = append(containers, buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers...)
@@ -326,10 +373,10 @@ func TestNoRenderCarriesBothChatSubscriptions(t *testing.T) {
 			}
 		}
 		if legacy && a2a {
-			t.Errorf("mode %v: both Chat subscription variables are rendered; every message would be answered twice", ptr.Deref(agent.Spec.Mode, "today"))
+			t.Errorf("%s: both Chat subscription variables are rendered; every message would be answered twice", name)
 		}
 		if !legacy && !a2a {
-			t.Errorf("mode %v: neither Chat subscription variable is rendered; Chat is enabled and nobody consumes it", ptr.Deref(agent.Spec.Mode, "today"))
+			t.Errorf("%s: neither Chat subscription variable is rendered; Chat is enabled and nobody consumes it", name)
 		}
 	}
 }
@@ -341,8 +388,8 @@ func TestNoRenderCarriesBothChatSubscriptions(t *testing.T) {
 func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 	armed := buildCredentialProxyNetworkPolicy(gchatTestAgent("next", true))
 	from := armed.Spec.Ingress[0].From
-	if len(from) != 3 {
-		t.Fatalf("armed: %d peers on the broker port, want 3 (sandbox, gateway, A2A gateway): %#v", len(from), from)
+	if len(from) != 4 {
+		t.Fatalf("armed: %d peers on the broker port, want 4 (sandbox, gateway, A2A gateway, MCP): %#v", len(from), from)
 	}
 	var found bool
 	for _, peer := range from {
@@ -356,26 +403,27 @@ func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 	if !found {
 		t.Error("the A2A gateway pod is not a peer; its relay pulls would be refused before TokenReview")
 	}
-	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("", true), a2aTestAgent()} {
-		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
-			t.Errorf("unarmed: %d peers, want the two main renders", got)
+	// Unarmed, the A2A gateway is still a peer: its report reader calls the
+	// store routes on every install (a2a_report_reader.go).
+	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("next", false), a2aTestAgent()} {
+		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 4 {
+			t.Errorf("unarmed: %d peers, want the four default renders (sandbox, gateway, A2A gateway, MCP)", got)
 		}
 	}
 }
 
-// TestTheLegacyChatConsumerIsNotRenderedUnderNext: the Hermes google_chat
-// platform, its relay env on the gateway container and its pins in the
-// managed .env all go with the mode. Under today they are exactly what main
-// renders; under skew they come back, because renderMode fails closed.
-func TestTheLegacyChatConsumerIsNotRenderedUnderNext(t *testing.T) {
+// TestTheLegacyChatConsumerIsNotRendered: the Hermes google_chat platform,
+// its relay env on the gateway container and its pins in the managed .env
+// are gone from every install, whatever spec.mode says.
+func TestTheLegacyChatConsumerIsNotRendered(t *testing.T) {
 	legacyNames := []string{"GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME", "GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS"}
 	for _, tc := range []struct {
 		name   string
 		agent  *agentv1alpha1.PlatformAgent
 		legacy bool
 	}{
-		{"today with chat", gchatTestAgent("", true), true},
-		{"skew with chat", gchatTestAgent("later", true), true},
+		{"no mode with chat", gchatTestAgent("", true), false},
+		{"a stored today with chat", gchatTestAgent("today", true), false},
 		{"next with chat", gchatTestAgent("next", true), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -405,9 +453,8 @@ func TestTheLegacyChatConsumerIsNotRenderedUnderNext(t *testing.T) {
 // sees is normalized with its own grammar (joined, split on commas, trimmed,
 // empties dropped), and the allow-all decision is the legacy consumer's rule
 // on the RAW CR list (allowAllUsers: absent or a single empty string). So a
-// degenerate list - whitespace or commas only - is a restriction to nobody in
-// both modes, which the gateway announces at boot, never a silent widening to
-// everyone on the mode flip.
+// degenerate list - whitespace or commas only - is a restriction to nobody,
+// which the gateway announces at boot, never a silent widening to everyone.
 func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -441,24 +488,6 @@ func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
 	}
 }
 
-// TestTheAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer to "is
-// everyone allowed", whichever consumer the mode renders. The A2A render's
-// flag is compared with the legacy pod env's for the same list, so a CR that
-// answers nobody under today cannot answer everyone under next.
-func TestTheAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
-	for _, users := range [][]string{nil, {""}, {" "}, {","}, {" , ", ",,"}, {"", "  "}, {"a@example.com"}, {" a@example.com ", ""}} {
-		next := gchatTestAgent("next", true)
-		next.Spec.Integration.GoogleChat.AllowedUsers = users
-		today := gchatTestAgent("", true)
-		today.Spec.Integration.GoogleChat.AllowedUsers = users
-		a2a := envMapOf(buildA2AGatewayDeployment(next).Spec.Template.Spec.Containers[0].Env)[a2aGchatAllowAllUsersEnvVar].Value
-		legacy := envMapOf(brokerContainerNamed(buildPodTemplateSpec(today, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers, "platform-agent").Env)["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value
-		if a2a != legacy {
-			t.Errorf("allowedUsers=%q: next renders allow-all %s where today renders %s", users, a2a, legacy)
-		}
-	}
-}
-
 // TestTheHomeChannelReachesTheArmedGateway: the chat.notify route posts
 // proactive messages to googleChat.homeChannel, so the armed gateway carries
 // it, trimmed, and an install with no home channel renders none, which leaves
@@ -484,52 +513,135 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 			}
 		})
 	}
-	// Not under today: the legacy Hermes platform has the channel there.
-	today := gchatTestAgent("", true)
-	today.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAAA"
-	if _, ok := envMapOf(buildA2AGatewayDeployment(today).Spec.Template.Spec.Containers[0].Env)[a2aGchatHomeChannelEnvVar]; ok {
-		t.Errorf("%s rendered on an unarmed gateway", a2aGchatHomeChannelEnvVar)
-	}
 }
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
-// container is told to send proactive posts through chat.notify exactly when
-// the next stack holds Google Chat and the home channel is a space name, or
-// is unset with no Slack to fall back to (the gateway then keeps the refused
-// posts for the digest); and the kanban notifier to send a card's report
-// back to its conversation whenever the gateway arms the route (home channel
-// unset or a space name). Telling either with no route behind it sends posts
-// to a subject nobody answers.
+// container is told, in A2A_NOTIFY_CONVERSATIONS, every platform whose route
+// the gateway arms, home channel or not, Chat first, and in
+// A2A_NOTIFY_PLATFORM the armed platforms whose home channel the CR sets.
+// The second may be absent; the agent then sends home posts to Slack's
+// projected channel or to every armed route. Both read CR fields only, so a
+// learned channel rolls no pod. Telling either with no route behind it sends
+// posts to a subject nobody answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
-		name               string
-		agent              *agentv1alpha1.PlatformAgent
-		home, conversation bool
+		name                            string
+		agent                           *agentv1alpha1.PlatformAgent
+		wantPlatform, wantConversations string // "" for absent
 	}{
-		{"today with chat", gchatTestAgent("", true), false, false},
-		{"skew with chat", gchatTestAgent("later", true), false, false},
-		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true},
-		{"next with chat, no home channel", gchatTestAgent("next", true), true, true},
-		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), false, true},
-		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false},
-		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false},
-		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false},
-		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false, false},
+		{"no mode with chat", gchatTestAgent("", true), "", "google_chat"},
+		{"a stored today with chat", gchatTestAgent("today", true), "", "google_chat"},
+		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), "google_chat", "google_chat"},
+		{"next with chat, no home channel", gchatTestAgent("next", true), "", "google_chat"},
+		{"next with slack, no home channel", slackTestAgent("next", true), "", "slack"},
+		// Both backends share the gateway, so both carry conversation
+		// reports; the platform list names the ones with a CR home.
+		{"next with chat and slack, no homes", chatAndSlackTestAgent("next"), "", "google_chat,slack"},
+		{"next with chat and slack, slack home only", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), "slack", "google_chat,slack"},
+		{"next with chat and slack, chat home only", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "google_chat", "google_chat,slack"},
+		{"next with chat and slack, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "C0HOME"), "google_chat,slack", "google_chat,slack"},
+		// A malformed home drops only that platform's route; the other stays.
+		{"next with chat and slack, slack home a name", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "#ops"), "google_chat", "google_chat"},
+		{"next with chat and slack, chat home not a space", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "C0HOME"), "slack", "slack"},
+		{"next with chat and slack, both homes malformed", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "#ops"), "", ""},
+		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), "", ""},
+		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), "", ""},
+		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), "", ""},
+		{"no mode with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), "google_chat", "google_chat"},
+		{"no mode with chat and slack", chatAndSlackTestAgent(""), "", "google_chat,slack"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
 			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
-			for name, want := range map[string]bool{a2aNotifyPlatformEnvVar: tc.home, a2aNotifyConversationsEnvVar: tc.conversation} {
+			for name, want := range map[string]string{a2aNotifyPlatformEnvVar: tc.wantPlatform, a2aNotifyConversationsEnvVar: tc.wantConversations} {
 				got, ok := env[name]
-				if ok != want {
-					t.Fatalf("%s present = %v, want %v", name, ok, want)
+				if ok != (want != "") {
+					t.Fatalf("%s present = %v, want %v", name, ok, want != "")
 				}
-				if ok && got.Value != "google_chat" {
-					t.Errorf("%s = %q, want google_chat (the platform name the agent-side callers use)", name, got.Value)
+				if ok && got.Value != want {
+					t.Errorf("%s = %q, want %q (the platform names the agent-side callers use)", name, got.Value, want)
 				}
 			}
-			if (tc.home || tc.conversation) && legacyChatConsumer(tc.agent) {
-				t.Error("the notify route and the legacy Hermes platform both render")
+			if tc.wantConversations != "" {
+				for _, name := range []string{"GOOGLE_CHAT_RELAY_URL", "SLACK_RELAY_URL"} {
+					if _, ok := env[name]; ok {
+						t.Errorf("the notify route and the legacy Hermes relay env %s both render", name)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestNotifyPlatformsOrderIsChatThenSlack: the conversations list names every
+// armed route, Chat before Slack, whatever home channels are set, and Slack
+// alone on a Slack-only install.
+func TestNotifyPlatformsOrderIsChatThenSlack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  []string
+	}{
+		{"chat and slack, no homes", chatAndSlackTestAgent("next"), []string{"google_chat", "slack"}},
+		{"chat and slack, slack home", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), []string{"google_chat", "slack"}},
+		{"chat and slack, chat home", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), []string{"google_chat", "slack"}},
+		{"chat only, no home", gchatTestAgent("next", true), []string{"google_chat"}},
+		{"slack only", slackTestAgent("next", true), []string{"slack"}},
+		{"no mode", chatAndSlackTestAgent(""), []string{"google_chat", "slack"}},
+	} {
+		if got := a2aNotifyPlatforms(tc.agent); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: a2aNotifyPlatforms = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestNotifyHomePlatformsAreTheArmedRoutesWithACRHome: the platform list
+// names the armed routes whose CR home channel is set and well-formed, Chat
+// before Slack, and is empty when none is: no fallback to every armed route,
+// and no admitted record, which only the projected file carries.
+func TestNotifyHomePlatformsAreTheArmedRoutesWithACRHome(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  []string
+	}{
+		{"chat and slack, no homes", chatAndSlackTestAgent("next"), nil},
+		{"chat and slack, slack home", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), []string{"slack"}},
+		{"chat and slack, chat home", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), []string{"google_chat"}},
+		{"chat and slack, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "C0HOME"), []string{"google_chat", "slack"}},
+		{"chat and slack, chat home not a space", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "C0HOME"), []string{"slack"}},
+		{"chat only, no home", gchatTestAgent("next", true), nil},
+		{"chat only, home", withHome(gchatTestAgent("next", true), "spaces/AAAA"), []string{"google_chat"}},
+		{"slack only, no home", slackTestAgent("next", true), nil},
+		{"slack only, home", withSlackHomeChannel(slackTestAgent("next", true), "C0HOME"), []string{"slack"}},
+		{"no mode, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent(""), "spaces/AAAA"), "C0HOME"), []string{"google_chat", "slack"}},
+	} {
+		if got := a2aNotifyHomePlatforms(tc.agent); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: a2aNotifyHomePlatforms = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTheAgentCarriesNoChatHomeChannel: the agent container carries no
+// GOOGLE_CHAT_HOME_CHANNEL, whatever the CR sets and whatever spec.mode
+// says: the platform list carries Chat's home, and an added variable would
+// roll the pod on upgrade.
+func TestTheAgentCarriesNoChatHomeChannel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"next with chat and slack, chat home set", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA")},
+		{"next with chat, home set", withHome(gchatTestAgent("next", true), "spaces/AAAA")},
+		{"next slack only", withSlackHomeChannel(slackTestAgent("next", true), "C0HOME")},
+		{"no mode with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
+			for _, e := range brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env {
+				if e.Name == "GOOGLE_CHAT_HOME_CHANNEL" {
+					t.Errorf("GOOGLE_CHAT_HOME_CHANNEL = %q, want absent", e.Value)
+				}
 			}
 		})
 	}
@@ -537,6 +649,11 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 
 func withHome(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
 	agent.Spec.Integration.GoogleChat.HomeChannel = home
+	return agent
+}
+
+func withSlackHomeChannel(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
+	agent.Spec.Integration.Slack.HomeChannel = home
 	return agent
 }
 
@@ -556,7 +673,7 @@ func TestGchatAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
 		{"unset", gchatTestAgent("next", true), nil, "", false},
 		{"true", gchatTestAgent("next", true), &on, "", false},
 		{"false", gchatTestAgent("next", true), &off, "false", true},
-		{"false under today", gchatTestAgent("", true), &off, "", false},
+		{"false with no mode", gchatTestAgent("", true), &off, "false", true},
 		{"false with chat disabled", gchatTestAgent("next", false), &off, "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

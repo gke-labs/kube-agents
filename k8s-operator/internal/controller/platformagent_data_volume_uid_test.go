@@ -78,7 +78,7 @@ type renderedPodTemplate struct {
 //
 // The builders are called directly rather than through the reconciler's gates,
 // so a workload an install would not create today — the shell sandbox is
-// experimental, the A2A pods are dark outside mode next — is still walked. What
+// experimental — is still walked. What
 // is being asserted is what the builder would render if the gate opened. Both
 // gateway shapes are rendered for the same reason: useStatefulSet picks one of
 // them per CR, and the one it did not pick is still a pod this operator build
@@ -101,10 +101,22 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	profilePool := buildProfilePool(agent, &poolProfile, agentv1alpha1.AgentProfileTierRead, "agentprofile-auditor-read", false)
 	a2aConsole := buildA2AConsoleDeployment(agent)
 	a2aMCP := buildA2AMCPDeployment(agent)
+	a2aCurator := buildA2ACuratorDeployment(agent)
+	// The Teams inbound receiver renders only with Teams, its inbound switch
+	// and a tenant on the CR; the walk hands it a copy of agent with those set.
+	teamsInbound := buildA2ATeamsInboundDeployment(withTeamsInboundOn(agent))
 	gatewayStatefulSet := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
 	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
 	nats := buildA2ANATSStatefulSet(agent, "c")
 	provision := buildA2AProvisionJob(agent)
+	provisionThird := a2aProvisionJobForm(agent, true)
+	// The bus migration's pin and unpin Jobs share one builder, its
+	// snapshot, restore and rollback pods another, and its hashing pod a
+	// third; none mounts the agent's claim.
+	busRun := &agentv1alpha1.BusMigrationStatus{RunID: "1-1", Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	busPin := buildBusMigrationJob(agent, busRun, "pin", time.Now())
+	busRestore := buildBusStreamPod(agent, busRun, "restore", time.Now())
+	busHash := buildBusHashPod(agent, busRun)
 	scopePublisher := buildScopePublisherJob(agent, time.Time{}, scopeMemberHash(agent))
 
 	pods := []renderedPodTemplate{
@@ -120,7 +132,13 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildProfilePool", profilePool.Name, profilePool.Spec.Template.Spec},
 		{"buildA2AConsoleDeployment", a2aConsole.Name, a2aConsole.Spec.Template.Spec},
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
+		{"buildA2ACuratorDeployment", a2aCurator.Name, a2aCurator.Spec.Template.Spec},
+		{"buildA2ATeamsInboundDeployment", teamsInbound.Name, teamsInbound.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
+		{"a2aProvisionJobForm", provisionThird.Name, provisionThird.Spec.Template.Spec},
+		{"buildBusMigrationJob", busPin.Name, busPin.Spec.Template.Spec},
+		{"buildBusStreamPod", busRestore.Name, busRestore.Spec},
+		{"buildBusHashPod", busHash.Name, busHash.Spec},
 		{"buildScopePublisherJob", scopePublisher.Name, scopePublisher.Spec.Template.Spec},
 	}
 	for builder, statefulSet := range map[string]*appsv1.StatefulSet{
@@ -185,7 +203,6 @@ func dataVolumeTestAgent() *agentv1alpha1.PlatformAgent {
 // is what actually puts a second claim name in front of the filter.
 func dataVolumeEveryComponentAgent() *agentv1alpha1.PlatformAgent {
 	agent := dataVolumeTestAgent()
-	agent.Spec.Mode = ptr.To(string(ModeNext))
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
 		Experimental: &agentv1alpha1.ExperimentalSpec{
 			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(true)},

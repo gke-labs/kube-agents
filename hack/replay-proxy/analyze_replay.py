@@ -15,7 +15,11 @@ Reported:
   and every request after it in its conversation), by the role of the first
   differing message and by the miss signature the proxy logged;
 - with `--verdicts`, whether each conversation's run verdict matched the
-  verdict of the run that recorded its first served answer;
+  verdict of the build that first wrote its first served answer's object
+  (which may not be the night that produced it);
+- answers per key: of the served requests, how many came from a key with
+  several saved answers (the proxy draws among those by weight), and of those
+  keys, how many had more than one of their answers served;
 - lost requests: replay lines whose analysis was dropped or failed, so they
   carry no hashes and join no conversation. They are counted, served or not;
   a conversation that lost a request not served may show its first miss late.
@@ -57,6 +61,14 @@ class Line:
     miss: Dict[str, Any]
     served_from_build: Optional[str]
     served_via: str
+    # On a served line: how many answers its key had (0 on a line written
+    # before the proxy logged it), and which one was served.
+    fingerprint: str = ""
+    # The key a served answer came from (served_key): the slot's on an
+    # answer_slots hit; empty on a line written before the proxy logged it.
+    served_key: str = ""
+    alternates: int = 0
+    served_alternate: str = ""
     # A line whose analysis was dropped or failed: no fingerprint, no hashes.
     lost: bool = False
     # Whether the request holds an assistant message: a conversation already under way.
@@ -80,9 +92,17 @@ class Line:
             chain=chain,
             miss=entry.get(F.MISS) or {},
             served_from_build=str(served_from.get(F.JOB_BUILD)) if served_from.get(F.JOB_BUILD) else None,
+            fingerprint=str(entry.get(F.FINGERPRINT) or ""),
+            served_key=str(entry.get(F.SERVED_KEY) or ""),
+            alternates=_count(entry.get(F.ALTERNATES)),
+            served_alternate=str(entry.get(F.SERVED_ALTERNATE) or ""),
             lost=not entry.get(F.FINGERPRINT),
             continues=ASSISTANT_ROLE in (entry.get(F.ROLES) or []),
         )
+
+
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 @dataclass
@@ -197,6 +217,11 @@ def summarize(lines: List[Line], verdicts: Optional[Dict[str, str]] = None, top:
     served = sum(line.prompt_tokens for line in lines if line.served)
     via_slots = sum(line.prompt_tokens for line in lines if line.served and line.served_via == F.VIA_ANSWER_SLOTS)
     before = sum(conv.served_before_first_miss()[1] for conv in convs)
+    several = [line for line in lines if line.served and line.alternates > 1]
+    served_per_key: Dict[str, set] = {}
+    for line in several:
+        # By the key served from: on a slot hit that is not the request's own.
+        served_per_key.setdefault(line.served_key or line.fingerprint, set()).add(line.served_alternate)
     by_role: Dict[str, int] = {}
     by_signature: Dict[Tuple[str, str], int] = {}
     per_conversation = []
@@ -231,6 +256,10 @@ def summarize(lines: List[Line], verdicts: Optional[Dict[str, str]] = None, top:
         "served_token_percent": percent(served, total),
         "served_via_answer_slots_token_percent": percent(via_slots, total),
         "served_before_first_miss_token_percent": percent(before, total),
+        "served_requests_from_keys_with_several_answers": len(several),
+        "served_from_keys_with_several_answers_token_percent": percent(sum(l.prompt_tokens for l in several), total),
+        "keys_with_several_answers_served": len(served_per_key),
+        "keys_with_more_than_one_answer_served": sum(1 for names in served_per_key.values() if len(names) > 1),
         "first_miss_tokens_lost_by_role": dict(sorted(by_role.items(), key=lambda kv: -kv[1])),
         "first_miss_tokens_lost_by_signature": [
             {"role": role, "signature": signature, "tokens_lost": lost}
@@ -249,6 +278,10 @@ def render(report: Dict[str, Any]) -> str:
         f"served: {report['served_token_percent']}% of prompt tokens"
         f" ({report['served_before_first_miss_token_percent']}% before each conversation's first miss;"
         f" {report['served_via_answer_slots_token_percent']}% through answer slots)",
+        f"served from keys with several answers: {report['served_requests_from_keys_with_several_answers']} requests"
+        f" ({report['served_from_keys_with_several_answers_token_percent']}% of prompt tokens);"
+        f" {report['keys_with_more_than_one_answer_served']} of {report['keys_with_several_answers_served']}"
+        " such keys had more than one of their answers served",
         f"lost requests (analysis dropped or failed; in no conversation): {report['lost_requests']}"
         f" ({report['lost_requests_served']} served, {report['lost_requests_not_served']} not served)",
         f"first-miss tokens lost by role: {report['first_miss_tokens_lost_by_role']}",

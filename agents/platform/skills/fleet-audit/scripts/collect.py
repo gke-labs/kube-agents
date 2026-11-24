@@ -7,22 +7,25 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 --manifest-file` cross-checks the published document against.
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
-twenty-four-check roster (§3.1–§3.24 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s seventeen-check roster (§2.1–§2.17 of
+twenty-seven-check roster (§3.1–§3.28 of `governance/obtainability_audit_sop.md`),
+`compliance-audit`'s twenty-check roster (§2.1–§2.20 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
 to *find*, including ai-security's §3.4, whose severity forks on whether the
 same container also trips §3.2, a fact both checks compute from the same dump —
-so nothing was left on the SOP side to skip. Four checks' *fixes* do need a
+so nothing was left on the SOP side to skip. Six checks' *fixes* do need a
 reader -- `netpol-missing`'s remedy is a default-deny NetworkPolicy, for one --
 so their candidates carry a marker that keeps the automatic sweep from
 opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
-collect in different shapes: obtainability answers every check from one
-workload dump plus the reads its declaration fields need; compliance issues
-several distinct `kubectl` and `gcloud` reads per cluster, four of them
-best-effort because their CRDs are not installed everywhere; ai-security reads
+collect in different shapes: obtainability answers most checks from one
+workload dump plus supplemental CRD and node-pool reads for §3.24/§3.26, a pod
+read for §3.28 that is issued only when a workload is short of available pods
+or mid-rollout, and the reads its declaration fields need; compliance issues
+several distinct `kubectl` and `gcloud` reads per cluster, seven of them
+best-effort (five because their CRDs are not installed everywhere, two because
+an identity may not list webhook configurations or EndpointSlices); ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
 `collect_cluster` is a thin dispatcher over a per-stream *context builder* for
@@ -38,12 +41,17 @@ What this file does for the checks it covers:
      refuses and names the tool. Then enumerates each project's clusters
      (`gcloud container clusters list`), naming every cluster
      `<project>/<location>/<name>` because a bare name is unique only inside
-     one project and location.
+     one project and location. With `--cluster <location>/<name>` (and
+     `--project`), only that cluster is read: the project's others are
+     recorded as not read here, and a cluster the listing doesn't return is
+     refused with nothing read (#5623: one fan-out child per cluster).
   2. Fetches per-cluster credentials into an isolated kubeconfig — the same
      path convention every SOP already uses (`AGENTS.md`, "Cluster
-     Credentials") — then runs the stream's context builder: one dump for
-     obtainability, several distinct `kubectl`/`gcloud` reads for
-     compliance, two dumps for ai-security, each behind its own fail-closed
+     Credentials") — then runs the stream's context builder: one workload dump
+     plus supplemental CRD, node-pool and (when a workload is short of
+     available pods) pod reads for obtainability, several
+     distinct `kubectl`/`gcloud` reads for compliance, two dumps for
+     ai-security, each behind its own fail-closed
      `jq -e`-equivalent gate so a truncated or empty result cannot read as a
      clean cluster.
   3. Runs every covered check's filter against the collected context, in
@@ -65,11 +73,14 @@ own shell to run.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import datetime
 import errno
 import functools
 import hashlib
+import importlib
 import ipaddress
 import json
 import math
@@ -192,12 +203,102 @@ NETPOL_DEFAULT_DENY_TRIAGE = "default-deny"
 SA_TOKEN_TRIAGE = "namespace-token"
 SERVICE_SELECTOR_TRIAGE = "service-selector"
 HARD_SPREAD_TRIAGE = "hard-spread"
+# §2.19: the fix narrows one team's ServiceEntry, and which team keeps the
+# host is the owners' call, not one the check can read off the objects.
+SERVICEENTRY_OWNER_TRIAGE = "serviceentry-owner"
+SERVICEENTRY_HOST_COLLISION_SLUG = "serviceentry-host-collision"
+# §3.28: the fix follows from why the pull fails (a registry permission, an
+# image path, a credential), which this check does not establish and the
+# alert's triage does.
+IMAGE_PULL_FAILING_SLUG = "image-pull-failing"
+IMAGE_PULL_TRIAGE = "image-pull"
 TRIAGE_BY_SLUG = {
     NETPOL_MISSING_SLUG: NETPOL_DEFAULT_DENY_TRIAGE,
     "default-sa-automount": SA_TOKEN_TRIAGE,
     "service-selects-nothing": SERVICE_SELECTOR_TRIAGE,
     "spread-not-achieved": HARD_SPREAD_TRIAGE,
+    SERVICEENTRY_HOST_COLLISION_SLUG: SERVICEENTRY_OWNER_TRIAGE,
+    IMAGE_PULL_FAILING_SLUG: IMAGE_PULL_TRIAGE,
 }
+
+# §3.26 (`ingress-gateway-healthcheck-mismatch`): in-cluster cross-check of
+# HTTPRoute / Ingress backendRefs, Service numeric targetPorts, and
+# BackendConfig / HealthCheckPolicy probe ports against backing workloads.
+INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG = "ingress-gateway-healthcheck-mismatch"
+KUBECTL_CHUNK_SIZE_ARG = "--chunk-size=500"
+INGRESS_KIND = "Ingress"
+HTTPROUTE_KIND = "HTTPRoute"
+BACKEND_CONFIG_KIND = "BackendConfig"
+HEALTH_CHECK_POLICY_KIND = "HealthCheckPolicy"
+SERVICE_KIND = "Service"
+CORE_API_GROUP = ""
+HTTPROUTE_CRD_RESOURCE = "httproutes.gateway.networking.k8s.io"
+BACKEND_CONFIG_CRD_RESOURCE = "backendconfigs.cloud.google.com"
+HEALTH_CHECK_POLICY_CRD_RESOURCE = "healthcheckpolicies.networking.gke.io"
+INGRESS_GATEWAY_CRD_RESOURCES: tuple[str, ...] = (
+    HTTPROUTE_CRD_RESOURCE,
+    BACKEND_CONFIG_CRD_RESOURCE,
+    HEALTH_CHECK_POLICY_CRD_RESOURCE,
+)
+INGRESS_GATEWAY_CRD_META: dict[str, tuple[str, str]] = {
+    HTTPROUTE_CRD_RESOURCE: (HTTPROUTE_KIND, "http_routes"),
+    BACKEND_CONFIG_CRD_RESOURCE: (BACKEND_CONFIG_KIND, "backend_configs"),
+    HEALTH_CHECK_POLICY_CRD_RESOURCE: (HEALTH_CHECK_POLICY_KIND, "health_check_policies"),
+}
+BACKEND_CONFIG_ANNOTATIONS: tuple[str, ...] = (
+    "cloud.google.com/backend-config",
+    "beta.cloud.google.com/backend-config",
+)
+HEALTH_CHECK_SUBCONFIG_KEYS: tuple[str, ...] = (
+    "httpHealthCheck",
+    "httpsHealthCheck",
+    "http2HealthCheck",
+    "tcpHealthCheck",
+    "sslHealthCheck",
+    "grpcHealthCheck",
+)
+PORT_SPEC_USE_SERVING = "USE_SERVING_PORT"
+PORT_SPEC_USE_NAMED = "USE_NAMED_PORT"
+REQUEST_MIRROR_FILTER_TYPE = "RequestMirror"
+DEFAULT_PORT_PROTOCOL = "TCP"
+PROBE_FIELDS: tuple[str, ...] = ("readinessProbe", "livenessProbe", "startupProbe")
+READINESS_PROBE_FIELD = "readinessProbe"
+PROBE_PORT_HANDLERS: tuple[str, ...] = ("httpGet", "tcpSocket", "grpc")
+RESTART_POLICY_ALWAYS = "Always"
+WILDCARD_PORT_KEY = "*"
+# Container port names that expose observability, health, or admin endpoints
+# rather than application traffic. A container declaring only these ports does
+# not state a serving-port contract for Service targetPort comparison.
+AUXILIARY_PORT_NAMES: frozenset[str] = frozenset(
+    {
+        "metrics",
+        "http-metrics",
+        "https-metrics",
+        "prometheus",
+        "prom",
+        "telemetry",
+        "health",
+        "healthz",
+        "ready",
+        "readyz",
+        "live",
+        "livez",
+        "probe",
+        "probes",
+        "status",
+        "admin",
+        "debug",
+        "pprof",
+        "stats",
+    }
+)
+ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
+OPT_OUT_EXEMPT_VALUE = "exempt"
+_IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH = (
+    "Traffic routed through an Ingress or Gateway HTTPRoute, or probed by a "
+    "load-balancer health check, targets a port that the Service or its backing "
+    "pods do not expose, so requests or health checks fail while the pods report Ready."
+)
 
 # The manifest contract's outcomes, and the target names a sweep of more than
 # one project needs (§2 of `docs/designs/fleet-audit-collector-manifest.md`).
@@ -220,6 +321,95 @@ UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 # the broker path.
 PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 PLATFORM_SCRIPT_DIR_DEPTH = 3
+
+# §3.25 `hpa-aggressive-scaledown`: autoscaling/v2 `behavior.scaleDown`
+# defaults and thresholds. Kubernetes defaults `stabilizationWindowSeconds` to
+# 300, `selectPolicy` to `Max`, and `policies` to 100% per 15 seconds; only an
+# explicit stabilization window below 60 seconds exposes the workload to immediate
+# post-burst contraction. A `Percent` policy at or above 50 removes at least
+# half the running replicas in one period.
+HPA_AGGRESSIVE_SCALEDOWN_SLUG = "hpa-aggressive-scaledown"
+CHECK_KIND_CLUSTER = "cluster"
+SEVERITY_MAJOR = "major"
+# S2, the label GKE stamps on the add-ons it manages; shared by HPA, Service
+# and compliance checks whose objects do not pass through `normalize_workloads`.
+_ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
+DEFAULT_HPA_SCALEDOWN_STABILIZATION_SECONDS = 300
+HPA_AGGRESSIVE_SCALEDOWN_MAX_STABILIZATION_SECONDS = 60
+DEFAULT_HPA_SCALEDOWN_SELECT_POLICY = "Max"
+HPA_SELECT_POLICY_DISABLED = "Disabled"
+HPA_SELECT_POLICY_MIN = "Min"
+HPA_POLICY_TYPE_PERCENT = "Percent"
+DEFAULT_HPA_SCALEDOWN_PERCENT_VALUE = 100
+DEFAULT_HPA_SCALEDOWN_PERIOD_SECONDS = 15
+HPA_AGGRESSIVE_SCALEDOWN_PERCENT_FLOOR = 50
+HPA_HIT_COMMA_JOIN = ", "
+IMPACT_HPA_AGGRESSIVE_SCALEDOWN = (
+    "When traffic subsides after a burst, the autoscaler removes a large share "
+    "of running pods in a single period with little or no stabilization window "
+    "while the containers receive SIGTERM immediately with no preStop wait, "
+    "dropping connections in flight and flapping capacity on brief load dips."
+)
+
+# §2.18 and §2.20 admission-webhook constants, plus §2.20's PEM / X.509 DER
+# `Validity` (`notAfter`) constants (RFC 5280 §4.1, §4.1.2.5) and 30-day window.
+WEBHOOK_BACKEND_UNREACHABLE_SLUG = "webhook-backend-unreachable"
+WEBHOOK_CA_BUNDLE_EXPIRED_SLUG = "webhook-ca-bundle-expired"
+WEBHOOK_CA_EXPIRY_WARNING_DAYS = 30
+WEBHOOK_SEVERITY_CA_IGNORE_EXPIRING = "minor"
+PEM_CERT_BEGIN_MARKER = "-----BEGIN CERTIFICATE-----"
+PEM_CERT_END_MARKER = "-----END CERTIFICATE-----"
+DER_TAG_INTEGER = 0x02
+DER_TAG_UTC_TIME = 0x17
+DER_TAG_GENERALIZED_TIME = 0x18
+DER_TAG_SEQUENCE = 0x30
+DER_TAG_EXPLICIT_VERSION = 0xA0
+DER_HIGH_TAG_NUMBER_MASK = 0x1F
+DER_LONG_LENGTH_FLAG = 0x80
+DER_LONG_LENGTH_MASK = 0x7F
+DER_MAX_LENGTH_OCTETS = 4
+BIG_ENDIAN = "big"
+ASCII_ENCODING = "ascii"
+LATIN1_ENCODING = "latin-1"
+# RFC 5280 §4.1.2.5.1: two-digit UTCTime years >= 50 map to 1900..1999,
+# years < 50 map to 2000..2049.
+ASN1_UTC_PIVOT_YEAR = 50
+ASN1_UTC_CENTURY_1900 = 1900
+ASN1_UTC_CENTURY_2000 = 2000
+ASN1_UTC_Z = "Z"
+ASN1_MINUS_SIGN = "-"
+ASN1_OFFSET_HOURS_END = 3
+MINUTES_PER_HOUR = 60
+HOURS_PER_DAY = 24
+SECONDS_PER_DAY = 86400
+MICROSECOND_DIGITS = 6
+ASN1_UTC_TIME_RE = re.compile(
+    r"^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?(Z|[+-]\d{4})\Z"
+)
+ASN1_GENERALIZED_TIME_RE = re.compile(
+    r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(?:(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{4})\Z"
+)
+WEBHOOK_CA_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_IMPACT_WEBHOOK_CA_FAIL_EXPIRED = (
+    "This admission webhook fails closed and every certificate in its CA bundle has expired, "
+    "so the API server cannot verify the webhook's TLS certificate and refuses every request "
+    "its rules match until the bundle is rotated."
+)
+_IMPACT_WEBHOOK_CA_FAIL_EXPIRING = (
+    "This admission webhook fails closed and every certificate in its CA bundle expires "
+    "within 30 days; once notAfter passes, the API server will fail TLS verification to the "
+    "webhook and refuse every request its rules match until the bundle is rotated."
+)
+_IMPACT_WEBHOOK_CA_IGNORE_EXPIRED = (
+    "Every certificate in this admission webhook's CA bundle has expired and its "
+    "failurePolicy is Ignore, so the API server fails TLS verification on every call and "
+    "skips the webhook in silence without enforcing or mutating matching requests."
+)
+_IMPACT_WEBHOOK_CA_IGNORE_EXPIRING = (
+    "Every certificate in this admission webhook's CA bundle expires within 30 days and its "
+    "failurePolicy is Ignore; once notAfter passes, the API server will fail TLS verification "
+    "on every call and skip the webhook in silence."
+)
 
 
 def _platform_script_dirs() -> tuple[str, ...]:
@@ -262,6 +452,23 @@ import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
+
+# `--cluster <location>/<name>`: one cluster of `--project`, the rest dropped
+# from the listing before any of them is read (#5623: a fan-out child runs the
+# collector for the one cluster its confined credential reaches). None, the
+# default, reads every cluster as before.
+ONLY_CLUSTER_RE = re.compile(r"^(?P<location>[a-z][a-z0-9-]{0,62})/(?P<name>[a-z](?:[-a-z0-9]{0,38}[a-z0-9])?)\Z")
+only_cluster: tuple[str, str] | None = None
+
+
+def cluster_arg(value: str) -> tuple[str, str]:
+    """argparse's check of --cluster: `<location>/<name>` as GKE spells them."""
+    m = ONLY_CLUSTER_RE.match(value)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not <location>/<cluster> (for example us-central1/prod-a)"
+        )
+    return m.group("location"), m.group("name")
 
 # What that same target stands for when the operator narrowed the scope on
 # purpose. `--project` skips discovery, so a scoped run reads one project and
@@ -488,6 +695,78 @@ CONFIGSYNC_TRANSIENT_ERROR_CODES = frozenset({"2016"})
 # How much of a reconciler message survives into the excerpt; the same budget
 # as a Config Connector message, for the same reason.
 MAX_CONFIGSYNC_MESSAGE_CHARS = MAX_KCC_WEDGE_MESSAGE_CHARS
+# The reconciler-manager's condition while it waits for the reconciler, and
+# the reason it carries while the thing it waits for is the reconciler's
+# Deployment.
+CONFIGSYNC_RECONCILING_CONDITION = "Reconciling"
+CONFIGSYNC_DEPLOYMENT_REASON = "Deployment"
+# How long `Reconciling` has to have held that reason before the Deployment is
+# read as down: the ten minutes after which Config Sync itself reports
+# `Stalled` for a Deployment that made no progress. A daily audit loses
+# nothing by waiting for the vendor's own verdict, and a shorter wait would
+# file a slow healthy start (new images on a new node, a scale-up) as a
+# critical finding. Past the ten minutes with no `Stalled`, Config Sync is
+# still waiting on a Deployment it does not call failed. A healthy start held
+# the condition for 12 and 14 seconds (two samples, Config Sync v1.25.2).
+CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS = 600
+# Config Sync runs every reconciler, root and namespace alike, in this
+# namespace, and labels each reconciler pod with the sync object it serves
+# (read on a live v1.25.2). Its source defines the three label names from
+# v1.14.0 (pkg/metadata/labels.go); v1.13.0 has no `sync-kind`. On a version
+# whose pods lack the labels no pod is kept, and the memory rule sees nothing
+# and says nothing. The container named below is the one that applies the
+# repository; the pod's other containers fetch, render and export metrics.
+CONFIGSYNC_RECONCILER_NAMESPACE = "config-management-system"
+CONFIGSYNC_RECONCILER_CONTAINER = "reconciler"
+CONFIGSYNC_SYNC_KIND_LABEL = "configsync.gke.io/sync-kind"
+CONFIGSYNC_SYNC_NAME_LABEL = "configsync.gke.io/sync-name"
+CONFIGSYNC_SYNC_NAMESPACE_LABEL = "configsync.gke.io/sync-namespace"
+# A reconciler container the kernel killed for memory. One kill a week ago is
+# history: the rule asks for a second restart and a kill inside this window,
+# which is three times the five minutes a crash loop's back-off tops out at.
+# The restart count is the container's lifetime count, so one fresh kill after
+# an older restart is read the same way; a reconciler that runs for longer
+# than the window between two kills is missed while it runs.
+CONFIGSYNC_OOM_REASON = "OOMKilled"
+CONFIGSYNC_OOM_MIN_RESTARTS = 2
+CONFIGSYNC_OOM_RECENT_SECONDS = 900
+# `check_serviceentry_host_collision` (§2.19). The Istio kind, fully qualified
+# so the read cannot land on another group's `serviceentries`.
+SERVICEENTRY_KIND = "serviceentries.networking.istio.io"
+# The read projects each entry to its namespace, name and spec, one
+# tab-separated line per entry. A full `-o json` list also carries every
+# entry's managedFields, annotations and status, which is most of its bytes and
+# what pushes a large mesh's reply past the credential proxy's output cap.
+# kubectl's jsonpath prints a map as JSON, so the spec field parses as JSON.
+# Measured on one cluster with the shell sandbox's default 2 GiB: correct to
+# 50,000 entries, but kubectl decodes every full object before projecting, so it
+# peaked at 917 MiB there (sandbox 1,160 MiB, against 239 MiB with no mesh). The
+# sandbox's memory guard kills the largest process near 1.75 GiB, so one mesh of
+# roughly 85-90k entries, or two large meshes read in the same sweep wave, ends
+# the read and leaves the check Undetermined. The SOP's §2.19 states the same.
+SERVICEENTRY_PROJECTION = 'jsonpath={range .items[*]}{.metadata.namespace}{"\\t"}{.metadata.name}{"\\t"}{.spec}{"\\n"}{end}'
+SERVICEENTRY_PROJECTION_FIELDS = 3
+# Istio's `exportTo` values (`pkg/config/visibility`): namespace-local, every
+# namespace, and no namespace. Any other entry is a namespace name. An absent
+# or empty list exports to every namespace, the ServiceEntry reference's
+# default when the mesh does not narrow `defaultServiceExportTo`.
+EXPORT_TO_PRIVATE = "."
+EXPORT_TO_PUBLIC = "*"
+EXPORT_TO_NONE = "~"
+# Severity forks on whether the colliding declarations disagree: a namespace
+# that gets either of two different answers is routed by chance, while
+# identical copies route the same either way and only wait to diverge.
+SERVICEENTRY_SEVERITY_CONFLICTING = "major"
+SERVICEENTRY_SEVERITY_IDENTICAL = "minor"
+# How many declaring entries and affected namespaces an excerpt names before
+# it counts the rest, so a host declared in hundreds of namespaces stays one
+# readable line.
+MAX_SERVICEENTRY_NAMED = 5
+# The longest one field's value may run in an excerpt before it is cut with an
+# ellipsis: an entry with dozens of endpoints would otherwise fill the excerpt.
+MAX_SERVICEENTRY_VALUE_CHARS = 120
+# Two declarers, or two of them seen from one namespace, are a collision.
+SERVICEENTRY_COLLISION_MINIMUM = 2
 
 # The fleet-wide system-namespace set (S1), spelled identically in every SOP
 # that names it. Kept here rather than imported from audit_report.py: this
@@ -536,6 +815,8 @@ Run = collector_run.Run
 # "Config Connector is not installed on this cluster" about the one cluster in
 # the fleet that runs Config Connector, on the strength of its own timeout.
 TIMEOUT_RC = collector_run.TIMEOUT_RC
+PAGE_SIZE = collector_run.PAGE_SIZE
+PAGE_CEILING_FORMAT = collector_run.PAGE_CEILING_FORMAT
 Discovery = collector_run.Discovery
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 paged_dump = collector_run.paged_dump
@@ -586,6 +867,19 @@ def not_running_entry(c: dict, project: str) -> dict:
         # GKE's status, so `finish` does not count this cluster as one that
         # may run Config Connector (`audit_report.kcc_health`).
         kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
+    }
+
+
+def only_cluster_unread_entry(c: dict, project: str) -> dict:
+    """A manifest target for a cluster of --project that --cluster left unread.
+
+    Not `collected`, so `finish` treats it as a coverage gap, as for any
+    cluster this run couldn't read: a run that read one cluster says nothing
+    about the others, and a finding on one must not read as resolved.
+    """
+    return {
+        **not_running_entry(c, project),
+        "error": f"--cluster names another cluster of {project}; this run read only that one, and no check was evaluated here",
     }
 
 
@@ -741,6 +1035,19 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
     if not isinstance(clusters, list):
         return [], [], "clusters list returned JSON that is not a list"
     clusters = declared_scope.drop_excluded(project, clusters)
+    others: list[dict] = []
+    if only_cluster is not None:
+        location, name = only_cluster
+
+        def named(c) -> bool:
+            return isinstance(c, dict) and c.get("name") == name and (c.get("location") or c.get("zone") or "") == location
+
+        others = [c for c in clusters if isinstance(c, dict) and not named(c)]
+        clusters = [c for c in clusters if named(c)]
+        if not clusters:
+            # Refused, not widened: a cluster the listing doesn't return (or the
+            # scope excludes) reads nothing at all.
+            return [], [], f"--cluster {location}/{name} is not a cluster `clusters list` returns in {project}; nothing was read"
     running = []
     for c in clusters:
         if c.get("status") not in AUDITABLE_STATUSES:
@@ -759,6 +1066,10 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
             }
         )
     not_running = [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
+    # The project's other clusters, which --cluster left unread: recorded, not
+    # dropped, so `finish` places them as not audited by this run and never
+    # resolves a finding on one as fixed (each is another task's to read).
+    not_running += [only_cluster_unread_entry(c, project) for c in others]
     incomplete = [line.strip() for line in result.stderr.splitlines() if ZONE_TIMEOUT_MARKER in line]
     if incomplete:
         detail = " ".join(incomplete)[:ERROR_EXCERPT_CHARS]
@@ -936,6 +1247,8 @@ DUMP_COMMAND_KINDS = (
     ",persistentvolumeclaims"
     # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload).
     ",namespaces,nodes"
+    # `ingresses` serves 3.26 (ingress-gateway-healthcheck-mismatch).
+    ",ingresses"
 )
 
 # How long a CronJob must have been firing without a success before 3.12 calls
@@ -943,9 +1256,10 @@ DUMP_COMMAND_KINDS = (
 #
 # Both ends come out of the dump, so this check needs no clock -- which is why
 # it is a gap between two recorded times rather than an age against `now`.
-# Nothing else in this file reads wall-clock time, the tests would have to
-# freeze it, and a collector whose verdict depends on when it ran is a
-# collector whose findings cannot be reproduced from its own manifest.
+# A check whose verdict depends on when it ran cannot be reproduced from its
+# own manifest, so a check reads the clock only where no second recorded time
+# exists: 3.28 (how long a pull has failed, measured to its own read of the
+# pods) and the compliance stream's certificate expiry.
 #
 # Deliberately not scaled to the schedule's period. The instinct is that a
 # weekly CronJob should get a week of grace and an hourly one an hour, but that
@@ -1254,6 +1568,8 @@ def selector_matches(selector: dict, labels: dict) -> bool:
         if labels.get(key) != value:
             return False
     for expr in selector.get("matchExpressions") or []:
+        if not isinstance(expr, dict):
+            continue
         key, op, values = expr.get("key"), expr.get("operator"), expr.get("values") or []
         if op == "In" and labels.get(key) not in values:
             return False
@@ -1327,9 +1643,10 @@ def hpas_by_namespace(dump: dict) -> dict[str, list[dict]]:
 def _hpa_is_owned(hpa: dict) -> bool:
     """An HPA carrying `ownerReferences`, KEDA's `ScaledObject` included.
 
-    Skipped only by the checks that grade the HPA's own `min`/`max` (3.6,
-    3.22): on an owned HPA those are a copy the operator writes from a CRD
-    this audit cannot read, so grading them grades a projection. The checks
+    Skipped only by the checks that grade the HPA's own `min`/`max` or
+    `behavior` (3.6, 3.22, 3.25): on an owned HPA those are a copy the operator
+    writes from a CRD this audit cannot read, so grading them grades a
+    projection. The checks
     that ask whether a workload is autoscaled at all (3.4, 3.5, 3.11) keep
     it -- a KEDA-scaled Deployment is autoscaled, and its floor is the one
     KEDA wrote. This is not `_defers_to_owner`: a workload owned by a CRD
@@ -1352,6 +1669,20 @@ def workload_keys(dump: dict) -> set[tuple[str, str, str]]:
         for item in dump.get("items", []) or []
         if item.get("kind") in WORKLOAD_KINDS
     }
+
+
+def _is_excluded_object(item: dict) -> bool:
+    """Standard S1 (system namespace), S2 (addon-managed), and S4 (opt-out) exclusions."""
+    meta = item.get("metadata") or {}
+    if _is_system_namespace(meta.get("namespace", "")):  # S1
+        return True
+    labels = meta.get("labels") or {}
+    annotations = meta.get("annotations") or {}
+    if ADDON_MANAGER_MODE_LABEL in labels:  # S2
+        return True
+    if labels.get(OPT_OUT_KEY) == OPT_OUT_EXEMPT_VALUE or annotations.get(OPT_OUT_KEY) == OPT_OUT_EXEMPT_VALUE:  # S4
+        return True
+    return False
 
 
 def cronjobs_with_jobs(dump: dict) -> list[dict]:
@@ -1377,18 +1708,10 @@ def cronjobs_with_jobs(dump: dict) -> list[dict]:
     """
     out = []
     for item in dump.get("items", []) or []:
-        if item.get("kind") != "CronJob":
+        if item.get("kind") != "CronJob" or _is_excluded_object(item):
             continue
         meta = item.get("metadata") or {}
         ns = meta.get("namespace", "")
-        if _is_system_namespace(ns):  # S1
-            continue
-        labels = meta.get("labels") or {}
-        annotations = meta.get("annotations") or {}
-        if "addonmanager.kubernetes.io/mode" in labels:  # S2
-            continue
-        if labels.get(OPT_OUT_KEY) == "exempt" or annotations.get(OPT_OUT_KEY) == "exempt":  # S4
-            continue
         name = meta.get("name", "")
         owned = [
             job
@@ -1476,18 +1799,10 @@ def services_with_endpoints(dump: dict) -> list[dict]:
 
     out = []
     for item in dump.get("items", []) or []:
-        if item.get("kind") != "Service":
+        if item.get("kind") != "Service" or _is_excluded_object(item):
             continue
         meta = item.get("metadata") or {}
         ns = meta.get("namespace", "")
-        if _is_system_namespace(ns):  # S1
-            continue
-        labels = meta.get("labels") or {}
-        annotations = meta.get("annotations") or {}
-        if "addonmanager.kubernetes.io/mode" in labels:  # S2
-            continue
-        if labels.get(OPT_OUT_KEY) == "exempt" or annotations.get(OPT_OUT_KEY) == "exempt":  # S4
-            continue
         spec = item.get("spec") or {}
         selector = spec.get("selector") or {}
         # No selector at all means the endpoints are managed by hand -- the
@@ -1687,6 +2002,11 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "compute_classes": [i for i in (dump.get("items") or []) if i.get("kind") == "ComputeClass"],
         "namespaces": [i for i in (dump.get("items") or []) if i.get("kind") == "Namespace"],
         "nodes": [i for i in (dump.get("items") or []) if i.get("kind") == "Node"],
+        "ingresses": [i for i in (dump.get("items") or []) if i.get("kind") == INGRESS_KIND],
+        "http_routes": [i for i in (dump.get("items") or []) if i.get("kind") == HTTPROUTE_KIND],
+        "backend_configs": [i for i in (dump.get("items") or []) if i.get("kind") == BACKEND_CONFIG_KIND],
+        "health_check_policies": [i for i in (dump.get("items") or []) if i.get("kind") == HEALTH_CHECK_POLICY_KIND],
+        "raw_workloads": [i for i in (dump.get("items") or []) if i.get("kind") in WORKLOAD_KINDS],
     }
 
 
@@ -2515,6 +2835,139 @@ def check_hpa_floors_at_one(context: dict) -> list[dict]:
                 }
             )
     return hits
+
+
+def _scaledown_policy_is_aggressive(policy: object) -> bool:
+    """Whether one `HPAScalingPolicy` removes at least half the replicas in a period."""
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("type") != HPA_POLICY_TYPE_PERCENT:
+        return False
+    value = policy.get("value")
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return value >= HPA_AGGRESSIVE_SCALEDOWN_PERCENT_FLOOR
+
+
+def check_hpa_aggressive_scaledown(context: dict) -> list[dict]:
+    """§3.25 -- an HPA whose `behavior.scaleDown` sets `stabilizationWindowSeconds`
+    below 60 with an aggressive `Percent` scale-down policy on a workload whose
+    containers declare no `lifecycle.preStop` hook.
+
+    Kubernetes defaults `behavior.scaleDown.stabilizationWindowSeconds` to 300
+    seconds and `policies` to 100% per 15 seconds under `selectPolicy: Max`.
+    With the 300-second window intact, that default policy waits out post-burst
+    dips; overriding `stabilizationWindowSeconds` below 60 exposes the 100%
+    step immediately when metrics fall, and a target container with no
+    `preStop` hook receives `SIGTERM` before callers stop sending work to it.
+    """
+    workloads = {(w["ns"], w["kind"], w["name"]): w for w in context["workloads"]}
+    hits = []
+    for ns, hpas in context["hpas"].items():
+        if _is_system_namespace(ns):  # S1
+            continue
+        for hpa in hpas:
+            meta = hpa.get("metadata") or {}
+            if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):  # S2
+                continue
+            if _hpa_is_owned(hpa):
+                continue
+            spec = hpa.get("spec") or {}
+            floor = spec.get("minReplicas")
+            if not isinstance(floor, int) or isinstance(floor, bool):
+                floor = DEFAULT_HPA_MIN_REPLICAS
+            max_replicas = spec.get("maxReplicas")
+            if not isinstance(max_replicas, int) or isinstance(max_replicas, bool) or max_replicas <= floor:
+                continue
+            behavior = spec.get("behavior")
+            if not isinstance(behavior, dict):
+                continue
+            scale_down = behavior.get("scaleDown")
+            if not isinstance(scale_down, dict):
+                continue
+            select_policy = scale_down.get("selectPolicy") or DEFAULT_HPA_SCALEDOWN_SELECT_POLICY
+            if select_policy == HPA_SELECT_POLICY_DISABLED:
+                continue
+            stabilization = scale_down.get("stabilizationWindowSeconds")
+            if stabilization is None:
+                stabilization = DEFAULT_HPA_SCALEDOWN_STABILIZATION_SECONDS
+            if (
+                not isinstance(stabilization, int)
+                or isinstance(stabilization, bool)
+                or stabilization >= HPA_AGGRESSIVE_SCALEDOWN_MAX_STABILIZATION_SECONDS
+            ):
+                continue
+            raw_policies = scale_down.get("policies")
+            if raw_policies is None or raw_policies == []:
+                policies = [
+                    {
+                        "type": HPA_POLICY_TYPE_PERCENT,
+                        "value": DEFAULT_HPA_SCALEDOWN_PERCENT_VALUE,
+                        "periodSeconds": DEFAULT_HPA_SCALEDOWN_PERIOD_SECONDS,
+                    }
+                ]
+                policies_defaulted = True
+            elif isinstance(raw_policies, list):
+                policies = [p for p in raw_policies if isinstance(p, dict)]
+                if not policies:
+                    continue
+                policies_defaulted = False
+            else:
+                continue
+            aggressive = [p for p in policies if _scaledown_policy_is_aggressive(p)]
+            if select_policy == HPA_SELECT_POLICY_MIN:
+                if len(aggressive) != len(policies):
+                    continue
+            elif not aggressive:
+                continue
+            target = spec.get("scaleTargetRef") or {}
+            if (
+                target.get("apiVersion") != _WORKLOAD_API_VERSION
+                or target.get("kind") not in SCALABLE_WORKLOAD_KINDS
+            ):
+                continue
+            workload = workloads.get((ns, target.get("kind"), target.get("name")))
+            if workload is None:
+                continue
+            services = _selecting_services(workload, context)
+            candidate_containers = (
+                _containers_behind_a_service(workload, _routing_services(services))
+                if services and _exposure_scope(services) == _SCOPE_SERVING
+                else _effective_containers(workload)
+            )
+            missing = [
+                c.get("name", "")
+                for c in candidate_containers
+                if c.get("name") not in _SELF_HEALTH_SIDECARS
+                and not (c.get("lifecycle") or {}).get("preStop")
+            ]
+            if not missing:
+                continue
+            grace = workload["template"].get("terminationGracePeriodSeconds")
+            if grace is None:
+                grace = DEFAULT_GRACE_PERIOD_S
+            policy_summary = HPA_HIT_COMMA_JOIN.join(
+                f"{p.get('value')}% per {p.get('periodSeconds')}s" for p in aggressive
+            )
+            if policies_defaulted:
+                policy_summary += " (API default)"
+            hits.append(
+                {
+                    "namespace": ns,
+                    "object": f"HorizontalPodAutoscaler/{meta.get('name', '')}",
+                    "excerpt": (
+                        f"behavior.scaleDown: stabilizationWindowSeconds={stabilization}, "
+                        f"selectPolicy={select_policy}, policies={policy_summary}; "
+                        f"scaling {workload['kind']}/{workload['name']} "
+                        f"(minReplicas={floor}, maxReplicas={max_replicas})\n"
+                        f"target containers with no preStop hook: "
+                        f"{HPA_HIT_COMMA_JOIN.join(missing)} (terminationGracePeriodSeconds={grace})"
+                    ),
+                    "reconciler": reconciler_of(meta),
+                    "release": release_of(meta),
+                }
+            )
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
 
 
 _HOSTNAME_KEY = "kubernetes.io/hostname"
@@ -3949,6 +4402,464 @@ def check_service_port_unresolved(context: dict) -> list[dict]:
     return hits
 
 
+def _is_int_port(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _resolve_probe_port(probe: object, named_ports: dict[str, int]) -> int | None:
+    if not isinstance(probe, dict):
+        return None
+    for handler_key in PROBE_PORT_HANDLERS:
+        handler = probe.get(handler_key)
+        if not isinstance(handler, dict):
+            continue
+        raw = handler.get("port")
+        if _is_int_port(raw):
+            return raw
+        if isinstance(raw, str):
+            if raw.isdigit():
+                return int(raw)
+            return named_ports.get(raw)
+    return None
+
+
+def _backing_port_inventory(raw_workloads: list[dict], ns: str, selector: dict) -> dict:
+    """Ports and probes declared across active workloads matching `selector` in `ns`.
+
+    Arms `has_app_port_contract` only when every non-self-health-sidecar
+    application container across the matching workloads declares at least one
+    non-auxiliary `containerPort`. A `readinessProbe` alone, or a container
+    declaring only observability/health/admin ports (such as `metrics: 9090`),
+    does not arm the port comparison because Kubernetes does not require a
+    serving port to be declared in `container.ports`.
+    """
+    backends: list[str] = []
+    declared_ports: set[tuple[str, int]] = set()
+    declared_labels: list[str] = []
+    readiness_labels: list[str] = []
+    all_probe_ports: set[int] = set()
+    app_containers_seen = 0
+    all_app_containers_declare_serving_port = True
+
+    for item in raw_workloads:
+        meta = item.get("metadata") or {}
+        if meta.get("namespace", "") != ns:
+            continue
+        spec = item.get("spec") or {}
+        if spec.get("replicas") == 0:
+            continue
+        template = spec.get("template") or {}
+        pod_labels = (template.get("metadata") or {}).get("labels") or {}
+        if not selector_matches({"matchLabels": selector}, pod_labels):
+            continue
+        backends.append(f"{item['kind']}/{meta.get('name', '')}")
+        pod_spec = template.get("spec") or {}
+        app_containers = [c for c in (pod_spec.get("containers") or []) if isinstance(c, dict)]
+        sidecars = [
+            ic
+            for ic in pod_spec.get("initContainers") or []
+            if isinstance(ic, dict) and ic.get("restartPolicy") == RESTART_POLICY_ALWAYS
+        ]
+        for is_regular, container in [(True, c) for c in app_containers] + [(False, sc) for sc in sidecars]:
+            is_self_health_sidecar = (container.get("name") or "") in _SELF_HEALTH_SIDECARS
+            named_ports: dict[str, int] = {}
+            declares_serving_port = False
+            for port_entry in container.get("ports") or []:
+                if not isinstance(port_entry, dict):
+                    continue
+                cport = port_entry.get("containerPort")
+                if not _is_int_port(cport):
+                    continue
+                proto = str(port_entry.get("protocol") or DEFAULT_PORT_PROTOCOL).upper()
+                pname = str(port_entry.get("name") or "")
+                if pname:
+                    named_ports[pname] = cport
+                declared_ports.add((proto, cport))
+                if not is_self_health_sidecar:
+                    if pname.lower() not in AUXILIARY_PORT_NAMES:
+                        declares_serving_port = True
+                    label = f"{pname}:{cport}/{proto}" if pname else f"{cport}/{proto}"
+                    if label not in declared_labels:
+                        declared_labels.append(label)
+            if is_regular and not is_self_health_sidecar:
+                app_containers_seen += 1
+                if not declares_serving_port:
+                    all_app_containers_declare_serving_port = False
+            for field in PROBE_FIELDS:
+                pport = _resolve_probe_port(container.get(field), named_ports)
+                if pport is None:
+                    continue
+                all_probe_ports.add(pport)
+                if field == READINESS_PROBE_FIELD and not is_self_health_sidecar:
+                    rlabel = f"readiness:{pport}"
+                    if rlabel not in readiness_labels:
+                        readiness_labels.append(rlabel)
+
+    parts = list(declared_labels)
+    for rlabel in readiness_labels:
+        if rlabel not in parts:
+            parts.append(rlabel)
+    backends_str = ", ".join(backends) or "backing workload"
+    ports_str = ", ".join(parts) or "no ports"
+    return {
+        "backends": backends,
+        "declared_ports": declared_ports,
+        "all_probe_ports": all_probe_ports,
+        "has_app_port_contract": app_containers_seen > 0 and all_app_containers_declare_serving_port,
+        "summary": f"{backends_str} declares {ports_str}",
+    }
+
+
+def _service_backend_configs(
+    service: dict,
+    bc_by_key: dict[tuple[str, str], dict],
+    ns: str,
+) -> tuple[list[tuple[str, set[str], int | None, bool]], set[str]]:
+    """BackendConfig bindings on `service`: `(source, port_keys, hc_port, has_hc)` and explicit port keys."""
+    annotations = (service.get("metadata") or {}).get("annotations") or {}
+    raw = ""
+    for ann_key in BACKEND_CONFIG_ANNOTATIONS:
+        val = annotations.get(ann_key)
+        if isinstance(val, str) and val.strip():
+            raw = val.strip()
+            break
+    if not raw:
+        return [], set()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return [], set()
+    if not isinstance(parsed, dict):
+        return [], set()
+
+    keys_by_bc: dict[str, set[str]] = {}
+    explicit_keys: set[str] = set()
+    default_bc = parsed.get("default")
+    if isinstance(default_bc, str) and default_bc.strip():
+        keys_by_bc.setdefault(default_bc.strip(), set()).add(WILDCARD_PORT_KEY)
+    ports_map = parsed.get("ports")
+    if isinstance(ports_map, dict):
+        for pkey, bc_name in ports_map.items():
+            if isinstance(bc_name, str) and bc_name.strip():
+                key_str = str(pkey).strip()
+                if key_str:
+                    explicit_keys.add(key_str)
+                    keys_by_bc.setdefault(bc_name.strip(), set()).add(key_str)
+
+    bindings: list[tuple[str, set[str], int | None, bool]] = []
+    for bc_name, pkeys in keys_by_bc.items():
+        bc_obj = bc_by_key.get((ns, bc_name))
+        if bc_obj is None:
+            continue
+        hc_raw = (bc_obj.get("spec") or {}).get("healthCheck")
+        has_hc = isinstance(hc_raw, dict) and bool(hc_raw)
+        raw_port = hc_raw.get("port") if isinstance(hc_raw, dict) else None
+        hc_port = raw_port if _is_int_port(raw_port) else None
+        bindings.append((f"{BACKEND_CONFIG_KIND}/{bc_name}", pkeys, hc_port, has_hc))
+    return bindings, explicit_keys
+
+
+def check_ingress_gateway_healthcheck_mismatch(context: dict) -> list[dict]:
+    """Cluster-scoped: route, numeric `targetPort`, or LB health-check port mismatch (§3.26).
+
+    §3.17 catches a named `targetPort` that no container declares because the
+    EndpointSlice controller omits unresolved named ports. A numeric `targetPort`
+    always copies straight into the EndpointSlice whether or not any container
+    listens on it, and an unattached `HTTPRoute` or `Ingress` (or a GKE
+    `BackendConfig` / `HealthCheckPolicy`) can point at a port the Service or
+    its backing pods never expose while every pod stays `Ready`.
+    """
+    routes_by_service: dict[tuple[str, str], list[tuple[str, int | None, str | None]]] = {}
+
+    def _add_route(svc_ns: str, svc_name: str, source: str, port_num: int | None, port_name: str | None) -> None:
+        if not svc_name:
+            return
+        bucket = routes_by_service.setdefault((svc_ns, svc_name), [])
+        item = (source, port_num, port_name)
+        if item not in bucket:
+            bucket.append(item)
+
+    for route in context.get("http_routes") or []:
+        if not isinstance(route, dict) or _is_excluded_object(route):
+            continue
+        meta = route.get("metadata") or {}
+        route_ns = meta.get("namespace", "")
+        route_name = meta.get("name", "")
+        for rule in (route.get("spec") or {}).get("rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            refs = list(rule.get("backendRefs") or [])
+            rule_filters = list(rule.get("filters") or [])
+            for bref in rule.get("backendRefs") or []:
+                if isinstance(bref, dict):
+                    rule_filters.extend(bref.get("filters") or [])
+            for flt in rule_filters:
+                if isinstance(flt, dict) and flt.get("type") == REQUEST_MIRROR_FILTER_TYPE:
+                    mirror_ref = (flt.get("requestMirror") or {}).get("backendRef")
+                    if isinstance(mirror_ref, dict):
+                        refs.append(mirror_ref)
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                group = str(ref.get("group") or CORE_API_GROUP)
+                kind = str(ref.get("kind") or SERVICE_KIND)
+                if group != CORE_API_GROUP or kind != SERVICE_KIND:
+                    continue
+                svc_ns = str(ref.get("namespace") or route_ns)
+                svc_name = str(ref.get("name") or "")
+                port_val = ref.get("port") if _is_int_port(ref.get("port")) else None
+                source = (
+                    f"{HTTPROUTE_KIND}/{route_name}"
+                    if svc_ns == route_ns
+                    else f"{HTTPROUTE_KIND}/{route_ns}/{route_name}"
+                )
+                _add_route(svc_ns, svc_name, source, port_val, None)
+
+    for ing in context.get("ingresses") or []:
+        if not isinstance(ing, dict) or _is_excluded_object(ing):
+            continue
+        meta = ing.get("metadata") or {}
+        ing_ns = meta.get("namespace", "")
+        ing_name = meta.get("name", "")
+        spec = ing.get("spec") or {}
+        svc_backends: list[dict] = []
+        default_svc = ((spec.get("defaultBackend") or {}).get("service")) if isinstance(spec.get("defaultBackend"), dict) else None
+        if isinstance(default_svc, dict):
+            svc_backends.append(default_svc)
+        for rule in spec.get("rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            http_block = rule.get("http")
+            if not isinstance(http_block, dict):
+                continue
+            for path_entry in http_block.get("paths") or []:
+                if not isinstance(path_entry, dict):
+                    continue
+                backend = path_entry.get("backend")
+                svc_ref = backend.get("service") if isinstance(backend, dict) else None
+                if isinstance(svc_ref, dict):
+                    svc_backends.append(svc_ref)
+        for svc_ref in svc_backends:
+            svc_name = str(svc_ref.get("name") or "")
+            port_obj = svc_ref.get("port") if isinstance(svc_ref.get("port"), dict) else {}
+            port_num = port_obj.get("number") if _is_int_port(port_obj.get("number")) else None
+            port_name = str(port_obj.get("name") or "") or None
+            _add_route(ing_ns, svc_name, f"{INGRESS_KIND}/{ing_name}", port_num, port_name)
+
+    bc_by_key: dict[tuple[str, str], dict] = {}
+    for bc in context.get("backend_configs") or []:
+        if not isinstance(bc, dict) or _is_excluded_object(bc):
+            continue
+        meta = bc.get("metadata") or {}
+        bc_by_key[(meta.get("namespace", ""), meta.get("name", ""))] = bc
+
+    hcp_by_service: dict[tuple[str, str], list[tuple[str, int | None, str | None, bool]]] = {}
+    for hcp in context.get("health_check_policies") or []:
+        if not isinstance(hcp, dict) or _is_excluded_object(hcp):
+            continue
+        meta = hcp.get("metadata") or {}
+        hcp_ns = meta.get("namespace", "")
+        hcp_name = meta.get("name", "")
+        spec = hcp.get("spec") or {}
+        target_ref = spec.get("targetRef") if isinstance(spec.get("targetRef"), dict) else {}
+        group = str(target_ref.get("group") or CORE_API_GROUP)
+        kind = str(target_ref.get("kind") or "")
+        svc_name = str(target_ref.get("name") or "")
+        if group != CORE_API_GROUP or kind != SERVICE_KIND or not svc_name:
+            continue
+        cfg = ((spec.get("default") or {}).get("config")) if isinstance(spec.get("default"), dict) else {}
+        cfg = cfg if isinstance(cfg, dict) else {}
+        added = False
+        for sub_key in HEALTH_CHECK_SUBCONFIG_KEYS:
+            sub = cfg.get(sub_key)
+            if not isinstance(sub, dict):
+                continue
+            port_spec = str(sub.get("portSpecification") or "")
+            raw_port = sub.get("port")
+            raw_pname = str(sub.get("portName") or "") or None
+            hc_port = (
+                raw_port
+                if _is_int_port(raw_port) and port_spec not in (PORT_SPEC_USE_SERVING, PORT_SPEC_USE_NAMED)
+                else None
+            )
+            hc_pname = (
+                raw_pname
+                if port_spec != PORT_SPEC_USE_SERVING and (port_spec == PORT_SPEC_USE_NAMED or (raw_pname and hc_port is None))
+                else None
+            )
+            uses_serving_port = port_spec == PORT_SPEC_USE_SERVING or (hc_port is None and hc_pname is None)
+            hcp_by_service.setdefault((hcp_ns, svc_name), []).append(
+                (f"{HEALTH_CHECK_POLICY_KIND}/{hcp_name}", hc_port, hc_pname, uses_serving_port)
+            )
+            added = True
+        if not added:
+            hcp_by_service.setdefault((hcp_ns, svc_name), []).append(
+                (f"{HEALTH_CHECK_POLICY_KIND}/{hcp_name}", None, None, False)
+            )
+
+    raw_workloads = context.get("raw_workloads") or []
+    hits: list[dict] = []
+    for entry in context["service_endpoints"]:
+        if not entry["endpoints"]:
+            continue
+        ns = entry["ns"]
+        svc_name = entry["name"]
+        service = entry["service"]
+        route_refs = routes_by_service.get((ns, svc_name), [])
+        bc_refs, explicit_bc_keys = _service_backend_configs(service, bc_by_key, ns)
+        hcp_refs = hcp_by_service.get((ns, svc_name), [])
+        if not route_refs and not bc_refs and not hcp_refs:
+            continue
+
+        svc_ports = [p for p in ((service.get("spec") or {}).get("ports") or []) if isinstance(p, dict)]
+        svc_ports_desc = (
+            ", ".join(
+                f"{p.get('name')}:{p.get('port')}" if p.get("name") else str(p.get("port", ""))
+                for p in svc_ports
+            )
+            or "no ports"
+        )
+
+        reasons: list[str] = []
+        port_sources: dict[int, list[str]] = {}
+
+        def _mark_covered(idx: int, src: str) -> None:
+            srcs = port_sources.setdefault(idx, [])
+            if src not in srcs:
+                srcs.append(src)
+
+        for source, req_port, req_port_name in route_refs:
+            if req_port is not None:
+                matched = [idx for idx, p in enumerate(svc_ports) if p.get("port") == req_port]
+                if not matched:
+                    reasons.append(
+                        f"{source} routes to port {req_port}, which Service/{svc_name} does not expose "
+                        f"(declares {svc_ports_desc})"
+                    )
+                else:
+                    for idx in matched:
+                        _mark_covered(idx, source)
+            elif req_port_name:
+                matched = [idx for idx, p in enumerate(svc_ports) if (p.get("name") or "") == req_port_name]
+                if not matched:
+                    reasons.append(
+                        f"{source} routes to port {req_port_name!r}, which Service/{svc_name} does not expose "
+                        f"(declares {svc_ports_desc})"
+                    )
+                else:
+                    for idx in matched:
+                        _mark_covered(idx, source)
+            else:
+                reasons.append(
+                    f"{source} omits target Service port for Service/{svc_name} "
+                    f"(declares {svc_ports_desc})"
+                )
+
+        routed_port_indices = set(port_sources.keys())
+        hc_checks: list[tuple[str, int]] = []
+        for bc_source, port_keys, hc_port, has_hc in bc_refs:
+            bc_applies = False
+            for key in sorted(port_keys):
+                if key == WILDCARD_PORT_KEY:
+                    unoverridden = [
+                        idx
+                        for idx, p in enumerate(svc_ports)
+                        if str(p.get("name") or "") not in explicit_bc_keys
+                        and str(p.get("port") or "") not in explicit_bc_keys
+                    ]
+                    active = [idx for idx in unoverridden if not routed_port_indices or idx in routed_port_indices]
+                    if active:
+                        bc_applies = True
+                        if has_hc and hc_port is None and not routed_port_indices and len(svc_ports) == 1:
+                            _mark_covered(active[0], bc_source)
+                else:
+                    matched = [
+                        idx
+                        for idx, p in enumerate(svc_ports)
+                        if str(p.get("port") or "") == key or str(p.get("name") or "") == key
+                    ]
+                    if not matched:
+                        reasons.append(
+                            f"{bc_source} is bound to Service port {key!r}, which Service/{svc_name} does not expose "
+                            f"(declares {svc_ports_desc})"
+                        )
+                    else:
+                        active = [idx for idx in matched if not routed_port_indices or idx in routed_port_indices]
+                        if active:
+                            bc_applies = True
+                            if has_hc and hc_port is None:
+                                for idx in active:
+                                    _mark_covered(idx, bc_source)
+            if hc_port is not None and bc_applies:
+                hc_checks.append((bc_source, hc_port))
+
+        for hcp_source, hc_port, hc_pname, uses_serving_port in hcp_refs:
+            if hc_pname:
+                matched = [idx for idx, p in enumerate(svc_ports) if (p.get("name") or "") == hc_pname]
+                if not matched:
+                    reasons.append(
+                        f"{hcp_source} names portName {hc_pname!r}, which Service/{svc_name} does not expose "
+                        f"(declares {svc_ports_desc})"
+                    )
+                else:
+                    for idx in matched:
+                        _mark_covered(idx, hcp_source)
+            elif uses_serving_port and not routed_port_indices and len(svc_ports) == 1:
+                _mark_covered(0, hcp_source)
+            if hc_port is not None:
+                hc_checks.append((hcp_source, hc_port))
+
+        if port_sources or hc_checks:
+            inv = _backing_port_inventory(raw_workloads, ns, entry["selector"])
+            if inv["backends"] and inv["has_app_port_contract"]:
+                for idx in sorted(port_sources):
+                    sp = svc_ports[idx]
+                    raw_target = sp.get("targetPort") if sp.get("targetPort") is not None else sp.get("port")
+                    if not _is_int_port(raw_target):
+                        continue
+                    proto = str(sp.get("protocol") or DEFAULT_PORT_PROTOCOL).upper()
+                    known = {p for pr, p in inv["declared_ports"] if pr == proto}
+                    if proto == DEFAULT_PORT_PROTOCOL:
+                        known |= inv["all_probe_ports"]
+                    if raw_target not in known:
+                        sources_str = ", ".join(port_sources[idx])
+                        sp_name = str(sp.get("name") or "")
+                        sp_label = (
+                            f"port {sp.get('port')} ({sp_name}, targetPort {raw_target}/{proto})"
+                            if sp_name
+                            else f"port {sp.get('port')} (targetPort {raw_target}/{proto})"
+                        )
+                        reasons.append(
+                            f"{sources_str} routes to Service/{svc_name} {sp_label}, which no backing "
+                            f"container declares or probes; {inv['summary']}"
+                        )
+
+                known_pod_ports = (
+                    {p for _, p in inv["declared_ports"]}
+                    | inv["all_probe_ports"]
+                    | {p.get("nodePort") for p in svc_ports if _is_int_port(p.get("nodePort"))}
+                )
+                for hc_source, hc_port in hc_checks:
+                    if hc_port not in known_pod_ports:
+                        reasons.append(
+                            f"{hc_source} probes port {hc_port} on Service/{svc_name}, which no backing "
+                            f"container declares or probes; {inv['summary']}"
+                        )
+
+        if reasons:
+            hits.append(
+                {
+                    "namespace": ns,
+                    "object": f"{SERVICE_KIND}/{svc_name}",
+                    "severity": "major",
+                    "excerpt": "; ".join(reasons),
+                    "reconciler": reconciler_of(service.get("metadata") or {}),
+                    "release": release_of(service.get("metadata") or {}),
+                }
+            )
+    return hits
+
+
 COMPUTE_CLASS_LABEL = "cloud.google.com/compute-class"
 DEFAULT_COMPUTE_CLASS_LABEL = "cloud.google.com/default-compute-class"
 DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL = "cloud.google.com/default-compute-class-non-daemonset"
@@ -4329,7 +5240,422 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all seventeen checks of §2.
+# obtainability-audit §3.28 `image-pull-failing`: a workload with a pod that
+# has failed to pull an image for ten minutes or more.
+#
+# The event watcher alerts on a failing pull once for the same pods and then
+# stays quiet while the kubelet keeps retrying, so nothing says the pull is
+# still failing a day later. This check is that standing record. It states
+# what the pod's status states and leaves the diagnosis to the alert's
+# triage: the finding carries no cause of its own beyond the kubelet's stated
+# reason, from a closed set.
+#
+# This stream's dump holds no pods (`DUMP_COMMAND_KINDS` says why), and a fleet
+# whose workloads are all available and rolled out reads none: the dump's own
+# workload status decides whether the one pod read below is issued at all.
+# --------------------------------------------------------------------------- #
+
+PODS_KIND = "pods"
+# Pods that have a node and have not started. Phase Pending includes "the time
+# spent downloading container images" (Kubernetes, Pod Lifecycle), so a pod
+# whose image was never pulled is in it. A pod with no node has no kubelet to
+# pull for it: `spec.nodeName!=` keeps a stock-out's unschedulable pods out of
+# the read.
+PULL_WAITING_PODS_QUERY = {"fieldSelector": "status.phase=Pending,spec.nodeName!="}
+# The most pages of `collector_run.PAGE_SIZE` this read takes: two thousand
+# pods that have a node and have not started. Past it the check is not
+# evaluated on the cluster, which says more than a partial read would.
+PULL_WAITING_PODS_MAX_PAGES = 4
+_PULL_FAILURE_REASONS = ("ErrImagePull", "ImagePullBackOff")
+# How long a pull must have been failing before the workload is named. A pod
+# that fails for a minute in a rollout is not a finding. Ten minutes is
+# Kubernetes' own line for a stalled rollout (`progressDeadlineSeconds`
+# defaults to 600), it outlasts the time a new IAM grant takes to work
+# ("typically 2 minutes, potentially 7 minutes or longer"), and by then the
+# kubelet's back-off (ten seconds, doubling, to its 300-second limit) has
+# failed six attempts.
+IMAGE_PULL_FAILING_MIN_SECONDS = 600
+# The pod conditions after whose turn to True a pull can begin: the sandbox is
+# up, and the init containers are done.
+_PULL_PRECEDING_CONDITIONS = ("PodReadyToStartContainers", "Initialized")
+_CONDITION_TRUE = "True"
+_DAEMONSET_KIND = "DaemonSet"
+# What the kubelet's message is read for. A reason is stated only in the three
+# forms a live pull showed, each of which names what it is about; any other
+# wording states no reason here, because the same words are said of other
+# faults ("not found" of a platform with no manifest, a timeout of a slow
+# copy, a refusal of a mirror or of a token service on another host such as
+# `auth.docker.io`). The message is the waiting container's own, so the
+# reference it resolved is this container's image as the runtime spells it.
+#
+# Refused: a 401 or 403 status for a request to the image's registry host.
+_REGISTRY_STATUS_RE = re.compile(
+    r"unexpected status from [A-Z]+ request to https://(?P<host>[^/\s]+)/\S*: (?P<status>401 Unauthorized|403 Forbidden)"
+)
+# Not found: the reference the runtime resolved, quoted and then repeated
+# before these words (`failed to resolve reference "<ref>": <ref>: not found`).
+_PULL_NOT_FOUND_RE = re.compile(r'"(?P<ref>[^"\s]+)": (?P=ref): not found')
+# Not resolved: a lookup of the image's registry host, named without its port
+# as the resolver names it, that ends in these words.
+_PULL_HOST_UNRESOLVED_TEMPLATE = r"lookup {host}(?: on \S+)?: no such host"
+_HOST_PORT_SEPARATOR = ":"
+# Container Registry's four hosts and Artifact Registry's per-location Docker
+# hosts, matched whole. On GKE a pull from one of these with no pull secret
+# runs as the node service account; a pull from any other registry with no
+# pull secret carries no credential, so the excerpt says the first only here.
+_GOOGLE_REGISTRY_HOST_RE = re.compile(r"(?:(?:us|eu|asia)\.)?gcr\.io|[a-z0-9-]+-docker\.pkg\.dev")
+# The stated reasons a finding may carry: this closed set, never the
+# kubelet's text, which can hold a signed URL.
+_PULL_REASON_NOT_FOUND = "the image was not found"
+_PULL_REASON_NOT_RESOLVED = "the registry's host name did not resolve"
+_PULL_REASON_REFUSED = "the registry refused the pull ({statuses})"
+_PULL_REASON_CLAUSE = "the kubelet's stated reason: {reasons}"
+_PULL_NO_REASON_CLAUSE = "the kubelet's message states no reason this check reads"
+_PULL_EXCERPT_LEAD = "At this audit's read: "
+_PULL_PART_JOINER = "; "
+_PULL_LIST_JOINER = ", "
+_PULL_CONTAINER_LINE = "{container}: {pods} could not pull {image}, waiting since {since}"
+_PULL_ONE_POD = "1 pod"
+_PULL_MANY_PODS = "{count} pods"
+_PULL_AVAILABILITY_NOTE = "{available} of {counted} pods of the workload are available"
+# The path the pull ran on, as the pods' own specs name it. The texts say what
+# a spec names and nothing a Secret read would show: not that a named pull
+# secret was the credential used, nor that it expired.
+_PULL_PATH_UNNAMED_NOTE = "the pods name no pull secret"
+_PULL_NODE_IDENTITY_NOTE = "the pods name no pull secret, so the pull runs as the node service account"
+_PULL_PATH_NAMED_NOTE = "the pods name {named}"
+_PULL_REF_ONE = "pull secret"
+_PULL_REF_MANY = "pull secrets"
+# A workload whose waiting pods disagree, as in a rolling update that added or
+# dropped the reference: one clause per group, each with its count.
+_PULL_MIXED_NOTE = "of the waiting pods, {groups}"
+_PULL_MIXED_UNNAMED = "{count} name no pull secret"
+_PULL_MIXED_NODE_IDENTITY = "{count} name no pull secret, so their pull runs as the node service account"
+_PULL_MIXED_NAMED = "{count} name {named}"
+_IMPACT_IMAGE_PULL_FAILING = (
+    "The pods that need this image cannot start. A restart, a node drain, an upgrade "
+    "or a scale-up takes capacity away until the pull works, and where older pods "
+    "still serve, the rollout cannot finish. The alert for a failing pull is sent "
+    "once for the same pods; this finding is filed at each run that finds a pod ten "
+    "minutes into a failed pull."
+)
+# Why the pod read did not answer, in plain words: the reason reaches the
+# run's report. The exit code and the stderr go to the collector's log.
+_PULL_READ_UNEVALUATED = (
+    "{prefix} the pods that have a node and have not started {what}, so a failing "
+    "image pull could not be established. This check cleared nothing on this cluster."
+)
+_PULL_READ_FAILED = "could not be read"
+_PULL_READ_TIMED_OUT = "could not be read in time"
+_PULL_READ_TOO_MANY = "are more than the {pods} this check reads on one cluster"
+_PULL_READ_NOT_A_LIST = "came back as something other than a list of pods"
+_PULL_READ_LOG = "{slug}: the pod read did not answer (rc={rc}): {stderr}"
+
+
+def pod_availability(item: dict) -> tuple[int, int]:
+    """`(counted, available)` for one Deployment, StatefulSet or DaemonSet, from
+    its own status: the pods its controller counts, and the ones it counts
+    available. A pod that cannot pull its image is counted and never
+    available, the surge pod of a Deployment's rollout included."""
+    status = item.get("status") or {}
+    if item.get("kind") == _DAEMONSET_KIND:
+        counted, available = status.get("desiredNumberScheduled"), status.get("numberAvailable")
+    else:
+        counted, available = status.get("replicas"), status.get("availableReplicas")
+    return (counted if isinstance(counted, int) else 0, available if isinstance(available, int) else 0)
+
+
+def _rollout_unfinished(item: dict, counted: int) -> bool:
+    """Whether the workload's status counts fewer pods on its current template
+    than it counts pods. A DaemonSet counts a node available from its old pod,
+    so the surge pod of its rollout lowers neither count `pod_availability`
+    reads; this one it does lower."""
+    status = item.get("status") or {}
+    updated = status.get("updatedNumberScheduled" if item.get("kind") == _DAEMONSET_KIND else "updatedReplicas")
+    return isinstance(updated, int) and updated < counted
+
+
+def workloads_short_of_pods(raw_workloads: list[dict], workloads: list[dict]) -> dict[tuple[str, str, str], tuple[int, int]]:
+    """`{(kind, namespace, name): (counted, available)}` for each workload this
+    audit judges whose status counts a pod that is not available, or whose
+    rollout is not finished. These are the workloads a pod can be failing a
+    pull for, and the only ones the pod read is issued and judged for."""
+    judged = {(w["kind"], w["ns"], w["name"]) for w in workloads}
+    out = {}
+    for item in raw_workloads:
+        meta = item.get("metadata") or {}
+        key = (item.get("kind", ""), meta.get("namespace", ""), meta.get("name", ""))
+        counted, available = pod_availability(item)
+        if key in judged and (counted > available or _rollout_unfinished(item, counted)):
+            out[key] = (counted, available)
+    return out
+
+
+def _pod_pull_refs(item: dict) -> list[str]:
+    """The names under `imagePullSecrets` on the pod itself, in order. The
+    pod's spec and not the template's: the ServiceAccount admission plugin
+    copies an account's references onto the pod, so the pod shows the path the
+    pull ran on."""
+    refs = (item.get("spec") or {}).get("imagePullSecrets") or []
+    return [str(ref.get("name") or "") for ref in refs if isinstance(ref, dict) and ref.get("name")]
+
+
+def _pull_waiting_states(item: dict) -> dict[str, dict]:
+    """`{container: {"message", "last_ran"}}` for the containers of this pod,
+    init containers included, that wait on a failed image pull: the kubelet's
+    waiting message, and when the container last finished a run, if it ever
+    ran (a container that exited and cannot pull again has waited since then,
+    not since the pod started). Empty for a terminating pod: its pull failure
+    is on the way out with it."""
+    if (item.get("metadata") or {}).get("deletionTimestamp"):
+        return {}
+    status = item.get("status") or {}
+    out = {}
+    for cs in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or []):
+        waiting = (cs.get("state") or {}).get("waiting") or {}
+        if waiting.get("reason") in _PULL_FAILURE_REASONS:
+            last_ran = ((cs.get("lastState") or {}).get("terminated") or {}).get("finishedAt")
+            out[cs.get("name", "")] = {"message": str(waiting.get("message") or ""), "last_ran": _rfc3339(str(last_ran or ""))}
+    return out
+
+
+def _pull_could_start(item: dict) -> float | None:
+    """Epoch seconds from which a pull in this pod could have been failing, or
+    `None` when the pod carries no start time.
+
+    Not `status.startTime` alone, which is when the kubelet took the pod: an
+    init container may run for twenty minutes before the main image is pulled
+    for the first time. The latest of these recorded times is used: the start
+    time, the conditions after which a pull can begin
+    (`_PULL_PRECEDING_CONDITIONS`) turning True, and the last init container
+    to finish (the next init container's pull begins after it). A second
+    container's pull that began only after a first container's long pull is
+    not told apart: its wait is counted from the same time."""
+    status = item.get("status") or {}
+    started = _rfc3339(str(status.get("startTime") or ""))
+    if started is None:
+        return None
+    stamps = [
+        str(condition.get("lastTransitionTime") or "")
+        for condition in status.get("conditions") or []
+        if condition.get("type") in _PULL_PRECEDING_CONDITIONS and condition.get("status") == _CONDITION_TRUE
+    ]
+    stamps += [
+        str(((cs.get("state") or {}).get("terminated") or {}).get("finishedAt") or "")
+        for cs in status.get("initContainerStatuses") or []
+    ]
+    return max([started, *(t for t in map(_rfc3339, stamps) if t is not None)])
+
+
+def pull_waiting_pod_record(item: dict) -> dict:
+    """What `image-pull-failing` keeps of one pod of its read."""
+    meta = item.get("metadata") or {}
+    return {
+        "ns": meta.get("namespace", ""),
+        "name": meta.get("name", ""),
+        "labels": meta.get("labels") or {},
+        "owners": _controller_refs(meta),
+        "image_refs": _pod_image_refs(item),
+        "pull_waiting": _pull_waiting_states(item),
+        "pull_refs": _pod_pull_refs(item),
+        "pull_could_start": _pull_could_start(item),
+    }
+
+
+def _pod_belongs_to(pod: dict, workload: dict) -> bool:
+    """Whether this pod is the workload's: its labels match the workload's
+    selector, and its owner resolves to the workload (`_pod_workload_ref`: the
+    workload itself, or for a Deployment a ReplicaSet named for it). Both,
+    because a bare ReplicaSet can share a name prefix and a stray pod can share
+    labels."""
+    if pod.get("ns") != workload["ns"]:
+        return False
+    if not selector_matches((workload.get("spec") or {}).get("selector") or {}, pod.get("labels") or {}):
+        return False
+    return _pod_workload_ref(pod, [workload]) == f"{workload['kind']}/{workload['name']}"
+
+
+def _image_registry_host(image: str) -> str:
+    """The registry host an image reference names, or "" when it names none
+    (a bare `app:1.0` resolves to the runtime's default registry)."""
+    first, slash, _ = image.partition("/")
+    return first if slash and ("." in first or ":" in first) else ""
+
+
+def stated_pull_failure(messages: list[str], image: str) -> str:
+    """What the kubelet's messages say went wrong with this pull, as text from
+    a closed set, or "" when they state nothing this check reads. Every pod's
+    message is read: a back-off message may carry no cause ("Back-off pulling
+    image" and nothing more), and another pod of the workload may still state it.
+    Pods, and attempts within one message, that state different things give
+    each, in a fixed order.
+
+    Each reason is read only in a form that names what it is about: the
+    resolved reference followed by "not found", a lookup of the image's
+    registry host that does not resolve, and the registry's own 401 or 403 for
+    a request to that host, one per attempt the kubelet made."""
+    host = _image_registry_host(image)
+    host_name = host.partition(_HOST_PORT_SEPARATOR)[0]
+    unresolved_re = re.compile(_PULL_HOST_UNRESOLVED_TEMPLATE.format(host=re.escape(host_name))) if host_name else None
+    not_found = unresolved = False
+    statuses: list[str] = []
+    for message in messages:
+        not_found = not_found or bool(_PULL_NOT_FOUND_RE.search(message))
+        unresolved = unresolved or bool(unresolved_re and unresolved_re.search(message))
+        statuses += [m.group("status") for m in _REGISTRY_STATUS_RE.finditer(message) if m.group("host") == host]
+    reasons = []
+    if not_found:
+        reasons.append(_PULL_REASON_NOT_FOUND)
+    if unresolved:
+        reasons.append(_PULL_REASON_NOT_RESOLVED)
+    if statuses:
+        reasons.append(_PULL_REASON_REFUSED.format(statuses=_PULL_LIST_JOINER.join(dict.fromkeys(statuses))))
+    return _PULL_PART_JOINER.join(reasons)
+
+
+def _named_pull_refs(names: tuple[str, ...]) -> str:
+    """`pull secret `a`` or `pull secrets `a`, `b``, in the pod's order."""
+    noun = _PULL_REF_ONE if len(names) == 1 else _PULL_REF_MANY
+    return f"{noun} {_PULL_LIST_JOINER.join(f'`{name}`' for name in names)}"
+
+
+def _pull_path_note(ref_lists: list[tuple[str, ...]], google_registry: bool) -> str:
+    """What the waiting pods' own specs say about the path their pull ran on:
+    one entry of `ref_lists` per waiting pod, empty for a pod that names no
+    pull secret. `google_registry` says every waited image is on a Google
+    registry host, the one case where a pull with no pull secret is known to
+    run as the node service account."""
+    groups = list(dict.fromkeys(ref_lists))
+    if groups == [()]:
+        return _PULL_NODE_IDENTITY_NOTE if google_registry else _PULL_PATH_UNNAMED_NOTE
+    if len(groups) == 1:
+        return _PULL_PATH_NAMED_NOTE.format(named=_named_pull_refs(groups[0]))
+    unnamed = _PULL_MIXED_NODE_IDENTITY if google_registry else _PULL_MIXED_UNNAMED
+    clauses = [
+        _PULL_MIXED_NAMED.format(count=ref_lists.count(names), named=_named_pull_refs(names))
+        if names
+        else unnamed.format(count=ref_lists.count(names))
+        for names in groups
+    ]
+    return _PULL_MIXED_NOTE.format(groups=_PULL_PART_JOINER.join(clauses))
+
+
+def check_image_pull_failing(workload: dict, context: dict) -> dict | None:
+    """3.28 -- a workload with a pod that has failed to pull an image for
+    `IMAGE_PULL_FAILING_MIN_SECONDS` or more, at this run's read of the pods.
+
+    One hit per workload. Each container line counts the pods that have waited
+    that long on the image and gives the earliest time the wait began; the
+    kubelet's stated reason follows where its message states one. The last two
+    parts are the workload's own availability count and the path the pull ran
+    on, from the pods' own specs: the pull secrets a pod names, or none, which
+    on a Google registry means the node identity. Quiet for a pod younger than
+    the minimum, a terminating pod, a pod that is pulling
+    (`ContainerCreating`), and a workload the read did not run for
+    (`workloads_short_of_pods`).
+
+    The minimum is each pod's own, on every run: a workload whose failing pods
+    were all replaced within the last ten minutes is not named by that run,
+    and is named again by the next. Nothing here remembers the run before.
+    """
+    read_at = context.get("pull_waiting_read_at")
+    key = (workload["kind"], workload["ns"], workload["name"])
+    availability = (context.get("pod_availability") or {}).get(key)
+    if read_at is None or availability is None:
+        return None
+    waited: dict[tuple[str, str], list[float]] = {}
+    messages: dict[tuple[str, str], list[str]] = {}
+    ref_lists: list[tuple[str, ...]] = []
+    for pod in context.get("pull_waiting_pods") or []:
+        if not _pod_belongs_to(pod, workload):
+            continue
+        could_start = pod.get("pull_could_start")
+        counted_pod = False
+        for container, state in (pod.get("pull_waiting") or {}).items():
+            pull = (container, (pod.get("image_refs") or {}).get(container, ""))
+            messages.setdefault(pull, []).append(state["message"])
+            if could_start is None:
+                continue
+            since = max(could_start, state["last_ran"] or could_start)
+            if read_at - since >= IMAGE_PULL_FAILING_MIN_SECONDS:
+                waited.setdefault(pull, []).append(since)
+                counted_pod = True
+        if counted_pod:
+            ref_lists.append(tuple(pod.get("pull_refs") or ()))
+    if not waited:
+        return None
+    lines = []
+    for (container, image), sinces in sorted(waited.items()):
+        since = datetime.datetime.fromtimestamp(min(sinces), datetime.timezone.utc).strftime(TIMESTAMP_FORMAT)
+        pods = _PULL_ONE_POD if len(sinces) == 1 else _PULL_MANY_PODS.format(count=len(sinces))
+        lines.append(_PULL_CONTAINER_LINE.format(container=container, pods=pods, image=image, since=since))
+        reasons = stated_pull_failure(messages[(container, image)], image)
+        lines.append(_PULL_REASON_CLAUSE.format(reasons=reasons) if reasons else _PULL_NO_REASON_CLAUSE)
+    counted, available = availability
+    lines.append(_PULL_AVAILABILITY_NOTE.format(available=available, counted=counted))
+    google_registry = all(_GOOGLE_REGISTRY_HOST_RE.fullmatch(_image_registry_host(image)) for _, image in waited)
+    lines.append(_pull_path_note(ref_lists, google_registry))
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": _PULL_EXCERPT_LEAD + _PULL_PART_JOINER.join(lines)}
+
+
+def _pull_read_failure(result: Run) -> str:
+    """Why the pod read did not answer, in the words the run's report carries."""
+    if result.rc == TIMEOUT_RC:
+        return _PULL_READ_TIMED_OUT
+    if result.rc != 0:
+        return _PULL_READ_FAILED
+    if result.stderr.endswith(PAGE_CEILING_FORMAT.format(pages=PULL_WAITING_PODS_MAX_PAGES)):
+        return _PULL_READ_TOO_MANY.format(pods=PULL_WAITING_PODS_MAX_PAGES * PAGE_SIZE)
+    return _PULL_READ_NOT_A_LIST
+
+
+def read_pull_waiting_pods(
+    context: dict, commands: dict, record: dict, dump_run: Run, kubeconfig: Path, *, run: RunFn
+) -> None:
+    """`image-pull-failing`'s read, issued only when the dump shows a judged
+    workload that is short of available pods or mid-rollout: one paged list of
+    the pods that have a node and have not started (`PULL_WAITING_PODS_QUERY`).
+    With every workload whole nothing is read and the check's command stays
+    the dump.
+
+    This is the one obtainability check whose verdict reads the clock: how
+    long a pull has failed has one recorded end, the pod's, and the other end
+    is this read. The time is taken before the read, so a pod is never judged
+    older than it was when it was read. A read that fails, or passes
+    `PULL_WAITING_PODS_MAX_PAGES`, leaves this one check not evaluated on the
+    cluster and every other check as it was."""
+    context["pull_waiting_pods"] = []
+    context["pod_availability"] = workloads_short_of_pods(context.get("raw_workloads") or [], context.get("workloads") or [])
+    if not context["pod_availability"]:
+        return
+    read_at = time.time()
+    parsed, result = paged_dump(
+        (PODS_KIND,),
+        run=run,
+        query=PULL_WAITING_PODS_QUERY,
+        max_pages=PULL_WAITING_PODS_MAX_PAGES,
+        env={**os.environ, "KUBECONFIG": str(kubeconfig)},
+        timeout=DEFAULT_TIMEOUT_S,
+    )
+    if parsed is None:
+        log(_PULL_READ_LOG.format(slug=IMAGE_PULL_FAILING_SLUG, rc=result.rc, stderr=result.stderr.strip()[:ERROR_EXCERPT_CHARS]))
+        commands.pop(IMAGE_PULL_FAILING_SLUG, None)
+        context.setdefault("unevaluated", {})[IMAGE_PULL_FAILING_SLUG] = _PULL_READ_UNEVALUATED.format(
+            prefix=UNDETERMINED_PREFIX, what=_pull_read_failure(result)
+        )
+        return
+    context["pull_waiting_read_at"] = read_at
+    context["pull_waiting_pods"] = [pull_waiting_pod_record(item) for item in parsed.get("items") or []]
+    commands[IMAGE_PULL_FAILING_SLUG] = _record(
+        _PULL_PART_JOINER.join(
+            [record["command"], paged_command_text((PODS_KIND,), query=PULL_WAITING_PODS_QUERY, kubeconfig=kubeconfig)]
+        ),
+        Run([], 0, dump_run.stdout + result.stdout, "", dump_run.duration_s + result.duration_s),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# compliance-audit: all twenty checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -6804,11 +8130,6 @@ _INTERNAL_LB_ANNOTATION_VALUE = "Internal"
 # `spec.ports[].protocol` when the field is omitted.
 _DEFAULT_SERVICE_PROTOCOL = "TCP"
 
-# S2, the label GKE stamps on the add-ons it manages. Named here rather than
-# repeated as a literal because this is the first Service-scoped check to apply
-# the suppression; the workload-scoped ones inherit it from `normalize_workloads`.
-_ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
-
 _IMPACT_LB_WORLD_OPEN = (
     "This Service holds a public load-balancer address that forwards a "
     "management or datastore port straight to its pods, with no source-range "
@@ -7589,6 +8910,30 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         None,
         _IMPACT_UNTARGETED_COMPUTE_CLASS,
     ),
+    CheckSpec(
+        HPA_AGGRESSIVE_SCALEDOWN_SLUG,
+        CHECK_KIND_CLUSTER,
+        check_hpa_aggressive_scaledown,
+        SEVERITY_MAJOR,
+        None,
+        IMPACT_HPA_AGGRESSIVE_SCALEDOWN,
+    ),
+    CheckSpec(
+        INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG,
+        "cluster",
+        check_ingress_gateway_healthcheck_mismatch,
+        "major",
+        None,
+        _IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH,
+    ),
+    CheckSpec(
+        IMAGE_PULL_FAILING_SLUG,
+        "workload",
+        check_image_pull_failing,
+        SEVERITY_MAJOR,
+        None,
+        _IMPACT_IMAGE_PULL_FAILING,
+    ),
 )
 
 def _condition(item: dict, condition_type: str) -> dict | None:
@@ -7616,7 +8961,78 @@ def _configsync_stage_errors(item: dict, ref: str) -> list[dict]:
     return [e for e in node if isinstance(e, dict)] if isinstance(node, list) else []
 
 
-def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
+def _configsync_oom_loop(pods: list, kind: str, name: str, namespace: str, now_s: float) -> str:
+    """Why this sync object's reconciler is down for memory, or "".
+
+    The pod is the one signal that held at every moment of a live loop. The
+    sync object flipped: each restart made the Deployment available for a
+    moment, `Reconciling` went False, and the next kill started it again.
+
+    Only the container that applies the repository is read. Another container
+    of the pod in the same loop is not this finding: whether the repository is
+    still applied then was not tested. The words carry no count and no time:
+    both move at every kill, and the ledger compares an excerpt byte for byte
+    to tell a finding that changed from one that did not.
+    """
+    for pod in pods:
+        if not isinstance(pod, dict):
+            continue
+        # A pod that ended (phase Failed, left beside its replacement) is not
+        # the reconciler any more; a container in a restart loop keeps its pod
+        # in phase Running.
+        if not _is_live_pod({"phase": (pod.get("status") or {}).get("phase")}):
+            continue
+        labels = (pod.get("metadata") or {}).get("labels") or {}
+        if (
+            labels.get(CONFIGSYNC_SYNC_KIND_LABEL) != kind
+            or labels.get(CONFIGSYNC_SYNC_NAME_LABEL) != name
+            or labels.get(CONFIGSYNC_SYNC_NAMESPACE_LABEL) != namespace
+        ):
+            continue
+        for status in (pod.get("status") or {}).get("containerStatuses") or []:
+            if not isinstance(status, dict) or status.get("name") != CONFIGSYNC_RECONCILER_CONTAINER:
+                continue
+            restarts = status.get("restartCount") or 0
+            for state_key in ("state", "lastState"):
+                killed = ((status.get(state_key) or {}).get("terminated")) or {}
+                if killed.get("reason") != CONFIGSYNC_OOM_REASON:
+                    continue
+                finished = _rfc3339(str(killed.get("finishedAt") or ""))
+                if finished is None or now_s - finished > CONFIGSYNC_OOM_RECENT_SECONDS:
+                    continue
+                if restarts < CONFIGSYNC_OOM_MIN_RESTARTS:
+                    continue
+                return (
+                    f"its reconciler container `{CONFIGSYNC_RECONCILER_CONTAINER}` was killed for memory "
+                    f"({CONFIGSYNC_OOM_REASON}) and has restarted more than once "
+                    f"(pod {(pod.get('metadata') or {}).get('name', '')})"
+                )
+    return ""
+
+
+def _configsync_deployment_down(item: dict, now_s: float) -> str:
+    """Why this sync object's reconciler Deployment has no available replica, or "".
+
+    The age is the age of the condition: the time `Reconciling` last became
+    True. A reason that changed to `Deployment` later does not restart it, so
+    the rollout that repairs a reconciler that was down for longer than the
+    wait is still named until `Reconciling` goes False.
+    """
+    reconciling = _condition(item, CONFIGSYNC_RECONCILING_CONDITION)
+    if (
+        reconciling is None
+        or str(reconciling.get("status")) != "True"
+        or reconciling.get("reason") != CONFIGSYNC_DEPLOYMENT_REASON
+    ):
+        return ""
+    since = _rfc3339(str(reconciling.get("lastTransitionTime") or ""))
+    if since is None or now_s - since < CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS:
+        return ""
+    # The time, not the age: an age would change the excerpt on every run.
+    return f"its reconciler has not come up since {reconciling.get('lastTransitionTime')} ({_condition_why(reconciling)})"
+
+
+def check_configsync_reconciler_stalled(context: dict, *, now: datetime.datetime | None = None) -> list[dict]:
     """Cluster-scoped: Config Sync RootSync and RepoSync objects whose
     reconciler has stopped applying the repository.
 
@@ -7626,19 +9042,34 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
     RootSync drifts the cluster from Git while every `manifest` remediation
     this audit opens against that cluster merges and applies nothing.
 
-    Two signals, both the reconciler's own verdict on the object. `Stalled=True`
-    is the reconciler-manager saying it cannot create or run the reconciler
-    (a Deployment that will not come up, an invalid spec). A `Syncing`
-    condition naming `errorSourceRefs` is the reconciler saying the current
-    commit failed to fetch, render or apply, and the stage it names holds the
-    error line. The stage summaries are not read on their own: they keep the
+    Four signals. `Stalled=True` is the reconciler-manager saying it cannot
+    create or run the reconciler: Config Sync writes it when the reconciler's
+    Deployment has made no progress for ten minutes (read live for a pod that
+    could not be scheduled) or the spec is invalid. A `Syncing` condition
+    naming `errorSourceRefs` is the reconciler saying the current commit
+    failed to fetch, render or apply, and the stage it names holds the error
+    line. The stage summaries are not read on their own: they keep the
     previous commit's errors until the next stage overwrites them, and a
     render in progress writes a transient error there that clears by itself,
-    so a count over them fires on a fix in flight. `Reconciling=True` alone
-    is not a finding: it is the state of every first sync, and a large
-    repository can hold it for longer than any threshold this check could
-    defend.
+    so a count over them fires on a fix in flight.
+
+    The other two cover a reconciler that is down and did not read `Stalled`
+    in the live tests (Config Sync v1.25.2, loops of up to 23 minutes): the
+    Deployment of a reconciler killed for memory at every start kept
+    `Progressing` True through the loop, and the object read `Reconciling`
+    True or, between two kills, False. Its pod says what the object does not
+    (`_configsync_oom_loop`). A reconciler that has not come up at all holds
+    `Reconciling=True` with the reason `Deployment`
+    (`_configsync_deployment_down`). `Reconciling=True` for any other reason,
+    or for less than the wait, is not a finding: it is the state of every
+    first sync.
+
+    Both ages are measured from the moment the check runs, which is after the
+    stream's last read of the cluster and so later than the read of the pods
+    by the time those reads took.
     """
+    now_s = (now if now is not None else datetime.datetime.now(datetime.timezone.utc)).timestamp()
+    pods = context.get("configsync_reconciler_pods") or []
     hits = []
     for item in context.get("configsync_objects") or []:
         if not isinstance(item, dict):
@@ -7657,22 +9088,634 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
             refs = [str(r) for r in syncing["errorSourceRefs"] if r]
             errors = [e for ref in refs for e in _configsync_stage_errors(item, ref)]
             real = [e for e in errors if str(e.get("code")) not in CONFIGSYNC_TRANSIENT_ERROR_CODES]
-            if errors and not real:
-                continue
-            first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
-            why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
-            if refs:
-                why = f"{why} (errors in {', '.join(refs)})"
+            # Only transient errors is a render in flight, not a verdict: the
+            # object gives no finding by this signal. The two rules below
+            # read the reconciler itself and still apply.
+            if real or not errors:
+                first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
+                why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
+                if refs:
+                    why = f"{why} (errors in {', '.join(refs)})"
+        # Config Sync's own verdict leads the excerpt when there is one. A
+        # reconciler that is down has none, so the excerpt says what was read:
+        # the kill for memory first, which names a cause, then the age.
+        lead = f"Config Sync reports {kind}/{name} is not applying its repository"
+        if not why:
+            lead = f"{kind}/{name} is not applying its repository"
+            why = _configsync_oom_loop(pods, kind, name, str(meta.get("namespace") or ""), now_s)
+        if not why:
+            why = _configsync_deployment_down(item, now_s)
         if not why:
             continue
         hits.append(
             {
                 "namespace": str(meta.get("namespace") or ""),
                 "object": f"{kind}/{name}",
-                "excerpt": f"Config Sync reports {kind}/{name} is not applying its repository: {why}",
+                "excerpt": f"{lead}: {why}",
             }
         )
     return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
+
+
+_IMPACT_SERVICEENTRY_HOST_COLLISION = (
+    "Istio never merges ServiceEntries declared in different namespaces. A sidecar in a "
+    "namespace that can see two of them for one host uses its own namespace's entry when "
+    "it has one, and otherwise whichever one Istio picks, so that namespace's traffic to "
+    "the host follows a declaration neither owner chose for it. Calls can fail DNS "
+    "resolution or reach the wrong address, and nothing on either entry reports it."
+)
+
+
+def _serviceentry_visibility(export_to: object, namespace: str) -> tuple[bool, frozenset[str]]:
+    """`(public, namespaces)`: whether an entry is exported to every namespace,
+    else the namespaces it is exported to. `~` exports to none."""
+    values = [str(v) for v in export_to] if isinstance(export_to, list) else []
+    if not values:
+        return True, frozenset()
+    if EXPORT_TO_PUBLIC in values:
+        return True, frozenset()
+    names = {namespace if v == EXPORT_TO_PRIVATE else v for v in values if v != EXPORT_TO_NONE}
+    return False, frozenset(names)
+
+
+def _canonical(value: object) -> str:
+    """A field's value in a form two equal values always print the same."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _serviceentry_port_text(port: dict) -> str:
+    """A port as a person reads it: `443/TLS https`, `443/TLS https->8443` with a
+    target port. The name stays even with a protocol set: an endpoint's `ports`
+    map is keyed by the service port's name, so a renamed port routes elsewhere."""
+    text = f"{port.get('number', '?')}/{port.get('protocol') or 'unset'}"
+    if port.get("name"):
+        text += f" {port['name']}"
+    if port.get("targetPort"):
+        text += f"->{port['targetPort']}"
+    return text
+
+
+def _serviceentry_endpoint_text(endpoint: dict) -> str:
+    """An endpoint as its address, then any other field as `key=value`."""
+    extras = [f"{k}={_canonical(v)}" for k, v in sorted(endpoint.items()) if k != "address"]
+    return str(endpoint.get("address") or "?") + (f" ({', '.join(extras)})" if extras else "")
+
+
+def _serviceentry_fields(spec: dict) -> dict[str, str]:
+    """What a sidecar routes by, one readable string per field, in a fixed order:
+    every spec field but `hosts` and `exportTo`, which are what make two entries
+    collide rather than how each routes. Two entries route the same when these
+    are equal, and the excerpt names the fields where they are not. Lists whose
+    order carries no meaning are sorted."""
+    fields = {
+        "location": str(spec.get("location") or "unset"),
+        "resolution": str(spec.get("resolution") or "unset"),
+        "ports": ", ".join(sorted(_serviceentry_port_text(p) for p in spec.get("ports") or [] if isinstance(p, dict))) or "none",
+        "addresses": ", ".join(sorted(str(a) for a in spec.get("addresses") or [])) or "none",
+        "endpoints": ", ".join(sorted(_serviceentry_endpoint_text(e) for e in spec.get("endpoints") or [] if isinstance(e, dict))) or "none",
+        "subjectAltNames": ", ".join(sorted(str(n) for n in spec.get("subjectAltNames") or [])) or "none",
+    }
+    for key in sorted(k for k in spec if k not in fields and k not in ("hosts", "exportTo")):
+        fields[key] = _canonical(spec[key])
+    return fields
+
+
+def _clipped(text: str) -> str:
+    return text if len(text) <= MAX_SERVICEENTRY_VALUE_CHARS else text[: MAX_SERVICEENTRY_VALUE_CHARS - 1] + "…"
+
+
+def _serviceentry_difference(seen: list[tuple[str, dict[str, str]]]) -> str:
+    """The fields the seen entries disagree on, each value with the entries that
+    carry it: `addresses 192.0.2.10 in team-a/x, 192.0.2.20 in team-b/y`. The
+    number of fields, of values per field and of entries per value are capped,
+    and each value is cut at MAX_SERVICEENTRY_VALUE_CHARS, so the sentence stays
+    bounded."""
+    keys = list(dict.fromkeys(k for _, fields in seen for k in fields))
+    differing = [k for k in keys if len({fields.get(k, "unset") for _, fields in seen}) > 1]
+    parts = []
+    for key in differing[:MAX_SERVICEENTRY_NAMED]:
+        by_value: dict[str, list[str]] = {}
+        for ref, fields in seen:
+            by_value.setdefault(fields.get(key, "unset"), []).append(ref)
+        values = [f"{_clipped(value)} in {_named(sorted(refs))}" for value, refs in sorted(by_value.items())]
+        parts.append(f"{key} {_named(values)}")
+    more = len(differing) - len(parts)
+    return "; ".join(parts) + (f"; and {more} more field(s)" if more > 0 else "")
+
+
+def _named(values: list[str]) -> str:
+    shown = ", ".join(values[:MAX_SERVICEENTRY_NAMED])
+    rest = len(values) - MAX_SERVICEENTRY_NAMED
+    return f"{shown} and {rest} more" if rest > 0 else shown
+
+
+def check_serviceentry_host_collision(context: dict) -> list[dict]:
+    """Cluster-scoped: one host declared by ServiceEntries in two or more
+    namespaces, where some other namespace can see more than one of them.
+
+    Istio builds each sidecar's view from the ServiceEntries exported to its
+    namespace. When several namespaces export the same host there, the sidecar
+    keeps its own namespace's entry if it has one, and otherwise the first one
+    Istio meets (`pilot/pkg/model/sidecar.go`, `selectServices`); entries from
+    different namespaces are never merged (`canMergeServices` requires one
+    namespace). So a namespace whose own entry is exported to itself is fine,
+    on that entry, and the defect is any other namespace that sees two: its
+    traffic follows a declaration neither owner chose for it.
+
+    Declarations are grouped by host first, so the work is linear in the
+    entries read: one pass to group, then per host one pass over the
+    namespaces each declaring namespace exports to. A namespace that declares
+    the host twice is one declarer here, since Istio merges or orders those
+    itself and the fix is one team's; that is not this check's question.
+    Wildcard hosts are compared as strings: `*.example.com` beside
+    `api.example.com` is Envoy's most-specific match, not a collision.
+    """
+    by_host: dict[str, dict[str, dict]] = {}
+    for item in context.get("serviceentries") or []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("metadata") or {}
+        spec = item.get("spec") or {}
+        namespace = str(meta.get("namespace") or "")
+        name = str(meta.get("name") or "")
+        if not namespace or not name:
+            continue
+        public, names = _serviceentry_visibility(spec.get("exportTo"), namespace)
+        fields = _serviceentry_fields(spec)
+        for host in {str(h).strip().lower() for h in spec.get("hosts") or [] if str(h).strip()}:
+            declarer = by_host.setdefault(host, {}).setdefault(
+                namespace, {"public": False, "names": set(), "items": []}
+            )
+            declarer["public"] = declarer["public"] or public
+            declarer["names"] |= names
+            declarer["items"].append((f"{namespace}/{name}", public, names, fields))
+
+    hits = []
+    for host, declarers in by_host.items():
+        if len(declarers) < SERVICEENTRY_COLLISION_MINIMUM:
+            continue
+        # A declaring namespace is on its own entry only when that entry is
+        # exported to it: one exported to `~`, or only to other namespaces,
+        # leaves its own sidecars choosing among the others like anyone's.
+        self_served = {ns for ns, d in declarers.items() if d["public"] or ns in d["names"]}
+        public = sorted(ns for ns, d in declarers.items() if d["public"])
+        # Every non-declaring namespace an explicit list names, with the
+        # declarers visible to it: the public ones, plus each that lists it.
+        seen_by: dict[str, set[str]] = {}
+        for ns, d in declarers.items():
+            for target in d["names"] - self_served:
+                seen_by.setdefault(target, set(public)).add(ns)
+        affected = sorted(t for t, seers in seen_by.items() if len(seers) >= SERVICEENTRY_COLLISION_MINIMUM)
+        colliding: set[str] = set().union(*(seen_by[t] for t in affected)) if affected else set()
+        if len(public) >= SERVICEENTRY_COLLISION_MINIMUM:
+            colliding |= set(public)
+        if not colliding:
+            continue
+        involved = sorted(colliding)
+        # Only the entries a colliding viewer can see: a namespace's other
+        # entry for the host, exported to `.` or to no affected namespace, is
+        # not part of the collision and must not name it or move its severity.
+        viewers = set(affected)
+        seen = sorted(
+            (ref, fields)
+            for ns in involved
+            for ref, entry_public, entry_names, fields in declarers[ns]["items"]
+            if entry_public or entry_names & viewers
+        )
+        entries = [ref for ref, _ in seen]
+        difference = _serviceentry_difference(seen)
+        where = (
+            "every namespace that declares none of them"
+            if len(public) >= SERVICEENTRY_COLLISION_MINIMUM
+            else f"namespace {_named(affected)}"
+        )
+        if difference:
+            severity = SERVICEENTRY_SEVERITY_CONFLICTING
+            detail = f"They differ in {difference}."
+        else:
+            severity = SERVICEENTRY_SEVERITY_IDENTICAL
+            detail = "They are identical today, so routing does not change until one is edited."
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"ServiceEntry host {host}",
+                "severity": severity,
+                # The fix comes before the difference: publication trims a long
+                # excerpt from the end, and the SOP has the agent start from it.
+                "excerpt": f"host {host} is declared by ServiceEntries in {len(involved)} namespaces "
+                f"({_named(entries)}), and {where} sees more than one of them. "
+                f"First fix to consider, if no namespace that declares none of them needs the host: set "
+                f"exportTo: [\".\"] on {_named(entries)}, so each team keeps its own entry and no other "
+                f"namespace sees two. {detail}",
+            }
+        )
+    return sorted(hits, key=lambda h: h["object"])
+
+
+# §2.18 `webhook-backend-unreachable`: a fail-closed admission webhook whose
+# backend the API server cannot reach. The predicate is the upgrade readiness
+# report's (`backend_problem` in the fleet-upgrade-verification skill: the
+# Service is missing, has no port equal to the webhook's, or has no ready
+# endpoint behind that port), imported from that skill's `scripts/`, which the
+# image and the repository lay out beside this one (`patch_readiness.py` reaches
+# the same directory for 3.11's reporter). The readiness report grades such a
+# webhook only when its rules reach the upgrade's path; this check names every
+# one, because a fail-closed webhook with a dead backend refuses every request
+# its rules match today, and a config-management system is the first caller to
+# find out. Both reads are best-effort, like `ccnp` above: a cluster whose
+# identity cannot list webhook configurations keeps its other eighteen checks
+# (or nineteen when EndpointSlices alone fails), and any uncovered check reads
+# `Undetermined` there.
+WEBHOOK_DUMP_KINDS = "validatingwebhookconfigurations,mutatingwebhookconfigurations"
+ENDPOINTSLICE_DUMP_KINDS = "endpointslices"
+UPGRADE_READINESS_SCRIPTS = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts"
+UPGRADE_READINESS_MODULE = "upgrade_readiness"
+# admissionregistration.k8s.io/v1 defaults `failurePolicy` to Fail: an absent
+# field reads as Fail, as the API server reads it.
+WEBHOOK_FAILURE_POLICY_FAIL = "Fail"
+# The namespaces whose writes a dead fail-closed webhook hurts most, judged for
+# severity: the platform's own controllers (`kube-system`) and the
+# config-management system (Config Sync's `config-management-system`). A webhook
+# whose `namespaceSelector` is absent, empty, or admits either is `critical`;
+# one that reaches neither is `major`, a real outage for whatever it does gate.
+# Each is judged on the Namespace object the read returned, or on the name label
+# every namespace carries when the read returned none (`config-management-system`
+# is absent on a cluster without Config Sync, and a selector on its name must
+# still read the way it would once it exists).
+WEBHOOK_SEVERITY_NAMESPACES = ("kube-system", "config-management-system")
+WEBHOOK_SEVERITY_REACHES = "critical"
+WEBHOOK_SEVERITY_OFF_PATH = "major"
+NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
+_GKE_COMPONENT_ANNOTATION = "components.gke.io/component-name"
+_WEBHOOK_RULE_CORE_GROUP = "core"
+_WEBHOOK_HIT_JOIN = " | "
+_IMPACT_WEBHOOK_BACKEND_UNREACHABLE = (
+    "This admission webhook fails closed and the API server cannot reach its backend, so "
+    "every request its rules match is refused until the backend answers again. A "
+    "config-management system or a controller that writes a matching object cannot apply, "
+    "and the cluster drifts from its repository while every object reads healthy."
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _upgrade_readiness():
+    """The fleet-upgrade-verification skill's readiness module, imported once from the
+    `scripts/` directory beside this skill's. Imported on first use so this module's own
+    import stays as it was; a missing sibling raises ImportError to the caller, which
+    records the check as unevaluated rather than failing the cluster closed."""
+    scripts_dir = str(UPGRADE_READINESS_SCRIPTS)
+    if scripts_dir not in sys.path:
+        sys.path.append(scripts_dir)
+    return importlib.import_module(UPGRADE_READINESS_MODULE)
+
+
+def _webhook_rules_text(rules: list[dict]) -> str:
+    parts = []
+    for rule in rules:
+        groups = ",".join(g or _WEBHOOK_RULE_CORE_GROUP for g in rule.get("apiGroups") or ["*"])
+        resources = ",".join(rule.get("resources") or ["*"])
+        operations = "/".join(rule.get("operations") or ["*"])
+        parts.append(f"{operations} {resources} in {groups}")
+    return "; ".join(parts)
+
+
+def _webhook_severity_namespaces(context: dict) -> dict[str, dict]:
+    by_name: dict[str, dict] = {}
+    for item in context.get("namespaces") or []:
+        meta = item.get("metadata") or {}
+        name = meta.get("name", "")
+        by_name[name] = {**(meta.get("labels") or {}), NAMESPACE_NAME_LABEL: name}
+    return {name: by_name.get(name, {NAMESPACE_NAME_LABEL: name}) for name in WEBHOOK_SEVERITY_NAMESPACES}
+
+
+def check_webhook_backend_unreachable(context: dict) -> list[dict]:
+    """Cluster-scoped: a fail-closed admission webhook whose backend the API server cannot reach.
+
+    One hit per configuration, since the finding id is (check, cluster, namespace,
+    object): the excerpt names each failing webhook of it, its backend problem, its
+    rules, and whether its selector admits the severity namespaces. Skipped: a webhook
+    with `failurePolicy: Ignore` (admission skips it in silence), one whose backend is
+    a URL (its reachability is not readable from the cluster), one with no rules (the
+    server never calls it), and a configuration carrying GKE's add-on label or
+    component annotation (the universal suppressions, which the webhook configurations
+    of GKE's own operators carry).
+    """
+    if WEBHOOK_BACKEND_UNREACHABLE_SLUG in (context.get("unevaluated") or {}):
+        return []
+    configurations = context.get("webhook_configurations") or []
+    if not configurations:
+        # Nothing to judge, and the one state the collector leaves when the
+        # webhook read failed (the check is then unevaluated): import nothing.
+        return []
+    readiness = _upgrade_readiness()
+    services = context.get("services") or []
+    slices = context.get("endpointslices") or []
+    severity_labels = _webhook_severity_namespaces(context)
+    hits = []
+    for config in configurations:
+        meta = config.get("metadata") or {}
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):
+            continue
+        if (meta.get("annotations") or {}).get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        lines, reaches = [], False
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            if hook.get("failurePolicy", WEBHOOK_FAILURE_POLICY_FAIL) != WEBHOOK_FAILURE_POLICY_FAIL:
+                continue
+            rules = [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+            if not rules:
+                continue
+            service_ref = (hook.get("clientConfig") or {}).get("service")
+            if not isinstance(service_ref, dict):
+                continue
+            problem = readiness.backend_problem(service_ref, services, slices)
+            if problem is None:
+                continue
+            admitted = [ns for ns, labels in severity_labels.items() if readiness.namespace_selector_reaches(hook, labels)]
+            reaches = reaches or bool(admitted)
+            reach = (
+                f"its namespaceSelector admits {', '.join(admitted)}"
+                if admitted
+                else f"its namespaceSelector admits neither {' nor '.join(WEBHOOK_SEVERITY_NAMESPACES)}"
+            )
+            lines.append(
+                f"{hook.get('name', '')}: failurePolicy Fail and {problem}; rules: {_webhook_rules_text(rules)}; {reach}"
+            )
+        if not lines:
+            continue
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"{config.get('kind', '')}/{meta.get('name', '')}",
+                "excerpt": _WEBHOOK_HIT_JOIN.join(lines),
+                "severity": WEBHOOK_SEVERITY_REACHES if reaches else WEBHOOK_SEVERITY_OFF_PATH,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return hits
+
+
+def _der_read_tlv(data: bytes, offset: int) -> tuple[int, bytes, int]:
+    """Read one ASN.1 DER `(tag, content, next_offset)` tuple at `offset`."""
+    if offset < 0 or offset >= len(data):
+        raise ValueError("DER offset past end of buffer")
+    tag = data[offset]
+    if (tag & DER_HIGH_TAG_NUMBER_MASK) == DER_HIGH_TAG_NUMBER_MASK:
+        raise ValueError("unsupported high-tag-number DER tag")
+    offset += 1
+    if offset >= len(data):
+        raise ValueError("truncated DER length")
+    first_len = data[offset]
+    offset += 1
+    if first_len < DER_LONG_LENGTH_FLAG:
+        length = first_len
+    else:
+        num_octets = first_len & DER_LONG_LENGTH_MASK
+        if (
+            num_octets == 0
+            or num_octets > DER_MAX_LENGTH_OCTETS
+            or offset + num_octets > len(data)
+            or data[offset] == 0
+        ):
+            raise ValueError("invalid DER multi-octet length")
+        length = int.from_bytes(data[offset : offset + num_octets], BIG_ENDIAN)
+        if length < DER_LONG_LENGTH_FLAG:
+            raise ValueError("non-minimal DER length encoding")
+        offset += num_octets
+    end = offset + length
+    if end > len(data):
+        raise ValueError("DER element extends past buffer")
+    return tag, data[offset:end], end
+
+
+def _parse_asn1_time(tag: int, raw: bytes) -> datetime.datetime:
+    """Parse RFC 5280 §4.1.2.5 `UTCTime` (`0x17`) or `GeneralizedTime` (`0x18`) to UTC."""
+    try:
+        text = raw.decode(ASCII_ENCODING)
+    except UnicodeDecodeError as exc:
+        raise ValueError("non-ASCII ASN.1 time") from exc
+    frac = None
+    if tag == DER_TAG_UTC_TIME:
+        match = ASN1_UTC_TIME_RE.match(text)
+        if not match:
+            raise ValueError("malformed ASN.1 UTCTime")
+        yy_str, month, day, hour, minute, second, tz_str = match.groups()
+        yy = int(yy_str)
+        year = (ASN1_UTC_CENTURY_1900 if yy >= ASN1_UTC_PIVOT_YEAR else ASN1_UTC_CENTURY_2000) + yy
+    elif tag == DER_TAG_GENERALIZED_TIME:
+        match = ASN1_GENERALIZED_TIME_RE.match(text)
+        if not match:
+            raise ValueError("malformed ASN.1 GeneralizedTime")
+        yyyy_str, month, day, hour, minute, second, frac, tz_str = match.groups()
+        year = int(yyyy_str)
+    else:
+        raise ValueError(f"unexpected ASN.1 Time tag 0x{tag:02x}")
+    if tz_str == ASN1_UTC_Z:
+        tz = datetime.timezone.utc
+    else:
+        sign = -1 if tz_str[0] == ASN1_MINUS_SIGN else 1
+        tz_hours = int(tz_str[1:ASN1_OFFSET_HOURS_END])
+        tz_minutes = int(tz_str[ASN1_OFFSET_HOURS_END:])
+        if tz_hours >= HOURS_PER_DAY or tz_minutes >= MINUTES_PER_HOUR:
+            raise ValueError("invalid ASN.1 timezone offset")
+        tz = datetime.timezone(datetime.timedelta(hours=sign * tz_hours, minutes=sign * tz_minutes))
+    microsecond = int((frac + "0" * MICROSECOND_DIGITS)[:MICROSECOND_DIGITS]) if frac else 0
+    dt = datetime.datetime(
+        year, int(month), int(day), int(hour), int(minute), int(second or 0), microsecond, tzinfo=tz
+    )
+    try:
+        return dt.astimezone(datetime.timezone.utc)
+    except OverflowError as exc:
+        raise ValueError("ASN.1 time out of UTC range") from exc
+
+
+def _x509_not_after_utc(der: bytes) -> datetime.datetime:
+    """Extract `TBSCertificate.validity.notAfter` from a DER-encoded X.509 certificate."""
+    tag, cert_body, end = _der_read_tlv(der, 0)
+    if tag != DER_TAG_SEQUENCE or end != len(der):
+        raise ValueError("not a DER Certificate SEQUENCE")
+    tag, tbs_body, _ = _der_read_tlv(cert_body, 0)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing TBSCertificate SEQUENCE")
+    pos = 0
+    tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag == DER_TAG_EXPLICIT_VERSION:
+        tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_INTEGER:
+        raise ValueError("missing CertificateSerialNumber INTEGER")
+    tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing signature AlgorithmIdentifier SEQUENCE")
+    tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing issuer Name SEQUENCE")
+    tag, validity_body, _ = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing Validity SEQUENCE")
+    nb_tag, nb_raw, vpos = _der_read_tlv(validity_body, 0)
+    _parse_asn1_time(nb_tag, nb_raw)
+    na_tag, na_raw, vend = _der_read_tlv(validity_body, vpos)
+    if vend != len(validity_body):
+        raise ValueError("unexpected trailing bytes in Validity")
+    return _parse_asn1_time(na_tag, na_raw)
+
+
+def _ca_bundle_not_afters(ca_bundle_b64: object) -> list[datetime.datetime]:
+    """All valid PEM X.509 `notAfter` timestamps decoded from a base64 `clientConfig.caBundle`."""
+    if not isinstance(ca_bundle_b64, str):
+        return []
+    compact = "".join(ca_bundle_b64.split())
+    if not compact:
+        return []
+    try:
+        pem_bytes = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError):
+        return []
+    pem_text = pem_bytes.decode(LATIN1_ENCODING)
+    expiries: list[datetime.datetime] = []
+    for chunk in pem_text.split(PEM_CERT_BEGIN_MARKER)[1:]:
+        if PEM_CERT_END_MARKER not in chunk:
+            continue
+        body, _, _ = chunk.partition(PEM_CERT_END_MARKER)
+        block_b64 = "".join(body.split())
+        if not block_b64:
+            continue
+        try:
+            der = base64.b64decode(block_b64, validate=True)
+            expiries.append(_x509_not_after_utc(der))
+        except (binascii.Error, ValueError):
+            continue
+    return expiries
+
+
+def check_webhook_ca_bundle_expired(
+    context: dict,
+    *,
+    now: datetime.datetime | None = None,
+) -> list[dict]:
+    """Cluster-scoped (§2.20): an admission webhook whose CA bundle certificate has expired
+    or expires within 30 days.
+
+    `kube-apiserver` loads every PEM certificate in `clientConfig.caBundle` into one X.509
+    root pool (`x509.CertPool.AppendCertsFromPEM`), so a rotation bundle carrying an
+    expired CA beside a newly injected valid CA still verifies serving certificates signed
+    by the active CA. A webhook is flagged when its `caBundle` parses to at least one
+    certificate and `max(notAfter)` across the bundle is in the past or within 30 days.
+    """
+    if WEBHOOK_CA_BUNDLE_EXPIRED_SLUG in (context.get("unevaluated") or {}):
+        return []
+    configurations = context.get("webhook_configurations") or []
+    if not configurations:
+        return []
+    eval_now = (
+        now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    ).astimezone(datetime.timezone.utc)
+    horizon = eval_now + datetime.timedelta(days=WEBHOOK_CA_EXPIRY_WARNING_DAYS)
+    severity_labels = _webhook_severity_namespaces(context)
+    hits: list[dict] = []
+    for config in configurations:
+        if not isinstance(config, dict):
+            continue
+        meta = config.get("metadata") or {}
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):
+            continue
+        if (meta.get("annotations") or {}).get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        lines: list[str] = []
+        has_fail_reaching_sys = False
+        has_fail_expired = False
+        has_fail_expiring = False
+        has_ignore_expired = False
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            rules = [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+            if not rules:
+                continue
+            client_cfg = hook.get("clientConfig")
+            if not isinstance(client_cfg, dict):
+                continue
+            expiries = _ca_bundle_not_afters(client_cfg.get("caBundle"))
+            if not expiries:
+                continue
+            latest_not_after = max(expiries)
+            if latest_not_after > horizon:
+                continue
+            is_expired = latest_not_after < eval_now
+            stamp = latest_not_after.strftime(WEBHOOK_CA_TIMESTAMP_FORMAT)
+            if is_expired:
+                days_ago = int((eval_now - latest_not_after).total_seconds() // SECONDS_PER_DAY)
+                ca_problem = (
+                    f"all {len(expiries)} caBundle certificates expired (latest notAfter {stamp}, {days_ago}d ago)"
+                    if len(expiries) > 1
+                    else f"caBundle notAfter {stamp} passed ({days_ago}d ago)"
+                )
+            else:
+                days_left = int((latest_not_after - eval_now).total_seconds() // SECONDS_PER_DAY)
+                ca_problem = (
+                    f"caBundle ({len(expiries)} certificates) latest notAfter {stamp} is within "
+                    f"{WEBHOOK_CA_EXPIRY_WARNING_DAYS}d ({days_left}d remaining)"
+                    if len(expiries) > 1
+                    else f"caBundle notAfter {stamp} is within {WEBHOOK_CA_EXPIRY_WARNING_DAYS}d ({days_left}d remaining)"
+                )
+            policy = hook.get("failurePolicy") or WEBHOOK_FAILURE_POLICY_FAIL
+            if policy == WEBHOOK_FAILURE_POLICY_FAIL:
+                raw_selector = hook.get("namespaceSelector")
+                selector = raw_selector if isinstance(raw_selector, dict) else {}
+                admitted = [
+                    ns for ns, labels in severity_labels.items() if selector_matches(selector, labels)
+                ]
+                if admitted:
+                    has_fail_reaching_sys = True
+                if is_expired:
+                    has_fail_expired = True
+                else:
+                    has_fail_expiring = True
+                reach = (
+                    f"its namespaceSelector admits {', '.join(admitted)}"
+                    if admitted
+                    else f"its namespaceSelector admits neither {' nor '.join(WEBHOOK_SEVERITY_NAMESPACES)}"
+                )
+                lines.append(
+                    f"{hook.get('name', '')}: failurePolicy Fail and {ca_problem}; rules: {_webhook_rules_text(rules)}; {reach}"
+                )
+            else:
+                if is_expired:
+                    has_ignore_expired = True
+                lines.append(
+                    f"{hook.get('name', '')}: failurePolicy {policy} and {ca_problem}; rules: {_webhook_rules_text(rules)}"
+                )
+        if not lines:
+            continue
+        if has_fail_reaching_sys:
+            severity = WEBHOOK_SEVERITY_REACHES
+        elif has_fail_expired or has_fail_expiring or has_ignore_expired:
+            severity = WEBHOOK_SEVERITY_OFF_PATH
+        else:
+            severity = WEBHOOK_SEVERITY_CA_IGNORE_EXPIRING
+        if has_fail_expired:
+            impact = _IMPACT_WEBHOOK_CA_FAIL_EXPIRED
+        elif has_fail_expiring:
+            impact = _IMPACT_WEBHOOK_CA_FAIL_EXPIRING
+        elif has_ignore_expired:
+            impact = _IMPACT_WEBHOOK_CA_IGNORE_EXPIRED
+        else:
+            impact = _IMPACT_WEBHOOK_CA_IGNORE_EXPIRING
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"{config.get('kind', '')}/{meta.get('name', '')}",
+                "excerpt": _WEBHOOK_HIT_JOIN.join(lines),
+                "severity": severity,
+                "impact": impact,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return hits
 
 
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
@@ -7850,6 +9893,30 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         "including a remediation this audit proposes -- changes nothing on it "
         "until the reconciler is unblocked.",
     ),
+    CheckSpec(
+        "webhook-backend-unreachable",
+        "cluster",
+        check_webhook_backend_unreachable,
+        "critical",  # overridden per hit: major when the selector reaches no severity namespace
+        None,
+        _IMPACT_WEBHOOK_BACKEND_UNREACHABLE,
+    ),
+    CheckSpec(
+        SERVICEENTRY_HOST_COLLISION_SLUG,
+        "cluster",
+        check_serviceentry_host_collision,
+        SERVICEENTRY_SEVERITY_CONFLICTING,  # overridden per hit: minor when the declarations are identical
+        None,
+        _IMPACT_SERVICEENTRY_HOST_COLLISION,
+    ),
+    CheckSpec(
+        WEBHOOK_CA_BUNDLE_EXPIRED_SLUG,
+        "cluster",
+        check_webhook_ca_bundle_expired,
+        "critical",  # overridden per hit by failurePolicy, selector reach, and expired vs 30-day window
+        None,
+        _IMPACT_WEBHOOK_CA_FAIL_EXPIRED,
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -7958,6 +10025,57 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
 
     context = build_context(dump, workloads)
     commands = {spec.slug: record for spec in checks}
+    if any(spec.slug == INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG for spec in checks):
+        served_crd_runs: list[tuple[str, Run]] = []
+        for crd_resource in INGRESS_GATEWAY_CRD_RESOURCES:
+            expected_kind, context_key = INGRESS_GATEWAY_CRD_META[crd_resource]
+            crd_argv = ["kubectl", "get", crd_resource, "-A", KUBECTL_CHUNK_SIZE_ARG, "-o", "json"]
+            crd_parsed, crd_result = run_and_gate(crd_argv, kubeconfig, run=run)
+            if isinstance(crd_parsed, dict) and isinstance(crd_parsed.get("items"), list):
+                context[context_key] = [
+                    i for i in crd_parsed["items"] if isinstance(i, dict) and i.get("kind") == expected_kind
+                ]
+                served_crd_runs.append(
+                    (f"KUBECONFIG={shlex.quote(str(kubeconfig))} {shlex.join(crd_argv)}", crd_result)
+                )
+            elif (
+                crd_result.rc != TIMEOUT_RC
+                and crd_result.rc != 0
+                and RESOURCE_TYPE_ABSENT_MARKER in crd_result.stderr
+            ):
+                context[context_key] = []
+            else:
+                commands.pop(INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG, None)
+                served_crd_runs = []
+                stderr = crd_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+                what = (
+                    f"did not finish within {DEFAULT_TIMEOUT_S}s and was killed"
+                    if crd_result.rc == TIMEOUT_RC
+                    else f"exited {crd_result.rc} without saying the type is unserved ({stderr})"
+                    if crd_result.rc != 0
+                    else f"returned output that is not a {expected_kind} list (rc=0)"
+                )
+                context.setdefault("unevaluated", {})[INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG] = (
+                    f"{UNDETERMINED_PREFIX} `kubectl get {crd_resource} -A` {what}, so route and "
+                    "health-check port alignment could not be established. "
+                    "This check cleared nothing on this cluster."
+                )
+                break
+        if served_crd_runs and INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG in commands:
+            commands[INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG] = _record(
+                "; ".join([record["command"], *(cmd for cmd, _ in served_crd_runs)]),
+                Run(
+                    [],
+                    0,
+                    dump_run.stdout + "".join(r.stdout for _, r in served_crd_runs),
+                    "",
+                    dump_run.duration_s + sum(r.duration_s for _, r in served_crd_runs),
+                ),
+            )
+
+    if IMAGE_PULL_FAILING_SLUG in commands:
+        read_pull_waiting_pods(context, commands, record, dump_run, kubeconfig, run=run)
+
     if cluster.get("autopilot"):
         commands.pop("untargeted-compute-class-workload", None)
         context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (
@@ -8076,8 +10194,11 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
     "kcc-object-wedged": ("kcc",),
-    "configsync-reconciler-stalled": ("configsync",),
+    "configsync-reconciler-stalled": ("configsync", "workloads"),
     "lb-world-open": ("services",),
+    "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
+    SERVICEENTRY_HOST_COLLISION_SLUG: ("serviceentries",),
+    WEBHOOK_CA_BUNDLE_EXPIRED_SLUG: ("webhooks",),
 }
 
 # The category Config Connector registers across every CRD it installs.
@@ -8162,8 +10283,13 @@ _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE: tuple[tuple[str, str], ...] = (
 )
 
 
-def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[str, dict]:
-    """One answer for §2.17's two reads.
+def _configsync_disposition(
+    runs: list[tuple[str, dict | None, Run]],
+    workload_read: tuple[str, Run] | None = None,
+) -> tuple[str, dict]:
+    """One answer for §2.17's two reads of the sync kinds. `workload_read` is
+    the stream's workload dump, command and result: the reconciler pods come
+    from it, so where a sync object exists the record names it as well.
 
     Returns `(reason, record)`: an `Undetermined:` reason when any read failed
     for a cause other than the API server not serving the kind (that read
@@ -8215,6 +10341,8 @@ def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[s
             "reconciliation could stall.",
             {},
         )
+    if workload_read is not None:
+        served.append(workload_read)
     combined = Run(
         [],
         0,
@@ -8223,6 +10351,68 @@ def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[s
         sum(result.duration_s for _, result in served),
     )
     return "", _record("; ".join(cmd for cmd, _ in served), combined)
+
+
+def _parse_serviceentry_projection(result: Run) -> list[dict] | None:
+    """The projected read's lines as ServiceEntry-shaped objects, or `None` when
+    the read failed or a line is not `<namespace>\\t<name>\\t<spec JSON>`.
+    The credential proxy exits non-zero on a reply it cuts (`run_and_gate`
+    says which shim), which reads as a failed read; a line cut short also
+    fails to parse. A cut that falls exactly on a line break under a shim
+    that exits 0 would read as fewer entries, which nothing here can tell."""
+    if result.rc != 0:
+        return None
+    items = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t", SERVICEENTRY_PROJECTION_FIELDS - 1)
+        if len(fields) != SERVICEENTRY_PROJECTION_FIELDS:
+            return None
+        namespace, name, spec_text = fields
+        try:
+            spec = json.loads(spec_text) if spec_text.strip() else {}
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(spec, dict):
+            return None
+        items.append({"metadata": {"namespace": namespace, "name": name}, "spec": spec})
+    return items
+
+
+def _serviceentry_disposition(items: list[dict] | None, result: Run) -> str:
+    """§2.19's read, as `_configsync_disposition` reads §2.17's: an `Undetermined:`
+    reason when the read failed for a cause other than the kind being unserved,
+    a not-applicable reason when it is unserved or holds no objects, else empty."""
+    if items is not None:
+        if items:
+            return ""
+        return (
+            "Istio's ServiceEntry kind is served on this cluster but no namespace "
+            "declares one, so there is no host two declarations could share."
+        )
+    if result.rc == TIMEOUT_RC:
+        return (
+            f"{UNDETERMINED_PREFIX} `kubectl get {SERVICEENTRY_KIND} -A` did not finish within "
+            f"{DEFAULT_TIMEOUT_S}s and was killed, so whether any host is declared twice "
+            "was not established. This check cleared nothing on this cluster."
+        )
+    if result.rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in result.stderr:
+        return (
+            "Istio is not installed on this cluster: `kubectl get` answered that the "
+            f"server does not serve {SERVICEENTRY_KIND}. No ServiceEntry routes anything here."
+        )
+    stderr = result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+    detail = (
+        f"exited {result.rc} without saying the kind is unserved ({stderr})"
+        if result.rc != 0
+        else "exited 0 but returned output this collector could not read as a list of objects"
+    )
+    return (
+        f"{UNDETERMINED_PREFIX} `kubectl get {SERVICEENTRY_KIND} -A` {detail}, so whether "
+        "any host is declared twice was not established. This check cleared nothing on "
+        "this cluster."
+    )
 
 
 def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
@@ -8282,7 +10472,18 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"
     ]
-    workload_record = _record(paged_text(COMPLIANCE_DUMP_KINDS), result)
+    # And once more, whole, for §2.17: the reconciler pods of Config Sync, by
+    # the label that names the sync object each one serves. Their container
+    # statuses say what a sync object cannot (`_configsync_oom_loop`).
+    context["configsync_reconciler_pods"] = [
+        i
+        for i in parsed.get("items", []) or []
+        if i.get("kind") == "Pod"
+        and (i.get("metadata") or {}).get("namespace") == CONFIGSYNC_RECONCILER_NAMESPACE
+        and CONFIGSYNC_SYNC_KIND_LABEL in ((i.get("metadata") or {}).get("labels") or {})
+    ]
+    workload_read = (paged_text(COMPLIANCE_DUMP_KINDS), result)
+    workload_record = _record(*workload_read)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
             commands[spec.slug] = workload_record
@@ -8315,6 +10516,62 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["services"] = parsed.get("items", []) or []
     commands["lb-world-open"] = _record(paged_text(SERVICE_DUMP_KINDS), result)
+
+    # §2.18 and §2.20's best-effort reads, like `ccnp` below: both APIs exist
+    # on every cluster, but an identity that cannot list webhook configurations
+    # or EndpointSlices must not cost the cluster its other checks. §2.20 reads
+    # the webhook configurations alone (with stdlib X.509 parsing), so an
+    # EndpointSlice failure or a missing sibling readiness module leaves §2.18
+    # `Undetermined` while §2.20 still runs.
+    context["webhook_configurations"], context["endpointslices"] = [], []
+    webhook_reads: list[tuple[str, dict | None, Run]] = []
+    for kinds in (WEBHOOK_DUMP_KINDS, ENDPOINTSLICE_DUMP_KINDS):
+        parsed, result = paged(kinds)
+        webhook_reads.append((kinds, parsed, result))
+    webhook_cfg_parsed, webhook_cfg_result = webhook_reads[0][1], webhook_reads[0][2]
+    if webhook_cfg_parsed is None:
+        stderr = webhook_cfg_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        context.setdefault("unevaluated", {})[WEBHOOK_CA_BUNDLE_EXPIRED_SLUG] = (
+            f"{UNDETERMINED_PREFIX} `kubectl get {WEBHOOK_DUMP_KINDS}` exited {webhook_cfg_result.rc} ({stderr}), so "
+            "whether an admission webhook's CA bundle certificate has expired or expires within 30 days was not "
+            "established. This check cleared nothing on this cluster."
+        )
+    else:
+        context["webhook_configurations"] = webhook_cfg_parsed.get("items", []) or []
+        commands[WEBHOOK_CA_BUNDLE_EXPIRED_SLUG] = _record(paged_text(WEBHOOK_DUMP_KINDS), webhook_cfg_result)
+    webhook_reason = ""
+    for kinds, parsed, result in webhook_reads:
+        if parsed is None:
+            stderr = result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+            webhook_reason = (
+                f"{UNDETERMINED_PREFIX} `kubectl get {kinds}` exited {result.rc} ({stderr}), so "
+                "whether a fail-closed webhook has a reachable backend was not established. "
+                "This check cleared nothing on this cluster."
+            )
+            break
+    if not webhook_reason:
+        try:
+            _upgrade_readiness()
+        except ImportError as exc:
+            webhook_reason = (
+                f"{UNDETERMINED_PREFIX} the readiness module this check reads its predicate from "
+                f"could not be imported ({exc}), so no webhook was judged. This check cleared "
+                "nothing on this cluster."
+            )
+    if webhook_reason:
+        context.setdefault("unevaluated", {})[WEBHOOK_BACKEND_UNREACHABLE_SLUG] = webhook_reason
+    else:
+        context["endpointslices"] = webhook_reads[1][1].get("items", []) or []
+        commands[WEBHOOK_BACKEND_UNREACHABLE_SLUG] = _record(
+            "; ".join(paged_text(kinds) for kinds, _, _ in webhook_reads),
+            Run(
+                [],
+                0,
+                "".join(result.stdout for _, _, result in webhook_reads),
+                "",
+                sum(result.duration_s for _, _, result in webhook_reads),
+            ),
+        )
 
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp
@@ -8437,13 +10694,33 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         configsync_runs.append((f"KUBECONFIG={kubeconfig} {shlex.join(argv)}", parsed, result))
         if parsed is not None:
             context["configsync_objects"].extend((parsed or {}).get("items") or [])
-    configsync_reason, configsync_record = _configsync_disposition(configsync_runs)
+    # The reconciler pods are already in hand, from the workload dump at the
+    # top of this function, so the record names that read after the sync
+    # reads. There is a record only where a sync object exists.
+    configsync_reason, configsync_record = _configsync_disposition(configsync_runs, workload_read)
     if configsync_reason.startswith(UNDETERMINED_PREFIX):
         context.setdefault("unevaluated", {})["configsync-reconciler-stalled"] = configsync_reason
     elif configsync_reason:
         context.setdefault("not_applicable", {})["configsync-reconciler-stalled"] = configsync_reason
     else:
         commands["configsync-reconciler-stalled"] = configsync_record
+
+    # Istio's ServiceEntries, for §2.19. Ungated like the Config Sync reads
+    # above and for the same reason: most clusters run no mesh, and an unserved
+    # kind is their ordinary answer. One projected read (SERVICEENTRY_PROJECTION
+    # says why), parsed line by line so a reply the proxy cut reads as
+    # Undetermined rather than as a shorter list.
+    serviceentry_argv = ["kubectl", "get", SERVICEENTRY_KIND, "-A", "-o", SERVICEENTRY_PROJECTION]
+    result = run(serviceentry_argv, env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=DEFAULT_TIMEOUT_S)
+    serviceentry_items = _parse_serviceentry_projection(result)
+    serviceentry_reason = _serviceentry_disposition(serviceentry_items, result)
+    if serviceentry_reason.startswith(UNDETERMINED_PREFIX):
+        context.setdefault("unevaluated", {})[SERVICEENTRY_HOST_COLLISION_SLUG] = serviceentry_reason
+    elif serviceentry_reason:
+        context.setdefault("not_applicable", {})[SERVICEENTRY_HOST_COLLISION_SLUG] = serviceentry_reason
+    else:
+        context["serviceentries"] = serviceentry_items
+        commands[SERVICEENTRY_HOST_COLLISION_SLUG] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(serviceentry_argv)}", result)
 
     # Every ServiceAccount, not only `default`: §2.14 looks up the one each
     # workload names, and a read narrowed to `default` left it nothing to find
@@ -8592,12 +10869,12 @@ _COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
 # Cluster-kind checks that match against `collected.workloads`, so an empty
 # workload set leaves them nothing to examine exactly as it does a workload
 # check: a PDB is only graded against the workload it covers, and an HPA's
-# floor only against the Service-backed workload it scales. Compliance's two
+# floor or scale-down behavior only against the workload it scales. Compliance's two
 # automount checks iterate the workload set too. `netpol-missing` does not: it
 # reads `pod_namespaces`, every namespace holding a live Pod, so it still has
 # something to examine on a cluster whose workloads are all out of scope.
 _WORKLOAD_ANCHORED_CLUSTER_CHECKS = frozenset({
-    "blocking-pdb", "pdb-overlapping", "hpa-floors-at-one",
+    "blocking-pdb", "pdb-overlapping", "hpa-floors-at-one", HPA_AGGRESSIVE_SCALEDOWN_SLUG,
     "default-sa-automount", "unbound-sa-automount",
 })
 
@@ -9463,7 +11740,8 @@ def collect_cluster(
         # hit has no object whose spec a controller could be holding". That is
         # false for most cluster checks -- `inference-endpoint-public`
         # names a Service, `blocking-pdb` a PodDisruptionBudget,
-        # `hpa-cannot-scale` an HPA, the two RBAC checks a binding or a role,
+        # `hpa-cannot-scale` an HPA, the RBAC checks a binding or a role,
+        # the two admission-webhook checks a webhook configuration,
         # and `default-sa-automount` a workload it reached without iterating
         # `collected.workloads`. Cluster-scoped means the check runs once per
         # cluster, not that its findings name the cluster. The one that cost:
@@ -10127,6 +12405,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument(
+        "--cluster",
+        type=cluster_arg,
+        help=(
+            "with --project, audit only this cluster, as <location>/<name>; the project's other clusters "
+            "are dropped before any is read, and a cluster the project doesn't list is refused"
+        ),
+    )
+    parser.add_argument(
         "--workspace",
         help=(
             "the GitOps workspace `audit_report.py start` made -- a clone, or in "
@@ -10143,6 +12429,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.cluster is not None and not args.project:
+        parser.error("--cluster needs --project: a cluster is named within one project")
+    global only_cluster
+    only_cluster = args.cluster
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():

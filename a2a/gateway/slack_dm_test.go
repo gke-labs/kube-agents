@@ -184,6 +184,7 @@ func (d *slackDMRig) awaitTasks(t *testing.T, n int) []*lib.Envelope {
 // and stays in that thread. A second top-level question is a second
 // conversation with a second thread. Nothing in the DM is posted top-level.
 func TestSlackDMQuestionsAnswerInTheirOwnThreads(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 
@@ -261,6 +262,7 @@ func TestSlackDMQuestionsAnswerInTheirOwnThreads(t *testing.T) {
 // top-level, where its ask was. A top-level DM sent while it runs is a new
 // question in its own thread, not a steer into the old task.
 func TestSlackLegacyDMRecordStillRelaysItsTerminal(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 
@@ -293,6 +295,7 @@ func TestSlackLegacyDMRecordStillRelaysItsTerminal(t *testing.T) {
 // asks two top-level questions (two conversations now) hears it once, in
 // the first question's thread, and nothing is published.
 func TestSlackDMRefusalIsOncePerSenderAcrossThreads(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	// One at a time: two top-level DMs are two conversations, whose queue
 	// workers run concurrently, so sent together either could post first.
@@ -320,6 +323,7 @@ func TestSlackDMRefusalIsOncePerSenderAcrossThreads(t *testing.T) {
 // unchanged by DM threading -- a mention roots its session on its own ts and
 // the placeholder posts in that thread.
 func TestSlackChannelMentionStillThreadsOnTheMention(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet", "300.1", "")
 	d.awaitTasks(t, 1)
@@ -331,6 +335,7 @@ func TestSlackChannelMentionStillThreadsOnTheMention(t *testing.T) {
 // must not claim the DM is idle, and it must say where the stop goes. The
 // question's task is not cancelled.
 func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
@@ -374,6 +379,7 @@ func TestSlackDMTopLevelStopPointsAtTheThread(t *testing.T) {
 // the deploy doing") is a real ask with nothing to report on, so it starts
 // a task.
 func TestSlackDMTopLevelStatusPointsAtTheThread(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	ctx := context.Background()
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
@@ -400,10 +406,11 @@ func TestSlackDMTopLevelStatusPointsAtTheThread(t *testing.T) {
 	}
 }
 
-// TestSlackDMStopInARefusedThreadGetsThePlainNotice: a question refused at
+// TestSlackDMStopInARefusedThreadGetsThePlainNotice: a question parked at
 // the session cap leaves a thread conversation with no task in it. A stop
-// typed in that thread is in the right place, so it gets the plain notice,
-// not the redirect to the thread it is already in.
+// typed in that thread takes the question out of the line; another stop
+// there is in the right place, so it gets the plain notice, not the
+// redirect to the thread it is already in.
 func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 	spawn := &fakeSpawner{}
 	spawn.setLive(1)
@@ -412,8 +419,11 @@ func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 		c.MaxSessions = 1
 	})
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
-	d.awaitPost(t, "the cap refusal in the question's thread", "D1", "100.1", "not started")
+	d.awaitPost(t, "the queued notice in the question's thread", "D1", "100.1", "queued")
 	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "102.1", "100.1")
+	// The stop edits the queued notice rather than posting.
+	waitFor(t, "the stop took the question out of the line", func() bool { return capLineLen(d.r) == 0 })
+	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "103.1", "100.1")
 	d.awaitPost(t, "the plain notice in the refused question's thread", "D1", "100.1", "nothing is running")
 	for _, p := range d.posts() {
 		if p.text == toMrkdwn(topLevelNothingRunningNotice) {
@@ -422,11 +432,54 @@ func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 	}
 }
 
+// TestSlackChannelThreadParkedAtTheCapCarriesUnmentionedReplies: a channel
+// mention parked at the session cap has started nothing in its thread, yet
+// the thread's unmentioned replies reach the turn waiting there: a follow-up
+// joins it, a status ask is answered with the place in line, and a stop
+// takes it out of the line. The adapter is not left holding a false for the
+// thread from before any of them.
+func TestSlackChannelThreadParkedAtTheCapCarriesUnmentionedReplies(t *testing.T) {
+	t.Parallel()
+	spawn := &fakeSpawner{}
+	spawn.setLive(1)
+	d := startSlackDMRigWith(t, spawn, func(c *Config) {
+		c.DefaultAddressee = RouteSession
+		c.MaxSessions = 1
+	})
+	const conv = "slack:C1/500.1"
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet", "500.1", "")
+	d.awaitPost(t, "the queued notice in the mention's thread", "C1", "500.1", "queued")
+
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "and the nodes too", "501.1", "500.1")
+	waitFor(t, "the unmentioned follow-up behind the parked turn", func() bool { return followUpsOf(d.r, conv) == 1 })
+
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "status", "501.5", "500.1")
+	waitFor(t, "the unmentioned status ask answered with the place in line", func() bool {
+		n := 0
+		for _, p := range d.posts() {
+			if p.channel == "C1" && p.thread == "500.1" && p.text == toMrkdwn(sessionQueuedNext) {
+				n++
+			}
+		}
+		return n == 2
+	})
+
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "stop", "502.1", "500.1")
+	waitFor(t, "the unmentioned stop took the turn out of the line", func() bool { return !d.r.g.parkedAtCap(conv) })
+	if d.r.g.parkedAtCap(conv) {
+		t.Fatal("the turn is still in line after the stop")
+	}
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d spawns", n)
+	}
+}
+
 // TestSlackChannelTopLevelControlPhrasesUnchanged: a channel mention roots
 // its own thread too, but the redirect is a DM affordance; a channel
 // mention reading "stop" gets the plain notice and one reading "any
 // update?" is the ordinary turn it always was.
 func TestSlackChannelTopLevelControlPhrasesUnchanged(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> stop", "400.1", "")
 	d.awaitPost(t, "the plain notice in the mention's thread", "C1", "400.1", "nothing is running")

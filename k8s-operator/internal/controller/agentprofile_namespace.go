@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"slices"
 	"strings"
 	"time"
 
@@ -86,6 +85,12 @@ const (
 // profileNamespaceName is the namespace profile work runs in.
 func profileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Namespace + profileNamespaceSuffix
+}
+
+// ProfileNamespaceName is profileNamespaceName for the webhook, which names
+// the namespace in its warning on an agent outside the operator's namespace.
+func ProfileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
+	return profileNamespaceName(agent)
 }
 
 // profileNamespaceOf is the profile namespace for a profile: the one beside
@@ -170,13 +175,12 @@ func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // interactiveProfileTiers counts the warm pools the profiles need: one per
-// (profile, tier) whose tier is interactive. Read is the only interactive
-// tier until tiers are CR data (#3659).
+// (profile, tier) whose tier's mode is interactive (#3659).
 func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 	n := 0
 	for i := range profiles {
 		for _, tier := range profiles[i].AllowedTierList() {
-			if tier == agentv1alpha1.AgentProfileTierRead {
+			if interactiveTier(&profiles[i], tier) {
 				n++
 			}
 		}
@@ -188,12 +192,12 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 //
 // pods covers the three kinds of pod the namespace runs: the warm workers
 // (warmReplicas for each interactive (profile, tier)), one rollout surge pod
-// per warm pool, and the unattended tier's Job pods, which the dispatcher
-// holds to the ceiling. Interactive tasks run in the warm workers, so they
+// per warm pool, and the Job pods (unattended tasks', and at any tier
+// permit-carrying ones', #5646), which the dispatcher holds to the ceiling. Interactive tasks run in the warm workers, so they
 // add no pods. Like the session quota, the key is `pods`, which counts
 // non-terminal pods only, and a pod in its deletion grace period is not yet
-// terminal. Where Job mode can run (the chart's Job policy signal and a
-// profile allowing the unattended tier), a task's slot is free once its Job
+// terminal. Where Job mode can run (the chart's Job policy signal and any
+// bound profile, since every profile has Job templates), a task's slot is free once its Job
 // is deleted, so the next Job's pod can start while the last one's still
 // terminates: a second ceiling's worth covers one terminating Job pod per
 // slot. It is the only key for now; requests.cpu and
@@ -202,9 +206,10 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[corev1.ResourceName]int64 {
 	pools := interactiveProfileTiers(profiles)
 	jobs := resolveProfileCeiling(agent)
-	if dispatcherJobPolicyRendered() && slices.ContainsFunc(profiles, func(p agentv1alpha1.AgentProfile) bool {
-		return slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended)
-	}) {
+	// Under Job mode every profile has Job templates (its unattended tasks',
+	// and at every tier its permit-carrying ones', #5646), so the Job pods'
+	// budget doubles whenever any profile is bound.
+	if dispatcherJobPolicyRendered() && len(profiles) > 0 {
 		jobs *= 2
 	}
 	return map[corev1.ResourceName]int64{
@@ -358,9 +363,19 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 		if err == nil {
 			logf.FromContext(ctx).V(1).Info("profile namespace absent; the chart creates it, and profile work renders nothing until it exists",
 				"namespace", profileNamespaceName(agent))
+			// Nothing is written there while it is absent (its RoleBinding is
+			// absent with it), so its denials must not stand
+			// against this agent; Observe adds it back the pass it returns.
+			r.RBAC.Forget(profileNamespaceName(agent))
 		}
 		return false, err
 	}
+	// The namespace exists, so the operator's writes there are about to
+	// start: the RBAC self-check probes the namespaced Role's verbs in it
+	// from now on (once inline, then on the ticker), and reportRBACSkew
+	// reads the denials as this agent's. handleDeletion forgets it, and so
+	// does the branch above once the namespace is gone.
+	r.RBAC.Observe(profileNamespaceName(agent))
 	if err := r.applyManaged(ctx, agent, buildProfileNetworkPolicy(agent, dnsClusterIPs)); err != nil {
 		return false, fmt.Errorf("failed to apply the profile NetworkPolicy: %w", err)
 	}
@@ -502,15 +517,12 @@ func (r *PlatformAgentReconciler) adoptLeftoverProfileQuotas(ctx context.Context
 }
 
 // deleteProfileQuota and deleteProfileFence remove what this agent rendered
-// into the profile namespace, for the flip back to today (deleting the
-// PlatformAgent removes the quota, removeProfileQuotaOnDeletion, and leaves
-// the fence for the chart's uninstall). Those objects
-// carry no owner reference, so nothing else reclaims them, and an install
-// that isn't running next should look like it never did. An object of that
-// name that this agent's labels don't mark as its own is left to its owner,
-// like the callout's unowned ClusterRoleBinding. cleanupA2A removes the
-// fence last, after the bus fence that admits the namespace is gone; a pass
-// that dies before then leaves a fence that only restricts.
+// into the profile namespace (deleting the PlatformAgent removes the quota,
+// removeProfileQuotaOnDeletion, and leaves the fence for the chart's
+// uninstall). Those objects carry no owner reference, so nothing else
+// reclaims them. An object of that name that this agent's labels don't mark
+// as its own is left to its owner, like the callout's unowned
+// ClusterRoleBinding.
 func (r *PlatformAgentReconciler) deleteProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	return r.deleteProfileObject(ctx, agent, &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: profileNamespaceName(agent)}}, r.a2aReader(), profileQuotaComponent)
 }
@@ -532,10 +544,9 @@ func (r *PlatformAgentReconciler) deleteProfileObject(ctx context.Context, agent
 	return nil
 }
 
-// profileFenceRendered reports whether this agent's profile fence exists,
-// for cleanupA2A's sentinels: it is the first write of
-// reconcileA2ANetworkFences, and it carries no owner reference, so the
-// owner test the other sentinels use can't see it.
+// profileFenceRendered reports whether this agent's profile fence exists: it
+// is the first write of reconcileA2ANetworkFences, and it carries no owner
+// reference, so an owner test can't see it.
 func (r *PlatformAgentReconciler) profileFenceRendered(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	var np networkingv1.NetworkPolicy
 	err := r.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np)

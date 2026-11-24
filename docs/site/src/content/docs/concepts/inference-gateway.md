@@ -47,10 +47,10 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 
 | `MODEL_PROVIDER`       | Default `MODEL_DEFAULT_NAME`   | Notes                                                                                                                                 |
 | ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `gemini` (default)     | `gemini-3.5-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
+| `gemini` (default)     | `gemini-3.8-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
 | `anthropic`            | `claude-opus-5`                | Uses `ANTHROPIC_API_KEY`.                                                                                                             |
 | `openai`               | `gpt-5.4`                      | Uses `OPENAI_API_KEY`.                                                                                                                |
-| `vertex_ai`            | `gemini-3.5-flash`             | Workload Identity by default (or a SA key Secret). See below.                                                                         |
+| `vertex_ai`            | `gemini-3.8-flash`             | Workload Identity by default (or a SA key Secret). See below.                                                                         |
 | `openai_compatible`    | none; required                 | Optional `OPENAI_COMPATIBLE_API_KEY`. The base URL is required too. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
 | `sap`                  | `anthropic--claude-4.5-sonnet` | OAuth2 client credentials from a Secret you create. See [below](#sap-ai-core).                                                        |
 | any other LiteLLM slug | none; required                 | `azure`, `bedrock`, `databricks`, ...; credentials from the same Secret. See [below](#other-litellm-providers).                       |
@@ -63,7 +63,7 @@ To change the default on an installed system, re-run the installer with `--menu`
 
 ```bash
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.5-flash
+export MODEL_DEFAULT_NAME=gemini-3.8-flash
 make -C k8s-operator deploy-litellm
 ```
 
@@ -77,7 +77,7 @@ Either way the agent picks up the new model on its next request without any chan
 model_list:
   - model_name: model-default
     litellm_params:
-      model: gemini/gemini-3.5-flash
+      model: gemini/gemini-3.8-flash
       max_tokens: 8192
 ```
 
@@ -115,6 +115,19 @@ Each gateway pod exports the remaining share as `litellm_provider_remaining_budg
 
 A model that LiteLLM's cost map does not price costs `0` on every call, so `litellm_spend_metric` does not move and the ceiling is never reached. Check that the series moves on your model before you rely on the ceiling. A ceiling whose per-replica share would round to `0.0000` fails the render, because LiteLLM reads a `budget_limit` of `0` as no limit; raise the amount or lower `litellm.replicaCount`. Why the ceiling is split rather than shared, and what is still to come on the `PlatformAgent`: [`docs/designs/gateway-spend-cap.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gateway-spend-cap.md).
 
+### Caller authentication
+
+The gateway checks the key each caller sends. The chart runs LiteLLM with a master key, which it generates into the `litellm-master-key` Secret on first install and keeps across upgrades (`litellm.masterKey.generate: false` turns that off for offline renders such as [Argo CD](/kube-agents/deploy/gitops-argocd/)). Only the gateway container reads that Secret, and the master key is what reaches LiteLLM's admin routes. Every other caller goes through a LiteLLM `custom_auth` hook that the chart mounts beside the gateway's `config.yaml` (`charts/kube-agents/files/litellm_caller_auth.py`):
+
+- A key whose SHA-256 is listed in the `litellm-caller-keys` Secret is admitted as the caller class the entry names. LiteLLM reports the class as the `api_key_alias` and `team` labels on its spend and token metrics, and the key's digest, never the key, as `hashed_api_key`.
+- A call with no key, or with a placeholder the install's own clients send (`none`, `a2a-playground`, and the agent runtime's `no-key-required`), is admitted as the class `keyless`. So is the unexpanded `${LITELLM_API_KEY}`, which the agent can send for a moment while its pod rolls onto its own key.
+- A key listed under the reserved class `gateway-probe` reaches `GET /v1/models` and nothing else. It lets a readiness check confirm that a gateway pod has loaded the current map without sending any caller's key.
+- Any other key is refused with HTTP 401.
+
+An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
+
+`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart. While the Secret is absent the gateway knows no caller key and every caller is `keyless`. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
+
 ### Fallback alias and parameter dropping
 
 Two chart blocks, both off by default, add a fallback alias and router retry limits when a primary call fails. At their defaults nothing is rendered, so the gateway config and its rollout checksum are what they were.
@@ -123,7 +136,7 @@ Two chart blocks, both off by default, add a fallback alias and router retry lim
 
 `litellm.fallback.timeoutSeconds` and `numRetries` render `router_settings.timeout` and `num_retries` (both default to `0`, omitting the keys).
 
-`litellm.fallback.retryAfterSeconds` renders `router_settings.retry_after`, the shortest pause before each retry. LiteLLM's own pause starts at half a second and is clamped to eight, so a per-minute quota's 429 is retried inside the same closed minute. A value above eight also raises that clamp (`MAX_RETRY_DELAY` on the gateway). It needs `numRetries` above `0`; the render fails without it. The retries are a silent hold on the caller's stream, `numRetries + 1` pauses long. The render refuses a pair whose hold plus 60 s for the first chunk crosses the agents' 120 s stale-stream bound, past which the agent drops the stream and never sees the 429. On Vertex `gemini-3.5-flash`, a `600`-second request cap covers `99.96%` of streams while `300` seconds covers `99.57%`.
+`litellm.fallback.retryAfterSeconds` renders `router_settings.retry_after`, the shortest pause before each retry. LiteLLM's own pause starts at half a second and is clamped to eight, so a per-minute quota's 429 is retried inside the same closed minute. A value above eight also raises that clamp (`MAX_RETRY_DELAY` on the gateway). It needs `numRetries` above `0`; the render fails without it. The retries are a silent hold on the caller's stream, `numRetries + 1` pauses long. The render refuses a pair whose hold plus 60 s for the first chunk crosses the agents' 120 s stale-stream bound, past which the agent drops the stream and never sees the 429. Measured on Vertex `gemini-3.5-flash`, a `600`-second request cap covered `99.96%` of streams while `300` seconds covers `99.57%`.
 
 The render fails if `litellm.fallback.modelName` is set without `litellm.fallback.reasoningEffort` or matches a primary alias name. With `fallback.reasoningEffort: low` and `gemini-3.8-flash` on Vertex AI the result reads:
 
@@ -166,7 +179,7 @@ A fallback is not silent. The gateway's reply carries `x-litellm-attempted-fallb
 model_list:
   - model_name: model-default
     litellm_params:
-      model: vertex_ai/gemini-3.5-flash
+      model: vertex_ai/gemini-3.8-flash
       reasoning_effort: "high"
 ```
 
@@ -174,7 +187,7 @@ LiteLLM translates the value for each provider. On Gemini 3.x, through `gemini` 
 
 A vLLM server passes the value to the model's chat template, which decides what each level means. GLM-5.3's template, for example, recognizes only `low` and `high`. Anything else, `medium` included, runs at `max`, its default and slowest level, with no error. vLLM's Gemma 4 template has no effort field: every value is ignored, and thinking is a server-side template setting. Check the served model's template before relying on a level.
 
-At the default, empty, no `reasoning_effort` is rendered and the model thinks at its own default level; a Gemini 2.5 or 3.x model keeps the `thinking` key described in [Gemini's thoughts](#geminis-thoughts). The value is a default the gateway supplies, the same as `max_tokens` above: LiteLLM lets a request's own `reasoning_effort` win over the one in `litellm_params`.
+At the default, empty, no `reasoning_effort` is rendered and the model thinks at its own default level; a Gemini 2.5 or 3.x model keeps the `thinking` key described in [Gemini's thoughts](#geminis-thoughts). The value is a default the gateway supplies, the same as `max_tokens` above: LiteLLM lets a request's own `reasoning_effort` win over the one in `litellm_params`. The operator reports the value an install is configured with in `status.inference.reasoningEffort` ([CRD reference](/kube-agents/operator/platformagent-crd/#status)), absent at the default.
 
 The chart is the only path that renders it. The kustomize dev copy carries no `reasoning_effort`, and neither `install.env` nor the Terraform example has a variable for it. Set it through the Terraform example's `extra_helm_values` (`{ litellm = { reasoningEffort = "high" } }`) or with `--set litellm.reasoningEffort=high` on a direct Helm install.
 
@@ -223,7 +236,7 @@ Gemini thinks before it answers whether or not a request asks it to, but it retu
 model_list:
   - model_name: model-default
     litellm_params:
-      model: vertex_ai/gemini-3.5-flash
+      model: vertex_ai/gemini-3.8-flash
       thinking: { "type": "enabled" }
 ```
 
@@ -233,7 +246,7 @@ No other model gets the key. LiteLLM refuses it on a model it does not treat as 
 
 ### Replayed thinking on Gemini
 
-A client that turns thinking on, as Claude Code does in the session pods of an install on the `spec.mode: next` stack, sends each earlier turn's thinking back in the next request. LiteLLM releases before v1.106.0 passed that thinking to a Gemini model as ordinary text rather than as a thought. Gemini then read its earlier thought summaries as things it said and opened its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reached that text. The release the install pins ([Container images](/kube-agents/deploy/docker-images/)) carries the upstream fix.
+A client that turns thinking on, as Claude Code does in an install's session pods, sends each earlier turn's thinking back in the next request. LiteLLM releases before v1.106.0 passed that thinking to a Gemini model as ordinary text rather than as a thought. Gemini then read its earlier thought summaries as things it said and opened its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reached that text. The release the install pins ([Container images](/kube-agents/deploy/docker-images/)) carries the upstream fix.
 
 Both the chart and the kustomize base still load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. It removes more than the upstream fix does. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s) bound for a Gemini model`.
 
@@ -346,7 +359,7 @@ Two things differ from the API-key providers:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --model-provider=vertex_ai \
-  --model-default-name=gemini-3.5-flash \
+  --model-default-name=gemini-3.8-flash \
   --vertex-project-id=my-gcp-project \
   --vertex-location=us-east4   # both optional: project defaults to the install's, location to "global"
 ```
@@ -357,11 +370,41 @@ Where Workload Identity is not available, the chart can read a service-account k
 
 Both fields are chart-only and read only with `modelProvider: vertex_ai`; the render fails if either is set for another provider or omits `name` or `key`. Mint the key for a dedicated service account holding only `roles/aiplatform.user` on the serving project (see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity)), rotate it in the Secret, and prefer Workload Identity wherever the cluster supports it. Changing either Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it so the process reloads `VERTEXAI_PROJECT` and the key file.
 
+To override the Vertex AI endpoint host through the [gateway environment Secret](#a-credentials-secret-for-the-gateway), set `VERTEXAI_API_BASE` in the Secret to a host matching `--vertex-location` (`VERTEX_LOCATION` / `litellm.vertex.location`) and pair `--litellm-env-secret` (`LITELLM_ENV_SECRET_NAME` / `litellm.envFromSecret`) with `--vertex-project-id` (`VERTEX_PROJECT_ID` / `litellm.vertex.projectId`):
+
+```bash
+kubectl create secret generic vertex-endpoint -n kubeagents-system \
+  --from-literal=VERTEXAI_API_BASE=https://us-east4-aiplatform.universe.example.com
+
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --model-provider=vertex_ai \
+  --model-default-name=gemini-3.8-flash \
+  --vertex-project-id=my-gcp-project \
+  --vertex-location=us-east4 \
+  --litellm-env-secret=vertex-endpoint
+```
+
+When a model entry in `config.yaml` has no `api_base`, LiteLLM reads `VERTEXAI_API_BASE` from the environment and appends `/v1/projects/<VERTEXAI_PROJECT>/locations/<VERTEXAI_LOCATION>/...` to a host-only base, so the chart's project and location still apply. (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` does not set LiteLLM's Vertex AI URL.) `litellm.envFromSecret` mounts its keys via `envFrom` and does not render `api_base` in `config.yaml`. Because Kubernetes resolves explicit container `env` entries after `envFrom`, the `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` entries rendered by the chart always override those keys in `litellm.envFromSecret`. Set the serving project and model location through the installer flags or `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and `litellm.vertex.location` rather than inside the Secret.
+
+To render a custom Vertex AI `api_base` on each `model_list` entry in `config.yaml`, set `platformAgent.harness.universeDomain` to a domain other than `googleapis.com` (`install.sh` has no flag for `universeDomain`, so set it via Helm or `TF_VAR_extra_helm_values`). The chart then renders `api_base` as `https://aiplatform.<universeDomain>` when `litellm.vertex.location` is `global`, or `https://<location>-aiplatform.<universeDomain>` for a regional location, and that rendered `api_base` wins over `VERTEXAI_API_BASE`. It also sets `GOOGLE_CLOUD_UNIVERSE_DOMAIN` directly in container `env`, overriding any `GOOGLE_CLOUD_UNIVERSE_DOMAIN` key in `litellm.envFromSecret`:
+
+```bash
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set platformAgent.harness.universeDomain=universe.example.com \
+  --set litellm.modelProvider=vertex_ai \
+  --set litellm.modelDefaultName=gemini-3.8-flash \
+  --set litellm.vertex.projectId=my-serving-project \
+  --set litellm.vertex.location=us-east4
+```
+
 ### A credentials Secret for the gateway
 
-`LITELLM_ENV_SECRET_NAME` (`--litellm-env-secret`, chart value `litellm.envFromSecret`, Terraform `litellm_env_secret_name`) names a Secret in the agent's namespace that the gateway container reads whole as environment variables. You create it with `kubectl`; the install only names it, so the credentials never pass through `install.env`, `terraform.tfvars` or Terraform state, and `upgrade.sh` never rewrites them. The mount is optional: the pod starts without the Secret, and the first model call, not the rollout, reports a missing credential. It is how the two provider shapes below, and an OAuth2 gateway, get their credentials.
+`LITELLM_ENV_SECRET_NAME` (`--litellm-env-secret`, chart value `litellm.envFromSecret`, Terraform `litellm_env_secret_name`) names a Secret in the agent's namespace that the gateway container reads whole as environment variables. You create it with `kubectl`; the install only names it, so the credentials never pass through `install.env`, `terraform.tfvars` or Terraform state, and `upgrade.sh` never rewrites them. The mount is optional: the pod starts without the Secret, and the first model call, not the rollout, reports a missing credential. It carries credentials for the two provider shapes below and for an OAuth2 gateway, as well as custom environment variables on `vertex_ai`.
 
-A variable the chart also sets from `platform-agent-secrets` (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY` and the others) wins over the same name in this Secret. Changing the Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it.
+A variable the chart sets directly in container `env` — keys from `platform-agent-secrets` (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY` and the others), `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` on `vertex_ai`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN` when `platformAgent.harness.universeDomain` is non-default — wins over the same name in this Secret. Changing the Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it.
 
 ### SAP AI Core
 

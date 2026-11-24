@@ -2,7 +2,7 @@ Subject: Use the beta track without installing components
 
 Why: upstream's Notes tell the agent to run `gcloud components install beta`. Here gcloud runs through the credential proxy, which refuses component installs, and the image's gcloud already carries the beta track.
 Local-Issue: none (#2359)
-Upstream-Issue: none (specific to this repository)
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Retire-When: never; the credential proxy is this repository's
 
 diff --git a/SKILL.md b/SKILL.md

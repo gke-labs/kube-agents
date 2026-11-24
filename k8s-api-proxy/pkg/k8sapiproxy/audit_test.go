@@ -107,7 +107,7 @@ func TestHandlerAuditEvents(t *testing.T) {
 		},
 		{
 			name: "authentication unavailable", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/pods",
-			cfg:     Config{Authenticator: staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))}},
+			cfg:     Config{Authenticator: staticAuthenticator{err: fmt.Errorf("%w: %w", ErrAuthenticationUnavailable, errors.New("connection refused"))}},
 			want:    AuditEvent{Path: "/clusters/in-cluster/api/v1/pods", Outcome: OutcomeAuthUnavailable, StatusCode: http.StatusServiceUnavailable},
 			wantErr: "caller authentication is unavailable: connection refused", noCaller: true,
 		},
@@ -271,7 +271,17 @@ func TestSlogAuditSink(t *testing.T) {
 				auditKeyUsername: "system:serviceaccount:agents:shell", auditKeyUID: "u1",
 				auditKeyGroups: []any{"system:serviceaccounts"}, auditKeyCache: "hit",
 			},
-			absent: []string{auditKeyAPIGroup, auditKeyNamespace, auditKeyName, auditKeyReason, auditKeyDryRun, auditKeyError},
+			absent: []string{auditKeyAPIGroup, auditKeyNamespace, auditKeyName, auditKeyReason, auditKeyDryRun, auditKeyError, auditKeyPartition, auditKeyAuthenticator},
+		},
+		{
+			name: "caller with a partition and its authenticator",
+			event: AuditEvent{
+				Caller:  &CallerIdentity{Username: "agent-1", Partition: "team-a", Authenticator: "jwt"},
+				Outcome: OutcomeForwarded, StatusCode: http.StatusOK,
+			},
+			wantLevel: "INFO",
+			want:      map[string]any{auditKeyUsername: "agent-1", auditKeyPartition: "team-a", auditKeyAuthenticator: "jwt"},
+			absent:    []string{auditKeyUID, auditKeyGroups},
 		},
 		{
 			name:      "refused",
@@ -294,7 +304,7 @@ func TestSlogAuditSink(t *testing.T) {
 		},
 		{
 			name:      "authentication unavailable",
-			event:     AuditEvent{Outcome: OutcomeAuthUnavailable, Err: errAuthenticationUnavailable, StatusCode: http.StatusServiceUnavailable},
+			event:     AuditEvent{Outcome: OutcomeAuthUnavailable, Err: ErrAuthenticationUnavailable, StatusCode: http.StatusServiceUnavailable},
 			wantLevel: "ERROR",
 			want:      map[string]any{auditKeyOutcome: "auth_unavailable", auditKeyError: "caller authentication is unavailable"},
 		},

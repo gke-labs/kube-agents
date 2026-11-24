@@ -1,7 +1,7 @@
 # The GitLab lane's matrix: what pull-kube-agents-smoke-test-gitlab runs on
 # a pull request and ci-kube-agents-eval-nightly-gitlab-next runs once a
-# night (kube-agents#2394, #2832), both under spec.mode next (EVAL_MODE_NEXT=1,
-# through the inject door). hack/ci-eval-pr.sh reads this file in place of the catalogue
+# night (kube-agents#2394, #2832), both through the inject door.
+# hack/ci-eval-pr.sh reads this file in place of the catalogue
 # whenever EVAL_FORGE is gitlab or gitlab-ce (a self-managed instance,
 # kube-agents#3682), on either tier: nothing else grades the forge,
 # so the presubmit cases and the other nightly-only cases run on GitHub
@@ -14,8 +14,9 @@
 # in neither file and on a file that names nothing.
 #
 # WHAT BELONGS HERE. Cases that grade the forge: a `pull_request_opened` or
-# `pull_request_diff_contains` check (a merge request on GitLab) or a
-# `ledger_issue_contains` check (a ledger issue). A chat probe passes the
+# `pull_request_diff_contains` check (a merge request on GitLab), a
+# `ledger_issue_contains` check (a ledger issue) or a `forge_issue_state`
+# check (the issue the reply names). A chat probe passes the
 # same on either forge and proves nothing about GitLab; the GitHub run
 # already grades it on every pull request. scripts/test_eval_rosters.py pins
 # the set, and that each entry requires a positive forge check (not under a

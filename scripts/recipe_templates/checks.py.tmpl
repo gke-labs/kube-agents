@@ -1,0 +1,34 @@
+"""The {kind} fix's safety checks: live facts that must hold before it may merge unattended.
+
+The sandbox's pre-flight loads this file
+(`fix_recipes.registry.checks_module`, `fleet-audit/scripts/fix_preflight.py`)
+and runs `checks` on its own read of the target namespace. The broker's label
+gate runs it too, but today it labels only no-pdb fixes
+(`automerge_eligibility.FIX_TYPE`): wiring this kind into the gate edits
+shared plumbing, which `recipe-check --base` flags for platform review. Stdlib
+only: the credential proxy loads this file.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+#: The kubectl kinds one read of the target namespace must fetch, separated by commas.
+read_kinds = "RECIPE-TEMPLATE"
+#: One name per check, in the order `checks` answers them.
+CHECK_NAMES = ("RECIPE-TEMPLATE",)
+PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
+
+
+def _result(name: str, passed: bool, detail: str, status: str = "") -> dict:
+    return {"name": name, "passed": passed, "detail": detail, "status": status or (PASS if passed else FAIL)}
+
+
+def unanswered(detail: str) -> list[dict]:
+    """Every check `unknown` for one reason: nothing could be judged. Not passed, so the gate refuses."""
+    return [_result(name, False, detail, UNKNOWN) for name in CHECK_NAMES]
+
+
+def checks(change: Any, live: dict) -> list[dict]:
+    """One `_result` per name in CHECK_NAMES, for the fix `change` (its fields as attributes) against the namespace read `live`."""
+    raise NotImplementedError("RECIPE-TEMPLATE: write the {kind} safety checks")

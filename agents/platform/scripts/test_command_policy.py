@@ -26,7 +26,7 @@ CONFIG_CONNECTOR_SKILL_DIR = (
     Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
 )
 # A fence may be indented, as one inside a numbered list is. The languages
-# are deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+# are the info strings a2a/cmd/session-persona/transform.go calls shellLangs.
 FENCED_SHELL_BLOCK = re.compile(
     r"^(?P<indent>[ \t]*)```(?:bash|sh|shell|zsh)[ \t]*\n(?P<body>.*?)^(?P=indent)```[ \t]*$",
     re.MULTILINE | re.DOTALL,
@@ -1657,6 +1657,81 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 self.assertEqual(expected_rule_id, decision.rule_id)
 
 
+class GcloudBillingAccountFlagTest(unittest.TestCase):
+    """`--billing-account` names a scope above a project. The flag walker knows
+    it for every command, because `billing budgets list` requires it; the policy
+    lets it through on that command only. `logging read` takes the flag too, and
+    with it reads a billing account's logs and not a project's."""
+
+    RULE = "gcp.billing-account-forbidden"
+    FLAG = "--billing-account"
+    BUDGETS = ("billing", "budgets", "list")
+    ASSET_SEARCH_NEEDS = ["--scope=projects/p", "--asset-types=container.googleapis.com/Cluster"]
+
+    def test_logging_read_refuses_a_billing_account_in_every_spelling(self):
+        for argv in (
+            ["gcloud", "logging", "read", "q", "--billing-account=012345-6789AB-CDEF01"],
+            ["gcloud", "logging", "read", "q", "--billing-account", "012345-6789AB-CDEF01"],
+            ["gcloud", "--billing-account=012345-6789AB-CDEF01", "logging", "read", "q"],
+            ["gcloud", "logging", "read", "q", "--project=p", "--billing-account=012345-6789AB-CDEF01"],
+            ["gcloud", "logging", "read", "q", "--billing-account=012345-6789AB-CDEF01", "--limit=5", "--format=json"],
+            # Where another flag's value would stand: gcloud still reads it as the flag.
+            ["gcloud", "logging", "read", "q", "--format", "--billing-account=012345-6789AB-CDEF01"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(self.RULE, decision.rule_id)
+                self.assertEqual(self.FLAG, decision.offending_flag)
+                self.assertIn("--project", decision.message, "the refusal says what reads a project's logs")
+
+    def test_logging_read_still_reads_a_project(self):
+        for argv in (
+            ["gcloud", "logging", "read", "q"],
+            ["gcloud", "logging", "read", "q", "--project=p"],
+            ["gcloud", "logging", "read", "q", "--project", "p", "--limit=5", "--order=asc", "--freshness=1h", "--format=json"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed)
+
+    def test_the_other_scopes_above_a_project_stay_refused_on_logging_read(self):
+        """These were never listed for the flag walker; the cases keep them so."""
+        for flags in (["--folder=123"], ["--organization=123"], ["--bucket=b", "--location=global", "--view=v"],
+                      ["--resource-names=folders/123"]):
+            with self.subTest(flags=flags):
+                self.assertFalse(evaluate(["gcloud", "logging", "read", "q", *flags]).allowed)
+
+    def test_billing_budgets_list_keeps_its_billing_account(self):
+        for argv in (
+            ["gcloud", "billing", "budgets", "list", "--billing-account=012345-6789AB-CDEF01"],
+            ["gcloud", "billing", "budgets", "list", "--billing-account", "012345-6789AB-CDEF01", "--format=json"],
+            ["gcloud", "--billing-account=012345-6789AB-CDEF01", "billing", "budgets", "list", "--quiet"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed)
+
+    def test_only_billing_budgets_list_passes_the_flag(self):
+        """Every allowlisted read. The flag passes on one command; a change that
+        lets it through on a second one, an entry added later included, goes
+        red here."""
+        passes = set()
+        for command in sorted(command_policy.GCLOUD_READ_COMMANDS):
+            needs = self.ASSET_SEARCH_NEEDS if command == ("asset", "search-all-resources") else []
+            with self.subTest(command=" ".join(command)):
+                self.assertTrue(evaluate(["gcloud", *command, *needs]).allowed, "the command alone is an allowed read")
+                decision = evaluate(["gcloud", *command, *needs, f"{self.FLAG}=012345-6789AB-CDEF01"])
+                if decision.allowed:
+                    passes.add(command)
+                else:
+                    self.assertEqual(self.RULE, decision.rule_id)
+        self.assertEqual({self.BUDGETS}, passes)
+
+    def test_a_write_keeps_its_own_refusal(self):
+        decision = evaluate(["gcloud", "billing", "budgets", "create", "--billing-account=012345-6789AB-CDEF01"])
+        self.assertFalse(decision.allowed)
+        self.assertNotEqual(self.RULE, decision.rule_id, "the read-only rule answers first, as before")
+
+
 class RefusalCostIsBounded(unittest.TestCase):
     """A refusal must not become a way to spend the sidecar's CPU.
 
@@ -2924,3 +2999,18 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KubectlDefinitiveWriteTest(unittest.TestCase):
+    """command_policy.kubectl_definitive_write: which argvs the broker marks as a write."""
+
+    def test_a_help_letter_in_a_short_cluster_is_not_a_write(self):
+        self.assertIsNone(command_policy.kubectl_definitive_write(shlex.split("kubectl delete pod x -hv=9")))
+        self.assertEqual(("delete",), command_policy.kubectl_definitive_write(shlex.split("kubectl delete pod x -v=9")))
+
+    def test_a_long_hostile_flag_is_read_in_linear_time(self):
+        import time
+        token = "-" + "h" * 200_000 + "!"
+        start = time.monotonic()
+        command_policy.kubectl_definitive_write(["kubectl", "delete", "pod", "x", token])
+        self.assertLess(time.monotonic() - start, 1.0)

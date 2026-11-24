@@ -1,5 +1,6 @@
-// Package upstream implements k8sapiproxy.UpstreamTransport for the cluster the proxy runs in
-// and for GKE clusters, which it reaches with the proxy's own Google credentials.
+// Package upstream implements k8sapiproxy.UpstreamTransport: Transport (New) reaches the
+// in-cluster API server and GKE clusters with Google credentials, while StaticTransport
+// (NewStatic) forwards to one pre-resolved HTTP or HTTPS endpoint without cloud discovery.
 package upstream
 
 import (

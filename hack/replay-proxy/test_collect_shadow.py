@@ -376,6 +376,18 @@ class FinalPassTest(CollectorTestCase):
         self.collector.collect_pass(final=True)
         self.assertEqual(self.cluster.objects(), {})
 
+    def test_outside_replay_mode_the_last_pass_uploads_each_pod_before_the_next(self):
+        other = self.cluster.add_pod("proxy-b")
+        self.put("logs/p-1-000001.jsonl", b"a\n")
+        self.put("logs/p-2-000001.jsonl", b"b\n", pod=other)
+        self.collector.lane_report = lambda out_dir: None
+        self.collector.deadline = self.now + 60
+        self.collector.collect_pass(final=True)
+        steps = [("upload" if c[0] == "gcloud" else "list" if C.LIST_SCRIPT in c else "")
+                 for c in self.cluster.calls]
+        self.assertEqual([s for s in steps if s], ["list", "upload", "list", "upload"])
+        self.assertFalse(self.collector.lane_report_tried, "only replay mode writes the report in the pass")
+
     def test_ordinary_pass_never_takes_open_segments(self):
         self.put("logs/p-1-000002.jsonl.open", b"whole\n")
         self.collector.collect_pass()
@@ -421,6 +433,33 @@ class DeadlineTest(CollectorTestCase):
             C.default_runner([sys.executable, "-c", "import time; time.sleep(30)"],
                              remaining=lambda: 1.5 - (time.monotonic() - started))
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_default_runner_is_not_held_by_a_descendant_keeping_its_pipes(self):
+        # `gcloud storage cp` hands the copy to worker processes, which inherit
+        # stdout and stderr; killing only the command left them holding the
+        # pipes, and the wait for EOF after the kill never returned.
+        started = time.monotonic()
+        script = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); time.sleep(30)"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_default_runner_is_not_held_by_a_descendant_that_left_its_process_group(self):
+        # A descendant in a session of its own escapes the group kill; the
+        # bounded drain, then closing the pipes, still ends the wait.
+        started = time.monotonic()
+        child = "import os, time; os.setsid(); time.sleep(30)"
+        script = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_default_runner_is_not_held_by_a_descendant_of_a_command_that_exited(self):
+        started = time.monotonic()
+        script = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
 
     def test_default_runner_feeds_input_and_returns_output(self):
         proc = C.default_runner([sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read()[::-1])"],
@@ -578,6 +617,15 @@ class RecordModeTest(CollectorTestCase):
 
     def kept(self, rel):
         return os.path.join(self.keep, "pods", POD_NAME, "cache", rel)
+
+    def test_alternates_are_kept_on_this_machine_and_emptied_in_the_pod(self):
+        first = self.cache(f"alts/{fp(1)}/{fp(7)}.json", b'{"answer": 7}')
+        self.cache(f"alts/{fp(1)}/{fp(8)}.json", b'{"answer": 8}')
+        self.collector.collect_pass()
+        for answer, data in ((fp(7), b'{"answer": 7}'), (fp(8), b'{"answer": 8}')):
+            with open(self.kept(f"alts/{fp(1)}/{answer}.json"), "rb") as handle:
+                self.assertEqual(handle.read(), data)
+        self.assertEqual(os.path.getsize(first), 0, "emptied, so its name still says that answer was written")
 
     def test_answers_are_kept_on_this_machine_and_emptied_in_the_pod(self):
         answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
@@ -737,6 +785,14 @@ class ReplayModeTest(CollectorTestCase):
         self.collector.collect_pass()
         self.assertEqual(self.seeds(), 1, "a seeded pod is not seeded again")
 
+    def test_a_weights_file_is_seeded_with_the_answers(self):
+        path = os.path.join(self.seed_dir, "weights", f"{fp(1)}.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as handle:
+            handle.write('{"%s": 9}' % fp(2))
+        self.collector.collect_pass()
+        self.assertTrue(os.path.isfile(os.path.join(self.pod, CACHE, "weights", f"{fp(1)}.json")))
+
     def test_a_pod_that_replaced_one_is_seeded_too(self):
         self.collector.collect_pass()
         other = self.cluster.add_pod("proxy-b")
@@ -848,6 +904,43 @@ class ReplayModeTest(CollectorTestCase):
         C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
         self.assertIn(self.key("report/verdicts.json"), self.cluster.objects())
         self.assertIn("case-a: lane 3/3", self.out.getvalue())
+
+    def slow_bulk_uploads(self):
+        """Every logs/store upload runs out the last pass's deadline; the report's upload is quick."""
+        def runner(cmd, input=None, remaining=None, env=None, stdin_path=None):
+            if cmd[0] == "gcloud" and "-I" in cmd and f"/{C.REPORT_DIR}/" not in cmd[-1]:
+                self.cluster.calls.append(list(cmd))
+                self.now = self.collector.deadline + 1
+                raise subprocess.TimeoutExpired(cmd, 0)
+            return self.cluster(cmd, input=input, remaining=remaining, env=env, stdin_path=stdin_path)
+
+        self.collector.runner = runner
+
+    def test_a_last_pass_whose_bulk_upload_times_out_still_uploads_the_report(self):
+        self.put("logs/p-1-000001.jsonl", b"last\n")
+        seen = []
+
+        def report(out_dir):
+            seen.append(sorted(os.listdir(os.path.join(self.collector.keep_dir, C.KEEP_PODS_DIR, "proxy-a", "logs"))))
+            with open(os.path.join(out_dir, "verdicts.json"), "w") as handle:
+                handle.write("{}")
+            return "case-a: lane 3/3"
+
+        self.collector.lane_report = report
+        self.slow_bulk_uploads()
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertEqual(seen, [["p-1-000001.jsonl"]], "the report reads the last pass's lines, copied first")
+        objects = self.cluster.objects()
+        self.assertIn(self.key("report/verdicts.json"), objects)
+        self.assertNotIn(self.key("logs/p-1-000001.jsonl"), objects)
+        self.assertEqual(self.collector.totals.errors, {"upload_timeout": 1})
+        self.assertEqual(self.size("logs/p-1-000001.jsonl"), 5, "a file not uploaded is not emptied")
+
+    def test_the_report_is_written_once(self):
+        calls = []
+        self.collector.lane_report = lambda out_dir: calls.append(out_dir) or ""
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertEqual(len(calls), 1)
 
 
 class ProcessTest(unittest.TestCase):

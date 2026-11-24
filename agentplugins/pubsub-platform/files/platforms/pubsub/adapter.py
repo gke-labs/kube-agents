@@ -45,8 +45,12 @@ CREDENTIAL_PROXY_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TOKEN_FILE"
 # subscription the broker refuses; GCP_PROJECT_ID is a plugin's to override and is the
 # fallback for an install without the operator's variable.
 PROJECT_ID_ENVS = ("PUBSUB_RELAY_PROJECT", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT")
+GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+CLOUDSDK_UNIVERSE_DOMAIN_ENV = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+DEFAULT_UNIVERSE_DOMAIN = "googleapis.com"
+PUBSUB_SERVICE_PREFIX = "pubsub."
 RELAY_PREFIX = "/v1/pubsub/gcp/"
-RELAY_PUBSUB_HOST = "pubsub.googleapis.com"
+RELAY_PUBSUB_HOST = PUBSUB_SERVICE_PREFIX + DEFAULT_UNIVERSE_DOMAIN
 # One pull asks for one message. A pull is a lease: by the time the broker reads the
 # answer, Pub/Sub has delivered the batch and started its ack deadline, and the ack ids
 # are in the body, so an answer the broker cannot relay (its response cap) strands every
@@ -146,10 +150,19 @@ class RelayRefused(Exception):
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
-    """A 3xx from the relay is an error, not a place to re-send the token to."""
+    """A 3xx is an error, not a place to re-send the call's headers to."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
         return None
+
+
+# For the gateway's own API, which is on loopback. No proxy from the
+# environment: a proxy cannot reach this pod's loopback, so the turn would
+# fail, and the proxy would get the alert's prompt and the call's headers.
+# No redirect: urllib follows a 301, 302 or 303 answer to a POST with a GET
+# that keeps the Authorization header and has no body, so neither call of the
+# API can work through one.
+_GATEWAY_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
 
 class PubsubRelay:
@@ -160,13 +173,15 @@ class PubsubRelay:
     broker adds the Google credential; this side presents the gateway's
     projected token, read from CREDENTIAL_PROXY_TOKEN_FILE on every call, and
     never follows a redirect with it (credential_proxy_client's guard, kept
-    here because this file is loaded by path with no sibling module).
+    here because this file is loaded by path with no sibling module). It takes
+    no proxy from the environment, as that client does not: the relay is an
+    in-cluster Service, and a proxy in between would get the token.
     """
 
     def __init__(self, base_url: str, token_file: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.token_file = token_file
-        self._opener = urllib.request.build_opener(_NoRedirects)
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -178,8 +193,15 @@ class PubsubRelay:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
+    def _pubsub_host(self) -> str:
+        for env_name in (GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, CLOUDSDK_UNIVERSE_DOMAIN_ENV):
+            domain = os.environ.get(env_name, "").strip().rstrip(".").lower()
+            if domain:
+                return f"{PUBSUB_SERVICE_PREFIX}{domain}"
+        return RELAY_PUBSUB_HOST
+
     def _url(self, subscription_path: str, verb: str) -> str:
-        return f"{self.base_url}{RELAY_PREFIX}{RELAY_PUBSUB_HOST}/v1/{subscription_path}{verb}"
+        return f"{self.base_url}{RELAY_PREFIX}{self._pubsub_host()}/v1/{subscription_path}{verb}"
 
     def call(self, method: str, subscription_path: str, verb: str = "", body: Optional[dict] = None,
              timeout: float = SETTLE_REQUEST_TIMEOUT_SECONDS) -> Any:
@@ -1248,7 +1270,7 @@ class PubSubAdapter(BasePlatformAdapter):
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
             )
-            return urllib.request.urlopen(req, timeout=timeout)
+            return _GATEWAY_API_OPENER.open(req, timeout=timeout)
 
         try:
             await asyncio.to_thread(

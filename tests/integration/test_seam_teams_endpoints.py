@@ -45,7 +45,7 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
             method=method or ("POST" if body is not None else "GET"),
         )
         try:
-            with urllib.request.urlopen(request) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 return response.status, json.load(response)
         except urllib.error.HTTPError as exc:
             return exc.status, json.load(exc)
@@ -96,7 +96,7 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         self.assertEqual(status, 400)
 
     def test_pull_and_settle_ack_and_nack(self):
-        self._call(
+        seeded = self._call(
             "/v1/chat/teams/events",
             {
                 "type": "message",
@@ -105,6 +105,8 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
             },
             method="POST",
         )
+        # A refused enqueue would otherwise surface 20 s later as an empty pull.
+        self.assertEqual(seeded, (202, {"status": "accepted"}))
         status, body = self._call("/v1/chat/teams/events", method="GET")
         self.assertEqual(status, 200)
         self.assertEqual(body["event"]["event"]["text"], "audit cluster")
@@ -121,6 +123,34 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         )
         self.assertEqual(status, 404)
         self.assertFalse(body["settled"])
+
+        # A nack on a live receipt requeues the activity: the next pull hands
+        # the same text back under a new receipt, and the old one is spent.
+        seeded = self._call(
+            "/v1/chat/teams/events",
+            {
+                "type": "message",
+                "text": "second turn",
+                "conversation": {"id": "c-1", "tenantId": "tenant-allowed-1"},
+            },
+            method="POST",
+        )
+        self.assertEqual(seeded, (202, {"status": "accepted"}))
+        status, body = self._call("/v1/chat/teams/events", method="GET")
+        self.assertEqual(status, 200)
+        first_receipt = body["event"]["receipt"]
+        status, body = self._call(
+            "/v1/chat/teams/events/nack", {"receipt": first_receipt}, method="POST"
+        )
+        self.assertEqual((status, body), (200, {"settled": True}))
+        status, body = self._call("/v1/chat/teams/events", method="GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["event"]["event"]["text"], "second turn")
+        self.assertNotEqual(body["event"]["receipt"], first_receipt)
+        status, body = self._call(
+            "/v1/chat/teams/events/nack", {"receipt": first_receipt}, method="POST"
+        )
+        self.assertEqual((status, body), (404, {"settled": False}))
 
     def test_api_forwarding_with_oauth_token_exchange_and_method_or_host_restrictions(self):
         upstream_requests = []
@@ -229,6 +259,83 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
             method="POST",
         )
         self.assertEqual(status, 400)
+
+    def test_microsoft_rejection_reaches_the_caller_as_a_teams_field(self):
+        """A Bot Framework 403 goes through ``_open_url``'s conversion: the
+        route answers 502 with Microsoft's code in a ``teams`` object."""
+        import io
+
+        self.relay._token = "cached-bot-token"
+        self.relay._token_expires_at = 9999999999.0
+        body = json.dumps({"error": {"code": "BotNotInConversationRoster", "message": "The bot is not part of the roster."}}).encode()
+        err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/v3/x", 403, "Forbidden", {}, io.BytesIO(body))
+        from credential_proxy import _TEAMS_OPENER
+
+        with mock.patch.object(_TEAMS_OPENER, "open", side_effect=err), self.assertLogs(
+            "credential-proxy", level="WARNING"
+        ) as logs:
+            status, answer = self._call(
+                "/v1/chat/teams/api",
+                {
+                    "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                    "endpoint": "v3/conversations/123/activities",
+                    "method": "POST",
+                    "payload": {"type": "message", "text": "reply"},
+                },
+                method="POST",
+            )
+        self.assertEqual(status, 502)
+        self.assertEqual(
+            answer["teams"],
+            {"status": 403, "code": "BotNotInConversationRoster", "message": "The bot is not part of the roster."},
+        )
+        self.assertTrue(any("BotNotInConversationRoster" in line for line in logs.output), logs.output)
+
+        # Microsoft's words go through the same redaction as the detail.
+        token = "ghp_" + "a" * 36
+        body = json.dumps({"error": {"code": "Forbidden", "message": f"token {token} rejected"}}).encode()
+        err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/v3/x", 403, "Forbidden", {}, io.BytesIO(body))
+        with mock.patch.object(_TEAMS_OPENER, "open", side_effect=err), self.assertLogs(
+            "credential-proxy", level="WARNING"
+        ):
+            status, answer = self._call(
+                "/v1/chat/teams/api",
+                {
+                    "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                    "endpoint": "v3/conversations/123/activities",
+                    "method": "POST",
+                    "payload": {"type": "message", "text": "reply"},
+                },
+                method="POST",
+            )
+        self.assertEqual(status, 502)
+        self.assertEqual(answer["teams"]["message"], "token [REDACTED] rejected")
+        self.assertNotIn(token, json.dumps(answer))
+
+    def test_refused_redirect_is_a_502_with_its_reason_logged(self):
+        """Any ``TeamsUpstreamError`` raised under ``api_call`` reaches the 502
+        branch and its warning line; the handler itself is covered by the
+        broker's real-socket redirect test."""
+        from credential_proxy import TeamsUpstreamError
+
+        self.relay._token = "cached-bot-token"
+        self.relay._token_expires_at = 9999999999.0
+        with mock.patch.object(
+            TeamsRelay, "_open_url", side_effect=TeamsUpstreamError("Teams API redirect refused (HTTP 302)")
+        ), self.assertLogs("credential-proxy", level="WARNING") as logs:
+            status, body = self._call(
+                "/v1/chat/teams/api",
+                {
+                    "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                    "endpoint": "v3/conversations/123/activities",
+                    "method": "POST",
+                    "payload": {"type": "message", "text": "reply"},
+                },
+                method="POST",
+            )
+        self.assertEqual(status, 502)
+        self.assertIn("redirect refused", body["detail"])
+        self.assertTrue(any("TeamsUpstreamError" in line for line in logs.output), logs.output)
 
 
 if __name__ == "__main__":

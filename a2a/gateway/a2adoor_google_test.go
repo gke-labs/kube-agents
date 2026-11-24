@@ -291,6 +291,7 @@ func TestGoogleVerifierCacheStopsAtTheTokensOwnExpiry(t *testing.T) {
 }
 
 func TestGoogleVerifierCacheIsBoundedInBytes(t *testing.T) {
+	t.Parallel()
 	v := newGoogleTokenVerifier(googleTestClientID)
 	far := time.Now().Add(time.Hour)
 	for i := 0; i < a2aGoogleCacheBudgetBytes/a2aGoogleCacheEntryOverhead; i++ {
@@ -352,6 +353,7 @@ func startA2AGoogleRig(t *testing.T) (*a2aRig, *fakeTokeninfo) {
 // class's own backend and mechanism, and a roster resolved the class's way,
 // never through the chat map.
 func TestA2AGoogleCallerStartsATaskAttributedToTheirEmail(t *testing.T) {
+	t.Parallel()
 	r, _ := startA2AGoogleRig(t)
 	resp, status := r.rawRPC(t, googleTestToken, "", a2aMethodSend, sendParams("hello as me", "m-1", "ctx-1", false))
 	if status != http.StatusOK {
@@ -391,6 +393,7 @@ func TestA2AGoogleCallerStartsATaskAttributedToTheirEmail(t *testing.T) {
 // a conversation or a submission, so a stream of such accounts cannot push
 // an allowed developer's state out of the door's bounds.
 func TestA2AGoogleCallerOffTheAllowlistIsRefusedBeforeTheDoorHoldsAnything(t *testing.T) {
+	t.Parallel()
 	r, _ := startA2AGoogleRig(t)
 	_, status := r.rawRPC(t, googleTestOtherToken, "", a2aMethodSend, sendParams("let me in", "m-1", "", false))
 	if status != http.StatusForbidden {
@@ -410,6 +413,7 @@ func TestA2AGoogleCallerOffTheAllowlistIsRefusedBeforeTheDoorHoldsAnything(t *te
 // TestA2AGoogleCallerMayNotAlsoNameACaller: a token travels with no name
 // beside it, in the header or in the metadata.
 func TestA2AGoogleCallerMayNotAlsoNameACaller(t *testing.T) {
+	t.Parallel()
 	r, _ := startA2AGoogleRig(t)
 	resp, _ := r.rawRPC(t, googleTestToken, a2aTestCaller, a2aMethodSend, sendParams("as someone else", "m-1", "", false))
 	if resp.Error == nil || resp.Error.Code != rpcInvalidParams {
@@ -546,6 +550,7 @@ func TestA2AGoogleConfigGuards(t *testing.T) {
 // waited out a lock-hold starts a task after the door told its caller it
 // did not.
 func TestA2AGoogleTurnClockStartsBeforeTheSessionLock(t *testing.T) {
+	t.Parallel()
 	r, _ := startA2AGoogleRig(t)
 	caller := a2aGoogleCaller(googleTestEmail)
 	key := a2aConversationKey(caller, "held-lock")

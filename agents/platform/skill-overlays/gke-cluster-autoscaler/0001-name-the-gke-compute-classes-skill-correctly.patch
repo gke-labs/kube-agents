@@ -2,7 +2,7 @@ Subject: Name the gke-compute-classes skill correctly
 
 Why: upstream names a `gke-compute-class` skill that does not exist; the skill is `gke-compute-classes`, and the reference check fails on the wrong name.
 Local-Issue: none (#691)
-Upstream-Issue: none filed yet
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Retire-When: upstream names `gke-compute-classes`
 
 diff --git a/SKILL.md b/SKILL.md

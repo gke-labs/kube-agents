@@ -39,6 +39,7 @@ START_SERVICES = REPO_ROOT / "deploy" / "shared" / "start-services.sh"
 ENVOY_CONFIG = REPO_ROOT / "deploy" / "shared" / "envoy-credential-proxy.yaml"
 DOCKERFILE = REPO_ROOT / "deploy" / "docker" / "Dockerfile"
 SANDBOX_DOCKERFILE = REPO_ROOT / "deploy" / "sandbox" / "Dockerfile"
+WORKER_DOCKERFILE = REPO_ROOT / "a2a" / "Dockerfile.worker"
 MANIFESTS_GO = (
     REPO_ROOT
     / "k8s-operator"
@@ -764,6 +765,71 @@ class SandboxBytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
         self.assertIn("! -name '*.opt-*.pyc'", cmd)
 
 
+class TheShimStartsFromBytecodeTest(unittest.TestCase):
+    """The sandbox and worker images start the credential proxy client from
+    bytecode compiled in the build.
+
+    Every brokered `gcloud` and `kubectl` call starts the client as a new
+    process. A script is compiled at every start, so the images install a
+    launcher (deploy/shared/credential-proxy-exec.py) that imports the client
+    as a module, with the module's bytecode beside it. No run-time user can
+    write that bytecode: the folder is root's.
+    """
+
+    LIBEXEC = "/opt/credential-proxy/libexec"
+    MODULE = f"{LIBEXEC}/credential_proxy_client.py"
+    LAUNCHER = f"{LIBEXEC}/credential-proxy-exec"
+
+    def instructions(self, dockerfile):
+        return joined_instructions(dockerfile.read_text())
+
+    def compile_step(self, dockerfile):
+        steps = [i for i in self.instructions(dockerfile) if "compileall" in i and self.MODULE in i]
+        self.assertEqual(1, len(steps), f"{dockerfile.name} compiles the client module once")
+        return steps[0]
+
+    def test_both_images_install_the_launcher_beside_the_module(self):
+        for dockerfile in (SANDBOX_DOCKERFILE, WORKER_DOCKERFILE):
+            with self.subTest(dockerfile.name):
+                copies = [i.split() for i in self.instructions(dockerfile) if i.startswith("COPY ")]
+                self.assertIn(["deploy/shared/credential-proxy-exec.py", self.LAUNCHER], [c[-2:] for c in copies])
+                self.assertIn(["agents/platform/scripts/credential_proxy_client.py", self.MODULE], [c[-2:] for c in copies])
+                self.assertNotIn(
+                    "agents/platform/scripts/credential_proxy_client.py",
+                    [c[-2] for c in copies if c[-1].endswith("/credential-proxy-exec")],
+                    "the client's source is not installed as the command: it would be compiled at every start",
+                )
+
+    def test_the_module_is_compiled_so_that_the_bytecode_loads_unchecked(self):
+        for dockerfile in (SANDBOX_DOCKERFILE, WORKER_DOCKERFILE):
+            with self.subTest(dockerfile.name):
+                step = self.compile_step(dockerfile)
+                self.assertIn("python3 -m compileall", step)
+                self.assertIn("--invalidation-mode unchecked-hash", step)
+                self.assertNotRegex(step, OPTIMIZE_FLAG_RE)
+
+    def test_the_build_fails_when_the_launcher_does_not_load_the_bytecode(self):
+        for dockerfile in (SANDBOX_DOCKERFILE, WORKER_DOCKERFILE):
+            with self.subTest(dockerfile.name):
+                step = self.compile_step(dockerfile)
+                compiled, _, guard = step.partition("python3 -v ")
+                self.assertIn("compileall", compiled, "the guard runs after the compile")
+                self.assertIn("credential-proxy-exec --help", guard)
+                self.assertRegex(guard, r"\|\s+grep \"code object from '" + self.LIBEXEC + r"/__pycache__/credential_proxy_client")
+                self.assertNotIn("||", step, "nothing swallows a failed guard")
+
+    def test_the_sandbox_keeps_the_command_on_its_old_path(self):
+        step = self.compile_step(SANDBOX_DOCKERFILE)
+        self.assertIn(f"ln -s {self.LAUNCHER} /usr/local/bin/credential-proxy-exec", step)
+
+    def test_the_sandbox_step_comes_after_the_standard_library_step(self):
+        """`SandboxBytecodeIsBakedAtBuildTimeTest` reads the first compileall
+        step as the standard library's."""
+        steps = [i for i in self.instructions(SANDBOX_DOCKERFILE) if "compileall" in i]
+        self.assertIn("stdlib", steps[0])
+        self.assertIn(self.MODULE, steps[-1])
+
+
 class BytecodePremiseTest(unittest.TestCase):
     """The interpreter behaviour the build step depends on.
 
@@ -1087,7 +1153,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
         # scripts; the entrypoint hard-codes that path rather than the PVC copy,
         # which `cp -ru` can leave older than the image.
         self.assertIn("/opt/defaults/scripts/verify_skills_provenance.py", self.entrypoint)
-        self.assertIn("agents/platform/scripts/ /opt/defaults/scripts/", self.stage)
+        self.assertRegex(self.stage, r"COPY [^\n]*agents/platform/scripts/ [^\n]*/opt/defaults/scripts/\n")
 
 
 # The tree no normalization loop walks, so every write into it has to carry its

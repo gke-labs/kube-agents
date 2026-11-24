@@ -1,11 +1,10 @@
 # The eval transport under `spec.mode: next`
 
-> **STATUS — design of record; stage 1 built, off by default.** The gateway has the inject adapter
-> and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
-> only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
-> flips the install, hands the operator the bridge's settings and runs the matrix through the door (The CI flag). The
-> merge-blocking presubmit sets the flag, so every pull request is graded through the door; the
-> today lane grades `today` after a scripted rollback. Stage 2's operator wiring is rendered and
+> **STATUS — design of record; built, the one transport CI grades over.** The gateway has the
+> inject adapter and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator
+> renders the door only under its eval flag; every install runs the A2A stack, so the presubmit
+> scripts build the bridge image, hand the operator the bridge's settings and run every matrix
+> through the door (The inject door on every lane). Stage 2's operator wiring is rendered and
 > its eval-install half is not started.
 > The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
@@ -96,8 +95,7 @@ Service, off by default, rendered by the operator only under the eval flag. Its 
 the gateway spec's "The inject backend" section; this document records what the harness does
 with it. The direct-bus transport survives as a diagnostic, below.
 
-Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is today's transport byte for byte, and
-the presubmit exports nothing new until it chooses to. The exchange:
+Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is the agent API transport byte for byte (a developer's door; no CI lane uses it). The exchange:
 
 1. Port-forward the adapter's Service on `AGENT_CLUSTER_CONTEXT`, through the harness's existing
    forward machinery and its retry classes.
@@ -222,11 +220,13 @@ infrastructure paragraph below says what the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
-Chat; a localhost door has no silent-stop failure mode, so it is a side door that may sit beside
-exactly one real backend, and the guard keeps refusing two real ones. The door beside a real
+Chat; a localhost door has no silent-stop failure mode, so it was a side door that could sit beside
+exactly one real backend then, and the guard refused two real ones at the time. The door beside a real
 backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
 against one install and compare them, and meets the A2A owner's condition that the guard change
-be coordinated with the Slack adapter in flight.
+be coordinated with the Slack adapter in flight. The guard was narrowed on 2026-11-12, so the
+gateway now runs every armed backend (the gateway spec's "Every armed backend in one gateway
+process").
 The door alone is also enough for the gateway to start (decided 2026-09-17 by the A2A owner,
 whose reason is that this is what makes the adapter the answer for an eval install with no real
 backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
@@ -234,7 +234,7 @@ the guard say so in code and in the gateway spec's test-backend section. What th
 the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
 install that wants no real backend from one whose relay URL failed to render. The adapter's
 guard change drops only that refusal, only when a door is rendered (the inject door, or the A2A
-door beside it, which shares the exemption), and keeps the two-backend refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
+door beside it, which shares the exemption), and kept the two-backend refusal then. And the door-alone start is not silent: the gateway logs it and the read route reports
 the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
 run as infrastructure when Chat is not the one, before any case grades. The stage-2 change that
 renders the gateway's relay URL adds it to the operator's golden set, which is where a failed
@@ -357,9 +357,9 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id (for the required checks, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
+the kanban worker logs by card id (for the required checks, for the forbidden runs where a `terminal` entry holds no heredoc, for a card with no log line, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
-wait found the cards and the door showed the trace); on
+wait found the cards and the door showed the trace; a check with `after_result_pattern` and a forbidden set reads those entries alone); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
 (Completion signals), and none when the wait falls back. Neither is graded
 as a failure here: on this transport's record the scorer sets every `worker_commands`,
@@ -378,7 +378,7 @@ the worker checks, as does a `tool_called` with a `result` pattern, since the tr
 cannot show"). A case whose premise
 the transport removes is a different matter:
 `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with its reason, and the
-api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
+roster files are untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
 unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
 `API_SERVER_KEY` the operator sets on it, and the deploy's start-line wait requires
@@ -406,11 +406,11 @@ session pod waits on the profile and dispatcher work, which has no date, and the
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a container in the agent pod
-that the operator renders under `next` (a CR may declare its own on `spec.deployment.sidecars`
+that the operator renders (a CR may declare its own on `spec.deployment.sidecars`
 instead) and whose image `a2a/Dockerfile.hermes-bridge` builds. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
-addressee stays `platform`, which is what the addressee token is for. An install under `next`
-with no bridge in the pod - before the bus is provisioned, or with the bridge failing - has a bus
+addressee stays `platform`, which is what the addressee token is for. An install
+whose bridge is not consuming - still waiting for the bus to be provisioned, or failing - has a bus
 with nobody consuming `platform` tasks, and every case on the
 inject transport ends as infrastructure. That is the correct reading of that install, and it is
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
@@ -436,12 +436,12 @@ carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deplo
 hands that image to the operator as `A2A_BRIDGE_IMAGE`, with `A2A_BRIDGE_CONCURRENCY` set to
 `EVAL_TASK_PARALLELISM`, through the chart's `operator.extraEnv`; the operator renders the bridge
 with the bus URL and the `bridge` user's password from its creds Secret as the bridge doc lists
-its env, and withholds it from the agent pod until the bus is provisioned (a bridge that starts
-before the bus exists crash-loops the agent's pod). The worker count is sized against the
+its env, and puts it in the agent pod from the first render (the bridge waits for the bus
+rather than exiting, so it no longer has to be withheld until the bus is provisioned). The worker count is sized against the
 bridge's fixed queue as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
 as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
 sizes the `TASKS` consumer reserve from that `A2A_BRIDGE_CONCURRENCY` too, from the first `next`
-render, and provisioning never edits a stream that exists, so the first provision has to fit
+render, and provisioning never changes an existing stream's max_consumers, so the first provision has to fit
 the bridge's workers. The deploy therefore sizes the first provision for the bridge (decided
 2026-09-30 on gke-labs/kube-agents#2077): its mode change also sets `spec.harness.tuning.maxSessions` to the
 largest value whose budget at the lane's worker count fits the 64-consumer floor the first
@@ -482,8 +482,8 @@ comparison. The lane now runs the bridge's `api` executor, the default a custome
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
 transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
 session store rather than from the trajectory (Completion signals), so a case whose answer is a
-delegated worker's report is graded on that report, as on the api lane. Two differences from the
-api lane remain, and both are the transport's rather than the agent's. A router-scope
+delegated worker's report is graded on that report, as a run over the agent API grades it. Two
+differences from the agent API remain, and both are the transport's rather than the agent's. A router-scope
 `tool_called` reads the Planning Agent's calls through the door's trace, from which the harness leaves out the
 calls the bridge labels with a card worker's session. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
 call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
@@ -502,7 +502,7 @@ prerequisite warns and the unit runs. A fence that could not run to its verdict 
 Ready gateway pod or an exec that did not reach the container, leaves the unit unlaunched and recorded
 as infrastructure, so no block follows it. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
-`api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
+`api` being acceptable per case and stable across the on-demand runs, not the agent API's numbers.
 Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
 through the exclusion list with its reason. And every case carries a GitHub-write safeguard,
@@ -562,7 +562,7 @@ What it adds to the proof: the A2A relay instance pulls the install's subscripti
 broker with its own audience, the gateway mints the session and the `authority` block, the
 allowed-users gate admits the sender, and the reply reaches the thread.
 
-The operator work this stage stood on is rendered: under `next` with Google Chat enabled the
+The operator work this stage stood on is rendered: with Google Chat enabled the
 gateway carries the adapter's env and relay token, the broker arms the A2A relay instance on
 the install's one subscription with the third audience, the gateway's ServiceAccount is a
 broker caller and a NetworkPolicy peer, and the legacy consumer is not rendered (the gateway
@@ -574,9 +574,10 @@ allowed-users gate are exactly as "The Google Chat adapter" section has them, th
 as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`; removed 2026-10-22, when every next install began running a console-only gateway) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
-armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
+armed, the relay URL beside a Slack credential was the gateway's refusal at the time, and the inject door
 beside the relay URL is not one (stage 1), so the install this stage wires runs both
-transports. A render that drops the relay URL still leaves a gateway on the door alone, which
+transports. The gateway's guard was narrowed on 2026-11-12 to run every armed backend (the
+gateway spec's "Every armed backend in one gateway process"). A render that drops the relay URL still leaves a gateway on the door alone, which
 the read route reports as inject-only and the stage's preflight fails as infrastructure before
 any case runs.
 
@@ -601,7 +602,7 @@ The caveat that decides how much of the time cost stage 1 removes: the bridge ru
 per task, by default a turn in the conversation's session through the pod's API server and as
 the fallback a `hermes -p platform chat -Q -q <prompt>` subprocess, and publishes its terminal
 when that turn ends.
-Kanban stays the delegation mechanism inside the persona under `next` (decided 2026-09-17).
+Kanban stays the delegation mechanism inside the persona (decided 2026-09-17).
 Agent-initiated delegation as a child task on the bus is designed and not built:
 [`spec-subagent-profiles.md`](spec-subagent-profiles.md) has an orchestrator delegate by
 publishing a submission on `a2a.tasks.{profile}.{taskId}.in` ("How a profile becomes a pod"), a
@@ -656,118 +657,80 @@ transport, and it is the first thing child tasks delete.
 When child tasks exist, the parent's events name the child's task id, the same await code awaits
 it, and the wait goes.
 
-## The CI flag
+## The inject door on every lane
 
-`EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
-today-mode install has passed its own readiness and connectivity checks. It records the agent
-Deployment's generation, sets the mode through the chart's `platformAgent.mode` in a `helm
-upgrade --reuse-values` of its own release (with the `maxSessions` sized for the bridge's
-workers, so the first render sees both), and waits for the generation to move before
-asking any workload for status, because the flip is a rollout and a status read before it lands
-describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
+There is no flag now: every install runs the A2A stack, and `hack/ci-deploy.sh` has one path.
+Step 5's install hands the operator the A2A image references through the chart's
+`operator.extraEnv`, arms the gateway's inject door on the operator the same way
+(`A2A_INJECT_BACKEND=true`), sets the bridge's image and `BRIDGE_CONCURRENCY` on it
+(`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`; the bridge's default `api` executor), and sets the
+CR's `maxSessions` sized for the bridge's workers so the first provisioning Job's TASKS budget
+fits the floor. Step 6b then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
 ordered its creation after a serving callout replica it was measured at 19.5 minutes under adverse
-conditions, so its bound is generous), and the agent Deployment. Then
-the door and the executor. The deploy arms the gateway's inject door on the operator under the
-same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
-image overrides) and waits for the door's Service and token Secret. The bridge is the
-operator's: it renders it with the image and `BRIDGE_CONCURRENCY` the deploy sets on it the same
-way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`) and the bridge's default `api` executor, and
-the TASKS budget counts its workers from the first `next` render, so the mode change is the only
-change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
-pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
-Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step waits for the
-bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
-bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
-console under `next` (the same read routes and chat turn the deploy gated under `today`, through
-the console's port-forward). It reports the A2A gateway's state and last log
-lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
-starts, but a gateway that is down is what the harness classifies as infrastructure on every
-case, and gating it is the change that follows the first measured run through the door. The
-flag reaches the operator as an operator environment variable, the pattern the A2A image
-overrides use, and not as a CRD field (decided 2026-09-17 by the A2A owner on the adapter's
-issue): the door maps a body-supplied principal, and nothing a customer can set on a
-`PlatformAgent` may render it. The rendered object set with the flag unset carries no inject
-Service, env or NetworkPolicy, and that is a property for the conformance suite to check rather
-than a comment to trust. The A2A images the flip needs, and the bridge image, are built in the
-same Cloud Build as the other images (two steps of their own, no-ops with the flag unset) and the
-three are set on the operator, because its defaults point at a registry the pool projects cannot
-pull from. Under the same flag
-`hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
-`AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
-changes nothing else about the run except what hangs off that transport switch: the inject
-lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
-than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
-(`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
-lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
-grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
-nor the transport: on both lanes they are appended to a scratch copy of every remaining task
-file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
-`BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
-request, the stopped asks and the cases that declare `writes_alone: true`, run in a second phase after every first-phase unit (a case that
-declares `scope_exclude:` runs after them, in a phase of its own), one at a time and each after a settle, so no repetition that requests nothing shares the repository with one that
-writes by design and no window reaches back into the unit before; and after the fan-out the
-script lists in the job log what the run left on that repository, closing nothing. With the flag
-unset, the transport, the inject lane's exclusion list, the card stop and the rollback check
-below are off; the api lane's exclusion list and the lane safeguards still apply.
+conditions, so its bound is generous), and the agent Deployment. Then the door and the executor:
+the deploy waits for the door's Service and token Secret. The bridge is in the agent pod from the
+first render and waits for the bus (#5971), so the agent Deployment rolls once; the step gates that rollout and then checks, once,
+that the template carries the bridge. The step ends on the bridge's own log line that it is consuming
+`platform` tasks, because an install without a consuming bridge leaves a bus on which nobody
+answers, then gates the verifier's rollout and the web console (its read routes and a chat
+turn, through the console's port-forward). It reports the A2A gateway's state and last log lines and does not gate on it: a gateway
+that is down is what the harness classifies as infrastructure on every case, and gating it is
+the change that follows the first measured run through the door. The door is armed through an
+operator environment variable, the pattern the A2A image overrides use, and not through a CRD
+field (decided 2026-09-17 by the A2A owner on the adapter's issue): the door maps a body-supplied
+principal, and nothing a customer can set on a `PlatformAgent` may render it. The rendered object
+set with the operator variable unset carries no inject Service, env or NetworkPolicy, and that is a
+property for the conformance suite to check rather than a comment to trust. The A2A images and the
+bridge image are built in the same Cloud Build as the other images (two steps of their own) and
+set on the operator, because its defaults point at a registry the pool projects cannot pull from.
 
-Under the flag a run on `main` also checks the rollback path once the suite verdict is computed and
-before the final line announces it (a pull request's run, `JOB_TYPE` presubmit or batch, skips it,
-since nobody reads the report there and the today lane below proves the same path):
-`hack/rollback-roundtrip.sh` flips the install to `today`
-and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
-and declared again after the second (the lane declares none: the bridge the operator renders
-leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
-UIDs, that the agent answers a turn under `today`, that a task completes over the bus
-afterwards, and, before the first flip and after each leg, that the web console's read routes
-answer and a chat turn through it gets a reply (a `SKIP` on an install with no console, which the
-lane always has). It is reported, not gated: its own section of the log and two artifacts
-(`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
-on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
-inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
-the eval script's own start plus an allowance for the deploy in front of it. It is also skipped
-on a release-candidate run (`RC_COMMIT_SHA` set): the promotion waits on that job finishing, so
-an hour of report-only round trip would come out of the verdict poller's 330 minutes. The eval's gateway
-log and pod diagnostics are collected before it starts, because the flip replaces the pods
-they come from.
+`hack/ci-eval-pr.sh` runs every matrix through the door: it exports `AGENT_TRANSPORT=inject` and
+`AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door. The inject
+lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`) leaves out the cases whose premise
+needs the chat front door; a listed case therefore runs on no CI lane until its entry goes. The
+deploy arms the card stop (`A2A_CARD_STOP`) on the install, which the stopped-ask cases grade, and
+turns on the gateway's A2A door (`A2A_AGENT_DOOR`) for the card-wait stopped ask, which cancels a
+door task while its turn holds for its cards; the script exports that door's own token
+(`AGENT_A2A_DOOR_TOKEN`) beside the inject one, so an eval install runs with a door a default
+install does not have. The
+lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
+task file, which the unit hands devops-bench, over the leased project's GitOps repository exported
+as `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
+request, the stopped asks and the cases that declare `writes_alone: true` run in a second phase
+after every first-phase unit (a case that declares `scope_exclude:` or `scope_hold:` runs after them, in a phase
+of its own), one at a time and each after a settle, so no repetition that requests nothing shares
+the repository with one that writes by design and no window reaches back into the unit before;
+and after the fan-out the script lists in the job log what the run left on that repository,
+closing nothing.
 
-Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
-mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
-`next` through the door. `today` stays supported as the rollback, so a second lane proves that
-path. The today lane (`pull-kube-agents-smoke-test-today`, on pull requests that touch the round trip, or on demand) sets the flag together with
-`EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
-`hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
-leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The
-matrix runs over the agent API on that install, with no exclusion list and no lane safeguards,
-and a rollback that fails stops the run red rather than being reported beside it. The deploy
-refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
+A run on `main` records under the version key's `next` mode
+([`bench/baselines/README.md`](../../bench/baselines/README.md)), and rung 6 compares only with
+history at that key (agent model included; the main nightly and the presubmit run the same one).
+The dashboard's Trend page keeps a series per mode: it draws `next` by default, and the legacy
+`today` series stays selectable from the lines the store already holds until they age out of
+its window; its Nightly page reads the main nightly's runs, so it shows `next`.
 
-The flag admits those jobs by name and nothing else without a pull request: section 2b of the
-deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
-listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-the batch runs Tide started, the main nightly's eight parts
-`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
-`ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
-under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets), and refuses it on any other Prow run, so the flag mis-set on another periodic or
-postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
-`bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
-so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the
-inject lane compares only with next-mode history at its own key (agent model included; the main
-nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
-out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
-but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
-keeps a series per mode: it draws `next` by default, and today's stays selectable from the lines
-the store already holds until they age out of its window; its Nightly page
-reads the main nightly's runs, so it shows `next`.
+**The front door (#6539).** `EVAL_FRONT_DOOR` picks which front door a run deploys. `platform`, the default, sends a plain conversation to the platform agent, as every install does today. `session` sets the chart's `platformAgent.harness.tuning.defaultRoute` to `session`, so each new conversation gets a session pod of its own: the default session that the sessions-by-default change (#2371) makes the front door. The door takes the install's route, so the cases run unchanged. On the session route a session costs its conversation's replays too, 7 TASKS consumers rather than 3, and the floor would fit only 2 sessions at 4 parallel conversations. So a session run sizes `maxSessions` to the run's parallelism plus two (`EVAL_FRONT_DOOR_SESSIONS=fair`), and its fresh TASKS is created at that budget. The headroom matters because the gateway doesn't queue at the cap: it evicts the longest-idle pod or refuses the turn, and an eviction between a multi-turn case's turns would cost B for something that isn't the front door. `EVAL_FRONT_DOOR_SESSIONS=shipped` leaves the cap at the install default instead, which is what a customer install gets; an eviction or refusal there is a finding about that default. After its gates, the deploy reads the route the install resolved (the `A2A_DEFAULT_ADDRESSEE` the operator rendered on the gateway), writes the requested and the resolved route to `front-door.txt` in its artifacts, and fails when they differ (#6942). Today a mismatch means the chart or the CR lost the setting; once the operator can hold an explicit `session` back on `platform` (the session cap's guards, #6487), it also catches a run that would grade the wrong door. A session run keeps its records apart from the main nightly's: the gate files them under the version key's `next-session` mode, the dashboard publish skips the run, and it never records into the shared replay cache. `scripts/eval_front_door_ab.py <run A> <run B>` reads the two runs' `case-<name>.json` hand-offs and lists every case B fails where A passed. When both runs carry their `eval-grading.log`, it also compares each case's median answer words, infrastructure repetitions left out, and flags a case whose answer on B runs more than 25% and at least 10 words over A's; `--length-gate` makes that exit 1 too, since answer length is part of front-door parity, and exits 2 when a run has no shapes to compare. It exits 1 on a regression, and 2 when the runs can't be compared: an empty run, swapped front doors, a run whose resolved front door differs from the one it asked for or wasn't recorded, or a B where no case was graded.
+
+**History.** While `spec.mode: today` existed, `EVAL_MODE_NEXT=1` on a Prow job chose this path:
+the deploy installed `today`, proved it, then flipped the install to `next` through the chart's
+`platformAgent.mode` and gated the stack; the eval script exported the inject transport under the
+same flag, and an api-lane exclusion list (`hack/eval/api-lane-exclusions.txt`) kept the cases only
+the door can carry off the lanes that graded over the agent API. A second lane,
+`pull-kube-agents-smoke-test-today` (`EVAL_ROLLBACK_LANE=1`), proved the rollback path with
+`hack/rollback-roundtrip.sh` (`next` to `today` and back, the JetStream PVC and the bus creds
+Secret keeping their UIDs) and graded the rolled-back install over the agent API, gating nothing;
+a report-only round trip after the verdict ran the same script on `main`. The mode, the flag,
+the lane, the round trip and the api-lane list retired together; a Prow job that still exports
+`EVAL_MODE_NEXT=1` is ignored.
 
 ## Open questions
 
 Marked open on purpose; this document does not pick. The first draft's two questions for the A2A
 owner, which executor answers `platform` and whether delegation becomes a child task on the bus,
 were answered on 2026-09-17 and are recorded above as decisions, as was how the eval flag
-reaches the operator (The CI flag). Whether the bridge image build lands in this repository, and
+reaches the operator (The inject door on every lane). Whether the bridge image build lands in this repository, and
 the bridge look-ahead with it, was the A2A owner's and was answered on 2026-09-18 on
 gke-labs/kube-agents#1661: both yes, the build `FROM` the same run's platform-agent image and
 the look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. The

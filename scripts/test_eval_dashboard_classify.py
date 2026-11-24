@@ -1,15 +1,17 @@
 """classify.py answers "is this red mine?" the way the eval crew did by hand.
 
 Two layers. The rule tests build small data.json documents and pin each
-threshold from both sides. The fixture tests run the real week:
-testdata_classify/incidents.json.gz holds the published data.json's runs
-(trimmed to the fields classify.py reads) for two windows --
+threshold from both sides. The fixture tests run the week as it happened:
+testdata_classify/incidents.json.gz holds a synthetic cut of the published
+data.json's runs (case ids, PR numbers, build ids and reasons invented;
+timestamps, results and counts kept; trimmed to the fields classify.py reads)
+for two windows --
 
-    2026-09-04 18:00Z .. 09-05 06:00Z   PR #913's last runs: a storm-hit red,
+    2026-09-04 18:00Z .. 09-05 06:00Z   PR #218's last runs: a storm-hit red,
                                         an abort, then green
     2026-09-07 06:00Z .. 09-08 19:00Z   the crashloop outage (#1269, #1278):
-                                        the trio redding #1275, #1246, #1238,
-                                        #1150, #1226, #1267; PR #608's
+                                        the trio redding #340, #322, #319,
+                                        #273, #312, #334; PR #206's
                                         15-case red inside it
 
 -- and assert the classification against what those incidents were.
@@ -28,24 +30,24 @@ UTC = timezone.utc
 T0 = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
 
 CRASHLOOP_TRIO = [
-    "cluster-agent-crashloop-debug",
-    "cluster-agent-crashloop-evidence-chain",
-    "cluster-agent-crashloop-misleading-symptom",
+    "case-14",
+    "case-18",
+    "case-19",
 ]
 # The roster in force on 2026-09-08 (hack/eval/blocking-roster.txt at this checkout).
 ADMITTED = frozenset(
     CRASHLOOP_TRIO
     + [
-        "reliability-pdb-probe",
-        "security-overgrant-probe",
-        "upgrades-lagging-master-probe",
-        "consistency-authorized-networks-probe",
-        "cost-idle-pool-probe",
-        "obtainability-remediation-proposal",
-        "agent-kanban-smoke",
+        "case-02",
+        "case-29",
+        "case-27",
+        "case-13",
+        "case-01",
+        "case-35",
+        "case-24",
     ]
 )
-HOLD_OUT = "compliance-rbac-overgrant"
+HOLD_OUT = "case-09"
 GRADED_FAIL = "VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent from the report: ['OOMKilled']"
 NEVER_RAN = "the record shows no agent ever ran: the trajectory is empty and tokens.total is 0"
 # The scorer's delegation-ceiling marker, read out of its source: this test
@@ -74,6 +76,10 @@ def _forge_marker() -> str:
 FORGE_MARKER = _forge_marker()
 FORGE = f"{FORGE_MARKER}: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: {FORGE_MARKER} (answered 503): unexpected GitHub response 503"
 CEILING = f"{SCORER_CEILING_MARKER}: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
+# A rung-2 block (a catastrophic safeguard the scorer keeps there) whose only
+# errored leaf is the forge's (#6105).
+BARE_RUNG_2 = f"checks errored rather than ran: ['writes'] -- writes: {FORGE_MARKER} (answered 403): GitHub denied the pull-request list"
+FORGE_RUNG_2 = f"KUBE_AGENTS_FORGE_SAFEGUARD: {BARE_RUNG_2}"
 OUTAGE = {"state": "OUTAGE", "condition": "shared_break", "failing_cases": CRASHLOOP_TRIO}
 STORM = {"state": "DEGRADED", "condition": "storm", "failing_cases": []}
 SETUP = {"state": "DEGRADED", "condition": "setup_deaths", "failing_cases": []}
@@ -87,6 +93,7 @@ def rep(letter):
         "e": {"result": "fail", "reason": NEVER_RAN},
         "c": {"result": "infra", "reason": CEILING},
         "g": {"result": "infra", "reason": FORGE},
+        "b": {"result": "fail", "reason": FORGE_RUNG_2},
     }[letter]
 
 
@@ -263,6 +270,70 @@ class RepAndOutcomeTest(unittest.TestCase):
         rates = classify.case_pass_rates([target, run(2, 2, T0, tasks=[task("x", "pgg")])], T0)
         self.assertEqual(rates["x"], 1.0, "the denominator is graded reps only")
 
+    def test_a_rung_2_block_marked_as_the_forges_is_a_forge_rep_and_unmarked_stays_fail(self):
+        self.assertEqual(classify.rep_kind({"result": "fail", "reason": FORGE_RUNG_2}), "forge")
+        self.assertEqual(classify.rep_kind({"result": "fail", "reason": BARE_RUNG_2}), "fail", "may hide a failed check")
+        target = run(1, 1, T0, tasks=gate_tasks() + [task("x", "bbb")], result="FAILURE")
+        row = case(classify_run(target, [target], health_at=STORM), "x")
+        self.assertEqual((row["outcome"], row["cls"]), ("infra", classify.CLS_FORGE))
+        self.assertIn("hourly reset", row["do"])
+
+    def test_a_red_run_lost_to_the_forge_stays_red_and_matches_a_declared_outage(self):
+        outage = {"state": "DEGRADED", "condition": "forge_outage", "failing_cases": []}
+        everything = run(1, 1, T0, tasks=[task(name, "bbb") for name in sorted(ADMITTED)], result="FAILURE")
+        verdict = classify_run(everything, [everything], health_at=outage)
+        self.assertEqual((verdict["verdict"], verdict["headline"]), (classify.VERDICT_RED, classify.FORGE_RED_HEADLINE))
+        self.assertTrue(verdict["matches_incident"])
+        self.assertIn(classify.FORGE_OUTAGE_NOTE.strip(), verdict["lede"])
+        beside_passes = run(2, 2, T0, tasks=[task(n, "ppp") for n in sorted(ADMITTED)] + [task("x", "bbb")], result="FAILURE")
+        verdict = classify_run(beside_passes, [beside_passes], health_at=STORM)
+        self.assertEqual((verdict["verdict"], verdict["headline"], verdict["matches_incident"]), (classify.VERDICT_RED, classify.FORGE_RED_HEADLINE, False))
+        self.assertNotIn(classify.FORGE_OUTAGE_NOTE.strip(), verdict["lede"])
+        self.assertTrue(verdict["lede"].startswith(classify.FORGE_RED_LEDE_GRADED))
+        # Passes beside a safeguard block are partial, as the scorer blocks the case: never passed.
+        counts = classify.rep_counts(task("y", "ppb"))
+        self.assertEqual((counts["forge"], counts["safeguard"], classify.outcome_of(counts)), (1, 1, classify.OUTCOME_PARTIAL))
+        self.assertEqual(classify.outcome_of(classify.rep_counts(task("y", "ppg"))), classify.OUTCOME_PASSED, "an infra forge rep does not block")
+        straddle = run(4, 4, T0, tasks=[task(n, "ppp") for n in sorted(ADMITTED)[1:]] + [task(sorted(ADMITTED)[0], "ppb")], result="FAILURE")
+        row = case(classify_run(straddle, [straddle], health_at=STORM), sorted(ADMITTED)[0])
+        self.assertEqual((row["outcome"], row["cls"], row["do"]), (classify.OUTCOME_PARTIAL, classify.CLS_FORGE, classify.DO_FORGE))
+        self.assertIn("KUBE_AGENTS_FORGE_SAFEGUARD", row["reason"])
+        names = sorted(ADMITTED)
+        # A held-out case's graded fail never blocks, so it does not hide the safeguard's red; the held note shows.
+        held_fail = run(6, 6, T0, tasks=[task(n, "ppp") for n in names[1:]] + [task(names[0], "ppb"), task(HOLD_OUT, "fff")], result="FAILURE")
+        verdict = classify_run(held_fail, [held_fail], health_at=STORM)
+        self.assertEqual(verdict["headline"], classify.FORGE_RED_HEADLINE)
+        self.assertIn("held-out case", verdict["lede"])
+        # A held-out case's rung 1-3 block reds the run on its own (admission-blind), so the forge is not blamed.
+        for reason in (
+            "VerificationCatastrophic=0.0 (no-delete): the agent took an action a safeguard forbids",
+            BARE_RUNG_2,
+            "the record is not evidence of a real agent run: trajectory is empty",
+        ):
+            held = task(HOLD_OUT, "pp")
+            held["reps"].append({"n": 3, "result": "fail", "reason": reason})
+            held["result"] = "fail"
+            held_trip = run(8, 8, T0, tasks=[task(n, "ppp") for n in names[1:]] + [task(names[0], "ppb"), held], result="FAILURE")
+            self.assertFalse(classify.safeguard_blocked(held_trip, frozenset({HOLD_OUT})), reason)
+            self.assertNotEqual(classify_run(held_trip, [held_trip], health_at=STORM)["headline"], classify.FORGE_RED_HEADLINE, reason)
+        # An admitted graded fail beside the block is a red the forge does not explain.
+        own_fail = run(7, 7, T0, tasks=[task(n, "ppp") for n in names[2:]] + [task(names[0], "ppb"), task(names[1], "fff")], result="FAILURE")
+        self.assertNotEqual(classify_run(own_fail, [own_fail], health_at=STORM)["headline"], classify.FORGE_RED_HEADLINE)
+        # The row shows the safeguard block's reason, not an earlier storm rep's.
+        self.assertIn("KUBE_AGENTS_FORGE_SAFEGUARD", classify.first_reason(task("y", "ibb")))
+        # Nothing graded, a safeguard block beside a ceiling case: still red, whatever the neighbour lost to.
+        names = sorted(ADMITTED)
+        beside_ceiling = run(5, 5, T0, tasks=[task(names[0], "bbb")] + [task(n, "ccc") for n in names[1:]], result="FAILURE")
+        verdict = classify_run(beside_ceiling, [beside_ceiling], health_at=STORM)
+        self.assertEqual((verdict["verdict"], verdict["headline"]), (classify.VERDICT_RED, classify.FORGE_RED_HEADLINE))
+        # A real red beside the forge's (a tripped safeguard on a partial case) is not blamed on the forge.
+        tripped = {"result": "fail", "reason": "VerificationCatastrophic=0.0 -- the agent took an action a safeguard forbids"}
+        other = task(sorted(ADMITTED)[0], "pp")
+        other["reps"].append(dict(tripped, n=3))
+        other["result"] = "fail"
+        mixed = run(3, 3, T0, tasks=[other] + [task(n, "ppp") for n in sorted(ADMITTED)[1:]] + [task("x", "bbb")], result="FAILURE")
+        self.assertNotEqual(classify_run(mixed, [mixed], health_at=STORM)["headline"], classify.FORGE_RED_HEADLINE)
+
     def test_a_case_lost_to_a_forge_outage_is_classed_as_such(self):
         target = run(1, 1, T0, tasks=gate_tasks() + [task("x", "ggg")], result="SUCCESS")
         row = case(classify_run(target, [target], health_at=STORM), "x")
@@ -300,7 +371,7 @@ class RepAndOutcomeTest(unittest.TestCase):
         target = run(1, 1, T0, tasks=[task(n, "ccc") for n in sorted(ADMITTED)], result="FAILURE")
         self.assertTrue(classify_run(target, [target], health_at=wave)["matches_incident"])
         self.assertFalse(classify_run(target, [target], health_at=STORM)["matches_incident"], "ceiling reps are not the storm's signature")
-        lone = run(2, 2, T0, tasks=gate_tasks(["agent-kanban-smoke"], letters="ppc"))
+        lone = run(2, 2, T0, tasks=gate_tasks(["case-24"], letters="ppc"))
         self.assertFalse(classify_run(lone, [lone], health_at=wave)["matches_incident"], "matching the wave needs the run's own signature")
     def test_nothing_graded_because_of_the_ceiling_says_so(self):
         target = run(1, 1, T0, tasks=[task(n, "ccc") for n in sorted(ADMITTED)], result="FAILURE")
@@ -351,51 +422,52 @@ class RepAndOutcomeTest(unittest.TestCase):
     def test_the_roster_is_read_from_the_roster_file(self):
         roster = classify.admitted_cases()
         self.assertIsNotNone(roster)
-        for name in CRASHLOOP_TRIO:
+        # The checkout's own roster, so the real names, not the fixture's ids.
+        for name in ("cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain", "cluster-agent-crashloop-misleading-symptom"):
             self.assertIn(name, roster)
         self.assertIsNone(classify.admitted_cases(pathlib.Path("/nonexistent/blocking-roster.txt")))
 
 
 class SharedRuleTest(unittest.TestCase):
-    def others(self, prs, finished_offsets_min, failing=("cluster-agent-crashloop-debug",)):
+    def others(self, prs, finished_offsets_min, failing=("case-19",)):
         return [run(100 + i, pr, T0 - timedelta(minutes=off), tasks=gate_tasks(failing)) for i, (pr, off) in enumerate(zip(prs, finished_offsets_min))]
 
     def test_two_other_prs_inside_six_hours_make_a_case_shared(self):
-        target = run(1, 1275, T0, tasks=gate_tasks(["cluster-agent-crashloop-debug"]))
-        runs = [target] + self.others([1246, 1238], [60, 300])
+        target = run(1, 340, T0, tasks=gate_tasks(["case-19"]))
+        runs = [target] + self.others([322, 319], [60, 300])
         verdict = classify_run(target, runs)
-        c = case(verdict, "cluster-agent-crashloop-debug")
+        c = case(verdict, "case-19")
         self.assertEqual((c["cls"], c["also_failing_prs"]), ("shared", 2))
         self.assertEqual(verdict["verdict"], "infra")
         self.assertEqual(verdict["headline"], "1 of 10 gate cases failed. None of them look like your PR.")
         self.assertFalse(verdict["matches_incident"], "no verdict was given, so nothing to match")
 
     def test_one_other_pr_is_not_shared_and_the_same_pr_twice_does_not_count(self):
-        target = run(1, 1275, T0, tasks=gate_tasks(["cluster-agent-crashloop-debug"]))
-        runs = [target] + self.others([1246, 1246, 1275], [60, 120, 180])
-        c = case(classify_run(target, runs), "cluster-agent-crashloop-debug")
+        target = run(1, 340, T0, tasks=gate_tasks(["case-19"]))
+        runs = [target] + self.others([322, 322, 340], [60, 120, 180])
+        c = case(classify_run(target, runs), "case-19")
         self.assertEqual(c["also_failing_prs"], 1)
         self.assertIsNone(c["cls"])
 
     def test_the_window_is_six_hours_before_the_start_to_the_finish(self):
-        target = run(1, 1275, T0, minutes=120, tasks=gate_tasks(["cluster-agent-crashloop-debug"]))
+        target = run(1, 340, T0, minutes=120, tasks=gate_tasks(["case-19"]))
 
         def also(offsets):
-            return case(classify_run(target, [target] + self.others([1246, 1238, 1150], offsets)), "cluster-agent-crashloop-debug")["also_failing_prs"]
+            return case(classify_run(target, [target] + self.others([322, 319, 273], offsets)), "case-19")["also_failing_prs"]
 
         self.assertEqual(also([120 + 6 * 60, 60, 0]), 3, "exactly 6h before the start, and exactly at the finish, are inside")
         self.assertEqual(also([120 + 6 * 60 + 1, 60, 0]), 2, "one minute earlier is outside")
         self.assertEqual(also([120 + 6 * 60, 60, -1]), 2, "one minute after the finish is outside")
 
     def test_the_verdict_naming_the_case_makes_it_shared_without_other_runs(self):
-        target = run(1, 1275, T0, tasks=gate_tasks(["cluster-agent-crashloop-debug"]))
+        target = run(1, 340, T0, tasks=gate_tasks(["case-19"]))
         verdict = classify_run(target, [target], health_at=OUTAGE)
-        self.assertEqual(case(verdict, "cluster-agent-crashloop-debug")["cls"], "shared")
+        self.assertEqual(case(verdict, "case-19")["cls"], "shared")
         self.assertTrue(verdict["matches_incident"])
         self.assertIn("matches the outage", verdict["lede"])
 
     def test_a_hold_out_is_reported_but_never_blamed(self):
-        target = run(1, 1275, T0, result="SUCCESS", tasks=gate_tasks())
+        target = run(1, 340, T0, result="SUCCESS", tasks=gate_tasks())
         verdict = classify_run(target, [target] + self.others([1, 2], [10, 20], failing=(HOLD_OUT,)))
         self.assertEqual(verdict["verdict"], "green")
         self.assertEqual(verdict["headline"], "All 10 gate cases passed.")
@@ -409,31 +481,31 @@ class OnlyThisPrRuleTest(unittest.TestCase):
         return [run(200 + i, (prs or [500 + i])[0] if prs else 500 + i, T0 - timedelta(minutes=step_min * (i + 1)), tasks=gate_tasks()) for i in range(count)]
 
     def test_three_recent_other_pr_passes_make_the_failure_this_prs(self):
-        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe"]))
+        target = run(1, 218, T0, tasks=gate_tasks(["case-29"]))
         verdict = classify_run(target, [target] + self.passing_others(3))
-        c = case(verdict, "security-overgrant-probe")
+        c = case(verdict, "case-29")
         self.assertEqual(c["cls"], "only-this-pr")
         self.assertEqual(c["do"], classify.DO_ONLY_THIS_PR)
         self.assertEqual(verdict["verdict"], "red")
         self.assertEqual(verdict["headline"], "1 of 10 gate cases failed, and it looks like your PR.")
 
     def test_two_passes_are_not_enough_and_a_partial_elsewhere_breaks_the_streak(self):
-        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe"]))
-        self.assertIsNone(case(classify_run(target, [target] + self.passing_others(2)), "security-overgrant-probe")["cls"])
+        target = run(1, 218, T0, tasks=gate_tasks(["case-29"]))
+        self.assertIsNone(case(classify_run(target, [target] + self.passing_others(2)), "case-29")["cls"])
         others = self.passing_others(3)
-        others[0]["tasks"] = [task(n, "pfp" if n == "security-overgrant-probe" else "ppp") for n in sorted(ADMITTED)]
-        self.assertIsNone(case(classify_run(target, [target] + others), "security-overgrant-probe")["cls"])
+        others[0]["tasks"] = [task(n, "pfp" if n == "case-29" else "ppp") for n in sorted(ADMITTED)]
+        self.assertIsNone(case(classify_run(target, [target] + others), "case-29")["cls"])
 
     def test_only_the_last_24_hours_count(self):
-        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe"]))
+        target = run(1, 218, T0, tasks=gate_tasks(["case-29"]))
         old = self.passing_others(3, step_min=25 * 60)
-        self.assertIsNone(case(classify_run(target, [target] + old), "security-overgrant-probe")["cls"])
+        self.assertIsNone(case(classify_run(target, [target] + old), "case-29")["cls"])
 
     def test_mixed_headline_counts_both_sides(self):
-        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe", "cluster-agent-crashloop-debug"]))
+        target = run(1, 218, T0, tasks=gate_tasks(["case-29", "case-19"]))
         others = self.passing_others(3)
         for other in others:
-            other["tasks"] = [task(n, "fff" if n == "cluster-agent-crashloop-debug" else "ppp") for n in sorted(ADMITTED)]
+            other["tasks"] = [task(n, "fff" if n == "case-19" else "ppp") for n in sorted(ADMITTED)]
         verdict = classify_run(target, [target] + others)
         self.assertEqual(verdict["headline"], "1 of 2 failures match failures on other PRs; 1 is only on your PR.")
         self.assertEqual(verdict["verdict"], "red")
@@ -441,27 +513,27 @@ class OnlyThisPrRuleTest(unittest.TestCase):
         self.assertEqual(verdict["headline"], "1 of 2 failures match the outage; 1 is only on your PR.")
 
     def test_an_unexplained_failure_is_said_to_be_unexplained(self):
-        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe"]))
+        target = run(1, 218, T0, tasks=gate_tasks(["case-29"]))
         verdict = classify_run(target, [target])
-        self.assertIsNone(case(verdict, "security-overgrant-probe")["cls"])
+        self.assertIsNone(case(verdict, "case-29")["cls"])
         self.assertEqual(verdict["headline"], "1 of 10 gate cases failed. We can't tell yet whether it is your PR.")
-        self.assertEqual(case(verdict, "security-overgrant-probe")["do"], classify.DO_UNCLEAR)
+        self.assertEqual(case(verdict, "case-29")["do"], classify.DO_UNCLEAR)
 
 
 class StormAndSetupTest(unittest.TestCase):
     def test_five_storm_reps_in_the_run_make_its_failures_storm(self):
-        target = run(1, 1, T0, tasks=gate_tasks(["agent-kanban-smoke", "cost-idle-pool-probe"], letters="ffi") + [task("x", "iii")])
+        target = run(1, 1, T0, tasks=gate_tasks(["case-24", "case-01"], letters="ffi") + [task("x", "iii")])
         verdict = classify_run(target, [target])
         self.assertEqual(verdict["storm_reps"], 5)
-        self.assertEqual(case(verdict, "agent-kanban-smoke")["cls"], "storm")
+        self.assertEqual(case(verdict, "case-24")["cls"], "storm")
         self.assertEqual(case(verdict, "x")["cls"], "storm", "an ungraded case inside the storm is the storm's")
         self.assertEqual(verdict["verdict"], "infra")
 
     def test_four_storm_reps_are_noise_unless_the_verdict_says_storm(self):
-        target = run(1, 1, T0, tasks=gate_tasks(["agent-kanban-smoke"], letters="ffi") + [task("x", "iii")])
-        self.assertIsNone(case(classify_run(target, [target]), "agent-kanban-smoke")["cls"])
+        target = run(1, 1, T0, tasks=gate_tasks(["case-24"], letters="ffi") + [task("x", "iii")])
+        self.assertIsNone(case(classify_run(target, [target]), "case-24")["cls"])
         verdict = classify_run(target, [target], health_at=STORM)
-        self.assertEqual(case(verdict, "agent-kanban-smoke")["cls"], "storm")
+        self.assertEqual(case(verdict, "case-24")["cls"], "storm")
         self.assertFalse(verdict["matches_incident"], "matching a storm needs the run's own signature")
 
     def test_nothing_graded_reads_as_the_storms_shape(self):
@@ -522,18 +594,18 @@ class StormAndSetupTest(unittest.TestCase):
     def test_a_zero_task_green_is_a_revalidated_push(self):
         # hack/ci-revalidate.sh, step 0: the head already passed, or only inert
         # paths changed since the branch's last green, and that green stands.
-        verdict = classify_run(run(1, 913, T0, minutes=4, result="SUCCESS"), [])
+        verdict = classify_run(run(1, 218, T0, minutes=4, result="SUCCESS"), [])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("green", "Green without running the cases."))
 
     def test_a_red_run_without_a_collapsed_gate_case_is_still_red(self):
-        target = run(1, 913, T0, result="FAILURE", tasks=gate_tasks())
+        target = run(1, 218, T0, result="FAILURE", tasks=gate_tasks())
         target["tasks"] = [task(n, "ppp") for n in sorted(ADMITTED)]
         verdict = classify_run(target, [target])
         self.assertEqual(verdict["verdict"], "red")
         self.assertTrue(verdict["headline"].startswith("The run is red, but no gate case failed outright."))
 
     def test_a_slow_zero_task_failure_is_the_branchs_own(self):
-        target = run(1, 913, T0, minutes=25, result="FAILURE")
+        target = run(1, 218, T0, minutes=25, result="FAILURE")
         verdict = classify_run(target, [target])
         self.assertEqual(verdict["verdict"], "red")
         self.assertEqual(verdict["headline"], "The run failed before any case ran 25 minutes in.")
@@ -541,7 +613,7 @@ class StormAndSetupTest(unittest.TestCase):
     def test_a_deadline_kill_is_run_level_and_named_as_prows(self):
         # #1894: a FAILURE with no verdict that ran to the job's timeout is
         # Prow's kill, not the branch's failure -- and not a setup death.
-        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[])
+        target = run(1, 218, T0, minutes=363, result="FAILURE", tasks=[])
         target.update({"eval_verdict": None, "has_build_log": True, "pod_last_event": None, "merge_conflict": False})
         verdict = classify_run(target, [target])
         self.assertEqual((verdict["verdict"], verdict["cls"], verdict["do"]), ("infra", classify.CLS_DEADLINE, classify.DO_DEADLINE_KILL))
@@ -566,7 +638,7 @@ class StormAndSetupTest(unittest.TestCase):
         # #1875: the cases graded before Prow stopped the run are shown, but
         # the run's class, verdict and `do` are the kill's -- the same reading
         # health.py counts and the gate comment gives it.
-        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[task(n, "ppp") for n in sorted(ADMITTED)[:2]])
+        target = run(1, 218, T0, minutes=363, result="FAILURE", tasks=[task(n, "ppp") for n in sorted(ADMITTED)[:2]])
         target.update({"eval_verdict": None, "has_build_log": True, "pod_last_event": None, "merge_conflict": False})
         verdict = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": []})
         self.assertEqual((verdict["verdict"], verdict["cls"], verdict["do"]), ("infra", classify.CLS_DEADLINE, classify.DO_DEADLINE_KILL))
@@ -579,7 +651,7 @@ class StormAndSetupTest(unittest.TestCase):
         # SCHEMA.md: no key is unknown, not "no verdict". The 2026-09-04
         # long zero-task failures in testdata_classify predate the field and
         # must keep reading as the branch's own, as health.Run reads them.
-        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[])
+        target = run(1, 218, T0, minutes=363, result="FAILURE", tasks=[])
         target.update({"has_build_log": True, "pod_last_event": None, "merge_conflict": False})
         self.assertNotIn("eval_verdict", target)
         self.assertFalse(classify.is_deadline_kill(target))
@@ -591,7 +663,7 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertEqual((classify.PROW_JOB_TIMEOUT, classify.DEADLINE_KILL_MARGIN), (health.PROW_JOB_TIMEOUT, health.DEADLINE_KILL_MARGIN))
 
     def test_an_aborted_run_is_not_a_verdict(self):
-        verdict = classify_run(run(1, 913, T0, minutes=8, result="ABORTED"), [])
+        verdict = classify_run(run(1, 218, T0, minutes=8, result="ABORTED"), [])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))
 
     def test_an_aborted_run_with_graded_cases_is_still_not_a_verdict(self):
@@ -600,14 +672,14 @@ class StormAndSetupTest(unittest.TestCase):
         that finished before Prow stopped it. Five passing cases out of a
         matrix the run never completed must not read as "all passed"."""
         graded = [task(n, "ppp") for n in sorted(ADMITTED)[:5]]
-        target = run(1, 913, T0, minutes=40, result="ABORTED", tasks=graded)
+        target = run(1, 218, T0, minutes=40, result="ABORTED", tasks=graded)
         verdict = classify_run(target, [target])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))
         self.assertIn("5 gate cases had been graded by then", verdict["lede"])
         self.assertEqual(len(verdict["cases"]), 5, "the graded cases still travel with the run")
 
     def test_prows_green_wins_over_collapsed_cases(self):
-        target = run(1, 1, T0, result="SUCCESS", tasks=gate_tasks(["agent-kanban-smoke"], letters="ffi"))
+        target = run(1, 1, T0, result="SUCCESS", tasks=gate_tasks(["case-24"], letters="ffi"))
         verdict = classify_run(target, [target])
         self.assertEqual(verdict["verdict"], "green")
         self.assertTrue(verdict["headline"].startswith("Prow passed this run"))
@@ -617,12 +689,12 @@ class PassRateTest(unittest.TestCase):
     def test_thirty_days_before_now_and_run_level_events_excluded(self):
         good = [run(300 + i, 1, T0 - timedelta(days=i), tasks=gate_tasks()) for i in range(3)]
         bad = run(310, 2, T0 - timedelta(days=1), tasks=gate_tasks(sorted(ADMITTED)))  # every gate case failed: a run-level event
-        old = run(311, 3, T0 - timedelta(days=31), tasks=gate_tasks(["agent-kanban-smoke"]))
+        old = run(311, 3, T0 - timedelta(days=31), tasks=gate_tasks(["case-24"]))
         rates = classify.case_pass_rates(good + [bad, old], T0)
-        self.assertEqual(rates["agent-kanban-smoke"], 1.0)
+        self.assertEqual(rates["case-24"], 1.0)
         self.assertEqual(rates[HOLD_OUT], 0.0)
-        target = run(1, 9, T0, tasks=gate_tasks(["agent-kanban-smoke"]))
-        c = case(classify.classify_run(target, good + [bad, old, target], admitted=ADMITTED, now=T0), "agent-kanban-smoke")
+        target = run(1, 9, T0, tasks=gate_tasks(["case-24"]))
+        c = case(classify.classify_run(target, good + [bad, old, target], admitted=ADMITTED, now=T0), "case-24")
         self.assertAlmostEqual(c["pass_rate_30d"], 9 / 12)
 
     def test_a_reused_list_id_does_not_return_another_lists_rates(self):
@@ -631,12 +703,12 @@ class PassRateTest(unittest.TestCase):
         # reuse, put the first list's entry under the second list's key,
         # which is the state the reuse leaves behind, and ask for the second.
         first = [run(400, 1, T0 - timedelta(days=1), tasks=gate_tasks())]
-        second = [run(401, 2, T0 - timedelta(days=1), tasks=gate_tasks(["agent-kanban-smoke"]))]
-        self.assertEqual(classify.case_pass_rates(first, T0)["agent-kanban-smoke"], 1.0)
+        second = [run(401, 2, T0 - timedelta(days=1), tasks=gate_tasks(["case-24"]))]
+        self.assertEqual(classify.case_pass_rates(first, T0)["case-24"], 1.0)
         first_key, second_key = (id(first), len(first), T0), (id(second), len(second), T0)
         self.assertIn(first_key, classify._RATE_CACHE)
         classify._RATE_CACHE[second_key] = classify._RATE_CACHE[first_key]
-        self.assertEqual(classify.case_pass_rates(second, T0)["agent-kanban-smoke"], 0.0, "the hit must be verified against the list, not only its id")
+        self.assertEqual(classify.case_pass_rates(second, T0)["case-24"], 0.0, "the hit must be verified against the list, not only its id")
         self.assertIs(classify._RATE_CACHE[second_key][0], second, "the memo holds the list so its id stays pinned")
 
 
@@ -650,54 +722,54 @@ class NightlyTierTest(unittest.TestCase):
         return dict(run_doc, tier="nightly", pr=None)
 
     def test_nightly_failures_are_not_other_prs_for_the_shared_rule(self):
-        target = run(1, 1275, T0, tasks=gate_tasks(["cluster-agent-crashloop-debug"]))
-        others = [run(100 + i, None, T0 - timedelta(minutes=60 * (i + 1)), tasks=gate_tasks(["cluster-agent-crashloop-debug"])) for i in range(2)]
+        target = run(1, 340, T0, tasks=gate_tasks(["case-19"]))
+        others = [run(100 + i, None, T0 - timedelta(minutes=60 * (i + 1)), tasks=gate_tasks(["case-19"])) for i in range(2)]
         # Two runs with pr None but no tier are still other-PR runs (the
         # pre-tier reading of an unknown PR) and count as ONE phantom PR;
         # tagged nightly they count as none. A third such run would have
         # been the difference between "unexplained" and "shared".
-        c = case(classify_run(target, [target] + others), "cluster-agent-crashloop-debug")
+        c = case(classify_run(target, [target] + others), "case-19")
         self.assertEqual((c["cls"], c["also_failing_prs"]), (None, 1))
-        c = case(classify_run(target, [target] + [self.nightly(o) for o in others]), "cluster-agent-crashloop-debug")
+        c = case(classify_run(target, [target] + [self.nightly(o) for o in others]), "case-19")
         self.assertEqual((c["cls"], c["also_failing_prs"]), (None, 0))
-        with_one_pr = others + [run(300, 1246, T0 - timedelta(minutes=30), tasks=gate_tasks(["cluster-agent-crashloop-debug"]))]
-        self.assertEqual(case(classify_run(target, [target] + with_one_pr), "cluster-agent-crashloop-debug")["cls"], "shared", "untagged: the phantom PR plus #1246 clear the two-PR floor")
-        self.assertIsNone(case(classify_run(target, [target] + [self.nightly(o) for o in others] + with_one_pr[-1:]), "cluster-agent-crashloop-debug")["cls"], "tagged: #1246 alone does not")
+        with_one_pr = others + [run(300, 322, T0 - timedelta(minutes=30), tasks=gate_tasks(["case-19"]))]
+        self.assertEqual(case(classify_run(target, [target] + with_one_pr), "case-19")["cls"], "shared", "untagged: the phantom PR plus #322 clear the two-PR floor")
+        self.assertIsNone(case(classify_run(target, [target] + [self.nightly(o) for o in others] + with_one_pr[-1:]), "case-19")["cls"], "tagged: #322 alone does not")
         self.assertTrue(c["nightly_failed_recent"], "but the nightly's collapse is reported beside the verdict")
 
     def test_nightly_passes_do_not_make_a_failure_only_this_prs(self):
-        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe"]))
+        target = run(1, 218, T0, tasks=gate_tasks(["case-29"]))
         passing = [run(200 + i, 500 + i, T0 - timedelta(minutes=60 * (i + 1)), tasks=gate_tasks()) for i in range(3)]
-        self.assertEqual(case(classify_run(target, [target] + passing), "security-overgrant-probe")["cls"], "only-this-pr")
-        c = case(classify_run(target, [target] + [self.nightly(p) for p in passing]), "security-overgrant-probe")
+        self.assertEqual(case(classify_run(target, [target] + passing), "case-29")["cls"], "only-this-pr")
+        c = case(classify_run(target, [target] + [self.nightly(p) for p in passing]), "case-29")
         self.assertIsNone(c["cls"])
         self.assertIs(c["nightly_failed_recent"], False, "the latest nightly passed it")
 
     def test_the_30_day_rate_is_the_presubmits_alone(self):
         good = [run(300 + i, 1, T0 - timedelta(days=i + 1), tasks=gate_tasks()) for i in range(3)]
-        nightly_bad = [self.nightly(run(400 + i, None, T0 - timedelta(days=i + 1), tasks=gate_tasks(["agent-kanban-smoke"]))) for i in range(3)]
-        target = run(1, 9, T0, tasks=gate_tasks(["agent-kanban-smoke"]))
-        c = case(classify.classify_run(target, good + nightly_bad + [target], admitted=ADMITTED, now=T0), "agent-kanban-smoke")
+        nightly_bad = [self.nightly(run(400 + i, None, T0 - timedelta(days=i + 1), tasks=gate_tasks(["case-24"]))) for i in range(3)]
+        target = run(1, 9, T0, tasks=gate_tasks(["case-24"]))
+        c = case(classify.classify_run(target, good + nightly_bad + [target], admitted=ADMITTED, now=T0), "case-24")
         self.assertAlmostEqual(c["pass_rate_30d"], 9 / 12, msg="9 presubmit passes, this run's 3 fails; the nightly's 9 fails not counted")
 
     def test_nightly_failed_recent_is_the_newest_night_within_two_days_or_none(self):
-        target = run(1, 9, T0, tasks=gate_tasks(["agent-kanban-smoke"]))
-        old_fail = self.nightly(run(500, None, T0 - timedelta(days=3), tasks=gate_tasks(["agent-kanban-smoke"])))
-        self.assertIsNone(case(classify_run(target, [target, old_fail]), "agent-kanban-smoke")["nightly_failed_recent"], "outside the window")
+        target = run(1, 9, T0, tasks=gate_tasks(["case-24"]))
+        old_fail = self.nightly(run(500, None, T0 - timedelta(days=3), tasks=gate_tasks(["case-24"])))
+        self.assertIsNone(case(classify_run(target, [target, old_fail]), "case-24")["nightly_failed_recent"], "outside the window")
         newer_pass = self.nightly(run(501, None, T0 - timedelta(hours=20), tasks=gate_tasks()))
-        older_fail = self.nightly(run(502, None, T0 - timedelta(hours=44), tasks=gate_tasks(["agent-kanban-smoke"])))
-        self.assertIs(case(classify_run(target, [target, older_fail, newer_pass]), "agent-kanban-smoke")["nightly_failed_recent"], False, "the newest night wins")
-        after = self.nightly(run(503, None, T0 + timedelta(hours=6), tasks=gate_tasks(["agent-kanban-smoke"])))
-        self.assertIs(case(classify_run(target, [target, newer_pass, after]), "agent-kanban-smoke")["nightly_failed_recent"], True, "a night after the run counts too")
-        ungraded = self.nightly(run(504, None, T0 - timedelta(hours=1), tasks=[task("agent-kanban-smoke", "iii")]))
-        self.assertIsNone(case(classify_run(target, [target, ungraded]), "agent-kanban-smoke")["nightly_failed_recent"], "infra grades nothing")
+        older_fail = self.nightly(run(502, None, T0 - timedelta(hours=44), tasks=gate_tasks(["case-24"])))
+        self.assertIs(case(classify_run(target, [target, older_fail, newer_pass]), "case-24")["nightly_failed_recent"], False, "the newest night wins")
+        after = self.nightly(run(503, None, T0 + timedelta(hours=6), tasks=gate_tasks(["case-24"])))
+        self.assertIs(case(classify_run(target, [target, newer_pass, after]), "case-24")["nightly_failed_recent"], True, "a night after the run counts too")
+        ungraded = self.nightly(run(504, None, T0 - timedelta(hours=1), tasks=[task("case-24", "iii")]))
+        self.assertIsNone(case(classify_run(target, [target, ungraded]), "case-24")["nightly_failed_recent"], "infra grades nothing")
         whole_night_red = self.nightly(run(505, None, T0 - timedelta(hours=2), tasks=gate_tasks(sorted(ADMITTED))))
-        self.assertIsNone(case(classify_run(target, [target, whole_night_red]), "agent-kanban-smoke")["nightly_failed_recent"], "a run-level-event night says nothing about one case")
-        self.assertIs(case(classify_run(target, [target, whole_night_red, older_fail]), "agent-kanban-smoke")["nightly_failed_recent"], True, "the newest night that counts is the one before it")
+        self.assertIsNone(case(classify_run(target, [target, whole_night_red]), "case-24")["nightly_failed_recent"], "a run-level-event night says nothing about one case")
+        self.assertIs(case(classify_run(target, [target, whole_night_red, older_fail]), "case-24")["nightly_failed_recent"], True, "the newest night that counts is the one before it")
         # A passing case on the target still gets the note; a case the
         # nightly never ran gets None.
         verdict = classify_run(target, [target, after])
-        self.assertIs(case(verdict, "reliability-pdb-probe")["nightly_failed_recent"], False)
+        self.assertIs(case(verdict, "case-02")["nightly_failed_recent"], False)
 
     def test_the_tier_split_is_stable_across_calls(self):
         runs = [run(1, 1, T0, tasks=gate_tasks()), self.nightly(run(2, None, T0, tasks=gate_tasks()))]
@@ -717,17 +789,17 @@ class RealWeekTest(unittest.TestCase):
     def verdict(self, build, health_at=OUTAGE):
         return classify.classify_run(self.by_build[build], self.runs, health_at=health_at, admitted=ADMITTED)
 
-    def test_the_fixture_is_real_and_trimmed(self):
+    def test_the_fixture_is_trimmed_and_declares_its_derived_run(self):
         self.assertGreater(len(self.runs), 100)
         self.assertIn("trimmed", self.data)
-        self.assertIn("2097362141184626688", self.data["trimmed"]["derived"], "the one derived run is declared")
+        self.assertIn("2091000000000000609", self.data["trimmed"]["derived"], "the one derived run is declared")
         prs = {r["pr"] for r in self.runs}
-        for pr in (1275, 1246, 1238, 1150, 1226, 1267, 913, 608):
+        for pr in (340, 322, 319, 273, 312, 334, 218, 206):
             self.assertIn(pr, prs)
 
     def test_the_crashloop_trio_is_shared_on_every_outage_pr(self):
         # #1278: the trio collapsed on every PR from 2026-09-08 morning.
-        for build, pr in (("2097282860221206528", 1275), ("2097160163919138816", 1246), ("2097197449759166464", 1238), ("2097213176524312576", 1150)):
+        for build, pr in (("2091000000000000563", 340), ("2091000000000000552", 322), ("2091000000000000555", 319), ("2091000000000000556", 273)):
             verdict = self.verdict(build)
             self.assertEqual(verdict["pr"], pr)
             for name in CRASHLOOP_TRIO:
@@ -736,9 +808,9 @@ class RealWeekTest(unittest.TestCase):
             self.assertTrue(verdict["matches_incident"], pr)
             self.assertEqual(verdict["headline"], "3 of 10 gate cases failed. None of them look like your PR.", pr)
 
-    def test_1275_is_shared_by_the_runs_alone_without_a_verdict(self):
+    def test_340_is_shared_by_the_runs_alone_without_a_verdict(self):
         # Four other PRs collapsed the trio inside the window; no health.json needed.
-        verdict = self.verdict("2097282860221206528", health_at=None)
+        verdict = self.verdict("2091000000000000563", health_at=None)
         for name in CRASHLOOP_TRIO:
             c = case(verdict, name)
             self.assertEqual(c["cls"], "shared")
@@ -746,24 +818,24 @@ class RealWeekTest(unittest.TestCase):
         self.assertFalse(verdict["matches_incident"])
         self.assertIn("match failures on other PRs", verdict["lede"])
 
-    def test_1226_carries_one_failure_the_outage_does_not_explain(self):
-        verdict = self.verdict("2097253644305960960")
-        self.assertIsNone(case(verdict, "upgrades-lagging-master-probe")["cls"])
+    def test_312_carries_one_failure_the_outage_does_not_explain(self):
+        verdict = self.verdict("2091000000000000557")
+        self.assertIsNone(case(verdict, "case-27")["cls"])
         self.assertEqual(verdict["headline"], "3 of 4 failures match the outage; 1 is unexplained so far.")
         self.assertEqual(verdict["verdict"], "red")
         self.assertTrue(verdict["matches_incident"])
 
-    def test_1267_passed_one_trio_case_on_a_retry(self):
-        verdict = self.verdict("2097289472310775808")
-        self.assertEqual(case(verdict, "cluster-agent-crashloop-debug")["outcome"], "partial")
+    def test_334_passed_one_trio_case_on_a_retry(self):
+        verdict = self.verdict("2091000000000000566")
+        self.assertEqual(case(verdict, "case-19")["outcome"], "partial")
         self.assertEqual(verdict["headline"], "2 of 10 gate cases failed. None of them look like your PR.")
 
-    def test_608s_fifteen_failures_are_three_shared_and_the_rest_retries_or_hold_outs(self):
+    def test_206s_fifteen_failures_are_three_shared_and_the_rest_retries_or_hold_outs(self):
         # The collector marks 15 of this run's tasks `fail` (UNSTABLE partials
         # included); 7 of them collapsed on every graded repetition.
-        run_608 = self.by_build["2097197276001734656"]
-        self.assertEqual(sum(1 for t in run_608["tasks"] if t["result"] == "fail"), 15)
-        verdict = self.verdict("2097197276001734656")
+        run_206 = self.by_build["2091000000000000554"]
+        self.assertEqual(sum(1 for t in run_206["tasks"] if t["result"] == "fail"), 15)
+        verdict = self.verdict("2091000000000000554")
         failed = [c for c in verdict["cases"] if c["outcome"] == "failed"]
         self.assertEqual(len(failed), 7)
         gate_failed = [c for c in failed if c["admitted"]]
@@ -773,18 +845,18 @@ class RealWeekTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "infra")
         self.assertIn("4 held-out cases also failed", verdict["lede"])
 
-    def test_913s_last_runs(self):
+    def test_218s_last_runs(self):
         # 09-04 13:44Z: a red inside the storm; 20:29Z aborted (superseded); 09-05 01:29Z green.
-        stormy = self.verdict("2095870560067129344", health_at=None)
+        stormy = self.verdict("2091000000000000411", health_at=None)
         self.assertGreaterEqual(stormy["storm_reps"], classify.STORM_RUN_SIGNATURE_REPS)
-        self.assertEqual(case(stormy, "obtainability-remediation-proposal")["cls"], "storm")
+        self.assertEqual(case(stormy, "case-35")["cls"], "storm")
         self.assertEqual(stormy["verdict"], "infra")
-        self.assertEqual(self.verdict("2095972484435152896", health_at=None)["headline"], "Aborted before it finished.")
-        green = self.verdict("2096047888260927488", health_at=None)
+        self.assertEqual(self.verdict("2091000000000000453", health_at=None)["headline"], "Aborted before it finished.")
+        green = self.verdict("2091000000000000459", health_at=None)
         self.assertEqual((green["verdict"], green["headline"]), ("green", "All 10 gate cases passed."))
 
     def test_a_setup_death_in_the_outage_window(self):
-        verdict = self.verdict("2096985236955992064", health_at=SETUP)
+        verdict = self.verdict("2091000000000000534", health_at=SETUP)
         self.assertTrue(verdict["setup_death"])
         self.assertEqual(verdict["cls"], "setup")
         self.assertTrue(verdict["matches_incident"])
@@ -793,13 +865,13 @@ class RealWeekTest(unittest.TestCase):
         # SCHEMA.md, Fixtures: the testdata_notevaluated/ build re-dated into
         # the window. The outage's shared rule must not claim it: its one
         # lost case graded nothing, and the suite's word comes first.
-        verdict = self.verdict("2097362141184626688")
-        self.assertEqual(verdict["pr"], 1782)
+        verdict = self.verdict("2091000000000000609")
+        self.assertEqual(verdict["pr"], 108)
         self.assertEqual(verdict["verdict"], "not_evaluated")
-        self.assertEqual(verdict["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(verdict["not_evaluated"], ["case-29"])
         self.assertEqual(verdict["headline"], "Not evaluated: 1 gate case lost every repetition to infrastructure.")
         self.assertFalse(verdict["matches_incident"])
-        self.assertEqual(case(verdict, "security-overgrant-probe")["outcome"], "infra")
+        self.assertEqual(case(verdict, "case-29")["outcome"], "infra")
 
     def test_the_contract_keys_are_present_on_every_run(self):
         for r in self.runs:
@@ -814,7 +886,7 @@ class RealWeekTest(unittest.TestCase):
 
 
 
-def not_evaluated_run(build=1, pr=1782, lost=("security-overgrant-probe",), every=False, finished=T0):
+def not_evaluated_run(build=1, pr=108, lost=("case-29",), every=False, finished=T0):
     """What the collector records for a run the suite could not evaluate
     (SCHEMA.md, `eval_outcome`): the lost cases graded nothing, the rest
     passed, Prow says FAILURE, and the suite's list names the lost ones."""
@@ -836,13 +908,13 @@ class NotEvaluatedTest(unittest.TestCase):
         verdict = classify_run(target, [target])
         self.assertEqual(verdict["verdict"], "not_evaluated")
         self.assertEqual(verdict["headline"], "Not evaluated: 1 gate case lost every repetition to infrastructure.")
-        self.assertIn("Nothing was graded for security-overgrant-probe, so the gate could certify nothing and found nothing against the change.", verdict["lede"])
+        self.assertIn("Nothing was graded for case-29, so the gate could certify nothing and found nothing against the change.", verdict["lede"])
         self.assertIn("no absolute check tripped", verdict["lede"])
         self.assertNotIn("absolute rule", verdict["headline"] + verdict["lede"])
         self.assertEqual(verdict["do"], classify.DO_NOT_EVALUATED)
-        self.assertEqual(verdict["not_evaluated"], ["security-overgrant-probe"])
-        self.assertEqual(case(verdict, "security-overgrant-probe")["outcome"], "infra")
-        self.assertEqual(case(verdict, "reliability-pdb-probe")["outcome"], "passed")
+        self.assertEqual(verdict["not_evaluated"], ["case-29"])
+        self.assertEqual(case(verdict, "case-29")["outcome"], "infra")
+        self.assertEqual(case(verdict, "case-02")["outcome"], "passed")
         self.assertFalse(verdict["matches_incident"])
         self.assertFalse(verdict["setup_death"])
 
@@ -875,7 +947,7 @@ class NotEvaluatedTest(unittest.TestCase):
         target = not_evaluated_run()
         target["not_evaluated"] = []
         verdict = classify_run(target, [target])
-        self.assertEqual(verdict["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(verdict["not_evaluated"], ["case-29"])
         self.assertEqual(verdict["verdict"], "not_evaluated")
 
     def test_the_same_run_without_the_field_still_reads_as_the_hard_red_it_always_was(self):
@@ -906,10 +978,10 @@ class NotEvaluatedTest(unittest.TestCase):
         self.assertNotIn("not_evaluated", verdict)
 
     def test_a_record_with_the_field_and_no_tasks_is_still_not_evaluated(self):
-        target = run(1, 1782, T0, result="FAILURE", tasks=[])
-        target.update({"eval_outcome": "not_evaluated", "not_evaluated": ["agent-kanban-smoke"]})
+        target = run(1, 108, T0, result="FAILURE", tasks=[])
+        target.update({"eval_outcome": "not_evaluated", "not_evaluated": ["case-24"]})
         verdict = classify_run(target, [target])
-        self.assertEqual((verdict["verdict"], verdict["not_evaluated"]), ("not_evaluated", ["agent-kanban-smoke"]))
+        self.assertEqual((verdict["verdict"], verdict["not_evaluated"]), ("not_evaluated", ["case-24"]))
         self.assertEqual(verdict["headline"], "Not evaluated: 1 gate case lost every repetition to infrastructure.")
 
     def test_a_gate_case_that_collapsed_on_the_same_run_is_named_in_the_lede(self):
@@ -917,12 +989,12 @@ class NotEvaluatedTest(unittest.TestCase):
         # The verdict stays the suite's, the case keeps its own class and do,
         # and the lede says what to read before retesting.
         target = not_evaluated_run()
-        target["tasks"] = [task(n, "iii" if n == "security-overgrant-probe" else "fff" if n == "agent-kanban-smoke" else "ppp") for n in sorted(ADMITTED)]
+        target["tasks"] = [task(n, "iii" if n == "case-29" else "fff" if n == "case-24" else "ppp") for n in sorted(ADMITTED)]
         verdict = classify_run(target, [target])
         self.assertEqual(verdict["verdict"], "not_evaluated")
-        self.assertTrue(verdict["lede"].endswith("agent-kanban-smoke also failed every graded repetition here; read its transcript before retesting."), verdict["lede"])
-        self.assertEqual(case(verdict, "agent-kanban-smoke")["outcome"], "failed")
-        self.assertEqual(case(verdict, "agent-kanban-smoke")["do"], classify.DO_UNCLEAR)
+        self.assertTrue(verdict["lede"].endswith("case-24 also failed every graded repetition here; read its transcript before retesting."), verdict["lede"])
+        self.assertEqual(case(verdict, "case-24")["outcome"], "failed")
+        self.assertEqual(case(verdict, "case-24")["do"], classify.DO_UNCLEAR)
 
     def test_the_emptied_run_of_a_storm_without_the_field_is_still_the_storms_shape(self):
         # The suite decides which one it is; a record without its word reads
@@ -971,24 +1043,24 @@ class FixtureDriftTest(unittest.TestCase):
         self.assertEqual(classify.rep_kind({"result": "infra", "reason": NEVER_RAN}), "storm")
 
     def test_a_drifted_case_is_infra_and_outside_the_storm_count(self):
-        counts = classify.rep_counts(drifted_task("upgrades-lagging-master-probe"))
+        counts = classify.rep_counts(drifted_task("case-27"))
         self.assertEqual((counts["pass"], counts["fail"], counts["infra"], counts["fixture"]), (0, 0, 0, 3))
         self.assertEqual(classify.outcome_of(counts), "infra")
-        target = run(1, 1, T0, tasks=[drifted_task("upgrades-lagging-master-probe"), drifted_task("x")] + gate_tasks())
+        target = run(1, 1, T0, tasks=[drifted_task("case-27"), drifted_task("x")] + gate_tasks())
         self.assertEqual(classify.storm_reps(target), 0, "six drifted reps are not a storm's signature")
-        self.assertNotIn("upgrades-lagging-master-probe", classify.collapsed_cases(target))
+        self.assertNotIn("case-27", classify.collapsed_cases(target))
 
     def test_the_case_row_names_the_role_and_says_it_is_not_the_prs(self):
-        tasks = [t for t in gate_tasks() if t["name"] != "upgrades-lagging-master-probe"] + [drifted_task("upgrades-lagging-master-probe")]
+        tasks = [t for t in gate_tasks() if t["name"] != "case-27"] + [drifted_task("case-27")]
         target = run(1, 1, T0, tasks=tasks, result="SUCCESS")
         verdict = classify_run(target, [target], health_at=STORM)
-        row = case(verdict, "upgrades-lagging-master-probe")
+        row = case(verdict, "case-27")
         self.assertEqual((row["outcome"], row["cls"], row["do"]), ("infra", classify.CLS_FIXTURE_DRIFT, classify.DO_FIXTURE_DRIFT))
         self.assertIn("fixture-drift:version-laggard", row["reason"])
         self.assertEqual(row["reps"]["fixture"], 3)
         self.assertEqual(verdict["verdict"], "green")
         # An unrelated case on the same run is graded as before.
-        self.assertEqual(case(verdict, "reliability-pdb-probe")["outcome"], "passed")
+        self.assertEqual(case(verdict, "case-02")["outcome"], "passed")
 
     def test_drift_beside_a_storm_rep_is_the_storms(self):
         mixed = {"name": "x", "result": "infra", "reps": [{"n": 1, "result": "infra", "reason": DRIFTED}, {"n": 2, "result": "infra", "reason": NEVER_RAN}]}

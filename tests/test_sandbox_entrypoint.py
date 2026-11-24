@@ -30,6 +30,7 @@ import pathlib
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -649,6 +650,7 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             "GKE_PROJECT_ID",
             "GKE_CLUSTER_NAME",
             "GKE_LOCATION",
+            "GOOGLE_CLOUD_UNIVERSE_DOMAIN",
             # The collectors' scope guard reads it in the session; set on the
             # container alone it never reaches them (#2840's strict pass).
             "KUBEAGENTS_SCOPE_DECLARED",
@@ -825,6 +827,115 @@ class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
         )
         default_kc = existing_kc.read_text()
         self.assertNotIn("gke_fleet-proj_us-east1_hardlinked", default_kc)
+
+
+class SandboxEntrypointKubeconfigLockTest(_SandboxEntrypointHarness):
+    """The lock credential_proxy_client.py takes beside the default kubeconfig is on the volume.
+    One left by a client from before only the kubeconfig's owner made it can belong to root, and
+    the agent user cannot open that; the entrypoint removes it before any session starts."""
+
+    def _start_with_kube_proxy(self) -> None:
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+
+    def test_a_kubeconfig_lock_left_on_the_volume_is_removed(self) -> None:
+        """A client from before only the kubeconfig's owner made the lock left one owned by the
+        first caller; after a root `kubectl --context`, one the agent user could not open."""
+        lock = self.data / "..kubeconfig.lock"
+        lock.touch(mode=0o600)
+        self._start_with_kube_proxy()
+        self.assertFalse(lock.exists())
+        self.assertNotIn("kubeconfig lock", self.result.stderr)
+        self.assertIn("gke_my-proj_us-central1-a_default", (self.data / ".kubeconfig").read_text())
+
+    def test_a_link_under_the_locks_name_is_removed_and_not_followed(self) -> None:
+        target = self.tmp / "elsewhere"
+        target.write_text("keep\n")
+        lock = self.data / "..kubeconfig.lock"
+        lock.symlink_to(target)
+        self._start_with_kube_proxy()
+        self.assertFalse(lock.is_symlink())
+        self.assertEqual("keep\n", target.read_text())
+
+    def test_a_link_to_nothing_under_the_locks_name_is_removed(self) -> None:
+        lock = self.data / "..kubeconfig.lock"
+        lock.symlink_to(self.tmp / "nowhere")
+        self._start_with_kube_proxy()
+        self.assertFalse(lock.is_symlink())
+
+    def test_a_folder_under_the_locks_name_and_other_files_are_left(self) -> None:
+        folder = self.data / "..kubeconfig.lock"
+        folder.mkdir()
+        (folder / "inside").write_text("keep\n")
+        record = self.data / "..kubeconfig.contexts-registered"
+        record.write_text("gke_a_b_c 0 0\n")
+        self._start_with_kube_proxy()
+        self.assertEqual("keep\n", (folder / "inside").read_text())
+        self.assertEqual("gke_a_b_c 0 0\n", record.read_text())
+        self.assertNotIn("kubeconfig lock", self.result.stderr, "a folder is not touched, so nothing fails")
+        self.assertIn("gke_my-proj_us-central1-a_default", (self.data / ".kubeconfig").read_text())
+
+    def test_without_the_kube_proxy_the_lock_is_left(self) -> None:
+        lock = self.data / "..kubeconfig.lock"
+        lock.touch(mode=0o600)
+        self._run(". profiles/platform")
+        self.assertTrue(lock.exists())
+
+
+class SandboxEntrypointKubectlAdmissionTest(unittest.TestCase):
+    """The block that writes the kubectl admission's inputs and state, lifted out of the shipped
+    entrypoint and run with its /run paths pointed at a temporary directory. It sits past the
+    authorized_keys step the harness above stops at."""
+
+    START = 'tier="${KUBEAGENTS_KUBECTL_COST_TIER:-$SANDBOX_KUBECTL_COST_TIER_DEFAULT}"'
+    END = "done"
+
+    def _block(self) -> str:
+        lines = _ENTRYPOINT.read_text().splitlines()
+        start = lines.index(self.START)
+        end = next(i for i in range(start, len(lines)) if lines[i] == self.END)
+        return "\n".join(lines[start : end + 1])
+
+    def _run_block(self, env: dict[str, str]) -> pathlib.Path:
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        prelude = (
+            f'SANDBOX_KUBECTL_COST_TIER_FILE="{tmp}/kubectl-cost-tier"\n'
+            f'SANDBOX_MEMORY_LIMIT_FILE="{tmp}/memory-limit-bytes"\n'
+            f'SANDBOX_KUBECTL_ADMISSION_DIR="{tmp}/kubectl-admission"\n'
+            'SANDBOX_KUBECTL_COST_TIER_DEFAULT="default"\n'
+        )
+        clean = {k: v for k, v in os.environ.items() if k not in ("KUBEAGENTS_KUBECTL_COST_TIER", "SANDBOX_MEMORY_LIMIT_BYTES")}
+        subprocess.run(["bash", "-euc", prelude + self._block()], env={**clean, **env}, check=True, timeout=30)
+        return tmp
+
+    def test_the_tier_file_holds_a_valid_word_and_an_invalid_one_falls_back_to_default(self) -> None:
+        for given, written in (("fleet", "fleet"), ("", "default"), ("Fleet", "default"), ("a b", "default"),
+                               ("../x", "default"), ("fleet-2", "fleet-2")):
+            with self.subTest(given=given):
+                tmp = self._run_block({"KUBEAGENTS_KUBECTL_COST_TIER": given})
+                self.assertEqual((tmp / "kubectl-cost-tier").read_text(), f"{written}\n")
+
+    def test_the_limit_file_holds_digits_only(self) -> None:
+        for given, written in (("2147483648", "2147483648\n"), ("", ""), ("2Gi", "")):
+            with self.subTest(given=given):
+                tmp = self._run_block({"SANDBOX_MEMORY_LIMIT_BYTES": given})
+                self.assertEqual((tmp / "memory-limit-bytes").read_text(), written)
+
+    def test_the_state_directories_are_sticky_and_world_writable_and_the_state_files_shared(self) -> None:
+        tmp = self._run_block({})
+        state = tmp / "kubectl-admission"
+        for directory in (state, state / "reservations", state / "slots", state / "waiting"):
+            with self.subTest(directory=directory.name):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o1777)
+        for name in ("ledger.lock", "events.log"):
+            with self.subTest(file=name):
+                self.assertEqual(stat.S_IMODE((state / name).stat().st_mode), 0o666)
 
 
 if __name__ == "__main__":

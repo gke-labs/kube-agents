@@ -46,6 +46,30 @@ SLACK_ROUTE = {
 }
 # The opening turn's id, which both hooks receive.
 TURN = "turn-7f3a"
+# The deepest document the search of `nested_past_the_parser` tries: 2 MiB of brackets.
+DEEPEST_DOCUMENT_TRIED = 1 << 20
+# Why a test skips when the search of `nested_past_the_parser` finds no document.
+NO_DOCUMENT_REFUSED = "the JSON parser of this Python parses %d levels, the deepest that this test tries"
+
+
+def nested_past_the_parser(levels, most):
+    """A JSON array nested `levels` deep or deeper that `json.loads` refuses for its
+    depth on this run, or None when one of `most` levels still parses.
+
+    The parser's depth limit is the interpreter's: about 10,000 levels on Python
+    3.12 and 3.13, and on 3.14 as many as the stack holds (more than 100,000
+    with a 16 MB stack). So no fixed depth is past it on every run.
+    """
+    depth = levels
+    while True:
+        text = "[" * depth + "]" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        if depth >= most:
+            return None
+        depth = min(2 * depth, most)
 
 
 # Hermes' Platform also has non-durable members, so a turn past a regressed
@@ -885,8 +909,15 @@ class PreLlmCallTest(unittest.TestCase):
     def test_unreadable_eval_marker_is_ignored(self):
         (self.data_dir / ".bootstrap_greet_eval-a").write_text("not json", encoding="utf-8")
         (self.data_dir / ".bootstrap_greet_eval-b").write_text("[]", encoding="utf-8")
-        (self.data_dir / ".bootstrap_greet_eval-c").write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
-        self.assertIsNone(self._eval_call())
+        deep = nested_past_the_parser(100000, DEEPEST_DOCUMENT_TRIED)
+        if deep is not None:
+            (self.data_dir / ".bootstrap_greet_eval-c").write_text(deep, encoding="utf-8")
+        with self.assertLogs(plugin.logger, level="WARNING") as logs:
+            self.assertIsNone(self._eval_call())
+        if deep is None:
+            self.skipTest(NO_DOCUMENT_REFUSED % DEEPEST_DOCUMENT_TRIED)
+        # The third marker was refused by the parser, not read and then found to be no object.
+        self.assertTrue(any(isinstance(record.args[-1], RecursionError) for record in logs.records))
 
     def test_concurrent_eval_markers_are_each_taken_by_their_own_phrase(self):
         running = self._plant(phrase="just installed you", suffix="-running")
@@ -1009,6 +1040,20 @@ class ConversationPrimingTest(unittest.TestCase):
         record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
         self.assertEqual(record["conversation"], "gchat:spaces/S/threads/T")
 
+    def test_a_gateway_serving_a_list_primes_a_google_chat_route_on_it(self):
+        self._route(BRIDGE_SESSION, {**SLACK_ROUTE, "platform": "google_chat",
+                                     "conversation": "gchat:spaces/S/threads/T"})
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "slack,google_chat"}):
+            self.assertIsNotNone(self._bridge_call())
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["conversation"], "gchat:spaces/S/threads/T")
+
+    def test_a_gateway_serving_a_list_primes_a_slack_route_on_it(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "slack,google_chat"}):
+            self.assertIsNotNone(self._bridge_call())
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["conversation"], SLACK_ROUTE["conversation"])
+
     def test_an_api_server_turn_with_no_route_is_ignored(self):
         # The bench, curl, and the inject and A2A doors: no chat conversation behind the session.
         self.assertIsNone(self._bridge_call(session_id="a2a-ctx-inject-only"))
@@ -1031,6 +1076,23 @@ class ConversationPrimingTest(unittest.TestCase):
             with self.subTest(served=served), mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": served}):
                 self.assertIsNone(self._bridge_call())
                 self._assert_unprimed()
+
+    def test_a_gateway_serving_only_slack_leaves_a_google_chat_route_unprimed(self):
+        self._route(BRIDGE_SESSION, {**SLACK_ROUTE, "platform": "google_chat",
+                                     "conversation": "gchat:spaces/S/threads/T"})
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "slack"}), \
+                self.assertLogs(plugin.logger, level="WARNING") as logs:
+            self.assertIsNone(self._bridge_call())
+        self._assert_unprimed()
+        warning = next(line for line in logs.output if "does not serve" in line)
+        self.assertIn("A2A_NOTIFY_CONVERSATIONS=slack)", warning, "the warning names the served list")
+
+    def test_an_empty_served_list_logs_as_unset(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": ""}), \
+                self.assertLogs(plugin.logger, level="WARNING") as logs:
+            self.assertIsNone(self._bridge_call())
+        warning = next(line for line in logs.output if "does not serve" in line)
+        self.assertIn("A2A_NOTIFY_CONVERSATIONS=<unset>)", warning)
 
     def test_chat_notify_is_loaded_once(self):
         with mock.patch.object(plugin, "_load_image_module", wraps=plugin._load_image_module) as load:

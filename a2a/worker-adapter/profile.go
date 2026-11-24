@@ -30,9 +30,11 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/render"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 // ProfileWorkerConfig is what a profile worker needs beyond Config, which
@@ -56,6 +58,10 @@ type ProfileWorkerConfig struct {
 	// task leaves in its config reaches the next. Empty runs the harness as
 	// configured, which only tests do.
 	PersonaDir string
+	// RequirePersonaIntegrity refuses a persona that carries no build-time
+	// content manifest (lib.EnvPersonaIntegrity). A manifest that is
+	// present is checked either way.
+	RequirePersonaIntegrity bool
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
 	// Relay is how the rendered persona's MCP servers reach the broker's
@@ -77,6 +83,13 @@ type ProfileWorkerConfig struct {
 	// the worker never guesses, so it can't empty a directory it wasn't
 	// given.
 	ResetPaths []string
+	// TaskSigningKeys is the install's task-signing public keys
+	// (A2A_TASK_SIGNING_PUBLIC_KEYS), rendered into a profile's Job template:
+	// what a script-run task's credential is verified against (#5622).
+	// Without them no script runs.
+	TaskSigningKeys string
+	// scriptCheck replaces the image's script-file check in tests.
+	scriptCheck scriptFileCheck
 	// resetTimeout replaces resetTimeout in tests.
 	resetTimeout time.Duration
 	// resetHook, when set, runs at the start of each reset, inside its
@@ -140,7 +153,7 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		return err
 	}
 	if pw.PersonaDir != "" {
-		if w.persona, err = renderPersona(pw); err != nil {
+		if w.persona, err = renderPersona(pw, cfg.Logger); err != nil {
 			return err
 		}
 		logPersonaWarnings(cfg.Logger, w.persona)
@@ -182,16 +195,25 @@ type profileWorker struct {
 // renderPersona loads the profile's persona and renders it for the harness.
 // It runs once: the persona is the image's and doesn't change under a
 // running pod, and a persona that doesn't load stops the worker before it
-// takes a task.
-func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
+// takes a task. That includes a persona whose files don't match its
+// build-time content manifest, and, under RequirePersonaIntegrity, one with
+// no manifest. Which of verified or unverified it loaded as is logged.
+func renderPersona(pw ProfileWorkerConfig, log *slog.Logger) (*persona.Output, error) {
+	// The persona loads, and its files are checked, before the harness is
+	// looked at: the check is the same for every harness, and a persona that
+	// differs from its build is refused as that, whichever driver the
+	// profile runs.
+	p, err := persona.LoadWithOptions(pw.PersonaDir, persona.Options{RequireIntegrity: pw.RequirePersonaIntegrity})
+	if err != nil {
+		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
+	}
 	adapter, err := render.For(pw.Harness)
 	if err != nil {
 		return nil, err
 	}
-	p, err := persona.Load(pw.PersonaDir)
-	if err != nil {
-		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
-	}
+	// Logged once the persona is one this harness can use, so a refused
+	// harness doesn't follow a success line.
+	logPersonaIntegrity(log, pw.PersonaDir, p)
 	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay})
 	if err != nil {
 		return nil, fmt.Errorf("rendering the persona: %w", err)
@@ -200,6 +222,30 @@ func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// logPersonaIntegrity says whether the persona's files were checked against
+// its build-time manifest. Unverified is a warning: the persona loaded, but
+// nothing showed its files are the ones its build produced.
+func logPersonaIntegrity(log *slog.Logger, dir string, p *persona.Persona) {
+	if p.Integrity == persona.IntegrityVerified {
+		log.Info("persona files match their build-time manifest", "dir", dir, "files", p.IntegrityFiles)
+		return
+	}
+	log.Warn("persona integrity unverified: it carries no build-time manifest", "dir", dir, "manifest", persona.IntegrityManifestFile)
+}
+
+// ParsePersonaIntegrity reads lib.EnvPersonaIntegrity: empty is false,
+// lib.PersonaIntegrityRequired is true, and anything else is an error, so
+// a misspelt value stops the worker rather than leave the check off.
+func ParsePersonaIntegrity(v string) (bool, error) {
+	switch v {
+	case "":
+		return false, nil
+	case lib.PersonaIntegrityRequired:
+		return true, nil
+	}
+	return false, fmt.Errorf("%s=%q: the only value is %q", lib.EnvPersonaIntegrity, v, lib.PersonaIntegrityRequired)
 }
 
 // logPersonaWarnings logs what rendering left out of the persona: a broker
@@ -299,6 +345,9 @@ type held struct {
 	// taskCredential and proxyToken are the confirm's task credentials, when
 	// the dispatcher holds a task-signing key (addendum 8).
 	taskCredential, proxyToken string
+	// script is the confirm's helper script for a script-run task (#5622),
+	// nil for a model task.
+	script *lib.DispatchScript
 	// done carries the task's outcome once execute returns.
 	done chan turnOutcome
 }
@@ -424,7 +473,7 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					continue
 				}
 				cur.running, acceptTimer = true, nil
-				cur.taskCredential, cur.proxyToken = m.TaskCredential, m.ProxyToken
+				cur.taskCredential, cur.proxyToken, cur.script = m.TaskCredential, m.ProxyToken, m.Script
 				taskDone = w.start(ctx, cur)
 
 			case lib.DispatchAbandon:
@@ -574,14 +623,40 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 			// setting sources) after the base argv, which carries none.
 			cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
 			cfg.HarnessCommandNoDelegate = nil
-			cfg.HarnessEnv = append(cfg.HarnessEnv, "CLAUDE_CONFIG_DIR="+dir)
+			cfg.HarnessEnv = append(cfg.HarnessEnv, cfg.driver().ConfigDirEnv(dir))
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)
+	removeRefusals := w.makeWriteRefusalFile(&cfg)
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
 	cfg.TaskDeadline = time.Until(h.offer.Deadline) - w.pw.deadlineMargin
+	if h.script == nil {
+		// A credential, or the submission's own trigger, naming a script is
+		// a script task's, whatever the confirm says: one never runs as a
+		// model turn. Both are read unverified, which can only make the
+		// worker refuse more, and an authority block that can't be read is
+		// refused too.
+		from, script, err := scriptMarker(h)
+		switch {
+		case err != nil:
+			plan.scriptRefusal = "the submission's authority block can't be read (" + err.Error() + "), so the task may be a script's, and a script task never runs as a model turn"
+			cfg.Logger.Warn("refusing a model turn for a task whose authority block can't be read", "task", cfg.TaskID, "err", err)
+		case script != "":
+			plan.scriptRefusal = fmt.Sprintf("the %s names script %q but the confirm carries none, and a script task never runs as a model turn", from, script)
+			cfg.Logger.Warn("refusing a model turn for a script task", "task", cfg.TaskID, "script", script, "namedBy", from)
+		}
+	}
+	if h.script != nil {
+		plan.script, plan.scriptRefusal = w.prepareScript(h, cfg.TaskDeadline)
+		if plan.scriptRefusal != "" {
+			cfg.Logger.Warn("refusing the script-run task", "task", cfg.TaskID, "script", h.script.Name, "reason", plan.scriptRefusal)
+		}
+	}
 	cfg.HarnessEnv = append(cfg.HarnessEnv, taskParameterEnv(h.origin, cfg.Logger)...)
+	// After the parameters, so that even a name they could spell can't stand
+	// in for the trigger's (they can't: their prefix is PROFILE_TASK_).
+	cfg.HarnessEnv = append(withoutTriggerEnv(cfg.HarnessEnv), taskTriggerEnv(h.origin, cfg.Logger)...)
 	a := newTaskAdapter(cfg, bus)
 	a.dispatched = true
 	a.abandon = h.abandon
@@ -595,6 +670,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		// config.
 		removeConfig()
 		removeToken()
+		removeRefusals()
 		closeTaskBus()
 		h.done <- out
 	}()
@@ -669,7 +745,7 @@ func removeAllWritable(path string) error {
 
 // writeTaskToken writes the proxy token where the shims read it, for the
 // task's lifetime, and returns what removes it. A task with no token (no
-// target, or no signing key) leaves no file, so the broker gives its calls
+// target and not a report credential, or no signing key) leaves no file, so the broker gives its calls
 // no cluster.
 func (w *profileWorker) writeTaskToken(token string) func() {
 	path := w.pw.TaskTokenFile
@@ -684,6 +760,31 @@ func (w *profileWorker) writeTaskToken(token string) func() {
 		w.cfg.Logger.Error("could not write the proxy token; the task's cluster calls will be refused", "path", path, "err", err)
 		return func() {}
 	}
+	return func() { _ = os.Remove(path) }
+}
+
+// makeWriteRefusalFile makes the task's write-refusal record file empty
+// beside the task token, on the same tmpfs, names it to the broker client
+// (EnvWriteRefusalFile, with the task in EnvWriteRefusalTask) and to the
+// adapter (Config.WriteRefusalFile), and returns what removes it. The client
+// appends to the file and never creates it, so a stale one from an earlier
+// task is removed first. With the stop off or no token directory, or when
+// the file can't be made, there is no file: the task runs, and is never
+// stopped at a refusal (refusal.go says why that is safe).
+func (w *profileWorker) makeWriteRefusalFile(cfg *Config) func() {
+	if !cfg.StopOnWriteRefusal || w.pw.TaskTokenFile == "" {
+		return func() {}
+	}
+	path := filepath.Join(filepath.Dir(w.pw.TaskTokenFile), writeRefusalFileName)
+	_ = os.Remove(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- the worker's own per-task file
+	if err != nil {
+		w.cfg.Logger.Warn("could not make the write-refusal record; the task won't stop at a write refusal", "path", path, "err", err)
+		return func() {}
+	}
+	_ = f.Close()
+	cfg.WriteRefusalFile = path
+	cfg.HarnessEnv = append(cfg.HarnessEnv, EnvWriteRefusalFile+"="+path, EnvWriteRefusalTask+"="+cfg.TaskID)
 	return func() { _ = os.Remove(path) }
 }
 
@@ -709,28 +810,141 @@ func (w *profileWorker) finish(h *held, out turnOutcome) {
 	}
 }
 
+// The trigger a dispatched task came from (#4685, #5623), as the harness
+// reads it. Runtime-owned: they come from the submission's authority block,
+// never from a task parameter, whose names all take the PROFILE_TASK_ prefix
+// (taskParameterEnv), so no parameter can set or override them, and the
+// pod's own environment is stripped of them first (withoutTriggerEnv), so an
+// untriggered task never inherits one. The fleet audit's shadow run names
+// its report stream after the schedule (audit_report.py, #6956).
+const (
+	profileTriggerStreamEnv = "PROFILE_TRIGGER_STREAM"
+	profileTriggerOriginEnv = "PROFILE_TRIGGER_ORIGIN"
+)
+
+// taskTriggerEnv is the submission's trigger, PROFILE_TRIGGER_STREAM and
+// PROFILE_TRIGGER_ORIGIN, each only when the trigger names it; nothing for a
+// task no trigger started. The block's trigger is a claim the dispatcher
+// checked against the grant before it offered the task; a script that acts
+// on the stream does it through the broker, which holds every report write
+// to the stream the signed task credential names. A block that can't be read
+// passes none on.
+func taskTriggerEnv(origin *lib.Envelope, log interface{ Warn(string, ...any) }) []string {
+	trigger, err := capability.TriggerFromAuthority(origin.Authority)
+	if err != nil {
+		log.Warn("the submission's trigger can't be read; none is passed on", "task", origin.TaskID, "err", err)
+		return nil
+	}
+	if trigger == nil {
+		return nil
+	}
+	var env []string
+	if trigger.Stream != "" {
+		env = append(env, profileTriggerStreamEnv+"="+trigger.Stream)
+	}
+	if trigger.Origin != "" {
+		env = append(env, profileTriggerOriginEnv+"="+trigger.Origin)
+	}
+	return env
+}
+
+// withoutTriggerEnv is env with any PROFILE_TRIGGER_STREAM or
+// PROFILE_TRIGGER_ORIGIN entry removed: only the task's own trigger sets them.
+func withoutTriggerEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == profileTriggerStreamEnv || name == profileTriggerOriginEnv {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // taskParameterEnv is the submission's declared parameters as the harness
 // reads them, PROFILE_TASK_<NAME>=value. A set that fails the bounds is
 // dropped whole: the dispatcher already admitted the task on them, so this
 // is a submission the worker can't trust to be the one admitted.
 func taskParameterEnv(origin *lib.Envelope, log interface{ Warn(string, ...any) }) []string {
-	var msg lib.Message
-	if err := json.Unmarshal(origin.Payload, &msg); err != nil {
-		return nil
-	}
-	params, ok, err := lib.TaskParametersOf(msg.Parts)
+	params, err := taskParameters(origin)
 	if err != nil {
 		log.Warn("the submission's task parameters are malformed; none are passed on", "task", origin.TaskID, "err", err)
 		return nil
 	}
-	if !ok {
-		return nil
-	}
-	env := make([]string, 0, len(params.Parameters))
-	for name, value := range params.Parameters {
+	env := make([]string, 0, len(params))
+	for name, value := range params {
 		env = append(env, "PROFILE_TASK_"+strings.ToUpper(name)+"="+value)
 	}
 	return env
+}
+
+// taskParameters is the submission's declared parameters, none when it
+// declares none. A payload that isn't a message carries none.
+func taskParameters(origin *lib.Envelope) (map[string]string, error) {
+	var msg lib.Message
+	if err := json.Unmarshal(origin.Payload, &msg); err != nil {
+		return nil, nil
+	}
+	params, ok, err := lib.TaskParametersOf(msg.Parts)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return params.Parameters, nil
+}
+
+// scriptMarker is the script a held task is marked with, and what marks
+// it: the task credential's trigger, else the submission's own (its
+// authority block's trigger, which admission checked). Both are "" for a
+// model task.
+func scriptMarker(h *held) (from, script string, err error) {
+	if h.proxyToken != "" {
+		if tr, err := taskcred.UnverifiedTrigger(h.proxyToken); err == nil && tr != nil && tr.Script != "" {
+			return "task credential", tr.Script, nil
+		}
+	}
+	if h.origin != nil {
+		tr, err := capability.TriggerFromAuthority(h.origin.Authority)
+		if err != nil {
+			// Admission refuses such a block, so none should reach here;
+			// one that does may be a script task's, and is refused.
+			return "", "", err
+		}
+		if tr != nil && tr.Script != "" {
+			return "submission's trigger", tr.Script, nil
+		}
+	}
+	return "", "", nil
+}
+
+// prepareScript clears a script-run task's script to run, or says why it
+// can't (script.go): Job mode, the credential cross-check, the file, and the
+// environment. Its bound is the script's timeout within the task's own.
+func (w *profileWorker) prepareScript(h *held, taskDeadline time.Duration) (*scriptRun, string) {
+	sc := h.script
+	if !w.pw.OneShot {
+		return nil, "a script runs only in Job mode, and this worker serves a pool"
+	}
+	keys, err := taskcred.ParseTrustedKeys(w.pw.TaskSigningKeys)
+	if err != nil {
+		return nil, "the worker's task-signing keys are malformed: " + err.Error()
+	}
+	if err := verifyScriptCredential(h.proxyToken, keys, time.Now(), h.offer.TaskID, w.cfg.PodName, sc.Name); err != nil {
+		return nil, err.Error()
+	}
+	path, err := w.pw.scriptCheck.resolve(sc.Path)
+	if err != nil {
+		return nil, err.Error()
+	}
+	env, err := scriptEnv(h.origin, os.Getenv)
+	if err != nil {
+		return nil, err.Error()
+	}
+	timeout := min(time.Duration(sc.TimeoutSeconds)*time.Second, taskDeadline)
+	if timeout <= 0 {
+		return nil, "no time is left in the task's deadline to run the script"
+	}
+	return &scriptRun{name: sc.Name, path: path, env: env, timeout: timeout}, ""
 }
 
 // serveReadiness answers /readyz with 200 once the worker is listening, and

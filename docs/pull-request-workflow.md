@@ -130,6 +130,13 @@ place, and the comment above the target says why. In a mirrored `gke-*` skill, m
 place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
 fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
+**A new or changed test.** Run it through `scripts/dev/repeat_under_load.sh -- <test command>`.
+By default it runs the command ten times pinned to four cores (fewer on a smaller machine, and
+unpinned where `taskset` is missing or cannot bind them, which the line then says), with three busy
+loops per core on the same cores; `-n`, `-c` and `-l` change those. It keeps each run's output and
+prints the line the Testing section carries. A failure in any run blocks the push. The rule is in
+`.agents/rules/pre_pr_review.md`, "Repeat a new or changed test".
+
 **Agent blueprints.** If you add a `kubectl get` to a `.py`, `.sh` or `.md` under `agents/`, run
 `make cluster-reads-check`. It fails a read of several kinds, or of one kind in one page, across
 every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
@@ -200,8 +207,8 @@ been fed the bytes of the failed one. A GitHub release download in either Docker
 retrying for at least four minutes, which is `--retry 8`: GitHub's release-asset CDN can fail one
 runner for minutes while it serves others, and curl's doubling backoff waits 255 seconds over eight
 retries but 31 over five. The test reads that wait from the flags, where `--retry-max-time` can only
-shorten it, and runs the tirith download, a wget loop, against stubs; a release URL fetched any other
-way, such as another wget loop, an `ADD` or a piped curl, fails it.
+shorten it; a release URL fetched any other way, such as a wget loop, an `ADD` or a piped curl,
+fails it.
 
 `docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
 from the network run once more, after a pause, when the first attempt fails. The in-image gate
@@ -236,8 +243,9 @@ ensure compilation succeeds.
 
 **A2A module code.** If you modify `a2a/`, run `make gosec` from the repository root (it scans every
 module; the CI step scans `a2a/` alone, with the same binary built from `k8s-operator/go.mod`'s
-pin), then `go vet ./...` and `go test -race ./...` inside that directory — what the
-`A2A Module Tests` CI job runs for this module. The conformance suite starts an embedded
+pin), then `go vet ./...` and `go test -race -timeout 20m ./...` inside that directory — what the
+`A2A Module Tests` CI job runs for this module (the gateway package alone takes close to go test's
+default 10 minutes under `-race`). The conformance suite starts an embedded
 JetStream server, so no cluster or credentials are needed. The CI job additionally installs the
 envtest binaries and the `nats` CLI; without them the auth callout's API-server and CLI cases skip
 and the run still reports green. To match it, run with
@@ -247,18 +255,24 @@ not been set.
 
 **Image pins.** `images.json` is the source of truth for every image an install pulls, but a bump
 starts there and rarely ends there. Several images keep a second copy that the file is the source
-for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
+for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator, the chart's
+template default for the A2A bus's four (`kube-agents.a2aBusImageDefaults` in
+`charts/kube-agents/templates/_helpers.tpl`) — and
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
-default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
+default and a mirrored install, what each off-by-default toggle it renders adds to each (the
+GitHub token minter, the web console, the cluster profile, Hindsight), and the four bus env vars of
+a `helm upgrade --reuse-values` render from before `a2aBus` (no `a2aBus` key), unmirrored and
+mirrored; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
-worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
-rather than a literal. Two copies it does not reach, where a stale pin passes every check:
-Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
-`platformAgent.harness.memory.provider`, which no render turns on — so their pins in
-`charts/kube-agents/values.yaml` are unguarded; and cert-manager's version is set again in
-`terraform/examples/full-install/variables.tf`, which no check reads. So: bump the pin in
+worker repository; the example manifests; the kustomize integrations, which it requires to name a variable the file owns
+rather than a literal; and the `cert_manager_version` default in
+`terraform/examples/full-install/variables.tf`, with its commented copy in the tfvars example,
+against the cert-manager pins. Copies it does not reach, where a stale pin passes every check: the
+example fluent-bit tags in `INSTALL.md`, the commented example in
+`k8s-operator/config/manager/manager.yaml`, and the cert-manager example in the header comment of
+`scripts/mirror_images.sh` are prose. So: bump the pin in
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 
@@ -278,7 +292,9 @@ alert closing: a pull-request run reports changed lines only, and an absent anno
 evidence. To show an alert closing, or to see one before the pull request opens, reproduce it
 locally: install the CLI as a `gh` extension, pin it to the version the alert's `tool.version`
 reports, and build a database once before the change and once after. For Python the database is
-over a scratch tree holding the flagged file at its repository path. For Go it is over the module
+over a scratch tree holding the flagged file at its repository path, or over the whole tree when the
+alert's source is in another file (a `py/polynomial-redos` alert's user-provided value can be): the
+flagged file alone then reports nothing. For Go it is over the module
 that holds the file, because a Go database is built rather than read, and the build is named rather
 than left to the autobuilder, which runs whatever build file its source root holds (from the
 repository root, `make`, whose default target is the platform image's Docker build; it fails
@@ -287,7 +303,8 @@ fast on a runner where the image tag is empty and runs for real where it is not)
 ```bash
 gh extension install github/gh-codeql
 gh codeql set-version 2.27.3 # the alert's tool.version
-# Python: the flagged file alone, at its repository path under /tmp/cq/tree
+# Python: the flagged file alone, at its repository path under /tmp/cq/tree,
+# or --source-root . from the repository root when the source is in another file
 gh codeql database create /tmp/cq/db --language=python --source-root /tmp/cq/tree
 gh codeql database analyze /tmp/cq/db \
   codeql/python-queries:Security/CWE-312/CleartextLogging.ql \
@@ -312,12 +329,12 @@ code-scanning tab on the merged head is still the final check.
 
 **Terraform module tests.** If you change a module or composition under `terraform/`, run
 `make terraform-test`. It runs the `terraform test` suite of each directory under
-`terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
+`terraform/modules/` and `terraform/examples/` that has a `tftests/`, against mocked providers, so it
 needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
-plugin cache); it needs Terraform 1.11 or newer — `mock_provider` from 1.7 and `override_during`
-from 1.11 — above the 1.5 floor the modules
-and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
-below includes it.
+plugin cache); it needs Terraform 1.15 or newer (the Makefile's `TERRAFORM_TEST_MIN_VERSION` says
+why), above the 1.5 floor the modules and the installer declare, and the `validate` job runs it on
+the version it pins. Suites go in `tftests/`, for the reason
+[`testing-map.md`](testing-map.md#the-trap-that-spans-every-tier) gives. `make verify` below includes it.
 
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
 and test, the Python suites, the conformance suite, the Terraform module tests; gosec is the
@@ -499,11 +516,12 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   eleven of the eighteen rounds on #2360 were on merges of `main`.
 - **Resolving.** Reply to a declined or deferred bot finding with the reason, and the follow-up
   issue when there is one, record it in **Self-Review**, and then resolve the thread, with a user in
-  the loop or without. An open thread makes the pull request the author's on the reviewers'
-  dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)), so the summoned
-  reviewer would never see a pull request that kept one open. The reply stays on the resolved
-  thread. A reviewer who disagrees replies in it (one with write access may also unresolve it); a
-  reply does not reopen it, so on one that asks for the fix, unresolve it, and it is your move again
+  the loop or without. An open thread keeps the pull request on its author's list as well as the
+  reviewer's and blocks the merge ([who owns an open pull request](#who-owns-an-open-pull-request)),
+  so the summoned reviewer sees an unanswered finding as the author's outstanding work. The reply
+  stays on the resolved thread. A reviewer who disagrees replies in it (one with write access may
+  also unresolve it); a reply does not reopen it, so on one that asks for the fix, unresolve it, and
+  it is your move again
   (**who counts**, next;
   [resolving conversations](#resolving-conversations)).
 - **Who counts, and how a reply is read.** A human is _on_ a pull request when a reviewer is requested,
@@ -540,9 +558,10 @@ Reply first — `AGENTS.md` says why — naming what changed and the commit that
 `kube-agents-bot` finding you decline or defer, the reason and the follow-up issue, if any, which
 **Self-Review** gives too. Then resolve what a commit fixed, what you showed wrong, and the bot
 findings you declined or deferred; the description thread waits for the body edit described below,
-or for your reply declining an ask the bot repeated. An open thread makes the pull request its
-author's on the reviewers' dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)),
-so a declined bot thread left open hides the pull request from the reviewer who has to rule on it.
+or for your reply declining an ask the bot repeated. An open thread keeps the pull request on its
+author's list as well as the reviewer's ([who owns an open pull request](#who-owns-an-open-pull-request)),
+so a declined bot thread left open reads as the author's unfinished work to the reviewer who has to
+rule on it.
 A reviewer who disagrees replies in the thread; only the author or a user with write access can
 unresolve it. A reply does not reopen a resolved thread, so on a reply that asks for the fix,
 unresolve it (`unresolveReviewThread`, below): it owes the fix and stays open until the fix lands
@@ -697,7 +716,9 @@ only `lgtm`, so the draw is the whole pool at equal weight; any other change sti
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files, and
 `approved` is per file, so it takes as many of them as it needs to cover every file: first one for
 the file with the fewest approvers, then one more for whatever that person cannot approve, from
-the default reviewers when nobody the glob matched can approve it. A change
+the default reviewers when nobody the glob matched can approve it. Both draws pass over a
+reviewer who is away while someone on the roster who is here can do the same job
+([who owns an open pull request](#who-owns-an-open-pull-request)). A change
 to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
 unless that member is one. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
@@ -822,9 +843,8 @@ request. The sweep puts it back once after the first such removal since the last
 one keeps it out until a push. If `Smoke gate` is pending, a `/test` or a push is how you get a
 fresh green. `/retest` is fine: it reruns only failed contexts.
 
-No verdict carries across a change to what the job grades. When the blocking job's `spec.mode`
-changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the repository
-variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
+No verdict carries across a change to what the job grades. When a change to the stack the blocking job
+grades lands in `oss-test-infra`, set the repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
 timeout (a run in flight at the change reports afterwards). `Smoke gate` then stays pending on a
 green whose build first reported before that time, until a run from after it replaces it, and its
 pending text asks for a push. Check the value before you set it: an unparsable one exits
@@ -949,17 +969,25 @@ that no test cites any more.
 
 ## Who owns an open pull request
 
-Every open pull request has exactly one party whose move it is, and the commonest way one sits for
-a fortnight is that both sides believe it is the other's. The rule:
+Every open pull request has at least one party whose move it is, and the commonest way one sits
+for a fortnight is that each side believes it is the other's. The rule:
 
 **The author owns it while it is blocked on them** — a draft, a failing or cancelled required check,
 a pull request the sweep left out of the merge queue, merge conflicts, unresolved review threads,
 changes requested, or no human reviewer requested yet. An open thread is always the author's move,
-the reviewers' dashboard counts it that way, and a declined or deferred `kube-agents-bot` finding is
+the reviewers' dashboard counts it against the author (and the reviewers too, below), and a declined
+or deferred `kube-agents-bot` finding is
 resolved with its reply rather than left open for the reviewer
 ([resolving conversations](#resolving-conversations)).
-**Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
-is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
+**The requested reviewers own it** when one of them still owes a review — alone when nothing blocks
+the author, and together with the author when the blocker is a failing check, a merge conflict, open
+threads or a changes-requested verdict. None of those stops a review: the diff is readable as it
+stands, so the pull request is on the author for the fix and on the reviewers for the review at the
+same time, and the triage sweep counts it against both. Only a draft keeps a blocked pull request
+off the reviewers' lists. A reviewer who finds the blocker matters says so in a changes-requested
+review; submitting a review takes them off the requested list until review is requested of them
+again. A past reviewer does not own it: an approval already given is not an outstanding obligation.
+`kube-agents-bot` and other bot reviewers never count either way.
 
 A draft is owned by its author and waited on by nobody, so it is not a backlog item — it is work in
 progress, and chasing it is noise.
@@ -969,7 +997,9 @@ Four states that look like somebody else's problem and are not:
 - **`CHANGES_REQUESTED` does not clear itself.** It stays set until a reviewer submits a _new_
   review. Pushing the fix does not clear it, resolving every thread does not clear it, and GitHub
   will report `CHANGES_REQUESTED` and "review requested from X" in the same breath. Re-requesting
-  review is the explicit hand-back — do that rather than assuming the push spoke for itself.
+  review is the explicit hand-back — do that rather than assuming the push spoke for itself. Until
+  review is re-requested, the reviewer who gave the verdict is off the requested list, so if a
+  second reviewer was requested the pull request is on that reviewer as well as on the author.
 - **Nobody is requested at all.** A human is assigned once the `AI Review` check goes green, or
   once the bot has reviewed three commits whatever the colour (`AGENTS.md`, "Automated Review After
   Opening a Pull Request"); before either, an author with outstanding bot findings has no reviewer
@@ -1008,8 +1038,31 @@ skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
 naming the reason. A periodic
-triage sweep applies the wider rule and messages whoever owns each pull request; it runs outside
-this repository, so the rule above is all this page can state about it.
+triage sweep applies the wider rule and messages whoever owns each pull request, both parties on
+one they share; it runs outside this repository (`triage/` in the internal `gke-labs/kube-agents-bot`,
+with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above
+is all this page can state about it.
+
+The script passes over a reviewer who is away, on the check-run path and on `/request-review`. The
+`REVIEWERS_AWAY` repository secret holds a JSON list of who is away and until when, and those people
+leave the draw. A change that needs only `lgtm`, with everyone it routes to away, draws from the
+default reviewers who are here. Where nobody here on the roster can approve a file, or nobody on it
+is here at all, the script asks the person back soonest, at random among those back the same day,
+in place of nobody; a file someone here can approve still gets that person. A request already
+made stays with its reviewer. A maintainer sets the list, and each set replaces all of it. Keep the
+value on one line: GitHub masks a secret in the log one line at a time.
+
+```bash
+# `back` is the first day the person reviews again; `from` is optional. Dates are UTC.
+gh secret set REVIEWERS_AWAY --repo gke-labs/kube-agents \
+  --body '[{"login":"<login>","from":"2026-12-21","back":"2027-01-05"}]'
+# Nobody away: delete it. A list that is empty or does not parse also reads as nobody away.
+gh secret delete REVIEWERS_AWAY --repo gke-labs/kube-agents
+```
+
+GitHub does not show a secret back, so keep the list you set. The run log names logins
+and never a date. The hand-off comment says so when the reviewer it names was asked while away, also
+with no date.
 
 ```bash
 # Whose move is it: draft, conflicts, verdict, and who is on the hook now.

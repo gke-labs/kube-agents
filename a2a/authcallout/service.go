@@ -12,6 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 
+	lib "github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
@@ -78,12 +79,12 @@ const (
 	// issue time are allowed against this callout's clock: the dispatcher
 	// that signed it runs on another node. The dispatcher adds the same
 	// allowance to a task's deadline when it mints the credential.
-	TaskCredentialSkew = 30 * time.Second
+	TaskCredentialSkew = taskcred.Skew
 
 	// DefaultTaskCredentialMaxLifetime bounds how far out a task
 	// credential's expiry may be. See Config.TaskCredentialMaxLifetime. The
 	// dispatcher caps the expiries it mints at the same default.
-	DefaultTaskCredentialMaxLifetime = 6 * time.Hour
+	DefaultTaskCredentialMaxLifetime = taskcred.DefaultMaxLifetime
 
 	// maxTaskCredentialMaxLifetime is the most TaskCredentialMaxLifetime may
 	// be set to; see ParseTaskCredentialMaxLifetime.
@@ -205,32 +206,12 @@ func ParseTaskCredentialMaxLifetime(raw string) (time.Duration, error) {
 	return d, nil
 }
 
-// taskSigningKeySeparator separates the keys in ParseTaskSigningKeys' input.
-const taskSigningKeySeparator = ","
-
 // ParseTaskSigningKeys reads the task-signing public keys the operator renders
 // for the callout, comma separated. Empty is allowed and means none (no task
 // connection is honoured); an empty element, a key that is not a task-signing
 // public key, or more than taskcred.MaxTrustedKeys is refused.
 func ParseTaskSigningKeys(raw string) ([]string, error) {
-	if strings.TrimSpace(raw) == "" {
-		return nil, nil
-	}
-	var keys []string
-	for _, field := range strings.Split(raw, taskSigningKeySeparator) {
-		key := strings.TrimSpace(field)
-		if key == "" {
-			return nil, fmt.Errorf("the task-signing key list %q has an empty element", raw)
-		}
-		if !taskcred.ValidPublicKey(key) {
-			return nil, fmt.Errorf("%q is not a task-signing public key (C...)", key)
-		}
-		keys = append(keys, key)
-	}
-	if len(keys) > taskcred.MaxTrustedKeys {
-		return nil, fmt.Errorf("%d task-signing keys; at most %d (the current one and the one it replaces)", len(keys), taskcred.MaxTrustedKeys)
-	}
-	return keys, nil
+	return taskcred.ParseTrustedKeys(raw)
 }
 
 // Service answers the server's authorization requests.
@@ -252,6 +233,10 @@ type Service struct {
 	log             *slog.Logger
 	// slots bounds the decisions in flight at once; see calloutWorkers.
 	slots chan struct{}
+	// decisionBudget is authDecisionBudget. It is a field so the suite's
+	// harness, which lifts the server's own two-second ceilings, can lift
+	// this one with them.
+	decisionBudget time.Duration
 }
 
 // NewService builds the callout.
@@ -309,6 +294,8 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		now:       cfg.Now,
 		log:       log,
 		slots:     make(chan struct{}, calloutWorkers),
+
+		decisionBudget: authDecisionBudget,
 	}
 	if svc.grantTTL <= 0 {
 		svc.grantTTL = defaultGrantTTL
@@ -372,7 +359,7 @@ func (s *Service) handle(m *nats.Msg) {
 	// starts here, on receipt, so time spent waiting for a slot counts
 	// against it: a request that waited past the point the client has
 	// already given up is not worth a TokenReview.
-	ctx, cancel := context.WithTimeout(context.Background(), authDecisionBudget)
+	ctx, cancel := context.WithTimeout(context.Background(), s.decisionBudget)
 
 	// nats.go delivers this subscription's messages from one goroutine, so
 	// the callback itself does nothing slow: it hands the request on and
@@ -428,7 +415,9 @@ func (s *Service) decide(ctx context.Context, m *nats.Msg) {
 		// "Authorization Violation" whether its token was bad, the callout
 		// was down, or the response was malformed — so this log line and
 		// the $SYS disconnect advisory are the only places the reason
-		// exists. Log the identity, never the token.
+		// exists. Log the identity, never the token nor the password: the
+		// reason is built from what the client sent, so no step below may
+		// format either into it (ParseDispatcherBucketCredential once did).
 		s.log.Warn("refusing a connection",
 			"reason", err,
 			"host", req.ClientInformation.Host,
@@ -509,9 +498,9 @@ type decision struct {
 	perms   *jwt.Permissions
 	user    string
 
-	// task and notAfter are set on a profile worker's task connection
-	// alone: the task its grants are scoped to, and its credential's
-	// expiry, which caps the minted JWT's (see mint).
+	// task is set on a profile worker's task connection alone: the task
+	// its grants are scoped to. notAfter caps the minted JWT's expiry (see
+	// mint): the task credential's expiry there, or the entry's NotAfter.
 	task     string
 	notAfter time.Time
 
@@ -534,8 +523,9 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	// A profile worker's task connection presents a second credential, the
 	// task credential, and it rides the password beside a token. So: a token
 	// is the ServiceAccount token and the password, if any, the task
-	// credential; with no token, the password is the ServiceAccount token
-	// and there is no task credential.
+	// credential (or, on the dispatcher's entry, a bucket selector "<b>/32",
+	// which is not a credential); with no token, the password is the
+	// ServiceAccount token and there is no task credential.
 	//
 	// Why the password and not CONNECT's jwt field, which nats-server
 	// v2.15.1 also forwards to the callout in this (non-operator) mode:
@@ -580,17 +570,60 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		return decision{}, fmt.Errorf("%s is not in the identity map (version %s)", att.ServiceAccount, m.Version)
 	}
 
-	// A task credential means something only on a profile worker's entry.
-	// Anywhere else it is refused, not ignored: a client presenting one
-	// believes it is getting a task's scope.
-	if taskToken != "" && id.Narrowing != NarrowingProfile {
-		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's", att.ServiceAccount)
+	// A password beside a token means something only on a profile worker's
+	// entry (a task credential) or the dispatcher's (a bucket). Anywhere else
+	// it is refused, not ignored: a client presenting one believes it is
+	// getting a narrower scope.
+	if taskToken != "" && id.Narrowing != NarrowingProfile && id.Narrowing != NarrowingDispatcher {
+		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's or the dispatcher's", att.ServiceAccount)
 	}
 
 	grants, user := id.Grants, id.User
 	var task string
 	var notAfter time.Time
-	if id.Narrowing != "" {
+	// An entry past its NotAfter authenticates nothing, whatever the map
+	// still says; one before it mints no JWT that outlives it.
+	if id.NotAfter != nil {
+		if !s.now().Before(*id.NotAfter) {
+			return decision{}, fmt.Errorf("%s's entry expired at %s", att.ServiceAccount, id.NotAfter.UTC().Format(time.RFC3339))
+		}
+		notAfter = *id.NotAfter
+	}
+	if id.Narrowing == NarrowingDispatcher {
+		// The dispatcher's users are the map's own (its entry's user, or
+		// that user's bucket users, which the map reserves), not a pod
+		// name, so the narrowed-pod reserved check below does not apply.
+		if taskToken != "" {
+			bucket, err := lib.ParseDispatcherBucketCredential(taskToken)
+			if err != nil {
+				// Refused, never served the control connection's grants:
+				// the client asked for a bucket and gets it or nothing.
+				return decision{}, fmt.Errorf("%s presented a dispatcher bucket that was refused: %w", att.ServiceAccount, err)
+			}
+			user = dispatcherBucketUser(id.User, bucket)
+			// The map reserves the bucket users against its own entries and
+			// profiles (validateIdentities), but not against the static
+			// principals and addressees this callout was started with. Nor
+			// can it check the draining names against them, and a draining
+			// name becomes a2a.tasks.<name>.*.supervisor. A bucket user that
+			// is a reserved name refuses the connection. A draining name
+			// that is one is left out of the grants rather than refusing:
+			// one such name must not stop every bucket (#5553, round 1).
+			if kind, ok := s.reserved[user]; ok {
+				return decision{}, fmt.Errorf("%s asked for dispatcher bucket user %q, which is the name of %s", att.ServiceAccount, user, kind)
+			}
+			kept := id
+			kept.Draining = nil
+			for _, p := range id.Draining {
+				if kind, ok := s.reserved[p]; ok {
+					s.log.Warn("dispatcher draining profile left out of its bucket grants: it is a reserved name", "profile", p, "reserved", kind)
+					continue
+				}
+				kept.Draining = append(kept.Draining, p)
+			}
+			grants = dispatcherBucketGrants(m, kept, bucket)
+		}
+	} else if id.Narrowing != "" {
 		// A narrowed entry holds no grants; they are built here from what
 		// the cluster attested about this connection specifically. The
 		// default arm cannot be reached through a parsed map — validate
@@ -769,6 +802,9 @@ func permissionsFor(grants Grants) *jwt.Permissions {
 	p := &jwt.Permissions{}
 	p.Pub.Allow.Add(grants.Publish...)
 	p.Sub.Allow.Add(grants.Subscribe...)
+	// The entry's own denies, on top of its allows (Grants.DenyPublish).
+	p.Pub.Deny.Add(grants.DenyPublish...)
+	p.Sub.Deny.Add(grants.DenySubscribe...)
 	if len(p.Pub.Allow) == 0 {
 		p.Pub.Deny.Add(">")
 	}

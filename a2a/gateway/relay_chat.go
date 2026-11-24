@@ -96,6 +96,9 @@ func chatDroppedWhat(c chatmsg.Carrier, r chatmsg.Reading) string {
 // exactly the post the relay made before chat messages existed. An answer
 // marked for feedback keeps the mark on the text too, on its last chunk.
 func (g *Gateway) postMessage(conversation string, m OutMessage) {
+	if g.unpostableTrigger(conversation) {
+		return
+	}
 	if m.Chat != nil && strings.TrimSpace(m.Text) != "" {
 		_, err := g.adapter.PostMessage(conversation, m)
 		if g.chatOutcome(conversation, err) {
@@ -106,7 +109,7 @@ func (g *Gateway) postMessage(conversation string, m OutMessage) {
 		g.post(conversation, m.Text)
 		return
 	}
-	chunks := chatChunks(m.Text, discordChunk)
+	chunks := chatChunks(m.Text, pieceSizeOf(g.adapter, conversation))
 	last := len(chunks) - 1
 	for _, chunk := range chunks[:last] {
 		if _, err := g.adapter.Post(conversation, chunk); err != nil {
@@ -148,6 +151,21 @@ func (g *Gateway) answerLineFor(rec *SessionRecord, taskID string) string {
 		return ref.StatusMsgID
 	}
 	return ""
+}
+
+// answersWholeOnLine reports a direct answer the backend takes whole on the
+// task's live message (WholeLineAnswerer): one within the backend's piece
+// size (PieceSizer), so the edit carries all of it. A longer one posts, in
+// pieces, and the line ends as lineDoneMark.
+func (g *Gateway) answersWholeOnLine(conversation string, m OutMessage) bool {
+	answerer, ok := g.adapter.(WholeLineAnswerer)
+	if !ok || !answerer.AnswersWholeOnLine(conversation) {
+		return false
+	}
+	// Bytes, the unit chatChunks, truncateRunes and the Teams activity
+	// budget measure in: counted in runes, a long answer in a multi-byte
+	// script would fit the piece and overflow the activity.
+	return len(m.Text) <= pieceSizeOf(g.adapter, conversation)
 }
 
 // answerOnLine edits messageID, the task's live message, into m, the
@@ -206,7 +224,7 @@ func (g *Gateway) chatOutcome(conversation string, err error) bool {
 // stop is editLine's: the running task's id keeps the Stop control on its
 // line, and none takes it off at the terminal.
 func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayState, stop string) bool {
-	line = truncateRunes(line, discordChunk)
+	line = truncateRunes(line, pieceSizeOf(g.adapter, conversation))
 	if rs.lineTextOnly || (rs.lineChat == nil && !rs.lineLaidOut) {
 		return g.editLine(conversation, messageID, line, stop)
 	}

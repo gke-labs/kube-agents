@@ -191,7 +191,7 @@ jobs:
       # so without a helm binary on the runner they skip silently while the job
       # reports green.
       - name: Set up Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.2.3
 
@@ -511,7 +511,7 @@ jobs:
           done
 
       - name: Set up Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.2.3
 
@@ -546,6 +546,25 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           make test-bench-deps
+
+      # The fix recipes: each loads, names an eval case that names it back, and
+      # carries no scaffold line. On a pull request it also flags a change that
+      # edits a recipe and the shared plumbing beside it (a warning, for a
+      # platform owner's review). The checkout is the pull request's merge
+      # commit, one deep; its first parent is the base it merged onto, so a
+      # second commit of depth gives exactly the pull request's change. It
+      # fetches that commit by SHA, not the merge ref, which GitHub may have
+      # rebuilt since checkout (main moved, or an old job re-ran).
+      - name: Check the fix recipes
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          base=""
+          if [ "$IS_PR" = "true" ]; then
+            git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
+            base="HEAD^1"
+          fi
+          make recipe-check RECIPE_CHECK_BASE="$base"
 
       - name: Run the bench harness tests
         run: make test-bench

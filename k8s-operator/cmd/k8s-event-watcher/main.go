@@ -1376,16 +1376,16 @@ func realMain(argv []string) error {
 		return err
 	}
 
+	// Publish cluster_up at 0 and flip watch_set_ready to 1 atomically, so any
+	// scrape that sees watch_set_ready=1 already sees every initial cluster's
+	// series even when waiting on --gateway-url or running under --dry-run.
+	m.publishWatchSet(clusters)
+
 	// After buildWatchSet, so a watch set that cannot be built still exits
 	// at once and counts as a failed start to the entrypoint's supervisor;
 	// before any dedup cache, so nothing is restored or snapshotted while
-	// the process may yet be a standby. cluster_up is published at 0 first,
-	// so the wait reads as "registered, not yet watching" rather than as no
-	// watcher at all.
+	// the process may yet be a standby.
 	if f.gatewayURL != "" && !f.dryRun {
-		for _, tc := range clusters {
-			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-		}
 		waitForGateway(ctx, f.gatewayURL, f.gatewayWait, gatewayProbeInterval)
 		if ctx.Err() != nil {
 			return nil

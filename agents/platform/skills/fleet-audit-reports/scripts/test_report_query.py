@@ -449,6 +449,46 @@ class TestStreams(StoreTestCase):
         self.assertEqual(rows[AUDIT]["liveness"], "error")
 
 
+class TestShadowStreams(StoreTestCase):
+    """A shadow run's stream (#5623) is a canary's: hidden unless --include-shadow asks for it."""
+
+    SHADOW = "compliance-audit-canary"
+
+    def setUp(self):
+        super().setUp()
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        self.write_run(self.SHADOW, "20260826T064100.000000Z", [finding("b")], shadow=True)
+
+    def test_streams_leaves_it_out_and_counts_it(self):
+        payload = self.ok("streams")
+        self.assertEqual([row["audit_id"] for row in payload["streams"]], [AUDIT])
+        self.assertEqual(payload["shadow_hidden"], 1)
+
+    def test_streams_lists_it_with_the_opt_in(self):
+        payload = self.ok("streams", report_query.INCLUDE_SHADOW_FLAG)
+        self.assertEqual(sorted(row["audit_id"] for row in payload["streams"]), sorted([AUDIT, self.SHADOW]))
+        self.assertEqual(payload["shadow_hidden"], 0)
+
+    def test_a_question_about_it_is_refused_without_the_opt_in(self):
+        for argv in (("show", self.SHADOW), ("findings", self.SHADOW), ("finding", self.SHADOW, "b"), ("checks", self.SHADOW), ("runs", self.SHADOW), ("diff", self.SHADOW)):
+            with self.subTest(argv=argv):
+                payload = self.refused(*argv)
+                self.assertIs(payload["shadow"], True)
+                self.assertIn("shadow run", payload["error"])
+
+    def test_a_question_about_it_is_answered_with_the_opt_in(self):
+        payload = self.ok("findings", self.SHADOW, report_query.INCLUDE_SHADOW_FLAG)
+        self.assertEqual([row["id"] for row in payload["findings"]], ["b"])
+        self.assertEqual(self.ok("runs", self.SHADOW, report_query.INCLUDE_SHADOW_FLAG)["count"], 1)
+        # A diff with the opt-in reaches the ring's own answer: one run, nothing to diff.
+        payload = self.refused("diff", self.SHADOW, report_query.INCLUDE_SHADOW_FLAG)
+        self.assertNotIn("shadow", payload)
+        self.assertIn("oldest entry", payload["error"])
+
+    def test_a_live_stream_is_answered_as_before(self):
+        self.assertEqual([row["id"] for row in self.ok("findings", AUDIT)["findings"]], ["a"])
+
+
 class TestShow(StoreTestCase):
     def setUp(self):
         super().setUp()
@@ -1263,6 +1303,51 @@ class TestTheWriterIsWhatIsRead(StoreTestCase):
         diff = self.ok("diff", AUDIT)
         self.assertEqual([row["id"] for row in diff["resolved"]], ["a1"])
         self.assertEqual(diff["added_total"], 0)
+
+
+class TestThroughTheBroker(TestTheWriterIsWhatIsRead):
+    """The same written runs, read and written through the broker store
+    (FLEET_AUDIT_REPORT_STORE=broker): every subcommand answers as over the
+    file store, and nothing is written to the local root."""
+
+    def setUp(self):
+        super().setUp()
+        import test_report_store_broker  # noqa: PLC0415 — on the path report_query put there
+
+        self.broker = test_report_store_broker.FakeBroker()
+        self.addCleanup(self.broker.close)
+        env = patch.dict(os.environ, {
+            "FLEET_AUDIT_REPORT_STORE": "broker",
+            "CREDENTIAL_PROXY_URL": self.broker.url,
+            "CREDENTIAL_PROXY_TOKEN_FILE": "",
+            "CREDENTIAL_PROXY_TASK_TOKEN_FILE": "",
+            "FLEET_AUDIT_REPORTS_DIR": os.path.join(self.root, "absent"),
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        self.audit_report._BROKER_CLIENTS.clear()
+        self.addCleanup(self.audit_report._BROKER_CLIENTS.clear)
+
+    def query(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = report_query.main(list(argv))
+        self.assertEqual(
+            f"report store: broker {self.broker.url} (FLEET_AUDIT_REPORT_STORE=broker)\n", err.getvalue()
+        )
+        return code, json.loads(out.getvalue())
+
+    def test_a_written_run_answers_every_subcommand(self):
+        super().test_a_written_run_answers_every_subcommand()
+        self.assertEqual(os.listdir(self.root), [])
+        self.assertEqual(f"broker {self.broker.url}", self.ok("streams")["root"])
+
+    def test_an_absent_stream_is_absent(self):
+        payload = self.refused("show", AUDIT)
+        self.assertIn("no reports for stream", payload["error"])
+        self.broker.down = 503
+        payload = self.refused("show", AUDIT)
+        self.assertIn("not readable", payload["error"])
 
 
 if __name__ == "__main__":

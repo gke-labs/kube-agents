@@ -28,12 +28,13 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
-- **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
-- **`Tier`** — names what a task may do at a tier. The operator only reports it `Accepted`; nothing enforces it yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
+- **`AgentProfile`** — declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
+- **`Tier`** — names what a task may do at a tier. The operator renders every `Tier` into the tiers file the capability verifier, the gateway and the auth callout load, and an `AgentProfile` lists the tiers it runs at in `allowedTiers`; the PlatformAgent's `spec.tiers.membership` maps people to them. See [Tier CRD](/kube-agents/operator/tier-crd/).
+- **`AgentSchedule`** — runs a prompt, or a built-in schedule's helper script, on an `AgentProfile` on a cron schedule, each run an `Unattended` task. Off by default, and nothing fires yet. See [AgentSchedule CRD](/kube-agents/operator/agentschedule-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
-- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key, runs the `k8s-event-watcher`, and runs the `drift-detector` where an install has enabled it. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
+- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key, runs the `k8s-event-watcher`, runs the `drift-detector` where an install has enabled it, and runs the audit-report store listener on 8700, which renders with the A2A stack on every install. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `StatefulSet` (named `<name>-shell`) and its `Service`, the shell sandbox: `sshd` on `2222`, the durable `/opt/data`, and the wrappers that stand in for `gcloud` and `kubectl`. This is the pod that runs model-authored commands, and its ServiceAccount carries no Workload Identity annotation.
 - A `Deployment` (named `<name>-credential-proxy`), a `ClusterIP` `Service` on port `8765`, a `PodDisruptionBudget` (`maxUnavailable: 1`, which on its one replica refuses no eviction and blocks no drain), and a `NetworkPolicy` narrowing who may reach it (the sandbox and the gateway on `8765`; pods in `gke-gmp-system`, where the managed-Prometheus collector runs, and the operator's own pods on the metrics-only port `8766`) — the credential broker, which holds every credential in the install and executes the real CLIs on the sandbox's behalf. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `Service` fronting the gateway `Deployment` (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
@@ -41,9 +42,10 @@ The controller reconciles a `PlatformAgent` into:
 - A `ServiceAccount` (annotated for Workload Identity) plus RBAC — a viewer `ClusterRoleBinding` and an "explorer" `ClusterRole` with its own `ClusterRoleBinding`.
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, the [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) declaration as `scope.json` mounted at `/etc/kube-agents/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
+- A `ConfigMap` (named `<name>-hold`) holding [`spec.hold`](/kube-agents/operator/platformagent-crd/#spechold) as `hold.json`, mounted into the credential broker and `kube-proxy` at `/etc/kube-agents/hold/`. No pod template hashes it, so a hold rolls nothing.
 - A `ConfigMap` (named `<name>-usage-counters`) holding the totals and per-pod baseline behind `status.usage`'s counters, owned by the CR, so it is collected with it, and written outside the reconcile loop; the operator writes it on the leader, at most once per five-minute poll, when a total or the per-pod baseline changed; a quiet poll writes nothing.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and version control (`forges` and the `repositories` on them — GitOps, managed and read-only context — with `github` as a deprecated alias).
-- Under `spec.mode: next`, additionally the A2A stack (NATS, bus provisioning, the auth callout, the capability verifier and the A2A gateway, on the console door alone until a chat backend is configured), and a `hermes-bridge` container in the agent pod, the bus's task executor, added once the bus is provisioned unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
+- The A2A stack (NATS, bus provisioning, the auth callout, the capability verifier and the A2A gateway, on the console door alone until a chat backend is configured), and a `hermes-bridge` container in the agent pod, the bus's task executor, from the first render unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
@@ -195,8 +197,9 @@ five minutes after, on its own ticker rather than on the reconcile worker. A den
 `RBAC self-check failed` line in the startup log naming the denied permissions
 (`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
 `RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
-`Degraded` for another reason. The Secret write verbs are also probed in the namespace of each
-`PlatformAgent` once the controller has reconciled it. A denial there is learned after startup,
+`Degraded` for another reason. The namespaced write verbs are also probed in the namespace of each
+`PlatformAgent` once the controller has reconciled it, and in its profile namespace once that
+namespace exists. A denial there is learned after startup,
 logged as `RBAC self-check result changed`, and written on that agent alone, with the namespace in
 the label. Reconciles continue; the steps that need the missing verb still fail
 until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and
@@ -204,6 +207,50 @@ triggers no reconcile, so the condition follows the next reconcile after the pro
 five minutes while the condition stands and the reconcile completes, or, while the reconcile itself
 is failing on the missing verb, on controller-runtime's retry backoff, which caps at about seventeen
 minutes.
+
+## Manager cache and memory sizing
+
+Every informer the manager starts is cluster-wide (`PlatformAgent` is namespaced, and the RBAC prune and foreign-`ServiceAccount` checks have to see unlabelled objects in the cluster). Pods, Secrets and the A2A bookkeeping objects are read live without informers, and `Coordination/v1` `Lease` watches are filtered by the A2A gateway label. The manager caches the twelve cluster-scaling resource kinds below across all namespaces, stripping `metadata.managedFields` on ingest and keeping `kubectl.kubernetes.io/last-applied-configuration` so cached `Update` calls do not strip that annotation from live objects.
+
+The chart's default memory limit for the manager is `512Mi` (and the chart refuses a lower limit). At startup the manager sets its Go soft memory limit (`GOMEMLIMIT`) to nine tenths of `OPERATOR_MEMORY_LIMIT_BYTES` (`460.8 MiB` at `512Mi`). On GKE Autopilot without Pod bursting, the cluster clamps a container's limit to its request (`256Mi` by default), so an Autopilot install on a large host cluster must raise `operator.resources.requests.memory` alongside `limits.memory`.
+
+| Cached kind              | Raw live heap per 1,000 objects | Cached live heap per 1,000 objects (`managedFields` stripped) | Without `last-applied-configuration` per 1,000 objects | `managedFields` saved | `last-applied-configuration` share of cached heap |
+| ------------------------ | ------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------ | --------------------- | ------------------------------------------------- |
+| `Deployment`             | 11.2 MiB                        | 8.5 MiB                                                       | 6.2 MiB                                                | 23.8%                 | 27.3%                                             |
+| `StatefulSet`            | 9.5 MiB                         | 7.9 MiB                                                       | 6.2 MiB                                                | 16.5%                 | 21.0%                                             |
+| `PersistentVolumeClaim`  | 4.6 MiB                         | 3.7 MiB                                                       | 3.0 MiB                                                | 19.2%                 | 19.0%                                             |
+| `NetworkPolicy`          | 3.9 MiB                         | 3.5 MiB                                                       | 2.4 MiB                                                | 9.9%                  | 30.9%                                             |
+| `ConfigMap` (~0.6 KiB)   | 3.6 MiB                         | 3.2 MiB                                                       | 1.9 MiB                                                | 11.2%                 | 41.9%                                             |
+| `Service`                | 3.7 MiB                         | 3.0 MiB                                                       | 1.9 MiB                                                | 18.5%                 | 36.2%                                             |
+| `ClusterRole`            | 3.4 MiB                         | 3.0 MiB                                                       | 2.0 MiB                                                | 10.8%                 | 34.3%                                             |
+| `Role`                   | 3.2 MiB                         | 2.9 MiB                                                       | 1.9 MiB                                                | 11.3%                 | 32.6%                                             |
+| `PodDisruptionBudget`    | 3.3 MiB                         | 2.4 MiB                                                       | 1.5 MiB                                                | 27.4%                 | 35.7%                                             |
+| `ClusterRoleBinding`     | 2.4 MiB                         | 2.0 MiB                                                       | 1.1 MiB                                                | 16.5%                 | 45.1%                                             |
+| `RoleBinding`            | 2.4 MiB                         | 2.0 MiB                                                       | 1.1 MiB                                                | 16.8%                 | 43.7%                                             |
+| `ServiceAccount`         | 2.2 MiB                         | 1.8 MiB                                                       | 1.3 MiB                                                | 18.4%                 | 24.1%                                             |
+| **Balanced 12-kind mix** | **4.5 MiB**                     | **3.7 MiB**                                                   | **2.6 MiB**                                            | **17.5%**             | **29.9%**                                         |
+
+`ConfigMap` cache cost grows linearly with payload size above the 0.6 KiB baseline in the table (and doubles when `kubectl.kubernetes.io/last-applied-configuration` mirrors the `data` map).
+
+To size `operator.resources.limits.memory` (and `requests.memory` on Autopilot), sum the host cluster's object counts across the twelve kinds using the cached column above:
+
+```text
+cache_live_heap_mib =
+  8.5 * (Deployments / 1000) +
+  7.9 * (StatefulSets / 1000) +
+  3.7 * (PersistentVolumeClaims / 1000) +
+  3.5 * (NetworkPolicies / 1000) +
+  3.2 * (ConfigMaps / 1000) +
+  3.0 * ((Services + ClusterRoles + Roles) / 1000) +
+  2.4 * (PodDisruptionBudgets / 1000) +
+  2.0 * ((ClusterRoleBindings + RoleBindings) / 1000) +
+  1.8 * (ServiceAccounts / 1000)
+```
+
+Reserve at least 2.5 times `cache_live_heap_mib` (plus 64 MiB for the base runtime, goroutine stacks and webhook TLS state) so initial list decoding and periodic relists stay below the 0.9 Go soft limit without GC thrashing or OOM kills:
+
+- **Raise above `512Mi` (`1Gi` request and limit, as in `examples/values-fleet.yaml`)** when `cache_live_heap_mib` exceeds **180 MiB**. That threshold is reached at roughly **50,000 watched objects** in a balanced cluster mix, or at roughly **20,000 `Deployment` and `StatefulSet` objects** (or 15,000 workloads alongside 20,000 `ConfigMap`, `Service` and RBAC objects).
+- **On GKE Autopilot without bursting**, the default `256Mi` request clamps the container limit to `256Mi` (`230.4 MiB` soft limit). Raise `operator.resources.requests.memory` to `512Mi` once `cache_live_heap_mib` exceeds **75 MiB** (roughly **20,000 watched objects** in a balanced mix, or **9,000 `Deployment` and `StatefulSet` objects**), and to `1Gi` past 50,000 watched objects. See [Fleet and host-cluster sizing](/kube-agents/deploy/fleet-sizing/).
 
 ## Related resources
 

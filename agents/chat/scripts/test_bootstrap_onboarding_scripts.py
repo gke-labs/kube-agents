@@ -457,6 +457,8 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertNotIn("--update", argv)
         text = argv[argv.index("--") + 1]
         self.assertTrue(text.startswith(self.REPORT.rstrip("\n")))
+        # No platform has a home: the gateway keeps the home posts for its digest
+        # and posts none, so the note says the install has no home channel.
         self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
         self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
         self.assertTrue((self.d / COMPLETED).exists())
@@ -492,6 +494,18 @@ class DeliveryToConversationTest(unittest.TestCase):
             note = bootstrap_delivery._audits_note(self.d, False, home=False)
         self.assertIn("not posted to the chat: `compliance-audit`.", note)
         self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE))
+
+    def test_a_gateway_with_no_home_channel_says_so_through_main(self):
+        # Chat is armed but no platform has a home channel: home posts are kept for the
+        # digest, not posted, so the note says the install has none.
+        conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_CONVERSATIONS": "google_chat", "A2A_NOTIFY_PLATFORM": ""}), \
+                mock.patch.object(chat_notify, "HOME_FILE_DIR", str(self.d / "no-home-file")):
+            self.assertEqual(self._run(), 0)
+        text = self.calls[-1][self.calls[-1].index("--") + 1]
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
 
     def test_the_card_posts_with_its_update_key_then_the_note(self):
         with self._card():
@@ -814,6 +828,11 @@ class DeliveryToConversationTest(unittest.TestCase):
                 self.assertFalse((self.d / COMPLETED).exists())
                 self.assertEqual(self._attempts()["attempts"], 0)
                 self.assertIn("the report waits", self._attempts()["last_reason"])
+
+    def test_an_empty_served_list_reads_as_unset_in_the_reason(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_CONVERSATIONS": ""}):
+            self._run()
+        self.assertIn("(A2A_NOTIFY_CONVERSATIONS=<unset>)", self._attempts()["last_reason"])
 
     def test_a_block_does_not_restart_the_wait_after_an_attempt(self):
         record = {"attempts": 1, "last_reason": "refused", "last_at": 1000.0}
@@ -1685,11 +1704,11 @@ class DeliveryCardTest(unittest.TestCase):
         self.assertEqual(chat, inventory_card.chat(self.card)[0])
 
     def test_a_google_chat_origin_with_no_routed_home_gets_the_text_and_the_log_says_why(self):
-        # A conversations-only gateway serves Google Chat, so the card is built, but the
-        # home door has nowhere to send it: the report prints as text and the log says so.
+        # The gateway serves Google Chat, so the card is built, but only Slack has a home,
+        # so the home door has nowhere to send it: the report prints as text and the log says so.
         origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
         environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")}
-        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_CONVERSATIONS": "google_chat"})
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "slack", "A2A_NOTIFY_CONVERSATIONS": "google_chat,slack"})
         out = io.StringIO()
         with (
             mock.patch.dict(os.environ, environ, clear=True),
@@ -1999,6 +2018,33 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertEqual(len(self.runs), len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1)
         self.assertTrue((self.d / COMPLETED).exists(), "the issue is the record; the line is best effort")
         self.assertTrue(any("exited 4" in n for n in self._note_texts()))
+
+    def test_the_home_line_lands_on_every_routed_platform(self):
+        self._filed(self.DAY + self.HOUR)
+        def run(argv, **_kwargs):
+            self.runs.append(argv)
+            if argv[3] == "google_chat":
+                raise OSError("no a2a binary")
+            return subprocess.CompletedProcess(argv, 0, "{}\n", "")
+        with (
+            mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat,slack"}),
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+        ):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual([argv[:4] for argv in self.runs], [
+            [chat_notify.A2A_CLI, "notify", "--platform", "google_chat"],
+            [chat_notify.A2A_CLI, "notify", "--platform", "slack"],
+        ], "a failure on google_chat does not skip slack")
+        line_notes = [n for n in self._note_texts() if "the home line" in n]
+        self.assertEqual(line_notes, [
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="google_chat")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(
+                outcome=bootstrap_delivery.HOME_LINE_FAILED.format(
+                    code=bootstrap_delivery.HOME_LINE_NO_EXIT, detail=OSError("no a2a binary"))),
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="slack")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+        ])
+        self.assertTrue((self.d / COMPLETED).exists())
 
     def test_no_routed_platform_posts_no_home_line(self):
         self._filed(self.DAY + self.HOUR)
@@ -4168,7 +4214,8 @@ class FirstRunAuditsTest(unittest.TestCase):
             json.dumps({"jobs": [{"id": job_id, "name": name} for job_id, name in names.items()]}), encoding="utf-8"
         )
 
-    def _resend(self, home: str, answers=None, now: float | None = None) -> list[tuple[urllib.request.Request, dict]]:
+    def _resend(self, home: str, answers=None, now: float | None = None,
+                homes: dict | None = None) -> list[tuple[urllib.request.Request, dict]]:
         """One tick of the re-send stage with the projected home channel ``home``; the relay's requests, decoded.
 
         ``answers`` is what each request gets, in order: a dict the relay answers with, or an exception to raise;
@@ -4189,12 +4236,21 @@ class FirstRunAuditsTest(unittest.TestCase):
 
         env = {bootstrap_delivery.SESSION_KV_AUTH_ENV: "kv-key", bootstrap_delivery.FINDINGS_ENDPOINT_ENV: "http://relay.test"}
         with (
-            mock.patch.object(chat_notify, "home_file_value", return_value=home),
+            mock.patch.object(chat_notify, "home_file_value",
+                              side_effect=lambda key=chat_notify.HOME_FILE_KEY: (homes or {chat_notify.HOME_FILE_KEY: home}).get(key, "")),
             mock.patch.object(urllib.request, "urlopen", urlopen),
             mock.patch.dict(os.environ, env),
         ):
             bootstrap_delivery.resend_lost_summaries(self.d, time.time() if now is None else now)
         return requests
+
+    def test_a_learned_google_chat_space_opens_the_stage_as_a_slack_channel_does(self):
+        # The gate reads every projected home: a Chat space with Slack's file
+        # empty re-sends, and with both files empty nothing is asked.
+        self._lost_first_run()
+        self.assertEqual(self._resend("", homes={chat_notify.HOME_FILE_KEY: "", chat_notify.GCHAT_HOME_FILE_KEY: ""}), [])
+        requests = self._resend("", homes={chat_notify.HOME_FILE_KEY: "", chat_notify.GCHAT_HOME_FILE_KEY: "spaces/AAA"})
+        self.assertEqual(len(requests), 1)
 
     def _stage_log(self) -> str:
         try:

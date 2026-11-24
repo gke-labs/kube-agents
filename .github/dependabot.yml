@@ -103,9 +103,9 @@ updates:
         patterns:
           - "*"
 
-  # The docs site holds the only package.json with dependencies to update. The
-  # gke-app-onboarding scaffold's declares none, so the old glob covered it
-  # without ever having anything to propose.
+  # The docs site's dependencies. The gke-app-onboarding scaffold's package.json
+  # declares none, so the old glob covered it without ever having anything to
+  # propose. The worker harness SDK has its own entry below.
   - package-ecosystem: "npm"
     directory: "/docs/site"
     schedule:
@@ -123,6 +123,27 @@ updates:
         patterns:
           - "*"
 
+  # The worker image's harness SDK, installed from this directory's lockfile with
+  # `npm ci` (#6948). Its own entry and group, so an SDK bump arrives alone: the
+  # worker's stream-json handling is proved against one SDK version
+  # (a2a/Dockerfile.worker), and that bump needs its own review.
+  - package-ecosystem: "npm"
+    directory: "/a2a/worker-harness"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "build"
+    groups:
+      worker-harness:
+        patterns:
+          - "*"
+
   # This directory holds a literal FROM pin that images.json does not cover:
   # an alpine base in an e2e fixture. The gke-app-onboarding skill's Dockerfile
   # also has a literal pin, but it is generated from google/skills plus a patch
@@ -133,10 +154,11 @@ updates:
   # images this repository builds interpolate two ARGs each
   # (`FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}`), which the Docker updater cannot
   # resolve; images.json and `make mirror-images` own those pins. The
-  # agentplugins Dockerfiles are `FROM busybox:musl@sha256:…`, a literal digest
-  # the updater could move, and are left out because images.json owns that pin
-  # (its `busybox` entry) and `make images-check` holds the three copies in
-  # step; a bump lands in all of them at once, by hand. Naming the
+  # agentplugins and `a2a/Dockerfile.persona-*` Dockerfiles are
+  # `FROM busybox:musl@sha256:…`, a literal digest the updater could move, and
+  # are left out because images.json owns that pin (its `busybox` entry) and
+  # `make images-check` holds every copy in step; a bump lands in all of them
+  # at once, by hand. Naming the
   # directory, rather than globbing, is what keeps this from recreating #763.
   - package-ecosystem: "docker"
     directories:

@@ -1,0 +1,56 @@
+✓ Successfully leased project: kube-agents-evals-11
+>>> [2025-09-22T15:11:02Z] launching case-02 rep 1/3
+>>> [2025-09-22T15:11:07Z] launching case-29 rep 1/3
+>>> [2025-09-22T15:11:12Z] launching case-24 rep 1/3
+>>> [2025-09-22T15:11:17Z] launching case-09 rep 1/3
+<<< [2025-09-22T15:14:40Z] finished case-29 rep 1 in 199s
+>>> [2025-09-22T15:14:41Z] launching case-29 rep 2/3
+<<< [2025-09-22T15:18:03Z] finished case-29 rep 2 in 191s
+>>> [2025-09-22T15:18:04Z] launching case-29 rep 3/3
+<<< [2025-09-22T15:19:55Z] finished case-02 rep 1 in 423s
+>>> [2025-09-22T15:19:56Z] launching case-02 rep 2/3
+<<< [2025-09-22T15:21:30Z] finished case-29 rep 3 in 194s
+<<< [2025-09-22T15:22:48Z] finished case-24 rep 1 in 537s
+>>> [2025-09-22T15:22:49Z] launching case-24 rep 2/3
+<<< [2025-09-22T15:24:12Z] finished case-09 rep 1 in 592s
+>>> [2025-09-22T15:24:13Z] launching case-09 rep 2/3
+<<< [2025-09-22T15:28:20Z] finished case-02 rep 2 in 402s
+>>> [2025-09-22T15:28:21Z] launching case-02 rep 3/3
+<<< [2025-09-22T15:30:05Z] finished case-24 rep 2 in 355s
+>>> [2025-09-22T15:30:06Z] launching case-24 rep 3/3
+<<< [2025-09-22T15:33:41Z] finished case-09 rep 2 in 447s
+>>> [2025-09-22T15:33:42Z] launching case-09 rep 3/3
+<<< [2025-09-22T15:36:02Z] finished case-02 rep 3 in 372s
+<<< [2025-09-22T15:36:44Z] finished case-24 rep 3 in 328s
+<<< [2025-09-22T15:38:10Z] finished case-09 rep 3 in 237s
+>>> [2025-09-22T15:38:11Z] Grading Task: case-02 (./tasks/case-02/task.yaml) x3 <<<
+Task case-02 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: roster
+>>> [2025-09-22T15:38:11Z] Grading Task: case-29 (./tasks/case-29/task.yaml) x3 <<<
+Task case-29 Result: [RESOURCE_PREPARATION_FAILED] all 3 repetition(s) failed on infrastructure before the case could be evaluated
+  deployer: noop
+  rep 1: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: roster
+>>> [2025-09-22T15:38:12Z] Grading Task: case-24 (./tasks/case-24/task.yaml) x3 <<<
+Task case-24 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.55]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.55]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.55]
+  admission: roster
+>>> [2025-09-22T15:38:12Z] Grading Task: case-09 (./tasks/case-09/task.yaml) x3 <<<
+Task case-09 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  admission: not on the roster (held out)
+Admitted-case pass rate: 100.0% (no baseline at the current version key -- advisory)
+❌ [2025-09-22T15:38:13Z] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See /logs/artifacts/eval-verdict.md (Total Duration: 1191s)
+released resource "kube-agents-evals-11"

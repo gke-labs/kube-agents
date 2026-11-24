@@ -2,7 +2,7 @@ Subject: Scope the stockout cooldown by GKE version
 
 Why: Upstream calls the stockout cooldown global, but upstream's own gke-compute-classes (prioritization reference, SKILL.md cooldown bullet, and the code index's per-zone `npc_backoff.go` row) says it is zonal from GKE 1.36.3-gke.1244000. Without the version split this skill gives the pre-1.36.3 answer for every cluster, and contradicts the gke-compute-classes text it defers to once that skill carries upstream's version split.
 Local-Issue: none (#2692)
-Upstream-Issue: none filed yet
+Eval-Case: autoscaler-zonal-stockout-cooldown-scope-probe
 Retire-When: upstream gke-cluster-autoscaler gives the cooldown scope by GKE version
 
 diff --git a/SKILL.md b/SKILL.md

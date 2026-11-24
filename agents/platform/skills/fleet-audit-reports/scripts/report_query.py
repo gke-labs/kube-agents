@@ -30,6 +30,12 @@ that cannot be listed makes the stream unreadable, as `streams` reports it:
 the default then is not known to be the only one, and a repository named under
 that owner could not be looked for.
 
+A shadow run's stream (#5623) holds a canary's results, not a live audit's.
+`streams` leaves it out and counts it as `shadow_hidden`, and a question
+about one of its runs is refused, unless `--include-shadow` asks for it: the
+flag is for the canary's comparison and its eval, never for an answer to a
+person.
+
 Exit 0 means answered. Exit 2 means the question could not be answered, and
 stdout still carries one JSON object whose `error` says why — an absent or
 unlistable store, an absent stream, an absent stamp, a file that would not
@@ -101,7 +107,14 @@ def _oneline(exc: Exception) -> str:
 
 
 def _root_of(args: argparse.Namespace) -> str:
-    return report_status.reports_root(getattr(args, "root", None))
+    """The store this run reads, its choice logged on stderr: the file store
+    at `--root` or the default root, or the broker store when
+    FLEET_AUDIT_REPORT_STORE is `broker` (report_status.select_report_store)."""
+    return report_status.report_store(getattr(args, "root", None))
+
+
+def _is_broker(root: str) -> bool:
+    return isinstance(root, report_status.BrokerReportStore)
 
 
 def _stream_ids(root: str) -> list[str]:
@@ -161,7 +174,7 @@ def _require_stream(root: str, audit_id: str) -> None:
     `streams` reports it, not absent."""
     _inside_store(audit_id, "stream")
     reason = report_status.store_root_error(root)
-    if reason or not os.path.isdir(root):
+    if reason or not (_is_broker(root) or os.path.isdir(root)):
         raise QueryError(
             _store_error(root, reason),
             root=root,
@@ -172,7 +185,10 @@ def _require_stream(root: str, audit_id: str) -> None:
             **_liveness(root, audit_id),
         )
     try:
-        is_stream = stat.S_ISDIR(os.stat(os.path.join(root, audit_id)).st_mode)
+        if _is_broker(root):
+            is_stream = audit_id in report_status.stream_ids(root)
+        else:
+            is_stream = stat.S_ISDIR(os.stat(os.path.join(root, audit_id)).st_mode)
     except FileNotFoundError:
         is_stream = False
     except OSError as exc:
@@ -221,7 +237,7 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
     repos, unreadable = _repos(root, audit_id)
     if repo is not None:
         try:
-            path = report_status.store_path(root, audit_id, repo)
+            path = None if _is_broker(root) else report_status.store_path(root, audit_id, repo)
             # The listing's spelling of that store: `github.com/owner/name`
             # and `owner/name` open one directory and must answer alike.
             repo = report_status.store_key(root, audit_id, repo)
@@ -230,8 +246,9 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
         if repo not in repos:
             # Its owner may not have listed: whether the directory is there is
             # the stat's to say, and a stat that fails is unread, not absent.
+            # The broker's listing has no unlisted owner to hide behind.
             try:
-                is_repo = stat.S_ISDIR(os.stat(path).st_mode)
+                is_repo = path is not None and stat.S_ISDIR(os.stat(path).st_mode)
             except FileNotFoundError:
                 is_repo = False
             except OSError as exc:
@@ -277,13 +294,35 @@ def _stream_state(root: str, audit_id: str) -> tuple[str, str | None]:
     """The stream's liveness and stream-level error, as `streams` reports
     them: the same projection, so `runs` and a refusal cannot disagree with
     it about a lease, and an `error` liveness always comes with its reason."""
+    liveness, error, _ = _stream_state_and_shadow(root, audit_id)
+    return liveness, error
+
+
+def _refuse_shadow(args: argparse.Namespace, shadow: bool) -> None:
+    """Refuse a question about a shadow run's stream unless `--include-shadow` asks for it."""
+    if shadow and not args.include_shadow:
+        raise QueryError(
+            f"{args.stream} is a shadow run's stream: a canary's results, not a live "
+            "audit's. Answer from the live audit's stream instead.",
+            shadow=True,
+        )
+
+
+def _refuse_shadow_stream(root: str, args: argparse.Namespace) -> None:
+    """`_refuse_shadow` for a subcommand that hasn't projected the stream yet."""
+    _, _, shadow = _stream_state_and_shadow(root, args.stream)
+    _refuse_shadow(args, shadow)
+
+
+def _stream_state_and_shadow(root: str, audit_id: str) -> tuple[str, str | None, bool]:
+    """`_stream_state`, and whether the projection reads the stream as a shadow run's."""
     try:
         stream = report_status.project_stream(
             root, report_status.scratch_root(), audit_id, time.time()
         )
     except (OSError, ValueError, OverflowError) as exc:
-        return "error", f"the stream could not be projected: {_oneline(exc)}"
-    return stream["liveness"], stream.get("error")
+        return "error", f"the stream could not be projected: {_oneline(exc)}", False
+    return stream["liveness"], stream.get("error"), report_status.stream_is_shadow(stream)
 
 
 def _liveness(root: str, audit_id: str) -> dict:
@@ -302,10 +341,13 @@ def _run_name(run: str | None) -> str:
     return _inside_store(run if run.endswith(".json") else f"{run}.json", "run")
 
 
-def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple[str, dict]:
+def load_envelope(
+    root: str, audit_id: str, repo: str, run: str | None, *, include_shadow: bool = False
+) -> tuple[str, dict]:
     """One run's envelope, whole, `document` included. Raises QueryError.
 
-    `repo` is already resolved (`_resolve_repo`)."""
+    `repo` is already resolved (`_resolve_repo`). A shadow run's envelope is
+    refused unless `include_shadow` (INCLUDE_SHADOW_FLAG)."""
     name = _run_name(run)
     try:
         if name == report_status.LATEST_NAME:
@@ -339,6 +381,12 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
             f"{audit_id} has no run {name!r} in the ring for {repo}",
             runs=_ring(root, audit_id, repo),
         )
+    if envelope.get(report_status.SHADOW_KEY) is True and not include_shadow:
+        raise QueryError(
+            f"{audit_id}/{name} is a shadow run's report: a canary's results, not a "
+            "live audit's. Answer from the live audit's stream instead.",
+            shadow=True,
+        )
     return name, envelope
 
 
@@ -346,7 +394,7 @@ def _open(args: argparse.Namespace) -> tuple[str, str, str, dict]:
     """Root, repository, run name and envelope for a per-run subcommand."""
     root = _root_of(args)
     repo = _resolve_repo(root, args.stream, args.repo)
-    name, envelope = load_envelope(root, args.stream, repo, args.run)
+    name, envelope = load_envelope(root, args.stream, repo, args.run, include_shadow=args.include_shadow)
     return root, repo, name, envelope
 
 
@@ -408,12 +456,18 @@ def _matches(finding: dict, severity: str | None, cluster: str | None, check: st
     return True
 
 
+# A shadow run's stream holds a canary's results, not a live audit's (#5623).
+# Every answer leaves it out unless this flag asks for it, which the canary's
+# comparison and its eval pass; an agent answering a person never does.
+INCLUDE_SHADOW_FLAG = "--include-shadow"
+
+
 def cmd_streams(args: argparse.Namespace) -> dict:
     """One row per stream — the fleet at a glance, no document read into the
     answer. `report_status.project` already computes this; the rows here are
     its projection with the per-stream `latest` flattened and the ring reduced
     to a count."""
-    projection = report_status.project(_root_of(args))
+    projection = report_status.project(_root_of(args), include_shadow=args.include_shadow)
     rows = [
         _stream_row(audit_id, stream, repo, entry)
         for audit_id, stream in sorted(projection["streams"].items())
@@ -440,6 +494,8 @@ def cmd_streams(args: argparse.Namespace) -> dict:
         "ttl_s": projection["ttl_s"],
         "lease_error": projection.get("lease_error"),
         "streams": rows,
+        # Shadow runs' streams left out (`--include-shadow` lists them).
+        "shadow_hidden": projection.get("shadow_hidden", 0),
         "error": error,
     }
 
@@ -651,6 +707,10 @@ def cmd_diff(args: argparse.Namespace) -> dict:
     """
     root = _root_of(args)
     repo = _resolve_repo(root, args.stream, args.repo)
+    # Before the ring checks, whose refusals list the ring's stamps: a shadow
+    # stream is refused first, as `runs` refuses it (`load_envelope` below
+    # refuses each envelope too).
+    _refuse_shadow_stream(root, args)
     ring = _ring(root, args.stream, repo)
     if not ring:
         raise QueryError(f"{args.stream}: the run ring is empty, so there is nothing to diff")
@@ -679,8 +739,8 @@ def cmd_diff(args: argparse.Namespace) -> dict:
         raise QueryError(
             f"{args.stream}: --from {earlier} is not older than --to {later}", runs=ring
         )
-    _, before_envelope = load_envelope(root, args.stream, repo, earlier)
-    _, after_envelope = load_envelope(root, args.stream, repo, later)
+    _, before_envelope = load_envelope(root, args.stream, repo, earlier, include_shadow=args.include_shadow)
+    _, after_envelope = load_envelope(root, args.stream, repo, later, include_shadow=args.include_shadow)
     before = {str(f.get("id")): f for f in _findings_of(args.stream, earlier, before_envelope)}
     after = {str(f.get("id")): f for f in _findings_of(args.stream, later, after_envelope)}
     added = sorted((f for fid, f in after.items() if fid not in before), key=_severity_key)
@@ -727,7 +787,8 @@ def cmd_runs(args: argparse.Namespace) -> dict:
     # sibling repository's corrupt store, a stray directory, an unreadable
     # lease -- and a lease that makes liveness `running` does not clear it.
     # The ring still lists; the error makes the exit 2, as it does there.
-    liveness, error = _stream_state(root, args.stream)
+    liveness, error, shadow = _stream_state_and_shadow(root, args.stream)
+    _refuse_shadow(args, shadow)
     return {
         "root": root,
         "audit_id": args.stream,
@@ -763,6 +824,12 @@ def build_parser() -> argparse.ArgumentParser:
     # overwrites one given before the subcommand.
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--root", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    shared.add_argument(
+        INCLUDE_SHADOW_FLAG,
+        dest="include_shadow",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     repo_flag = argparse.ArgumentParser(add_help=False)
     repo_flag.add_argument(
         "--repo",

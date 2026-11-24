@@ -2,7 +2,7 @@ Subject: Start Developer Knowledge lookups with search_documents
 
 Why: Developer Knowledge's `answer_query` has a quota of 50 requests per day per project, shared by every agent in an install; the grounding step starts with `search_documents` and never calls `answer_query`. `get_document` is also not the tool's name.
 Local-Issue: #1765 (fixed in #1838)
-Upstream-Issue: none filed yet
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Retire-When: upstream stops preferring `answer_query` and names `get_documents`
 
 diff --git a/SKILL.md b/SKILL.md

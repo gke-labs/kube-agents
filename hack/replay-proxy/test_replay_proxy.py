@@ -1,5 +1,6 @@
 """The shadow proxy end to end against a fake LiteLLM: pass-through, the log line, /metrics, never replaying."""
 
+import concurrent.futures
 import http.client
 import io
 import json
@@ -32,6 +33,11 @@ STALL_SECONDS = 0.3
 LONG_STALL_SECONDS = 1.0
 SHORT_TIMEOUT_SECONDS = 0.25
 DEEP_NESTING = 100_000
+# The deepest document the search of `nested_past_the_parser` tries: its
+# brackets are a quarter of the bytes that the proxy observes of an answer.
+DEEPEST_DOCUMENT_TRIED = replay_proxy.MAX_OBSERVED_BYTES // 8
+# Why a test skips when the search of `nested_past_the_parser` finds no document.
+NO_DOCUMENT_REFUSED = "the JSON parser of this Python parses %d levels, the deepest that this test tries"
 SLOW_CHUNKS = 100
 SLOW_CHUNK_SECONDS = 0.05
 
@@ -247,10 +253,11 @@ class ProxyTestCase(unittest.TestCase):
         self.server.server_close()
         self.upstream.server_close()
 
-    def request(self, method, path, body=None, port=None):
+    def request(self, method, path, body=None, port=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=LOG_WAIT_SECONDS)
         data = json.dumps(body).encode() if isinstance(body, dict) else body
-        conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
+        sent = {"Content-Type": "application/json"} if data else {}
+        conn.request(method, path, body=data, headers={**sent, **(headers or {})})
         resp = conn.getresponse()
         try:
             payload = resp.read()
@@ -380,6 +387,39 @@ def sse(event):
     return f"data: {event}\n\n".encode()
 
 
+def nested_past_the_parser(levels, most):
+    """A JSON array nested `levels` deep or deeper that `json.loads` refuses for its
+    depth on this run, or None when one of `most` levels still parses.
+
+    The parser's depth limit is the interpreter's: about 10,000 levels on Python
+    3.12 and 3.13, and on 3.14 as many as the stack holds (more than 100,000
+    with a 16 MB stack). So no fixed depth is past it on every run.
+    """
+    depth = levels
+    while True:
+        text = "[" * depth + "]" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        if depth >= most:
+            return None
+        depth = min(2 * depth, most)
+
+
+def nested_past_the_parser_on_a_thread(levels, most):
+    """`nested_past_the_parser`, searched on a new thread: the server parses on
+    one, and on Python 3.14 the limit is that thread's stack."""
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        return pool.submit(nested_past_the_parser, levels, most).result()
+
+
+def nested_too_deep_stream():
+    """A stream whose one event the proxy's parser refuses for its depth, or None."""
+    deep = nested_past_the_parser_on_a_thread(DEEP_NESTING, DEEPEST_DOCUMENT_TRIED)
+    return None if deep is None else sse('{"choices": ' + deep + "}")
+
+
 MALFORMED_STREAMS = {
     "tool_call index null": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": None, "id": "c"}]}}]})),
     "tool_call index string": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": "0", "id": "c"}]}}]})),
@@ -389,7 +429,7 @@ MALFORMED_STREAMS = {
     "data that is not JSON": sse("not json at all"),
     "delta not a dict": sse(json.dumps({"choices": [{"delta": ["x"]}]})),
     "choices a number": sse(json.dumps({"choices": 5})),
-    "nested too deep": sse('{"choices": ' + "[" * DEEP_NESTING + "]" * DEEP_NESTING + "}"),
+    "nested too deep": nested_too_deep_stream(),
 }
 
 
@@ -410,6 +450,8 @@ class ObserveFailureTest(ProxyTestCase):
     def test_malformed_streamed_chunks(self):
         for name, body in MALFORMED_STREAMS.items():
             with self.subTest(name):
+                if body is None:
+                    self.skipTest(NO_DOCUMENT_REFUSED % DEEPEST_DOCUMENT_TRIED)
                 self.out.seek(0)
                 self.out.truncate()
                 self.check(body, stream=True)
@@ -747,6 +789,69 @@ class LocalEndpointTest(ProxyTestCase):
         self.assertEqual(FakeLiteLLM.calls, [])
 
 
+TAG = "devops-bench-0123456789ab/some-case/2"
+AGENT = "platform;card"
+
+
+class EvalRunTagTest(ProxyTestCase):
+    """X-Kube-Agents-Eval-Run and -Agent: logged on every line, never forwarded, never keyed."""
+
+    def tagged(self, body, run=TAG, agent=AGENT):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+        headers = {"Content-Type": "application/json"}
+        if run is not None:
+            headers["X-Kube-Agents-Eval-Run"] = run
+        if agent is not None:
+            headers["X-Kube-Agents-Eval-Agent"] = agent
+        conn.request("POST", "/v1/chat/completions", body=json.dumps(body).encode(), headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def test_the_tags_are_logged_and_never_forwarded(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                FakeLiteLLM.calls = []
+                self.assertEqual(self.tagged(chat("t_11111111", stream=stream)), 200)
+                forwarded = {k.lower() for k in FakeLiteLLM.calls[0]["headers"]}
+                self.assertNotIn("x-kube-agents-eval-run", forwarded)
+                self.assertNotIn("x-kube-agents-eval-agent", forwarded)
+        lines = self.lines(2)
+        self.assertEqual({(l["eval_run"], l["eval_agent"]) for l in lines}, {(TAG, AGENT)})
+
+    def test_the_fingerprint_is_the_same_with_and_without_the_tags(self):
+        body = chat("t_11111111", stream=False)
+        self.tagged(body, run=None, agent=None)
+        self.tagged(body)
+        # The proxy writes each request's line in the background, so the two can land in either order.
+        untagged, tagged = sorted(self.lines(2), key=lambda line: line["eval_run"] is not None)
+        self.assertIsNone(untagged["eval_run"])
+        self.assertIsNone(untagged["eval_agent"])
+        self.assertEqual(tagged["eval_run"], TAG)
+        for field in ("fingerprint", "settings_hash", "message_hashes", "diag_message_hashes", "diag_settings_hash"):
+            self.assertEqual(untagged[field], tagged[field], field)
+        self.assertEqual(FakeLiteLLM.calls[0]["body"], FakeLiteLLM.calls[1]["body"])
+        self.assertEqual({k: v for k, v in FakeLiteLLM.calls[0]["headers"].items() if k.lower() != "host"},
+                         {k: v for k, v in FakeLiteLLM.calls[1]["headers"].items() if k.lower() != "host"})
+
+    def test_a_malformed_tag_logs_as_null_and_is_still_dropped(self):
+        self.tagged(chat("t_11111111", stream=False), run="not-a-tag", agent="no separator")
+        line = self.lines(1)[0]
+        self.assertIsNone(line["eval_run"])
+        self.assertIsNone(line["eval_agent"])
+        self.assertNotIn("x-kube-agents-eval-run", {k.lower() for k in FakeLiteLLM.calls[0]["headers"]})
+
+    def test_an_errored_analysis_line_keeps_the_tags(self):
+        def explode(*_args):
+            raise RuntimeError("bug")
+
+        self.proxy.analyze = explode
+        self.tagged(chat("t_11111111", stream=False))
+        line = self.lines(1)[0]
+        self.assertEqual((line["error"], line["eval_run"], line["eval_agent"]), ("RuntimeError", TAG, AGENT))
+
+
 class LogLineTest(ProxyTestCase):
     def test_non_streaming_line(self):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
@@ -835,7 +940,39 @@ class LogLineTest(ProxyTestCase):
         headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
         answer = {"role": "assistant", "content": f"Reading ~/.hermes/sessions/{session}/state.json"}
         self.assertTrue(mapping.answer_repeats_date(answer["content"]), "the raw text does name the day")
-        self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber), [])
+        self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber,
+                                                         finish_reason="stop"), [])
+
+    def test_only_a_finished_reply_is_storable(self):
+        body = {"model": "model-default", "messages": [{"role": "user", "content": "list the pods"}]}
+        mapping = replay_proxy.normalizer.normalize_request(body, time.time()).mapping
+        scrubber = replay_proxy.request_store.Scrubber(REDACTOR, RULES)
+        headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        answer = {"role": "assistant", "content": "Listing the pods now."}
+        for finish, expected in (("stop", []), ("tool_calls", []), ("length", ["unfinished_reply"]),
+                                 ("content_filter", ["unfinished_reply"]), ("other", ["unfinished_reply"]),
+                                 (None, []), ("", [])):
+            with self.subTest(finish_reason=finish):
+                self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber,
+                                                                 finish_reason=finish), expected)
+
+    def test_a_reply_cut_off_at_the_token_limit_is_logged_unstorable(self):
+        FakeLiteLLM.custom_body = json.dumps({"choices": [{"index": 0, "finish_reason": "length", "message": {
+            "role": "assistant", "content": "The pods are web-1 and"}}]}).encode()
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        line = self.lines(1)[0]
+        self.assertIn("unfinished_reply", line["unstorable"])
+        self.assertEqual(line["finish_reason"], "length")
+
+    def test_a_reply_naming_no_finish_reason_is_storable_and_logged_as_none(self):
+        FakeLiteLLM.extra_headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        self.addCleanup(setattr, FakeLiteLLM, "extra_headers", {})
+        FakeLiteLLM.custom_body = json.dumps({"choices": [{"index": 0, "message": {
+            "role": "assistant", "content": "Listing the pods now."}}]}).encode()
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        line = self.lines(1)[0]
+        self.assertNotIn("unfinished_reply", line["unstorable"])
+        self.assertIsNone(line["finish_reason"])
 
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"

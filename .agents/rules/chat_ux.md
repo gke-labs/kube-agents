@@ -46,7 +46,8 @@ replies short", "Write replies as warm, full sentences that lead with the fact")
 [`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 ("Short by default") and §7. The
 layout is `answer_message` in `agents/platform/scripts/chat_message.py` and its port `answerChat`
 in `a2a/hermes-bridge/chat.go`: the first sentence becomes `headline`, cut at a clause to stay
-within 150 characters and rendered bold, and a rest too long for `detail` goes under `fold`.
+within 150 characters, or at a word with an ellipsis the detail then opens with when no clause
+fits, and rendered bold, and a rest too long for `detail` goes under `fold`.
 
 ## The acknowledgement names its target
 
@@ -68,15 +69,15 @@ a violation, and so is a progress line left behind under the answer.
 
 Why: a trail of progress posts buries the answer and notifies the user for every step.
 
-Today: under `next`, the `progress` artifact is "the task's one live message, edited in place"
+Today: through the A2A gateway, the `progress` artifact is "the task's one live message, edited in place"
 ([`spec-a2a-payloads.md`](../../docs/designs/spec-a2a-payloads.md), "Chat messages"), drawn by
 `updateRollingLine` in `a2a/gateway/relay.go`; the queue notice in `a2a/gateway/busy.go` replaces
 the placeholder rather than following it, and on Google Chat the line ends as a bare ✅ once the
 answer posts, or as the hand-off acknowledgement (`doneTerminalLine` in `a2a/gateway/relay.go`,
-`answerOnLine` in `a2a/gateway/relay_chat.go`), rather than reading `completed` under the ask. Under `today`, a card's heartbeats share one message
-([`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0, "Show your progress"), the plan is
-one message per thread (`agents/platform/scripts/slack_status.py`), and `kanban_notifier.py`'s
-`drop_superseded` drops a held failure line, before it posts, once the card recovers.
+`answerOnLine` in `a2a/gateway/relay_chat.go`), rather than reading `completed` under the ask. On Slack, which the gateway serves through its Slack presenter, a card's heartbeats share one
+message ([`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0, "Show your progress"), the
+plan is one message per thread (`a2a/gateway/slack_chat.go`, porting `slack_status.py`'s `plan_blocks`), and `drop_superseded` (`deploy/docker/patches/kanban_notifier.py`) drops a held
+failure line, before it posts, once the card recovers.
 
 ## No plumbing in user text
 
@@ -145,7 +146,9 @@ detail the dispatcher or the verifier wrote for the person (`reasonDetailShown`)
 
 Beyond the acknowledgement, a message of its own, one that notifies, is for a pull request opened,
 a question only the user can answer, a failure, or done. Everything else updates the live line or
-stays silent.
+stays silent. One more is permitted, on Slack and on Google Chat: a notice about the home channel,
+once per change. That is the line saying a mention, or a pick or move on Slack's Home tab, set it,
+and the one digest of kept posts when a home channel arrives.
 
 Why: every extra post notifies, and noise trains the user to ignore the thread.
 
@@ -157,7 +160,9 @@ work waits on as messages of their own while every other milestone stays a plan 
 the head line above a report and hold a failure line the wake will explain. A post one reader
 alone sees, telling them a control they pressed was refused and what still works
 (`refusedPressNotice` in `a2a/gateway/stopgate.go`), is that reader's failure line and notifies
-nobody else.
+nobody else. The home-channel notices are `homeLearnedLine` (`a2a/gateway/slack_home_channel.go`),
+`gchatHomeLearnedLine` (`a2a/gateway/gchat_home_channel.go`), `homePickedLine` and `homeMovedLine`
+(`a2a/gateway/slack_home_pick.go`), and `refusedDigestHead` (`a2a/gateway/notify_refused.go`).
 
 ## A destructive action needs the asker's confirm
 

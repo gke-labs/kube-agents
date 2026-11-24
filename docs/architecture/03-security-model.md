@@ -182,7 +182,8 @@ RBAC at runtime. Consequences:
     `spec.security.disallowSecretsRead: true` is set; model-executing containers mount no default-audience
     API server token and reach the API server through `<agent>-kube-proxy`, which enforces
     `KUBE_PROXY_REDACT_SECRETS=true`, while the credential broker's command policy refuses `Secret` reads
-    and the gateway's `agent-api-auth` sidecar uses its in-cluster token only for event and CR watching.
+    and the gateway's `agent-api-auth` sidecar uses its in-cluster token only for event and CR watching
+    and to read the cluster JWKS the audit-report store listener verifies against.
     Assuming it minted none is
     what let the second policy be written so that it denied the controller's own binding.)
   - a **second `ValidatingAdmissionPolicy` governs `(Cluster)RoleBinding`s by their bound _subject_** —
@@ -372,9 +373,12 @@ Two details that the trust-boundary and defense tables above rely on:
   GitHub (via Minty), and the MCP tool endpoints agents ground on (e.g. `developer_knowledge`, `gke`).
   The allowlist must never omit MCP endpoints needed for grounding on live docs. An L7 egress proxy
   for hostname-precise allowlisting is a Phase 5 hardening item ([07](07-implementation-roadmap.md)).
-- **Multi-tenant inference:** a shared LiteLLM proxy with **per-tier/per-tenant virtual keys** (own
-  budget, rate-limit, scoped logging); physically separate proxies only if data sensitivity later
-  requires it.
+- **Multi-tenant inference:** a shared LiteLLM proxy where each caller class (agent gateway, each
+  profile tier, sessions, curator, scheduled jobs) authenticates with **its own key**, checked by a
+  gateway auth hook against a map of key digests with no database, which attributes spend and
+  tokens per class and can carry a per-class rate limit. A per-tenant budget needs LiteLLM's
+  virtual keys and its database and is a later decision; physically separate proxies only if data
+  sensitivity later requires it.
 
 ## 11. Verification
 

@@ -2,7 +2,7 @@ Subject: Restore volume data in the restore plan
 
 Why: the restore plan leaves out --volume-data-restore-policy, whose default is no-volume-data-restoration, so a restore brings back PVCs bound to blank volumes even though the backup plan includes volume data. The patch restores from the backup.
 Local-Issue: none (#2359)
-Upstream-Issue: none filed yet
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Retire-When: upstream's restore plan sets a volume data restore policy
 
 diff --git a/SKILL.md b/SKILL.md

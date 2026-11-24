@@ -65,9 +65,15 @@ NOT_STARTED_NOTICES = (
     "🚦 not started: 1 session worker is already running (cap 1). Wait for one to finish or `stop` one you started; "
     "an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
     "⚠️ not started: can't count the running session workers right now — try again in a moment",
+    "⚠️ not started: other conversations were starting session workers and this one waited too long — try again in a moment",
+    "🚦 not started: the gateway stopped while this waited for a session worker — send it again",
+    "🚦 not started: every session worker stayed busy while this waited, so I took it out of the line — send it again later, "
+    "or `stop` a conversation you started to free one",
+    "🚦 not started: this conversation is already waiting for a session worker with 8 messages behind it — send this one once it starts",
     "⚠️ not started: could not mint this task's capability",
     "⚠️ not started: could not close the previous task on the bus; try again in a moment",
     "⚠️ not started: a task is still running here; stop it or wait for it before asking an agent profile",
+    "⚠️ not started: a task is still running here; stop it or wait for it before confirming a change",
 )
 # Far above any timeout a test sets: a poll that passes it is unbounded.
 SLEEP_BUDGET_SECONDS = 10_000
@@ -1340,8 +1346,11 @@ class UnitTest(unittest.TestCase):
         # Since #2493 the placeholder carries a delegated child's line note;
         # a typed turn has none, so the live check sees the bare placeholder.
         # The placeholder is a message value since the Google Chat Stop button:
-        # posted with Stop naming the task while it runs.
-        self.assertIn(f'g.adapter.PostMessage(rec.Key, OutMessage{{Text: withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote), Stop: taskID}})', gateway)
+        # posted with Stop naming the task while it runs. Since #6116 a
+        # top-level profile task's line also names its profile and the frame
+        # it answers (console only), so the call may carry more fields after
+        # Stop; the text and the Stop are what the live check reads.
+        self.assertIn(f'g.adapter.PostMessage(rec.Key, OutMessage{{Text: withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote), Stop: taskID', gateway)
         self.assertIn(f'"{harness.STATUS_BUS_FAILURE}"', gateway)
         # Main moved the notice into a constant; pin the constant and its use.
         self.assertIn(f'const noticeSteerNotSent = "{harness.STEER_FAILED_NOTICE}"', gateway)
@@ -1397,6 +1406,9 @@ class UnitTest(unittest.TestCase):
         profile_notice = "a task is still running here; stop it or wait for it before asking an agent profile"
         self.assertIn(f'noticeProfileWhileRunning = "{profile_notice}"', sources["profiles.go"])
         rendered.add("⚠️ not started: " + profile_notice)
+        confirm_notice = "a task is still running here; stop it or wait for it before confirming a change"
+        self.assertIn(f'noticeConfirmWhileRunning = "{confirm_notice}"', sources["profiles.go"])
+        rendered.add("⚠️ not started: " + confirm_notice)
         self.assertEqual(rendered, set(NOT_STARTED_NOTICES))
         # The session cap's count phrase, both forms.
         self.assertIn('workers := fmt.Sprintf("%d session workers are", live)', sources["spawn.go"])
@@ -1404,7 +1416,9 @@ class UnitTest(unittest.TestCase):
         # And each one is posted in place of a task: refuseAtSessionCap returns true
         # after both, and the retire refusal is the one passed to retireIncarnation.
         self.assertIn('retireRefusalNotStarted = "⚠️ not started: ', sources["gateway.go"])
-        self.assertIn('g.post(rec.Key, "⚠️ not started: can\'t count the running session workers', sources["spawn.go"])
+        # The cap check collects its posts and sends them once the check ends
+        # (#6033), so the count refusal is spelled as a capNotice for rec.Key.
+        self.assertIn('capNotice{rec.Key, "⚠️ not started: can\'t count the running session workers', sources["spawn.go"])
         self.assertIn('g.post(rec.Key, "⚠️ not started: could not mint this task\'s capability")', sources["gateway.go"])
 
     def test_redactor_cuts_the_escaped_forms_of_a_registered_value(self):

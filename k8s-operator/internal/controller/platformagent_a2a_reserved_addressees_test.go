@@ -22,10 +22,11 @@ package controller
 // subjects. The callout refuses such a pod by name, from A2A_RESERVED_ADDRESSEES,
 // so that list has to be every fixed-name addressee the install routes to. Those
 // are read from three places: the subjects the bridge identity's grants name,
-// which the operator renders, and two defaults it does not render, the
-// gateway's (A2A_DEFAULT_ADDRESSEE) and the bridge's profile (BRIDGE_PROFILE).
-// The defaults live in the a2a module, which this module cannot import, so the
-// test reads them out of the source. Every extraction fails the test rather than falling
+// which the operator renders, the gateway's A2A_DEFAULT_ADDRESSEE, which the
+// operator renders from defaultRoute (the a2a module's default is the fallback
+// should it ever stop), and the bridge's profile default (BRIDGE_PROFILE),
+// which it does not render. The defaults live in the a2a module, which this
+// module cannot import, so the test reads them out of the source. Every extraction fails the test rather than falling
 // back, so a moved or reshaped default reds here instead of passing vacuously.
 
 import (
@@ -171,10 +172,12 @@ func renderedCalloutReservedAddressees(t *testing.T, agent *agentv1alpha1.Platfo
 }
 
 // bridgeGrantAddressees is every addressee the bridge identity's grants name,
-// read off the subjects themselves rather than off a constant: the `<x>` in
-// `a2a.tasks.<x>.*.in` and `a2a.tasks.<x>.*.events`, in `a2a.cap.verify.<x>`
-// and in `a2a.cap.reply.<x>.>`. Widening the grant to a second addressee adds
-// it here with no test edit. See grantAddressees for what fails the test.
+// read off the subjects themselves rather than off a constant: the token after
+// the literal prefix of one of addresseeSubjectFamilies, whatever tail follows.
+// Today's grants are `a2a.tasks.<x>.*.in`, `a2a.tasks.<x>.*.events`,
+// `a2a.cap.verify.<x>` and `a2a.cap.reply.<x>.>`. Widening the grant to a
+// second addressee adds it here with no test edit. See grantAddressees for
+// what fails the test.
 func bridgeGrantAddressees(t *testing.T) []string {
 	t.Helper()
 	id := bridgeIdentity()
@@ -197,9 +200,18 @@ var addresseeSubjectFamilies = [][]string{
 // that leaves the addressee position open is an error, because no name list
 // can reserve it: any `*` or `>` at or before the addressee position of one of
 // addresseeSubjectFamilies, whatever the subject's token count, so a short
-// `a2a.tasks.>` fails as surely as `a2a.tasks.*.*.in`. Finding no addressee at
-// all is an error too, which would make every check on the result pass
-// vacuously.
+// `a2a.tasks.>` fails as surely as `a2a.tasks.*.*.in`. A grant inside a family
+// with a literal token at the addressee position is read as naming that token,
+// whatever follows it, so a tail this test has not seen cannot hide an
+// addressee. A subject outside every family, or one that ends before the
+// addressee position, names none. Finding no addressee at all is an error too,
+// which would make every check on the result pass vacuously.
+//
+// One shape is read too widely, on purpose: in a profile task's supervisor
+// subject, `a2a.tasks.p.<profile>.<task>.supervisor`, the token at the
+// addressee position is the `p` marker, not an addressee. No bridge grant has
+// that shape. One that did would be read as naming `p` and would fail the
+// reservation test, which is the moment to teach this reader the shape.
 func grantAddressees(subjects []string) ([]string, error) {
 	var out []string
 	for _, subject := range subjects {
@@ -211,15 +223,14 @@ func grantAddressees(subjects []string) ([]string, error) {
 			}
 		}
 		var addressee string
-		switch {
-		case len(tokens) == 5 && tokens[0] == "a2a" && tokens[1] == "tasks" &&
-			(tokens[4] == "in" || tokens[4] == "events"):
-			addressee = tokens[2]
-		case len(tokens) == 4 && tokens[0] == "a2a" && tokens[1] == "cap" && tokens[2] == "verify":
-			addressee = tokens[3]
-		case len(tokens) == 5 && tokens[0] == "a2a" && tokens[1] == "cap" && tokens[2] == "reply" && tokens[4] == ">":
-			addressee = tokens[3]
-		default:
+		found := false
+		for _, family := range addresseeSubjectFamilies {
+			if len(tokens) > len(family) && slices.Equal(tokens[:len(family)], family) {
+				addressee, found = tokens[len(family)], true
+				break
+			}
+		}
+		if !found {
 			continue
 		}
 		if addressee == "" || strings.ContainsAny(addressee, "*>") {
@@ -284,6 +295,34 @@ func TestReservedAddresseesRefuseAWildcardGrant(t *testing.T) {
 	}
 }
 
+// A grant inside an addressee-bearing family names its addressee whatever tail
+// follows it, so a bridge widened to a second addressee in a shape the bridge
+// does not use today still has that addressee held to the reserved list.
+func TestReservedAddresseesReadAnyTailInAFamily(t *testing.T) {
+	const other = "other"
+	id := bridgeIdentity()
+	real := slices.Concat(id.publish, id.subscribe)
+	if got, err := grantAddressees(real); err != nil || slices.Contains(got, other) {
+		t.Fatalf("grantAddressees(bridge grants) = %v, %v; want no error and no %q, or every row below passes vacuously", got, err, other)
+	}
+	for _, grant := range []string{
+		"a2a.tasks.other",
+		"a2a.tasks.other.>",
+		"a2a.tasks.other.*.>",
+		"a2a.tasks.other.*.in",
+		"a2a.tasks.other.*.supervisor",
+		"a2a.cap.verify.other",
+		"a2a.cap.verify.other.>",
+		"a2a.cap.reply.other.*",
+		"a2a.cap.reply.other.>",
+	} {
+		got, err := grantAddressees(append(slices.Clone(real), grant))
+		if err != nil || !slices.Contains(got, other) {
+			t.Errorf("grantAddressees(bridge grants + %q) = %v, %v; want %q among the addressees and no error", grant, got, err, other)
+		}
+	}
+}
+
 // Every fixed-name addressee the install routes to is reserved: each one the
 // bridge's grants name, the gateway's default addressee (unless it is the
 // RouteSession sentinel, see configuredAddressees), and the bridge's profile
@@ -344,8 +383,10 @@ func configuredAddressees(t *testing.T, gatewayAddressee, bridgeProfile string) 
 }
 
 // The day the gateway's default flips to the session route, the derivation
-// must not demand that the sentinel be reserved: it is not an addressee, and a
-// list that grew to carry it would refuse a pod for a name nothing routes to.
+// must not read the sentinel as an addressee the gateway routes to: it is a
+// route, and the bridge's `platform` must stay in the set. The sentinel is
+// reserved anyway, on its own account (TestTheSessionRouteIsAReservedAddressee),
+// so nothing can hold the name the gateway means something else by.
 func TestTheSessionRouteIsNotAConfiguredAddressee(t *testing.T) {
 	routeSession := stringConstInSource(t, a2aGatewaySpawnSource, gatewayRouteSessionConst)
 	bridgeProfile := envDefaultInSource(t, a2aBridgeMainSource, bridgeProfileEnv)

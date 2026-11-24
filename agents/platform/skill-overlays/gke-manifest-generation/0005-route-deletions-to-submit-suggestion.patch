@@ -2,7 +2,7 @@ Subject: Route deletions to submit-suggestion
 
 Why: asked to delete a namespace, the agent wrote a Namespace manifest with an invented `state: deleted` annotation (#3077). Merging it would declare the namespace, not delete it. The description routes deletions to submit-suggestion, whose deletion section answers it, and section 8 says a manifest cannot ask for a delete.
 Local-Issue: #3077
-Upstream-Issue: none
+Eval-Case: delete-namespace-unowned-stops
 Retire-When: never; submit-suggestion is this repository's skill
 
 diff --git a/SKILL.md b/SKILL.md

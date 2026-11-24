@@ -30,12 +30,14 @@ import unittest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "agents" / "platform" / "scripts"))
 _SCRAPE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_counters_scrape.go"
+_DISPATCHER_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_kanban_dispatcher.go"
 _WATCHER_METRICS_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "metrics.go"
 _BROKER_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.py"
 _READINGS_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "vcs_readings.py"
 _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
 _MANIFESTS_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
+_CURATOR_METRICS_GO = _REPO_ROOT / "a2a" / "memory" / "metrics.go"
 _A2A_LIB_PAYLOAD_GO = _REPO_ROOT / "a2a" / "lib" / "payload.go"
 _COMMON_TYPES_GO = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _FEEDBACK_SUMMARY_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "feedback_summary.py"
@@ -234,6 +236,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
 
+    def test_the_watchers_watch_set_ready_gauge_is_the_one_the_poller_reads(self):
+        self.assertEqual(_go_const(_WATCHER_METRICS_GO, "watchSetReadyMetric"), _go_const(_SCRAPE_GO, "watchSetReadySeries"))
+
     def test_the_cluster_gauges_labels_are_the_ones_the_poller_reads_into_the_scope_condition(self):
         # The watcher's GaugeVec declares its label names in order; the poller reads
         # three of them by name for the ScopeUndeclared condition's cluster triples.
@@ -257,6 +262,18 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _go_const(_WATCHER_METRICS_GO, "processStartTimeMetric"))
         self.assertEqual(name, _py_const("PROCESS_START_TIME_METRIC", _CHAT_METRICS_PY))
         self.assertEqual(name, _go_const(_A2A_METRICS_GO, "processStartTimeName"))
+        self.assertEqual(name, _go_const(_CURATOR_METRICS_GO, "processStartTimeName"))
+
+    def test_decision_memory_series_and_verdicts_are_closed(self):
+        import credential_proxy as cp
+
+        self.assertEqual(
+            _py_const("DECISION_MEMORY_CHECKS_METRIC"),
+            "kubeagents_credential_proxy_decision_memory_checks_total",
+        )
+        self.assertEqual(cp.DECISION_MEMORY_VERDICTS, frozenset({"allow", "warn", "block", "error"}))
+        self.assertEqual(_go_const(_CURATOR_METRICS_GO, "metricsNamespace"), "kubeagents")
+        self.assertEqual(_go_const(_CURATOR_METRICS_GO, "metricsSubsystem"), "curator")
 
     def test_the_counted_outcomes_are_the_brokers_success_and_error(self):
         counted = _go_set(_SCRAPE_GO, "toolInvocationsCountedStatuses")
@@ -316,6 +333,14 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_go_const(feedback_go, "FeedbackUp"), _go_const(_SCRAPE_GO, "a2aRatingUp"))
         self.assertEqual(_go_const(feedback_go, "FeedbackDown"), _go_const(_SCRAPE_GO, "a2aRatingDown"))
 
+    def test_the_a2a_gateways_post_ratings_are_the_autonomous_feedback_counters_family(self):
+        """The ratings of the posts the agent made on its own are a family of their own,
+        split on the same rating label and values as the answer ratings: down into
+        autonomousNegativeFeedbackTotal, up into autonomousPositiveFeedbackTotal."""
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "postFeedbackName"))
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aPostFeedbackSeries"))
+        self.assertNotEqual(name, _go_const(_SCRAPE_GO, "a2aAnswerFeedbackSeries"))
+
     def test_the_errored_states_the_poller_filters_on_are_the_a2a_libs_failed_and_rejected(self):
         """The state values are the A2A library's constants; the gateway emits them
         through its terminal list, and the operator's map is the second copy."""
@@ -336,6 +361,14 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_py_const("BOARD_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherBoardLabel"))
         self.assertEqual(_py_const("ERROR_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherErrorLabel"))
         self.assertEqual(_py_const("KANBAN_DISPATCHER_FAILING_SECONDS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherFailingSecondsSeries"))
+        self.assertEqual(_py_const("KANBAN_DISPATCHER_STUCK_SECONDS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherStuckSecondsSeries"))
+
+    def test_the_stuck_tick_limit_is_the_one_the_condition_message_names(self):
+        plugin = re.search(r"^STUCK_TICK_SECONDS = ([0-9.]+)$", _CHAT_METRICS_PY.read_text(), re.M)
+        operator = re.search(r"^\s*kanbanDispatcherStuckLimit\s*=\s*(\d+) \* time\.Second$", _DISPATCHER_GO.read_text(), re.M)
+        self.assertIsNotNone(plugin, "STUCK_TICK_SECONDS not found")
+        self.assertIsNotNone(operator, "kanbanDispatcherStuckLimit not found")
+        self.assertEqual(float(plugin.group(1)), float(operator.group(1)))
 
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))

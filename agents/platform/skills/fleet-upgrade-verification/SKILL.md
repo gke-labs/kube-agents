@@ -236,21 +236,9 @@ backend, GKE's own URL-backed ones included, as a blocker.
   the drain itself. When no rule matches any of those, the webhook is still a current outage for
   what it does match and the cell names it, but it does not grade the member; that list is what
   the rule knows of the upgrade's path, not a proof the upgrade is unaffected, which is why the
-  cell names what the webhook does match. Rules are matched on
-  API group, API version, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics)
-  and scope, as the API server matches them: a rule's `apiVersions` must carry `*` or the version
-  the server serves the write at (`v1` for every write on the list), so a rule pinned to a version
-  the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing. Each
-  rule of a dead off-path webhook is then classed by what the server serves it, on the resources it
-  names and not on its operations: a rule at `*` or `v1` fails now every request the server sends it (whether the server serves an off-list resource at all is not the reader's to say, and the cell claims no more); a rule naming graded
-  resources only, at an unserved version, is sent nothing (whatever the operation; the cell then names
-  the resource, and a group-resource pair the rule spells that the server serves at no version, such as
-  `policy/pods`, is said so rather than served at `v1`); a rule at an unserved version on a resource, group or wildcard off the lists is one
-  whose served versions the reader does not know. The cell says each for the rules the webhook has: a
-  webhook whose every rule is pinned is told the server sends it no request at a served version rather
-  than that its requests fail now; otherwise the live rules are named as failing now every request the server sends them,
-  the pinned rules as sent nothing, and the unknown rules as failing only if the server still serves
-  their version, so a failure now is asserted for the live rules alone; `objectSelector` and
+  cell names what the webhook does match. How a rule is matched, how each rule
+  of a dead off-path webhook is then classed and what the cell says of each class:
+  `references/webhook-rule-classes.md`. `objectSelector` and
   `matchConditions` are not evaluated, and `namespaceSelector`
   is read only for the `kube-system` reach, so a webhook they narrow is otherwise reported as
   able to match. A dead webhook off the node path is graded `blocked` all the same when its rules match a
@@ -267,7 +255,7 @@ backend, GKE's own URL-backed ones included, as a blocker.
   start-up path in Kubernetes 1.17, and its successor retries. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
-  `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
+  `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`; a fail-closed webhook whose backend answered is named under `answered`, by its identity keys alone. A fail-closed webhook with a URL backend is counted in the
   JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
   GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`), and so is a fail-closed webhook with no `rules` (`no_rules`): it matches no request, so the server never calls it and a dead backend behind it fails nothing now.
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an
@@ -458,8 +446,21 @@ is no, with the outage named; do not re-grade by hand. An exclusion in effect wh
 the target is `yes` whatever the aside says about automatic versus manual upgrades: the table
 graded the member `blocked` on it, and that is the verdict; the automatic-only qualification
 belongs in the prose beside the line, never in the yes/no. Name a webhook by its configuration,
-the part of the table's `configuration/webhook` cell before the slash; the webhook's own name may
+the part of the table's `configuration/webhook` cell before the slash (for one under `answered`,
+its `config`); the webhook's own name may
 follow it after a slash, never stand in for it.
+The per-object lines are for the objects the table and the JSON name, and for no others. Write a
+line for each webhook under `blocking` and `outage`, the fail-closed ones whose backend is
+unreachable. The ones whose backend answered are named under a member's
+`readiness.webhooks.answered` (`evaluated` counts the three lists together). When the user asks
+which webhooks the check tested, or for each one's backend, name every one of them from that list,
+with the backend ready; in any other answer give their count, with no line for them
+(where `webhooks` is null there are no names: say the webhooks were not graded). For a readiness answer,
+do not read budgets, webhook configurations, Services or EndpointSlices with `kubectl`, before
+the run or after it, to fill in names, confirm a cell or add detail: that is the hand survey as
+much as one made in the run's place. A run that exits 1 with the tables printed is still the
+answer: the lines under the version table name each read that failed and where, a rule that
+needed it is `unknown`, and that is what to report; do not make the failed read by hand.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
 repository's deprecation section too, with its source line copied word for word

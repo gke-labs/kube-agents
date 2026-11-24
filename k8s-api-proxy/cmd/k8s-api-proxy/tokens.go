@@ -25,10 +25,31 @@ import (
 
 const (
 	cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
+	defaultUniverse    = "googleapis.com"
 	defaultSTSURL      = "https://sts.googleapis.com/v1/token"
 	// #nosec G101 -- public IAM Credentials API URL, not a credential.
 	defaultIAMCredentialsURL = "https://iamcredentials.googleapis.com/v1"
 	tokenHTTPTimeout         = 10 * time.Second
+
+	universeDomainEnv        = "KUBE_PROXY_UNIVERSE_DOMAIN"
+	googleCloudUniverseEnv   = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+	containerAPIURLEnv       = "KUBE_PROXY_CONTAINER_API_URL"
+	wifAudienceEnv           = "CREDENTIAL_PROXY_WIF_AUDIENCE"
+	gkeClusterIDPrefix       = "gke_"
+	stsHostPrefix            = "https://sts."
+	stsExchangePathSuffix    = "/v1/token"
+	iamServiceHostPrefix     = "https://iamcredentials."
+	iamServicePathSuffix     = "/v1"
+	containerHostPrefix      = "https://container."
+	maxUniverseDomainLength  = 253
+	commercialUniverseSuffix = "." + defaultUniverse
+	gceMetadataUniverseURL   = "http://169.254.169.254/computeMetadata/v1/universe/universe-domain"
+	gceMetadataHeaderName    = "Metadata-Flavor"
+	gceMetadataHeaderValue   = "Google"
+	gceMetadataTimeout       = 2 * time.Second
+	gceMetadataMaxBytes      = 512
+	gceMetadataProbeAttempts = 3
+	gceMetadataRetryDelay    = 250 * time.Millisecond
 
 	// #nosec G101 -- environment variable and ConfigMap path names, not credentials.
 	scopedPoolFlagEnv          = "CREDENTIAL_PROXY_SCOPED_SA_POOL"
@@ -43,7 +64,110 @@ const (
 var (
 	scopedComponentRE      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\z`)
 	scopedServiceAccountRE = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com\z`)
+	universeDomainRE       = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 )
+
+// normalizeKubeProxyUniverseDomain is the operator's NormalizeUniverseDomain
+// (k8s-operator/api/v1alpha1), kept here because this module does not import
+// that one. A name under the commercial domain, such as mtls.googleapis.com,
+// is a host of the commercial universe and no other universe's domain.
+func normalizeKubeProxyUniverseDomain(raw string) (string, bool) {
+	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	if candidate == "" || len(candidate) > maxUniverseDomainLength || !universeDomainRE.MatchString(candidate) ||
+		strings.HasSuffix(candidate, commercialUniverseSuffix) {
+		return "", false
+	}
+	return candidate, true
+}
+
+func resolveKubeProxyUniverseDomain(ctx context.Context, explicit string, probeMetadata bool, metadataURL string, client *http.Client) (string, error) {
+	if strings.TrimSpace(explicit) != "" {
+		normalized, ok := normalizeKubeProxyUniverseDomain(explicit)
+		if !ok {
+			return "", fmt.Errorf("invalid universe domain %q: must be a lower-case DNS hostname that is not under %s", explicit, defaultUniverse)
+		}
+		return normalized, nil
+	}
+	if probeMetadata {
+		target := metadataURL
+		if target == "" {
+			target = gceMetadataUniverseURL
+		}
+		httpClient := client
+		if httpClient == nil {
+			httpClient = &http.Client{Timeout: gceMetadataTimeout}
+		}
+		var lastErr error
+		for attempt := 0; attempt < gceMetadataProbeAttempts; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					return "", fmt.Errorf("context cancelled while probing GCE metadata universe domain: %w", ctx.Err())
+				case <-time.After(gceMetadataRetryDelay):
+				}
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, gceMetadataTimeout)
+			req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, target, nil)
+			if err != nil {
+				cancel()
+				return "", fmt.Errorf("invalid GCE metadata URL %q: %w", target, err)
+			}
+			req.Header.Set(gceMetadataHeaderName, gceMetadataHeaderValue)
+			resp, doErr := httpClient.Do(req)
+			if doErr != nil {
+				cancel()
+				lastErr = doErr
+				continue
+			}
+			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, gceMetadataMaxBytes))
+			_ = resp.Body.Close()
+			cancel()
+			if resp.StatusCode == http.StatusNotFound {
+				return defaultUniverse, nil
+			}
+			if readErr != nil {
+				lastErr = readErr
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				lastErr = fmt.Errorf("metadata server returned HTTP %d", resp.StatusCode)
+				continue
+			}
+			candidate, ok := normalizeKubeProxyUniverseDomain(string(raw))
+			if !ok {
+				lastErr = fmt.Errorf("metadata server returned invalid universe domain %q", strings.TrimSpace(string(raw)))
+				continue
+			}
+			return candidate, nil
+		}
+		return "", fmt.Errorf("failed to resolve GCE metadata universe domain after %d attempts: %w", gceMetadataProbeAttempts, lastErr)
+	}
+	return defaultUniverse, nil
+}
+
+func stsURLForUniverse(universeDomain string) string {
+	if universeDomain == "" || universeDomain == defaultUniverse {
+		return defaultSTSURL
+	}
+	return stsHostPrefix + universeDomain + stsExchangePathSuffix
+}
+
+func iamCredentialsURLForUniverse(universeDomain string) string {
+	if universeDomain == "" || universeDomain == defaultUniverse {
+		return defaultIAMCredentialsURL
+	}
+	return iamServiceHostPrefix + universeDomain + iamServicePathSuffix
+}
+
+func containerAPIURLForUniverse(universeDomain, explicitContainerAPIURL string) string {
+	if trimmed := strings.TrimSpace(explicitContainerAPIURL); trimmed != "" {
+		return trimmed
+	}
+	if universeDomain == "" || universeDomain == defaultUniverse {
+		return ""
+	}
+	return containerHostPrefix + universeDomain
+}
 
 type gcpTokenConfig struct {
 	WIFAudience       string

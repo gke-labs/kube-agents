@@ -52,6 +52,23 @@ const (
 	taskTerminalsName       = "task_terminals_total"
 	gchatEventsReceivedName = "gchat_events_received_total"
 	gchatPullsName          = "gchat_pulls_total"
+	// gchatAPIDurationName times each Chat API call the Google Chat adapter
+	// makes through the credential proxy's relay, by method and outcome, and
+	// gchatRateLimitedName counts the ones answered 429. The event pull and
+	// its ack are relay routes, not Chat API calls, and are not timed; the
+	// pull is a long poll gchatPullsName already counts.
+	gchatAPIDurationName = "gchat_api_request_duration_seconds"
+	gchatRateLimitedName = "gchat_api_rate_limited_total"
+	// The Teams backend's equivalents: each pull of the broker's Teams queue
+	// by outcome and the events it carried; each Bot Framework call the
+	// adapter makes through the broker's passthrough, by operation and
+	// outcome, and the ones Microsoft answered 429; and how long an activity
+	// it takes as a turn took from its own timestamp to the gateway's receipt.
+	teamsEventsReceivedName = "teams_events_received_total"
+	teamsPullsName          = "teams_pulls_total"
+	teamsAPIDurationName    = "teams_api_request_duration_seconds"
+	teamsRateLimitedName    = "teams_api_rate_limited_total"
+	teamsIngressLagName     = "teams_ingress_lag_seconds"
 	chatMessagesName        = "chat_messages_total"
 	notifyMarksDroppedName  = "notify_marks_dropped_total"
 	// messagesInboundName counts the chat messages the gateway accepted as
@@ -63,6 +80,11 @@ const (
 	// platform, rating and answer (feedback.go): the dashboard's 👍/👎
 	// series.
 	answerFeedbackName = "answer_feedback_total"
+	// postFeedbackName counts the ratings chat users gave the posts the agent
+	// made on its own (alerts and reports on the chat.notify route), by
+	// platform, rating and kind (feedback.go): apart from answer_feedback_total,
+	// so a 👎 on a noisy alert reads as noise rather than as a bad answer.
+	postFeedbackName = "post_feedback_total"
 	// sessionsName counts the conversations the gateway minted a session
 	// record for, by platform: the next-mode chat half of status.usage's
 	// sessionsTotal, beside the watcher's triage sessions and the
@@ -103,6 +125,11 @@ const (
 	slackIngressLagName  = "slack_ingress_lag_seconds"
 	slackAPIDurationName = "slack_api_request_duration_seconds"
 	slackRateLimitedName = "slack_api_rate_limited_total"
+	// slackFirstAckName is how long a Slack ask waited for its first receipt:
+	// from the adapter receiving the message to its arrival reaction landing
+	// (the reactions call succeeded). Ingress lag before it
+	// and the agent's own time after it are measured apart.
+	slackFirstAckName = "slack_first_ack_seconds"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -113,6 +140,7 @@ const (
 	labelPlatform = "platform"
 	labelRating   = "rating"
 	labelAnswer   = "answer"
+	labelKind     = "kind"
 	labelWindow   = "window"
 	labelMethod   = "method"
 	// The Slack API outcomes: ok (a 2xx), rate_limited (a 429) and error
@@ -122,13 +150,26 @@ const (
 	slackAPIOK          = "ok"
 	slackAPIRateLimited = "rate_limited"
 	slackAPIError       = "error"
+	// The Chat API outcomes, under the Slack ones' names: ok (the relay
+	// answered 200 with the API's response), rate_limited (the Chat API's 429,
+	// as the relay carries it) and error (any other status, the relay's own
+	// 429 included, or no response at all).
+	gchatCallOK          = "ok"
+	gchatCallRateLimited = "rate_limited"
+	gchatCallError       = "error"
+	// The Teams passthrough's call outcomes: the same three words, spelled
+	// on their own so a change to one backend's cannot move the other's.
+	teamsCallOK          = "ok"
+	teamsCallRateLimited = "rate_limited"
+	teamsCallError       = "error"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
-	// ingress. The doors (inject, a2a, a2a-google) carry programs' turns, not
+	// ingress. The doors (inject, a2a, a2a-google, a2a-entra) carry programs' turns, not
 	// chat, and are not counted.
 	platformGoogleChat = "googlechat"
 	platformSlack      = "slack"
+	platformTeams      = "teams"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
 	// The answer label's values: what the rated message answered with, the
@@ -137,6 +178,11 @@ const (
 	// or the root aged out of its history) is counted as other.
 	answerReply = "reply"
 	answerCard  = "card"
+	// The kind label's values: what the rated post was, an alert (a keyed
+	// home post, whose thread its triage edits) or a report (any other home
+	// post: a scheduled or audit report, a digest).
+	postKindAlert  = "alert"
+	postKindReport = "report"
 	// The window label's values: peopleWindowShort and peopleWindowLong.
 	peopleWindowShortLabel = "7d"
 	peopleWindowLongLabel  = "30d"
@@ -153,6 +199,11 @@ const (
 	gchatPullEvents = "events"
 	gchatPullEmpty  = "empty"
 	gchatPullFailed = "failed"
+	// The Teams queue's pull outcomes, the same three words spelled on
+	// their own.
+	teamsPullEvents = "events"
+	teamsPullEmpty  = "empty"
+	teamsPullFailed = "failed"
 
 	// The chat-message outcomes (spec-a2a-payloads.md, "Chat messages"):
 	// rendered, laid out by the backend; text-only, a backend that renders
@@ -203,10 +254,12 @@ var (
 	}
 	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor, TerminalFromGateway, TerminalNeverStarted}
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
+	metricsTeamsOutcomes   = []string{teamsPullEvents, teamsPullEmpty, teamsPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
-	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
+	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformTeams, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
 	metricsAnswers         = []string{answerReply, answerCard}
+	metricsPostKinds       = []string{postKindAlert, postKindReport}
 	// metricsRatedPlatforms are the backends that draw rating controls, each
 	// given a zero answer_feedback_total series per rating and answer.
 	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
@@ -215,6 +268,7 @@ var (
 	metricsBackendPlatforms = map[string]string{
 		gchatBackend:   platformGoogleChat,
 		slackBackend:   platformSlack,
+		teamsBackend:   platformTeams,
 		discordBackend: platformDiscord,
 		consoleBackend: platformConsole,
 	}
@@ -231,11 +285,22 @@ var (
 		"auth.test", "apps.connections.open", "assistant.threads.setSuggestedPrompts",
 		slackSessionsSetStatusMethod, slackSessionsRenameMethod,
 	}
+	// metricsGchatAPIMethods are the Chat API methods the method label names,
+	// each its resource path and method joined by dots as the Chat API
+	// reference writes it; a call to any other (a method added later) is
+	// counted as other.
+	metricsGchatAPIMethods = []string{
+		"spaces.messages.create", "spaces.messages.patch", "spaces.messages.get",
+		"spaces.members.list", "spaces.findDirectMessage", "spaces.setup",
+	}
 	// metricsSlackIngressBuckets reach from a Socket Mode delivery that is
 	// near instant to one a minute late; metricsSlackAPIBuckets from a fast
 	// Web API call to the client's 30-second bound (slackAPITimeout).
 	metricsSlackIngressBuckets = []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}
 	metricsSlackAPIBuckets     = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+	// metricsGchatAPIBuckets are the Slack API buckets, reaching on to the
+	// relay client's 45-second bound (gchatRelayTimeout).
+	metricsGchatAPIBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 45}
 )
 
 // Metrics is the gateway's counters and the private registry that serves
@@ -249,13 +314,22 @@ type Metrics struct {
 	taskTerminals       *prometheus.CounterVec
 	gchatEventsReceived prometheus.Counter
 	gchatPulls          *prometheus.CounterVec
+	gchatAPIDuration    *prometheus.HistogramVec
+	gchatRateLimited    *prometheus.CounterVec
+	teamsEventsReceived prometheus.Counter
+	teamsPulls          *prometheus.CounterVec
+	teamsAPIDuration    *prometheus.HistogramVec
+	teamsRateLimited    *prometheus.CounterVec
+	teamsIngressLag     *prometheus.HistogramVec
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
 	answerFeedback      *prometheus.CounterVec
+	postFeedback        *prometheus.CounterVec
 	sessions            *prometheus.CounterVec
 	slackIngressLag     *prometheus.HistogramVec
 	slackAPIDuration    *prometheus.HistogramVec
+	slackFirstAckSecs   *prometheus.HistogramVec
 	slackRateLimited    *prometheus.CounterVec
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
@@ -364,6 +438,51 @@ func NewMetrics() *Metrics {
 			Name:      gchatPullsName,
 			Help:      "Pulls of the Google Chat relay, by outcome: events (one arrived), empty (none did), failed (the relay refused or did not answer, or the pull was never made or could not be read).",
 		}, []string{labelOutcome}),
+		gchatAPIDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      gchatAPIDurationName,
+			Help:      "Seconds each Google Chat API call the Google Chat adapter made through the credential broker's relay took, by method (spaces.messages.create, spaces.messages.patch, spaces.members.list, ..., other) and outcome (ok, the relay returned the API's response; rate_limited, a 429 from the Chat API; error, any other status or no response).",
+			Buckets:   metricsGchatAPIBuckets,
+		}, []string{labelMethod, labelOutcome}),
+		gchatRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      gchatRateLimitedName,
+			Help:      "Google Chat API calls answered 429 (rate limited), by the Chat API as the relay carries its status, by method (spaces.messages.create, spaces.messages.patch, spaces.members.list, ..., other).",
+		}, []string{labelMethod}),
+		teamsEventsReceived: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsEventsReceivedName,
+			Help:      "Microsoft Teams activities the gateway pulled from the credential broker's Teams queue, before parsing or classification.",
+		}),
+		teamsPulls: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsPullsName,
+			Help:      "Pulls of the credential broker's Teams queue, by outcome: events (one arrived), empty (none did), failed (the broker refused or did not answer, or the pull could not be read).",
+		}, []string{labelOutcome}),
+		teamsAPIDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsAPIDurationName,
+			Help:      "Seconds each Bot Framework call the Teams adapter made through the credential broker's passthrough took, by method (conversations.activities.create, conversations.activities.update, other) and outcome (ok, the broker returned Microsoft's response; rate_limited, a 429 from Microsoft; error, any other status or no response).",
+			Buckets:   metricsGchatAPIBuckets,
+		}, []string{labelMethod, labelOutcome}),
+		teamsRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsRateLimitedName,
+			Help:      "Bot Framework calls Microsoft answered 429 (rate limited), as the credential broker carries its status, by method (conversations.activities.create, conversations.activities.update, other).",
+		}, []string{labelMethod}),
+		teamsIngressLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      teamsIngressLagName,
+			Help:      "Seconds from a Teams activity's own timestamp to the gateway's receipt of it, for an activity it takes as a turn: Microsoft's delivery, the receiver in front of the broker and the broker's queue together; a negative lag (clock skew) is observed as 0 and an activity with no readable timestamp is not observed. No sample until the first.",
+			Buckets:   metricsSlackIngressBuckets,
+		}, []string{}),
 		chatMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -380,19 +499,25 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      messagesInboundName,
-			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
+			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, teams, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
 		}, []string{labelPlatform}),
 		answerFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      answerFeedbackName,
-			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, teams, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
 		}, []string{labelPlatform, labelRating, labelAnswer}),
+		postFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      postFeedbackName,
+			Help:      "Ratings verified chat users gave the posts the agent made on its own, by platform (googlechat, slack, teams, discord, console, other), rating (up, down, other) and kind (alert, a keyed home post its triage edits; report, any other home post; other); counted once per rating change, apart from answer_feedback_total.",
+		}, []string{labelPlatform, labelRating, labelKind}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      sessionsName,
-			Help:      "Conversations the gateway minted a session for, by the platform of the first message (googlechat, slack, discord, console, other); a conversation is counted once, and a door's are not chat and are not counted.",
+			Help:      "Conversations the gateway minted a session for, by the platform of the first message (googlechat, slack, teams, discord, console, other); a conversation is counted once, and a door's are not chat and are not counted.",
 		}, []string{labelPlatform}),
 		slackIngressLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
@@ -410,6 +535,13 @@ func NewMetrics() *Metrics {
 			Help:      "Seconds each Slack Web API call the Slack adapter made took, by method (chat.postMessage, chat.update, reactions.add, ..., other) and outcome (ok, a 2xx including Slack's ok:false answers; rate_limited, a 429; error, any other status or no response).",
 			Buckets:   metricsSlackAPIBuckets,
 		}, []string{labelMethod, labelOutcome}),
+		slackFirstAckSecs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackFirstAckName,
+			Help:      "Seconds from the Slack adapter receiving an ask to its arrival reaction landing (the reactions call succeeded); a click, an answer or a steer draws none, and a refused reaction is not counted. No sample until the first.",
+			Buckets:   metricsSlackIngressBuckets,
+		}, nil),
 		slackRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -431,7 +563,7 @@ func NewMetrics() *Metrics {
 		connected: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackConnectedName), slackConnectedHelp, nil, nil),
 		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackRateLimited, m.processStart, people, slackGauges)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.gchatAPIDuration, m.gchatRateLimited, m.teamsEventsReceived, m.teamsPulls, m.teamsAPIDuration, m.teamsRateLimited, m.teamsIngressLag, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -447,10 +579,16 @@ func NewMetrics() *Metrics {
 	for _, outcome := range metricsGchatOutcomes {
 		m.gchatPulls.WithLabelValues(outcome)
 	}
+	for _, outcome := range metricsTeamsOutcomes {
+		m.teamsPulls.WithLabelValues(outcome)
+	}
 	for _, platform := range metricsRatedPlatforms {
 		for _, rating := range metricsRatings {
 			for _, answer := range metricsAnswers {
 				m.answerFeedback.WithLabelValues(platform, rating, answer)
+			}
+			for _, kind := range metricsPostKinds {
+				m.postFeedback.WithLabelValues(platform, rating, kind)
 			}
 		}
 	}
@@ -538,6 +676,18 @@ func (m *Metrics) gchatPull(outcome string) {
 	m.gchatPulls.WithLabelValues(outcome).Inc()
 }
 
+// teamsPull counts one pull of the broker's Teams queue under its outcome,
+// and the activity it carried when it carried one.
+func (m *Metrics) teamsPull(outcome string) {
+	if m == nil {
+		return
+	}
+	if outcome == teamsPullEvents {
+		m.teamsEventsReceived.Inc()
+	}
+	m.teamsPulls.WithLabelValues(outcome).Inc()
+}
+
 // chatMessage counts one chat message under its outcome, one of
 // metricsChatOutcomes; the callers pass only those constants.
 func (m *Metrics) chatMessage(outcome string) {
@@ -584,7 +734,7 @@ func metricsPlatformLabel(backend string) (string, bool) {
 		return platform, true
 	}
 	switch backend {
-	case injectBackend, a2aBackend, a2aGoogleBackend:
+	case injectBackend, a2aBackend, a2aGoogleBackend, a2aEntraBackend:
 		return "", false
 	}
 	return metricsLabelOther, true
@@ -724,4 +874,23 @@ func (m *Metrics) answerRated(platform, rating, answer string) {
 		answer = metricsLabelOther
 	}
 	m.answerFeedback.WithLabelValues(platform, rating, answer).Inc()
+}
+
+// postRated counts one rating of a post the agent made on its own. Every
+// label comes from a closed list: a platform, rating or kind outside them is
+// counted as other.
+func (m *Metrics) postRated(platform, rating, kind string) {
+	if m == nil {
+		return
+	}
+	if !slices.Contains(metricsPlatforms, platform) {
+		platform = metricsLabelOther
+	}
+	if !slices.Contains(metricsRatings, rating) {
+		rating = metricsLabelOther
+	}
+	if !slices.Contains(metricsPostKinds, kind) {
+		kind = metricsLabelOther
+	}
+	m.postFeedback.WithLabelValues(platform, rating, kind).Inc()
 }

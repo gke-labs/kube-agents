@@ -1,12 +1,12 @@
 # MCP server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the console page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject.
+A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the console page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject.
 
 It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
-## Turn it on
+## Turning it off
 
-The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's, which the chart sets from `operator.mcpServer.enabled`. With it set, the operator renders, beside the console server:
+The server runs by default beside the console server:
 
 - `<agent>-a2a-mcp`: a Deployment running `/mcp` from the `a2a-console` image, and a ClusterIP Service on port 8089;
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;
@@ -14,11 +14,11 @@ The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator
 
 The operator also renders the server's ServiceAccount, `<agent>-a2a-mcp`, and its token Secret, `<agent>-a2a-mcp-token`. If either name is already taken by an object the operator does not control, the server is not rendered and the PlatformAgent carries the `A2AMCPServer` condition ([conditions](../../docs/site/src/content/docs/operator/platformagent-crd.md)).
 
-Unset the flag and all of it is removed, the token included.
+Set `operator.mcpServer.enabled: false` in the chart (or `A2A_MCP_DOOR=false` on the operator) to turn it off; all of its objects are removed, the token included.
 
 ## Connect a client
 
-For a step-by-step setup of the workstation bridge in Antigravity, which reads the token and opens the port-forward itself, see [Using kube-agents from Antigravity](../../docs/site/src/content/docs/install/antigravity-mcp.md).
+For a step-by-step setup of the workstation bridge in Claude Code, the Antigravity CLI or the Antigravity editor, which reads the token and opens the port-forward itself, see [Using kube-agents over MCP](../../docs/site/src/content/docs/install/mcp.md).
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
@@ -38,7 +38,7 @@ The match fails closed. The bridge renames a deployment to `<kube-context>/<name
 
 The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
 
-When a turn call carries `_meta.conversation_id` or `stream_steps: true` (which the workstation bridge sets automatically when its host passes `_meta.conversation_id`), `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact, with `result` starting ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running`` while the task is still running, so the workstation bridge surfaces each step's plan title, tool activity, any `thinking` parts a worker adapter publishes, and card subtask outcomes before the final answer. Tool activity carries tool names, statuses, card ids, durations, error types and worker labels, and an activity title that the Hermes bridge builds from the call's arguments: file paths, cluster names, card titles, tool-search queries and a summary of a shell command. The Hermes bridge publishes no raw arguments, results, error text (outside a maintainer's debugging switch) or model reasoning. `task_control` takes `task_id` as an alias for `task` and `wait_timeout_seconds` as an alias for `wait_seconds`. A streamed `get` of a finished turn that delegated, read with no live watch of its chain (a re-read, not the stream that sent it), settles at once with the root's own answer and a note that its delegated tasks were not followed. Without step streaming, each call waits for the turn to finish (or the wait window to end) and returns one plain-text answer.
+When a turn call carries `_meta.conversation_id` or `stream_steps: true` (which the workstation bridge sets automatically when its host passes `_meta.conversation_id`, unless its `KUBE_AGENTS_MCP_STREAM_STEPS` setting is `off`, which sends `stream_steps: false`, or `on`, which sets it for every host), `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact, with `result` starting ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running`` while the task is still running, so the workstation bridge surfaces each step's plan title, tool activity, any `thinking` parts a worker adapter publishes, and card subtask outcomes before the final answer. Tool activity carries tool names, statuses, card ids, durations, error types and worker labels, and an activity title that the Hermes bridge builds from the call's arguments: file paths, cluster names, card titles, tool-search queries and a summary of a shell command. The Hermes bridge publishes no raw arguments, results, error text (outside a maintainer's debugging switch) or model reasoning. `task_control` takes `task_id` as an alias for `task` and `wait_timeout_seconds` as an alias for `wait_seconds`. A streamed `get` of a finished turn that delegated, read with no live watch of its chain (a re-read, not the stream that sent it), settles at once with the root's own answer and a note that its delegated tasks were not followed. Without step streaming, each call waits for the turn to finish (or the wait window to end) and returns one plain-text answer.
 
 Point an MCP client at `http://localhost:8089/mcp` with the header `Authorization: Bearer <token>`. The endpoint takes JSON-RPC 2.0 over `POST`, one JSON answer per request. It refuses any request that carries an `Origin` header, so a browser page cannot use it. `GET /healthz` answers without a token.
 
@@ -90,6 +90,24 @@ Names are this server's memory only, and they're shared:
 
 The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.
 
+## Sending a turn to an AgentProfile
+
+`send_message` takes two optional fields that send the turn straight to an AgentProfile instead of the conversation's agent, as the A2A console can:
+
+- `addressee`: the profile's name, for example `cluster`. It must be one subject token: no spaces, dots or wildcards.
+- `parameters`: the profile's task parameters, an object of string values, for `cluster` its `project`, `location` and `cluster`. They are refused without an `addressee`.
+
+Both go into the console frame as the gateway's `ConsoleInFrame` reads them (`addressee`, `parameters`). Without them the frame is the same as before. An `addressee` is refused on a stop word, a bare `/feedback` or `/feedback summary`, and any `/session` text, a message after it included, since those are commands for the conversation rather than tasks. An addressed turn is a new task for the profile, never a session. Everything else is the gateway's to check: it refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards on `DIRECTORY` by profile.
+
+The gateway publishes a profile's task on `a2a.submit`, which the console account can't read, so the turn can't find its task from the submission the way a plain turn does. Instead, the gateway's status line for a profile turn (`⏳ submitted…`) names the task, the profile it went to and the inbound frame whose turn started it (`taskId`, `addressee`, `inReplyTo`). The turn takes only the line that answers its own frame, so another turn's line on the same conversation (an earlier turn's that came late, or another client's) is not taken for it, and follows that task's events and terminal on `TASKS`, as it follows its own. A turn still running when the wait ends returns the task as `<profile>/<task-id>`. Read it with `task_control get` under that reference, which always resolves. A bare task id resolves only while this server still holds the task as running, since otherwise it is looked up from the task's submission, which the console can't see.
+
+On an install with `A2A_PROFILE_SUPERVISOR_CUTOFF` set, a task is read as a profile task when its addressee has a live agent card, unless one of this server's turns learned its kind. That covers any typed `<addressee>/<task-id>` reference to a task no turn learned, so an old session task whose name a profile has since taken reads as still running if its gateway terminal was stored after the cutoff.
+
+Two known limits:
+
+- The gateway posts the status line before it publishes the submission. If that publish fails, the turn reports a running task that never existed, until its wait runs out.
+- Against a gateway older than this change, the status line names no task, so an addressed turn returns after the gateway's notice with no task, about ten seconds later.
+
 ## Card reports and poll_events
 
 On the Hermes bridge's `api` executor, a console or MCP turn that files Kanban cards holds the turn open while its cards run (`waitForKanbanCards`), streams card `subtask` steps (`steps` artifact) and `progress` updates in turn, and folds settled card results directly into the task's `result` artifact, clearing `cardsFiled` so no `handoff` artifact or `cardsPending: true` result flag is emitted when the cards settle in turn. When a turn instead ends with unsettled cards (under the `cli` executor, when a card is still open at turn exit), the card's report arrives on the conversation as a `notify` frame on `chat.console.<token>.out`, naming the task whose turn filed the card in `replyTo`. A delegation chain's terminal result is posted there too, as a `result` frame; the server doesn't keep those, since the chain's tasks hold the result and `send_message` and `task_control` read it there. A turn in progress reads one flag off its own result frame, below.
@@ -105,6 +123,8 @@ What it keeps is live only. Lost:
 - everything, across a restart of the server.
 
 `send_message` (and the terminal step of a streamed turn) gathers any `notify` reports on the turn. Without step streaming, once the turn's task and the tasks delegated from it have ended, it keeps collecting `notify` reports on any of those tasks until no new one has come for 15 seconds, or the wait ends, whichever is first; on a streamed turn (`stream_steps: true`), when the chain settles with no `cardsPending` signal, no `handoff` artifact, and no `subtask` card steps, it snapshots any already-buffered `notify` frames for the chain and returns immediately (`gatherStepReports`), citing the gateway's `result` frame only if it was heard (the poll often sees the root end before that frame arrives; otherwise it says no handoff or card signal was seen), or otherwise gathers for up to 5 seconds (`reportGatherBudget`). Only reports heard after the turn was sent count, so a report from an earlier turn on the same task isn't taken for this one. The turn also reads the gateway's `result` frame for its own task: one without `cardsPending` means no unsettled card handoff remains, and gathering stops at once; with `cardsPending`, or when no result frame arrives (an older gateway), it waits for the quiet period as above. It returns them in the order they arrived, each labelled as a card's report and shown as quoted text, and says why it stopped: the tasks were still running, so these are only the reports that had arrived; or they ended and no new report came; or they ended and the wait ran out. When a card settles after the turn has already returned, read its report with `poll_events`.
+
+A message that answers a report passes `reply_to`: the task the report's heading gave as `on task`. The turn's frame carries it as `replyTo`, and the agent reads that report before answering (on the platform route, the install's default; a conversation on its own session pod does not read it yet); without it a reply under a card's report starts from the words alone. A `reply_to` that is not a task id is refused.
 
 `poll_events` reads a conversation's kept frames: `conversation` or `conversation_token` as for `send_message`, `since` (a cursor; 0 for everything kept), and `wait_seconds` (up to 60) to wait for a frame newer than `since`. A name must be one the server knows; an unknown name is refused rather than created. A token the server hadn't heard of is listened to from that call on. It returns the frames newer than `since` in cursor order, the new cursor, how many were dropped, and whether any dropped frame was newer than `since`. An updated report comes back under a new cursor. One cursor counts across all conversations, so a cursor stays valid when a conversation's listener goes and comes back; a `since` past the server's cursor, as after a restart, reads from 0.
 

@@ -70,9 +70,12 @@ func (g *Gateway) nextIncarnation(ctx context.Context, rec *SessionRecord) bool 
 	return g.freshIncarnation(ctx, rec)
 }
 
-// evictIdleSession frees a slot at the session cap by retiring the session
-// pod that has been idle longest: a live pod whose conversation has no task
-// at all, oldest last user message first. It reports whether a pod went.
+// evictIdleSessions frees up to n slots at the session cap by retiring the
+// session pods that have been idle longest: live pods whose conversations
+// have no task at all, oldest last user message first. It reports how many
+// went, and hands each evicted conversation's notice to notify, which the
+// caller posts once it has finished. pods is the caller's list of live
+// session pods.
 //
 // Idle is read off each conversation's own record, under that
 // conversation's lock, and re-checked there, because the lock is what orders
@@ -85,12 +88,7 @@ func (g *Gateway) nextIncarnation(ctx context.Context, rec *SessionRecord) bool 
 //
 // The evicted conversation is told in one line. Its next message finds no
 // pod and spawns cold with the primer, as after a reap.
-func (g *Gateway) evictIdleSession(ctx context.Context, requester *SessionRecord) bool {
-	pods, err := g.spawner.SessionPods(ctx)
-	if err != nil {
-		g.log.Error("session cap: pod list for eviction failed", "err", err)
-		return false
-	}
+func (g *Gateway) evictIdleSessions(ctx context.Context, requester *SessionRecord, pods []sessionPod, n int, notify func(key, text string)) int {
 	type candidate struct {
 		pod       sessionPod
 		idleSince time.Time
@@ -114,18 +112,22 @@ func (g *Gateway) evictIdleSession(ctx context.Context, requester *SessionRecord
 		}
 	}
 	slices.SortFunc(candidates, func(a, b candidate) int { return a.idleSince.Compare(b.idleSince) })
+	evicted := 0
 	for _, c := range candidates {
-		if g.evictSession(ctx, c.pod) {
-			return true
+		if evicted >= n {
+			break
+		}
+		if g.evictSession(ctx, c.pod, notify) {
+			evicted++
 		}
 	}
-	return false
+	return evicted
 }
 
 // evictSession retires one idle conversation's pod under that conversation's
 // lock, if the lock is free and the conversation is still idle on its fresh
 // record.
-func (g *Gateway) evictSession(ctx context.Context, p sessionPod) bool {
+func (g *Gateway) evictSession(ctx context.Context, p sessionPod, notify func(key, text string)) bool {
 	l := g.lockSession(p.SessionKey)
 	if !l.TryLock() {
 		return false
@@ -157,7 +159,7 @@ func (g *Gateway) evictSession(ctx context.Context, p sessionPod) bool {
 	}
 	g.log.Info("session cap: evicted the longest-idle session pod", "conversation", rec.Key, "pod", p.PodName,
 		"idleSince", rec.idleSince())
-	g.post(rec.Key, noticeSessionPaused)
+	notify(rec.Key, noticeSessionPaused)
 	return true
 }
 
@@ -239,6 +241,7 @@ func (g *Gateway) retireOverdue(ctx context.Context, key string) {
 		g.log.Warn("overdue check: closed a wedged task and retired its pod", "task", active.TaskID, "pod", rec.PodName,
 			"age", time.Since(active.SubmittedAt).Round(time.Second))
 		rec.PodName = ""
+		g.kickCapQueue()
 	}
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("overdue check: record write failed", "conversation", rec.Key, "err", err)

@@ -549,7 +549,7 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # else can stand in for them: reservations list is the committed
         # capacity, regions describe is the quota headroom, machine-types
         # list is what the region can actually place. Missing, the job runs,
-        # reports, and silently skips most of its twelve checks -- a clean
+        # reports, and silently skips most of its thirteen checks -- a clean
         # capacity report the agent never gathered is worse than a failed one.
         ("compute", "machine-types", "list"),
         ("compute", "regions", "describe"),
@@ -671,7 +671,8 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # before the allowlist entry was consulted at all, which is the same
         # trap --zones and --machine-type above were added for.
         "--port",
-        # `billing budgets list` requires it.
+        # `billing budgets list` requires it. Listed here for its arity only:
+        # _BILLING_ACCOUNT_VERB below is the one command that may pass it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud
         # synopsis. --output-path is deliberately absent from this set and
@@ -700,6 +701,22 @@ _GCLOUD_FILE_WRITE_FLAGS = frozenset({"--output-path", "--log-http-log-file"})
 _ASSET_SEARCH_VERB = ("asset", "search-all-resources")
 _ASSET_SEARCH_TYPE_FLAG = "--asset-types"
 _ASSET_SEARCH_REQUIRED_TYPE = "container.googleapis.com/Cluster"
+
+# `--billing-account` names a scope above a project. _GCLOUD_FLAGS_WITH_VALUE is one list for every
+# command, so the flag `billing budgets list` requires was also read on every other allowlisted
+# command, and `logging read` takes it: with it the read is of a billing account's logs, where the
+# selectors beside it (--folder, --organization, --bucket, --view, --resource-names) were never
+# listed and stay refused. So the flag passes on the one command it was listed for and is refused
+# on every other read, which also keeps it from a command allowlisted later that happens to take
+# it. IAM is still the outer bound either way.
+_BILLING_ACCOUNT_FLAG = "--billing-account"
+_BILLING_ACCOUNT_VERB = ("billing", "budgets", "list")
+_BILLING_ACCOUNT_RULE_ID = "gcp.billing-account-forbidden"
+_BILLING_ACCOUNT_REASON = (
+    "--billing-account selects a billing account, a scope above a project, and is allowed on "
+    "`gcloud billing budgets list` only."
+)
+_BILLING_ACCOUNT_REMOVAL = "Remove it; to read one project's logs or resources, pass --project."
 
 # gcloud boolean global flags that do not consume the following argument.
 # These are enumerated from gcloud help and are boolean **at the global parser
@@ -983,6 +1000,12 @@ def _gcloud_writes_a_file(argv: list[str]) -> str | None:
         if name in _GCLOUD_FILE_WRITE_FLAGS:
             return name
     return None
+
+
+def _gcloud_names_flag(argv: list[str], flag: str) -> bool:
+    """Whether any token is `flag` in either spelling. Any token, a flag's value included: gcloud
+    reads a token of that shape as the flag wherever it stands."""
+    return any(token.partition("=")[0] == flag for token in argv[1:])
 
 
 def _asset_search_type(argv: list[str]) -> str | None:
@@ -1613,6 +1636,69 @@ def local_render(argv: list[str]) -> bool:
     return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
 
 
+# The kubectl verbs that change state (``debug`` starts a pod or container), and
+# the verbs whose second word decides. A ``kubernetes.read-only`` refusal of one
+# of these, not a local render, is a definitive write refusal: the broker marks
+# its refusal body so (credential_proxy.read_only_refusal, ``write_refusal``),
+# and a profile worker stops its task on the in-pod client's record of it. The
+# Hermes runtime's text stop holds the same two tables
+# (deploy/docker/patches/permission_refusal_stop.py MUTATING_VERBS and
+# MUTATING_SUBVERBS); test_permission_refusal_stop holds them equal.
+KUBECTL_MUTATING_VERBS = frozenset({
+    "scale", "patch", "edit", "apply", "replace", "autoscale", "annotate", "label", "create",
+    "delete", "set", "run", "expose", "cordon", "uncordon", "drain", "taint", "debug",
+})
+KUBECTL_MUTATING_SUBVERBS: dict[str, frozenset[str]] = {
+    "rollout": frozenset({"restart", "undo", "pause", "resume"}),
+    "auth": frozenset({"reconcile"}),
+    "certificate": frozenset({"approve", "deny"}),
+}
+
+
+def _short_help_cluster(token: str) -> bool:
+    """Whether ``token`` is a short-flag cluster carrying the help letter (`-hv=9`).
+
+    Plain string parsing: one dash, then ASCII letters up to an optional `=`.
+    """
+    if not token.startswith("-") or token.startswith("--"):
+        return False
+    letters = token[1:].split("=", 1)[0]
+    return letters.isascii() and letters.isalpha() and "h" in letters
+
+
+def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
+    """The verb words of a kubectl ``argv`` that tries a change, or None.
+
+    A mutating verb as the policy resolves it, that is not a local render.
+    The verb words alone (one, or two for a verb whose second word decides),
+    never the object they name. A policy rule that refuses such an argv has
+    refused a write outright, whichever rule it is.
+    """
+    if not argv or argv[0] != "kubectl" or local_render(argv):
+        return None
+    own = argv[: argv.index("--")] if "--" in argv else argv
+    # The verb parser stops at the first flag it can't size, so `apply -f m.yaml
+    # view-last-applied` reads as `apply`, though kubectl skips the flag and
+    # runs the read. A help flag inside a short cluster (`-hv=9`) also only
+    # prints help. Neither is marked: a missed mark only lets the task run on.
+    if _LOCAL_RENDER_SUBCOMMAND in own[1:] or any(_short_help_cluster(t) for t in own[1:]):
+        return None
+    verb, _ = _kubectl_verb_and_flag(argv)
+    if not kubectl_verb_is_mutating(verb):
+        return None
+    return verb[:2] if verb[0] in KUBECTL_MUTATING_SUBVERBS else verb[:1]
+
+
+def kubectl_verb_is_mutating(verb_words) -> bool:
+    """Whether the kubectl verb the policy resolved (``Decision.verb_tuple``) changes state."""
+    if not verb_words:
+        return False
+    head = verb_words[0]
+    if head in KUBECTL_MUTATING_SUBVERBS:
+        return len(verb_words) > 1 and verb_words[1] in KUBECTL_MUTATING_SUBVERBS[head]
+    return head in KUBECTL_MUTATING_VERBS
+
+
 def _refused_flags(tool: str) -> frozenset[str]:
     """Every flag the policy refuses by name for `tool`, whatever the command."""
     if tool == "kubectl":
@@ -2020,6 +2106,20 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
                 message=_GCLOUD_READ_ONLY_MESSAGE
                 + (_NEAREST_READ_HINT.format(command=nearest) if nearest else ""),
                 verb_tuple=_gcloud_verb_tuple(words),
+            )
+
+        # Only on a command the lines above found to be an allowed read, so a write keeps its own
+        # refusal.
+        if (
+            _gcloud_names_flag(argv, _BILLING_ACCOUNT_FLAG)
+            and tuple(words[: len(_BILLING_ACCOUNT_VERB)]) != _BILLING_ACCOUNT_VERB
+        ):
+            return _flag_refusal(
+                argv,
+                _BILLING_ACCOUNT_RULE_ID,
+                _BILLING_ACCOUNT_REASON,
+                _BILLING_ACCOUNT_REMOVAL,
+                _BILLING_ACCOUNT_FLAG,
             )
         return _ALLOWED
 
