@@ -5221,7 +5221,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # ``finding_ids``; a body's hidden id block holds every id on ONE line, so
     # a body pattern bounds its gaps with a class and not `.*`. Every required
     # pattern must match; no forbidden pattern may. No ``{cluster:<slot>}`` is
-    # expanded here.
+    # expanded here; one is refused at load.
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids", "finding"] = "body"
@@ -5252,6 +5252,13 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     @classmethod
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
+            # Not expanded by this check: it would compile as literal text and
+            # never match, an inert forbid or a miss on every run.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a cluster placeholder, which only report_contains "
+                    "expands; here it is literal text that never matches"
+                )
             try:
                 re.compile(pattern, _LEDGER_PATTERN_FLAGS)
             except re.error as exc:

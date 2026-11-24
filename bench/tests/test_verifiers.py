@@ -4147,6 +4147,13 @@ def test_ledger_pattern_that_does_not_compile_is_refused_at_load(field):
     assert "does not compile" in str(raised.value)
 
 
+@pytest.mark.parametrize("field", ["required_patterns", "forbidden_patterns"])
+def test_ledger_pattern_with_a_cluster_placeholder_is_refused_at_load(field):
+    """Only report_contains expands one; here it would be literal text."""
+    with pytest.raises(ValueError, match="cluster placeholder"):
+        _ledger_check(**{field: [r"master-behind\..*{cluster:b}"]})
+
+
 def test_parse_node_builds_a_ledger_check_with_patterns():
     node = parse_node(
         {
