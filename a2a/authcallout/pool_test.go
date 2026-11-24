@@ -169,7 +169,8 @@ func response(t *testing.T, m *nats.Msg) *jwt.AuthorizationResponseClaims {
 // Each request gets a goroutine of its own, as handle gives it, but not
 // handle's decision budget: that is a wall clock from receipt, and a held
 // round on a busy runner outlasts it, which is a refusal the pool did not
-// cause. TestHandleReturnsBeforeTheDecisionIsMade covers handle itself.
+// cause. TestHandleReturnsBeforeTheDecisionIsMade covers handle's hand-off;
+// no test here covers the budget itself.
 func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 	const callbacks = 64
 	// Sixteen abreast: the width is pinned here, so a change to
