@@ -735,9 +735,11 @@ func wrappedData(p Part, key string) (json.RawMessage, bool) {
 // the non-final status-update it publishes for each follow-up message it
 // receives on a running task: one when the follow-up arrives, either queued
 // or refused with a reason, and a second, refused, for a queued follow-up
-// that does not get its turn. The gateway's relay reads it to word its posts
-// and to count what it promised the room; a reader that does not know it
-// sees the text part beside it.
+// that does not get its turn. Neither is guaranteed: a redelivered follow-up
+// and one that arrives after the terminal get none, and an executor that
+// crashes sends none for its queue. The gateway's relay reads it to word
+// its posts and to count what it promised the room; a reader that does not
+// know it sees the text part beside it.
 type SteerNotice struct {
 	Steer      string `json:"steer"`
 	EnvelopeID string `json:"envelopeId"`
