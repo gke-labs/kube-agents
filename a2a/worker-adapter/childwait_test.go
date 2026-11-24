@@ -381,6 +381,55 @@ func TestARefusalEndsTheWholeWait(t *testing.T) {
 	}
 }
 
+// A repeat refusal (the gateway refusing a request made after the one the
+// wait is on) ends nothing: the wait holds while the first batch's children
+// run, collects their ends, and delivers them, with no refusal in the
+// delivery. A first refusal, untagged, still ends the wait
+// (TestARefusalEndsTheWholeWait).
+func TestARepeatRefusalLeavesTheWaitOnLiveChildrenOpen(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const addressee, taskID = "auditor-repeat", "task-wait-repeat"
+	submitWithParts(t, c, addressee, taskID, "audit two clusters", widthPart(t, 2))
+	p := newParentStub(t, nil, resultLine(t, "Both healthy."))
+	done := runDispatched(context.Background(), parentConfig(url, taskID, addressee, p))
+	p.armed(t)
+	if reply := askDelegate(t, p.sock(), lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b")}}); !reply.OK {
+		t.Fatalf("delegate reply = %+v", reply)
+	}
+	p.delegated(t)
+	waitWorkingNote(t, url, addressee, taskID, "waiting on 2 delegated tasks")
+
+	end := func(entry int, id, text string) lib.Part {
+		return childPart(t, lib.ChildResult{ChildTaskID: id, Addressee: "cluster", State: lib.StateCompleted, Text: text, Entry: entry})
+	}
+	sendChildEnd(t, c, addressee, taskID, end(1, "child-a", "a is healthy"))
+	const repeatNotice = "⚠️ delegation refused: this task has already handed its work on"
+	repeat, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: repeatNotice, Repeat: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendChildEnd(t, c, addressee, taskID, repeat)
+	time.Sleep(childWaitPause)
+	if p.delivered() {
+		t.Fatalf("a repeat refusal ended the wait with entry 2 still running:\n%s", p.delivery(t))
+	}
+	sendChildEnd(t, c, addressee, taskID, end(2, "child-b", "b is healthy"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	got := p.delivery(t)
+	ia := strings.Index(got, "Report 1 of 2 (entry 1, task child-a, from cluster, state completed):\n> a is healthy")
+	ib := strings.Index(got, "Report 2 of 2 (entry 2, task child-b, from cluster, state completed):\n> b is healthy")
+	if ia < 0 || ib < ia {
+		t.Errorf("the delivery doesn't hold both children's ends:\n%s", got)
+	}
+	if strings.Contains(got, childRefusalHeader) || strings.Contains(got, repeatNotice) || strings.Contains(got, "No report arrived") {
+		t.Errorf("the delivery carries the repeat refusal or names a missing entry:\n%s", got)
+	}
+}
+
 // At the deadline minus the reserve, the wait delivers what has arrived and
 // names the entries with no end, and the task still completes on the answer
 // before its deadline.

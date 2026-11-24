@@ -35,6 +35,10 @@ const (
 	childWaitReserveFloor   = 2 * time.Minute
 	childWaitReservePercent = 15
 	childWaitReserveMaxDiv  = 2
+
+	// repeatRefusalLogCap bounds, in bytes, the notice a repeat refusal's
+	// log line quotes: the gateway's fixed line, never a model's input.
+	repeatRefusalLogCap = 256
 )
 
 // The model-facing text of the wait.
@@ -107,7 +111,9 @@ type childWait struct {
 	// one already keyed under either.
 	entries  map[int]bool
 	children map[string]bool
-	// refusal ends the whole wait: the gateway minted nothing.
+	// refusal ends the whole wait: the gateway minted nothing. Only a first
+	// refusal is one; a repeat (lib.DelegationRefusal.Repeat) is dropped at
+	// the in consumer and never reaches the wait.
 	refusal *lib.DelegationRefusal
 	// delivered is set once the delivery turn is written: the next result
 	// is the deliverable, and nothing more is taken into the wait.

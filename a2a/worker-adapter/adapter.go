@@ -2378,6 +2378,16 @@ func (a *adapter) handleInMsg(msg jetstream.Msg, subject string, seen map[string
 			// children (childwait.go); supervise decides whether a wait is
 			// open for it.
 			if end, ok := childEndOf(m.Parts); ok {
+				// A repeat refusal is of a request made after the one
+				// the wait is on (lib.DelegationRefusal.Repeat): that
+				// one's children are still running or have reported, so
+				// it ends nothing and is only logged. Only an untagged
+				// refusal ends the whole wait (supervise).
+				if end.refusal != nil && end.refusal.Repeat {
+					a.log.Info("repeat delegation refused by the gateway; the wait on the first request's children goes on",
+						"task", a.cfg.TaskID, "notice", truncate(end.refusal.Text, repeatRefusalLogCap))
+					return
+				}
 				if a.childCh == nil {
 					a.log.Warn("child result on a task that waits on no children dropped", "task", a.cfg.TaskID)
 					return
