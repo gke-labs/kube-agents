@@ -207,17 +207,18 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationBusy, "repeat", true}, audit...), extra...)...)
 		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+noticeDelegationRepeat), true)
 	}
-	if profileParent {
-		// A profile parent's request that already ended (DelegationEnd:
-		// refused, not started, or a batch withdrawn) has had its answer,
-		// and the parent was told it (#4860), or had each entry ended
-		// (endWithdrawnProfileBatch). Its request again, a redelivery or a
-		// second ask, is refused as a repeat, never minted late: its
-		// children's ends would all be held back by the mark.
-		if parent.DelegationEnd != "" {
-			refuseRepeat("delegationEnd", parent.DelegationEnd)
-			return
-		}
+	// A profile parent stays open after its request, so it can ask again
+	// after one that ended (DelegationEnd: refused, not started, or a batch
+	// withdrawn, with or without children kept). It has had its answer, and
+	// was told it (#4860), or had each entry ended (endWithdrawnProfileBatch).
+	// That request again, a redelivery or a second ask, is its one, too:
+	// minting it would send none of its ends, since the parent's mark holds
+	// them back (profileBatchChildEnded), and a batch minted beside one a
+	// withdrawal kept would mix with it. It mints nothing and records
+	// nothing; the parent is told, tagged so it ends nothing.
+	if profileParent && parent.DelegationEnd != "" {
+		refuseRepeat("delegationEnd", parent.DelegationEnd)
+		return
 	}
 	// A request is accepted once per task, whether it asked for one child
 	// or a batch: a parent with any child has had its request. Checked
