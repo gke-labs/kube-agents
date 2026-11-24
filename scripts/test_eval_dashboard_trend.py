@@ -516,7 +516,8 @@ def build_started_at(started: str) -> str:
 
 class NightsTheCollectorLacksTest(unittest.TestCase):
     """``data.json`` can hold fewer nights than the store (a refresh with no
-    prior document sweeps 14 days; the store reads 104). The builds of a
+    prior document sweeps ``collect.DEGRADED_SINCE_DAYS``; the store reads
+    its window and lead-in). The builds of a
     night its runs lack are then joined by their start alone: one night
     date, started together. Night two, Wed 2025-09-10: the main and writers
     builds start seconds after 00:00 UTC and record at 06:30 and 02:00; a
@@ -569,6 +570,42 @@ class NightsTheCollectorLacksTest(unittest.TestCase):
         runs = [main, timed_run(soon, NIGHT_1_RUN["job"], "2025-09-10T00:05:00+00:00", "2025-09-10T06:40:00+00:00", [])]
         records = [self.record("case-19", self.MAIN, "2025-09-10T06:30:00Z"), self.record("case-19", soon, "2025-09-10T06:39:00Z")]
         self.assertEqual([n["build"] for n in trend.night_documents(records, data_with_nightly(DOMAINS, runs))], [self.MAIN, soon])
+
+    def test_a_part_the_collector_lacks_joins_the_known_night_that_started_nearest(self):
+        """A main re-run started ten minutes before the cron builds is the
+        next date's and inside the spread. With both mains on record, the
+        writers build the collector has not read goes to the cron night,
+        six seconds away, as ``nightly.filed_nights`` will file it."""
+        eve = build_started_at("2025-09-09T23:50:00+00:00")
+        runs = [timed_run(eve, NIGHT_1_RUN["job"], "2025-09-09T23:50:00+00:00", "2025-09-10T05:00:00+00:00", []),
+                timed_run(self.MAIN, NIGHT_1_RUN["job"], "2025-09-10T00:00:10+00:00", "2025-09-10T06:31:00+00:00", [])]
+        records = [self.record("case-19", eve, "2025-09-10T04:59:00Z")] + self.split_night()
+        nights = trend.night_documents(records, data_with_nightly(DOMAINS, runs))
+        self.assertEqual([(n["build"], n["cases"]) for n in nights], [(eve, 1), (self.MAIN, 2)])
+
+    def test_the_spread_is_measured_from_the_first_build_of_the_group(self):
+        """00:00, 00:12 and 00:24: the third is within the spread of the
+        second and not of the first, and begins a night of its own."""
+        first, second, third = (build_started_at(f"2025-09-10T00:{minute}:00+00:00") for minute in ("00", "12", "24"))
+        records = [self.record(case, build, "2025-09-10T06:00:00Z") for case, build in (("case-19", first), ("case-23", second), ("case-24", third))]
+        self.assertEqual([(n["build"], n["cases"]) for n in trend.night_documents(records, data_with_nightly(DOMAINS))], [(first, 2), (third, 1)])
+
+    def test_a_night_across_the_windows_edge_keeps_one_id_for_its_points_and_its_night(self):
+        """The writers part recorded in the lead-in, the main part inside
+        the drawn window (read at 14:09 with a 10-day window: drawn from
+        09-08 14:09). The drawn point names a night that ``nights[]`` holds."""
+        writers, main = build_started_at("2025-09-08T00:00:04+00:00"), build_started_at("2025-09-08T00:00:10+00:00")
+        records = [self.record("case-23", writers, "2025-09-08T02:00:00Z"), self.record("case-19", main, "2025-09-08T14:10:00Z")]
+        doc = trend.trend_document(store_doc(records, window_days=10, lead_days=14), data_with_nightly(DOMAINS))
+        self.assertEqual(sorted(doc["cases"]), ["case-19"], "the lead-in record is not drawn")
+        (point,) = doc["cases"]["case-19"]["points"]
+        self.assertEqual(([n["id"] for n in doc["nights"]], point["night"]), ([f"build:{writers}"], f"build:{writers}"))
+
+    def test_a_build_that_is_not_a_string_stands_alone(self):
+        """A damaged store.json must not stop the render: the record is
+        filed under its stamp, as before."""
+        odd = self.record("case-19", ["not", "a", "build"], "2025-09-10T06:30:00Z")
+        self.assertEqual([n["id"] for n in trend.night_documents([odd], data_with_nightly(DOMAINS))], ["at:2025-09-10T06:30:00Z"])
 
     def test_builds_on_either_side_of_the_night_date_are_two_nights(self):
         """A build is dated by its start plus the grace, as the collector's
