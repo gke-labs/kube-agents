@@ -675,10 +675,16 @@ func publishHeaderBlock(t *testing.T, url, subject, hdr string, data []byte) {
 // server expects. The server appends its own headers after the last line;
 // the client's parse stops at the blank line and never sees them.
 func blankLineStampBlock(subject string, at time.Time) string {
+	return blankLineBlock(subject, 1, at)
+}
+
+// blankLineBlock is blankLineStampBlock with the publisher's Nats-Sequence
+// set to seq as well.
+func blankLineBlock(subject string, seq uint64, at time.Time) string {
 	return "NATS/1.0\r\n" +
 		"Nats-Stream: " + TasksStream + "\r\n" +
 		"Nats-Subject: " + subject + "\r\n" +
-		"Nats-Sequence: 1\r\n" +
+		"Nats-Sequence: " + fmt.Sprint(seq) + "\r\n" +
 		"Nats-Time-Stamp: " + at.UTC().Format(time.RFC3339Nano) + "\r\n" +
 		"\r\n" +
 		"X-Pad: 1\r\n\r\n"
@@ -729,6 +735,73 @@ func TestABlankLineInTheHeaderBlockDoesNotPassTheCutoff(t *testing.T) {
 	}
 	if c.ProfileSupervisorDrops() < 3 {
 		t.Errorf("drops = %d, want one per read", c.ProfileSupervisorDrops())
+	}
+}
+
+// The replay's horizon is the server's, not the direct get's Nats-Sequence,
+// which sits in the same header block a blank line ends early (the sibling
+// of H1 on #6885). A publisher-forged sequence on a task's newest event
+// neither hides the events stored before it nor admits one stored after the
+// call: a forged low one used to stop the replay at the first event, and a
+// forged high one to fold whatever was stored while it ran.
+func TestAForgedSequenceDoesNotMoveTheReplayHorizon(t *testing.T) {
+	cases := []struct {
+		name string
+		seq  uint64
+	}{
+		{"low", 1},
+		{"high", 1 << 40},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := startServer(t)
+			url := clientURL(s)
+			provisionCutoffTasksStream(t, url, true)
+			taskID := "task-seq-" + tc.name
+			subject := TaskEventsSubject(cutoffSessionName, taskID)
+			publishRaw(t, url, subject, cutoffEnvelope(t, cutoffSessionName, taskID, StateSubmitted, false))
+			publishRaw(t, url, subject, cutoffEnvelope(t, cutoffSessionName, taskID, StateWorking, false))
+			publishHeaderBlock(t, url, subject, blankLineBlock(subject, tc.seq, time.Now()),
+				cutoffEnvelope(t, cutoffSessionName, taskID, StateInputRequired, false))
+			c := cutoffReader(t, url, time.Time{}, nil)
+			ctx := testCtx(t)
+
+			// The forgery reaches the client: the direct get's sequence is
+			// the publisher's.
+			_, js := c.conn()
+			st, err := js.Stream(ctx, TasksStream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := st.GetLastMsgForSubject(ctx, subject)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if raw.Sequence != tc.seq {
+				t.Fatalf("direct get: Sequence %d; want the forged %d (the server no longer hides its own?)", raw.Sequence, tc.seq)
+			}
+
+			// A terminal stored after the horizon is read and before the
+			// consumer is made is past the call.
+			replayHorizonTaken = func() {
+				publishRaw(t, url, subject, cutoffEnvelope(t, cutoffSessionName, taskID, StateFailed, true))
+			}
+			t.Cleanup(func() { replayHorizonTaken = nil })
+			task, err := c.TasksGet(ctx, cutoffSessionName, taskID)
+			replayHorizonTaken = nil
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []TaskState{StateSubmitted, StateWorking, StateInputRequired}
+			if !reflect.DeepEqual(task.StatusHistory, want) || task.Final {
+				t.Errorf("replay: history %v, final %v; want %v and not final", task.StatusHistory, task.Final, want)
+			}
+
+			// The next call's horizon is past the terminal, and folds it.
+			if task, err := c.TasksGet(ctx, cutoffSessionName, taskID); err != nil || !task.Final {
+				t.Errorf("second replay: %+v, %v; want the terminal", task, err)
+			}
+		})
 	}
 }
 

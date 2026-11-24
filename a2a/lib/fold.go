@@ -454,11 +454,20 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 	}
 	// Snapshot the replay horizon first: fold what the stream holds now, and
 	// terminate deterministically even while the task is still emitting.
-	// GetLastMsgForSubject is single-subject, so the horizon is the latest
-	// across the subjects, and a task exists if any subject holds a message.
-	var last uint64
+	// The direct gets say only whether a subject holds a message, and a task
+	// exists if any does. They do not give the horizon: a direct get's
+	// Nats-Sequence is a header after the publisher's own header block, and
+	// a blank line inside that block ends it for the client's parse, so the
+	// server's sequence is hidden and a publisher's forged one is all the
+	// client reads (the same forgery storedTimeOf refuses for the time). A
+	// forged low one would stop the replay early and hide the task's later
+	// events; a forged high one would let it fold events stored after the
+	// call. The horizon is the stream's last sequence from STREAM.INFO, read
+	// after the direct gets, so every message they found is at or under it.
+	// It is the stream's, not the subjects', so the loop below also stops at
+	// the first message past it and does not fold that one.
 	for _, subject := range subjects {
-		msg, err := stream.GetLastMsgForSubject(ctx, subject)
+		_, err := stream.GetLastMsgForSubject(ctx, subject)
 		if err != nil {
 			if errors.Is(err, jetstream.ErrMsgNotFound) {
 				continue
@@ -466,12 +475,18 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 			return nil, nil, false, fmt.Errorf("replay horizon for %s: %w", taskID, err)
 		}
 		found = true
-		if msg.Sequence > last {
-			last = msg.Sequence
-		}
+		break
 	}
 	if !found {
 		return nil, nil, false, nil
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("replay horizon for %s: %w", taskID, err)
+	}
+	last := info.State.LastSeq
+	if replayHorizonTaken != nil {
+		replayHorizonTaken()
 	}
 	cons, err := js.OrderedConsumer(ctx, TasksStream, jetstream.OrderedConsumerConfig{
 		FilterSubjects:    subjects,
@@ -511,6 +526,11 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 		if err != nil {
 			return nil, nil, true, fmt.Errorf("replay metadata for %s: %w", taskID, err)
 		}
+		if meta.Sequence.Stream > last {
+			// Stored after the horizon: the call folds what the stream held
+			// when it was made.
+			break
+		}
 		subject := msg.Subject()
 		env, err := ParseEnvelope(msg.Data())
 		if err != nil {
@@ -548,6 +568,11 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 	}
 	return events, eventMeta, true, nil
 }
+
+// replayHorizonTaken, when set, runs in replay right after the horizon is
+// read and before the consumer is made. Tests set it to store a message
+// past the horizon; it is nil otherwise.
+var replayHorizonTaken func()
 
 // finalEvent is the subject and stored time of the event that made the fold
 // final: the first final status-update in stream order, which is the one
