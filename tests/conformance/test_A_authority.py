@@ -511,7 +511,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
 
     def test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other(self) -> None:
         # The row above holds the writes. This one holds the whole set: a read
-        # added to it (proposal-reviews, snapshot) is a grant to every profile
+        # added to it (proposal-reviews, for one) is a grant to every profile
         # of the install, and it turns this row red rather than none.
         cp = h.credential_proxy
         profile = cp.CALLER_ROLE_PROFILE
@@ -527,7 +527,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 self.assertEqual(verb in reached, cp.vcs_verb_permitted(profile, verb))
         self.assertFalse(cp.vcs_verb_permitted(profile, "Proposal-View"), "a spelling that is no verb")
 
-    def test_A3_the_handler_asks_the_route_table_and_the_task_gate_for_a_profile_caller(self) -> None:
+    def test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller(self) -> None:
         # The route row reads ROUTE_ROLES. This one drives the handler's own
         # authentication step, so a handler that stops asking the table, or
         # stops binding a profile caller's task credential, is red.
@@ -621,7 +621,8 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
 
     def test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role(self) -> None:
         # Both tables are checked when the broker module loads. Each case is
-        # an edit that reads as policy and widens the profile role; the
+        # an edit that reads as policy: most widen the profile role, and two
+        # are a typo that a table must not accept as a verb or a role. The
         # shipped tables pass.
         cp = h.credential_proxy
         profile = cp.CALLER_ROLE_PROFILE

@@ -203,24 +203,24 @@ MUTATIONS: list[Mutation] = [
         ('    return narrowed is None or verb in narrowed\n',
          '    return True\n'),
         "test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other",
-        "drop the per-role verb narrowing as redundant with the route table, "
+        "drop the per-role verb narrowing as redundant with the role table, "
         "which already says who reaches /v1/vcs/",
     ),
     Mutation(
-        "A3-handler-skips-the-route-table",
+        "A3-handler-skips-the-role-table",
         "agents/platform/scripts/credential_proxy.py",
         ('        if not self._role_permits(self.principal):\n            return None\n',
          '        if False:\n            return None\n'),
-        "test_A3_the_handler_asks_the_route_table_and_the_task_gate_for_a_profile_caller",
-        "stop asking the route table on every request, since each handler "
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "stop asking the role table on every request, since each handler "
         "checks its own caller anyway -- only the ones that were written to do",
     ),
     Mutation(
-        "A3-route-table-admits-any-role",
+        "A3-role-table-admits-any-role",
         "agents/platform/scripts/credential_proxy.py",
         ('        if not needed or not principal.role or principal.role in needed:\n            return True\n',
          '        if True:\n            return True\n'),
-        "test_A3_the_handler_asks_the_route_table_and_the_task_gate_for_a_profile_caller",
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
         "treat a role the table does not list for a route as the no-role "
         "principal behind the socket, which reaches everything",
     ),
@@ -229,7 +229,7 @@ MUTATIONS: list[Mutation] = [
         "agents/platform/scripts/credential_proxy.py",
         ('        if self.principal.role == CALLER_ROLE_PROFILE and not self._admit_task(self.principal):\n',
          '        if False:\n'),
-        "test_A3_the_handler_asks_the_route_table_and_the_task_gate_for_a_profile_caller",
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
         "let a profile request through with whatever credential it sent, "
         "leaving each route to notice that no task was bound",
     ),
@@ -292,7 +292,7 @@ MUTATIONS: list[Mutation] = [
         "agents/platform/scripts/credential_proxy.py",
         ('                    "message": f"The task credential was refused: {exc}.",\n                },\n            )\n            return False\n',
          '                    "message": f"The task credential was refused: {exc}.",\n                },\n            )\n            return True\n'),
-        "test_A3_the_handler_asks_the_route_table_and_the_task_gate_for_a_profile_caller",
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
         "answer a refused task credential and carry on with the request as a "
         "caller with no task, so a stale credential degrades instead of failing",
     ),
