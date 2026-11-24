@@ -143,6 +143,8 @@ LOG_CLUSTER_LABEL = "resource.labels.cluster_name"
 LOG_CLAUSE_NOT = "NOT "
 LOG_REGEX_MATCH = "=~"
 LOG_REGEX_OR = "|"
+LOG_REGEX_OPEN = "^("
+LOG_REGEX_CLOSE = ")$"
 
 
 def _log_clause(triples: frozenset[tuple[str, str, str]]) -> str:
@@ -154,7 +156,7 @@ def _log_clause(triples: frozenset[tuple[str, str, str]]) -> str:
     exclusion, never less. The names are held to the GKE name grammar by
     _parse_cluster_refs, so they need no escaping in the regex or the quotes."""
     names = sorted({cluster for _, _, cluster in triples})
-    return f'{LOG_CLAUSE_NOT}{LOG_CLUSTER_LABEL}{LOG_REGEX_MATCH}"^({LOG_REGEX_OR.join(names)})$"'
+    return f'{LOG_CLAUSE_NOT}{LOG_CLUSTER_LABEL}{LOG_REGEX_MATCH}"{LOG_REGEX_OPEN}{LOG_REGEX_OR.join(names)}{LOG_REGEX_CLOSE}"'
 
 
 class HoldState:
@@ -384,3 +386,20 @@ class Exclusions:
         if not triples:
             return None
         return _log_clause(triples)
+
+    def excluded_names_pattern(self) -> str | None:
+        """An anchored regex alternation of the excluded clusters' names, for a
+        gcloud `--filter` that drops them from a project-wide listing; None when
+        nothing is excluded. The names are held to NAME_PART when the scope file
+        is parsed (a file with any other name is refused whole), so no regex
+        metacharacter can reach the pattern. A scope file the broker can't read
+        refuses the listing."""
+        triples, error = self._load()
+        if error is not None:
+            raise ExcludedCluster(
+                RULE_EXCLUDE_UNREADABLE,
+                f"{error}, so the broker can't tell which clusters to leave out of the listing and lists none until it can",
+            )
+        if not triples:
+            return None
+        return LOG_REGEX_OPEN + LOG_REGEX_OR.join(sorted({c for _, _, c in triples})) + LOG_REGEX_CLOSE

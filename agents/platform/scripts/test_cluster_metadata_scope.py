@@ -322,3 +322,72 @@ class MetadataScopeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListingScopeTest(unittest.TestCase):
+    """Project-wide listings (#7031): gcloud's --filter drops excluded clusters."""
+
+    setUp = MetadataScopeTest.setUp
+    exclusions = MetadataScopeTest.exclusions
+
+    def listing(self, argv, exclusions):
+        return cluster_metadata_scope.scoped_listing_argv(argv, exclusions)
+
+    def test_a_cluster_listing_gets_the_name_clause_on_its_filter(self):
+        exclusions = self.exclusions(EXCLUDED, NUMBERED)
+        clause = 'NOT name~"^(legacy|scratch)$"'
+        for argv, want in (
+            (["gcloud", "container", "clusters", "list"], f"--filter={clause}"),
+            (["gcloud", "container", "clusters", "list", "--filter=status=RUNNING"], f"--filter=(status=RUNNING) AND {clause}"),
+            (["gcloud", "container", "clusters", "list", "--filter", "status=RUNNING"], f"--filter=(status=RUNNING) AND {clause}"),
+            # A repeated --filter keeps its last value, as gcloud reads it.
+            (["gcloud", "container", "clusters", "list", "--filter=a=b", "--filter=c=d"], f"--filter=(c=d) AND {clause}"),
+            (["gcloud", "beta", "container", "clusters", "list", "--format=json"], f"--filter={clause}"),
+        ):
+            with self.subTest(argv=argv):
+                out = self.listing(argv, exclusions)
+                self.assertEqual(out[-1], want)
+                self.assertEqual(sum(1 for t in out if t.startswith("--filter")), 1)
+
+    def test_an_operations_listing_drops_operations_on_excluded_clusters(self):
+        out = self.listing(["gcloud", "container", "operations", "list"], self.exclusions(EXCLUDED))
+        self.assertEqual(out[-1], '--filter=NOT targetLink~"/clusters/(scratch)(/|$)"')
+
+    def test_a_filter_that_could_swallow_the_clause_is_refused(self):
+        exclusions = self.exclusions(EXCLUDED)
+        for text in ('name="open', "name='x'", "status=RUNNING) OR (name=scratch", "a -- b"):
+            with self.subTest(filter=text):
+                with self.assertRaises(ExcludedCluster):
+                    self.listing(["gcloud", "container", "clusters", "list", f"--filter={text}"], exclusions)
+
+    def test_listings_are_unchanged_with_nothing_excluded_and_on_help(self):
+        for exclusions, argv in (
+            (self.exclusions(), ["gcloud", "container", "clusters", "list", "--filter=x=y"]),
+            (self.exclusions(EXCLUDED), ["gcloud", "container", "clusters", "list", "--help"]),
+            (self.exclusions(EXCLUDED), ["gcloud", "container", "clusters", "describe", "prod"]),
+            (self.exclusions(held=[HELD]), ["gcloud", "container", "clusters", "list"]),
+        ):
+            with self.subTest(argv=argv):
+                self.assertIs(self.listing(argv, exclusions), argv)
+
+    def test_a_name_outside_the_grammar_never_reaches_the_pattern(self):
+        # The pattern is built only from names parse_exclusions accepted: a scope
+        # file with any other name is refused whole, so the listing is refused
+        # rather than given a pattern carrying a metacharacter.
+        for bad in ("scr|atch", "a.*", "A", "x)y", 'q"'):
+            with self.subTest(name=bad):
+                exclusions = self.exclusions({"projectId": PROJECT, "location": "us-central1", "clusterName": bad})
+                with self.assertRaises(ExcludedCluster) as caught:
+                    self.listing(["gcloud", "container", "clusters", "list"], exclusions)
+                self.assertEqual(caught.exception.rule, RULE_EXCLUDE_UNREADABLE)
+
+    def test_a_relayed_cluster_list_drops_excluded_clusters_by_their_own_triple(self):
+        exclusions = self.exclusions(EXCLUDED)
+        body = json.dumps({"clusters": [
+            {"name": "scratch", "location": "us-central1", "status": "RUNNING", "id": "1"},
+            {"name": "scratch", "location": "us-east4", "status": "RUNNING", "id": "2"},
+            {"name": "prod", "location": "us-central1", "status": "RUNNING", "id": "3"},
+        ], "missingZones": []}).encode()
+        out = json.loads(cluster_metadata_scope.filtered_cluster_list(body, PROJECT, exclusions))
+        self.assertEqual([c["id"] for c in out["clusters"]], ["2", "3"])
+        self.assertEqual(out["missingZones"], [])

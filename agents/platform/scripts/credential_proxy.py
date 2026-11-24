@@ -2517,6 +2517,14 @@ CALLER_ROLE_A2A_REPORTS = "a2a-reports"
 # managed repository only, so the curator can verify active and superseded
 # records from Git without holding a forge credential of its own.
 CALLER_ROLE_CURATOR = "curator"
+# The callers whose project-wide cluster listings (`gcloud container clusters
+# list`, `operations list`) drop the install's excluded clusters (#7031). The
+# platform agent's own shell keeps the full list: its upgrade-readiness watch
+# grades an excluded cluster's versions from it, as the exclusion's docs say.
+# The scope role is left out too: its lookups are the reconcile's own, matched
+# token for token (scope_policy.SHAPES), and the reconcile leaves excluded
+# clusters out by itself.
+LISTING_FILTERED_ROLES = frozenset({CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE})
 CALLER_ROLE_TEAMS_INBOUND = "teams-inbound"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -15999,6 +16007,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         exclusions = getattr(self, "exclusions", None)
         if exclusions is not None:
             try:
+                if principal.role in LISTING_FILTERED_ROLES:
+                    # A project-wide cluster listing drops excluded clusters for
+                    # these callers (cluster_metadata_scope.scoped_listing_argv).
+                    argv = cluster_metadata_scope.scoped_listing_argv(argv, exclusions)
                 argv = cluster_metadata_scope.scoped_argv(argv, exclusions)
             except scope_exclude.ExcludedCluster as exc:
                 self._refuse_excluded_cluster(exc, request_id, audit, count)
@@ -16653,7 +16665,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # check was still let through for that resource, and over the cap
                 # the upstream has served it.
                 LOGGER.info(API_RELAY_BODY_CHECKED_LOG, request_id, decision.rule_id, resource)
-        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
+        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and (
+            self.headers.get(GET_CREDENTIALS_CHECK_HEADER) or CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES
+        ):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
             segments = path.split("/")
@@ -16761,6 +16775,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             upstream = replace(upstream, body=projected)
+            if decision.rule_id == api_policy.GKE_CLUSTER_LIST_RULE and CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES:
+                # The relay is the shell's: its listing drops excluded clusters
+                # only when the shell is among the filtered callers (#7031).
+                try:
+                    upstream = replace(upstream, body=cluster_metadata_scope.filtered_cluster_list(
+                        upstream.body, path.split("/")[2], self.exclusions,
+                    ))
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, lambda _status: None)
+                    return
         # `resource` has passed the route's body check, so it is logged as it is. The
         # audit mapping stays identifiers and outcomes.
         LOGGER.info(
