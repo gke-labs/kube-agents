@@ -264,9 +264,17 @@ class AuditRedactor:
     #   stay readable.
     # - The scheme is capped so a long alphanumeric run is not rescanned from
     #   every position.
+    # - Either part may also hold a JSON escape, whole (`\u0026`, `\"`, `\\`):
+    #   Go's encoder writes `&`, `<` and `>` that way, and any JSON encoder a
+    #   `"` or a `\`, so a password printed inside JSON is still matched. The
+    #   URL may also start right after an escape (`\n`), where `\b` finds no
+    #   boundary. These only widen the match; nothing the pattern took before
+    #   is left.
     URL_PASSWORD_PATTERN = re.compile(
-        r"\b([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)"
-        r"([^\s/?#\[\]\"'<>{}\\|^`,;]+)@"
+        r"(?:\b|(?<=\\[ntrbf\"/\\])|(?<=\\u[0-9a-fA-F]{4}))"
+        r"([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://"
+        r"(?:[^\s:/?#@\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\"\\/bfnrt]))*:)"
+        r"((?:[^\s/?#\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\"\\/bfnrt]))+)@"
     )
     # The three token shapes this redactor was missing that `redact_secrets` in
     # agents/platform/skills/fleet-audit/scripts/audit_report.py already had.
