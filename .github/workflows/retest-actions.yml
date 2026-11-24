@@ -1,7 +1,8 @@
 name: Retest Actions Checks
 
 # `/retest` on a pull request re-runs its failed GitHub Actions checks, and
-# cancels and re-runs the runs GitHub left stuck in `queued`. GitHub
+# cancels and re-runs the runs GitHub left stuck in `queued` (or, for a run
+# GitHub lost before queueing it, comments that a reopen is needed). GitHub
 # lets Write and above re-run a workflow and most collaborators here hold
 # Triage, so a flaked check on someone else's pull request waited for an admin;
 # Prow's `/retest` re-runs only Prow jobs. The same comment still reaches Prow,

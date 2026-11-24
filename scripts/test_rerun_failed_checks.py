@@ -144,7 +144,10 @@ class FakeAPI(rfc.GitHubAPI):
         if path in self.failing:
             raise urllib.error.HTTPError(path, 502, "Bad Gateway", {}, io.BytesIO(b""))
         if path in self.refusing:
-            raise urllib.error.HTTPError(path, 403, "Forbidden", {}, io.BytesIO(self.refusal_body))
+            # A dict gives each refused path its own body; a lost run's force-cancel can be refused
+            # for a different reason than its cancel.
+            body = self.refusal_body.get(path, b"") if isinstance(self.refusal_body, dict) else self.refusal_body
+            raise urllib.error.HTTPError(path, 403, "Forbidden", {}, io.BytesIO(body))
         self.posts.append((path, payload))
         matched = re.search(r"/actions/runs/(\d+)/([a-z-]+)$", path)
         if matched and matched.group(2) in self.finishes_on:
@@ -749,9 +752,37 @@ class MainTest(unittest.TestCase):
         ((path, payload),) = [(path, payload) for path, payload in api.posts if path == self.COMMENTS_PATH]
         self.assertIn(rfc.LOST_RUN_ADVICE, payload["body"])
         self.assertIn("Python Unit Tests (run 1", payload["body"])
-        self.assertIn("Merge Gate (run 2", payload["body"])
+        # Run 2 is superseded by a green run of its workflow: it carries no check, so no reopen is advised for it.
+        self.assertNotIn("Merge Gate", payload["body"])
         self.assertEqual(rfc.REACTION_DECLINED, api.posts[-1][1]["content"])
         self.assertIn("GitHub lost Python Unit Tests (run 1", out)
+        self.assertIn("GitHub lost Merge Gate (run 2", out)
+
+    def test_a_lost_run_that_is_only_superseded_gets_no_reopen_advice(self):
+        """After a reopen the old lost run is superseded; a later /retest must not repeat the advice."""
+        api = FakeAPI(
+            runs=[run(1, None, 10, status="queued", created=LONG_AGO), run(2, "success", 20)],
+            checks=[check(2, "Python Unit Tests", "success", 20)],
+            refusing=self.cancel_paths(1),
+            refusal_body=self.NOT_YET_QUEUED,
+        )
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual([], [path for path, _ in api.posts if path == self.COMMENTS_PATH])
+        self.assertIn("GitHub lost Python Unit Tests (run 1", out)
+
+    def test_a_force_cancel_refused_as_not_queued_after_another_cancel_refusal_is_still_lost(self):
+        cancel, force = "/repos/gke-labs/kube-agents/actions/runs/1/cancel", "/repos/gke-labs/kube-agents/actions/runs/1/force-cancel"
+        api = self.stuck_api(
+            refusing={cancel, force},
+            refusal_body={cancel: b'{"message": "Something else went wrong."}', force: self.NOT_YET_QUEUED},
+        )
+        with mock.patch.object(rfc, "CANCEL_SETTLE_SECONDS", 0):
+            code, out, err = self.run_stuck(api)
+        self.assertEqual(1, code)
+        self.assertNotIn(("/repos/gke-labs/kube-agents/actions/runs/1/rerun", None), api.posts)
+        ((path, payload),) = [(path, payload) for path, payload in api.posts if path == self.COMMENTS_PATH]
+        self.assertIn("Python Unit Tests (run 1", payload["body"])
 
     def test_a_lost_run_beside_one_that_cancels_is_the_only_one_named_and_the_other_is_still_cleared(self):
         api = self.stuck_api(refusing=self.cancel_paths(1), refusal_body=self.NOT_YET_QUEUED)

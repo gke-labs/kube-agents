@@ -57,8 +57,9 @@ stuck run is cancelled and not re-run; left queued, it would read as still
 going and hold back a re-run of the newer one. It is left alone when another
 run of its workflow is going, and at the attempt ceiling. A run GitHub lost
 before queueing it refuses every cancel ("has not been queued yet") and so can
-be neither cancelled nor re-run: the command stops on that answer and comments
-on the pull request that closing and reopening it starts fresh runs.
+be neither cancelled nor re-run: the command stops on that answer and, for a
+lost run that is still the newest of its workflow, comments on the pull request
+that closing and reopening it starts fresh runs.
 
 A re-run executes the original run again, with the privileges of the actor
 who first triggered it, so the person typing the command gains no ability to
@@ -168,10 +169,14 @@ NOT_YET_QUEUED_REFUSAL = "has not been queued yet"
 LOST = "lost"
 # What a lost run's pull request is told. Only a new event on the pull request
 # starts fresh runs at the same head, and one this job's token causes starts
-# none, so the author has to make it.
+# none, so the author has to make it. A reopen is not free, so the advice says
+# what it re-runs. Only a lost run that is still the newest of its workflow is
+# advised on: a superseded one carries no check, and after the reopen every
+# lost run is superseded, so a later /retest does not repeat the advice.
 LOST_RUN_ADVICE = (
     "GitHub lost these runs before queueing them, so they can be neither cancelled nor re-run. "
-    "Close and reopen this pull request to start fresh runs: that keeps its approvals and needs no push."
+    "Close and reopen this pull request to start fresh runs: that keeps its approvals and needs no push, "
+    "but it re-runs every check that runs on a reopen and starts a fresh automated review."
 )
 # GitHub's timestamps end in `Z`, which `fromisoformat` reads only from 3.11.
 UTC_SUFFIX, UTC_OFFSET = "Z", "+00:00"
@@ -649,7 +654,8 @@ def main(argv=None):
             if outcome[run["id"]] == LOST:
                 log(f"Lost {describe_stuck(run)}: GitHub cannot cancel it before it is queued")
                 noted.append(f"GitHub lost {describe_stuck(run)}: it can be neither cancelled nor re-run")
-                lost.append(run)
+                if run in stuck:
+                    lost.append(run)
         for run in superseded:
             if outcome[run["id"]] == LOST:
                 continue
