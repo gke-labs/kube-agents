@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -19,10 +20,12 @@ func seedWaitingChild(t *testing.T, r *rig, conv, taskID, msgID, tier, backend s
 		Key: conv, ContextID: "ctx-" + taskID, Kind: "group", LastActivity: time.Now().UTC(),
 		BusSession: "chat-otter-1", Addressee: "chat-otter-1",
 		ActiveTask: &ActiveTask{TaskID: taskID, CorrelationID: "corr-" + taskID,
-			Ask: "check the cluster", SubmittedAt: time.Now().Add(-age), StatusMsgID: msgID},
+			Ask: "check the cluster", SubmittedAt: time.Now().Add(-age), StatusMsgID: msgID,
+			LineNote: fmt.Sprintf(delegatedProfileLineNote, "cluster")},
 		Tasks: []TaskRef{
 			{ID: parent, Addressee: "chat-otter-1", Requester: &TaskRequester{Backend: backend, Subject: "s"}},
-			{ID: taskID, Addressee: "cluster", Tier: tier, Role: taskRoleChild, ParentTaskID: parent},
+			{ID: taskID, Addressee: "cluster", Tier: tier, Role: taskRoleChild, ParentTaskID: parent,
+				StartedAt: time.Now().Add(-age).UTC()},
 		},
 	}
 	if err := r.g.reg.Put(context.Background(), rec); err != nil {
@@ -77,6 +80,9 @@ func TestAWaitingChildsLineSaysItsWaiting(t *testing.T) {
 	got := waitingEdits(r.adapter, "msg-old")
 	if len(got) != 1 || !strings.Contains(got[0], "the cluster agent hasn't started on this yet") || !strings.Contains(got[0], "1 other request sent through me") {
 		t.Fatalf("waiting edits = %q, want one naming cluster and the 1 other (young) child", got)
+	}
+	if strings.Contains(got[0], "delegated to") {
+		t.Fatalf("the line repeats the delegation note: %q", got[0])
 	}
 	if _, err := r.client.TasksGet(ctx, "cluster", "task-old"); !isTaskNotFound(err) {
 		t.Fatalf("the notice put something on the task's stream: %v", err)
@@ -143,20 +149,26 @@ func TestTheGraceClosesAWaitingLineInPlace(t *testing.T) {
 	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
-	seedWaitingChild(t, r, "discord:g1/grace", "task-grace", "msg-grace", "read", "discord", defaultFirstEventGrace+time.Minute)
-	r.g.reapOnce(ctx)
+	seedWaitingChild(t, r, "discord:g1/grace", "task-grace", "msg-grace", "read", "discord", waitingNoticeAfter+10*time.Second)
+	r.g.reapOnce(ctx) // the waiting notice
+	rec, _ := r.g.reg.Get(ctx, "discord:g1/grace")
+	rec.ActiveTask.SubmittedAt = time.Now().Add(-(defaultFirstEventGrace + time.Minute))
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.reapOnce(ctx) // the grace
 	edits := r.adapter.editsOf("msg-grace")
 	if len(edits) < 2 {
 		t.Fatalf("edits = %q, want the waiting notice then the closing line", edits)
 	}
 	last := edits[len(edits)-1]
-	if strings.Contains(last, "⏳") || !strings.Contains(last, "**didn't start**") || !strings.Contains(last, "ask again to start a new request") || !strings.Contains(last, "minutes") {
+	if strings.Contains(last, "⏳") || strings.Contains(last, "delegated to") || !strings.Contains(last, "**didn't start**") || !strings.Contains(last, "ask again to start a new request") || !strings.Contains(last, "minutes") {
 		t.Fatalf("closing line = %q", last)
 	}
 	if got := noticePosts(r.adapter, "task-grace"); len(got) != 0 {
 		t.Fatalf("the grace posted its notice as well: %q", got)
 	}
-	rec, _ := r.g.reg.Get(ctx, "discord:g1/grace")
+	rec, _ = r.g.reg.Get(ctx, "discord:g1/grace")
 	if rec.ActiveTask.NoFirstEventNoticeAt.IsZero() {
 		t.Fatal("the grace marker wasn't set: the grace must run as before")
 	}
@@ -192,9 +204,10 @@ func TestTheWaitingCountReadsTheStreamAndCountsBatchChildren(t *testing.T) {
 		BusSession: "chat-otter-1", Addressee: "chat-otter-1",
 		Tasks: []TaskRef{
 			{ID: "batch-parent", Addressee: "chat-otter-1", Requester: &TaskRequester{Backend: "discord", Subject: "s"}},
-			{ID: "batch-0", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent"},
+			{ID: "batch-0", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent",
+				StartedAt: time.Now().Add(-time.Minute).UTC()},
 			{ID: "batch-1", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent",
-				BatchEnd: &BatchEnd{}},
+				StartedAt: time.Now().Add(-time.Minute).UTC(), BatchEnd: &BatchEnd{}},
 		},
 	}
 	if err := r.g.reg.Put(ctx, batch); err != nil {
@@ -211,7 +224,7 @@ func TestTheWaitingCountReadsTheStreamAndCountsBatchChildren(t *testing.T) {
 }
 
 // One count per profile and tier per pass, however many children ask.
-func TestTheWaitingCountIsReadOncePerPass(t *testing.T) {
+func TestTheWaitingCountIsCachedForThePass(t *testing.T) {
 	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
@@ -236,5 +249,82 @@ func TestTheWaitingCountIsReadOncePerPass(t *testing.T) {
 	r.g.mu.Unlock()
 	if n != 3 {
 		t.Fatalf("next pass count = %d, want 3", n)
+	}
+}
+
+// A child past its grace with an empty stream isn't waiting: it never
+// started and was released, or its events aged out of the stream. Nor is
+// an entry with no submission time. Neither is counted.
+func TestTheWaitingCountLeavesOutChildrenPastTheirGrace(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	seedWaitingChild(t, r, "discord:g1/past-me", "task-past-me", "msg-past-me", "read", "discord", waitingNoticeAfter+10*time.Second)
+	old := &SessionRecord{
+		Key: "discord:g1/past-old", ContextID: "ctx-past-old", Kind: "group", LastActivity: time.Now().UTC(),
+		BusSession: "chat-otter-1", Addressee: "chat-otter-1",
+		Tasks: []TaskRef{
+			{ID: "old-parent", Addressee: "chat-otter-1", Requester: &TaskRequester{Backend: "discord", Subject: "s"}},
+			{ID: "old-child", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "old-parent",
+				StartedAt: time.Now().Add(-4 * 24 * time.Hour).UTC()},
+			{ID: "undated-child", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "old-parent"},
+		},
+	}
+	if err := r.g.reg.Put(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	r.g.reapOnce(ctx)
+	got := waitingEdits(r.adapter, "msg-past-me")
+	if len(got) != 1 || strings.Contains(got[0], "other request") {
+		t.Fatalf("edits = %q, want one notice counting no others", got)
+	}
+}
+
+// A restart drops the relay's render state; a child still waiting gets the
+// notice anyway, and its line is still closed in place at the grace.
+func TestTheWaitingNoticeAndItsCloseSurviveARestart(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	seedWaitingChild(t, r, "discord:g1/restart", "task-restart", "msg-restart", "read", "discord", waitingNoticeAfter+10*time.Second)
+	r.g.mu.Lock()
+	delete(r.g.relays, "task-restart")
+	r.g.mu.Unlock()
+	r.g.reapOnce(ctx)
+	if got := waitingEdits(r.adapter, "msg-restart"); len(got) != 1 {
+		t.Fatalf("edits after a restart = %q, want the notice", got)
+	}
+	// Restart again, then let the grace pass.
+	rec, _ := r.g.reg.Get(ctx, "discord:g1/restart")
+	rec.ActiveTask.SubmittedAt = time.Now().Add(-(defaultFirstEventGrace + time.Minute))
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.mu.Lock()
+	delete(r.g.relays, "task-restart")
+	r.g.mu.Unlock()
+	r.g.reapOnce(ctx)
+	edits := r.adapter.editsOf("msg-restart")
+	if last := edits[len(edits)-1]; !strings.Contains(last, "**didn't start**") {
+		t.Fatalf("closing line after a restart = %q", last)
+	}
+	if got := noticePosts(r.adapter, "task-restart"); len(got) != 0 {
+		t.Fatalf("the grace posted its notice as well: %q", got)
+	}
+}
+
+// A child already past the grace when first seen (a gateway down across it)
+// gets no waiting notice, and so the grace's own post, as before.
+func TestAChildPastTheGraceGetsNoWaitingNotice(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	seedWaitingChild(t, r, "discord:g1/late", "task-late", "msg-late", "read", "discord", defaultFirstEventGrace+time.Minute)
+	r.g.reapOnce(ctx)
+	if got := waitingEdits(r.adapter, "msg-late"); len(got) != 0 {
+		t.Fatalf("a child past the grace got the waiting notice: %q", got)
+	}
+	if got := noticePosts(r.adapter, "task-late"); len(got) != 1 {
+		t.Fatalf("grace posts = %q, want the grace's own post", got)
 	}
 }

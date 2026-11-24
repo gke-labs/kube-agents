@@ -94,12 +94,31 @@ func waitingChild(rec *SessionRecord) (TaskRef, bool) {
 // lineStillWaiting reports whether taskID's line is still at submitted, by
 // the relay's render state (lineStillSubmitted). It reads relayState.state,
 // which the relay writes under the conversation's session lock, so callers
-// hold that lock.
+// hold that lock. Callers have just read the task's stream empty, so a task
+// with no render state is one a restart dropped it for, and still at
+// submitted: its state is created as the relay creates it (relayFor), so
+// the notice and the close at the grace survive a gateway restart.
 func (g *Gateway) lineStillWaiting(taskID string) (*relayState, bool) {
-	g.mu.Lock()
-	rs := g.relays[taskID]
-	g.mu.Unlock()
+	rs := g.relayFor(taskID)
 	return rs, lineStillSubmitted(rs)
+}
+
+// childCountable reports whether a child entry may still be waiting by its
+// age: inside its grace (FirstEventGrace, or batchChildGrace for a fan-out
+// child the dispatcher may hold queued) from its submission. Past it, an
+// empty stream is a child that never started and was released, or one whose
+// events have aged out of the stream, not one waiting; an entry with no
+// submission time has no age to judge. It is checked before the stream is
+// read, so old history costs no read.
+func (g *Gateway) childCountable(rec *SessionRecord, ref TaskRef, now time.Time) bool {
+	if ref.StartedAt.IsZero() {
+		return false
+	}
+	grace := g.cfg.FirstEventGrace
+	if rec.fanOutChild(ref) {
+		grace = g.batchChildGrace(ref)
+	}
+	return now.Sub(ref.StartedAt) <= grace
 }
 
 // childNotStarted reports whether a child's event stream is still empty,
@@ -112,7 +131,8 @@ func (g *Gateway) childNotStarted(ctx context.Context, rec *SessionRecord, strea
 
 // waitingChildren counts this gateway's delegated children for addressee at
 // tier that haven't started: every child task on a session record, a single
-// child or a batch's, not cancelled or ended, whose stream is still empty.
+// child or a batch's, not cancelled or ended, inside its grace
+// (childCountable), whose stream is still empty.
 // One count per (addressee, tier) per reap pass (waitingPass), however many
 // waiting children ask. A count that fails returns the error.
 func (g *Gateway) waitingChildren(ctx context.Context, addressee, tier string) (int, error) {
@@ -130,10 +150,11 @@ func (g *Gateway) waitingChildren(ctx context.Context, addressee, tier string) (
 		return 0, err
 	}
 	n := 0
+	now := time.Now()
 	err = g.reg.eachSessionRecord(ctx, func(rec *SessionRecord) {
 		for _, ref := range rec.Tasks {
 			if ref.Role != taskRoleChild || ref.Addressee != addressee || ref.Tier != tier ||
-				ref.Canceled || ref.TerminalObserved || ref.BatchEnd != nil {
+				ref.Canceled || ref.TerminalObserved || ref.BatchEnd != nil || !g.childCountable(rec, ref, now) {
 				continue
 			}
 			if g.childNotStarted(ctx, rec, stream, ref) {
@@ -170,7 +191,9 @@ func (g *Gateway) noticeChildWaiting(ctx context.Context, rec *SessionRecord) {
 		return
 	}
 	active := rec.ActiveTask
-	if active.SubmittedAt.IsZero() || time.Since(active.SubmittedAt) < waitingNoticeAfter {
+	// From waitingNoticeAfter to the grace: past the grace the line is the
+	// grace's to close (closeWaitingLine), or, past its ceiling, left alone.
+	if age := time.Since(active.SubmittedAt); active.SubmittedAt.IsZero() || age < waitingNoticeAfter || age > g.cfg.FirstEventGrace {
 		return
 	}
 	stream, err := g.tasksStream(ctx)
@@ -195,11 +218,15 @@ func (g *Gateway) noticeChildWaiting(ctx context.Context, rec *SessionRecord) {
 		return
 	}
 	cur := fresh.ActiveTask
-	if !cur.WaitingNoticeAt.IsZero() && cur.WaitingNoticeOthers == others {
-		return
-	}
 	rs, still := g.lineStillWaiting(cur.TaskID)
 	if !still {
+		return
+	}
+	// The line names the agent, so the delegation note the relay appends
+	// (LineNote, "(delegated to …)") would only repeat it; the relay's next
+	// render past submitted puts the note back.
+	line := waitingNotice(ref.Addressee, others)
+	if !cur.WaitingNoticeAt.IsZero() && cur.WaitingNoticeOthers == others && rs.lastLine == line {
 		return
 	}
 	// The record first: a line edited with no record of it would be left
@@ -213,7 +240,6 @@ func (g *Gateway) noticeChildWaiting(ctx context.Context, rec *SessionRecord) {
 		g.log.Error("waiting notice: record write failed", "conversation", fresh.Key, "err", err)
 		return
 	}
-	line := withLineNote(waitingNotice(ref.Addressee, others), cur.LineNote)
 	if !g.editLine(fresh.Key, cur.StatusMsgID, line, cur.TaskID) {
 		return
 	}
@@ -231,7 +257,7 @@ func (g *Gateway) noticeChildWaiting(ctx context.Context, rec *SessionRecord) {
 // The caller holds the session lock.
 func (g *Gateway) closeWaitingLine(rec *SessionRecord) bool {
 	active := rec.ActiveTask
-	if active == nil || active.WaitingNoticeAt.IsZero() || active.StatusMsgID == "" {
+	if active == nil || active.WaitingNoticeAt.IsZero() || active.StatusMsgID == "" || active.Detached || active.LineClosed {
 		return false
 	}
 	ref, ok := rec.TaskRefFor(active.TaskID)
@@ -242,7 +268,7 @@ func (g *Gateway) closeWaitingLine(rec *SessionRecord) bool {
 	if !still {
 		return false
 	}
-	line := withLineNote(fmt.Sprintf(stillWaitingNotice, ref.Addressee, graceWords(g.cfg.FirstEventGrace)), active.LineNote)
+	line := fmt.Sprintf(stillWaitingNotice, ref.Addressee, graceWords(g.cfg.FirstEventGrace))
 	if !g.editLine(rec.Key, active.StatusMsgID, line, active.TaskID) {
 		return false
 	}
