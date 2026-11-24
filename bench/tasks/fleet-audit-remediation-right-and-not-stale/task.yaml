@@ -36,10 +36,12 @@
 # What the case does not cover: a command for another cluster of the same
 # name (the command's project and location are not graded), and a wrong
 # command that this run wrote itself and that the four checks do not name.
-# Two limits of the command check: the cluster's name is matched as a whole
-# word anywhere on the command line, and the line must open with `gcloud
+# Three limits of the command check. The cluster's name is matched as a whole
+# word anywhere on the command line. The line must open with `gcloud
 # container clusters update`, so a flag before `container` is not read as the
-# command.
+# command. And a name in quotes is red when the placeholder on the same line
+# holds an apostrophe: that line is split on spaces, and the quotes stay on
+# the name.
 #
 # THE CONTROL is a case of its own, fleet-audit-wrong-kept-remediation-gives-way:
 # the same stack with `planted_remediation: gcloud-same` plants the command on
@@ -141,10 +143,11 @@ verification_spec:
         id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
         forbidden_text: ["stale-remedy-7b2e"]
         planted_mark: "stale-remedy-7b2e"
-  # Nothing of the previous run is kept. A content rule of `finish` drops the
-  # planted command also when `finish` keeps the planted wording by mistake,
-  # so the check above alone would pass on that mistake. A kept title holds
-  # the mark.
+  # The title holds nothing of the previous run. A content rule of `finish`
+  # drops the planted command also when `finish` keeps the planted wording by
+  # mistake, so the check above alone would pass on that mistake. A kept title
+  # holds the mark. The impact, which `finish` keeps with the title, is not
+  # read.
   - name: the-title-is-not-the-previous-runs
     role: objective
     mode: assert

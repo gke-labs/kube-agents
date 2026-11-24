@@ -386,9 +386,17 @@ class StackWiringTest(unittest.TestCase):
     def test_the_stack_passes_the_mark_the_state_and_the_collector_arguments_to_the_plant(self):
         main = (self._STACK / "main.tf").read_text(encoding="utf-8")
         plant = _load_plant()
-        # The plant's `main` reads: verb, scripts directory, mark, state.
-        self.assertIn('python3 - "$1" "${local.scripts_dir}" "${var.mark}" "${var.planted_remediation}"', main)
-        self.assertIn(f'{plant.COLLECTOR_ARGS_ENV}="${{var.collector_args}}"', main)
+        # The stack calls the plant's program in two places: the function that
+        # plants (and removes when an apply fails), and the removal at destroy
+        # time. A third call, for example one that plants with no state, fails
+        # here. The plant's `main` reads: verb, scripts directory, mark, state.
+        calls = [line.strip() for line in main.splitlines() if "python3 - " in line]
+        self.assertEqual(len(calls), 2, calls)
+        plants, removes = calls
+        self.assertIn('python3 - "$1" "${local.scripts_dir}" "${var.mark}" "${var.planted_remediation}"', plants)
+        self.assertIn(f'{plant.COLLECTOR_ARGS_ENV}="${{var.collector_args}}"', plants)
+        self.assertIn("python3 - teardown ", removes)
+        self.assertEqual(main.count("plant_store plant"), 1)
 
     def test_the_stacks_defaults_are_the_plants(self):
         variables = (self._STACK / "variables.tf").read_text(encoding="utf-8")

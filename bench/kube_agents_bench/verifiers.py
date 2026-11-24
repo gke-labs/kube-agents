@@ -10083,7 +10083,8 @@ class StoredFindingCheck(BaseModel):
     in the finding's ``recommendation`` or ``remediation``. ``title_contains``
     must each occur in its ``title``: the witness that ``finish`` kept a
     planted run's wording for this finding. ``title_lacks`` must each be
-    absent from it: nothing of a planted run's wording was kept. ``planted_mark`` is
+    absent from it: the title holds nothing of a planted run's wording (the
+    impact, which ``finish`` keeps with the title, is not read). ``planted_mark`` is
     the mark of a previous run the case's stack planted: when no envelope of
     the store holds it, the plant is gone and the check is an error, not a pass.
     """
