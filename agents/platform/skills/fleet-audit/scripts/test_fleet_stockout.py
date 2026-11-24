@@ -1906,6 +1906,20 @@ class AutoscalerVisibilityTest(unittest.TestCase):
                 self.assertEqual(hit["impact"], fs.RESERVATION_NOT_FOUND_IMPACT)
                 self.assertEqual(hit["needs_triage"], fs.RESERVED_POOL_TRIAGE)
 
+    def test_the_procedure_names_each_id_that_the_collector_counts(self):
+        """The procedure's `Flag when` line and its remediation branches, held
+        in step with the collector's set: an id that the collector files and
+        the procedure does not name has no remediation to state."""
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split("(`autoscaler-out-of-resources`)")[1].split("\n#### ")[0]
+        flag_line = next(line for line in section.splitlines() if line.startswith("- **Flag when:**"))
+        branches = [line for line in section.splitlines() if line.startswith("  - `scale.up.error.")]
+        for message_id in sorted(fs.AUTOSCALER_STOCKOUT_MESSAGE_IDS):
+            with self.subTest(message_id=message_id):
+                self.assertIn(f"`{message_id}`", flag_line)
+                self.assertEqual(len([line for line in branches if line.startswith(f"  - `{message_id}`:")]), 1)
+        self.assertEqual(len(branches), len(fs.AUTOSCALER_STOCKOUT_MESSAGE_IDS))
+
     def test_the_other_ids_keep_the_check_s_own_impact(self):
         [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([ERROR_MSG_ENTRY]))
         self.assertNotIn("impact", hit)
