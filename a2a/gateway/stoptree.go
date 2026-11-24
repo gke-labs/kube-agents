@@ -184,6 +184,16 @@ func (g *Gateway) cancelOrphanedChildren(ctx context.Context, rec *SessionRecord
 		if g.liveNode(ctx, rec, ref) {
 			g.cancelTreeNode(ctx, rec, ref, authority, true)
 			cancelled++
+			// A single child holds the conversation as its active task.
+			// Cancelled here, it's detached as a stop detaches it
+			// (cancelTaskVoiced): the conversation no longer serializes
+			// on a task the gateway itself cancelled, and the next turn
+			// starts a new task rather than steering into it.
+			if active := rec.ActiveTask; active != nil && active.TaskID == ref.ID && !active.Detached {
+				active.Detached = true
+				g.log.Info("an ended profile task's single child held the conversation; detached it as a stop does",
+					"parent", parentID, "taskId", ref.ID, "conversation", rec.Key)
+			}
 		}
 	}
 	if cancelled > 0 {
