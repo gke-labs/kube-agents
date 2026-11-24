@@ -358,6 +358,8 @@ readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
+# A first-run audit's pause comes after one more read of the roster and the
+# runs' ledger, bounded at 10s by the ledger's busy timeout.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
