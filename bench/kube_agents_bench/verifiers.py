@@ -1750,6 +1750,8 @@ class AnswerFirstVerifier(BaseVerifier):
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
 _TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
 _wrapped_tool_names = worker_trajectory.wrapped_tool_names
+# The wrapper's own top-level arguments, as Hermes reads them.
+_WRAPPER_OWN_ARGS = frozenset({"name", "arguments", "calls"})
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -1898,7 +1900,11 @@ class ToolCalledVerifier(BaseVerifier):
     A name in ``tool_names`` therefore also matches a ``tool_call`` entry
     whose wrapped name or ``calls`` list names it, else a worker's MCP calls
     would be invisible to this check by name. One wrapper entry counts once
-    however many of its calls match; ``require_success`` reads the wrapper's status.
+    however many of its calls match; ``require_success`` reads the wrapper's status,
+    which the pod takes on the tool's answer inside Hermes' ``<untrusted_tool_result>``
+    envelope (``worker_trajectory``'s ``failed``). The pod reads a worker wrapper's
+    names before it clips the arguments and records them on the entry, so a wrapper
+    too long to parse is still counted by name.
 
     ``agent``: optional Python regular expression. When set, only trajectory
     entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful
@@ -2016,7 +2022,13 @@ class ToolCalledVerifier(BaseVerifier):
                 if re.fullmatch(pattern, str(args[name])) is None:
                     return False
                 continue
-            if not clipped:
+            # A wrapper the pod named (`wrapped`) is counted by name though its
+            # arguments were clipped. Its own arguments are the wrapped call's
+            # name and arguments, which this filter does not read through, so
+            # an argument that is not one of the wrapper's own rules the call
+            # out as it does for a wrapper that fits, and as it did before the
+            # pod named it. One of its own that the clip cut is undecided.
+            if not clipped or (worker_trajectory.WRAPPED_NAMES_KEY in entry and name not in _WRAPPER_OWN_ARGS):
                 return False
             undecided = True
         return None if undecided else True
@@ -3089,7 +3101,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     row of such a call is read, and so is each row of a capture whose rows
     name no card. A result that only quotes the refusal words matches too.
 
-    ``after_result_pattern`` makes the forbidden set order-aware, for a
+    ``after_result_pattern`` makes the forbidden patterns order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
     refused one, and a pattern over write verbs alone flags the honest attempt
     that met the refusal. The commands then come from the workers' tagged
@@ -3819,11 +3831,14 @@ class WorkerBudgetVerifier(BaseVerifier):
     and no completed attempt either (the harness archived the card at its
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
-    A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches; a capture in which every result was
-    withheld or never recorded is unreadable, and with nothing named it is
-    ``status="error"`` too, while a single missing result among readable ones
-    does not turn a plain failure into one.
+    A notice in the part of a result that the capture's clip dropped is not
+    read: the clip keeps a result's head and its last
+    ``worker_trajectory.RESULT_TAIL_CHARS`` characters, where an appended
+    notice is, and a card of short tool outputs never reaches the clip; a
+    capture in which every result was withheld or never recorded is
+    unreadable, and with nothing named it is ``status="error"`` too, while a
+    single missing result among readable ones does not turn a plain failure
+    into one.
     """
 
     type: Literal["worker_budget"]
@@ -9915,21 +9930,32 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_state_file(shell: Callable[[str, float], str], path: str, timeout: float) -> dict[str, Any] | None:
+    """The JSON object a stack recorded at ``path`` in the pod ``shell`` reaches, or None when there is none."""
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def fired_at_of(state: dict[str, Any] | None) -> datetime | None:
+    """A stack state's ``fired_at``, or None when it has none that is an aware ISO-8601 stamp."""
+    try:
+        fired = datetime.fromisoformat(str((state or {})["fired_at"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+    return fired if fired.tzinfo is not None else None
+
+
 def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
     """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
 
     Missing file, not JSON, no ``fired_at``, or one that is not an aware
     ISO-8601 stamp all read as None: the stack did not fire the run.
     """
-    reply = shell(f"cat {shlex.quote(path)}", timeout)
-    try:
-        state = json.loads(reply.strip().splitlines()[-1])
-        fired = datetime.fromisoformat(str(state["fired_at"]))
-    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if fired.tzinfo is None:
-        return None
-    return fired
+    return fired_at_of(read_state_file(shell, path, timeout))
 
 
 def read_report_store(
@@ -9947,61 +9973,68 @@ def read_report_store(
     return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
 
 
-@VERIFIERS.register("audit_report_stored")
-class AuditReportStoredVerifier(_OnboardingPollVerifier):
-    """Checks that a fleet audit kept this run's report in the on-pod report store.
+class _StoredReportVerifier(_OnboardingPollVerifier):
+    """What ``audit_report_stored`` and ``shadow_report_stored`` share: one stream's store read and its grading.
 
-    Reads ``latest.json`` under every repository directory of ``audit`` in the
-    store, in the shell sandbox first and then in the agent container: the
-    store is on whichever pod ran the audit's shell. Passes when one envelope
-    finished at or after the run started (``TranscriptSnapshot.started_at``
-    less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
-    ``fired_at`` a case's stack recorded in that file in the agent container,
-    for a scheduled run the stack fired and waited out before the turn), and,
-    when it records its run's start (``started_at``), whose run opened at or
-    after that same bound -- a run from an earlier repetition can finish inside
-    this one; an envelope with the key and no start is such a run, and one
-    from an older image, with no key, is read by ``finished_at`` alone -- has
-    ``status`` when the check names one, has
-    each ``required_envelope`` key equal to the value given (a top-level key of
-    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), has, for each ``required_finding_phrases`` entry, a finding
-    in its ``document`` whose id contains it, and has no finding whose id
-    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
-    that plants a look-alike the check must leave alone), and, for each
-    ``required_evidence_phrases`` entry, a finding whose id contains a
-    ``required_finding_phrases`` entry and whose ``evidence.excerpt`` contains
-    it: what the collector observed and ``finish`` published, read where it was
-    stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
-    also carries ids a run held without finding them.
-
-    No envelope from this run is a fail: the audit published nothing where the
-    store's readers look. A pod that cannot be read, or a run with no start
-    time, is ``status="error"``.
+    A subclass names the stream (``_stream``), the pods whose report store it
+    reads (``_store_shells``, with ``_store_where`` naming them for a reason),
+    the pod holding ``since_state_file`` (``_state_shell``), and any envelope
+    keys it holds every envelope to beyond ``required_envelope``
+    (``_forced_envelope``). The window, the start bound and the finding and
+    evidence rules are the same for both; :class:`AuditReportStoredVerifier`
+    documents them.
     """
 
-    type: Literal["audit_report_stored"]
-    audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
     forbidden_finding_phrases: list[str] = Field(default_factory=list)
     required_evidence_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
-    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
-    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
+    # A JSON file whose ``fired_at`` (ISO-8601, as the audit-chat-report,
+    # unchanged-manifest-digest and builtin-schedule-run-now stacks write it)
     # replaces the run's start as the lower bound, with no skew allowance: the
-    # fire and the envelope are stamped by the same pod. Unreadable is an error.
+    # fire and the envelope are stamped by the same install. Unreadable is an error.
     since_state_file: str | None = None
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
     @model_validator(mode="after")
-    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
+    def _evidence_names_its_findings(self) -> "_StoredReportVerifier":
         if self.required_evidence_phrases and not self.required_finding_phrases:
             raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
         return self
+
+    def _stream(self) -> str:
+        raise NotImplementedError
+
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        raise NotImplementedError
+
+    def _store_where(self) -> str:
+        raise NotImplementedError
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        raise NotImplementedError
+
+    def _forced_envelope(self) -> dict[str, Any]:
+        return {}
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """One pod's envelopes of ``stream``, or None and why not: the store tree, read directly.
+
+        ``state`` is the stack's state file, read once for the poll (None without one).
+        """
+        return read_report_store(shell, stream, timeout, keys, excerpts), None
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         snap = transcript.get()
@@ -10012,23 +10045,32 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
             seconds=self.max_clock_skew_sec
         )
+        state = None
         if self.since_state_file:
-            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
+            # Read once per poll; _read_listing gets the same object.
+            state = read_state_file(self._state_shell(), self.since_state_file, read_timeout)
+            fired = fired_at_of(state)
             if fired is None:
                 return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
-            # No skew: the fire and the envelope are stamped by the same pod.
+            # No skew: the fire and the envelope are stamped by the same install.
             since = fired
+        stream = self._stream()
+        expected = {**self.required_envelope, **self._forced_envelope()}
         envelopes: list[dict[str, Any]] = []
         read_any = False
-        for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(
-                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
+        unread: list[str] = []
+        for shell in self._store_shells():
+            listing, why = self._read_listing(
+                shell, stream, read_timeout, tuple(expected), bool(self.required_evidence_phrases), state
             )
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
+            elif why:
+                unread.append(why)
         if not read_any:
-            return "error", "neither the sandbox nor the agent container could be read", None
+            detail = f": {'; '.join(unread)}" if unread else ""
+            return "error", f"{self._store_where()} could not be read{detail}", None
         fresh = []
         started_early = 0
         for envelope in envelopes:
@@ -10059,7 +10101,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                     started_early += 1
                     continue
             fresh.append(envelope)
-        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *self.required_envelope)
+        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *expected)
         raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
         if not fresh:
             window = "the stack fired the audit" if self.since_state_file else "the run started"
@@ -10068,10 +10110,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 if started_early
                 else ""
             )
+            errors = [str(e["error"]) for e in envelopes if e.get("error")]
+            said = f"; unread: {'; '.join(errors)}" if errors else ""
             return (
                 "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since {window} "
-                f"({len(envelopes) - started_early} older or unreadable{early})",
+                f"no {stream} report in {REPORT_STORE_ROOT} finished since {window} "
+                f"({len(envelopes) - started_early} older or unreadable{early}){said}",
                 raw,
             )
         failures = []
@@ -10082,13 +10126,13 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             excerpts = envelope.get("finding_excerpts") or {}
             matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
             unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
-            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
+            wrong = {key: envelope.get(key) for key, value in expected.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
             elif wrong:
                 failures.append(
                     f"{envelope.get('repo')}: "
-                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
+                    + ", ".join(f"{key} is {actual!r}, not {expected[key]!r}" for key, actual in wrong.items())
                 )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
@@ -10099,3 +10143,54 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw
+
+
+@VERIFIERS.register("audit_report_stored")
+class AuditReportStoredVerifier(_StoredReportVerifier):
+    """Checks that a fleet audit kept this run's report in the on-pod report store.
+
+    Reads ``latest.json`` under every repository directory of ``audit`` in the
+    store, in the shell sandbox first and then in the agent container: the
+    store is on whichever pod ran the audit's shell. Passes when one envelope
+    finished at or after the run started (``TranscriptSnapshot.started_at``
+    less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
+    ``fired_at`` a case's stack recorded in that file in the agent container,
+    for a scheduled run the stack fired and waited out before the turn), and,
+    when it records its run's start (``started_at``), whose run opened at or
+    after that same bound -- a run from an earlier repetition can finish inside
+    this one; an envelope with the key and no start is such a run, and one
+    from an older image, with no key, is read by ``finished_at`` alone -- has
+    ``status`` when the check names one, has
+    each ``required_envelope`` key equal to the value given (a top-level key of
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``,
+    which fails any other value and meets a required ``null``), has, for each
+    ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it, and has no finding whose id
+    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
+    that plants a look-alike the check must leave alone), and, for each
+    ``required_evidence_phrases`` entry, a finding whose id contains a
+    ``required_finding_phrases`` entry and whose ``evidence.excerpt`` contains
+    it: what the collector observed and ``finish`` published, read where it was
+    stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
+    also carries ids a run held without finding them.
+
+    No envelope from this run is a fail: the audit published nothing where the
+    store's readers look. A pod that cannot be read, or a run with no start
+    time, is ``status="error"``.
+    """
+
+    type: Literal["audit_report_stored"]
+    audit: AuditId
+
+    def _stream(self) -> str:
+        return self.audit
+
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        # Looked up on each read, so a test's swap of either shell is seen.
+        return (onboarding.sandbox_shell, onboarding.agent_shell)
+
+    def _store_where(self) -> str:
+        return "the sandbox and the agent container"
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        return onboarding.agent_shell

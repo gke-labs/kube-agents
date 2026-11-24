@@ -15,8 +15,9 @@
 # as eight periodics on eight projects: the main part in
 # five shards (#3384, #4238) across ci-kube-agents-eval-nightly with
 # EVAL_NIGHTLY_PART=main-a and ci-kube-agents-eval-nightly-main-b to -main-e
-# with main-b to main-e, the stack-bearing cases placed by nightly-main-b.txt
-# to nightly-main-e.txt; and the writers part, the cases
+# with main-b to main-e, the stack-bearing cases that take the infra lock
+# placed by nightly-main-b.txt to nightly-main-e.txt; and the writers part,
+# the cases
 # that request a pull request, the stopped asks and the writes_alone cases,
 # in thirds across ci-kube-agents-eval-nightly-writers with
 # EVAL_NIGHTLY_PART=writers-a and -writers-b and -writers-c with writers-b
@@ -1261,6 +1262,22 @@
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
 
+# A scheduled audit run, started the way the schedule starts it and not by a
+# request, stores the finding of a planted defect. Every other case that
+# grades a finding asks for the audit in its prompt, which is an on-demand
+# run. prebuilt/audit-chat-report moves the compliance-audit stream's stored
+# report and digest record aside, fires the stream's real cron job and waits
+# for it, so the turn is a one-line answer and the grade reads the store with
+# the stack's fire time as its clock. Fixture: rbac-overgrant. A tofu case
+# off the infra lock (hack/ci-eval-pr.sh, infra_lock_exempt): its stack
+# carries one full compliance audit and waits for it for up to 3000s, past
+# the longest hold the lock plans for, and the stream lock keeps it apart
+# from the other compliance-audit cases. Priced with
+# compliance-rbac-overgrant's 1000s plus the fire and the wait; the fired
+# run took 11 to 13 minutes on two dev installs and is unmeasured on a lane.
+# Placed by its name, as a case without a stack is.
+./tasks/fleet-audit-scheduled-run-files-the-finding/task.yaml
+
 # A scheduled audit over a fleet that did not change since the last scheduled
 # run is closed by `audit_report.py precheck` from that run's stored findings
 # document, with no document drafted by hand (gke-labs/kube-agents#4724).
@@ -1491,6 +1508,13 @@
 # inject door and the AgentProfile dispatcher, which every CI eval install
 # runs, with profiles.cluster, from #5394.
 ./tasks/session-delegates-to-the-profile-asked-for/task.yaml
+
+# #6882: at the session cap, a new conversation gets the queued notice, then
+# its answer (the session-cap directive, bench/kube_agents_bench/session_cap.py).
+# It needs a session cap of at most 2, which the nightly install does not
+# have, so here it reports infrastructure naming the cap; its evidence runs
+# come from twins that set the cap to 2. deployer: noop, read-only.
+./tasks/session-front-door-cap-busy-notice/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role

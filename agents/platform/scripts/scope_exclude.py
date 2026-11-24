@@ -5,9 +5,11 @@ The operator renders the PlatformAgent's scope into `scope.json` and mounts it o
 the broker (`CREDENTIAL_PROXY_SCOPE_FILE`). An excluded cluster is one named there
 by its full `projectId`, `location` and `clusterName`. The broker refuses every
 route to that cluster's Kubernetes API, for every caller: a kubeconfig it would
-mint or use, a `get-credentials`, the watcher's cluster relay. Reads of the GKE
-control plane (`clusters list`, `clusters describe`) stay allowed, because they
-are reads of the project, not of the cluster.
+mint or use, a `get-credentials`, the watcher's cluster relay. A metadata read
+that names it (`clusters describe`, a node-pool read, the gke MCP tools that
+read one cluster) is refused too, and a logging read leaves out its entries
+(cluster_metadata_scope). The project-wide reads (`clusters list`, the
+operations list, the relay's existence check) stay allowed.
 
 Matching is exact, field by field. A cluster's location is the one GKE gives it,
 a zone or a region, so a zonal name never matches a regional entry. A project
@@ -26,8 +28,10 @@ started outside the operator, and excludes nothing.
 that no pod-template hash covers, so an operator's hold applies, and lifts,
 without a restart. A held cluster keeps its Cluster Agent profile and its place in
 fleet audits; only its Kubernetes API is refused, under `scope.held-cluster`, with the hold's
-reason. `all` holds every cluster. `Exclusions` checks both, so every route that
-refuses an excluded cluster refuses a held one.
+reason. `all` holds every cluster. `Exclusions` checks both, so every route to a
+cluster's Kubernetes API that refuses an excluded cluster refuses a held one. A
+metadata read checks the exclusions alone (`include_holds=False`), since a hold
+leaves the cluster's metadata readable.
 
 Standard library only. No refusal message repeats caller text beyond the three
 name parts, each of which the caller's target already held to `[a-z0-9-]`; a
@@ -122,6 +126,35 @@ def _matches(triples: frozenset[tuple[str, str, str]], project: str, location: s
     return (project, location, cluster) in triples or any(
         PROJECT_NUMBER.match(p) and (l, c) == (location, cluster) for p, l, c in triples
     )
+
+
+def _name_matches(triples: frozenset[tuple[str, str, str]], project: str, cluster: str) -> list[str]:
+    """The locations of the triples a cluster named without its location could be:
+    its name in its project, or in an entry spelled by project number."""
+    return sorted(
+        {l for p, l, c in triples if c == cluster and (p == project or PROJECT_NUMBER.match(p))}
+    )
+
+
+# Cloud Logging's resource label for a GKE cluster's name (the k8s_*,
+# gke_cluster and gke_nodepool resource types carry it).
+LOG_CLUSTER_LABEL = "resource.labels.cluster_name"
+# The clause's parts: entries whose cluster label matches none of the names.
+LOG_CLAUSE_NOT = "NOT "
+LOG_REGEX_MATCH = "=~"
+LOG_REGEX_OR = "|"
+
+
+def _log_clause(triples: frozenset[tuple[str, str, str]]) -> str:
+    """One Logging query term that drops the entries of every cluster named by
+    triples: a single anchored regex on the cluster label, since Cloud Logging
+    refuses a filter with too many AND/OR terms ("Filter is too complex") and an
+    install can exclude many clusters. It matches the name alone, so an excluded
+    name's entries are dropped in any project and location: more than the
+    exclusion, never less. The names are held to the GKE name grammar by
+    _parse_cluster_refs, so they need no escaping in the regex or the quotes."""
+    names = sorted({cluster for _, _, cluster in triples})
+    return f'{LOG_CLAUSE_NOT}{LOG_CLUSTER_LABEL}{LOG_REGEX_MATCH}"^({LOG_REGEX_OR.join(names)})$"'
 
 
 class HoldState:
@@ -241,7 +274,8 @@ class Exclusions:
     The mount is a ConfigMap directory, so an edit lands in place; the file's
     identity (inode, size, mtime) is checked on every call and the parse is
     redone only when it moves. Each check also consults the holds (Holds), so a
-    caller of check or check_unnamed refuses a held cluster too.
+    caller of check or check_unnamed refuses a held cluster too, unless it passes
+    include_holds=False, as the metadata reads do.
     """
 
     def __init__(
@@ -276,7 +310,7 @@ class Exclusions:
                 self._seen = identity
             return self._triples, self._error
 
-    def check_unnamed(self) -> None:
+    def check_unnamed(self, include_holds: bool = True) -> None:
         """Raise ExcludedCluster for a call that reaches a cluster this broker can't name.
 
         Nothing is refused on an install that excludes no cluster; with one, a
@@ -291,10 +325,16 @@ class Exclusions:
                 "this install excludes clusters, and this call doesn't name its cluster by"
                 " projects/<project>/locations/<location>/clusters/<cluster>; name it that way",
             )
-        self.holds.check_unnamed()
+        if include_holds:
+            self.holds.check_unnamed()
 
-    def check(self, project: str, location: str, cluster: str) -> None:
-        """Raise ExcludedCluster when the broker must not reach this cluster."""
+    def check(self, project: str, location: str, cluster: str, include_holds: bool = True) -> None:
+        """Raise ExcludedCluster when the broker must not reach this cluster.
+
+        include_holds=False checks the exclusions alone: a GCP metadata read
+        (cluster_metadata_scope) is held to spec.scope.exclude.clusters, while
+        a hold pauses the agents' reach into the cluster and leaves its
+        metadata readable."""
         triples, error = self._load()
         if error is not None:
             raise ExcludedCluster(
@@ -314,4 +354,33 @@ class Exclusions:
                 f"project {project} is named by its number while this install excludes"
                 " clusters by project ID; name the project by its ID",
             )
-        self.holds.check(project, location, cluster)
+        if include_holds:
+            self.holds.check(project, location, cluster)
+
+    def check_name(self, project: str, cluster: str) -> None:
+        """Raise ExcludedCluster when a cluster named without its location (a
+        metadata read that leaves the location to gcloud's defaults) could be an
+        excluded one: any excluded cluster of that name in that project, whatever
+        its location. Holds aren't consulted (check's include_holds)."""
+        triples, error = self._load()
+        if error is not None:
+            self.check(project, "", cluster, include_holds=False)
+        for location in _name_matches(triples, project, cluster):
+            self.check(project, location, cluster, include_holds=False)
+        if triples and PROJECT_NUMBER.match(project):
+            self.check(project, "", cluster, include_holds=False)
+
+    def log_exclusion_clause(self) -> str | None:
+        """A Cloud Logging query clause that drops every excluded cluster's
+        entries, to AND onto a `logging read` filter; None when nothing is
+        excluded. Holds aren't consulted (check's include_holds). A scope file
+        the broker can't read refuses the read."""
+        triples, error = self._load()
+        if error is not None:
+            raise ExcludedCluster(
+                RULE_EXCLUDE_UNREADABLE,
+                f"{error}, so the broker can't tell which clusters' logs to leave out and reads none until it can",
+            )
+        if not triples:
+            return None
+        return _log_clause(triples)

@@ -59,8 +59,9 @@ readonly VALIDATED_CAPABILITIES_PART_KEY='suite_part'
 readonly VALIDATED_CAPABILITIES_PART_LINE_RE="^${VALIDATED_CAPABILITIES_PART_KEY}: [1-9][0-9]*$"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
-# (#3384, #4238): a stack-bearing case on no list runs in main-a, which
-# otherwise holds only the onboarding cases' chain (unit_state_lock).
+# (#3384, #4238): a stack-bearing case that takes the infra lock and is on
+# no list runs in main-a, which otherwise holds only the onboarding cases'
+# chain (unit_state_lock).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
 readonly EVAL_NIGHTLY_MAIN_C_FILE="eval/nightly-main-c.txt"
 readonly EVAL_NIGHTLY_MAIN_D_FILE="eval/nightly-main-d.txt"
@@ -357,6 +358,8 @@ readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
+# A first-run audit's pause comes after one more read of the roster and the
+# runs' ledger, bounded at 10s by the ledger's busy timeout.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
@@ -1124,11 +1127,7 @@ echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR
 profile_begin "cluster-auth: gcloud get-credentials"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gke_dns_endpoint_flag "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG
+get_cluster_credentials "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # 2b. Seeded-fleet credentials, one kubeconfig per fixture ROLE.
@@ -4252,7 +4251,17 @@ infra_lock_exempt() { # <task-name>
     # on the host cluster, through a kubeconfig of its own. In the install it
     # writes one daemon session, with the ledger row and card that its event
     # produces, which no other stack rewrites, so it needs no state lock.
-    oobe-first-run-audits | autoops-warning-event-no-action-triage) return 0 ;;
+    # fleet-audit-scheduled-run-files-the-finding waits out one full scheduled
+    # audit inside its stack's apply, for up to its run_wait, which is past
+    # INFRA_LOCK_LONGEST_HOLD_SECONDS. In the install its stack moves one
+    # stream's stored report and digest record aside and puts them back, which
+    # its stream lock (audit_streams) keeps to one unit at a time, and it
+    # writes that stream's entry in the Platform Agent's cron roster.
+    # oobe-first-run-audits' and unchanged-manifest-digest's stacks write
+    # that roster too: the nightly's main part runs their cases in other
+    # shards, on other installs (scripts/test_ci_eval_nightly.py holds that),
+    # and a run of every case on one install has no lock between them.
+    oobe-first-run-audits | autoops-warning-event-no-action-triage | fleet-audit-scheduled-run-files-the-finding) return 0 ;;
   esac
   return 1
 }
@@ -4260,7 +4269,11 @@ infra_lock_exempt() { # <task-name>
 # rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
 # markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
 # Agent's `oobe` cron job. The infra lock cannot keep an exempt case apart
-# from the others, so this lock does.
+# from the others, so this lock does. One state has no lock: the Platform
+# Agent's cron roster, which the stacks infra_lock_exempt's comment names
+# each write an entry of. Their cases run in different shards of the
+# nightly's main part instead (scripts/test_ci_eval_nightly.py), and a run
+# of every case on one install has no lock between them.
 unit_state_lock() { # <task-name>
   case "$1" in
     oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-discovery-capped | bootstrap-inventory-ranking-delivery | bootstrap-inventory-posture-scope) echo "onboarding" ;;
@@ -4979,6 +4992,14 @@ unit_cost_hint() {
     # waits out: a full audit on an image without the gate, a collector and a
     # precheck with it. Unmeasured; priced at the band plus the plant.
     fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
+    # One real scheduled compliance audit the stack fires and waits out, with
+    # the stream's stored report and digest record moved aside, so a full
+    # audit every time. The fired run took 11 to 13 minutes on two dev
+    # installs; unmeasured on a lane. Off the infra lock (infra_lock_exempt),
+    # so it is in none of the stack chains this hint prices; priced as the
+    # case above, over compliance-rbac-overgrant's requested run, so it
+    # launches early.
+    fleet-audit-scheduled-run-files-the-finding) echo 1200 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     # The same full audit after a plant that waits eleven minutes, so that
@@ -5402,7 +5423,9 @@ fi
 #                 and same-task reps share a tofu stack directory and cluster
 #                 name. Serial reps are also what keeps them comparable.
 #   per state  -- cases whose stacks rewrite the same agent-install state
-#                 (unit_state_lock) never overlap. A unit off the infra lock
+#                 (unit_state_lock) never overlap; the cron roster is the
+#                 state with no such lock (unit_state_lock's comment). A unit
+#                 off the infra lock
 #                 takes it after its streams and wait_platform_runs; a
 #                 stack-bearing unit takes it only while it holds the infra
 #                 lock, in one try, giving the infra lock back when it is
