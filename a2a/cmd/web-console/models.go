@@ -211,10 +211,10 @@ func (s *server) testModel(ctx context.Context, modelID, target string) error {
 		if err != nil {
 			return err
 		}
+		// No Authorization: the agent API key is the agent's own, not a gateway
+		// credential. The console calls the gateway keyless, as assist.go and
+		// insights.go do.
 		req.Header.Set("Content-Type", contentTypeJSON)
-		if s.cfg.APIServerKey != "" {
-			req.Header.Set("Authorization", bearerPrefix+s.cfg.APIServerKey)
-		}
 		resp, err := s.client.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("could not reach inference gateway: %w", err)
@@ -233,9 +233,6 @@ func (s *server) testModel(ctx context.Context, modelID, target string) error {
 			req2, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.LiteLLMURL+"/v1/chat/completions", bytes.NewReader(b2))
 			if reqErr == nil {
 				req2.Header.Set("Content-Type", contentTypeJSON)
-				if s.cfg.APIServerKey != "" {
-					req2.Header.Set("Authorization", bearerPrefix+s.cfg.APIServerKey)
-				}
 				resp2, err2 := s.client.Do(req2)
 				if err2 == nil {
 					status2 := resp2.StatusCode

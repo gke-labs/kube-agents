@@ -717,3 +717,63 @@ func TestSessionWriteRefusalDir(t *testing.T) {
 		})
 	}
 }
+
+// A session with the cluster view reads for itself, and that pulls an ask
+// that also needs a change toward reading first: the reads fan out to read
+// delegations and the change never reaches platform (#6859). The delegate
+// prompt says to hand such an ask over whole, in the turn it arrives, when
+// platform is listed and the person named no other agent; a fix only asked
+// for as a proposal stays in the reply. It rests that on the shorter path,
+// not on a wake turn being unable to delegate, which a later change makes
+// false (#6861). A pod without the delegate tool gets no such line, since it
+// has nothing to hand over with.
+func TestTheClusterViewSessionHandsAChangeRequiringAskToPlatformWhole(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvProfileExecutor} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	prompt := func() string {
+		argv := harnessCommand()
+		for i, a := range argv {
+			if a == "--append-system-prompt" && i+1 < len(argv) {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+	t.Setenv(lib.EnvClusterView, "true")
+	p := prompt()
+	if !strings.Contains(p, clusterViewPrompt) {
+		t.Fatalf("view-on session prompt lacks the view's own prompt, so this is not the case under test: %q", p)
+	}
+	for _, want := range []string{
+		"wants a change made",
+		"opened as a pull request",
+		"`platform` is listed",
+		"hand the whole ask to `platform` in the turn it arrives",
+		"with the reads it depends on",
+		"unless they named another agent",
+		"only asked to propose is not a change",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("view-on session prompt lacks %q: %q", want, p)
+		}
+	}
+	for _, never := range []string{"can't delegate again", "cannot delegate again", "only one delegation"} {
+		if strings.Contains(strings.ToLower(p), never) {
+			t.Errorf("view-on session prompt rests the handoff on %q, which re-delegation on a wake makes false: %q", never, p)
+		}
+	}
+	// Read-only asks keep the view's latency win: the read-it-yourself line stays.
+	if !strings.Contains(p, "answer yourself when you can") {
+		t.Errorf("view-on session prompt dropped the answer-yourself line: %q", p)
+	}
+	t.Setenv(lib.EnvDelegateTool, "off")
+	p = prompt()
+	if !strings.Contains(p, clusterViewPrompt) {
+		t.Fatalf("delegate-off view pod lost the view's prompt, so the check below would pass on nothing: %q", p)
+	}
+	if strings.Contains(p, "hand the whole ask") {
+		t.Errorf("a pod without the delegate tool is told to hand asks over: %q", p)
+	}
+}

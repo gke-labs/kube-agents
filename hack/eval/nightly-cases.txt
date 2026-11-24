@@ -1453,13 +1453,6 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
-# post-merge-verified-fixed: the post-merge check's verify-after-merge loop
-# (#6343 case 1), the eval record for #6311. A writer: the check merges the
-# agent's no-pdb fix, applies it and drives the cron's ticks (post_merge.py).
-# Cost: each repetition holds a serial writers slot for the agent's turn plus
-# up to 15 minutes of ticks, about 45 minutes a night across three.
-./tasks/post-merge-verified-fixed/task.yaml
-
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
 # into the platform charts context repository, names the chart template
@@ -1682,6 +1675,20 @@
 # per seeded cluster (the three slot roles beside the planted one tell a
 # missed cluster from an absent one). Nightly from its first merge.
 ./tasks/upgrades-readiness-changed-defaults/task.yaml
+
+# The explicit question behind the readiness report's `answered` list: which
+# fail-closed admission webhooks the readiness check tested, and whether each
+# one's backend answered. The fleet-upgrade-verification report names a webhook
+# with an unreachable backend in its table and one whose backend answered in
+# its JSON, so the names come from the run; the route check, the same as
+# upgrades-fleet-readiness-failclosed-webhook's, fails a hand survey of webhook
+# configurations. The case grades the planted gate's line as "backend: missing"
+# (seeded-b, role readiness-failclosed-webhook) and requires one webhook line
+# with "backend: ready"; it names no live webhook, because the fleet plants
+# none and GKE's own give one on a seeded cluster. Read-only chat prompt;
+# deployer: noop, no lock. Nightly from its first merge; a presubmit seat is a
+# later pull request that cites its record.
+./tasks/upgrades-readiness-checked-webhooks-named/task.yaml
 
 # Catalogue entry 10 through the readiness report's client-addon-skew rule:
 # stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0

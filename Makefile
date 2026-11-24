@@ -944,7 +944,7 @@ skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG=
 skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
 	@$(SKILL_OVERLAY) generate $(SKILL)
 
-skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line, and every shipped skill document fits skill_view.
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line and a Retire-When line in one of its three forms, and every shipped skill document fits skill_view.
 	@$(SKILL_OVERLAY) check
 	@python3 scripts/check_skill_size.py
 

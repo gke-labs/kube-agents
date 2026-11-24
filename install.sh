@@ -4372,7 +4372,12 @@ run_lifecycle_apply() {
       export KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true
     fi
     ./lifecycle.sh apply -auto-approve -input=false
-  ) 2>&1 | tee "$log_file" || ps=("${PIPESTATUS[@]}")
+  # tee ignores SIGINT (-i) for the reason lifecycle.sh's run_apply gives for
+  # its own: Ctrl-C reaches every process in the foreground group, and
+  # Terraform saves state and releases the lock only while it can still print.
+  # A tee that died of the signal would close the pipe under lifecycle.sh, and
+  # SIGPIPE would end the apply before that shutdown finished.
+  ) 2>&1 | tee -i "$log_file" || ps=("${PIPESTATUS[@]}")
 
   # ${ps[@]+"${ps[@]}"}: empty on a clean apply, and macOS's bash 3.2 treats an
   # empty array expansion as unbound under `set -u`.
