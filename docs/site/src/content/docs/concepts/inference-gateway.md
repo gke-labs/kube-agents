@@ -126,7 +126,9 @@ The gateway checks the key each caller sends. The chart runs LiteLLM with a mast
 
 An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
 
-`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart. While the Secret is absent the gateway knows no caller key: a call with no key or a placeholder is still admitted as `keyless`, and a caller that sends its class's key is refused until the operator writes the map again on its next pass. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
+`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart.
+
+While the Secret is absent the gateway knows no caller key. A call with no key or a placeholder is still admitted as `keyless`. A caller that sends its class's key is refused until the operator writes the map again on its next pass. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
 
 ### Which key each caller sends
 
