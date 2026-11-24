@@ -168,6 +168,7 @@ func buildBackendAdapters(cfg *gateway.Config, metrics *gateway.Metrics, log *sl
 			// The allowlist, so a sender listed by either of their ids is
 			// handed over under the listed one; the gateway still decides.
 			tm.SetAllowedUsers(cfg.TeamsAllowedUsers, cfg.TeamsAllowAllUsers)
+			tm.SetMetrics(metrics)
 			adapters[backend] = tm
 		case gateway.BackendDiscord:
 			dc, err := gateway.NewDiscordAdapter(cfg.DiscordToken, log)

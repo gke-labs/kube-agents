@@ -1028,10 +1028,14 @@ verify_local_source_clean() {
 #
 # Asked for the peeled form first: an annotated tag's own object is not the
 # commit, and comparing a checkout's HEAD against it would never match.
-# kube-agents' release tags are lightweight today, which is the second query.
+# The peeled entry is asked for by its own name, `<tag>^{}`: `git ls-remote`
+# lists a ref only when a pattern matches the end of its name, and
+# `refs/tags/<tag>^{}` does not end in `<tag>`, so the tag's name alone returns
+# only the tag object. kube-agents' release tags are annotated; a lightweight
+# tag has no peeled entry, which is the second lookup.
 remote_release_tag_commit() {
   local expected_ref="$1" listing="" commit=""
-  listing="$(git ls-remote --tags "$KUBE_AGENTS_REPO_URL" "$expected_ref" 2>/dev/null)" || return 1
+  listing="$(git ls-remote --tags "$KUBE_AGENTS_REPO_URL" "$expected_ref" "${expected_ref}^{}" 2>/dev/null)" || return 1
   commit="$(printf '%s\n' "$listing" | awk -v ref="refs/tags/${expected_ref}^{}" -F'\t' '$2 == ref {print $1; exit}')"
   if [ -z "$commit" ]; then
     commit="$(printf '%s\n' "$listing" | awk -v ref="refs/tags/${expected_ref}" -F'\t' '$2 == ref {print $1; exit}')"

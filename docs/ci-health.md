@@ -1576,7 +1576,8 @@ observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gatew
 status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
 warning that the fixture is not there (never planted, or no cluster for its
 slot), a rollout the next reconcile finishes; for one not ready (the orphaned-snapshot
-roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours` line
+roles, which the GCE compute audit ignores for 91 days, and the finished-Job family, which the
+waste audit ignores for 7), the `ready_after_hours` line
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
@@ -1589,7 +1590,7 @@ which this document does not carry; the note is judged at lease time by the
 presubmit and the nightly, never here, and a stale note surfaces as
 `fixture-drift:<role>` on their runs, with the replace command's printer in
 the drift line. The digest's fixture line and `health.json`'s `fixture_state` block carry
-drifted, absent and unread roles only, so a project whose two snapshots are young reads
+drifted, absent and unread roles only, so a project whose two snapshots or three finished Jobs are young reads
 there as every fixture in its designed state; the document's `summary` and each project's
 carry `not_ready` beside the other counts. `summary` counts projects, projects checked (at least one role
 read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
@@ -1603,7 +1604,7 @@ impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
 firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots list`,
 `gcloud compute disks list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress`,
+reads of the project-scoped roles (`startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`,
 `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and the `gcloud compute reservations list` read of the
@@ -1688,7 +1689,12 @@ merged, beside the re-apply line when a planted role drifts too, and the issue c
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
 applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
 failure line gone from its serial buffer, is cleared by the re-apply too, because the
-reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
+reconcile resets the VM after each project; a `rotated-console-vm` line reading
+`serial_contains`, the flood filler gone from the serial-flood VM's buffer, is the one
+`serial_contains` drift a re-apply does not clear — the reconcile plans nothing for a VM
+that is already there and never resets this one — and the remedy is a one-off hand reset
+(`gcloud compute instances reset serial-flood-<prefix>`), which re-runs the startup script
+and whose flood pass restores the designed state within about five minutes; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time

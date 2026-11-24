@@ -1,0 +1,12 @@
+# {kind}: RECIPE-TEMPLATE replace this line with what the finding is and what
+# the fix changes. Read by fix_recipes/registry.py: flat `key: value` lines only.
+kind: {kind}
+# What kube-agents calls these fixes in text it writes.
+name: RECIPE-TEMPLATE fixes
+# The dial's row for the kind, and the environment the row counts merges in.
+title: RECIPE-TEMPLATE
+dial_environment: dev
+owner: platform
+# The end-to-end case that grades the fix on the cluster after it merges: its
+# post_merge_outcome check carries `recipe: {kind}`.
+eval_case: ""
