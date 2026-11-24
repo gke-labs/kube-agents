@@ -785,6 +785,14 @@ func TestABlankLineForgeryPassesNeitherTheBusyCountNorTheEmptyRead(t *testing.T)
 	if r.g.busyTaskLeftOut(ctx, &busyTasksStream{g: r.g}, active, cutoffProfileAddressee, time.Now()) {
 		t.Error("the busy count left the running task out on the forged terminal")
 	}
+	// The fan-out's probe (probeTask): the same direct gets, the same answer.
+	stream, err := r.g.tasksStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := r.g.probeTask(ctx, stream, cutoffProfileAddressee, running); err != nil || p.final || p.empty {
+		t.Errorf("probeTask: %+v, %v; want running", p, err)
+	}
 
 	// The empty read: a forged terminal alone is not a first event.
 	const silent = "task-blank-silent"
@@ -817,6 +825,13 @@ func TestAPreCutoffTerminalStillEndsAProfileTaskOnTheDirectReads(t *testing.T) {
 	empty, final, err := (&busyTasksStream{g: r.g}).readTask(ctx, cutoffProfileAddressee, taskID)
 	if err != nil || empty || !final {
 		t.Errorf("busy readTask: empty %v, final %v, %v; want final", empty, final, err)
+	}
+	stream, err := r.g.tasksStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := r.g.probeTask(ctx, stream, cutoffProfileAddressee, taskID); err != nil || !p.final {
+		t.Errorf("probeTask: %+v, %v; want final", p, err)
 	}
 	const alone = "task-pre-cutoff-alone"
 	r.publishGatewayFiveToken(t, cutoffProfileAddressee, alone)
