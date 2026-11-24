@@ -60,6 +60,7 @@ __all__ = [
     "read_raw_block",
     "read_raw_coverage",
     "read_scored_report",
+    "report_store",
     "sandbox_pod",
     "sandbox_shell",
 ]
@@ -76,6 +77,15 @@ SANDBOX_CONTAINER = "shell"
 DEFAULT_AGENT_SERVICE = "platform-agent"
 DEFAULT_AGENT_NAMESPACE = "kubeagents-system"
 DEFAULT_AGENT_CONTAINER = "platform-agent"
+# The fleet-audit report store's switch, which the operator renders on the
+# sandbox's shell container (report_status.py: REPORT_STORE_ENV). Unset, empty
+# or `file` is the store on the sandbox's own volume; `broker` is the store the
+# credential broker serves, whose files are under the same root on the gateway
+# pod's data volume.
+REPORT_STORE_ENV = "FLEET_AUDIT_REPORT_STORE"
+REPORT_STORE_FILE = "file"
+REPORT_STORE_BROKER = "broker"
+ReportStore = Literal["file", "broker"]
 
 # agents/platform/scripts/inventory_findings.py: DEFAULT_ITEMS_PATH.
 ITEMS_FILE = f"{DATA_ROOT}/INVENTORY.items.json"
@@ -404,11 +414,17 @@ def sandbox_pod() -> str:
     return os.environ.get("EVAL_SANDBOX_POD") or f"{agent}{SANDBOX_POD_SUFFIX}"
 
 
-def _kubectl_exec(target: str, container: str, script: str, timeout: float) -> str:
-    cmd = ["kubectl", "exec", target, "-n", os.environ.get("AGENT_NAMESPACE", DEFAULT_AGENT_NAMESPACE)]
+def _kubectl(verb: str, target: str) -> list[str]:
+    """``kubectl <verb> <target>`` in the agent's namespace and, when set, its context."""
+    cmd = ["kubectl", verb, target, "-n", os.environ.get("AGENT_NAMESPACE", DEFAULT_AGENT_NAMESPACE)]
     context = os.environ.get("AGENT_CLUSTER_CONTEXT")
     if context:
         cmd.extend(["--context", context])
+    return cmd
+
+
+def _kubectl_exec(target: str, container: str, script: str, timeout: float) -> str:
+    cmd = _kubectl("exec", target)
     cmd.extend(["-c", container, "--", "sh", "-c", script])
     try:
         proc = subprocess.run(
@@ -421,6 +437,41 @@ def _kubectl_exec(target: str, container: str, script: str, timeout: float) -> s
         _log.debug("kubectl exec into %s exited %d: %s", target, proc.returncode, proc.stderr.strip()[:_STDERR_LOG_CHARS])
         return ""
     return proc.stdout
+
+
+def report_store(timeout: float) -> ReportStore:
+    """Which fleet-audit report store the sandbox's shell uses: ``"file"`` or ``"broker"``.
+
+    Read from the sandbox pod's spec, the env the operator rendered on the
+    shell container, not from a shell in it, so a pod that cannot be reached is
+    a kubectl failure here rather than an empty answer. RuntimeError when the
+    spec cannot be read, or when the value is neither: a guess would read one
+    store and grade the run against it while the run wrote the other.
+    """
+    pod = sandbox_pod()
+    jsonpath = (
+        f'{{.spec.containers[?(@.name=="{SANDBOX_CONTAINER}")]'
+        f'.env[?(@.name=="{REPORT_STORE_ENV}")].value}}'
+    )
+    cmd = [*_kubectl("get", f"pod/{pod}"), "-o", f"jsonpath={jsonpath}"]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not read the spec of the shell sandbox pod {pod}: {exc}") from exc
+    if proc.returncode != 0:
+        tail = proc.stderr.strip()[:_STDERR_LOG_CHARS]
+        raise RuntimeError(f"could not read the spec of the shell sandbox pod {pod}: {tail}")
+    value = proc.stdout
+    if value in ("", REPORT_STORE_FILE):
+        return REPORT_STORE_FILE
+    if value == REPORT_STORE_BROKER:
+        return REPORT_STORE_BROKER
+    raise RuntimeError(
+        f"{REPORT_STORE_ENV}={value!r} on the {SANDBOX_CONTAINER} container of {pod} is neither "
+        f"{REPORT_STORE_FILE!r} nor {REPORT_STORE_BROKER!r}, so which report store to read is unknown"
+    )
 
 
 def sandbox_shell(script: str, timeout: float) -> str:

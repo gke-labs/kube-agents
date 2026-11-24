@@ -16,7 +16,8 @@
 
 The store is written by ``audit_report.write_report`` and read for real through ``sh -c``
 with the repository's ``report_status.py`` as the reader; only the two pod shells, the reader's
-path and the store root are swapped for local ones.
+path, the store root and the report store switch are swapped for local ones. ``kubectl`` is a
+stand-in on PATH where the switch itself is read from the pod spec.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import stat
 import subprocess
 import time
 import tomllib
@@ -77,6 +79,7 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(report_store_reply, "READER_PATH", str(SCRIPTS / "report_status.py"))
     monkeypatch.setattr(onboarding, "sandbox_shell", _local_shell)
     monkeypatch.setattr(onboarding, "agent_shell", _local_shell)
+    monkeypatch.setattr(onboarding, "report_store", lambda timeout: onboarding.REPORT_STORE_FILE)
     yield store
     transcript.clear()
 
@@ -261,6 +264,112 @@ def test_an_unreadable_store_pod_is_an_error(root, monkeypatch):
     result = _verify(f"compliance-audit: {URL_COMPLIANCE}", audits=(COMPLIANCE,))
     assert result.status == "error"
     assert f"shell sandbox pod {onboarding.sandbox_pod()}" in result.reason
+
+
+def _refuse(script: str, timeout: float) -> str:
+    raise AssertionError("the store was read in the wrong container")
+
+
+def test_the_file_store_is_read_in_the_sandbox_with_its_python3(root, monkeypatch):
+    commands = []
+
+    def sandbox(script: str, timeout: float) -> str:
+        commands.append(script)
+        return _local_shell(script, timeout)
+
+    monkeypatch.setattr(onboarding, "sandbox_shell", sandbox)
+    _write(COMPLIANCE, issue_url=URL_COMPLIANCE, issue_number=12, written=BEFORE)
+    result = _verify(f"compliance-audit: {URL_COMPLIANCE}", audits=(COMPLIANCE,))
+    assert result.status == "pass", result.reason
+    assert [c.split(" ", 1)[0] for c in commands] == ["python3"]
+    assert result.raw["pod"] == onboarding.sandbox_pod()
+
+
+def test_the_broker_store_is_read_in_the_agent_container_not_the_sandbox(root, monkeypatch):
+    # With the broker store (#6110) the store's files are on the gateway pod's data volume.
+    commands = []
+
+    def agent(script: str, timeout: float) -> str:
+        commands.append(script)
+        return _local_shell(script, timeout)
+
+    monkeypatch.setattr(onboarding, "report_store", lambda timeout: onboarding.REPORT_STORE_BROKER)
+    monkeypatch.setattr(onboarding, "sandbox_shell", _refuse)
+    monkeypatch.setattr(onboarding, "agent_shell", agent)
+    _write(COMPLIANCE, issue_url=URL_COMPLIANCE, issue_number=12, written=BEFORE)
+    result = _verify(f"compliance-audit: {URL_COMPLIANCE}", audits=(COMPLIANCE,))
+    assert result.status == "pass", result.reason
+    # The reader, then the store under the agent container's own interpreter.
+    assert commands[-1].startswith(report_store_reply.AGENT_PYTHON + " -I -c ")
+    assert result.raw["pod"] == "the agent container"
+    assert result.reason.endswith("from the store in the agent container")
+
+
+def test_an_unreadable_broker_store_is_an_error_naming_the_agent_container(root, monkeypatch):
+    def reader_only(script: str, timeout: float) -> str:
+        return _local_shell(script, timeout) if report_store_reply.READER_READ in script else ""
+
+    monkeypatch.setattr(onboarding, "report_store", lambda timeout: onboarding.REPORT_STORE_BROKER)
+    monkeypatch.setattr(onboarding, "agent_shell", reader_only)
+    result = _verify(f"compliance-audit: {URL_COMPLIANCE}", audits=(COMPLIANCE,))
+    assert result.status == "error"
+    assert result.reason == "could not read the report store in the agent container"
+
+
+def test_a_switch_that_cannot_be_resolved_is_an_error_and_reads_no_store(root, monkeypatch):
+    def unknown(timeout: float) -> str:
+        raise RuntimeError("FLEET_AUDIT_REPORT_STORE='Broker' on the shell container is neither")
+
+    monkeypatch.setattr(onboarding, "report_store", unknown)
+    monkeypatch.setattr(onboarding, "sandbox_shell", _refuse)
+    result = _verify(f"compliance-audit: {URL_COMPLIANCE}", audits=(COMPLIANCE,))
+    assert result.status == "error"
+    assert "'Broker'" in result.reason
+
+
+@pytest.fixture
+def kubectl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A ``kubectl`` stand-in that logs its argv and prints $STUB_VALUE, or fails when $STUB_FAIL is set."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "kubectl.log"
+    stub = bin_dir / "kubectl"
+    stub.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$STUB_LOG"\n'
+        '[ -n "$STUB_FAIL" ] && { echo "pods not found" >&2; exit 1; }\nprintf "%s" "$STUB_VALUE"\n',
+        encoding="utf-8",
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("STUB_LOG", str(log))
+    monkeypatch.delenv("STUB_FAIL", raising=False)
+    monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
+    return log
+
+
+@pytest.mark.parametrize(("value", "kind"), [("", "file"), ("file", "file"), ("broker", "broker")])
+def test_the_switch_is_read_from_the_shell_containers_env_in_the_pod_spec(kubectl, monkeypatch, value, kind):
+    monkeypatch.setenv("STUB_VALUE", value)
+    assert onboarding.report_store(5.0) == kind
+    argv = kubectl.read_text(encoding="utf-8").splitlines()
+    assert argv[:2] == ["get", f"pod/{onboarding.sandbox_pod()}"]
+    assert argv[-2:] == [
+        "-o",
+        'jsonpath={.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}',
+    ]
+
+
+@pytest.mark.parametrize("value", ["Broker", "s3", " broker"])
+def test_any_other_switch_value_raises_naming_it(kubectl, monkeypatch, value):
+    monkeypatch.setenv("STUB_VALUE", value)
+    with pytest.raises(RuntimeError, match=re.escape(f"FLEET_AUDIT_REPORT_STORE={value!r}")):
+        onboarding.report_store(5.0)
+
+
+def test_a_pod_spec_that_cannot_be_read_raises(kubectl, monkeypatch):
+    monkeypatch.setenv("STUB_FAIL", "1")
+    with pytest.raises(RuntimeError, match="could not read the spec of the shell sandbox pod"):
+        onboarding.report_store(5.0)
 
 
 def test_an_absent_store_root_passes_on_mentions_and_the_record_says_so(root):

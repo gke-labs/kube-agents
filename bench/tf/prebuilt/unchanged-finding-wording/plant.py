@@ -14,9 +14,14 @@
 
 """Plant and remove the previous run of bench/tasks/fleet-audit-unchanged-finding-keeps-wording.
 
-main.tf runs this in the container that runs `audit_report.py finish`, as
-`python3 - <mode> <scripts dir> <mark>`. That container holds the report store
-on its own volume.
+main.tf runs this as `python3 - <mode> <scripts dir> <mark>`. `plant` runs in
+the container that runs `audit_report.py finish`. With the file store, that
+container holds the report store on its own volume, and `teardown` runs there
+too. With the broker store (FLEET_AUDIT_REPORT_STORE=broker on the shell
+sandbox, #6110), the shell writes through the credential broker, whose files are
+under the same root on the gateway pod's data volume, so `teardown` runs in the
+gateway's `platform-agent` container and `plant` reads its run back through the
+broker and leaves the teardown of a failed plant to main.tf.
 
 plant: runs the drift collector, which reads GKE metadata only, and writes a
 report-store envelope for the fleet-consistency-drift stream. The envelope holds
@@ -31,6 +36,9 @@ go green or red for the reason it tests.
 teardown: removes each stored envelope of the stream, `latest.json` and the
 ring entries, that holds <mark>. A kept wording then does not stay in the
 store for later runs of the stream.
+
+Any FLEET_AUDIT_REPORT_STORE other than unset, empty, `file` or `broker` stops
+`plant` before it writes: a guess would plant in a store the run does not read.
 """
 
 import json
@@ -53,6 +61,28 @@ PLANT_ARGC = 4
 # sees a previous weekly run, not a run that finished seconds ago.
 PLANTED_RUN_AGE = timedelta(days=7)
 STDERR_TAIL_CHARS = 500
+# The report store's switch, which the operator renders on the sandbox's shell
+# container (report_status.py: REPORT_STORE_ENV).
+REPORT_STORE_ENV = "FLEET_AUDIT_REPORT_STORE"
+REPORT_STORE_FILE = "file"
+REPORT_STORE_BROKER = "broker"
+# The broker store's record of who wrote an envelope, beside it with this
+# suffix in place of `.json` (audit_report_store.py: REPORT_WRITER_SUFFIX).
+# The file store writes none.
+WRITER_SUFFIX = ".writer"
+
+
+def report_store() -> str:
+    """`file` or `broker`, from this container's FLEET_AUDIT_REPORT_STORE; exits on any other value."""
+    value = os.environ.get(REPORT_STORE_ENV, "")
+    if value in ("", REPORT_STORE_FILE):
+        return REPORT_STORE_FILE
+    if value == REPORT_STORE_BROKER:
+        return REPORT_STORE_BROKER
+    sys.exit(
+        f"ERROR: {REPORT_STORE_ENV}={value!r} on the shell sandbox is neither "
+        f"{REPORT_STORE_FILE!r} nor {REPORT_STORE_BROKER!r}, so which report store to use is unknown."
+    )
 
 
 def ensure_proxy_path(proxy_bin: str = CREDENTIAL_PROXY_BIN) -> None:
@@ -102,6 +132,7 @@ def planted_finding(audit_report, entry: dict, candidate: dict, mark: str) -> di
 
 
 def plant(audit_report, mark: str, scripts: str) -> int:
+    store = report_store()
     collector = Path(scripts) / COLLECTOR
     run = subprocess.run(
         [sys.executable, str(collector)], capture_output=True, text=True, check=False
@@ -135,6 +166,19 @@ def plant(audit_report, mark: str, scripts: str) -> int:
         rendered_ids=[f["id"] for f in findings],
     )
     audit_report.write_report(AUDIT, envelope, now)
+    if store == REPORT_STORE_BROKER:
+        # Read back through the broker: the store's files are not in this container,
+        # so the teardown of a failed plant is main.tf's, where they are.
+        broker = audit_report.report_store_dir(AUDIT, repo)
+        try:
+            text = broker.read(audit_report.REPORT_LATEST_NAME)
+        except OSError:
+            text = ""
+        if mark not in text:
+            print(f"the store at {broker} does not hold the planted run.", file=sys.stderr)
+            return 1
+        print(f"planted {len(findings)} finding(s) for {AUDIT} in {repo}.")
+        return 0
     stored = audit_report.reports_dir_for(AUDIT, repo) / audit_report.REPORT_LATEST_NAME
     try:
         text = stored.read_text(encoding="utf-8")
@@ -158,6 +202,10 @@ def teardown(audit_report, mark: str) -> int:
         try:
             if mark in path.read_text(encoding="utf-8"):
                 path.unlink()
+                # The broker store's writer record goes with its entry, or the
+                # broker names a writer for an envelope that is gone. With the
+                # file store there is none, so this removes nothing.
+                path.with_suffix(WRITER_SUFFIX).unlink(missing_ok=True)
                 removed += 1
         except FileNotFoundError:
             continue
