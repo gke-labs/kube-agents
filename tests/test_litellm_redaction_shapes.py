@@ -10,12 +10,9 @@ the same list, at every position where a tool's output reaches the model:
 - an Anthropic `tool_result` whose content is a list of text blocks;
 - an OpenAI-wire `role: tool` message;
 - a Gemini `functionResponse`'s response;
-- per driver, the output as each harness actually sends it: Claude Code's
-  `tool_result` (the Anthropic string row above), and agy's `run_command`
-  output layout (`testdata/agy/tool.jsonl`) inside a Gemini
-  `functionResponse`, under both of agy's calls, `generateContent` and
-  `streamGenerateContent`. agy speaks only those Gemini routes to the
-  gateway, so that is the one position its tool output reaches.
+- the same Gemini `functionResponse` under the streaming call type as well
+  (`generateContent` and `streamGenerateContent`), which a Gemini-speaking
+  harness may use either of.
 
 A redact case's secret must not survive, nor any 8-character fragment of it,
 as the fixture's own description states. A keep case's text must come out
@@ -58,30 +55,25 @@ DELIBERATELY_WIDER = {
 }
 
 
-# agy's run_command output, as the recorded stream has it
-# (a2a/worker-adapter/testdata/agy/tool.jsonl): the exit line, a blank line,
-# then what the command printed.
-AGY_RUN_COMMAND_OUTPUT = "Command exited with code 0.\n\nCommand output:\n{}"
-# The LiteLLM call types agy's two Gemini routes arrive as.
-AGY_CALL_TYPES = ("agenerate_content", "agenerate_content_stream")
+# The LiteLLM call types a Gemini harness's two routes arrive as.
+GEMINI_CALL_TYPES = ("agenerate_content", "agenerate_content_stream")
 
 
-def _agy_shapes(text: str):
-    output = AGY_RUN_COMMAND_OUTPUT.format(text)
-    for call_type in AGY_CALL_TYPES:
+def _gemini_streaming_shapes(text: str):
+    """The Gemini functionResponse row under the streaming call type too."""
+    for call_type in GEMINI_CALL_TYPES[1:]:
         yield (
-            f"agy run_command output ({call_type})",
+            f"gemini functionResponse ({call_type})",
             {
                 "contents": [
                     {
                         "role": "user",
-                        "parts": [{"functionResponse": {"name": "run_command", "response": {"output": output}}}],
+                        "parts": [{"functionResponse": {"name": "run_command", "response": {"output": text}}}],
                     }
                 ]
             },
             call_type,
             lambda r: r["contents"][0]["parts"][0]["functionResponse"]["response"]["output"],
-            output,
         )
 
 
@@ -163,7 +155,7 @@ class TestGatewayMeetsTheCredentialShapesFixture(unittest.TestCase):
                     out = read_back(self._through_the_hook(request, call_type))
                     self.assertNotIn(secret, out)
                     self.assertEqual([], sorted(f for f in fragments if f in out), "a fragment of the secret survived")
-            for name, request, call_type, read_back, _ in _agy_shapes(case["text"]):
+            for name, request, call_type, read_back in _gemini_streaming_shapes(case["text"]):
                 with self.subTest(case=case["id"], position=name):
                     out = read_back(self._through_the_hook(request, call_type))
                     self.assertNotIn(secret, out)
@@ -174,9 +166,9 @@ class TestGatewayMeetsTheCredentialShapesFixture(unittest.TestCase):
             for name, request, call_type, read_back in _shapes(case["text"]):
                 with self.subTest(case=case["id"], position=name):
                     self.assertEqual(case["text"], read_back(self._through_the_hook(request, call_type)))
-            for name, request, call_type, read_back, sent in _agy_shapes(case["text"]):
+            for name, request, call_type, read_back in _gemini_streaming_shapes(case["text"]):
                 with self.subTest(case=case["id"], position=name):
-                    self.assertEqual(sent, read_back(self._through_the_hook(request, call_type)))
+                    self.assertEqual(case["text"], read_back(self._through_the_hook(request, call_type)))
 
     def test_a_deliberately_wider_case_is_still_in_the_fixture_and_still_wider(self) -> None:
         # The list must not outlive its reason: a case the fixture dropped, or
