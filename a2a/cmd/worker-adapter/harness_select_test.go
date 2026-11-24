@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
+	"github.com/gke-labs/kube-agents/a2a/worker-adapter/isolation"
 )
 
 // TestTheHarnessSelectorReadsOneNameForBothWorkerKinds: A2A_HARNESS picks the
@@ -163,5 +168,33 @@ func TestAnAgyWorkerStartsOnlyWithTheWaiver(t *testing.T) {
 	}
 	if cfg.HarnessUserSettings != "" {
 		t.Errorf("user settings %q, want none for agy", cfg.HarnessUserSettings)
+	}
+}
+
+// TestTheSelectorBuildsTheAgyDriverWithItsBinary: the antigravity driver
+// comes from the selector knowing its binary, never as a zero value. A
+// zero-value driver refuses every turn as "not known"; one built with the
+// binary runs it for its version, so a fake agy reporting an unknown version
+// is refused by that version instead.
+func TestTheSelectorBuildsTheAgyDriverWithItsBinary(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "agy")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho 9.9.9\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, env := range map[string]map[string]string{
+		"A2A_HARNESS_PATH": {lib.EnvHarness: "antigravity", lib.EnvHarnessUnisolated: lib.HarnessUnisolatedAllow, "A2A_HARNESS_PATH": fake},
+		"A2A_HARNESS_CMD":  {lib.EnvHarness: "antigravity", lib.EnvHarnessUnisolated: lib.HarnessUnisolatedAllow, "A2A_HARNESS_CMD": fake + " --some-flag"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, driver, _, err := selectHarness(func(k string) string { return env[k] })
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = driver.PrepareTurn(context.Background(), workeradapter.TurnDirs{Workspace: t.TempDir(), Home: t.TempDir()})
+			if !errors.Is(err, isolation.ErrUnknownVersion) || !strings.Contains(err.Error(), "9.9.9") {
+				t.Fatalf("PrepareTurn err = %v; want the fake binary's version refused, so the driver knows its binary", err)
+			}
+		})
 	}
 }

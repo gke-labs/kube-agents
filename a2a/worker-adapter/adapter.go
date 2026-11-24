@@ -900,6 +900,12 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return broken(Result{State: state}, ferr)
 	}
 
+	// A harness with its own wall-clock bound gets it from the task's
+	// deadline less the kill grace, so it ends the turn with a result
+	// before the adapter stops it.
+	if b, ok := drv.(turnBudgeter); ok {
+		argv = b.WithTurnBudget(argv, cfg.TaskDeadline-cfg.KillGrace)
+	}
 	proc, err := startHarnessWith(drv, argv, env, prompt, cfg.KillGrace, log)
 	if err != nil {
 		state := lib.StateFailed
@@ -907,7 +913,29 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return broken(Result{State: state}, ferr)
 	}
 
-	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh)
+	// A driver that takes one user turn per process (restartsPerTurn) gets
+	// each later turn of this task on a fresh process that resumes the same
+	// conversation, started only after the last one and everything it
+	// started are gone and the driver has prepared the turn.
+	var respawn func(prompt string, left time.Duration) (*harnessProc, error)
+	if restartsPerTurn(drv) {
+		resumed := plan.resume != ""
+		respawn = func(prompt string, left time.Duration) (*harnessProc, error) {
+			rargv := argv
+			if !resumed {
+				if a.harnessSession == "" {
+					return nil, errors.New("the harness reported no session to resume")
+				}
+				rargv = drv.WithResume(argv, a.harnessSession)
+			}
+			if b, ok := drv.(turnBudgeter); ok {
+				rargv = b.WithTurnBudget(rargv, left-cfg.KillGrace)
+			}
+			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log)
+		}
+	}
+
+	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh, respawn)
 	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
 }
 
@@ -935,8 +963,15 @@ func (a *adapter) dispatchedOr(check func(context.Context, *nats.Conn, *lib.Enve
 // and eviction and the deadline racing all of it. The terminal decision
 // waits until the harness has exited AND its stdout is fully drained - a
 // result event buffered behind a fast exit must still win.
-func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-chan string, cancelCh <-chan struct{}, delegateCh <-chan delegateAsk) (Result, error) {
+//
+// respawn, when set, is the driver's one-turn-per-process mode: a held steer
+// does not go onto the running harness's stdin. Its stdin is closed instead,
+// and once it has exited, drained and been reaped with everything it started
+// (killLeftovers), the driver prepares the next turn and respawn starts a
+// fresh harness on the same conversation with the steer as its prompt.
+func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-chan string, cancelCh <-chan struct{}, delegateCh <-chan delegateAsk, respawn func(prompt string, left time.Duration) (*harnessProc, error)) (Result, error) {
 	log := a.log
+	started := time.Now()
 	deadline := time.NewTimer(a.cfg.TaskDeadline)
 	defer deadline.Stop()
 
@@ -944,22 +979,27 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		err  error
 		took time.Duration
 	}
-	waitDone := make(chan reapOutcome, 1)
-	go func() {
-		// The scanner owns the pipe until EOF; Wait tears the pipe down.
-		// cmd.WaitDelay (KillGrace, set in startHarness) bounds Wait's stderr
-		// read after the harness exits, so a process it started outside its
-		// group cannot hold Wait open by holding stderr. It does not bound the
-		// wait for scanDone: a process outside the group that holds stdout
-		// still keeps the scanner, and this goroutine, from finishing.
-		<-proc.scanDone
-		reapStart := time.Now()
-		err := proc.cmd.Wait()
-		took := time.Since(reapStart)
-		proc.reaped()
-		proc.killLeftovers()
-		waitDone <- reapOutcome{err, took}
-	}()
+	var waitDone chan reapOutcome
+	startReap := func(proc *harnessProc) {
+		waitDone = make(chan reapOutcome, 1)
+		done := waitDone
+		go func() {
+			// The scanner owns the pipe until EOF; Wait tears the pipe down.
+			// cmd.WaitDelay (KillGrace, set in startHarness) bounds Wait's stderr
+			// read after the harness exits, so a process it started outside its
+			// group cannot hold Wait open by holding stderr. It does not bound the
+			// wait for scanDone: a process outside the group that holds stdout
+			// still keeps the scanner, and this goroutine, from finishing.
+			<-proc.scanDone
+			reapStart := time.Now()
+			err := proc.cmd.Wait()
+			took := time.Since(reapStart)
+			proc.reaped()
+			proc.killLeftovers()
+			done <- reapOutcome{err, took}
+		}()
+	}
+	startReap(proc)
 
 	var (
 		canceled      bool
@@ -991,6 +1031,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// refused visibly if none does.
 		holdSteers = a.cfg.driver().HoldsSteers()
 		held       []string
+		// nextPrompt is the held steer the next process starts with, in
+		// respawn mode: taken at a turn boundary, sent once the current
+		// process is gone.
+		nextPrompt string
 	)
 
 	// refuseHeld refuses, on the stream and before the terminal, every steer
@@ -1024,267 +1068,310 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	}
 
 	events := proc.events
-	for events != nil || !exited {
-		select {
-		case evs, ok := <-events:
-			if !ok {
-				events = nil
-				continue
-			}
-			// An abandoned task's stdout is drained, not published: the
-			// dispatcher has written its terminal.
-			if stopForAbandon() {
-				continue
-			}
-			for _, ev := range evs {
-				// A harness stopped at a write refusal is drained, not
-				// published, but for what its turn cost.
-				if refused != nil {
-					if ev.Kind == EventResult {
-						a.publishUsage(ctx, ev.Telemetry)
-					}
+	for {
+		for events != nil || !exited {
+			select {
+			case evs, ok := <-events:
+				if !ok {
+					events = nil
 					continue
 				}
-				switch ev.Kind {
-				case EventToolResult:
-					// A tool step's result is in: the call that wrote a
-					// record has exited. Only the record is read, never the
-					// result.
-					if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
-						continue
-					}
-					r, err := readWriteRefusal(a.cfg.WriteRefusalFile, a.taskID)
-					if err != nil && !refusalReadFailed {
-						refusalReadFailed = true
-						log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
-					}
-					if refused = r; refused != nil {
-						// Stopped the way cancel stops it: closed stdin,
-						// SIGTERM to the process group, SIGKILL after
-						// KillGrace. The loop still drains its stdout and
-						// reaps it before the terminal below.
-						log.Info("the broker refused a write; stopping the harness",
-							"task", a.taskID, "rule", refused.rule, "verb", refused.verb)
-						proc.closeStdin()
-						proc.kill(a.cfg.KillGrace)
-					}
-				case EventInit:
-					a.harnessSession = ev.Session
-					a.harnessModel = ev.Model
-					log.Info("harness session started", "harnessSession", ev.Session, "model", a.harnessModel)
-					if ev.ModelDropped {
-						log.Warn("the init line's model is not a string; the usage parts carry no model", "task", a.taskID)
-					}
-				case EventThinking:
-					a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: ev.Text}, false)
-				case EventProgress:
-					a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
-				case EventActivity:
-					a.publishActivity(ctx, ev)
-				case EventResult:
-					// What the turn cost goes out first, whatever the turn
-					// decided: a delegating turn, a steered one and an errored
-					// one all read tokens.
-					a.publishUsage(ctx, ev.Telemetry)
-					if delegated {
-						log.Info("harness result after delegation ignored", "task", a.taskID)
-						continue
-					}
-					// Drain steers that raced this result: they were published
-					// while the task was working and must be delivered, not
-					// dropped (assertion 21). A driver that holds steers gets
-					// them after PrepareTurn, below, with the ones it held.
-					for drained := false; !drained; {
-						select {
-						case text := <-steerCh:
-							if holdSteers {
-								held = append(held, text)
-								continue
-							}
-							if err := proc.writeUser(text); err == nil {
-								pendingTurns++
-								log.Info("steer absorbed at turn boundary", "task", a.taskID)
-							} else {
-								log.Warn("steer write failed", "err", err)
-							}
-						default:
-							drained = true
+				// An abandoned task's stdout is drained, not published: the
+				// dispatcher has written its terminal.
+				if stopForAbandon() {
+					continue
+				}
+				for _, ev := range evs {
+					// A harness stopped at a write refusal is drained, not
+					// published, but for what its turn cost.
+					if refused != nil {
+						if ev.Kind == EventResult {
+							a.publishUsage(ctx, ev.Telemetry)
 						}
+						continue
 					}
-					pendingTurns--
-					// Another turn follows when a steer is held and the turn
-					// neither failed nor was ended by cancel or the deadline,
-					// whose kill is already on its way: the driver prepares
-					// that turn, then the oldest held steer goes onto stdin.
-					// One per boundary, so every turn the harness runs gets
-					// its own PrepareTurn; the rest wait for the next result.
-					if holdSteers && len(held) > 0 && !ev.Failed && !canceled && !deadlineHit {
-						if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
-							log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
-							sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+					switch ev.Kind {
+					case EventToolResult:
+						// A tool step's result is in: the call that wrote a
+						// record has exited. Only the record is read, never the
+						// result.
+						if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
+							continue
+						}
+						r, err := readWriteRefusal(a.cfg.WriteRefusalFile, a.taskID)
+						if err != nil && !refusalReadFailed {
+							refusalReadFailed = true
+							log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
+						}
+						if refused = r; refused != nil {
+							// Stopped the way cancel stops it: closed stdin,
+							// SIGTERM to the process group, SIGKILL after
+							// KillGrace. The loop still drains its stdout and
+							// reaps it before the terminal below.
+							log.Info("the broker refused a write; stopping the harness",
+								"task", a.taskID, "rule", refused.rule, "verb", refused.verb)
+							proc.closeStdin()
+							proc.kill(a.cfg.KillGrace)
+						}
+					case EventInit:
+						a.harnessSession = ev.Session
+						a.harnessModel = ev.Model
+						log.Info("harness session started", "harnessSession", ev.Session, "model", a.harnessModel)
+						if ev.ModelDropped {
+							log.Warn("the init line's model is not a string; the usage parts carry no model", "task", a.taskID)
+						}
+					case EventThinking:
+						a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: ev.Text}, false)
+					case EventProgress:
+						a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
+					case EventActivity:
+						a.publishActivity(ctx, ev)
+					case EventResult:
+						// What the turn cost goes out first, whatever the turn
+						// decided: a delegating turn, a steered one and an errored
+						// one all read tokens.
+						a.publishUsage(ctx, ev.Telemetry)
+						if delegated {
+							log.Info("harness result after delegation ignored", "task", a.taskID)
+							continue
+						}
+						// Drain steers that raced this result: they were published
+						// while the task was working and must be delivered, not
+						// dropped (assertion 21). A driver that holds steers gets
+						// them after PrepareTurn, below, with the ones it held.
+						for drained := false; !drained; {
+							select {
+							case text := <-steerCh:
+								if holdSteers {
+									held = append(held, text)
+									continue
+								}
+								if err := proc.writeUser(text); err == nil {
+									pendingTurns++
+									log.Info("steer absorbed at turn boundary", "task", a.taskID)
+								} else {
+									log.Warn("steer write failed", "err", err)
+								}
+							default:
+								drained = true
+							}
+						}
+						pendingTurns--
+						// Another turn follows when a steer is held and the turn
+						// neither failed nor was ended by cancel or the deadline,
+						// whose kill is already on its way: the driver prepares
+						// that turn, then the oldest held steer goes onto stdin.
+						// One per boundary, so every turn the harness runs gets
+						// its own PrepareTurn; the rest wait for the next result.
+						if respawn != nil && holdSteers && len(held) > 0 && !ev.Failed && !canceled && !deadlineHit {
+							// One turn per process: this one ends here, and the
+							// steer starts the next process once it is gone.
+							nextPrompt, held = held[0], held[1:]
+							pendingTurns++
+							log.Info("turn ended; the held steer starts the next harness process", "task", a.taskID)
 							proc.closeStdin()
 							continue
 						}
-						text := held[0]
-						held = held[1:]
-						if err := proc.writeUser(text); err == nil {
-							pendingTurns++
-							log.Info("held steer written at turn boundary", "task", a.taskID)
-						} else {
-							// The adapter held it, so the adapter owns
-							// saying it never arrived.
-							log.Warn("held steer write failed; refusing it", "task", a.taskID, "err", err)
-							a.publishSteerRefusal(text, "")
+						if holdSteers && len(held) > 0 && !ev.Failed && !canceled && !deadlineHit {
+							if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
+								log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
+								sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+								proc.closeStdin()
+								continue
+							}
+							text := held[0]
+							held = held[1:]
+							if err := proc.writeUser(text); err == nil {
+								pendingTurns++
+								log.Info("held steer written at turn boundary", "task", a.taskID)
+							} else {
+								// The adapter held it, so the adapter owns
+								// saying it never arrived.
+								log.Warn("held steer write failed; refusing it", "task", a.taskID, "err", err)
+								a.publishSteerRefusal(text, "")
+							}
 						}
+						if ev.Failed {
+							sawResult = true
+							resultErr = ev.Token
+							resultText = ev.Text
+						} else if pendingTurns <= 0 {
+							sawResult = true
+							resultText = ev.Text
+						} else {
+							log.Info("turn result absorbed; steered turns pending",
+								"task", a.taskID, "pending", pendingTurns)
+							continue
+						}
+						// The deliverable (or the failure) is decided: close stdin
+						// so the harness wraps up and exits.
+						proc.closeStdin()
 					}
-					if ev.Failed {
-						sawResult = true
-						resultErr = ev.Token
-						resultText = ev.Text
-					} else if pendingTurns <= 0 {
-						sawResult = true
-						resultText = ev.Text
-					} else {
-						log.Info("turn result absorbed; steered turns pending",
-							"task", a.taskID, "pending", pendingTurns)
-						continue
-					}
-					// The deliverable (or the failure) is decided: close stdin
-					// so the harness wraps up and exits.
-					proc.closeStdin()
 				}
-			}
 
-		case text := <-steerCh:
-			if stopForAbandon() {
-				log.Info("steer for an abandoned task dropped", "task", a.taskID)
-				continue
-			}
-			if sawResult || exited || refused != nil {
-				// Post-deliverable steer: the deliverable is chosen and
-				// the harness is wrapping up, so this correction cannot be
-				// absorbed. The payload spec requires the refusal be
-				// VISIBLE - a non-final status-update carrying the task's
-				// current state, on the stream before the terminal event -
-				// because the alternative is that a message the user typed
-				// disappears with nothing anywhere saying so. Nothing else
-				// marks this window: the choice of deliverable is
-				// adapter-internal.
-				log.Warn("steer after deliverable; refusing visibly", "task", a.taskID)
-				a.publishSteerRefusal(text, "")
-				continue
-			}
-			if holdSteers {
-				// Written after this turn's result and PrepareTurn.
-				held = append(held, text)
-				log.Info("steer held until the turn boundary", "task", a.taskID)
-				continue
-			}
-			if err := proc.writeUser(text); err != nil {
-				log.Warn("steer write failed", "task", a.taskID, "err", err)
-				continue
-			}
-			pendingTurns++
-			log.Info("steer forwarded onto harness stdin", "task", a.taskID)
+			case text := <-steerCh:
+				if stopForAbandon() {
+					log.Info("steer for an abandoned task dropped", "task", a.taskID)
+					continue
+				}
+				if sawResult || exited || refused != nil {
+					// Post-deliverable steer: the deliverable is chosen and
+					// the harness is wrapping up, so this correction cannot be
+					// absorbed. The payload spec requires the refusal be
+					// VISIBLE - a non-final status-update carrying the task's
+					// current state, on the stream before the terminal event -
+					// because the alternative is that a message the user typed
+					// disappears with nothing anywhere saying so. Nothing else
+					// marks this window: the choice of deliverable is
+					// adapter-internal.
+					log.Warn("steer after deliverable; refusing visibly", "task", a.taskID)
+					a.publishSteerRefusal(text, "")
+					continue
+				}
+				if holdSteers {
+					// Written after this turn's result and PrepareTurn.
+					held = append(held, text)
+					log.Info("steer held until the turn boundary", "task", a.taskID)
+					continue
+				}
+				if err := proc.writeUser(text); err != nil {
+					log.Warn("steer write failed", "task", a.taskID, "err", err)
+					continue
+				}
+				pendingTurns++
+				log.Info("steer forwarded onto harness stdin", "task", a.taskID)
 
-		case ask := <-delegateCh:
-			// One child at a time, and the turn ends on the first one. A
-			// request after the turn is decided (the harness's own result, an
-			// earlier delegation, cancel or the deadline) is refused rather than
-			// published: there is no turn left for it to belong to.
-			if delegated {
-				ask.reply <- delegateReply{Message: "a task is already delegated this turn"}
-				continue
-			}
-			// Cancel and the deadline end the turn when they fire, not when
-			// the harness finally dies: a call in that window would publish
-			// a child and turn the canceled task into a completed one.
-			if sawResult || exited || canceled || deadlineHit || refused != nil || stopForAbandon() {
-				ask.reply <- delegateReply{Message: "this turn has already ended"}
-				continue
-			}
-			if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {
-				ask.reply <- delegateReply{Message: why}
-				continue
-			}
-			if err := a.publishDelegate(ctx, ask.req); err != nil {
-				log.Warn("delegate artifact publish failed", "task", a.taskID, "err", err)
-				ask.reply <- delegateReply{Message: "could not publish the delegation; try again"}
-				continue
-			}
-			delegated = true
-			line := delegatedTo(ask.req)
-			next := "; this turn ends now and the result arrives as your next turn"
-			if ask.req.IsBatch() {
-				next = "; this turn ends now and the results arrive together as your next turn"
-			}
-			ask.reply <- delegateReply{OK: true, Message: line + next}
-			log.Info("delegation published; ending the turn", "task", a.taskID, "tasks", len(ask.req.Entries()), "delegated", line)
-			sawResult, resultErr, resultText = true, "", line
-			// End the harness the way cancel does: closed stdin, SIGTERM to
-			// the process group, SIGKILL after KillGrace. Whatever it does
-			// next cannot change the deliverable, so waiting on it only
-			// spends model time; the loop still drains its stdout and reaps
-			// it before the terminal decision below.
-			proc.closeStdin()
-			proc.kill(a.cfg.KillGrace)
+			case ask := <-delegateCh:
+				// One child at a time, and the turn ends on the first one. A
+				// request after the turn is decided (the harness's own result, an
+				// earlier delegation, cancel or the deadline) is refused rather than
+				// published: there is no turn left for it to belong to.
+				if delegated {
+					ask.reply <- delegateReply{Message: "a task is already delegated this turn"}
+					continue
+				}
+				// Cancel and the deadline end the turn when they fire, not when
+				// the harness finally dies: a call in that window would publish
+				// a child and turn the canceled task into a completed one.
+				if sawResult || exited || canceled || deadlineHit || refused != nil || stopForAbandon() {
+					ask.reply <- delegateReply{Message: "this turn has already ended"}
+					continue
+				}
+				if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {
+					ask.reply <- delegateReply{Message: why}
+					continue
+				}
+				if err := a.publishDelegate(ctx, ask.req); err != nil {
+					log.Warn("delegate artifact publish failed", "task", a.taskID, "err", err)
+					ask.reply <- delegateReply{Message: "could not publish the delegation; try again"}
+					continue
+				}
+				delegated = true
+				line := delegatedTo(ask.req)
+				next := "; this turn ends now and the result arrives as your next turn"
+				if ask.req.IsBatch() {
+					next = "; this turn ends now and the results arrive together as your next turn"
+				}
+				ask.reply <- delegateReply{OK: true, Message: line + next}
+				log.Info("delegation published; ending the turn", "task", a.taskID, "tasks", len(ask.req.Entries()), "delegated", line)
+				sawResult, resultErr, resultText = true, "", line
+				// End the harness the way cancel does: closed stdin, SIGTERM to
+				// the process group, SIGKILL after KillGrace. Whatever it does
+				// next cannot change the deliverable, so waiting on it only
+				// spends model time; the loop still drains its stdout and reaps
+				// it before the terminal decision below.
+				proc.closeStdin()
+				proc.kill(a.cfg.KillGrace)
 
-		case reason := <-a.abandon:
-			// The dispatcher took the task back (deadline, lease expiry, a
-			// stop) and writes its terminal. Publishing one here too would
-			// put two finals on the task, so the harness is killed and
-			// nothing more goes out.
-			a.mu.Lock()
-			a.abandonSeen, a.abandonReason = true, reason
-			a.mu.Unlock()
-			stopForAbandon()
+			case reason := <-a.abandon:
+				// The dispatcher took the task back (deadline, lease expiry, a
+				// stop) and writes its terminal. Publishing one here too would
+				// put two finals on the task, so the harness is killed and
+				// nothing more goes out.
+				a.mu.Lock()
+				a.abandonSeen, a.abandonReason = true, reason
+				a.mu.Unlock()
+				stopForAbandon()
 
-		case <-cancelCh:
-			if canceled {
-				continue
-			}
-			canceled = true
-			log.Info("cancel received; killing harness", "task", a.taskID)
-			proc.kill(a.cfg.KillGrace)
+			case <-cancelCh:
+				if canceled {
+					continue
+				}
+				canceled = true
+				log.Info("cancel received; killing harness", "task", a.taskID)
+				proc.kill(a.cfg.KillGrace)
 
-		case <-deadline.C:
-			deadlineHit = true
-			proc.kill(a.cfg.KillGrace)
+			case <-deadline.C:
+				deadlineHit = true
+				proc.kill(a.cfg.KillGrace)
 
-		case <-ctx.Done():
-			// Eviction: kubelet SIGTERM landed. Flush what the harness
-			// already produced, state the reason honestly, exit 143.
-			proc.kill(0)
-			// The dispatcher already wrote an abandoned task's terminal,
-			// whether its abandon was taken first or is waiting beside the
-			// SIGTERM.
-			if a.abandoned() {
-				return Result{Abandoned: true}, nil
-			}
-			// A turn that delegated has its deliverable already: the
-			// one-line result. The SIGTERM is not a failure of it, and is
-			// expected: a child that ends fast wakes the session, and a
-			// wake the gateway could not route to this pod starts a fresh
-			// incarnation that retires it while the harness is still
-			// inside KillGrace.
-			refuseHeld()
-			if delegated {
-				return a.completeWith(resultText)
-			}
-			// Nor is it a failure of a task already stopped at a write
-			// refusal: that refusal is its end.
-			if refused != nil {
-				return a.endRefused(refused)
-			}
-			state := lib.StateFailed
-			err := a.finalize(state, a.evictedReason(), resultText)
-			return Result{State: state, Evicted: true}, err
+			case <-ctx.Done():
+				// Eviction: kubelet SIGTERM landed. Flush what the harness
+				// already produced, state the reason honestly, exit 143.
+				proc.kill(0)
+				// The dispatcher already wrote an abandoned task's terminal,
+				// whether its abandon was taken first or is waiting beside the
+				// SIGTERM.
+				if a.abandoned() {
+					return Result{Abandoned: true}, nil
+				}
+				// A turn that delegated has its deliverable already: the
+				// one-line result. The SIGTERM is not a failure of it, and is
+				// expected: a child that ends fast wakes the session, and a
+				// wake the gateway could not route to this pod starts a fresh
+				// incarnation that retires it while the harness is still
+				// inside KillGrace.
+				refuseHeld()
+				if delegated {
+					return a.completeWith(resultText)
+				}
+				// Nor is it a failure of a task already stopped at a write
+				// refusal: that refusal is its end.
+				if refused != nil {
+					return a.endRefused(refused)
+				}
+				state := lib.StateFailed
+				err := a.finalize(state, a.evictedReason(), resultText)
+				return Result{State: state, Evicted: true}, err
 
-		case reap := <-waitDone:
-			exited = true
-			waitErr, reapTook = reap.err, reap.took
-			waitDone = nil
+			case reap := <-waitDone:
+				exited = true
+				waitErr, reapTook = reap.err, reap.took
+				waitDone = nil
+			}
 		}
+
+		// Respawn mode: the process that took the last turn is gone, with
+		// everything it started. Unless the task ended meanwhile, prepare the next
+		// turn and start it on a fresh process.
+		if nextPrompt == "" {
+			break
+		}
+		prompt := nextPrompt
+		nextPrompt = ""
+		if sawResult || canceled || deadlineHit || a.abandoned() {
+			// The task ended while the last process wound down; the steer it
+			// took never ran.
+			a.publishSteerRefusal(prompt, "")
+			break
+		}
+		if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
+			log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
+			sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+			a.publishSteerRefusal(prompt, "")
+			break
+		}
+		next, err := respawn(prompt, a.cfg.TaskDeadline-time.Since(started))
+		if err != nil {
+			log.Warn("starting the next harness process failed; ending the task", "task", a.taskID, "err", err)
+			sawResult, resultErr, resultText = true, "spawn-failed"+reasonDetailSeparator+err.Error(), ""
+			a.publishSteerRefusal(prompt, "")
+			break
+		}
+		log.Info("held steer started a fresh harness process", "task", a.taskID)
+		proc = next
+		events, exited, waitErr, reapTook = proc.events, false, nil, 0
+		startReap(proc)
 	}
 
 	// Steers held for a turn that never came: the task ended first. Each is

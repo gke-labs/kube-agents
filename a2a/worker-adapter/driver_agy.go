@@ -5,12 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+	"github.com/gke-labs/kube-agents/a2a/worker-adapter/isolation"
 )
 
 // agyDriver is the Antigravity CLI (`agy`) driver (#6709): its headless
@@ -35,13 +40,71 @@ import (
 //   - result.usage is cumulative over the process, so the decoder reports
 //     each result's difference from the last.
 //
-// Its MCP configuration (#6712), permissions (#6711), workspace and HOME
-// isolation (#6710) and model routing (#6714) are other sub-issues of
-// #6707; until they land the driver configures no MCP server and prepares
-// nothing before a turn.
-type agyDriver struct{}
+// Before every agy process starts, the first included, PrepareTurn clears
+// agy's configuration entries from the workspace and its conversation
+// directories (the isolation package, #6710), and agy takes one user turn
+// per process (RestartsPerTurn), so nothing an earlier turn started is
+// still running when that happens. Its MCP configuration (#6712),
+// permissions (#6711) and model routing (#6714) are other sub-issues of
+// #6707; until they land the driver configures no MCP server.
+type agyDriver struct {
+	// iso picks the isolation table from the agy binary's version. Nil
+	// means the binary is unknown, and every turn is refused.
+	iso *agyIsolation
+}
 
 var _ Driver = agyDriver{}
+
+// NewAgyDriver is the driver for the agy binary at bin, whose version
+// chooses the isolation table on the first PrepareTurn.
+func NewAgyDriver(bin string) agyDriver {
+	return agyDriver{iso: &agyIsolation{bin: bin}}
+}
+
+// agyIsolation reads the agy binary's version once and keeps the table, or
+// the error, for every later turn.
+type agyIsolation struct {
+	bin   string
+	once  sync.Once
+	table isolation.Table
+	err   error
+}
+
+// agyVersionTimeout bounds `agy --version`.
+const agyVersionTimeout = 30 * time.Second
+
+func (i *agyIsolation) resolve(ctx context.Context) (isolation.Table, error) {
+	i.once.Do(func() { i.table, i.err = readAgyTable(ctx, i.bin) })
+	return i.table, i.err
+}
+
+// readAgyTable runs `agy --version` from an empty directory with an empty
+// HOME and a bare environment, so reading the version loads no workspace
+// or HOME configuration, and picks the table for exactly that version.
+func readAgyTable(ctx context.Context, bin string) (isolation.Table, error) {
+	if bin == "" {
+		return isolation.Table{}, errors.New("no agy binary named")
+	}
+	dir, err := os.MkdirTemp("", "agy-version-")
+	if err != nil {
+		return isolation.Table{}, err
+	}
+	defer os.RemoveAll(dir)
+	ctx, cancel := context.WithTimeout(ctx, agyVersionTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- the configured harness binary, no shell
+	cmd.Dir = dir
+	cmd.Env = []string{"HOME=" + dir, "PATH=/usr/local/bin:/usr/bin:/bin"}
+	out, err := cmd.Output()
+	if err != nil {
+		return isolation.Table{}, fmt.Errorf("agy --version: %w", err)
+	}
+	return isolation.ForVersion(string(out))
+}
+
+// otherProcesses lists the live processes in the pid namespace besides the
+// adapter (leftovers_linux.go); a variable so a test can scope it.
+var otherProcesses = listOtherProcesses
 
 // agyResumeFlag continues an agy conversation by id.
 const agyResumeFlag = "--conversation"
@@ -106,7 +169,88 @@ func (agyDriver) ConfiguresMCP([]string) bool { return false }
 // included, lives under $HOME/.gemini.
 func (agyDriver) ConfigDirEnv(dir string) string { return "HOME=" + dir }
 
-func (agyDriver) PrepareTurn(context.Context, TurnDirs) error { return nil }
+// PrepareTurn runs before every agy process starts. It refuses unless the
+// adapter is the container's init and no other process is alive: as pid 1
+// the adapter's killLeftovers ends every process in the namespace after a
+// harness exits, setsid'd ones included, so anything still alive here is
+// outside what that kill reaches (another user's, or a namespace shared
+// with other containers) and could still write. Then it clears agy's
+// configuration entries from the workspace and every conversation
+// directory under HOME, logging each one it removes.
+func (d agyDriver) PrepareTurn(ctx context.Context, dirs TurnDirs) error {
+	if d.iso == nil {
+		return errors.New("the agy binary is not known, so no isolation table applies")
+	}
+	table, err := d.iso.resolve(ctx)
+	if err != nil {
+		return err
+	}
+	if pid := adapterPID(); pid != containerInitPID {
+		return fmt.Errorf("agy needs the adapter as the container's init (pid %d, not %d) to end each turn's processes", containerInitPID, pid)
+	}
+	others, err := otherProcesses()
+	if err != nil {
+		return fmt.Errorf("checking for processes left from an earlier turn: %w", err)
+	}
+	if len(others) > 0 {
+		return fmt.Errorf("%d processes outlived the last turn (pids %v)", len(others), others)
+	}
+	removed, err := table.PrepareTurn(dirs.Workspace, dirs.Home)
+	for _, p := range removed {
+		slog.Warn("removed a harness configuration entry before the turn", "path", p)
+	}
+	return err
+}
+
+const (
+	// agyPrintTimeoutFlag bounds agy's wall clock for one user message. Its
+	// value is a Go duration. On expiry agy ends the turn with a result whose
+	// finished_reason is print_timeout, which the driver fails with the
+	// print-timeout reason.
+	agyPrintTimeoutFlag = "--print-timeout"
+	// agyPrintTimeoutMargin is how far below the turn budget agy's own bound
+	// sits, so agy writes its result before the adapter's deadline. agy
+	// retries a failing model call five times, about 50s, before its ERROR
+	// result; a tighter margin turns a gateway error into a print-timeout.
+	agyPrintTimeoutMargin = 60 * time.Second
+	// agyMinPrintTimeout is the floor: a turn budget at or below the margin
+	// plus the floor (120s), as in tests with a short deadline, gets 60s,
+	// and there the adapter's own deadline may end the turn first.
+	agyMinPrintTimeout = 60 * time.Second
+)
+
+// AgyPrintTimeout is a turn budget less agyPrintTimeoutMargin, and never
+// below agyMinPrintTimeout.
+func AgyPrintTimeout(budget time.Duration) time.Duration {
+	if d := budget - agyPrintTimeoutMargin; d > agyMinPrintTimeout {
+		return d
+	}
+	return agyMinPrintTimeout
+}
+
+// WithTurnBudget sets agy's --print-timeout from left, the time this
+// process has before the adapter stops it: the task's remaining deadline
+// less the kill grace. Every agy process gets its own (one user turn per
+// process, RestartsPerTurn), so a later turn's bound is what is left, not
+// the whole task's. Any earlier --print-timeout in argv is replaced.
+func (agyDriver) WithTurnBudget(argv []string, left time.Duration) []string {
+	out := make([]string, 0, len(argv)+2)
+	for i := 0; i < len(argv); i++ {
+		switch {
+		case argv[i] == agyPrintTimeoutFlag:
+			i++ // and its value
+		case strings.HasPrefix(argv[i], agyPrintTimeoutFlag+"="):
+		default:
+			out = append(out, argv[i])
+		}
+	}
+	return append(out, agyPrintTimeoutFlag, AgyPrintTimeout(left).String())
+}
+
+// RestartsPerTurn is true: each user turn gets a fresh agy process, so a
+// process an earlier turn left running cannot write between PrepareTurn
+// and the next turn's start.
+func (agyDriver) RestartsPerTurn() bool { return true }
 
 // HoldsSteers is true: agy answers each stdin message as its own turn, and
 // holding a steer to the boundary is where PrepareTurn can act before the

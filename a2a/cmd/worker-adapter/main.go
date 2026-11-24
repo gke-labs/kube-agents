@@ -467,7 +467,6 @@ func harnessCommand() []string {
 		disallowed: disallowed,
 		prompts:    prompts,
 		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
-		turnBudget: harnessTurnBudget(),
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
@@ -502,22 +501,11 @@ func profileHarnessCommand() []string {
 		maxTurns = defaultMaxTurns
 	}
 	return activeHarness.command(harnessSpec{
-		path:       path,
-		model:      model,
-		maxTurns:   maxTurns,
-		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
-		turnBudget: harnessTurnBudget(),
+		path:     path,
+		model:    model,
+		maxTurns: maxTurns,
+		extra:    strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
 	})
-}
-
-// harnessTurnBudget is harnessSpec.turnBudget from the same variables
-// Config.TaskDeadline and Config.KillGrace read. A profile worker's task
-// deadline comes from its offer and can be shorter; the adapter's own
-// deadline still bounds that task, and only the harness's clean ending is
-// lost.
-func harnessTurnBudget() time.Duration {
-	return envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds) -
-		envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds)
 }
 
 // delegateToolEnabled is the delegate tool's single switch: everything that
@@ -735,7 +723,25 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	if builder.defaultPath() == "" && getenv("A2A_HARNESS_PATH") == "" && getenv("A2A_HARNESS_CMD") == "" {
 		return "", nil, nil, fmt.Errorf("harness %q has no default path in this image; set A2A_HARNESS_PATH", driver.Harness())
 	}
+	if driver.Harness() == persona.Antigravity {
+		// The agy driver picks its isolation table from this binary's
+		// version, so it is built knowing the binary, never as a zero value.
+		driver = workeradapter.NewAgyDriver(harnessBinary(getenv, builder))
+	}
 	return driver.Harness(), driver, builder, nil
+}
+
+// harnessBinary is the harness executable the worker will run: the named
+// path, else the first field of a test's whole-argv override, else the
+// builder's default.
+func harnessBinary(getenv func(string) string, builder harnessBuilder) string {
+	if p := getenv("A2A_HARNESS_PATH"); p != "" {
+		return p
+	}
+	if f := strings.Fields(getenv("A2A_HARNESS_CMD")); len(f) > 0 {
+		return f[0]
+	}
+	return builder.defaultPath()
 }
 
 // builderFor is the argv and env builder for a harness that has a driver. A

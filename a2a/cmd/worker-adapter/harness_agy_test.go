@@ -17,22 +17,21 @@ import (
 )
 
 // TestAgysArgvIsItsHeadlessStreamJSONMode: agy's print switch takes a value
-// (`-p=`), the message comes on stdin as stream-json, and --print-timeout
-// sits a margin below the turn budget so agy ends the turn with a result
-// before the adapter stops it. A2A_HARNESS_EXTRA_ARGS still appends.
+// (`-p=`) and the message comes on stdin as stream-json.
+// A2A_HARNESS_EXTRA_ARGS still appends. --print-timeout is not the
+// builder's: the driver sets it for each process from the time left
+// (agyDriver.WithTurnBudget).
 func TestAgysArgvIsItsHeadlessStreamJSONMode(t *testing.T) {
 	got := agyBuilder{}.command(harnessSpec{
-		path:       "/opt/agy/bin/agy",
-		model:      "ignored",
-		maxTurns:   "40",
-		turnBudget: 1790 * time.Second,
-		extra:      []string{"--debug"},
+		path:     "/opt/agy/bin/agy",
+		model:    "ignored",
+		maxTurns: "40",
+		extra:    []string{"--debug"},
 	})
 	want := []string{
 		"/opt/agy/bin/agy", "-p=",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
-		"--print-timeout", "28m50s",
 		"--debug",
 	}
 	if !slices.Equal(got, want) {
@@ -54,7 +53,6 @@ func TestAgysArgvCarriesNoneOfClaudeCodesPolicy(t *testing.T) {
 		disallowed: "Write",
 		delegate:   &delegateServer{command: "/self", socket: "/run/s.sock"},
 		prompts:    []string{"a prompt"},
-		turnBudget: time.Hour,
 	})
 	for _, a := range got {
 		for _, bad := range []string{"--allowedTools", "--disallowedTools", "--mcp-config", "--append-system-prompt",
@@ -64,42 +62,6 @@ func TestAgysArgvCarriesNoneOfClaudeCodesPolicy(t *testing.T) {
 				t.Errorf("agy's argv %q carries Claude Code's %q", got, bad)
 			}
 		}
-	}
-}
-
-// TestAgysPrintTimeoutHasAFloor: a turn budget at or below the margin plus
-// the floor (120s), as in a test with a short deadline, gets the floor; the
-// adapter's own deadline may end such a turn first.
-func TestAgysPrintTimeoutHasAFloor(t *testing.T) {
-	for _, c := range []struct {
-		budget, want time.Duration
-	}{
-		{1790 * time.Second, 1730 * time.Second},
-		{121 * time.Second, 61 * time.Second},
-		{120 * time.Second, time.Minute},
-		{90 * time.Second, time.Minute},
-		{30 * time.Second, time.Minute},
-		{0, time.Minute},
-		{-time.Second, time.Minute},
-	} {
-		if got := agyPrintTimeout(c.budget); got != c.want {
-			t.Errorf("agyPrintTimeout(%v) = %v, want %v", c.budget, got, c.want)
-		}
-	}
-}
-
-// TestTheTurnBudgetFollowsTheDeadlineVariables: the budget is the task
-// deadline less the kill grace, read from the variables Config reads.
-func TestTheTurnBudgetFollowsTheDeadlineVariables(t *testing.T) {
-	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "")
-	t.Setenv("A2A_KILL_GRACE_SECONDS", "")
-	if got, want := harnessTurnBudget(), (defaultTaskDeadlineSeconds-defaultKillGraceSeconds)*time.Second; got != want {
-		t.Errorf("default budget %v, want %v", got, want)
-	}
-	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "600")
-	t.Setenv("A2A_KILL_GRACE_SECONDS", "20")
-	if got := harnessTurnBudget(); got != 580*time.Second {
-		t.Errorf("budget %v, want 9m40s", got)
 	}
 }
 
@@ -144,7 +106,13 @@ cat "` + fixture + `"
 		t.Fatal(err)
 	}
 	var driver workeradapter.Driver = mustDriver(t, persona.Antigravity)
-	argv := driver.WithResume(agyBuilder{}.command(harnessSpec{path: stub, turnBudget: 1790 * time.Second}), "conv-1")
+	budgeted, ok := driver.(interface {
+		WithTurnBudget([]string, time.Duration) []string
+	})
+	if !ok {
+		t.Fatal("the agy driver sets no turn budget")
+	}
+	argv := driver.WithResume(budgeted.WithTurnBudget(agyBuilder{}.command(harnessSpec{path: stub}), 1790*time.Second), "conv-1")
 	in, err := driver.EncodeUser("say pong")
 	if err != nil {
 		t.Fatal(err)
@@ -191,28 +159,28 @@ func mustDriver(t *testing.T, h persona.Harness) workeradapter.Driver {
 	return d
 }
 
-// TestAgysArgvTakesItsTimeoutFromTheDeadlineVariables: both argv call sites,
-// a session pod's (harnessCommand) and a profile worker's base argv
-// (profileHarnessCommand), hand agy a --print-timeout from
-// A2A_TASK_DEADLINE_SECONDS and A2A_KILL_GRACE_SECONDS, not the floor.
-func TestAgysArgvTakesItsTimeoutFromTheDeadlineVariables(t *testing.T) {
+// TestAgysArgvLeavesItsTimeoutToTheDriver: neither argv call site, a
+// session pod's (harnessCommand) nor a profile worker's base argv
+// (profileHarnessCommand), carries --print-timeout. The adapter has the
+// driver set it on each process from the time left on that task's deadline
+// less the kill grace (agyDriver.WithTurnBudget); a bound fixed here at
+// startup would give a later turn's process the whole task's time, and a
+// profile task with a shorter offered deadline a bound past it.
+func TestAgysArgvLeavesItsTimeoutToTheDriver(t *testing.T) {
 	was := activeHarness
 	t.Cleanup(func() { activeHarness = was })
 	activeHarness = agyBuilder{}
 	t.Setenv("A2A_HARNESS_CMD", "")
 	t.Setenv("A2A_HARNESS_PATH", "/opt/agy/bin/agy")
 	t.Setenv("A2A_HARNESS_EXTRA_ARGS", "")
-	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "600")
-	t.Setenv("A2A_KILL_GRACE_SECONDS", "20")
-	// 600s - 20s - 60s margin.
-	const want = "8m40s"
 	for name, argv := range map[string][]string{
 		"harnessCommand":        harnessCommand(),
 		"profileHarnessCommand": profileHarnessCommand(),
 	} {
-		i := slices.Index(argv, "--print-timeout")
-		if i < 0 || i+1 >= len(argv) || argv[i+1] != want {
-			t.Errorf("%s argv %q, want --print-timeout %s", name, argv, want)
+		for _, a := range argv {
+			if strings.HasPrefix(a, "--print-timeout") {
+				t.Errorf("%s argv %q carries %s; the driver sets it per process", name, argv, a)
+			}
 		}
 	}
 }

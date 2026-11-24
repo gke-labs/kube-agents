@@ -226,7 +226,7 @@ func runAgyTask(t *testing.T, session, taskID string, harness []string) (runOutc
 	c := testClient(t, url)
 	submit(t, c, session, taskID, "say pong")
 	cfg := adapterConfig(url, taskID, session, harness)
-	cfg.Driver = agyDriver{}
+	useAgyTestDriver(t, &cfg)
 	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
 	return out, replayEvents(t, url, session, taskID), foldTask(t, c, session, taskID)
 }
