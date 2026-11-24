@@ -58,6 +58,12 @@ func withModel(t *testing.T, m llm.LLM) {
 // runTurn runs one harness process's turn in dir and returns its lines.
 func runTurn(t *testing.T, dir string, env coreagentwire.Envelope) []coreagentwire.Event {
 	t.Helper()
+	return runTurnWith(t, dir, env)
+}
+
+// runTurnWith is runTurn with extra harness flags.
+func runTurnWith(t *testing.T, dir string, env coreagentwire.Envelope, flags ...string) []coreagentwire.Event {
+	t.Helper()
 	in, err := json.Marshal(env)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +74,7 @@ func runTurn(t *testing.T, dir string, env coreagentwire.Envelope) []coreagentwi
 	}
 	defer os.Chdir(wd)
 	var out, errOut bytes.Buffer
-	if code := run(context.Background(), []string{"--model", "gemini-2.5-flash"}, bytes.NewReader(in), &out, &errOut); code != 0 {
+	if code := run(context.Background(), append([]string{"--model", "gemini-2.5-flash"}, flags...), bytes.NewReader(in), &out, &errOut); code != 0 {
 		t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
 	}
 	var evs []coreagentwire.Event

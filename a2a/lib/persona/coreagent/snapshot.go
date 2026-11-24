@@ -105,7 +105,11 @@ func (s *snapshot) dir(name string, depth int) error {
 			if err != nil {
 				return err
 			}
-			s.skills[p[len(SkillsDir)+1:]] = &fstest.MapFile{Data: data, Mode: 0o444}
+			mode := fs.FileMode(0o444)
+			if info.Mode()&0o111 != 0 {
+				mode = 0o555
+			}
+			s.skills[p[len(SkillsDir)+1:]] = &fstest.MapFile{Data: data, Mode: mode}
 		}
 	}
 	return nil

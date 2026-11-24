@@ -229,3 +229,21 @@ func grantedTools(grants []string, server string) ([]string, bool) {
 func DelegateServer(self string, env map[string]string) persona.MCPServer {
 	return persona.MCPServer{Name: persona.ReservedServer, Command: self, Args: []string{"delegate-mcp"}, Env: maps.Clone(env), Tools: []string{"delegate"}}
 }
+
+// ScriptPaths are the absolute paths, under personaDir, of a rendering's
+// executable skill files: the only commands the harness's shell may run from
+// the persona, each directly by its path. A path outside personaDir's skills
+// directory, or one that isn't clean, is refused.
+func ScriptPaths(out persona.Output, personaDir string) ([]string, error) {
+	var paths []string
+	for _, f := range out.Files {
+		if !f.Executable {
+			continue
+		}
+		if path.Clean(f.Path) != f.Path || !strings.HasPrefix(f.Path, SkillsDir+"/") || strings.Count(f.Path, "/") < 2 {
+			return nil, fmt.Errorf("%s: an executable outside a skill's directory", f.Path)
+		}
+		paths = append(paths, path.Join(personaDir, f.Path))
+	}
+	return paths, nil
+}
