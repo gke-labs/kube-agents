@@ -6,6 +6,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // The inject door's chat.notify route (lib.NotifySubjectInject) is granted
@@ -251,5 +255,56 @@ func TestInjectNotifyFlagLeavesTheOtherNotifyGrantsAlone(t *testing.T) {
 	}
 	if !reflect.DeepEqual(offLines, onLines) {
 		t.Errorf("nats.conf differs with the flag on beyond the inject notify lines")
+	}
+}
+
+// TestInjectInTheConversationsListOnlyWithTheEvalFlag holds the agent side's
+// switch: A2A_NOTIFY_CONVERSATIONS names inject (last) only under the eval
+// flag, on the agent container and on the bridge, which inherits it and
+// records an inject conversation's route only when it is named
+// (a2a/hermes-bridge/route.go, InjectRouteFromEnv). It is never in
+// A2A_NOTIFY_PLATFORM: the inject route takes no home posts.
+func TestInjectInTheConversationsListOnlyWithTheEvalFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent func() *agentv1alpha1.PlatformAgent
+		off   string // A2A_NOTIFY_CONVERSATIONS with the flag off, "" for absent
+	}{
+		{"no chat backend", provisionedAgent, ""},
+		{"chat and slack", func() *agentv1alpha1.PlatformAgent { return chatAndSlackTestAgent("next") }, "google_chat,slack"},
+	} {
+		for _, flag := range []string{"", "true"} {
+			t.Run(tc.name+"/flag="+flag, func(t *testing.T) {
+				t.Setenv(a2aInjectBackendEnvVar, flag)
+				want := tc.off
+				if flag == "true" {
+					want = strings.TrimPrefix(tc.off+","+a2aNotifyPlatformInject, ",")
+				}
+				pod := bridgeTestPod(tc.agent())
+				containers := map[string]corev1.Container{"platform-agent": *brokerContainerNamed(pod.Spec.Containers, "platform-agent")}
+				if b := containersNamed(pod, a2aBridgeContainerName); len(b) == 1 {
+					containers[a2aBridgeContainerName] = b[0]
+				} else {
+					t.Fatalf("got %d bridge containers, want 1", len(b))
+				}
+				for name, c := range containers {
+					env := envIndex(c)
+					got, ok := env[a2aNotifyConversationsEnvVar]
+					if ok != (want != "") || got.Value != want {
+						t.Errorf("%s: %s = %q (present %v), want %q", name, a2aNotifyConversationsEnvVar, got.Value, ok, want)
+					}
+					if p := env[a2aNotifyPlatformEnvVar].Value; strings.Contains(p, a2aNotifyPlatformInject) {
+						t.Errorf("%s: %s = %q names inject; the inject route takes no home posts", name, a2aNotifyPlatformEnvVar, p)
+					}
+					if flag != "true" {
+						for _, e := range c.Env {
+							if strings.Contains(e.Value, a2aNotifyPlatformInject) && e.Name != a2aInjectBackendEnvVar {
+								t.Errorf("%s: %s = %q names inject with the eval flag off", name, e.Name, e.Value)
+							}
+						}
+					}
+				}
+			})
+		}
 	}
 }

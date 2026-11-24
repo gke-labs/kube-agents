@@ -291,12 +291,14 @@ func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
 		// The executor (a2a/hermes-bridge/api.go): a turn in the
 		// conversation's session through the pod's API server by default,
 		// BRIDGE_EXECUTOR=cli for the subprocess per task.
-		Executor:       bridgeExecutor(log),
-		APIURL:         envOr("BRIDGE_API_URL", hermesbridge.DefaultAPIURL),
-		APIModel:       envOr("BRIDGE_API_MODEL", hermesbridge.DefaultAPIModel),
-		APIKey:         os.Getenv(apiServerKeyEnv),
-		RouteURL:       envOr("BRIDGE_ROUTE_URL", hermesbridge.DefaultRouteURL),
-		RouteKey:       os.Getenv(hermesbridge.RouteKeyEnv),
+		Executor: bridgeExecutor(log),
+		APIURL:   envOr("BRIDGE_API_URL", hermesbridge.DefaultAPIURL),
+		APIModel: envOr("BRIDGE_API_MODEL", hermesbridge.DefaultAPIModel),
+		APIKey:   os.Getenv(apiServerKeyEnv),
+		RouteURL: envOr("BRIDGE_ROUTE_URL", hermesbridge.DefaultRouteURL),
+		RouteKey: os.Getenv(hermesbridge.RouteKeyEnv),
+		// Inject door routes, on an eval install alone (route.go).
+		InjectRoute:    hermesbridge.InjectRouteFromEnv(),
 		ActivitySecret: os.Getenv(hermesbridge.ActivitySecretEnv),
 		Logger:         log,
 		// The card stop's request to the same session-kv server

@@ -744,6 +744,9 @@ const (
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"
 	a2aNotifyPlatformSlack  = "slack"
+	// a2aNotifyPlatformInject is the inject door's (lib.NotifyPlatformInject),
+	// named in A2A_NOTIFY_CONVERSATIONS under the eval flag alone.
+	a2aNotifyPlatformInject = "inject"
 	// The agent reads A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS as
 	// comma-separated lists of the platform names above.
 	a2aNotifyPlatformSeparator = ","
@@ -1758,6 +1761,17 @@ func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	}
 	if a2aTeamsNotifyArmed(agent) {
 		platforms = append(platforms, a2aNotifyPlatformTeams)
+	}
+	// The inject door's route (chat.notify.inject), last and only on an eval
+	// install: the gateway serves it only with the door armed, and the
+	// operator grants it only under the same flag (a2aInjectNotifyGrants).
+	// Naming it here is what arms the agent side: the kanban notifier's
+	// conversation stand-in and Hermes's inject platform, and the bridge's
+	// recording of an inject conversation's route (the bridge inherits this
+	// variable). Conversations only: the agent's home-post fallback leaves
+	// it out (chat_notify.CONVERSATION_ONLY_PLATFORMS).
+	if a2aInjectBackendEnabled() {
+		platforms = append(platforms, a2aNotifyPlatformInject)
 	}
 	return platforms
 }

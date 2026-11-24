@@ -2144,8 +2144,17 @@ same flag. On any other install nothing subscribes to the subject and no princip
 it, so a card on an inject conversation is refused by the bus, which the kanban notifier counts
 as a failed send like any refused notify. The agent side reaches it as platform `inject`
 (`lib.NotifyPlatformInject`, `a2a notify --platform inject`) and the conversation prefix
-`inject:` in the kanban notifier and the session-kv route store; a card on an inject conversation
-goes out only where `A2A_NOTIFY_CONVERSATIONS` names `inject`.
+`inject:` in the kanban notifier and the session-kv route store, all armed by one switch: under
+`A2A_INJECT_BACKEND` the operator names `inject`, last, in `A2A_NOTIFY_CONVERSATIONS` (never in
+`A2A_NOTIFY_PLATFORM`). With it named, the hermes-bridge, which inherits the variable, records an
+inject conversation's route with the turn's task (`InjectRouteFromEnv`); the kanban notify patch
+registers an `inject` platform with Hermes as it registers the console's; `kanban_event_routing`
+addresses the card to `inject:<key>#<task>` (always suffixed, the task possibly empty, and split
+on the last `#`, since an inject key may contain one); and the notifier sends it with
+`--reply-to`, so the gateway keeps the report by root. The agent's home-post fallback to every
+armed route leaves `inject` out (`CONVERSATION_ONLY_PLATFORMS` in `chat_notify.py` and
+`kanban_chat_notify.py`): the route serves conversations only. Without the variable naming it,
+none of this happens.
 
 The gateway keeps each report the route posts into a conversation for the reply under it: a post
 the kanban notifier marks as a card's report (`report`, `a2a notify --report`, set by

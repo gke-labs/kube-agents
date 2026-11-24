@@ -522,6 +522,71 @@ class ResolveTest(unittest.TestCase):
         self.assertIsNone(entry.adapter_factory(None))
 
 
+class InjectPlatformTest(unittest.TestCase):
+    """The eval inject door's agent side: armed only where A2A_NOTIFY_CONVERSATIONS names inject."""
+
+    def _registry(self):
+        registered = {}
+        registry = types.SimpleNamespace(
+            is_registered=lambda name: name in registered,
+            register=lambda entry: registered.__setitem__(entry.name, entry),
+        )
+        module = types.SimpleNamespace(PlatformEntry=lambda **kw: types.SimpleNamespace(**kw), platform_registry=registry)
+        return registered, module
+
+    def test_the_inject_platform_is_registered_only_where_the_list_names_it(self):
+        for listed in ("", "google_chat,slack", "console", "injected"):
+            registered, module = self._registry()
+            with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: listed}), \
+                    mock.patch.dict(sys.modules, {"gateway.platform_registry": module}):
+                kanban_chat_notify._register_conversation_platforms()
+            self.assertIn("console", registered, listed)
+            self.assertNotIn("inject", registered, listed)
+        registered, module = self._registry()
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack,inject"}), \
+                mock.patch.dict(sys.modules, {"gateway.platform_registry": module}):
+            kanban_chat_notify._register_conversation_platforms()
+        entry = registered.get("inject")
+        self.assertIsNotNone(entry, "inject was not registered")
+        self.assertEqual(entry.source, "builtin")
+        self.assertIsNone(entry.adapter_factory(None))
+
+    def test_an_inject_report_names_the_turn_it_answers(self):
+        adapter = kanban_chat_notify.ConversationNotifyAdapter(types.SimpleNamespace(value="inject"), _Runner())
+        with mock.patch.object(kanban_chat_notify, "conversation_context", return_value="ctx-1"):
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "inject:case#3#task-7"),
+                             ["--conversation", "inject:case#3", "--context", "ctx-1", "--reply-to", "task-7"])
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "inject:case-8#"),
+                             ["--conversation", "inject:case-8", "--context", "ctx-1"])
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "inject:case-9"),
+                             ["--conversation", "inject:case-9", "--context", "ctx-1"])
+
+    def test_inject_is_never_a_home_post_route(self):
+        # With no home channel anywhere, home posts go to every armed route;
+        # the inject door serves conversations only, so it is left out, in
+        # both copies of the rule.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"))
+        try:
+            import chat_notify
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(kanban_chat_notify.CONVERSATION_ONLY_PLATFORMS, chat_notify.CONVERSATION_ONLY_PLATFORMS)
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
+                                          kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack,inject"}), \
+                mock.patch.object(kanban_chat_notify, "_home_file_value", return_value=""), \
+                mock.patch.object(chat_notify, "home_file_value", return_value=""):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+            self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+            self.assertFalse(kanban_chat_notify.routes("inject"))
+            self.assertIn("inject", kanban_chat_notify.served_platforms())
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
+                                          kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "inject"}), \
+                mock.patch.object(kanban_chat_notify, "_home_file_value", return_value=""), \
+                mock.patch.object(chat_notify, "home_file_value", return_value=""):
+            self.assertEqual(kanban_chat_notify.routed_platforms(), [])
+            self.assertEqual(chat_notify.routed_platforms(), [])
+
+
 class _Proc:
     def __init__(self, returncode, out=b"", err=b""):
         self.returncode, self._out, self._err = returncode, out, err

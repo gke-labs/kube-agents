@@ -87,6 +87,13 @@ CONSOLE_PLATFORM = "console"
 #: --reply-to). '#' cannot occur in a console conversation's token, which is
 #: one DNS-1123 label.
 CONSOLE_THREAD_TASK_SEP = "#"
+#: The eval inject door's platform name on a conversation route
+#: (lib.NotifyPlatformInject). The bridge records such a route only on an eval
+#: install, and it is served only where NOTIFY_CONVERSATIONS_ENV names it. Its
+#: card's thread carries the turn's task as a console card's does, but always
+#: suffixed (``inject:<key>#<task>``, the task possibly empty): an inject key
+#: may itself contain '#', so the notifier splits on the last one.
+INJECT_PLATFORM = "inject"
 
 #: How long to wait for the routing database. The caller is holding a board
 #: transaction open, so this is deliberately short: losing the thread is better
@@ -169,6 +176,8 @@ def _conversation_route(session_id: str, metadata: Optional[dict[str, Any]]) -> 
     task_id = str(route.get("task_id") or "")
     if platform == CONSOLE_PLATFORM and task_id and CONSOLE_THREAD_TASK_SEP not in task_id:
         conversation += CONSOLE_THREAD_TASK_SEP + task_id
+    elif platform == INJECT_PLATFORM:
+        conversation += CONSOLE_THREAD_TASK_SEP + (task_id if CONSOLE_THREAD_TASK_SEP not in task_id else "")
     return platform, session_id, conversation
 
 
