@@ -1,28 +1,59 @@
-# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): a workload leaks
-# threads or zombie processes on a node pool with no pod PID limit (GKE's
-# default), takes the node's PID space, and the kubelet sets PIDPressure and
-# evicts. A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#5410, which proposes `node-pid-pressure`). The shape
-# already exists on the fleet and nothing new is planted: role
-# `multi-process-container`, Deployment multi-process-worker in seeded-shapes
-# on slot a, a shell supervisor forking two workers, on the default pool,
-# whose kubelet configuration sets no pod PID limit. The readiness rule
-# group-oom-kill and the case upgrades-fleet-readiness-multi-process-container
-# assert it is the fleet's only forking container, so no second forking plant
-# may land. The customer failure, kubelet PIDPressure and eviction, stays far
-# away: PIDPressure is kubelet-owned and cannot be planted, and exhaustion is
-# the fault. Two flip conditions: a check that reads a pool's kubelet
-# configuration for a pod PID limit against the multi-process workloads it
-# hosts (in this stream, or another, which edits `audit:` and `finding_check`
-# in the same diff) flips this case; a check keyed on the PIDPressure
-# condition or on pid_used reads nothing here. Domain `fleet-audits` as the
-# other GCE compute cases.
+# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): workloads leak
+# threads or processes until a node's process IDs run out, and the kubelet
+# sets PIDPressure and evicts. Parked as FIXTURE_NOT_READY
+# (gke-labs/kube-agents#5410; gke-labs/kube-agents#2581 plans the check as
+# `node-pid-pressure` and holds it): the shape that the case reads is not
+# shown as the fault and is the platform's default, and no fixture for the
+# node's own PIDPressure is on the fleet, so the case carries no suite line.
+# What live tests showed (2026-11-20 and 2026-11-21 UTC, scratch clusters, GKE
+# Standard 1.35.8, one run each): a pool has no pod PID limit by default, but
+# each container showed `pids.max = 629145`, 15 percent of the node's 4194304.
+# On an 8 GB node a shell that starts background jobs without end (`sleep 3600
+# &` in a loop), under a 2 GiB memory limit, took the node's count of process
+# IDs to 7414, then memory ran out; six thread-making processes in one
+# container took it to at least 96195 (one sample), then memory ran out;
+# neither made PIDPressure. Seven leaking containers on a 256 GB node used
+# 4194238 of 4194304 within about 30 seconds: the node reported PIDPressure,
+# got the taint `node.kubernetes.io/pid-pressure`, the kubelet evicted one of
+# the seven, and the node read NotReady for between 17 and 77 seconds.
+# PIDPressure can be made on purpose (a privileged pod that lowers
+# `kernel.pid_max` on one node); the kubelet then evicted a pod and the
+# condition cleared after five minutes. Later tests of that way (2026-11-23,
+# one run each): a Deployment as the holder kept the condition coming back for
+# an hour, at the cost of hundreds of pods that the kubelet refused and of one
+# evicted pod of GKE's own metrics collector; one pod with no controller made
+# the condition for about five minutes with no refused pod.
+# The shape that this case reads exists on the fleet and nothing new is
+# planted: role `multi-process-container`, Deployment multi-process-worker in
+# seeded-shapes on slot a, a shell supervisor forking two workers under a 32Mi
+# memory limit, on the default pool, whose kubelet configuration sets no pod
+# PID limit. By that text it cannot hold many processes, and the tests above
+# do not show a workload of that shape as the fault. The pool setting is also
+# the platform's default, which fixture rule 9 does not take as a fixture.
+# #2581 states the check's form under its design decisions: it names a
+# multi-process workload on a pool with no pod PID limit, and a node that
+# reports PIDPressure. The first half flips this case; the second reads
+# nothing here. The test results were put to #2581's owners
+# (https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7112363582),
+# and an owner answered that the check is on hold, that the first half and the
+# removal of `expected_fail` "wait for a test that shows such a workload using
+# up a node's process IDs", and that "The `PIDPressure=True` reader can come
+# later as a small change of its own"
+# (https://github.com/gke-labs/kube-agents/issues/2581#issuecomment-7113974758).
+# A fixture for that reader needs a node of its own and a privileged pod that
+# lowers `kernel.pid_max`; it is not on the fleet, and no issue plans it. The
+# objective below keeps the form of the first plan, a finding on that
+# workload; the pull request that brings a fixture rewrites it, and the
+# un-park pull request restores the `suite:` and `suite_part:` lines.
+# `expected_fail` stays: the marker waits for a check that a fixture can flip.
+# The readiness rule group-oom-kill and the case
+# upgrades-fleet-readiness-multi-process-container assert it is the fleet's
+# only forking container, so no second forking plant may land. Domain
+# `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
-name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit)"
+name: "Node PID exhaustion (parked: the check is on hold; the shape that the case reads is the platform's default; no fixture for PIDPressure is on the fleet)"
 domain: fleet-audits
-suite: validated-capabilities
-suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -32,12 +63,13 @@ prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.
 expected_output: >-
-  Reads the fleet's existing multi-process workload on a pool with no pod PID
-  limit. Customer failure: kubelet PIDPressure and eviction. Validated means:
-  the ledger issue carries a finding that names Deployment
-  `multi-process-worker` in namespace `seeded-shapes` as a multi-process
-  workload on pool `default-pool`, whose kubelet configuration sets no pod PID
-  limit. The closing response is the SOP's one line with the ledger URL.
+  Parked. Reads the fleet's existing multi-process workload on a pool with no
+  pod PID limit. Customer failure, as live tests showed it: seven leaking
+  containers used all process IDs of the 256 GB node, and the kubelet set
+  PIDPressure and evicted; one container did not. Validated needs a fixture for
+  that state; the present objective accepts a finding that names
+  `multi-process-worker`. The closing response is the SOP's one line with the
+  ledger URL.
 infrastructure:
   deployer: noop
 validated: false

@@ -53,6 +53,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench.cancel import cancel_marker_path, is_cancelled
 from kube_agents_bench.gate import _judged_metrics
 from kube_agents_bench.scoring import DELEGATION_CEILING_MARKER, INFRA_FAILURE_MARKER, score_value
 
@@ -130,6 +131,8 @@ def _tripped_a_safeguard(scores: dict[str, Any]) -> bool:
 
 def missing_metrics(record: dict[str, Any], metrics: tuple[str, ...]) -> list[str]:
     """Gated metrics a scored, non-infrastructure record has no score for."""
+    if is_cancelled():
+        return []
     scores = record.get("scores")
     if not scores or is_infra(record) or _tripped_a_safeguard(scores):
         return []
@@ -186,6 +189,12 @@ def rejudge_file(
     judge_factory: Callable[[], Any] = _default_judge,
 ) -> list[str]:
     """Re-judge every record in one ``results.json``; rewrite it only on a change."""
+    if is_cancelled():
+        print(
+            f"rejudge: cancelled run marker found ({cancel_marker_path()}), skipping re-judge",
+            file=sys.stderr,
+        )
+        return []
     loaded = json.loads(path.read_text(encoding="utf-8"))
     records = [loaded] if isinstance(loaded, dict) else loaded
     lines: list[str] = []
@@ -206,6 +215,12 @@ def rejudge_file(
 
 
 def main(argv: list[str] | None = None) -> int:
+    if is_cancelled():
+        print(
+            f"rejudge: cancelled run marker found ({cancel_marker_path()}), skipping re-judge",
+            file=sys.stderr,
+        )
+        return 0
     paths = sys.argv[1:] if argv is None else argv
     metrics = _judged_metrics()
     status = 0

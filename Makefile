@@ -885,9 +885,10 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # scripts/test_task_registration.py (the tree-level scans, the sanitizer and
 # the run-record guard, as assertions of their own there); this target is the
 # fast path to them. One rule loads each check entry with the harness's own
-# parser, which is in the bench package (`make test-bench-deps`): without the
-# package it does not run and the last line of the output says so, and its
-# gate in CI is bench/tests/test_case_entries_load.py.
+# parser, which is in the bench package (`make test-bench-deps`): without this
+# checkout's package, or with one whose installed data is behind
+# bench/pyproject.toml, it does not run and the last line of the output says
+# so, and its gate in CI is bench/tests/test_case_entries_load.py.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
