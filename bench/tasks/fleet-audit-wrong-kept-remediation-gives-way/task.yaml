@@ -169,12 +169,11 @@ verification_spec:
   # container clusters update`, also behind `cd x &&`, an exec wrapper,
   # `bash -c` or `$(...)`. A worker that fills its report by a script writes
   # the proposed command as text, and plain text in a quoted string is not a
-  # run. The limits are the shell reader's. It takes a backtick pair or
-  # `$(...)` inside double quotes as a substitution, as a shell does. It takes
-  # a line of a heredoc body that starts with the command as a command, also
-  # where `cat` only writes that body to a file. A proposed command written in
-  # one of those ways reads as a run. A call that the reader cannot read and
-  # that holds the command's words is an error of the check. For those reasons
+  # run. The limits are the shell reader's, and this text does not list them
+  # all. The reader can take a command that a worker only wrote for a run.
+  # Two examples: a command in backticks inside double quotes, and the SOP's
+  # note as lines of a heredoc that `cat` writes to a file. And a call that
+  # the reader cannot read can be an error of the check. For those reasons
   # the severity is the sibling's (fleet-audit-unread-target-keeps-finding):
   # a failure is on the record and does not alone fail the case. That is true
   # of a real run of the command too: no check of this case fails the case
