@@ -176,12 +176,14 @@ LOST = "lost"
 # workflow is advised on: a superseded one carries no check, and the reopen
 # supersedes every lost run of a workflow that runs on a reopen, so a later
 # /retest does not repeat the advice. A workflow that runs only on labels gets
-# no new run from a reopen, so its lost run is advised on each time.
+# no new run from a reopen, so the advice names the label route too, and its
+# lost run is advised on each time until a label event replaces it.
 LOST_RUN_ADVICE = (
     "GitHub lost these runs before queueing them, so they can be neither cancelled nor re-run. "
     "Close and reopen this pull request to start fresh runs: that keeps its approvals and needs "
     "no push, but it re-runs every check that runs on a reopen, the smoke test included, and "
-    "starts a fresh automated review."
+    "starts a fresh automated review. A workflow that runs only on a label event gets no new run "
+    "from a reopen: remove and re-add its label instead."
 )
 # GitHub's timestamps end in `Z`, which `fromisoformat` reads only from 3.11.
 UTC_SUFFIX, UTC_OFFSET = "Z", "+00:00"
