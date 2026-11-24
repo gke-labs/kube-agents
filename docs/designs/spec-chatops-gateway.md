@@ -3045,7 +3045,7 @@ No new scope: `chat:write` covers the ephemeral line, and `views.open` takes onl
 
 A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id or Google Chat email, the conversation and rated message, the task and context ids, the ask and the answer.
+member id, Google Chat email or Teams sender id, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
@@ -3270,9 +3270,10 @@ is sent, with a note or without one, and has no Cancel. The adapter checks the p
 gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the pull loop, and
 redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
 rating because the card is the conversation's. It remembers the last 512 rated messages
-(`teamsRatedCap`); a press on an older one is recorded without the answer's text and without
-the redraw. Alerts and reports on Teams carry no controls (`metricsAnswerRatedPlatforms` has
-Teams, `metricsRatedPlatforms` does not).
+(`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
+recorded without the answer's text and without the redraw, and a re-rating that carries no
+answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
+names a post (`postKindOf`), so an alert its triage edits stays as it was.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object

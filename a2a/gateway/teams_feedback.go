@@ -73,9 +73,11 @@ func (a *TeamsAdapter) feedbackRecorder() FeedbackRecorder {
 }
 
 // rates reports whether m is posted with rating controls: an answer the
-// relay marked, as text, on an adapter that holds the recorder.
+// relay marked, as text, on an adapter that holds the recorder. A mark that
+// names a post the agent made on its own (an alert its triage edits, a
+// report) draws none: Teams rates answers only.
 func (a *TeamsAdapter) rates(m OutMessage) bool {
-	return m.Chat == nil && m.Feedback != "" && a.feedbackRecorder() != nil
+	return m.Chat == nil && m.Feedback != "" && postKindOf(m.Feedback) == "" && a.feedbackRecorder() != nil
 }
 
 // teamsRatingActions is the rating controls for the message rated under
@@ -94,7 +96,7 @@ func teamsRatingActions(task string, days int) []map[string]any {
 				"body": []map[string]any{
 					{
 						"type": teamsInputText, "id": teamsPressNoteKey, "isMultiline": true,
-						"maxLength": feedbackNoteMax, "placeholder": feedbackNoteTitleFor(task) + teamsNoteOptional,
+						"maxLength": feedbackNoteChars, "placeholder": feedbackNoteTitleFor(task) + teamsNoteOptional,
 					},
 					{"type": "TextBlock", "wrap": true, "isSubtle": true, "size": "Small", "text": feedbackKeptTextFor(task, days, true)},
 				},

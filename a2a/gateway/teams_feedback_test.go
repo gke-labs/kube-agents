@@ -215,3 +215,27 @@ func TestTeamsRatingPressWithFeedbackOffRecordsNothing(t *testing.T) {
 	}
 	a.rating.Wait()
 }
+
+// An alert's triage edits it under the alert's own feedback id, which the
+// notifier hands every backend; Teams rates answers only, so the edited
+// alert carries no rating controls, and neither does a post so marked.
+func TestTeamsDrawsNoRatingOnAnAlertItsTriageEdits(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	a.SetFeedbackRecorder(&fakeRecorder{})
+	home := "19:11fb65f1e6c941b382a410dd0e383724@thread.tacv2"
+	mark := feedbackPostAlertPrefix + "drift-1"
+	var editor notifyChatEditor = a
+	if err := editor.EditNotifyMessage(home, "", "act-7", OutMessage{Text: "triage: resolved", Feedback: mark}); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if actions := teamsLineActions(t, relay, 0); len(actions) != 0 {
+		t.Fatalf("an edited alert carries actions: %v", actions)
+	}
+	if _, err := a.PostMessage(teamsConversationID(home), OutMessage{Text: "report", Feedback: feedbackPostReportPrefix + "r-1"}); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if actions := teamsLineActions(t, relay, 1); len(actions) != 0 {
+		t.Fatalf("a post marked as a report carries actions: %v", actions)
+	}
+}
