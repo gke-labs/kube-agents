@@ -781,7 +781,7 @@ func TestAWithdrawnProfileBatchSendsAnUnsentEndAsRecorded(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 	ctx := context.Background()
 	conv := "console:tab-profile-batch-withdrawn-unsent"
