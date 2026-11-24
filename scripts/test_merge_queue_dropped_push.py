@@ -152,7 +152,7 @@ class DecideTest(unittest.TestCase):
         # Neither the merge commit nor the commit of `main` that it brought in.
         self.assertEqual(result["commits"], [(late, "fix: a late change")])
 
-    def test_a_late_commit_with_no_subject_is_named_with_an_empty_one(self):
+    def test_a_late_commit_with_no_subject_is_named_with_a_placeholder(self):
         merged = self.repo.squash(self.first)
         (self.repo.directory / "late.txt").write_text("late\n")
         self.repo.git.run("add", "--all")
