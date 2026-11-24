@@ -10,6 +10,10 @@ the same list, at every position where a tool's output reaches the model:
 - an Anthropic `tool_result` whose content is a list of text blocks;
 - an OpenAI-wire `role: tool` message;
 - a Gemini `functionResponse`'s response;
+- core-agent's bash result as it sends it: a Gemini `functionResponse`
+  whose response is the object `{"exit_code", "stderr", "stdout"}`
+  (a2a/worker-adapter/testdata/coreagent/tool-step.jsonl), with the
+  output in `stdout` and, separately, in `stderr`;
 - the same Gemini `functionResponse` under the streaming call type as well
   (`generateContent` and `streamGenerateContent`), which a Gemini-speaking
   harness may use either of.
@@ -74,6 +78,23 @@ def _gemini_streaming_shapes(text: str):
             },
             call_type,
             lambda r: r["contents"][0]["parts"][0]["functionResponse"]["response"]["output"],
+        )
+
+
+def _core_agent_shapes(text: str):
+    """core-agent's bash function response, the output in stdout and in stderr."""
+    for stream in ("stdout", "stderr"):
+        response = {"exit_code": 0, "stderr": "", "stdout": ""}
+        response[stream] = text
+        yield (
+            f"core-agent bash {stream}",
+            {
+                "contents": [
+                    {"role": "user", "parts": [{"functionResponse": {"id": "t", "name": "bash", "response": response}}]}
+                ]
+            },
+            "agenerate_content",
+            lambda r, stream=stream: r["contents"][0]["parts"][0]["functionResponse"]["response"][stream],
         )
 
 
@@ -155,7 +176,10 @@ class TestGatewayMeetsTheCredentialShapesFixture(unittest.TestCase):
                     out = read_back(self._through_the_hook(request, call_type))
                     self.assertNotIn(secret, out)
                     self.assertEqual([], sorted(f for f in fragments if f in out), "a fragment of the secret survived")
-            for name, request, call_type, read_back in _gemini_streaming_shapes(case["text"]):
+            for name, request, call_type, read_back in (
+                *_gemini_streaming_shapes(case["text"]),
+                *_core_agent_shapes(case["text"]),
+            ):
                 with self.subTest(case=case["id"], position=name):
                     out = read_back(self._through_the_hook(request, call_type))
                     self.assertNotIn(secret, out)
@@ -166,7 +190,10 @@ class TestGatewayMeetsTheCredentialShapesFixture(unittest.TestCase):
             for name, request, call_type, read_back in _shapes(case["text"]):
                 with self.subTest(case=case["id"], position=name):
                     self.assertEqual(case["text"], read_back(self._through_the_hook(request, call_type)))
-            for name, request, call_type, read_back in _gemini_streaming_shapes(case["text"]):
+            for name, request, call_type, read_back in (
+                *_gemini_streaming_shapes(case["text"]),
+                *_core_agent_shapes(case["text"]),
+            ):
                 with self.subTest(case=case["id"], position=name):
                     self.assertEqual(case["text"], read_back(self._through_the_hook(request, call_type)))
 
