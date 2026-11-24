@@ -10158,6 +10158,8 @@ class StoredFindingCheck(BaseModel):
         if kept:
             found.append(f"its title holds {kept}")
         return found
+
+
 class _StoredReportVerifier(_OnboardingPollVerifier):
     """What ``audit_report_stored`` and ``shadow_report_stored`` share: one stream's store read and its grading.
 
