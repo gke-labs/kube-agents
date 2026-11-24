@@ -93,7 +93,7 @@ def cluster(name, project="acme", location="us-central1", autopilot=False, statu
     return doc
 
 
-def pool(name, *, secure_boot=True, integrity=True, autoscaling=True, image="COS_CONTAINERD", taints=None, disk_type="pd-balanced", disk_gb=100):
+def pool(name, *, secure_boot=True, integrity=True, autoscaling=True, image="COS_CONTAINERD", taints=None, disk_type="pd-balanced", disk_gb=100, autoprovisioned=False):
     """A node pool for the cohorts below, varying one `_pool_fraction` input
     at a time so a fleet differs on exactly the facet a test is about."""
     config = {"shieldedInstanceConfig": {"enableSecureBoot": secure_boot, "enableIntegrityMonitoring": integrity}, "imageType": image}
@@ -103,7 +103,10 @@ def pool(name, *, secure_boot=True, integrity=True, autoscaling=True, image="COS
         config["diskSizeGb"] = disk_gb
     if taints:
         config["taints"] = taints
-    return {"name": name, "config": config, "autoscaling": {"enabled": autoscaling}}
+    scaling = {"enabled": autoscaling}
+    if autoprovisioned:
+        scaling["autoprovisioned"] = True
+    return {"name": name, "config": config, "autoscaling": scaling}
 
 
 def K(name, project="acme", location="us-central1"):
@@ -2705,6 +2708,29 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         _, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertEqual(self.boot_disk(candidates, "c"), [])
         self.assertEqual(len(fd.facet_tokens(fd.FACETS_BY_SLUG["boot-disk"], fleet)), 10)
+
+    def test_an_auto_provisioned_pool_does_not_vote_and_is_not_filed(self):
+        """GKE names, deletes and re-creates these pools, so a finding on one
+        changes identity between runs."""
+        fleet = self.seeded_fleet()
+        fleet[1]["nodePools"].append(pool("nap-e2-standard-4-ab12", disk_gb=200, autoprovisioned=True))
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual(self.boot_disk(candidates, "b"), [])
+        self.assertIn("in 9/10 node pools", self.boot_disk(candidates, "c")[0]["excerpt"])
+
+    def test_a_cluster_of_only_auto_provisioned_pools_declares_the_facet(self):
+        """A shape, not a gap: nothing the owner can change gives these pools
+        an identity to file against, so a `limitations` sentence would hold
+        the ledger open for as long as the cluster runs."""
+        fleet = self.seeded_fleet()
+        fleet[1]["nodePools"] = [pool("nap-a", autoprovisioned=True), pool("nap-b", disk_gb=50, autoprovisioned=True)]
+        entry = self.manifest(fleet)[T("b")]
+        declared = {n["check"]: n["reason"] for n in entry["checks_not_applicable"]}
+        self.assertEqual(list(declared), ["boot-disk"])
+        self.assertIn("auto-provisioned", declared["boot-disk"])
+        self.assertNotIn("limitations", entry)
+        self.assertNotIn("boot-disk", {c["check"] for c in entry["commands"]})
+        self.assertIn("image-type", {c["check"] for c in entry["commands"]})
 
     def test_a_pool_with_no_readable_disk_does_not_vote_and_is_not_an_outlier(self):
         fleet = self.seeded_fleet()

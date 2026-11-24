@@ -738,14 +738,23 @@ def pool_boot_disk(p: dict) -> str | None:
     return f"{disk_type}{BOOT_DISK_TOKEN_SEPARATOR}{size_gb}"
 
 
+def _is_autoprovisioned_pool(p: dict) -> bool:
+    """A pool node auto-provisioning created. GKE names it, deletes it and
+    makes another under a new name as load moves, and its disk comes from the
+    cluster's auto-provisioning defaults, so a finding on it changes identity
+    between runs and `node-pools update` on it fixes nothing that lasts."""
+    return bool((p.get("autoscaling") or {}).get("autoprovisioned"))
+
+
 def votable_pools(c: dict) -> list[tuple[str, dict]]:
     """The pools a pool-voted facet reads on this cluster, each with the name
     its vote is keyed by. Windows pools are left out, as §4.12 leaves them out
-    of `image-type`: their disk is sized for a different image."""
+    of `image-type`: their disk is sized for a different image. So are
+    auto-provisioned pools (`_is_autoprovisioned_pool`)."""
     return [
         (str(p.get("name") or f"{UNNAMED_POOL_PREFIX}{index}"), p)
         for index, p in enumerate(c.get("nodePools") or [])
-        if not _is_windows_pool(p)
+        if not _is_windows_pool(p) and not _is_autoprovisioned_pool(p)
     ]
 
 
@@ -1820,6 +1829,10 @@ def _shape_rules_out(facet: Facet, c: dict) -> str | None:
         why = "the cluster runs no node pools"
     elif all(_is_windows_pool(p) for p in pools):
         why = "every node pool runs Windows, which this facet does not compare"
+    elif facet.pool_token is not None and not votable_pools(c):
+        # A shape, like the two above: the owner chose auto-provisioning for
+        # the cluster, and no pool it makes has an identity to file against.
+        why = "every node pool is auto-provisioned or runs Windows, neither of which this facet compares"
     else:
         return None
     return (
