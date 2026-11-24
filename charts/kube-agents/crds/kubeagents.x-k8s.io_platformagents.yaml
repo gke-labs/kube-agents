@@ -10165,19 +10165,28 @@ spec:
                             DefaultRoute is the addressee the A2A gateway sends a plain
                             conversation's first message to: `session` opens a session pod of the
                             conversation's own, `platform` hands it to the platform agent. Unset
-                            means `platform` for now; a later change flips the default to
-                            `session`. `platform` stays reachable by handle either way, and a
-                            `delegate:` still opens a session pod on either route. The operator
-                            renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
-                            on the platform agent container (which the hermes-bridge sidecar
-                            copies), so a change rolls the gateway and the platform agent pod.
+                            means `platform`, today's behaviour; a later change, gated on evidence,
+                            makes `session` the default. `platform` stays reachable by handle either
+                            way, and a `delegate:` still opens a session pod on either route. The
+                            operator renders the resolved value as A2A_DEFAULT_ADDRESSEE on the
+                            gateway and on the platform agent container (which the hermes-bridge
+                            sidecar copies), so a change rolls the gateway and the platform agent
+                            pod.
 
                             `session` widens the TASKS consumer budget: each session also counts
                             the replays of its conversation's task, 7 consumers rather than 3, so
                             40 more at the default 10 sessions. TASKS cannot be widened once it
-                            exists, so on an install whose stream was created narrower the
-                            provision Job refuses until maxSessions is lowered to fit or TASKS is
-                            recreated; its message names both.
+                            exists, so on `session` the operator reads the stream's live
+                            max_consumers off the bus and fits the session cap to it
+                            (status.effectiveSessionCap, with the SessionCapFitted condition while
+                            the fit is below maxSessions). A stream with no room for one session
+                            sends plain conversations to `platform` instead. The cap stays fitted
+                            until TASKS is widened: on a one-server bus, busReplicas 3 widens it
+                            and keeps its history, and on any bus a new value on the
+                            kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
+                            rendered width. On an existing install, until the operator has read the bus's
+                            width once, the provision Job waits. On `platform` none of this
+                            applies.
                           enum:
                             - session
                             - platform
@@ -10557,6 +10566,75 @@ spec:
                     - clusterName
                     - location
                     - projectId
+                  type: object
+                hold:
+                  description: |-
+                    Hold pauses the agents' access to clusters' Kubernetes APIs without taking
+                    them out of scope: an operator's lever for an incident, set with kubectl
+                    patch and lifted by removing it. The credential broker and kube-proxy
+                    refuse a held cluster's API to every caller, on the routes
+                    spec.scope.exclude.clusters is refused on, and the refusal names the hold
+                    and its reason so the agent reports it and stops rather than working
+                    around it. A Cluster Agent task that targets a held cluster is refused for
+                    every command, metadata reads included; the Platform Agent's own reads of
+                    the GKE control plane for it (the project's cluster list, a describe) stay
+                    allowed. Unlike an exclusion, a held cluster keeps its Cluster Agent
+                    profile and its place in fleet answers and audits, and nothing restarts:
+                    the operator renders the hold into the <name>-hold ConfigMap, which no
+                    pod-template hash covers, the kubelet syncs the mounted file (usually
+                    within a minute or two), and both components re-read it on the next
+                    request. Like an exclusion it is checked when a request starts: a watch, a
+                    followed log, or an exec, attach, port-forward or proxy stream opened before the
+                    hold reached them keeps running until it ends. The installer does not
+                    carry it: an upgrade keeps the live value.
+                  properties:
+                    all:
+                      description:
+                        All holds every cluster, the one the harness runs
+                        in included.
+                      type: boolean
+                    clusters:
+                      description: |-
+                        Clusters holds single clusters by the full triple, matched as
+                        spec.scope.exclude.clusters entries are.
+                      items:
+                        description: ScopeClusterRef identifies one GKE cluster.
+                        properties:
+                          clusterName:
+                            description: ClusterName is the GKE cluster's name.
+                            maxLength: 63
+                            pattern: ^[a-z0-9][a-z0-9-]*$
+                            type: string
+                          location:
+                            description: Location is the cluster's region or zone.
+                            maxLength: 63
+                            pattern: ^[a-z0-9][a-z0-9-]*$
+                            type: string
+                          projectId:
+                            description:
+                              ProjectID is the project the cluster lives
+                              in.
+                            maxLength: 63
+                            pattern: ^[a-z0-9][a-z0-9-]*$
+                            type: string
+                        required:
+                          - clusterName
+                          - location
+                          - projectId
+                        type: object
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-map-keys:
+                        - projectId
+                        - location
+                        - clusterName
+                      x-kubernetes-list-type: map
+                    reason:
+                      description: |-
+                        Reason is shown in every refusal, so the agent can tell its user why
+                        the cluster is paused (an incident link, a change window).
+                      maxLength: 256
+                      type: string
                   type: object
                 integration:
                   description: Integration configures platform-specific external connections.
@@ -11313,6 +11391,27 @@ spec:
                             HomeChannelName is the human-readable name for
                             the home channel.
                           type: string
+                        inbound:
+                          description: |-
+                            Inbound is the receiver for the messages Microsoft delivers to the
+                            bot. Without it the bot can post to Teams, but a message typed in
+                            Teams does not reach the agent: Bot Framework delivers each message
+                            by an HTTPS request to the address registered for the bot, and no
+                            component of the install listens for it. With it the operator runs a
+                            small pod that verifies Microsoft's signed token on each request,
+                            pins the tenant, and hands the message to the credential broker's
+                            Teams queue; the admin exposes its Service with their own Ingress and
+                            TLS certificate and registers that address with the bot. It needs
+                            tenantId. The receiver holds no credential of the install's own.
+                          properties:
+                            enabled:
+                              default: false
+                              description: |-
+                                Enabled runs the receiver. Off by default: the install then accepts
+                                no connection from the internet, as it did before the receiver
+                                existed.
+                              type: boolean
+                          type: object
                         tenantId:
                           description:
                             TenantId is the Microsoft Entra ID Tenant ID
@@ -11326,6 +11425,14 @@ spec:
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef)
                             && has(self.appPasswordSecretRef))"
+                        - message:
+                            "integration.teams.enabled and a tenantId in GUID form
+                            are required when integration.teams.inbound is enabled: the
+                            receiver serves one tenant of one enabled integration"
+                          rule:
+                            "!has(self.inbound) || !has(self.inbound.enabled) || self.inbound.enabled
+                            == false || (has(self.enabled) && self.enabled == true &&
+                            has(self.tenantId) && self.tenantId.matches('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'))"
                   type: object
                   x-kubernetes-validations:
                     - message:
@@ -12627,6 +12734,22 @@ spec:
                       format: int32
                       type: integer
                   type: object
+                effectiveSessionCap:
+                  description: |-
+                    EffectiveSessionCap is the session cap the operator renders on the
+                    session route: spec.harness.tuning.maxSessions, or fewer when the live
+                    TASKS stream has no room for that many sessions' consumers, which
+                    TASKS cannot be widened to make once it exists. The A2A gateway's
+                    session cap, the session ResourceQuota and the provision Job's
+                    consumer check follow it; the width a new TASKS stream is created at
+                    follows maxSessions. 0 means not one session fits, and plain
+                    conversations go to `platform`. Read off the bus's monitoring
+                    endpoint, at most every five minutes once set; a pass that cannot read
+                    it keeps the value here. Written only where
+                    spec.harness.tuning.defaultRoute is `session`, and not before the
+                    operator has read an existing install's bus once. On `platform`, which an unset
+                    field means, a value an earlier opt-in left is cleared.
+                  type: integer
                 effectiveSizingTier:
                   description: |-
                     EffectiveSizingTier is the sizing tier the operator last rendered the
@@ -12778,8 +12901,10 @@ spec:
                     capacityBytes:
                       description: |-
                         CapacityBytes is the size of the filesystem on the agent's data volume,
-                        as the gateway pod's event watcher last read it. Absent when the watcher
-                        is disabled or the operator has no current reading from it.
+                        as the gateway pod's event watcher last read it. Absent before the first
+                        poll, while the watcher is disabled, after two polls in a row with no
+                        fleet reading (including k8s_event_watcher_watch_set_ready below 1), or
+                        when a ready watcher answers without the volume metric.
                       format: int64
                       type: integer
                     freeBytes:
@@ -12964,12 +13089,12 @@ spec:
                         events: the k8s_event_watcher_cluster_up series at 1, whose informer
                         has completed its initial list. The difference from ClustersRegistered
                         is the number of clusters silently unwatched, a stuck informer, a 403
-                        on the events list, or a stopped one. A 0 is a reading, and the normal
-                        one while the watcher starts, so read a fall alongside the pod's age.
-                        Absent on the same terms as ClustersRegistered: one poll in which no
-                        gateway replica could be read leaves both where they were, and a
-                        second in a row clears both, because the operator then has no current
-                        reading and an absent field says so.
+                        on the events list, or a stopped one. Once the watch set is ready
+                        (k8s_event_watcher_watch_set_ready at 1), a 0 is a reading and normal
+                        until informers finish their initial list, so read a drop alongside
+                        the pod's age. Absent on the same terms as ClustersRegistered: one poll
+                        without a current fleet reading leaves both where they were, and two
+                        in a row clear both because the operator has no current reading.
                       format: int64
                       type: integer
                     clustersRegistered:
@@ -12986,11 +13111,15 @@ spec:
                         stands. A gauge, not a counter: it falls on a removal or after such a
                         restart. Absent when the operator has no
                         current reading: before the first poll, while the event watcher is
-                        disabled, and after two polls in a row in which no gateway replica
-                        could be read, whether its listener failed, its pod was not running, or
-                        the operator could not reach it; the CR's events and the gateway pod's
-                        state say which. A 0 is a reading: the watcher answered and exports no
-                        series.
+                        disabled, or after two polls in a row without a current fleet
+                        reading. That includes a listener failure, a pod not running, an
+                        unreachable gateway, or a restarting watcher still building its
+                        initial watch set (k8s_event_watcher_watch_set_ready below 1). Check
+                        the CR's events, the gateway pod's state, and the watcher's logs or
+                        k8s_event_watcher_watch_set_ready metric to see which applies; a
+                        startup hold writes no CR event. A 0 is a reading once k8s_event_watcher_watch_set_ready reaches 1, or from
+                        an older watcher without that gauge: the watcher answered with no
+                        cluster series.
                       format: int64
                       type: integer
                     eventsIngestedTotal:

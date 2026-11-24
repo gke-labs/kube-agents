@@ -1,8 +1,11 @@
 package controller
 
 import (
+	"context"
 	"os"
 	"testing"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // TestMain clears the operator-level feature flags before any test runs, so a
@@ -15,6 +18,12 @@ import (
 func TestMain(m *testing.M) {
 	for _, name := range []string{a2aInjectBackendEnvVar, a2aAgentDoorEnvVar, a2aSessionClusterViewEnvVar, a2aMCPDoorEnvVar, a2aDispatcherImageEnvVar, a2aProfileDispatcherEnvVar, a2aDispatcherJobPolicyEnvVar, a2aCuratorEnvVar, a2aGatewayElectionEnvVar, a2aBridgeImageEnvVar, a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeExecutorOperatorEnvVar, a2aBridgeResourcesOperatorEnvVar, operatorNamespaceEnvVar, operatorServiceAccountEnvVar} {
 		_ = os.Unsetenv(name)
+	}
+	// No test runs a bus monitoring endpoint. A reconciler built without a
+	// stream seam reads a bus whose TASKS has no consumer limit, so the
+	// session cap is maxSessions; tests of the cap set busStreamState.
+	a2aBusStreamStateDefault = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+		return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: -1}}, nil
 	}
 	os.Exit(m.Run())
 }

@@ -783,7 +783,10 @@ func (r *PlatformAgentReconciler) scopePublisherIdentityOwned(ctx context.Contex
 // publisher's username bound to it both ways, as a2aMCPBrokerEnv binds the mcp role. Without the
 // pair the broker confers the scope role to nobody.
 func scopeBrokerEnv(agent *agentv1alpha1.PlatformAgent, owned bool) []corev1.EnvVar {
-	env := []corev1.EnvVar{{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)}}
+	env := []corev1.EnvVar{
+		{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)},
+		{Name: credentialProxyHoldFileEnvVar, Value: holdFilePath()},
+	}
 	if scopePublisherMayRun(agent, owned) {
 		env = append(env,
 			corev1.EnvVar{Name: credentialProxyScopeAudienceEnvVar, Value: credentialProxyScopeAudience},

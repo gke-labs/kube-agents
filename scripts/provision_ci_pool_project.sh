@@ -471,6 +471,7 @@ gcloud services enable \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
   gkehub.googleapis.com \
+  anthosconfigmanagement.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   dns.googleapis.com \
@@ -588,6 +589,11 @@ done
 # (declared-mtu-peering, main.tf), and the create needs compute.networks.create,
 # .delete, .addPeering, .removePeering and .updatePeering, which no other role
 # here carries.
+# gkehub.editor: the stack registers seeded-a to the project's fleet and turns
+# on the Config Sync feature for it on a project listed in
+# post_merge_sync_projects (bench/tf/fleet/config-sync.tf), which needs
+# gkehub.memberships.* and gkehub.features.*; editor, not admin, which adds
+# setIamPolicy.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
@@ -597,6 +603,7 @@ for role in \
   roles/compute.storageAdmin \
   roles/compute.viewer \
   roles/container.admin \
+  roles/gkehub.editor \
   roles/iam.serviceAccountAdmin \
   roles/iam.serviceAccountUser \
   roles/resourcemanager.projectIamAdmin \

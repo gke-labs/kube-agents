@@ -1,5 +1,7 @@
 package lib
 
+import "strings"
+
 // Session consumer naming — the contract between a session worker and the
 // grants the auth callout mints for it.
 //
@@ -73,6 +75,14 @@ const (
 	// its persona with (persona.ClaudeCode is the default and, for now, the
 	// only one written).
 	EnvProfileHarness = "PROFILE_HARNESS"
+	// EnvPersonaIntegrity sets whether a profile worker requires its persona
+	// to carry a build-time content manifest (persona.IntegrityManifestFile).
+	// PersonaIntegrityRequired refuses a persona without one; unset loads it
+	// unchecked and logs that. A manifest that is present is checked either
+	// way, and any other value stops the worker.
+	EnvPersonaIntegrity = "A2A_PERSONA_INTEGRITY"
+	// PersonaIntegrityRequired is EnvPersonaIntegrity's one value.
+	PersonaIntegrityRequired = "required"
 	// EnvPrimerFile names the file the spawner mounts the conversation's
 	// transcript primer at (the pod's rehydration-primer annotation, through
 	// the downward API). A pod spawned cold for a conversation that already
@@ -127,6 +137,23 @@ func SessionConsumerName(session, role string) string {
 // /readyz and /healthz on. The operator's readiness probe names it, so the
 // two ends share this number.
 const ProfileWorkerStatusPort = 8080
+
+// The session pod's shipped Claude Code home: the persona file and the
+// skills directory cmd/session-persona writes at image build, beside the
+// state the harness keeps in the same directory.
+const (
+	SessionHomePersonaFile = "CLAUDE.md"
+	SessionHomeSkillsDir   = "skills"
+)
+
+// SessionHomeCovers reports whether a path relative to the session pod's
+// Claude Code home is part of what the image shipped there, and so what its
+// build-time content manifest covers: the persona file and everything under
+// the skills directory. The harness's own state beside them is not.
+func SessionHomeCovers(rel string) bool {
+	return rel == SessionHomePersonaFile || rel == SessionHomeSkillsDir ||
+		strings.HasPrefix(rel, SessionHomeSkillsDir+"/")
+}
 
 // ProfilePersonaDir is where a profile pod mounts its persona, read-only
 // (#3662). The operator's profilepod.PersonaMountPath is the same path.

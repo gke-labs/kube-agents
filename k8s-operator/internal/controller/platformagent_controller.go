@@ -360,6 +360,7 @@ const (
 	// say True where the property does not hold. See workloadRenderState.
 	hostPathDroppedConditionType = "VolumesDropped"
 	hostPathDroppedReason        = "HostPathVolumeDropped"
+	watcherTokenDroppedReason    = "WatcherTokenVolumeDropped" // #nosec G101 -- Condition reason, not a credential
 	// hostPathDroppedEntryFormat renders one dropped entry as the author would
 	// find it in the spec: field, index, name, and the host path it asked for.
 	hostPathDroppedEntryFormat = "%s[%d] %q (hostPath %s)"
@@ -404,8 +405,12 @@ const (
 	// projection of the watcher audience under another name, so without this a
 	// sidecar would lose a mount its author wrote with nothing in status to say
 	// why.
-	watcherAudienceDroppedEntryFormat   = "%s[%d] %q"
-	watcherAudienceDroppedMessageFormat = "Volumes that would deliver the credential proxy's watcher token are left out " +
+	watcherAudienceDroppedEntryFormat       = "%s[%d] %q"
+	watcherContainerMountDroppedEntryFormat = "%s[%d].volumeMounts[%d] %q"
+	extraVolumeMountsField                  = "spec.deployment.extraVolumeMounts"
+	initContainersField                     = "spec.deployment.initContainers"
+	sidecarsField                           = "spec.deployment.sidecars"
+	watcherAudienceDroppedMessageFormat     = "Volumes that would deliver the credential proxy's watcher token are left out " +
 		"of the Pod template the operator renders, along with every volumeMount naming them: %s. That token belongs " +
 		"to the gateway's agent-api-auth container alone; any other container holding it would hold the broker's " +
 		"watcher role on every fleet cluster. Remove the entries from the spec to clear this condition."
@@ -652,6 +657,19 @@ type PlatformAgentReconciler struct {
 	// reason warns once. Keyed by ObjectKey, value
 	// a2aChartPodsWarning; cleared when the CR is deleted.
 	a2aChartPodsWarned sync.Map
+
+	// sessionCapWarned records, per CR, the SessionCapFitted Warning last
+	// recorded (resolveA2ASessionCap), so a cap fitted to the same width
+	// warns once rather than on every pass. Keyed by ObjectKey, value the
+	// event message; cleared when the CR is deleted and when the cap is no
+	// longer fitted.
+	sessionCapWarned sync.Map
+	// sessionCapPruned records, per CR, when a write's echo came back
+	// without the cap (resolveA2ASessionCap). sessionCapReadings is the last
+	// known reading of each CR's TASKS width (a2aTasksLiveWidth). Both are
+	// keyed by ObjectKey and cleared when the CR is deleted.
+	sessionCapPruned   sync.Map
+	sessionCapReadings sync.Map
 
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
 	// cap reconcileWorkload last logged, so each generation logs it once
@@ -1120,6 +1138,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.handleDeletion(ctx, instance)
 	}
 
+	// 1a. spec.hold, for kube-proxy and the broker, before any step that can
+	// fail or park the reconcile: an operator's kill switch must not wait on an
+	// unrelated fault. In no pod-template hash: both re-read the mounted file,
+	// so a hold rolls nothing.
+	if err := r.reconcileHoldConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 1b. Move a stored spec.mode "today" to "next" (mode_migration.go). The
 	// render below does not read the field; this keeps the object truthful.
 	if migrated, err := r.migrateRetiredMode(ctx, instance); err != nil || migrated {
@@ -1477,6 +1503,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if _, err := r.ensureA2ACredsSecret(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
 	}
+	// The session cap, fitted to the TASKS stream's live width
+	// (platformagent_a2a_session_cap.go), before the workload: the platform
+	// agent container's A2A_DEFAULT_ADDRESSEE reads it, as the gateway's
+	// does in the A2A stack below, so both render from the one reading.
+	r.resolveA2ASessionCap(ctx, renderAgent, instance)
 	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1757,12 +1788,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
 // pruned-status probe: the interval while a record is held for this CR, the
-// whole usage block's, status.busReplicas', status.inference's, or
-// status.observedVersion's. With no record it returns the secret re-read's
+// whole usage block's, status.busReplicas', status.inference's,
+// status.observedVersion's, status.universeDomain's, or, on the session route,
+// status.effectiveSessionCap's (sessionCapStatusPruned). With no record it returns the secret re-read's
 // interval, the ceiling the caller already applies, so the min it feeds leaves
 // the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) || r.sessionCapStatusPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -1919,6 +1951,9 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.kanbanAdmissionWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionCapWarned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionCapPruned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionCapReadings.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
 		r.forgetA2AGatewayLease(agent)
@@ -5997,6 +6032,17 @@ func setHomeChannelUnsetCondition(agent *agentv1alpha1.PlatformAgent, msg string
 	})
 }
 
+// volumesDroppedReason returns the VolumesDropped condition's Reason for the
+// entries the render strips: HostPathVolumeDropped whenever a hostPath volume
+// is among them, and WatcherTokenVolumeDropped when only watcher-token volumes
+// or mounts are dropped.
+func volumesDroppedReason(agent *agentv1alpha1.PlatformAgent) string {
+	if len(hostPathVolumes(agent)) > 0 {
+		return hostPathDroppedReason
+	}
+	return watcherTokenDroppedReason
+}
+
 // hostPathDroppedConditionCurrent reports whether the VolumesDropped condition
 // on the CR already says msg, where "" means the condition is to be absent.
 // Both status writers gate their write on this -- the Degraded one only on the
@@ -6009,12 +6055,12 @@ func hostPathDroppedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg str
 		return existing == nil
 	}
 	return existing != nil && existing.Status == metav1.ConditionTrue &&
-		existing.Reason == hostPathDroppedReason && existing.Message == msg
+		existing.Reason == volumesDroppedReason(agent) && existing.Message == msg
 }
 
 // setHostPathDroppedCondition writes the VolumesDropped condition, or removes
-// it when msg is "" because the spec carries no hostPath any more. The caller
-// does the API write.
+// it when msg is "" because the spec carries no dropped volumes or mounts any
+// more. The caller does the API write.
 func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
 	if msg == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, hostPathDroppedConditionType)
@@ -6023,7 +6069,7 @@ func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string,
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type:               hostPathDroppedConditionType,
 		Status:             metav1.ConditionTrue,
-		Reason:             hostPathDroppedReason,
+		Reason:             volumesDroppedReason(agent),
 		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -6155,9 +6201,11 @@ func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsP
 	return strings.Join(parts, " ")
 }
 
-// watcherTokenDroppedEntries names, field and index, each user volume the
-// render strips for delivering the watcher token: the set
-// watcherTokenSourceNames builds, read back against the two volume lists.
+// watcherTokenDroppedEntries names, field and index, each user volume and bare
+// reserved-volume mount the render strips for delivering the watcher token: the
+// set watcherTokenSourceNames builds, read back against the two volume lists,
+// plus any mount on the three user-authored mount lists that names the reserved
+// watcher-token volume directly.
 func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
 	if agent.Spec.Deployment == nil {
 		return nil
@@ -6174,6 +6222,26 @@ func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
 		for i, v := range list.volumes {
 			if sources[v.Name] {
 				entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, list.field, i, v.Name))
+			}
+		}
+	}
+	for i, m := range agent.Spec.Deployment.ExtraVolumeMounts {
+		if m.Name == watcherTokenVolume {
+			entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, extraVolumeMountsField, i, m.Name))
+		}
+	}
+	for _, list := range []struct {
+		field      string
+		containers []corev1.Container
+	}{
+		{initContainersField, agent.Spec.Deployment.InitContainers},
+		{sidecarsField, agent.Spec.Deployment.Sidecars},
+	} {
+		for ci, c := range list.containers {
+			for mi, m := range c.VolumeMounts {
+				if m.Name == watcherTokenVolume {
+					entries = append(entries, fmt.Sprintf(watcherContainerMountDroppedEntryFormat, list.field, ci, mi, m.Name))
+				}
 			}
 		}
 	}

@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat, Slack and Teams adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod, the same four widened when the Teams backend is armed, `a2aRelayCaller`); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat, Slack and Teams adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod, the same four widened when the Teams backend is armed, `a2aRelayCaller`); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, its replacement by the profile path is tracked in #6483, and since 2026-11-20 it is on by default for the session route (#6538), so `defaultRoute: session` routes plain turns to session pods with the view on; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` when unset until the flip, a later change gated on evidence; `defaultRoute: session` opts an install in, with the session cap fitted to the live `TASKS` stream's width (`status.effectiveSessionCap`)
 
 ## Purpose
 
@@ -317,7 +317,11 @@ after the restart. Each earlier turn's answer posts as it completes; the result 
 last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
 child is checked against the target's list first (rule `delegation.child-steer`);
 refused, it is not published, its author is not recorded, and the room is told the
-target is not reachable from here.
+target is not reachable from here. A steer into a running task that holds `ChangeRequested` (one a
+structured confirm started, or its child or wake) is refused from every door (rule
+`steer-change-requested`): it is not published, its author is not recorded, and the room is
+told to stop the task and confirm again. That covers an `input-required` answer and a choice
+click too, since both arrive as steers.
 
 **The busy notice.** The gateway tells a person when their turn is going to wait, on the
 turn's own status line. Once a fixed-route turn's task is on the bus, the gateway counts the
@@ -574,7 +578,7 @@ One exception stands while its flag is on: the session pod's temporary read-only
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
 credential broker directly, with the platform agent's scope and no child task, so the only gate
 between the requester and that read is the gateway's ingress allowlist, not the target's
-`AllowedUsers`. The view retires on the default flip (#2371); until then, on an install whose
+`AllowedUsers`. Its replacement by the profile path is tracked in #6483. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with it on (#6538, 2026-11-20). Until it is replaced, on an install whose
 operator has turned the flag on and whose CR narrows the platform agent's allowlist, a person the
 gateway refuses a delegation to `platform` can still read its clusters through a session's view.
 
@@ -730,9 +734,17 @@ or, when no wake followed, the end the observers were told. Chat backends read t
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
 setting, the PlatformAgent's `spec.harness.tuning.defaultRoute` (`session` or `platform`, unset
-meaning `platform` until the default flips), which the operator renders as
+meaning `platform`; making `session` the default is a later change, gated on evidence), which the operator renders as
 `A2A_DEFAULT_ADDRESSEE` on the gateway and on the platform agent container (which the hermes-bridge sidecar copies) from one resolver,
-so the two cannot disagree. The Delegate flow covers one task; the
+so the two cannot disagree. An install that sets `defaultRoute: session` opts into the session route,
+where the operator reads the live `TASKS` stream's `max_consumers` off the bus's monitoring endpoint
+and fits the session cap to it, since a stream cannot be widened once it exists:
+`status.effectiveSessionCap` is `maxSessions` or the sessions the stream has room for, whichever is
+fewer, the gateway's cap, the session quota and the provision Job's check follow it, and a stream
+with no room for one session sends plain conversations to `platform`. On an existing install, until
+the width has been read once, the provision Job waits. The operator's `A2A_SESSION_CLUSTER_VIEW`
+doesn't change the route: with the session pods' cluster view on, plain turns still go to session
+pods (#6538, 2026-11-20). On `platform` none of this runs. The Delegate flow covers one task; the
 per-conversation opt-in is `/session`: deterministic, resolved before status, stop and steer,
 naming a route rather than a handle. A bare `/session` marks the conversation session-routed
 and the next message opens the pod; `/session <text>` marks it and runs the text as the first
@@ -810,7 +822,7 @@ leaves the record as it was:
    console is `read`, and a requester with no identity is refused. The one path that mints
    `unattended` is the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which
    ships dark until the callout grants a trigger source its submit subject. A delegated profile child runs at its
-   parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
+   parent's tier when the parent is a profile task (`read` when the parent is `unattended`), and at its requester's otherwise. A profile
    task can't delegate to `platform`, whose child would be minted at the install's tier and
    scope.
 4. **Submit.** The submission goes on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the `PROFILE_SUBMITS` stream, `top`
@@ -836,8 +848,12 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent runs at `unattended`
-(`delegation.unattended-parent`), whose trigger binding a child's grant doesn't carry yet. A child's
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
+(a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
+parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
+trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
+(`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
+child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
@@ -965,7 +981,8 @@ released from the serialization at the conversation's next turn once it is older
 first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
 conversation saying so. Both subjects, not just `…events`: the fold reads them together,
 and assertion 9 exists because a task whose only event is its supervisor's terminal is not
-empty. That release publishes no terminal: age alone is not
+empty, unless that terminal is a five-token one on a profile task stored after the
+install's `A2A_PROFILE_SUPERVISOR_CUTOFF`, which is not folded, so the task is empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
@@ -3043,9 +3060,12 @@ relays replies to Bot Framework (`/v1/chat/teams/api`), so the gateway's `teams`
 (`a2a/gateway/teams.go`) long-polls that queue with the projected a2a-chat token, acks each
 receipt before the turn is handed over (at-most-once, as the Chat adapter argues; the relay's
 nack route has no caller here), and posts through the passthrough. The gateway opens no port
-for Teams; the question of an inbound endpoint on the gateway does not arise, and the public
-receiver stays a separate piece of work outside this repository, so the authority block names
-what is checked here (`teams-relay+allowlist`), not a JWT nothing in this tree verified.
+for Teams. The public endpoint is its own pod, the Teams inbound receiver (`a2a/teamsinbound`,
+rendered by the operator under `spec.integration.teams.inbound`, behind an Ingress the admin
+owns): it verifies Bot Framework's JWT against Microsoft's published keys, pins the tenant, and
+posts the activity to the broker's intake under a role that reaches that one route by POST
+(`teams-inbound`). The authority block still names what the gateway itself checked
+(`teams-relay+allowlist`); the JWT was verified a pod earlier, by the receiver.
 
 Identity is Chat's rule with one allowance: the Entra object id Bot Framework asserts
 (`from.aadObjectId`, immutable; never the display name or UPN) is the principal, gated by
@@ -3134,7 +3154,10 @@ submission as a `replyTo` part, `spec-a2a-payloads.md`, and the relayed report a
 `chat.console.<token>.in`, or to `chat.console.<token>.confirm` for a click on a confirm button
 (added 10/30): the same frame, which the adapter delivers with the confirm intent, so its task is
 submitted with `TaskParameters.ChangeRequested`. The subject is the only route to the confirm: a
-frame on `.in` with `kind` `confirm` is dropped as an unknown kind. The adapter posts the gateway's
+frame on `.in` with `kind` `confirm` is dropped as an unknown kind. A frame on `.in` while such a
+task runs is not steered into it: the console's human and its MCP server publish there as the same
+author, so the gateway refuses every steer into a change-requested task and tells the tab to stop
+it and confirm again. The adapter posts the gateway's
 own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
 protocol, and the payload spec's agreement rules do not apply to it. Each task's end goes out
@@ -3474,7 +3497,11 @@ which reads the gateway's inbound-message counter. Each armed door renders a cop
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every install now so that it is not (decided
-10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+10/6 on #2473). It is Ingress-only. The gateway's own dials are governed by a second policy,
+`<name>-a2a-gateway-egress` (#6553), which renders and goes with the fence: cluster DNS, the
+bus's client port, the broker's port, the Kubernetes API server, and TCP 443 except to private,
+link-local and shared addresses, for Slack, Discord and the A2A door's token check. Google Chat
+reaches Google through the broker's relay.
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
 once the gateway has bound its event relay and 503 until then, with the reason as the body
@@ -3522,6 +3549,11 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_gchat_pulls_total`                  | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the Chat relay: one that returned an event, one that returned nothing, one that failed (the relay refused or did not answer, or the pull was never made or could not be read). The same counts as the 15-minute `gchat events received` line, without the reset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `kubeagents_a2a_gateway_gchat_api_request_duration_seconds` | `method`: `spaces.messages.create`, `spaces.messages.patch`, `spaces.messages.get`, `spaces.members.list`, `spaces.findDirectMessage`, `spaces.setup`, `other`; `outcome`: `ok`, `rate_limited`, `error` | A histogram of each Chat API call the Google Chat adapter makes through the relay's passthrough (`apiCallContext`), from the request to the end of the relay's response body. `outcome` is `ok` for the relay's 200, `rate_limited` for a Chat API 429 as the relay's answer carries it, and `error` for any other status, a 429 of the relay's own included, or no response.                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_gchat_api_rate_limited_total`       | `method`: as above                                                                                                                                                                                       | Each Chat API call the Chat API answered 429, which the relay carries under `chat` in a 502 after its own retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `kubeagents_a2a_gateway_teams_events_received_total`        | none                                                                                                                                                                                                     | Microsoft Teams activities pulled from the broker's Teams queue, before parsing or classification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `kubeagents_a2a_gateway_teams_pulls_total`                  | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the broker's Teams queue: one that carried an activity, one that came back empty, one that failed (the broker refused or did not answer, or the pull was never made or could not be read).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `kubeagents_a2a_gateway_teams_api_request_duration_seconds` | `method`: `conversations.activities.create`, `conversations.activities.update`, `other`; `outcome`: `ok`, `rate_limited`, `error`                                                                        | A histogram of each Bot Framework call the Teams adapter made through the broker's passthrough, by the operation its HTTP method and endpoint spell.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `kubeagents_a2a_gateway_teams_api_rate_limited_total`       | `method`: as above                                                                                                                                                                                       | Each Bot Framework call Microsoft answered 429, as the broker carries its status under `teams.status`; the identity provider's 429 on the token the call needed arrives the same way and counts too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `kubeagents_a2a_gateway_teams_ingress_lag_seconds`          | none                                                                                                                                                                                                     | A histogram of the time from an activity's own `timestamp` to the gateway's receipt of it, for an activity it takes as a turn; a negative lag is observed as 0 and an activity with no parseable `timestamp` is not observed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_chat_messages_total`                | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                                                                                 | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`         | none                                                                                                                                                                                                     | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_messages_inbound_total`             | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`                                                                                                                                | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google, a2a-entra) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                        |
@@ -3542,6 +3574,18 @@ call's resource path and method joined by dots when `metricsGchatAPIMethods` nam
 otherwise. The event pull and its ack are relay routes, not Chat API calls, and are not timed: the
 pull is a long poll that holds for most of its duration by design, and `gchat_pulls_total` already
 counts it.
+
+The Teams backend mirrors the set. `teams_pulls_total` and `teams_events_received_total` count the
+long poll of the broker's Teams queue the same way, created at zero, so a gateway holding the Teams
+backend that nothing forwards into the broker's queue shows `empty` rising. The two `teams_api_*`
+series time each call through the broker's `/v1/chat/teams/api` passthrough and, like the
+`gchat_api_*` pair, appear with their first observation; `method` is the Bot Framework operation the call's HTTP
+method and endpoint spell (`teamsAPIMethodLabel`: a POST to a conversation's activities creates, a PUT
+to one updates; the passthrough admits no DELETE), `other` otherwise, and a 429 is Microsoft's
+alone, read from the `teams.status` the broker carries in its 502 body, never a 429 the broker
+answered itself. `teams_ingress_lag_seconds` is the activity's own `timestamp` to the gateway's receipt of an
+activity it takes as a turn, read before the ack, which spans Microsoft's delivery, the receiver in front of the broker and the queue; like Slack's,
+it appears with its first observation.
 
 A Slack gateway adds two unlabelled gauges that are not created at zero, set by the adapter's
 event pump from socketmode's own connection events, which share the channel with the envelopes and

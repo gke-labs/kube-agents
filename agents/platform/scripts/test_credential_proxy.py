@@ -12446,8 +12446,8 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "proposal-reviews", "proposal-claim", "issue-list", "issue-view", "branch-view",
-             "revision-contains"},
+             "proposal-commits", "proposal-reviews", "proposal-closer", "proposal-claim",
+             "issue-list", "issue-view", "branch-view", "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -14147,6 +14147,12 @@ class RequiredRoleTest(unittest.TestCase):
             credential_proxy.required_roles("/v1/chat/api"),
         )
 
+    def test_the_teams_intake_admits_the_chat_role_and_the_inbound_receiver(self):
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_TEAMS_INBOUND),
+            credential_proxy.required_roles(credential_proxy.TEAMS_INBOUND_ROUTE),
+        )
+
     def test_the_a2a_event_route_stays_its_own(self):
         self.assertEqual(
             (credential_proxy.CALLER_ROLE_A2A_CHAT,),
@@ -14172,16 +14178,25 @@ class RequiredRoleTest(unittest.TestCase):
             credential_proxy._teams_route_roles(True),
         )
         for armed in (False, True):
+            consumer = credential_proxy._teams_route_roles(armed)
+            # The intake's exact entry carries the consumer roles plus the
+            # inbound receiver's; the prefix entry carries the consumer roles.
             table = tuple(
-                (prefix, credential_proxy._teams_route_roles(armed)) if prefix == "/v1/chat/teams/" else (prefix, roles)
+                (prefix, consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,))
+                if prefix == credential_proxy.TEAMS_INBOUND_ROUTE
+                else (prefix, consumer) if prefix == "/v1/chat/teams/" else (prefix, roles)
                 for prefix, roles in credential_proxy.ROUTE_ROLES
             )
             credential_proxy._validate_route_roles(table)
             with mock.patch.object(credential_proxy, "ROUTE_ROLES", table):
                 for path in teams_paths:
-                    self.assertEqual(
-                        credential_proxy._teams_route_roles(armed), credential_proxy.required_roles(path), (armed, path)
-                    )
+                    # The intake entry is a prefix like the rest of the table, so
+                    # the pull and its receipts resolve to it too; _role_permits,
+                    # not this table, holds the receiver to POST on the exact path.
+                    want = consumer
+                    if path.startswith(credential_proxy.TEAMS_INBOUND_ROUTE):
+                        want = consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,)
+                    self.assertEqual(want, credential_proxy.required_roles(path), (armed, path))
                 self.assertEqual(
                     (credential_proxy.CALLER_ROLE_CHAT,),
                     credential_proxy.required_roles("/v1/chat/slack/events"),
@@ -14324,6 +14339,37 @@ class RolePermitsTest(unittest.TestCase):
             workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role
         )
         return handler, principal
+
+    def test_the_teams_inbound_receiver_reaches_the_intake_by_post_alone(self):
+        """ROUTE_ROLES admits the receiver under the intake's prefix, which also
+        covers the pull (GET on the same path) and the receipts under it; the
+        guard above the table holds it to POST on the exact path."""
+        intake = credential_proxy.TEAMS_INBOUND_ROUTE
+        role = credential_proxy.CALLER_ROLE_TEAMS_INBOUND
+        handler, principal = self._handler(intake, role)
+        handler.command = "POST"
+        self.assertTrue(handler._role_permits(principal))
+        self.assertEqual([], handler.replies)
+        for command, path in (
+            ("GET", intake),
+            ("POST", intake + "/ack"),
+            ("POST", intake + "/nack"),
+            ("POST", "/v1/chat/api"),
+            ("POST", "/v1/chat/teams/api"),
+            ("GET", "/v1/exec"),
+        ):
+            with self.subTest(command=command, path=path):
+                handler, principal = self._handler(path, role)
+                handler.command = command
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    self.assertFalse(handler._role_permits(principal))
+                status, payload = handler.replies[0]
+                self.assertEqual((HTTPStatus.FORBIDDEN, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        # The chat role's own reach of the intake and the pull is unchanged.
+        for command in ("GET", "POST"):
+            handler, principal = self._handler(intake, credential_proxy.CALLER_ROLE_CHAT)
+            handler.command = command
+            self.assertTrue(handler._role_permits(principal))
 
     def test_the_shell_cannot_reach_a_chat_route(self):
         handler, principal = self._handler(
@@ -19298,6 +19344,32 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(self.upstream_requests))
 
+    def test_the_get_credentials_check_is_refused_for_a_held_cluster(self):
+        # spec.hold answers on the same route, under its own rule, and
+        # the cluster's describe without the header stays a control-plane read.
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "scope.json").write_text("{}", encoding="utf-8")
+        (directory / "hold.json").write_text(json.dumps({"clusters": [
+            {"projectId": "acme-prod", "location": "us-central1", "clusterName": "paused"}], "reason": "INC-9"}),
+            encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(directory / "scope.json"),
+            holds=scope_exclude.Holds(path=lambda: str(directory / "hold.json")),
+        )
+        self.reply["body"] = b'{"name":"paused","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="paused"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, body["rule"])
+        self.assertIn("INC-9", body["message"])
+        self.assertEqual([], self.upstream_requests)
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="paused"))
+        self.assertEqual(200, status)
+
     def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
         self._exclude("acme-prod", "us-central1", "secret-cluster")
         self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
@@ -23008,6 +23080,44 @@ class ExcludedClusterPathTest(unittest.TestCase):
                 result = executor.execute(["kubectl", "get", "pods"])
                 self.assertNotIn("ExcludedCluster", result.stderr)
 
+    def hold(self, document):
+        """Rewrite hold.json, as an edit to spec.hold lands in its ConfigMap mount."""
+        text = json.dumps(document)
+        self.hold_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(text)
+        os.utime(self.hold_file, ns=(stamp, stamp))
+
+    def held_executor(self):
+        import scope_exclude
+
+        self.hold_file = Path(self.temp_dir.name) / "hold.json"
+        executor = self.executor()
+        executor.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(self.scope_file), holds=scope_exclude.Holds(path=lambda: str(self.hold_file)))
+        return executor
+
+    def test_a_held_cluster_is_refused_until_the_hold_is_lifted_and_its_describe_stays_allowed(self):
+        import scope_exclude
+
+        executor = self.held_executor()
+        self.hold({"clusters": [{"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": self.EXCLUDED}],
+                   "reason": "INC-7"})
+        for call in (
+            lambda: executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)),
+            lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True),
+        ):
+            with self.assertRaises(scope_exclude.HeldCluster) as caught:
+                call()
+            self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, caught.exception.rule)
+            self.assertIn("INC-7", str(caught.exception))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.hold({})
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+
     def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
         """Control-plane reads are the project's, and stay allowed."""
         self.exclude(self.EXCLUDED)
@@ -23015,6 +23125,372 @@ class ExcludedClusterPathTest(unittest.TestCase):
         result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
                                    f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
         self.assertEqual(0, result.exit_code, result.stderr)
+
+
+class DecisionMemoryChecksMetricTest(unittest.TestCase):
+    """`build_vcs_broker(..., metrics=...)` records Stage B OKF verdicts only for repos with knowledge."""
+
+    REPOSITORY = "https://local.test/acme/infra"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        self.bare = self.base / "remotes" / "acme" / "infra"
+        self.bare.parent.mkdir(parents=True, exist_ok=True)
+        self._git(self.base, "init", "--bare", "--initial-branch=main", str(self.bare))
+        self.seed = self.base / "seed"
+        self._git(self.base, "clone", "--quiet", str(self.bare), str(self.seed))
+        self._git(self.seed, "checkout", "-B", "main")
+        (self.seed / "README.md").write_text("seed\n", encoding="utf-8")
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "initial commit")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+    def _git(self, cwd: Path, *args: str, env_override: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env = {**self.git_env, **(env_override or {})}
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+
+    def _make_broker(self, metrics: credential_proxy.ProxyMetrics, *, pinned_bases=None):
+        state_dir = self.base / f"state-{len(pinned_bases or {})}"
+        executor = CommandExecutor(
+            timeout_seconds=15,
+            max_output_bytes=1 << 20,
+            state_dir=str(state_dir),
+        )
+        executor.environment["GIT_ALLOW_PROTOCOL"] = "https:file"
+        with mock.patch.object(credential_proxy, "warn_on_credential_reach"):
+            broker = credential_proxy.build_vcs_broker(
+                executor,
+                pinned_bases=pinned_bases,
+                metrics=metrics,
+            )
+
+        class _LocalForge(providers.Forge):
+            name = "local"
+            hosts = ("local.test",)
+
+            def __init__(self, remote_root: Path):
+                super().__init__()
+                self.remote_root = remote_root
+                self.credential = mock.Mock()
+                self.credential.git_config.return_value = ()
+                self.credential.headers.return_value = {}
+
+            @classmethod
+            def for_config(cls, config):
+                return ()
+
+            def parse(self, url: str) -> str:
+                return "/".join(providers.repo_segments(url, self.hosts))
+
+            def clone_url(self, repo: str) -> str:
+                return str(self.remote_root / repo)
+
+        broker.registry.hosts["local.test"] = _LocalForge(self.base / "remotes")
+        return broker
+
+    def _bundle_change(self, broker, name: str, branch: str, files: dict[str, str], *, commit_email: str = "kube-agents@users.noreply.invalid"):
+        cloned = broker.clone({"repository": self.REPOSITORY})
+        work = self.base / name
+        bundle_in = self.base / f"{name}-in.bundle"
+        bundle_in.write_bytes(base64.b64decode(cloned["bundleBase64"]))
+        self._git(self.base, "clone", "--quiet", "--branch", cloned["branch"], str(bundle_in), str(work))
+        self._git(work, "checkout", "--quiet", "-b", branch)
+        for rel, content in files.items():
+            dest = work / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        self._git(work, "add", "-A")
+        self._git(
+            work,
+            "commit",
+            "--quiet",
+            "-m",
+            f"change {name}",
+            env_override={"GIT_AUTHOR_EMAIL": commit_email, "GIT_COMMITTER_EMAIL": commit_email},
+        )
+        out_bundle = self.base / f"{name}-out.bundle"
+        self._git(work, "bundle", "create", str(out_bundle), f"{cloned['revision']}..refs/heads/{branch}")
+        return {
+            "repository": self.REPOSITORY,
+            "branch": branch,
+            "target": "main",
+            "baseRevision": cloned["revision"],
+            "bundleBase64": base64.b64encode(out_bundle.read_bytes()).decode("ascii"),
+        }
+
+    def _post_publish(self, broker, metrics: credential_proxy.ProxyMetrics, payload: dict):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/publish"
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:shell", uid="u", groups=(), role=credential_proxy.CALLER_ROLE_SHELL
+        )
+        handler.metrics = metrics
+        handler.max_request_bytes = 1 << 20
+        handler.replies = []
+        handler._json = lambda status, body: handler.replies.append((status, body))
+        handler._request_slot = contextlib.nullcontext
+        handler._repository_is_permitted = lambda repository, forge: True
+        handler.vcs = broker
+        encoded = json.dumps(payload).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        with mock.patch.object(vcs_broker, "write_mode", return_value=("propose", "propose")):
+            handler._handle_vcs_post()
+        return handler.replies[0]
+
+    def test_publish_records_allow_warn_block_and_error_verdicts_only_when_knowledge_exists(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+
+        # 0. Repo without knowledge/ or .kube-agents/intent.yaml -> allow stays 0.
+        payload_nok = self._bundle_change(broker, "nok", "platform-agent/nok", {"docs.txt": "plain\n"})
+        status0, body0 = self._post_publish(broker, metrics, payload_nok)
+        self.assertEqual(status0, HTTPStatus.OK, body0)
+        self.assertNotIn(f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{', metrics.render())
+
+        # Seed knowledge/ decisions (active block + proposed warn) on main.
+        dec_dir = self.seed / "knowledge" / "decisions"
+        dec_dir.mkdir(parents=True, exist_ok=True)
+        (dec_dir / "DEC-2026-001.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-001\n"
+            "title: Keep checkout memory >= 1Gi\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/prod/*.yaml\n"
+            "guard:\n  rule: memory >= 1Gi\n  severity: block\n  expect:\n"
+            "    file: clusters/prod/*.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: \">=\"\n"
+            "    value: 1Gi\n"
+            "---\n\nKeep memory >= 1Gi.\n",
+            encoding="utf-8",
+        )
+        (dec_dir / "DEC-2026-002.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-002\n"
+            "title: Keep staging replicas >= 2\n"
+            "status: proposed\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/staging/*.yaml\n"
+            "guard:\n  rule: replicas >= 2\n  severity: warn\n  expect:\n"
+            "    file: clusters/staging/*.yaml\n"
+            "    path: spec.replicas\n"
+            "    op: \">=\"\n"
+            "    value: 2\n"
+            "---\n\nKeep staging replicas >= 2.\n",
+            encoding="utf-8",
+        )
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "seed knowledge rules")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+        # 1. Clean publish on repo with knowledge/ -> allow
+        payload_allow = self._bundle_change(broker, "allow", "platform-agent/allow", {"notes.txt": "ok\n"})
+        status1, _ = self._post_publish(broker, metrics, payload_allow)
+        self.assertEqual(status1, HTTPStatus.OK)
+
+        # 2. Proposed rule warning -> warn
+        payload_warn = self._bundle_change(
+            broker,
+            "warn",
+            "platform-agent/warn",
+            {"clusters/staging/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 1\n"},
+        )
+        status2, body2 = self._post_publish(broker, metrics, payload_warn)
+        self.assertEqual(status2, HTTPStatus.OK)
+        self.assertIn("DEC-2026-002", body2.get("decisionMemoryMarkdown", ""))
+
+        # 3. Active block rule -> block (409)
+        payload_block = self._bundle_change(
+            broker,
+            "block",
+            "platform-agent/block",
+            {
+                "clusters/prod/checkout.yaml": (
+                    "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n"
+                    "      containers:\n      - name: checkout\n        resources:\n          requests:\n            memory: 256Mi\n"
+                )
+            },
+        )
+        status3, body3 = self._post_publish(broker, metrics, payload_block)
+        self.assertEqual(status3, HTTPStatus.CONFLICT)
+        self.assertEqual(body3.get("code"), vcs_broker.DECISION_MEMORY_BLOCKED)
+
+        # 4. Unresolvable base branch for Decision Memory guard -> error (502)
+        payload_err = self._bundle_change(broker, "err", "platform-agent/err", {"notes2.txt": "err\n"})
+        bad_broker = self._make_broker(metrics)
+        bad_broker._default_branch_of_remote = lambda *_a, **_kw: ""
+        status4, body4 = self._post_publish(bad_broker, metrics, payload_err)
+        self.assertEqual(status4, HTTPStatus.BAD_GATEWAY, body4)
+        self.assertEqual(body4.get("code"), vcs_broker.DECISION_MEMORY_CHECK_FAILED)
+
+        # 5. Non-DM error (NOT_FAST_FORWARD) -> does not change counters
+        bad_ff = dict(payload_allow, baseRevision="0" * 40)
+        status5, body5 = self._post_publish(broker, metrics, bad_ff)
+        self.assertEqual(status5, HTTPStatus.CONFLICT)
+        self.assertEqual(body5.get("code"), "NOT_FAST_FORWARD")
+
+        rendered = metrics.render()
+        for verdict in ("allow", "warn", "block", "error"):
+            self.assertIn(
+                f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{verdict="{verdict}"}} 1',
+                rendered,
+            )
+
+    def test_build_vcs_broker_refuses_spoofed_commit_email_over_http(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+        spoofed = self._bundle_change(
+            broker,
+            "spoof",
+            "platform-agent/spoof",
+            {"notes.txt": "spoofed\n"},
+            commit_email="reviewer@company.com",
+        )
+        status, body = self._post_publish(broker, metrics, spoofed)
+        self.assertEqual(status, HTTPStatus.FORBIDDEN, body)
+        self.assertEqual(body.get("code"), "FORBIDDEN_COMMIT_IDENTITY")
+        self.assertIn("reviewer@company.com", body.get("error", ""))
+
+
+class TeamsInboundCallerBindingTest(unittest.TestCase):
+    """The teams-inbound role is bound to the inbound receiver's ServiceAccount in
+    both directions, with the mcp binding's meaning: no callers named means the
+    audience confers nothing. The receiver is the one component the internet
+    reaches, so it holds no other audience and nobody else holds its role.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    TEAMS_INBOUND = "kubeagents-credential-proxy-teams-inbound"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    RECEIVER_SA = "system:serviceaccount:kubeagents-system:agent-teams-inbound"
+
+    def _authenticator(self, teams_inbound_callers=frozenset({RECEIVER_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.TEAMS_INBOUND: credential_proxy.CALLER_ROLE_TEAMS_INBOUND,
+            },
+            allowed_callers=frozenset({self.AGENT, self.RECEIVER_SA}),
+            teams_inbound_callers=teams_inbound_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_the_receiver_presenting_any_other_audience_is_refused(self):
+        for audience in (self.SHELL, self.CHAT):
+            with self.subTest(audience=audience):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only the teams-inbound audience"
+                ):
+                    self._authenticator()._principal_from(self._review(self.RECEIVER_SA, audience))
+
+    def test_the_receiver_presenting_its_audience_is_the_teams_inbound_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.RECEIVER_SA, self.TEAMS_INBOUND))
+        self.assertEqual(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, principal.role)
+
+    def test_another_caller_presenting_the_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only for the Teams inbound receiver"
+        ):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.TEAMS_INBOUND))
+
+    def test_with_no_callers_named_the_audience_confers_nothing(self):
+        for caller in (self.AGENT, self.RECEIVER_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for the Teams inbound receiver"
+                ):
+                    self._authenticator(frozenset())._principal_from(self._review(caller, self.TEAMS_INBOUND))
+
+    def test_the_callers_and_audience_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.RECEIVER_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-teams-inbound",
+            credential_proxy.TEAMS_INBOUND_CALLERS_ENV: f" {self.RECEIVER_SA} , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset({self.RECEIVER_SA}), authenticator.teams_inbound_callers)
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_TEAMS_INBOUND, authenticator.audience_roles["aud-teams-inbound"]
+        )
+        principal = authenticator._principal_from(self._review(self.RECEIVER_SA, "aud-teams-inbound"))
+        self.assertEqual(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, principal.role)
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(
+                self._review(self.RECEIVER_SA, credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE)
+            )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-teams-inbound"))
+
+    def test_the_audience_without_callers_warns_and_confers_nothing(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": self.AGENT,
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-teams-inbound",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.teams_inbound_callers)
+        self.assertTrue(any(credential_proxy.TEAMS_INBOUND_CALLERS_ENV in line for line in logs.output))
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-teams-inbound"))
+
+    def test_a_colliding_audience_is_not_conferred(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.RECEIVER_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-chat",
+            credential_proxy.TEAMS_INBOUND_CALLERS_ENV: self.RECEIVER_SA,
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                authenticator = credential_proxy.build_authenticator()
+        self.assertNotIn(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, authenticator.audience_roles.values())
 
 
 if __name__ == "__main__":

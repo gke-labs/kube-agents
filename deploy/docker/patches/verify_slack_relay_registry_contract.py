@@ -669,11 +669,12 @@ def main() -> int:
     if os.environ.get(WIRED):
         return wired()
 
-    # Every variable ``sitecustomize`` arms a patch on, not just Slack's. The
-    # operator sets GOOGLE_CHAT_RELAY_URL on the agent container, and
-    # google_chat_relay_patch.install() replaces create_adapter too -- so
-    # running this inside a pod with only SLACK_RELAY_URL stripped reads the
-    # Google Chat shim and reports create_adapter as drifted when it has not.
+    # Every variable ``sitecustomize`` arms a patch on, not just Slack's. A
+    # container can have another relay variable set: the operator renders
+    # TEAMS_RELAY_URL with Teams on (and set GOOGLE_CHAT_RELAY_URL in the
+    # past), and each relay patch's install() replaces create_adapter too --
+    # so running this inside a pod with only SLACK_RELAY_URL stripped reads
+    # another relay's shim and reports create_adapter as drifted when it has not.
     # That misfire is worse than a missed check: the docstring above tells the
     # reader to update the pin deliberately, and doing so here would pin the
     # shim against itself and delete the only guard on that method.

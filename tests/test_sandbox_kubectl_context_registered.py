@@ -432,12 +432,22 @@ class KubectlContextRegisteredTest(unittest.TestCase):
                 self.rewrite(old, new)
                 self.assert_not_registered("--context", CTX, "get", "ns")
 
+# The worker image's kubectl wrapper is a script it copies in.
+WRAPPER_SCRIPT = ROOT / "deploy" / "sandbox" / "session-kubectl.sh"
+WRAPPER_COPY = "COPY --chmod=0755 deploy/sandbox/session-kubectl.sh /usr/local/bin/kubectl"
+
+
 class WrapperWiringTest(unittest.TestCase):
     def test_both_images_install_the_helper_and_ask_it_before_python(self):
         for dockerfile in DOCKERFILES:
             text = dockerfile.read_text(encoding="utf-8")
             self.assertIn(f"COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh {INSTALLED}", text, dockerfile)
-            context_branch = re.search(r"\*\" --context\"\*\)' \\\n\s*'([^']*)'", text)
+            if WRAPPER_COPY in text:
+                # The worker image installs its wrapper as a script.
+                branch_text = WRAPPER_SCRIPT.read_text(encoding="utf-8")
+                context_branch = re.search(r'\*" --context"\*\)\n\s*(.*)', branch_text)
+            else:
+                context_branch = re.search(r"\*\" --context\"\*\)' \\\n\s*'([^']*)'", text)
             self.assertIsNotNone(context_branch, dockerfile)
             self.assertTrue(context_branch.group(1).strip().startswith(f'{INSTALLED} "$@" 2>/dev/null || '), dockerfile)
             self.assertIn("--ensure-kubectl-context", context_branch.group(1), dockerfile)
