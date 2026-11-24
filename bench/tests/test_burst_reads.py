@@ -407,4 +407,23 @@ def test_a_conversation_past_the_deadline_fails_even_if_it_then_completed():
     )
     got = burst_reads.assess([level], [1])
     assert got["status"] == "error" and "still running at the deadline" in got["result"]
+    level.wall_seconds = 1.0
+    assert level.completed() == 0
+    assert "0 of 1 conversations completed" in burst_reads.summary([level])
+
+
+def test_the_result_sums_every_conversations_tokens(fake, monkeypatch):
+    original = _FakeTask.await_terminal
+
+    def with_usage(self, task_id, *, deadline, on_poll=None):
+        exchange = original(self, task_id, deadline=deadline, on_poll=on_poll)
+        exchange.fold.usage = {"input": 10, "output": 1}
+        return exchange
+
+    monkeypatch.setattr(_FakeTask, "await_terminal", with_usage)
+    got = _run("1,3")
+    single = harness._inject_tokens({"input": 10, "output": 1})
+    for bucket, value in single.items():
+        if isinstance(value, int) and not isinstance(value, bool) and value:
+            assert got.tokens[bucket] == 4 * value, (bucket, got.tokens)
 

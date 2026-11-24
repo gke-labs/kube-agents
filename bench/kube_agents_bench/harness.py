@@ -4091,6 +4091,9 @@ class KubeAgentsHarness(AgentHarness):
         levels: list[burst_reads.LevelRecord] = []
         opened: list[tuple[inject.InjectTask, burst_reads.ConversationRecord]] = []
         events: list[dict[str, Any]] = []
+        # Every conversation's usage, summed as the inject path records one
+        # conversation's (_inject_tokens), under the same lock as events.
+        tokens: dict[str, Any] = empty_tokens()
         events_lock = threading.Lock()
 
         def _follow(task: inject.InjectTask, rec: burst_reads.ConversationRecord, deadline: float) -> None:
@@ -4150,8 +4153,10 @@ class KubeAgentsHarness(AgentHarness):
             if infrastructure is not None and not rec.infrastructure:
                 rec.infrastructure = str(infrastructure.metadata.get("infra_failure") or infrastructure.errors[0])
             tagged = [{**e, "args": {**(e.get("args") or {}), "conversation": task.conversation}} for e in exchange.fold.trajectory]
+            usage = _inject_tokens(exchange.fold.usage, exchange.fold.child_usage, exchange.fold.usage_partial)
             with events_lock:
                 events.extend(tagged)
+                _sum_tokens(tokens, usage)
 
         def _stop_all() -> None:
             """Cancel every opened task not seen to end, and take a queued
@@ -4209,7 +4214,7 @@ class KubeAgentsHarness(AgentHarness):
                                 "would overlap it"
                             )
                             break
-                        time.sleep(2)
+                        time.sleep(burst_reads.STRAGGLER_POLL_SECONDS)
                 if burst_reads.infrastructure([record]):
                     break
         finally:
@@ -4233,6 +4238,7 @@ class KubeAgentsHarness(AgentHarness):
             trajectory=[entry, *events],
             errors=[] if entry["status"] == inject.STATE_COMPLETED else [entry["result"]],
             metadata=metadata,
+            tokens=tokens,
         )
         _fold_worker_total(result.tokens)
         return result

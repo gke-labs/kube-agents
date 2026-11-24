@@ -82,7 +82,6 @@ __all__ = [
     "message_id",
     "parse",
     "precondition",
-    "records_from",
     "summary",
     "utc_stamp",
 ]
@@ -105,6 +104,11 @@ LEVEL_KEY_FORMAT = "{base}-L{level}-{index}"
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 #: The terminal state every conversation must reach for the run to pass.
 STATE_COMPLETED = "completed"
+#: How long the harness waits, after a level, for its cancelled stragglers'
+#: sessions to be released before the next level starts, and how often it
+#: reads whether they have been.
+STRAGGLER_RELEASE_SECONDS = 120.0
+STRAGGLER_POLL_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -243,11 +247,6 @@ class ConversationRecord:
         }
 
 
-#: How long the harness waits, after a level, for its cancelled stragglers'
-#: sessions to be released before the next level starts.
-STRAGGLER_RELEASE_SECONDS = 120.0
-
-
 @dataclass
 class LevelRecord:
     """One level: its concurrency, when it ran, and its conversations."""
@@ -262,7 +261,7 @@ class LevelRecord:
         return Counter(c.terminal_state or "none" for c in self.conversations)
 
     def completed(self) -> int:
-        return sum(c.terminal_state == STATE_COMPLETED for c in self.conversations)
+        return sum(c.terminal_state == STATE_COMPLETED and not c.timed_out for c in self.conversations)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -323,10 +322,3 @@ def assess(levels: list[LevelRecord], planned: Iterable[int]) -> dict[str, Any]:
     if problems:
         return {"name": ENTRY, "args": args, "status": "error", "result": "; ".join(problems)}
     return {"name": ENTRY, "args": args, "status": "completed", "result": summary(levels)}
-
-
-def records_from(data: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The level dicts of a recorded :data:`ENTRY`'s ``args`` (or of
-    ``metadata["burst_reads"]``, which holds the same), ``[]`` when absent."""
-    levels = data.get("levels")
-    return [lv for lv in levels if isinstance(lv, Mapping)] if isinstance(levels, list) else []
