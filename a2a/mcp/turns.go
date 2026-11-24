@@ -21,6 +21,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -324,7 +325,7 @@ type resolved struct {
 func nameOrToken(alias, token string) (string, string, error) {
 	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
 		if rest := strings.TrimPrefix(alias, consoleConversationPrefix); !isMintedToken(rest) {
-			return "", "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
+			return "", "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", inerttext.Cell(alias))
 		}
 		alias, token = "", alias
 	}
@@ -379,7 +380,7 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 	c.mu.Lock()
 	if _, ok := c.byAlias[alias]; ok {
 		c.mu.Unlock()
-		return "", fmt.Errorf("%w: %s", ErrConversationExists, cell(alias))
+		return "", fmt.Errorf("%w: %s", ErrConversationExists, inerttext.Cell(alias))
 	}
 	t, evicted, err := c.addLocked(alias, description)
 	c.mu.Unlock()
@@ -420,7 +421,7 @@ func (c *Conversations) lookup(alias, token string) (string, bool, error) {
 		c.touchLocked(e)
 		return e.token, true, nil
 	}
-	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", cell(alias))
+	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", inerttext.Cell(alias))
 }
 
 // Forget drops the name holding token, or else alias (a name, or a token in
