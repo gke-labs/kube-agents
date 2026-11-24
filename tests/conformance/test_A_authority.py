@@ -509,6 +509,148 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         others = cp.vcs_broker.WRITE_VERBS - writes
         self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
 
+    def test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other(self) -> None:
+        # The row above holds the writes. This one holds the whole set: a read
+        # added to it (proposal-reviews, snapshot) is a grant to every profile
+        # of the install, and it turns this row red rather than none.
+        cp = h.credential_proxy
+        profile = cp.CALLER_ROLE_PROFILE
+        reached = frozenset(
+            {
+                "clone", "proposal-view", "proposal-list", "proposal-commits", "branch-view", "identity",
+                "issue-list", "issue-view", "publish", "proposal-create", "proposal-update",
+            }
+        )
+        self.assertEqual(reached, cp.ROLE_VCS_VERBS[profile])
+        for verb in sorted(cp.vcs_broker.VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.assertEqual(verb in reached, cp.vcs_verb_permitted(profile, verb))
+        self.assertFalse(cp.vcs_verb_permitted(profile, "Proposal-View"), "a spelling that is no verb")
+
+    def test_A3_the_handler_asks_the_route_table_and_the_task_gate_for_a_profile_caller(self) -> None:
+        # The route row reads ROUTE_ROLES. This one drives the handler's own
+        # authentication step, so a handler that stops asking the table, or
+        # stops binding a profile caller's task credential, is red.
+        cp = h.credential_proxy
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+
+        def authenticated(path: str, credential: str | None = None, gate: object = None) -> tuple[object, list]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.authenticator = types.SimpleNamespace(authenticate=lambda headers: principal)
+            handler.headers = email.message.Message()
+            if credential is not None:
+                handler.headers[cp.TASK_CREDENTIAL_HEADER] = credential
+            handler.command, handler.path, handler.profile_gate = "POST", path, gate
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            return handler._authenticated(), replies
+
+        for path in ("/v1/exec", "/v1/vcs/clone", h.mcp_policy.MCP_RELAY_PREFIX + "developer_knowledge"):
+            with self.subTest(reached=path):
+                admitted, replies = authenticated(path)
+                self.assertIs(principal, admitted, replies)
+        for path in (
+            "/v1/forge/refresh", "/v1/github/refresh", "/v1/feedback/submit", cp.ADMISSION_PATH,
+            cp.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/projects/p/timeSeries", cp.DIAL_PATH, "/v1/chat/api",
+        ):
+            with self.subTest(refused=path):
+                admitted, replies = authenticated(path)
+                self.assertIsNone(admitted)
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", replies[0][1]["code"])
+        # A credential the gate refuses is refused whole, not dropped; one it
+        # binds is the principal the routes see. The same holds for a broker
+        # that verifies none.
+        bound = dataclasses.replace(principal, task=types.SimpleNamespace(report_only=False))
+
+        def refuse(caller: object, token: object) -> object:
+            raise cp.TaskCredentialRefused("the signature does not verify")
+
+        for case, gate in (
+            ("a gate that refuses", types.SimpleNamespace(admit=refuse)),
+            ("a broker with no gate", None),
+        ):
+            with self.subTest(case=case):
+                admitted, replies = authenticated("/v1/exec", credential="not-a-credential", gate=gate)
+                self.assertIsNone(admitted)
+                self.assertEqual((403, cp.RULE_TASK_CREDENTIAL), (replies[0][0], replies[0][1]["rule"]))
+        admitted, replies = authenticated(
+            "/v1/exec", credential="a-credential", gate=types.SimpleNamespace(admit=lambda caller, token: bound)
+        )
+        self.assertIs(bound, admitted, replies)
+
+    def test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body(self) -> None:
+        # The permit row calls profile_vcs_refusal. This one drives the
+        # dispatch, so a dispatch that stops asking the verb set or the permit
+        # is red. No forge is behind the handler: a refusal is the only answer
+        # these requests may get.
+        cp = h.credential_proxy
+        bare = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+        unpermitted = dataclasses.replace(bare, task=types.SimpleNamespace(task="task-1", permits=frozenset()))
+        permitted = dataclasses.replace(
+            bare, task=types.SimpleNamespace(task="task-1", permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        )
+
+        def dispatch(principal: object, verb: str) -> tuple[int, dict]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs = principal, None
+            handler.headers = email.message.Message()
+            handler.rfile = io.BytesIO(b"")
+            handler.max_request_bytes = 1 << 20
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            # The install's write mode is another refusal, ahead of the permit's.
+            with mock.patch.dict("os.environ", {cp.vcs_broker.WRITE_MODE_ENV: "", cp.vcs_broker.DIAL_ENV: ""}):
+                handler._dispatch_vcs_post(verb)
+            return replies[0]
+
+        for verb in ("branch-delete", "issue-create", "proposal-comment", "snapshot", "capabilities"):
+            with self.subTest(outside_the_set=verb):
+                status, answer = dispatch(permitted, verb)
+                self.assertEqual((403, cp.RULE_CALLER_VCS_VERB), (status, answer.get("rule")), answer)
+        for principal, verb, case in (
+            (bare, "clone", "a read with no task credential"),
+            (bare, "publish", "a write with no task credential"),
+            (unpermitted, "publish", "a write on a credential with no permit"),
+            (unpermitted, "proposal-create", "a write on a credential with no permit"),
+        ):
+            with self.subTest(case=case, verb=verb):
+                status, answer = dispatch(principal, verb)
+                self.assertEqual((403, cp.RULE_CALLER_VCS_PERMIT), (status, answer.get("rule")), answer)
+                self.assertEqual(cp.CALLER_PERMIT_REQUIRED_CODE, answer.get("code"))
+
+    def test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role(self) -> None:
+        # Both tables are checked when the broker module loads. Each case is
+        # an edit that reads as policy and widens the profile role; the
+        # shipped tables pass.
+        cp = h.credential_proxy
+        profile = cp.CALLER_ROLE_PROFILE
+        table = dict(cp.ROLE_VCS_VERBS)
+        gated, owned = cp.PROFILE_PERMIT_GATED_VCS_VERBS, cp.PROFILE_OWNERSHIP_GATED_VCS_VERBS
+        cp._validate_role_vcs_verbs(table, gated, owned)
+
+        def widened(verb: str) -> dict:
+            return {**table, profile: table[profile] | {verb}}
+
+        for case, verbs, permit_set, owned_set in (
+            ("a write with no permit gate", widened("issue-create"), gated, owned | {"issue-create"}),
+            ("a write with no ownership bar", widened("issue-create"), gated | {"issue-create"}, owned),
+            ("a read of a repository nobody registered", widened("snapshot"), gated, owned),
+            ("a verb the managed list does not gate", widened("capabilities"), gated, owned),
+            ("a verb that is no verb", widened("proposal-vew"), gated, owned),
+        ):
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    cp._validate_role_vcs_verbs(verbs, permit_set, owned_set)
+        with self.assertRaisesRegex(TypeError, "must be a frozenset"):
+            cp._validate_role_vcs_verbs({**table, profile: "publish"}, gated, owned)
+
+        cp._validate_route_roles(cp.ROUTE_ROLES)
+        with self.assertRaisesRegex(TypeError, "must be a tuple"):
+            cp._validate_route_roles(cp.ROUTE_ROLES + (("/v1/new/", profile),))
+        with self.assertRaisesRegex(ValueError, "is not a caller role"):
+            cp._validate_route_roles(cp.ROUTE_ROLES + (("/v1/new/", ("profil",)),))
+
     def test_A3_a_permitted_profile_update_reaches_only_the_installs_own_proposals(self) -> None:
         # #3993, #6247: the permit says a requester asked for a change, not
         # which proposal, so under it a profile worker's proposal-update still
