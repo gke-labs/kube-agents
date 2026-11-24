@@ -177,6 +177,33 @@ spec:
     - port: 8080
       path: /metrics
       interval: 30s
+{{- if and .Values.platformAgent.integration.teams.enabled (dig "inbound" "enabled" false .Values.platformAgent.integration.teams) }}
+---
+{{- /*
+The Teams inbound receiver's status listener (teamsInboundStatusPort in the
+operator): requests by outcome and refusals by reason, the one signal that a
+misconfigured receiver is dropping Teams messages, since it answers each
+refusal with a status code and logs at most one line a minute per reason. Rendered while the receiver is
+(spec.integration.teams.inbound), on its own selector; the operator's
+receiver NetworkPolicy admits the collector on that port and on no other.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-teams-inbound-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-teams-inbound
+      kubeagents.x-k8s.io/component: teams-inbound
+  endpoints:
+    - port: 9094
+      path: /metrics
+      interval: 30s
+{{- end }}
 {{- if include "kube-agents.a2aNATSExporterRendered" . }}
 ---
 {{- /*
@@ -439,6 +466,45 @@ spec:
     - port: kube-metrics
       path: /metrics
       interval: 30s
+---
+{{- if and .Values.platformAgent.integration.teams.enabled (dig "inbound" "enabled" false .Values.platformAgent.integration.teams) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.platformAgent.name }}-teams-inbound-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.platformAgent.name }}-teams-inbound-metrics
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.platformAgent.name }}-teams-inbound
+    kubeagents.x-k8s.io/component: teams-inbound
+  ports:
+    - name: status
+      port: 9094
+      targetPort: 9094
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.platformAgent.name }}-teams-inbound-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.serviceMonitorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-teams-inbound-metrics
+  endpoints:
+    - port: status
+      path: /metrics
+      interval: 30s
+{{- end }}
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentVMPodScrape" .) }}
 ---
@@ -565,6 +631,28 @@ spec:
     - port: kube-metrics
       path: /metrics
       interval: 30s
+---
+{{- if and .Values.platformAgent.integration.teams.enabled (dig "inbound" "enabled" false .Values.platformAgent.integration.teams) }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ .Values.platformAgent.name }}-teams-inbound-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.vmPodScrapeLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-teams-inbound
+      kubeagents.x-k8s.io/component: teams-inbound
+  podMetricsEndpoints:
+    - port: status
+      path: /metrics
+      interval: 30s
+{{- end }}
 {{- end }}
 
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.monitoringScraperNamespace }}
@@ -697,4 +785,28 @@ spec:
       ports:
         - protocol: TCP
           port: 9096
+---
+{{- if and .Values.platformAgent.integration.teams.enabled (dig "inbound" "enabled" false .Values.platformAgent.integration.teams) }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.platformAgent.name }}-teams-inbound-mon-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-teams-inbound
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace | quote }}
+      ports:
+        - protocol: TCP
+          port: 9094
+{{- end }}
 {{- end }}

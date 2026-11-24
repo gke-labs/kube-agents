@@ -13,6 +13,15 @@ litellm_settings:
     - otel
     - prometheus
     - litellm_thinking_replay_callback.proxy_handler_instance
+  # /metrics stays open to the scrape, which sends no key; see the chart's
+  # kube-agents.litellmConfig.
+  require_auth_for_metrics_endpoint: false
+# Caller authentication: the hook beside this file (a copy of the chart's
+# files/litellm_caller_auth.py) admits each caller by its key. The master key
+# comes from the environment (deployment.yaml), so this file carries none.
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  custom_auth: litellm_caller_auth.caller_auth
 # Prompt caching, injected gateway-side so the agent config stays free of model
 # identity. Hermes reaches us as `provider: custom` on the OpenAI wire asking
 # for "model-default", and its own Anthropic cache_control layout only engages

@@ -5425,6 +5425,10 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// unset as 0); the workloads behind an opt-in operator flag come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
+	// The Teams inbound receiver, a CR field like the exec tier.
+	if teamsInboundEnabled(agent) {
+		n += int64(ptr.Deref(buildA2ATeamsInboundDeployment(agent).Spec.Replicas, 1))
+	}
 	// The profile dispatcher and the MCP server, each on unless its flag is
 	// "false" (operator.profileDispatcher.enabled and operator.mcpServer.enabled
 	// in the chart).
@@ -7950,6 +7954,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	if a2aCuratorEnabled() {
 		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
 	}
+	if teamsInboundEnabled(agent) {
+		fences = append(fences, buildTeamsInboundNetworkPolicy(agent, dnsClusterIPs))
+	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
 	// the refusal-path rescue, so it is applied over a gateway that exists.
@@ -8272,6 +8279,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// After the fences, so its pod never runs unfenced, and ahead of the
 	// gateway's hold, because serving the page doesn't need the gateway.
 	if err := r.reconcileA2AConsole(ctx, agent); err != nil {
+		return state, err
+	}
+	if err := r.reconcileTeamsInbound(ctx, agent); err != nil {
 		return state, err
 	}
 	// The MCP server, the other console client, under its flag and for the

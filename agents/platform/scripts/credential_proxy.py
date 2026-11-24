@@ -2451,6 +2451,15 @@ CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
 # (#6090). The operator renders it beside CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE,
 # only while Google Chat is armed on the A2A stack.
 A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS"
+# The Teams inbound receiver (#1034): the one component the internet reaches,
+# which hands a verified Bot Framework activity to this broker. Its audience
+# confers a role that reaches one route by one method, POST on
+# TEAMS_INBOUND_ROUTE (the Teams queue intake), and nothing else under
+# /v1/chat/: not the pull, not the receipts, not the outbound API. Bound
+# like the mcp audience: callers unset confers the role on nobody.
+TEAMS_INBOUND_AUDIENCE_ENV = "CREDENTIAL_PROXY_TEAMS_INBOUND_AUDIENCE"
+TEAMS_INBOUND_CALLERS_ENV = "CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS"
+TEAMS_INBOUND_ROUTE = "/v1/chat/teams/events"
 # The profile workers' audience (#3889). An AgentProfile's worker pod runs
 # model output and reaches this broker the way a session pod does, over the
 # ClusterIP with a projected token, and gets a role of its own: the exec route,
@@ -2507,6 +2516,7 @@ CALLER_ROLE_A2A_REPORTS = "a2a-reports"
 # managed repository only, so the curator can verify active and superseded
 # records from Git without holding a forge credential of its own.
 CALLER_ROLE_CURATOR = "curator"
+CALLER_ROLE_TEAMS_INBOUND = "teams-inbound"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -2535,6 +2545,7 @@ CALLER_ROLES = (
     CALLER_ROLE_SCOPE,
     CALLER_ROLE_A2A_REPORTS,
     CALLER_ROLE_CURATOR,
+    CALLER_ROLE_TEAMS_INBOUND,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -3039,6 +3050,14 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # No trailing slash: the passthrough is one exact path, and the handler
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
+    # The Teams queue intake is the one route the inbound receiver reaches,
+    # and by POST alone. It sits before the Teams prefix below so the exact
+    # path wins: the install's Teams consumer (TEAMS_ROUTE_ROLES: the chat
+    # role, or the a2a-chat role under A2A_TEAMS_BACKEND) plus the receiver.
+    # As a prefix the entry below also covers the pull (GET on the same path)
+    # and the receipts under it, so _role_permits holds the teams-inbound
+    # role to the exact path and method on top of this table.
+    (TEAMS_INBOUND_ROUTE, TEAMS_ROUTE_ROLES + (CALLER_ROLE_TEAMS_INBOUND,)),
     # The Teams relay serves whichever gateway the install arms on it: the
     # Hermes consumer (chat role), or the A2A gateway's teams backend
     # (a2a-chat role) when the operator runs with A2A_TEAMS_BACKEND=true and
@@ -3130,6 +3149,10 @@ BROKER_FAILURE_KIND_BY_ROUTE: dict[str, str | None] = {
     watcher_policy.WATCHER_K8S_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
     "/v1/chat/a2a": None,
     "/v1/chat/api": None,
+    # The Teams intake sits ahead of the chat prefix in ROUTE_ROLES, so its
+    # label is its own; a relay 5xx there belongs to the caller as under
+    # /v1/chat, and a pull failure is recorded at its site.
+    TEAMS_INBOUND_ROUTE: None,
     "/v1/chat": None,
 }
 
@@ -5850,6 +5873,7 @@ class ServiceAccountAuthenticator:
         profile_identities: Mapping[str, Any] | None = None,
         a2a_reports_callers: frozenset[str] = frozenset(),
         a2a_chat_callers: frozenset[str] = frozenset(),
+        teams_inbound_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -5865,6 +5889,7 @@ class ServiceAccountAuthenticator:
         self.a2a_reports_callers = a2a_reports_callers
         self.curator_callers = curator_callers
         self.a2a_chat_callers = a2a_chat_callers
+        self.teams_inbound_callers = teams_inbound_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
@@ -6028,6 +6053,12 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("the A2A gateway may present only the a2a-chat or a2a-reports audience")
         if role == CALLER_ROLE_A2A_CHAT and self.a2a_chat_callers and username not in self.a2a_chat_callers:
             raise AuthenticationError("the a2a-chat audience is only for the A2A gateway")
+        # The Teams inbound binding, as the mcp one: empty names nobody, and
+        # the receiver holds no other audience.
+        if username in self.teams_inbound_callers and role != CALLER_ROLE_TEAMS_INBOUND:
+            raise AuthenticationError("the Teams inbound receiver may present only the teams-inbound audience")
+        if role == CALLER_ROLE_TEAMS_INBOUND and username not in self.teams_inbound_callers:
+            raise AuthenticationError("the teams-inbound audience is only for the Teams inbound receiver")
         # The profile binding, as the mcp one: empty names nobody.
         if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
             raise AuthenticationError("a profile caller may present only the profile audience")
@@ -6267,6 +6298,11 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(A2A_CHAT_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    teams_inbound_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(TEAMS_INBOUND_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     # The profile workers' identities, read only once the profile audience is
     # conferred below; an empty map confers the role on nobody.
     profile_identities: dict[str, Any] = {}
@@ -6358,6 +6394,25 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "there, so every caller presenting the a2a-reports audience is refused",
                     A2A_REPORTS_AUDIENCE_ENV,
                     A2A_REPORTS_CALLERS_ENV,
+                )
+        # The Teams inbound receiver's audience, read raw and refused on a
+        # collision for the mcp audience's reasons.
+        teams_inbound_audience = os.getenv(TEAMS_INBOUND_AUDIENCE_ENV, "").strip()
+        if teams_inbound_audience and teams_inbound_audience in audience_roles:
+            LOGGER.warning(
+                "%s equals the %s audience; the teams-inbound role needs an audience of its own, "
+                "so it is not conferred",
+                TEAMS_INBOUND_AUDIENCE_ENV,
+                audience_roles[teams_inbound_audience] or CALLER_ROLE_SHELL,
+            )
+        elif teams_inbound_audience:
+            audience_roles[teams_inbound_audience] = CALLER_ROLE_TEAMS_INBOUND
+            if not teams_inbound_callers:
+                LOGGER.warning(
+                    "%s is set but %s is not; the teams-inbound role is bound to the callers named "
+                    "there, so every caller presenting the teams-inbound audience is refused",
+                    TEAMS_INBOUND_AUDIENCE_ENV,
+                    TEAMS_INBOUND_CALLERS_ENV,
                 )
         # The scope publisher's audience, read raw and refused on a collision
         # for the mcp audience's reasons.
@@ -6475,6 +6530,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         a2a_reports_callers=a2a_reports_callers,
         curator_callers=curator_callers,
         a2a_chat_callers=a2a_chat_callers,
+        teams_inbound_callers=teams_inbound_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
@@ -15104,6 +15160,24 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         has not been upgraded to project a second audience yet; ``role`` is set
         only where the API server confirmed which audience it validated.
         """
+        if principal.role == CALLER_ROLE_TEAMS_INBOUND and (
+            self.command != "POST" or self.path != TEAMS_INBOUND_ROUTE
+        ):
+            # The receiver reaches one route by one method; ROUTE_ROLES
+            # cannot say "POST alone", so this does.
+            LOGGER.warning(
+                "refused the Teams inbound receiver a route that is not its intake method=%s path=%s",
+                self.command,
+                _sanitize_for_logging(self.path),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": "this route is not available to this caller",
+                    "code": "CALLER_ROLE_FORBIDDEN",
+                },
+            )
+            return False
         needed = required_roles(self.path)
         if not needed or not principal.role or principal.role in needed:
             return True

@@ -174,6 +174,10 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// a subscription change must not roll every exec replica.
 	a2aGoogleChatSubscriptionEnvVar:      true,
 	credentialProxyA2AChatAudienceEnvVar: true,
+	// The Teams inbound receiver's audience: the intake is the stateful
+	// broker's route, so an exec pod confers no teams-inbound role. Its
+	// callers binding stays, holding the receiver's account to its audience.
+	credentialProxyTeamsInboundAudienceEnvVar: true,
 	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
 	// allowed callers, the A2A gateway among them on every install, and
 	// the binding is what holds that account to the a2a-chat audience. The
