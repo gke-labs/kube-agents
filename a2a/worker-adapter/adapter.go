@@ -2383,7 +2383,7 @@ func (a *adapter) handleInMsg(msg jetstream.Msg, subject string, seen map[string
 				// one's children are still running or have reported, so
 				// it ends nothing and is only logged. Only an untagged
 				// refusal ends the whole wait (supervise).
-				if end.refusal != nil && end.refusal.Repeat {
+				if end.refusal != nil && end.refusal.Round > 1 {
 					a.log.Info("repeat delegation refused by the gateway; the wait on the first request's children goes on",
 						"task", a.cfg.TaskID, "notice", truncate(end.refusal.Text, repeatRefusalLogCap))
 					return

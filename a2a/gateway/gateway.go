@@ -637,6 +637,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.DelegationWidthMax <= 0 {
 		o.Config.DelegationWidthMax = defaultDelegationWidthMax
 	}
+	o.Config.DelegationRoundsMax = clampDelegationRounds(o.Config.DelegationRoundsMax, log)
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
 	}

@@ -203,7 +203,7 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 		// again (healProfileBatch); the parent dedupes on the entry. The
 		// last end changes nothing: the parent holds the conversation until
 		// its own end, which is the chain's.
-		if g.profileBatchChildEnded(ctx, rec, parent, child, end, reason) {
+		if g.profileBatchChildEnded(ctx, rec, parent, child, end) {
 			end.Text = ""
 		} else {
 			end.Unsent = true
@@ -469,7 +469,7 @@ func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, pare
 			}
 		case fresh.BatchEnd.Unsent:
 			end := *fresh.BatchEnd
-			if g.profileBatchChildEnded(ctx, rec, parent, fresh, end, end.Text) {
+			if g.profileBatchChildEnded(ctx, rec, parent, fresh, end) {
 				end.Unsent, end.Text = false, ""
 				rec.setBatchEnd(fresh.ID, &end)
 				changed = true

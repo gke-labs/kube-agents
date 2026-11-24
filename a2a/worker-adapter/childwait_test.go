@@ -405,7 +405,7 @@ func TestARepeatRefusalLeavesTheWaitOnLiveChildrenOpen(t *testing.T) {
 	}
 	sendChildEnd(t, c, addressee, taskID, end(1, "child-a", "a is healthy"))
 	const repeatNotice = "⚠️ delegation refused: this task has already handed its work on"
-	repeat, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: repeatNotice, Repeat: true})
+	repeat, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: repeatNotice, Round: 2})
 	if err != nil {
 		t.Fatal(err)
 	}

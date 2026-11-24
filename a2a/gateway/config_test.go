@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"os"
 	"slices"
 	"strconv"
@@ -44,6 +45,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_MAX_SESSIONS", "")
 	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "")
 	t.Setenv("A2A_DELEGATION_WIDTH_MAX", "")
+	t.Setenv("A2A_DELEGATION_ROUNDS_MAX", "")
 	t.Setenv("A2A_BUSY_NOTICE_AT", "")
 	t.Setenv("A2A_IDLE_TTL", "")
 	for _, k := range []string{"A2A_SESSION_CPU_REQUEST", "A2A_SESSION_MEMORY_REQUEST", "A2A_SESSION_CPU_LIMIT", "A2A_SESSION_MEMORY_LIMIT"} {
@@ -1165,6 +1167,59 @@ func TestDelegationWidthMaxFromEnv(t *testing.T) {
 			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q accepted", bad)
 		} else if !strings.Contains(err.Error(), "A2A_DELEGATION_WIDTH_MAX") {
 			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q: error %q does not name the variable", bad, err)
+		}
+	}
+}
+
+// TestDelegationRoundsMaxFromEnvAndTheClamp: FromEnv reads
+// A2A_DELEGATION_ROUNDS_MAX as set, unset reading as 0, and refuses a
+// non-integer naming the variable. New then keeps 1 to
+// lib.DelegateRoundsCeiling, and, until rounds past the first are supported,
+// clamps any value over 1 to 1 with a warning naming the variable.
+func TestDelegationRoundsMaxFromEnvAndTheClamp(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DelegationRoundsMax != 0 {
+		t.Fatalf("unset DelegationRoundsMax = %d, want 0 (New's default)", cfg.DelegationRoundsMax)
+	}
+	t.Setenv("A2A_DELEGATION_ROUNDS_MAX", "3")
+	if cfg, err = FromEnv(); err != nil || cfg.DelegationRoundsMax != 3 {
+		t.Fatalf("A2A_DELEGATION_ROUNDS_MAX=3: %v, %v", cfg, err)
+	}
+	for _, bad := range []string{"junk", "1.5", "two"} {
+		t.Setenv("A2A_DELEGATION_ROUNDS_MAX", bad)
+		if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "A2A_DELEGATION_ROUNDS_MAX") {
+			t.Fatalf("A2A_DELEGATION_ROUNDS_MAX=%q: err %v, want one naming the variable", bad, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		set  int
+		warn string
+	}{
+		{0, ""},
+		{1, ""},
+		{3, "A2A_DELEGATION_ROUNDS_MAX: rounds above 1 are not supported yet"},
+		{lib.DelegateRoundsCeiling, "rounds above 1 are not supported yet"},
+		{lib.DelegateRoundsCeiling + 5, "rounds above 1 are not supported yet"},
+		{-2, "A2A_DELEGATION_ROUNDS_MAX: out of range"},
+	} {
+		logs := &lockedBuffer{}
+		got := clampDelegationRounds(tc.set, slog.New(slog.NewTextHandler(logs, nil)))
+		if got != 1 {
+			t.Errorf("rounds %d kept as %d, want 1", tc.set, got)
+		}
+		if tc.warn == "" {
+			if logs.String() != "" {
+				t.Errorf("rounds %d logged %q, want nothing", tc.set, logs.String())
+			}
+			continue
+		}
+		if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), tc.warn) {
+			t.Errorf("rounds %d logged %q, want a warning with %q", tc.set, logs.String(), tc.warn)
 		}
 	}
 }

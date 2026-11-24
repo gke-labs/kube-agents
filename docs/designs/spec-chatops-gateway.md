@@ -864,9 +864,15 @@ trigger. A child below a scheduled run, at any depth, goes only to a profile who
 (`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
 child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, and a refusal as a
-`delegationRefused` one (#4860), which the parent reads while it waits open. A request the parent makes after
-its first one minted or ended is refused as a repeat (`delegation.busy`), on its `.in` with `repeat` set, and ends
-none of the wait on the first one's children. The parent holds the conversation again, so a stop or a steer
+`delegationRefused` one (#4860), which the parent reads while it waits open. Every request the gateway handles
+for a profile task uses one of its delegation rounds, minted or refused, and a request once the task has used
+them is refused (`delegation.rounds`), with a notice that says how many it used, on its `.in` with `round` set
+to the round it would have been. It mints nothing, records nothing, and ends none of the wait on the earlier
+request's children. The rounds are `A2A_DELEGATION_ROUNDS_MAX`, 1 by default and 1 at most for now: the
+gateway clamps anything above 1 to 1 at startup and logs a warning naming the variable, saying rounds above 1
+are not supported yet, until a profile task's later rounds ship. The operator renders it onto the gateway
+explicitly at 1, and refuses any other value it carries, in its startup log; the chart's
+`operator.delegation.roundsMax` takes only 1. At the default, the parent's second request is the one refused. The parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
 chain's end, delegated or not. A stop while the child runs cancels the child and every profile
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
@@ -881,7 +887,8 @@ requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), 
 cards, for the delegate tool the worker adapter serves to name in its addressee description. So
 does a delegating profile's own task (#6789): a submission to a profile whose card says it
 delegates, that is neither a child nor a wake, carries the profiles the delegation would accept from
-it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refused under). The list
+it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refused under), and the rounds
+(`roundsMax`, from `A2A_DELEGATION_ROUNDS_MAX`) when they are over one. The list
 runs the delegation's own checks on each profile, so it never offers one the delegation refuses:
 not `platform`, not a profile outside a cluster-scoped parent's cluster, only profiles that run at
 `read` and list `unattended` for a parent below a scheduled run, and nobody for a parent refused
