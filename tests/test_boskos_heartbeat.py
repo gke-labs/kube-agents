@@ -11,9 +11,8 @@ one line; a caller that dies without its EXIT trap (SIGKILL) takes the daemon
 with it at the next beat, so it never holds the job's log pipe open; detail
 lines carry a well-formed UTC stamp; a TERM that lands in the interval sleep
 stops the daemon at once and leaves no sleep on the job's pipe. One check is
-static: the script holds no
-command substitution, because bash 5.2 can run the TERM trap from inside the
-parser (the script's header says how).
+static: the script holds no command substitution, because bash 5.2 can run
+the TERM trap from inside the parser (the script's header says how).
 """
 
 import os
@@ -309,8 +308,10 @@ class BoskosHeartbeatTest(unittest.TestCase):
             start_new_session=True,
         )
         self.addCleanup(self._kill_session, proc)
-        # The detail line is the last thing a beat does before the sleep.
-        self.assertTrue(wait_until(self._logged_beats), "no beat was logged")
+        # The TERM goes out only once the sleep is running: one that lands
+        # before the fork stops any daemon at once and proves nothing.
+        self.assertTrue(wait_until(lambda: self._sleeping_child(proc.pid)),
+                        "the daemon never reached its interval sleep")
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=WAIT_DEADLINE_SECONDS)
@@ -325,6 +326,13 @@ class BoskosHeartbeatTest(unittest.TestCase):
             self.fail("the daemon left its sleep holding the job's stdout pipe")
         self.assertIn("stopping for", stdout)
         self.assertEqual(len(_FakeBoskos.updates), 1, "the TERM landed in the first sleep")
+
+    @staticmethod
+    def _sleeping_child(pid):
+        """True while pid has a child named sleep."""
+        return subprocess.run(
+            ["pgrep", "-P", str(pid), "sleep"], capture_output=True,
+        ).returncode == 0
 
     @staticmethod
     def _kill_session(proc):

@@ -54,7 +54,10 @@
 # holds the same pipe, by job spec (`kill %%`): bash records the job when it
 # forks, so no TERM can land between the fork and a pid being stored, a
 # finished job is gone from the table so no stale pid is signalled, and it
-# needs no $(jobs -p).
+# needs no $(jobs -p). One window stays open on bash 3.2 only: a sleep
+# signalled after the fork and before its exec still holds this shell's trap
+# and drops the signal, so it outlives the daemon by up to the interval, as
+# every sleep did before. bash 5.2 does not drop it.
 
 set -uo pipefail
 
