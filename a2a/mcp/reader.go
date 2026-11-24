@@ -173,23 +173,18 @@ func fetchWait(ctx context.Context, wait time.Duration) time.Duration {
 // (taskConsumerIdle), never an ordered consumer, whose reset deletes a
 // consumer the console grant cannot. It takes one reader slot, held until the
 // consumer it creates is reaped, or handed back at once when the server
-// refused to create one (consumerMayExist). It reads through a budgetReader,
+// refused to create one (createReadConsumer). It reads through a budgetReader,
 // waits for each message no longer than ctx's deadline, and reads at most
 // limit messages, failing after them if more were pending. It passes at most
 // readMaxBytes to each, and stops with ErrReadByteBudget before the message
 // that would pass it, or at one the server will not send under pullMaxBytes;
 // messages already passed to each stay passed, as when the deadline stops it.
 func (b *NATSBus) drainConsumer(ctx context.Context, s jetstream.Stream, cfg jetstream.ConsumerConfig, limit int, each func(jetstream.Msg)) (int, error) {
-	release, err := b.readerSlot()
-	if err != nil {
-		return 0, err
-	}
 	cfg.AckPolicy = jetstream.AckNonePolicy
 	cfg.MemoryStorage = true
 	cfg.InactiveThreshold = taskConsumerIdle
-	cons, err := s.CreateConsumer(ctx, cfg)
+	cons, release, err := b.createReadConsumer(ctx, s, s.CachedInfo().Config.Name, cfg)
 	if err != nil {
-		release(consumerMayExist(err))
 		return 0, err
 	}
 	defer release(true)

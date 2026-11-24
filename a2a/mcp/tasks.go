@@ -171,13 +171,15 @@ func (b *NATSBus) readerSlot() (release func(created bool), err error) {
 	}
 }
 
-// consumerMayExist reports whether a failed CreateConsumer can still have left
-// a consumer on the server. A JetStream API error is the server's refusal, so
-// nothing was made; anything else (a timeout, a dropped connection) may have
-// been answered after the client stopped waiting.
-func consumerMayExist(err error) bool {
-	var refused *jetstream.APIError
-	return !errors.As(err, &refused)
+// createReadConsumer creates one of this server's read consumers on s, which
+// the log lines call stream. Each attempt takes a reader slot
+// (lib.CreateEphemeralConsumer): one whose create timed out stays taken until
+// the consumer it may have left would be reaped, and one the server refused
+// goes back at once. The returned release is the consumer's slot.
+func (b *NATSBus) createReadConsumer(ctx context.Context, s lib.ConsumerCreator, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, func(created bool), error) {
+	return lib.CreateEphemeralConsumer(ctx, s, cfg, lib.EphemeralCreateOptions{
+		Slot: b.readerSlot, Logger: b.logger(), Stream: stream, AttemptTimeout: b.createAttemptTimeout,
+	})
 }
 
 // ReadTask folds a task from TASKS as it stands now.
@@ -274,16 +276,11 @@ type taskWatch struct {
 }
 
 func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error) {
-	release, err := b.readerSlot()
-	if err != nil {
-		return nil, err
-	}
 	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
 	if err != nil {
-		release(false)
 		return nil, err
 	}
-	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{
+	cons, release, err := b.createReadConsumer(ctx, s, lib.TasksStream, jetstream.ConsumerConfig{
 		FilterSubjects:    lib.TaskReplaySubjects(ref.Addressee, ref.TaskID),
 		DeliverPolicy:     jetstream.DeliverAllPolicy,
 		AckPolicy:         jetstream.AckNonePolicy,
@@ -291,7 +288,6 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 		InactiveThreshold: taskConsumerIdle,
 	})
 	if err != nil {
-		release(consumerMayExist(err))
 		return nil, err
 	}
 	pending := cons.CachedInfo().NumPending
