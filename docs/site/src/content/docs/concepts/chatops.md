@@ -91,7 +91,7 @@ A reply you type in the thread instead answers it the same way with your reply's
 
 Slack shows Working… on the thread from your message until the work, the agent's cards included, has settled, paused while it waits on you, and the thread is titled after your first ask, up to its first question. Opening a new assistant thread, or the bot's Messages tab on an app using agent view, shows the three suggested prompts listed under [Agent view](#agent-view).
 
-These need the app to hold `reactions:write`, `users:read` and `assistant:write`, to subscribe `assistant_thread_started` (and `app_home_opened` for agent view), and to have interactivity on; the manifest `hermes slack manifest` prints has all of them unless it was generated with `--no-assistant`. On an app built with only the scopes the gateway needs to read and answer messages, add them and reinstall the app. Otherwise the reactions, the answered line, Working… and the prompts silently do not appear, while the answers still arrive. A button on a message posted before a gateway restart still answers when clicked, but a reply typed under it leaves its buttons in place.
+These need the app to hold `reactions:write`, `users:read` and `assistant:write`, to subscribe `assistant_thread_started` (and `app_home_opened` for agent view), and to have interactivity on. The gateway's manifest ([Slack app setup](/kube-agents/install/slack-app/#for-the-a2a-gateway)) has all of them. So does the manifest that `hermes slack manifest` prints, except that with `--no-assistant` it lacks `assistant:write`, the assistant view and `assistant_thread_started`. On an app built with only the scopes the gateway needs to read and answer messages, add them and reinstall the app. Otherwise the reactions, the answered line, Working… and the prompts silently do not appear, while the answers still arrive. A button on a message posted before a gateway restart still answers when clicked, but a reply typed under it leaves its buttons in place.
 
 ### Allowed users
 
@@ -141,7 +141,7 @@ A scheduled brief posts flat in that channel, never inside a thread. A job that 
 
 The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report and fleet-audit reports into cards, and changes how the harness's own messages read on Slack (below).
 
-To turn the flag off, set `KAGE_SLACK_UX=false` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`); an install that never set it has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
+To turn the flag off, add `KAGE_SLACK_UX=false` to the chart value `platformAgent.deployment.env`; [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the `install.env` line. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply. An install that never set the flag has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
 
 #### What the reaction means
 
@@ -239,7 +239,7 @@ When a card blocks because it needs something from you, its question posts in pl
 
 The cut never falls inside a link. Code, bold or italic it falls inside is closed in the bold line and reopened below. When a long code span or link would leave only a few words in bold, the cut moves into the code span or past the link. No part of the question shows twice; a link in the bold line shows its label there, and the link itself opens the detail on a line of its own. The note that wakes the Planning Agent tells it the question is already posted so that it need not ask it again.
 
-A question that ends with two to five short options, right after a line ending in a question mark, gets a button for each. The exception is a line that only asks whether to go on ("Shall I proceed?", "Sound good?"), in which case the list is the plan and stays as text. Any other question keeps its options as text, as does a question outside a thread, since a click answers in the thread it was clicked in.
+A question that ends with two to five short options, right after a line ending in a question mark, gets a button for each. The exception is a line whose last sentence is a recognised go-ahead ask ("Shall I proceed?", "Sound good?") and offers no choice with "which" or "or": that list is the plan and stays as text. A go-ahead ask in other words ("Should I apply it?"), or one after a comma, dash or another question ("Here's the plan, sound good?"), is not recognised, and its list gets buttons. Any other shape of question keeps its options as text, as does a question outside a thread, since a click answers in the thread it was clicked in.
 
 Clicking one answers as if you had typed it as your reply in the thread, with the card's name added while the agent still holds the question (after a restart the click answers with the label alone). It runs as your message and passes the same user and channel checks a typed reply does, so a user the adapter would not answer changes nothing by clicking. A click never needs an @-mention.
 
@@ -432,7 +432,9 @@ The agent answers a fixed number of tasks at once: the Hermes bridge's worker co
 
 By default every conversation's tasks go to the `platform` route above. `/session` moves the conversation to the session route, where the conversation gets a session pod of its own, started from the `chat` profile. The same pod takes each of the conversation's tasks in turn, so each one carries on from the last. The pod is deleted 30 minutes after your last message in the conversation, and at most 4 hours after it started. Your next message after that starts a new pod, which reads the conversation so far.
 
-An install runs at most 10 session pods at once (`spec.harness.tuning.maxSessions`). When a conversation needs a new pod at that cap, the pod that has been idle longest is deleted to make room, and its conversation is told `⏸️ this session was paused to make room for another conversation; your next message here starts it fresh with the conversation so far`. If every other conversation with a pod still has a task in progress, the new task is refused instead, with `🚦 not started: 10 session workers are already running (cap 10). …`. A follow-up to a task on the session route gets `✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running`.
+An install runs at most 10 session pods at once (`spec.harness.tuning.maxSessions`). When a conversation needs a new pod at that cap, the pod that has been idle longest is deleted to make room, and its conversation is told `⏸️ this session was paused to make room for another conversation; your next message here starts it fresh with the conversation so far`. If every other conversation with a pod still has a task in progress, the new task waits in line instead, with one message that moves as the line does: `⏳ queued — every session worker is busy and you're next in line; I'll start if one frees up in the next few minutes` (or how many conversations are ahead). It starts when a slot frees, oldest first; `stop` takes it out of the line, and later messages in the conversation wait behind it.
+
+After five minutes in line, wherever it is in the line, it is taken out with `🚦 not started: every session worker stayed busy while this waited …`, which also names any later messages dropped with it. When 20 conversations are already waiting, it is refused at once with `🚦 not started: 10 session workers are already running (cap 10). …`. Messages from a chat app, the console and the eval harness's inject door wait this way. A task sent through the A2A door is refused at the cap rather than queued, because an A2A caller is a program that reads that answer as nothing started. A follow-up to a task on the session route gets `✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running`.
 
 On Slack, start the message with the bot's mention, `@bot /session`, because Slack takes a bare leading `/` as one of its own slash commands. In a Google Chat space, mention the app as with any message.
 
@@ -607,13 +609,11 @@ An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) c
 
 The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the Hermes gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched.
 
-External inbound Bot Framework webhook ingress is not yet shipped in the operator. `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods, and from the A2A gateway pod when a relay backend is armed on it. With the gateway backend armed and `homeChannel` set, proactive alerts and cron reports reach that Teams conversation through the gateway's `chat.notify` route. See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
-
 Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`).
 
 When the operator runs with `A2A_TEAMS_BACKEND=true`, the A2A chat gateway consumes that queue instead of the Hermes adapter (`a2a/gateway/teams.go`, the `A2A_TEAMS_*` env), the broker admits the gateway pod as a caller, and the Hermes Teams platform is not rendered.
 
-What this means for an evaluator: enabling `spec.integration.teams` gives you the outbound half only. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams does not reach the agent: Microsoft delivers it to the bot's messaging endpoint, and the install provides none. The broker's event queue that the gateway reads admits only the gateway pod, so nothing outside the install can feed a message in either.
+What this means for an evaluator: enabling `spec.integration.teams` alone gives you the outbound half. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams reaches the agent only with the inbound receiver on (`spec.integration.teams.inbound.enabled`, with `tenantId`). The operator then runs a pod that accepts the requests Microsoft delivers for the bot, verifies Microsoft's signature on each one, and hands the message to the install. You expose its Service with your own Ingress and TLS certificate and register that address as the bot's messaging endpoint; the setup guide walks through it.
 
 ## Proactive alerts (both channels)
 
@@ -724,6 +724,8 @@ The same workload means the same cluster, namespace and kind, and either the sam
 
 If the watcher cannot read a pod's owner, for example because its identity may not read Pods on that cluster, or the owner is not a Deployment, StatefulSet, DaemonSet or Job, only a Deployment's pods fold. They fold by the ReplicaSet hash in their names (such as `checkout-6cfdb6b98b-zwv24`), and other pods each still alert.
 
+An alert says when a workload broke, once: while the same pods keep retrying a failing image pull, the workload is not announced again. For a Deployment, StatefulSet or DaemonSet that it judges, the daily Workload Reliability audit keeps the standing record. It files a finding on its ledger at each run that finds a pod ten minutes into a failed pull, and the finding leaves at the first run that finds none ([what each SOP checks](/kube-agents/concepts/governance-sops/#what-each-sop-checks)).
+
 A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0` turns folding off, a larger value than `86400` counts as `86400`, a negative value counts as `0`, and a value that is not a number counts as the default.
 
 Change it with the chart value `platformAgent.deployment.incidentWorkloadDedupSeconds`, which renders the entry into the CR's `spec.deployment.env`, or set that entry yourself on an install that no chart manages. On an install made with `install.sh`, put the value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={deployment={incidentWorkloadDedupSeconds=0}}}'`. `0` turns folding off:
@@ -752,7 +754,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in the chart value `platformAgent.deployment.env`, or in `spec.deployment.env` on an install that no chart manages:
 
 ```yaml
 platformAgent:

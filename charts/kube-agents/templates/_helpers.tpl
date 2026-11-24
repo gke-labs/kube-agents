@@ -1273,6 +1273,24 @@ litellm_settings:
   drop_params: true
   {{- end }}
   callbacks: {{ .callbacks }}
+  {{- /*
+    /metrics stays open to the scrape, as it was while the gateway had no
+    master key: LiteLLM v1.108.6 runs its auth on /metrics unless this is
+    false (litellm/__init__.py, prometheus_auth_middleware.py), and the
+    managed-Prometheus scrape sends no key. Set as an attribute of the
+    litellm module, like every other key here (proxy_server.py, load_config).
+  */}}
+  require_auth_for_metrics_endpoint: false
+{{- /*
+  Caller authentication, in the kustomize base's config.yaml too. custom_auth
+  is the hook in files/litellm_caller_auth.py, mounted beside config.yaml,
+  where LiteLLM resolves the module; its docstring says what it admits. The
+  master key comes from the environment, which templates/litellm.yaml fills
+  from the litellm-master-key Secret, so the ConfigMap carries no key.
+*/}}
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  custom_auth: litellm_caller_auth.caller_auth
 {{- /*
   Prompt caching, for Anthropic-family models only: the $claude gate, which
   leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
@@ -3634,6 +3652,26 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
     {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
     {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+  {{- end -}}
+  {{- /* The Teams inbound receiver: one pod while platformAgent.integration.teams.inbound
+         is enabled beside teams.enabled, at the footprint's per-pod entry
+         (operatorRenderedPerReplica.teamsInboundReceiver, read from the operator's fixed
+         constants, so no resources override reaches it). Outside the loop above: the
+         default golden renders no receiver. A switch on with no entry fails rather than
+         counting the pod as zero. No surge term: the receiver rolls Recreate. */ -}}
+  {{- $teamsValues := .Values.platformAgent.integration.teams | default dict -}}
+  {{- if and $teamsValues.enabled (dig "inbound" "enabled" false $teamsValues) -}}
+    {{- $inbound := index ((index $footprint "operatorRenderedPerReplica") | default dict) "teamsInboundReceiver" | default dict -}}
+    {{- if not $inbound -}}
+      {{- fail "quota preflight: platformAgent.integration.teams.inbound.enabled is set, but footprint.yaml has no operatorRenderedPerReplica.teamsInboundReceiver entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" ($inbound.pods | default 1 | int64)) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($inbound.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($inbound.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($inbound.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($inbound.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($inbound.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($inbound.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
   {{- /* The session pods (a2a-worker): the gateway creates one per delegation or /session
          conversation, up to maxSessions at once, in this namespace. No golden renders one,

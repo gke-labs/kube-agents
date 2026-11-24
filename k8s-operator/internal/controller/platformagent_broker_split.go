@@ -104,9 +104,9 @@ const (
 	// projected into agent-api-auth only, so the Hermes container beside it
 	// holds the chat token and cannot reach these routes. Spelled identically
 	// in credential_proxy.py.
-	credentialProxyWatcherAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	credentialProxyWatcherAudience = agentv1alpha1.WatcherTokenAudience
 	// watcherTokenVolume and watcherTokenMountPath carry that token.
-	watcherTokenVolume    = "watcher-credential-proxy-token"            // #nosec G101 -- Volume name, not a credential
+	watcherTokenVolume    = agentv1alpha1.WatcherTokenVolumeName
 	watcherTokenMountPath = "/var/run/secrets/kubeagents/watcher-proxy" // #nosec G101 -- Mount path, not a credential
 	// watcherBrokerURLEnvVar and watcherBrokerTokenFileEnvVar tell the two
 	// watchers where the broker is and which token to present; the Go side
@@ -266,6 +266,11 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if a2aCuratorEnabled() {
 		callers = append(callers, a2aCuratorBrokerCaller(agent))
 	}
+	// The Teams inbound receiver, while it runs: held to the teams-inbound
+	// audience by CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS, rendered beside it.
+	if teamsInboundEnabled(agent) {
+		callers = append(callers, teamsInboundBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
 }
 
@@ -385,7 +390,7 @@ func gatewaySubject(agent *agentv1alpha1.PlatformAgent) rbacv1.Subject {
 // for its ServiceAccount whichever container asks. Unlike that one it is not
 // gated on mode: the watcher token is in every gateway pod.
 func watcherTokenSourceNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
-	names := map[string]bool{watcherTokenVolume: true}
+	names := map[string]bool{agentv1alpha1.WatcherTokenVolumeName: true}
 	if agent.Spec.Deployment == nil {
 		return names
 	}
@@ -402,11 +407,8 @@ func watcherTokenSourceNames(agent *agentv1alpha1.PlatformAgent) map[string]bool
 // projectsWatcherToken reports whether a volume delivers a token for the
 // watcher audience.
 func projectsWatcherToken(v corev1.Volume) bool {
-	if v.Projected == nil {
-		return false
-	}
-	for _, source := range v.Projected.Sources {
-		if source.ServiceAccountToken != nil && source.ServiceAccountToken.Audience == credentialProxyWatcherAudience {
+	for _, route := range agentv1alpha1.BusCredentialRoutes(v, "") {
+		if route.Kind == agentv1alpha1.BusCredentialRouteWatcherAudience {
 			return true
 		}
 	}

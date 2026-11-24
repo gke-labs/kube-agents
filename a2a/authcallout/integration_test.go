@@ -302,7 +302,8 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	// the shipped shape while nothing fixed is bound. Everything the test is
 	// actually asserting about — accounts, users, grants, the callout block's
 	// keys and policy — is untouched; its two-second timeout is the one
-	// value serverConnectBudget lifts, and why.
+	// value serverConnectBudget lifts, and why. The callout's own two budgets
+	// are not the server's: serveCallout lifts those.
 	opts.Port = -1
 	opts.Websocket.Port = -1
 	opts.HTTPPort = -1
@@ -363,9 +364,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("the callout service could not connect: %v", err)
 	}
 	t.Cleanup(svcConn.Close)
-	if _, err := svc.Subscribe(svcConn); err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	serveCallout(t, svc, validator, svcConn)
 
 	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, dial: dialOpt}
 }
@@ -824,8 +823,9 @@ func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
 	// Sixteen held at once is the whole measurement: serial dispatch cannot
 	// show it, and the pool cannot show more. The wall clock is logged and
 	// not asserted, since sixty-four TLS handshakes on a loaded runner set
-	// it; the one-second bound the issue asks for is measured without them,
-	// in TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast.
+	// it; the four rounds the issue's one-second bound comes down to are
+	// counted without them, in
+	// TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast.
 	if peak != calloutWorkers {
 		t.Errorf("peak concurrent authorizations = %d, want exactly the %d slots: fewer means the sixteenth never arrived while the first was held, more means the pool bounds nothing", peak, calloutWorkers)
 	}

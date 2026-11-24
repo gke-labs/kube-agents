@@ -849,6 +849,10 @@ WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
 # rather than relayed in part.
 WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
+WATCHER_K8S_TIMEOUT_CODE = "UPSTREAM_TIMEOUT"
+WATCHER_K8S_TIMEOUT_ERROR = "the API server did not answer within the relay deadline"
+WATCHER_K8S_UNRELAYABLE_CODE = "UPSTREAM_UNRELAYABLE"
+WATCHER_K8S_UNRELAYABLE_ERROR = "the upstream answer could not be relayed"
 # The header the shim's get-credentials check sends on its one relay read
 # (credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, held equal by a test).
 # It only narrows: with it, a clusters-get for a cluster that
@@ -1274,6 +1278,18 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 VCS_PROVIDER_LABEL = "provider"
 VCS_PROVIDER_NONE = "none"
+DECISION_MEMORY_CHECKS_METRIC = "kubeagents_credential_proxy_decision_memory_checks_total"
+DECISION_MEMORY_VERDICT_LABEL = "verdict"
+DECISION_MEMORY_VERDICT_ALLOW = "allow"
+DECISION_MEMORY_VERDICT_WARN = "warn"
+DECISION_MEMORY_VERDICT_BLOCK = "block"
+DECISION_MEMORY_VERDICT_ERROR = "error"
+DECISION_MEMORY_VERDICTS = frozenset({
+    DECISION_MEMORY_VERDICT_ALLOW,
+    DECISION_MEMORY_VERDICT_WARN,
+    DECISION_MEMORY_VERDICT_BLOCK,
+    DECISION_MEMORY_VERDICT_ERROR,
+})
 # The one-time claim token minted with each `proposal-create` answer, under
 # CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
 # (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
@@ -1510,6 +1526,16 @@ RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
 # The refusal code a profile caller gets for a version-control verb its task
 # credential doesn't cover (no credential, or a write without the permit).
 CALLER_PERMIT_REQUIRED_CODE = "CALLER_PERMIT_REQUIRED"
+# A refusal body's mark of a definitive write refusal: a write refused however
+# it is attempted, which a retry or another spelling cannot get through. Set on
+# a policy rule's refusal of a mutating kubectl verb that is not a local render
+# (command_policy.kubectl_definitive_write): the read-only rule's
+# (read_only_refusal) and, for a profile caller, the flag rule's. Never on a
+# busy, rate or timeout answer, nor on a version-control refusal, whose answer
+# is the patch the version-control skill gives. The in-pod client (credential_proxy_client.WRITE_REFUSAL_KEY)
+# records such a refusal for the profile worker, which stops the task at the
+# first one; every other refusal carries it false or not at all.
+WRITE_REFUSAL_KEY = "write_refusal"
 # A profile caller's permitted write that names a proposal or branch this
 # install does not own (VcsBroker.require_agent_proposal, #3993).
 RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
@@ -2376,7 +2402,8 @@ DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 #
 # The split is real rather than notional because the two callers already need
 # disjoint routes and the operator already gives each only what its side needs:
-# the gateway has GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL and an empty
+# the gateway has a relay URL (TEAMS_RELAY_URL with Teams on; the operator no
+# longer renders GOOGLE_CHAT_RELAY_URL or SLACK_RELAY_URL) and an empty
 # CREDENTIAL_PROXY_URL, and the sandbox has the reverse. What was missing was
 # anything on this side that refused when a caller reached across.
 #
@@ -2434,6 +2461,15 @@ CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
 # (#6090). The operator renders it beside CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE,
 # only while Google Chat is armed on the A2A stack.
 A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS"
+# The Teams inbound receiver (#1034): the one component the internet reaches,
+# which hands a verified Bot Framework activity to this broker. Its audience
+# confers a role that reaches one route by one method, POST on
+# TEAMS_INBOUND_ROUTE (the Teams queue intake), and nothing else under
+# /v1/chat/: not the pull, not the receipts, not the outbound API. Bound
+# like the mcp audience: callers unset confers the role on nobody.
+TEAMS_INBOUND_AUDIENCE_ENV = "CREDENTIAL_PROXY_TEAMS_INBOUND_AUDIENCE"
+TEAMS_INBOUND_CALLERS_ENV = "CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS"
+TEAMS_INBOUND_ROUTE = "/v1/chat/teams/events"
 # The profile workers' audience (#3889). An AgentProfile's worker pod runs
 # model output and reaches this broker the way a session pod does, over the
 # ClusterIP with a projected token, and gets a role of its own: the exec route,
@@ -2490,6 +2526,7 @@ CALLER_ROLE_A2A_REPORTS = "a2a-reports"
 # managed repository only, so the curator can verify active and superseded
 # records from Git without holding a forge credential of its own.
 CALLER_ROLE_CURATOR = "curator"
+CALLER_ROLE_TEAMS_INBOUND = "teams-inbound"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -2518,6 +2555,7 @@ CALLER_ROLES = (
     CALLER_ROLE_SCOPE,
     CALLER_ROLE_A2A_REPORTS,
     CALLER_ROLE_CURATOR,
+    CALLER_ROLE_TEAMS_INBOUND,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -3022,6 +3060,14 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # No trailing slash: the passthrough is one exact path, and the handler
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
+    # The Teams queue intake is the one route the inbound receiver reaches,
+    # and by POST alone. It sits before the Teams prefix below so the exact
+    # path wins: the install's Teams consumer (TEAMS_ROUTE_ROLES: the chat
+    # role, or the a2a-chat role under A2A_TEAMS_BACKEND) plus the receiver.
+    # As a prefix the entry below also covers the pull (GET on the same path)
+    # and the receipts under it, so _role_permits holds the teams-inbound
+    # role to the exact path and method on top of this table.
+    (TEAMS_INBOUND_ROUTE, TEAMS_ROUTE_ROLES + (CALLER_ROLE_TEAMS_INBOUND,)),
     # The Teams relay serves whichever gateway the install arms on it: the
     # Hermes consumer (chat role), or the A2A gateway's teams backend
     # (a2a-chat role) when the operator runs with A2A_TEAMS_BACKEND=true and
@@ -3113,6 +3159,10 @@ BROKER_FAILURE_KIND_BY_ROUTE: dict[str, str | None] = {
     watcher_policy.WATCHER_K8S_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
     "/v1/chat/a2a": None,
     "/v1/chat/api": None,
+    # The Teams intake sits ahead of the chat prefix in ROUTE_ROLES, so its
+    # label is its own; a relay 5xx there belongs to the caller as under
+    # /v1/chat, and a pull failure is recorded at its site.
+    TEAMS_INBOUND_ROUTE: None,
     "/v1/chat": None,
 }
 
@@ -5833,6 +5883,7 @@ class ServiceAccountAuthenticator:
         profile_identities: Mapping[str, Any] | None = None,
         a2a_reports_callers: frozenset[str] = frozenset(),
         a2a_chat_callers: frozenset[str] = frozenset(),
+        teams_inbound_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -5848,6 +5899,7 @@ class ServiceAccountAuthenticator:
         self.a2a_reports_callers = a2a_reports_callers
         self.curator_callers = curator_callers
         self.a2a_chat_callers = a2a_chat_callers
+        self.teams_inbound_callers = teams_inbound_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
@@ -5904,7 +5956,7 @@ class ServiceAccountAuthenticator:
     def _own_token(self) -> str:
         try:
             return Path(self.token_file).read_text(encoding="utf-8").strip()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             raise AuthenticationError(
                 f"this pod's own API server token is unreadable: {type(exc).__name__}"
             ) from exc
@@ -5939,9 +5991,12 @@ class ServiceAccountAuthenticator:
                 request, timeout=self.timeout_seconds, context=context
             ) as response:
                 review = json.load(response)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, RecursionError) as exc:
             # A TokenReview that cannot be completed is a rejection, not an
             # allow. An API server outage must not turn into an open broker.
+            # HTTPException: an answer that is not HTTP, or a body that ends
+            # early, is not an OSError. RecursionError: a body nested past the
+            # JSON parser's depth is not a ValueError.
             raise AuthenticationError(
                 f"TokenReview could not be completed: {type(exc).__name__}"
             ) from exc
@@ -5959,6 +6014,11 @@ class ServiceAccountAuthenticator:
         # authenticated for some other audience is not for us, and one it
         # validated for two of ours breaks the assumption the role rests on.
         audiences = status.get("audiences") or []
+        # The audiences, the user, its username, its uid and its groups: a value
+        # of another type than the API server's is a malformed answer, and a
+        # malformed answer is a rejection.
+        if not isinstance(audiences, list):
+            raise AuthenticationError("TokenReview returned audiences that are not a list")
         matched = sorted(
             {
                 audience
@@ -5973,7 +6033,11 @@ class ServiceAccountAuthenticator:
                 "the presented token names more than one of this broker's audiences"
             )
         user = status.get("user") or {}
+        if not isinstance(user, dict):
+            raise AuthenticationError("TokenReview returned a user that is not a mapping")
         username = user.get("username") or ""
+        if not isinstance(username, str):
+            raise AuthenticationError("TokenReview returned a username that is not text")
         if username not in self.allowed_callers:
             raise AuthenticationError("the authenticated caller is not permitted")
         role = self.audience_roles[matched[0]]
@@ -6009,12 +6073,23 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("the A2A gateway may present only the a2a-chat or a2a-reports audience")
         if role == CALLER_ROLE_A2A_CHAT and self.a2a_chat_callers and username not in self.a2a_chat_callers:
             raise AuthenticationError("the a2a-chat audience is only for the A2A gateway")
+        # The Teams inbound binding, as the mcp one: empty names nobody, and
+        # the receiver holds no other audience.
+        if username in self.teams_inbound_callers and role != CALLER_ROLE_TEAMS_INBOUND:
+            raise AuthenticationError("the Teams inbound receiver may present only the teams-inbound audience")
+        if role == CALLER_ROLE_TEAMS_INBOUND and username not in self.teams_inbound_callers:
+            raise AuthenticationError("the teams-inbound audience is only for the Teams inbound receiver")
         # The profile binding, as the mcp one: empty names nobody.
         if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
             raise AuthenticationError("a profile caller may present only the profile audience")
         if role == CALLER_ROLE_PROFILE and username not in self.profile_callers:
             raise AuthenticationError("the profile audience is only for profile callers")
         groups = user.get("groups") or []
+        if not isinstance(groups, list):
+            raise AuthenticationError("TokenReview returned groups that are not a list")
+        uid = user.get("uid") or ""
+        if not isinstance(uid, str):
+            raise AuthenticationError("TokenReview returned a uid that is not text")
         extra = user.get("extra") or {}
         pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
         pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
@@ -6022,7 +6097,7 @@ class ServiceAccountAuthenticator:
         pod_uid = pod_uids[0] if isinstance(pod_uids, list) and pod_uids else ""
         return Principal(
             workload=username,
-            uid=str(user.get("uid") or ""),
+            uid=uid,
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
             role=role,
             pod=pod if isinstance(pod, str) else "",
@@ -6248,6 +6323,11 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(A2A_CHAT_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    teams_inbound_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(TEAMS_INBOUND_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     # The profile workers' identities, read only once the profile audience is
     # conferred below; an empty map confers the role on nobody.
     profile_identities: dict[str, Any] = {}
@@ -6339,6 +6419,25 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "there, so every caller presenting the a2a-reports audience is refused",
                     A2A_REPORTS_AUDIENCE_ENV,
                     A2A_REPORTS_CALLERS_ENV,
+                )
+        # The Teams inbound receiver's audience, read raw and refused on a
+        # collision for the mcp audience's reasons.
+        teams_inbound_audience = os.getenv(TEAMS_INBOUND_AUDIENCE_ENV, "").strip()
+        if teams_inbound_audience and teams_inbound_audience in audience_roles:
+            LOGGER.warning(
+                "%s equals the %s audience; the teams-inbound role needs an audience of its own, "
+                "so it is not conferred",
+                TEAMS_INBOUND_AUDIENCE_ENV,
+                audience_roles[teams_inbound_audience] or CALLER_ROLE_SHELL,
+            )
+        elif teams_inbound_audience:
+            audience_roles[teams_inbound_audience] = CALLER_ROLE_TEAMS_INBOUND
+            if not teams_inbound_callers:
+                LOGGER.warning(
+                    "%s is set but %s is not; the teams-inbound role is bound to the callers named "
+                    "there, so every caller presenting the teams-inbound audience is refused",
+                    TEAMS_INBOUND_AUDIENCE_ENV,
+                    TEAMS_INBOUND_CALLERS_ENV,
                 )
         # The scope publisher's audience, read raw and refused on a collision
         # for the mcp audience's reasons.
@@ -6456,6 +6555,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         a2a_reports_callers=a2a_reports_callers,
         curator_callers=curator_callers,
         a2a_chat_callers=a2a_chat_callers,
+        teams_inbound_callers=teams_inbound_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
@@ -8824,7 +8924,8 @@ VCS_SCRATCH_DIR = "vcs"
 # its scratch directory (`--output`), from a bare clone.
 #
 # `diff-tree` is on it for one caller: `publish` diffs the incoming tip's tree
-# against the policy base's merge-base before pushing.
+# against the policy base's merge-base before pushing. `log` is on it so `publish`
+# inspects incoming commit author and committer addresses before pushing.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "archive",
@@ -8834,6 +8935,7 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "diff-tree",
         "fetch",
         "init",
+        "log",
         "ls-remote",
         "ls-tree",
         "merge-base",
@@ -13470,6 +13572,7 @@ def build_vcs_broker(
     executor: CommandExecutor,
     base_branch: str = "",
     pinned_bases: Mapping[tuple[str, str], str] | None = None,
+    metrics: ProxyMetrics | None = None,
 ):
     """The version-control broker. Always built; there is no switch.
 
@@ -13506,6 +13609,14 @@ def build_vcs_broker(
         # describe and a namespaced kubectl get, through the same executor,
         # kubeconfig selection and output cap as a caller's.
         cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
+        on_decision_memory_check=(
+            metrics.record_decision_memory_check if metrics is not None else None
+        ),
+        allowed_commit_emails=lambda host, viewer_login: vcs_readings.install_commit_emails(
+            host,
+            viewer_login,
+            os.environ.get(vcs_readings.GITHUB_APP_ID_ENV, "").strip() or None,
+        ),
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -13906,8 +14017,10 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     # so the shim can print them beside the rule: the agent runtime's refusal
     # stop reads those lines instead of re-deriving the verb from shell text.
     verb_words = list(decision.verb_tuple) if decision.verb_tuple else None
-    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE:
+    read_only_rule = decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE
+    if verb_words and read_only_rule:
         verb_words = verb_words[:2] if verb_words[1:2] and verb_words[1] in _KUBECTL_SUBCOMMANDS.get(verb_words[0], ()) else verb_words[:1]
+    rendered = read_only_rule and command_policy.local_render(argv)
     return (
         {
             "status": "blocked",
@@ -13915,7 +14028,13 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
             "rule": decision.rule_id,
             "message": decision.message,
             "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in verb_words] if verb_words else None,
-            "local_render": decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and command_policy.local_render(argv),
+            "local_render": rendered,
+            # A definitive write refusal: the read-only rule refused a mutating
+            # kubectl verb that was not a local render. The in-pod client
+            # records it for the profile worker's stop (WRITE_REFUSAL_KEY).
+            WRITE_REFUSAL_KEY: read_only_rule
+            and not rendered
+            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),
         },
         log_hint,
     )
@@ -14221,6 +14340,7 @@ class ProxyMetrics:
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str, str], int] = {}
+        self._decision_memory_checks: dict[str, int] = {}
         # The sweep's last reading of each kind, None until the first; a
         # withheld reading leaves the previous one here.
         self._outcomes: vcs_readings.OutcomesReading | None = None
@@ -14339,6 +14459,12 @@ class ProxyMetrics:
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
+    def record_decision_memory_check(self, verdict: str) -> None:
+        if verdict not in DECISION_MEMORY_VERDICTS:
+            verdict = DECISION_MEMORY_VERDICT_ERROR
+        with self._lock:
+            self._decision_memory_checks[verdict] = self._decision_memory_checks.get(verdict, 0) + 1
+
     def set_readings(
         self,
         outcomes: vcs_readings.OutcomesReading | None,
@@ -14456,6 +14582,7 @@ class ProxyMetrics:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
+            decision_memory_checks = sorted(self._decision_memory_checks.items())
             outcomes = self._outcomes
             details = self._details
             reading_failures = sorted(self._reading_failures.items())
@@ -14578,6 +14705,14 @@ class ProxyMetrics:
                 f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
                 f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
                 f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
+            )
+        lines += [
+            f"# HELP {DECISION_MEMORY_CHECKS_METRIC} Stage B OKF decision-memory guard checks evaluated on /v1/vcs/publish, by verdict (allow, warn, block, error).",
+            f"# TYPE {DECISION_MEMORY_CHECKS_METRIC} counter",
+        ]
+        for verdict, count in decision_memory_checks:
+            lines.append(
+                f'{DECISION_MEMORY_CHECKS_METRIC}{{{DECISION_MEMORY_VERDICT_LABEL}="{_escape_label_value(verdict)}"}} {count}'
             )
         # Wall clock, as the readings' `taken_at` is.
         self._render_readings(lines, outcomes, details, reading_failures, time.time())
@@ -15058,6 +15193,24 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         has not been upgraded to project a second audience yet; ``role`` is set
         only where the API server confirmed which audience it validated.
         """
+        if principal.role == CALLER_ROLE_TEAMS_INBOUND and (
+            self.command != "POST" or self.path != TEAMS_INBOUND_ROUTE
+        ):
+            # The receiver reaches one route by one method; ROUTE_ROLES
+            # cannot say "POST alone", so this does.
+            LOGGER.warning(
+                "refused the Teams inbound receiver a route that is not its intake method=%s path=%s",
+                self.command,
+                _sanitize_for_logging(self.path),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": "this route is not available to this caller",
+                    "code": "CALLER_ROLE_FORBIDDEN",
+                },
+            )
+            return False
         needed = required_roles(self.path)
         if not needed or not principal.role or principal.role in needed:
             return True
@@ -15832,6 +15985,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         refused_flag = session_kubectl_flag_refusal(principal.role, argv)
         if refused_flag is not None:
+            # A profile caller's write the flag rule refused is refused outright:
+            # marked for the worker's stop like a read-only refusal, with the
+            # verb words the record names. Only this policy refusal and the
+            # read-only rule's are marked, never a busy, rate or timeout answer.
+            flag_write = command_policy.kubectl_definitive_write(argv) if principal.role == CALLER_ROLE_PROFILE else None
             LOGGER.warning(
                 "flag refused for role request_id=%s role=%s executable=%s flag=%s",
                 request_id,
@@ -15852,6 +16010,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "is not one of them (file inputs, file-backed output formats, streaming flags and the "
                         "API server's own endpoints under --raw are not available to a session)."
                     ),
+                    "verb": list(flag_write) if flag_write else None,
+                    WRITE_REFUSAL_KEY: flag_write is not None,
                 },
             )
             return
@@ -15911,6 +16071,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             argv, kubeconfig_context = confined.argv, confined.kubeconfig_context
             # A task whose target the install excludes is refused outright,
             # metadata reads included: the gateway should never have granted it.
+            # A task whose target an operator holds (spec.hold) is refused the
+            # same way, every command, through the same check.
             if principal.task_target is not None:
                 try:
                     target = principal.task_target
@@ -16499,7 +16661,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self.exclusions.check(segments[2], segments[4], segments[6])
             except scope_exclude.ExcludedCluster as exc:
                 LOGGER.warning(
-                    "api excluded cluster refused request_id=%s rule=%s", request_id, exc.rule,
+                    "api scope refusal request_id=%s rule=%s", request_id, exc.rule,
                     extra=audit(AUDIT_STATUS_BLOCKED, rule=exc.rule),
                 )
                 self._json(
@@ -17111,8 +17273,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         credential. `watcher_policy.evaluate_k8s` is the table. A watch is
         streamed through as the API server sends it. A Pod's metadata is read
         whole and relayed as its projection (`project_pod_metadata`).
-        Everything else is streamed too, with the Cloud API relay's deadline
-        on each read.
+        Everything else is read whole under the Cloud API relay's total
+        deadline and response cap before headers are sent.
         """
         request_id = str(uuid.uuid4())
         if self.command != watcher_policy.METHOD_GET:
@@ -17178,7 +17340,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         try:
             self.exclusions.check(target["project"], target["location"], target["cluster"])
         except scope_exclude.ExcludedCluster as exc:
-            LOGGER.warning("watcher k8s excluded cluster request_id=%s rule=%s", request_id, exc.rule)
+            LOGGER.warning("watcher k8s scope refusal request_id=%s rule=%s", request_id, exc.rule)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -17200,25 +17362,36 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         authorization = self._relay_authorization("watcher k8s", request_id)
         if authorization is None:
             return
-        read_timeout = WATCHER_WATCH_READ_TIMEOUT_S if watching else API_RELAY_DEADLINE_S
         # Built inside the try: a cached CA that will not load is a TLS failure
         # like any other, answered 502 and forgotten, not an unanswered request.
         connection: http.client.HTTPConnection | None = None
         started = time.monotonic()
+        deadline = started + API_RELAY_DEADLINE_S
         answered = False
         # The API server's status line arrived: the cached host and CA reached
         # it, so a failure after this point is not theirs to be forgotten for.
         upstream_answered = False
         try:
             connection = self._watcher_k8s_connection(host, ca_pem)
-            connection.connect()
-            connection.sock.settimeout(read_timeout)
+            try:
+                connection.connect()
+            except TimeoutError as exc:
+                raise ApiRelayConnectTimeout(
+                    f"connect to {host} did not complete in {API_RELAY_CONNECT_TIMEOUT_S}s"
+                ) from exc
+            sock = connection.sock
+            sock.settimeout(
+                WATCHER_WATCH_READ_TIMEOUT_S if watching else GoogleApiRelay._remaining(deadline)
+            )
             target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
             connection.putrequest(watcher_policy.METHOD_GET, target_path, skip_accept_encoding=True)
             connection.putheader("Authorization", authorization)
             if accept:
                 connection.putheader("Accept", accept)
             connection.endheaders()
+            sock.settimeout(
+                WATCHER_WATCH_READ_TIMEOUT_S if watching else GoogleApiRelay._remaining(deadline)
+            )
             response = connection.getresponse()
             upstream_answered = True
             if HTTPStatus.MULTIPLE_CHOICES <= response.status < HTTPStatus.BAD_REQUEST:
@@ -17228,29 +17401,57 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
                 )
                 return
-            if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
-                # Read whole and projected: the Pod's ObjectMeta carries every
-                # annotation and managedFields, and only the owner lookup's
-                # fields leave the broker. A non-200 answer is the API server's
-                # Status, which carries no Pod data, and is relayed as it is.
-                body = response.read(WATCHER_POD_METADATA_MAX_BYTES + 1)
-                if len(body) > WATCHER_POD_METADATA_MAX_BYTES:
-                    LOGGER.warning("watcher k8s pod metadata too large request_id=%s", request_id)
-                    self._json(
-                        HTTPStatus.BAD_GATEWAY,
-                        {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
-                    )
-                    return
-                if response.status == HTTPStatus.OK:
-                    projected = watcher_policy.project_pod_metadata(body)
-                    if projected is None:
-                        LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+            if not watching:
+                # Non-watch reads are bounded like GoogleApiRelay.fetch: re-arm
+                # the total deadline before each read1 chunk, cap Pod metadata
+                # at WATCHER_POD_METADATA_MAX_BYTES and other non-watch reads
+                # at API_RELAY_MAX_RESPONSE_BYTES, and fail on a Content-Length
+                # body cut short before sending status headers downstream.
+                max_bytes = (
+                    WATCHER_POD_METADATA_MAX_BYTES
+                    if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA
+                    else API_RELAY_MAX_RESPONSE_BYTES
+                )
+                chunks: list[bytes] = []
+                received = 0
+                while True:
+                    if response.isclosed():
+                        break
+                    sock.settimeout(GoogleApiRelay._remaining(deadline))
+                    chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > max_bytes:
+                        LOGGER.warning(
+                            "watcher k8s response too large request_id=%s rule=%s status=%d cap_bytes=%d",
+                            request_id,
+                            decision.rule_id,
+                            response.status,
+                            max_bytes,
+                        )
                         self._json(
                             HTTPStatus.BAD_GATEWAY,
-                            {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                            {"error": WATCHER_K8S_UNRELAYABLE_ERROR, "code": WATCHER_K8S_UNRELAYABLE_CODE},
                         )
                         return
-                    body = projected
+                    chunks.append(chunk)
+                if response.length:
+                    raise http.client.IncompleteRead(b"".join(chunks), response.length)
+                body = b"".join(chunks)
+                content_type = response.getheader("Content-Type", "")
+                if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
+                    if response.status == HTTPStatus.OK:
+                        projected = watcher_policy.project_pod_metadata(body)
+                        if projected is None:
+                            LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+                            self._json(
+                                HTTPStatus.BAD_GATEWAY,
+                                {"error": WATCHER_K8S_UNRELAYABLE_ERROR, "code": WATCHER_K8S_UNRELAYABLE_CODE},
+                            )
+                            return
+                        body = projected
+                    content_type = watcher_policy.POD_METADATA_MEDIA_TYPE
                 LOGGER.info(
                     "watcher k8s forwarded request_id=%s rule=%s status=%d bytes=%d",
                     request_id,
@@ -17260,7 +17461,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 self.send_response(response.status)
                 answered = True
-                self.send_header("Content-Type", watcher_policy.POD_METADATA_MEDIA_TYPE)
+                if content_type:
+                    self.send_header("Content-Type", sanitize_header(content_type))
                 # Framed by its length, so the connection stays reusable, and
                 # closed with the answer when the request's body went unread.
                 self.send_header("Content-Length", str(len(body)))
@@ -17286,8 +17488,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             sent = 0
+            cut_by_limit = False
             while True:
                 if watching and time.monotonic() - started > WATCHER_WATCH_MAX_S:
+                    cut_by_limit = True
                     break
                 chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
                 if not chunk:
@@ -17309,9 +17513,31 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         sent,
                     )
                     self.close_connection = True
+                    cut_by_limit = True
                     break
                 sent += len(chunk)
+            if not cut_by_limit and response.length:
+                raise http.client.IncompleteRead(b"", response.length)
             LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
+        except TimeoutError:
+            LOGGER.warning(
+                "watcher k8s upstream timeout request_id=%s host=%s deadline_s=%d",
+                request_id,
+                host,
+                API_RELAY_DEADLINE_S,
+            )
+            if answered:
+                self.close_connection = True
+            else:
+                if not upstream_answered:
+                    key = (target["project"], target["location"], target["cluster"])
+                    with self.watcher_endpoints_lock:
+                        self.watcher_endpoints.pop(key, None)
+                with contextlib.suppress(OSError):
+                    self._json(
+                        HTTPStatus.GATEWAY_TIMEOUT,
+                        {"error": WATCHER_K8S_TIMEOUT_ERROR, "code": WATCHER_K8S_TIMEOUT_CODE},
+                    )
         except (OSError, http.client.HTTPException) as exc:
             # Before our status line, an answer, and the cached address is
             # forgotten in case it is what failed: only when the API server's
@@ -18603,15 +18829,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _refuse_excluded_cluster(
         self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,
     ) -> None:
-        """Answer a request whose cluster the install's scope excludes (scope_exclude).
+        """Answer a request whose cluster the install excludes or an operator holds
+        (scope_exclude: spec.scope.exclude.clusters, spec.hold).
 
-        Its own rule id, like the pool's refusal, so the agent can say the
-        cluster is out of scope rather than that a policy blocked it. The
-        message names only the target's three name parts, each already held to
-        the GKE context grammar, and the cap bounds the line regardless.
+        Its own rule id (exc.rule: scope.excluded-cluster, scope.held-cluster, or
+        their -unreadable forms), like the pool's refusal, so the agent can say
+        the cluster is out of scope or on hold rather than that a policy blocked
+        it; the log line is labelled by that rule. The message names only the
+        target's three name parts, each already held to the GKE context grammar,
+        and a hold's reason, which the operator wrote and scope_exclude keeps to
+        one printable line; the cap bounds the line regardless.
         """
         LOGGER.warning(
-            "excluded cluster refused request_id=%s rule=%s reason=%s",
+            "scope refusal request_id=%s rule=%s reason=%s",
             request_id,
             exc.rule,
             _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),
@@ -19128,6 +19358,7 @@ def serve(args: argparse.Namespace) -> None:
             executor,
             base_branch=CredentialProxyHandler.base_branch,
             pinned_bases=CredentialProxyHandler.pinned_bases,
+            metrics=CredentialProxyHandler.metrics,
         )
     # What the gate's soft watermark reclaims: vcs scratch no request of this
     # process holds (the vcs broker swept a dead process's at start), and on

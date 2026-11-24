@@ -3,7 +3,6 @@ Subject: Lead a pending Pod that names no ComputeClass on a labelled pool to its
 Why: A question about Pending Pods and no scale-up starts in this skill, and its checklist had no item for a pool that carries a compute-class label while the Pods name no class. With an empty `NotTriggerScaleUp` reason the agent then looks for a constraint on the Pod and puts the fix in the controller's code. The new item leads to the cause (details stay in gke-compute-classes, Symptom 13), and a short section gives the fix for workloads with generated names: the default class label on the namespace, which applies to new Pods only (tested on GKE 1.35.8-gke.1796000).
 Local-Issue: #2528
 Eval-Case: autoscaler-pending-generated-workloads-probe
-Upstream-Issue: none filed yet
 Retire-When: upstream's pending pod checklist names this case and the namespace fix
 
 diff --git a/SKILL.md b/SKILL.md

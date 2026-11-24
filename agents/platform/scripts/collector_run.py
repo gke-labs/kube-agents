@@ -80,7 +80,8 @@ PAGE_EMPTY_TEXT = "paged read: the page was empty"
 PAGE_NOT_JSON_TEXT = "paged read: the page is not JSON"
 PAGE_NOT_A_LIST_TEXT = "paged read: the page has no `items` list"
 PAGE_LOOP_TEXT = "paged read: the server repeated a continue token"
-PAGE_CEILING_TEXT = f"paged read: more than {MAX_PAGES} pages of one kind"
+PAGE_CEILING_FORMAT = "paged read: more than {pages} pages of one kind"
+PAGE_CEILING_TEXT = PAGE_CEILING_FORMAT.format(pages=MAX_PAGES)
 #: The query string's syntax in a page's `--raw` path.
 QUERY_MARK = "?"
 QUERY_PAIR_JOIN = "&"
@@ -372,6 +373,7 @@ def paged_list(
     run: RunFn,
     query: dict[str, str] | None = None,
     page_size: int | None = None,
+    max_pages: int | None = None,
     digest: "hashlib._Hash | None" = None,
     **run_kwargs,
 ) -> tuple[list | None, Run, int]:
@@ -380,13 +382,16 @@ def paged_list(
     with its kind. `(items, run, pages)` on success; `(None, run, pages)` with
     the failing page's `Run` when any page failed, printed nothing, printed
     something that is not JSON or not a list, or the server looped on a token:
-    a partial kind is never returned as a shorter one. A page that failed with
+    a partial kind is never returned as a shorter one. `max_pages` lowers the
+    ceiling of `MAX_PAGES` for a read whose caller would rather not evaluate
+    than read that much; past it the read fails the same way. A page that failed with
     an exit code is handed back as it ran; one that exited 0 carries the
     `PAGE_*_TEXT` naming its class at the end of its stderr, so a caller's error
     reports the reason rather than inferring one. `run_kwargs` (`env`,
     `timeout`) reach every page's `run` as the caller's `run_and_gate` passes
     them."""
     listed = LIST_KINDS[canonical_resource(resource)]
+    ceiling = max_pages or MAX_PAGES
     items: list = []
     token = ""
     seen_tokens: set[str] = set()
@@ -421,14 +426,20 @@ def paged_list(
             break
         if token in seen_tokens:
             return None, Run(argv, 0, "", PAGE_LOOP_TEXT, elapsed), pages
-        if pages >= MAX_PAGES:
-            return None, Run(argv, 0, "", PAGE_CEILING_TEXT, elapsed), pages
+        if pages >= ceiling:
+            ceiling_text = PAGE_CEILING_FORMAT.format(pages=max_pages) if max_pages else PAGE_CEILING_TEXT
+            return None, Run(argv, 0, "", ceiling_text, elapsed), pages
         seen_tokens.add(token)
     return items, Run(first_argv, 0, "", "", elapsed), pages
 
 
 def paged_dump(
-    resources: Iterable[str], *, run: RunFn, query: dict[str, str] | None = None, **run_kwargs
+    resources: Iterable[str],
+    *,
+    run: RunFn,
+    query: dict[str, str] | None = None,
+    max_pages: int | None = None,
+    **run_kwargs,
 ) -> tuple[dict | None, Run]:
     """The collectors' multi-kind dump, read one kind at a time in pages and
     merged into kubectl's `List` shape, behind the same fail-closed gate as
@@ -442,7 +453,9 @@ def paged_dump(
     pages = 0
     first: Run | None = None
     for resource in resources:
-        items, result, kind_pages = paged_list(resource, run=run, query=query, digest=digest, **run_kwargs)
+        items, result, kind_pages = paged_list(
+            resource, run=run, query=query, max_pages=max_pages, digest=digest, **run_kwargs
+        )
         elapsed += result.duration_s
         pages += kind_pages
         if items is None:

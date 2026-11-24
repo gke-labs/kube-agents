@@ -384,6 +384,7 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - agentschedules
       - dispatchjobtemplates
     verbs:
       - create

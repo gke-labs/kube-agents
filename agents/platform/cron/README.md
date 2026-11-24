@@ -469,7 +469,12 @@ the clusters after that point wait for a later run. A call that fails costs
 only its own clusters. Every cluster in a call is stamped in the ledger
 (`cluster_runs`) however the call ended; the least recently stamped go first,
 and clusters stamped together are shuffled by the run's date so batch
-membership changes from run to run. Projects go least recently swept first
+membership changes from run to run. On a tick that swept at least one target,
+`cluster_runs` entries for clusters outside the current sweep's targets
+(`LEEWAY_WATCH_CLUSTERS` or the target projects) whose timestamp is unparseable
+or older than twice the refresh window (`2 * LEEWAY_WATCH_REFRESH_DAYS`) are
+dropped so clusters removed from `LEEWAY_WATCH_CLUSTERS` or from projects that
+leave the scope do not accumulate. Projects go least recently swept first
 (`project_runs`): a project whose turn starts with a full 15 minutes is
 stamped then and rotates behind the others, so a project too big for one tick
 is covered over the next ticks without starving the rest. A project's turn
@@ -488,8 +493,9 @@ returned an error (<cause>)`), never named, and marks its project's episode as
 failed as a whole. Clusters only the budget kept from being read are
 not a failure: they post nothing, keep their findings, and are listed under
 the report's "Not Reached This Run". The partial-scan line posts when a project fails that
-has no open episode, and names the projects that failed in that run, up to
-six and then "+N more". An episode remembers the clusters that failed, and
+has no open episode, naming the projects that failed in that run, up to
+six and then "+N more", while the per-project summary goes to
+`logs/leeway_watch.log` under the agent home. An episode remembers the clusters that failed, and
 whether the project failed as a whole (its cluster list could not be read, or
 an error row matched none of its clusters). It closes once each remembered
 cluster has read cleanly since or left its project's list and, for a project
@@ -499,14 +505,17 @@ closed, and a project that leaves the sweep drops its episode without a line.
 A ledger from before per-project episodes has its signature of error kinds
 read in the first run after the upgrade and then removed, without a line: a
 project failing in that run with a kind the signature holds opens its episode
-silently, and one failing with another kind posts. A run in which no call
-returned fails the tick with one fixed sentence that names no project and no
-count, only whether the reads timed out, failed, or both; while the tick keeps
+silently, and one failing with another kind posts. When a tick fails, it posts
+one plain line ("**The topology skew check didn't run today.**" or "**The
+topology skew check didn't finish today.**" on a write failure, why, and
+whether it tries again tomorrow — or at its next scheduled run — or needs an
+admin to fix it) with the raw detail in `logs/leeway_watch.log`, keyed on the
+plain reason in `last-failure.txt` until the next clean tick posts the
+recovery, and exits 0 on every path so the scheduler never replaces the line
+with its own retry promise. A run in which no call
+returned says only whether the reads timed out, failed, or both; while the tick keeps
 failing it keeps the kinds the last line named, so it does not change with the
-rotation and posts once. A run of one project whose list failed, or whose one
-call held every cluster, keeps that project's message; under
-`LEEWAY_WATCH_CLUSTERS`, one call that held every cluster keeps that call's
-own error. A finding on a cluster its project no longer lists
+rotation and posts once. A finding on a cluster its project no longer lists
 retires once that list was read.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
@@ -517,7 +526,10 @@ alerts once per refresh window. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` set the
 scheduled sweep's alert thresholds and re-post interval from the `PlatformAgent` CR's
 `spec.deployment.env` (the operator's allowlist carries them), and also work
-on runs started by hand in the pod with `--dry-run`. `LEEWAY_WATCH_CLUSTERS`,
+on runs started by hand in the pod with `--dry-run`, which previews the exact
+due and cleared chat messages prefixed with `dry run (nothing posted):` (and
+prints a failing tick's raw detail to stderr) without touching the ledger,
+reports, failure marker or log. `LEEWAY_WATCH_CLUSTERS`,
 `LEEWAY_WATCH_PROJECTS` and `LEEWAY_WATCH_HOME` are not carried, so they apply
 only to runs started by hand. The report's
 topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
@@ -542,7 +554,8 @@ Resolved findings on cleanly scanned (`status: "ok"`) clusters are retired
 under their own headline in the same post ("**1 pod placement problem has
 cleared**", then up to three names), while clusters whose scan failed or that
 were not reached retain their ledger entries so transient errors do not erase
-state and re-page tomorrow. Lines about the scan itself follow the headlines. A run
+state and re-page tomorrow. Lines about the scan itself follow the headlines in
+plain text. A run
 with a finding due writes and publishes its own report, partial or not. The
 JSON report carries a `coverage` block: `clusters_swept`, `clusters_read`, and
 the projects `not_reached` or with `scan_errors` this run (each with its
@@ -556,7 +569,8 @@ or clusters not reached hold it back. So on a fleet too big for one run,
 keep the previous report. When `NATS_URL` is set, the watch also writes the
 JSON report it just saved to the `topology-skew`
 (`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
-fails, it warns once in chat and retries with `latest.json` on a later run
+fails, it logs the error and remediation commands to
+`logs/leeway_watch.log`, and retries silently with `latest.json` on a later run
 that reads every project in full without a failure, until the write recovers.
 A report too large for one bus message (NATS's 1 MiB `max_payload`, less 64
 KiB held back for the envelope and encoding slack) is published capped: the

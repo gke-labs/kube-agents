@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +17,8 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // Config is the adapter's contract with its pod: everything here arrives as
@@ -101,6 +102,9 @@ type Config struct {
 	// whatever it said. It separates "not told" from "told: unknown".
 	OriginSeqStated bool
 
+	// Driver is the harness's headless contract (driver.go). Nil means
+	// Claude Code, the harness every argv below is built for.
+	Driver Driver
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
 	HarnessCommand []string
@@ -147,6 +151,17 @@ type Config struct {
 	// always checked and its refusal is always honoured; there is no
 	// configuration in which this executor runs work a verifier refused.
 	CapabilityOptional bool
+
+	// StopOnWriteRefusal stops the harness at the first definitive write
+	// refusal the broker client recorded in WriteRefusalFile (refusal.go)
+	// and ends the task rejected with the refused rule and verb. No tool
+	// output is read for it. applyDefaults sets it for a profile pod
+	// (ProfileExecutor); a test sets it directly.
+	StopOnWriteRefusal bool
+	// WriteRefusalFile is the task's record file (EnvWriteRefusalFile),
+	// which the profile worker makes beside the task token. Empty reads
+	// nothing, and the task is never stopped at a refusal.
+	WriteRefusalFile string
 
 	// TaskDeadline bounds the harness wall clock below the pod's own
 	// activeDeadlineSeconds so the failure is ours to report, not the
@@ -251,6 +266,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Scope == "" {
 		c.Scope = capability.NamespaceScope(c.Namespace)
+	}
+	if c.ProfileExecutor {
+		c.StopOnWriteRefusal = true
 	}
 }
 
@@ -361,6 +379,11 @@ type adapter struct {
 	finalized bool
 	finalErr  error
 	appended  map[string]bool // artifact name -> first chunk already out
+	// askKind is the mark.ask token for the task's prompt (lib/askkind),
+	// carried on every progress line as the hermes-bridge carries it, so the
+	// gateway's reaction follows a profile task as it follows a platform one
+	// (#6536). Set once the prompt is read, before the harness runs.
+	askKind string
 
 	// harnessSession is the session id the harness reported at init, which
 	// the next task in a reused pod resumes (Config.SessionReuse).
@@ -619,7 +642,7 @@ func newTaskAdapter(cfg Config, b *busConns) *adapter {
 		c:        b.c,
 		nc:       b.nc,
 		js:       b.js,
-		from:     lib.Party{Session: cfg.Addressee(), AgentType: "claude-code", Profile: cfg.Profile},
+		from:     lib.Party{Session: cfg.Addressee(), AgentType: string(cfg.driver().Harness()), Profile: cfg.Profile},
 		appended: map[string]bool{},
 	}
 }
@@ -772,6 +795,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		err := a.finalize(state, "reason: no-text-parts - the submission message carries nothing to execute", "")
 		return done(Result{State: state}, err)
 	}
+	// The kind is the ask's words, as the bridge reads them: the message's
+	// own text, before any primer.
+	a.askKind = askkind.Kind(prompt)
 	prompt = withPrimer(plan.primer, prompt)
 
 	// The live in-subject consumer opens positioned just after the
@@ -810,7 +836,8 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			argv = cfg.HarnessCommandNoDelegate
 		}
 	}
-	argv = withResume(argv, plan.resume)
+	drv := cfg.driver()
+	argv = drv.WithResume(argv, plan.resume)
 	a.resumedSession = plan.resume != ""
 	env := cfg.HarnessEnv
 	if delegate && cfg.SessionReuse {
@@ -826,8 +853,8 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			return broken(Result{State: state}, ferr)
 		}
 		var rewrote bool
-		argv, env, rewrote = withDelegateSocket(argv, env, socket)
-		if !rewrote && slices.Contains(argv, MCPConfigFlag) {
+		argv, env, rewrote = withDelegateSocketFor(drv, argv, env, socket)
+		if !rewrote && drv.ConfiguresMCP(argv) {
 			// The harness is configured for MCP but not by the shape the pod
 			// builds, so its delegate server may still name the configured
 			// path, where nothing listens in a reused pod.
@@ -840,7 +867,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		// The agents this turn's requester may delegate to, as the gateway
 		// listed them on the submission: per turn, so a reused pod's tool
 		// keeps up with profiles added and removed.
-		argv, _ = withDelegateTargets(argv, origin)
+		argv, _ = withDelegateTargetsFor(drv, argv, origin)
 		a.delegateWidth = delegateWidthOf(origin)
 	}
 
@@ -865,7 +892,15 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	}
 	defer stopDelegate()
 
-	proc, err := startHarness(argv, env, prompt, cfg.KillGrace, log)
+	// The driver prepares the first turn before the harness starts; an error
+	// fails the task with nothing run (Driver.PrepareTurn).
+	if err := drv.PrepareTurn(ctx, a.turnDirs(env)); err != nil {
+		state := lib.StateFailed
+		ferr := a.finalize(state, "reason: "+prepareFailedToken+reasonDetailSeparator+err.Error(), "")
+		return broken(Result{State: state}, ferr)
+	}
+
+	proc, err := startHarnessWith(drv, argv, env, prompt, cfg.KillGrace, log)
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -945,7 +980,32 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// another turn, and the task's deliverable is the result that
 		// settles the count.
 		pendingTurns = 1
+		// refused is the definitive write refusal that stopped the harness
+		// (StopOnWriteRefusal): the task's end is decided, and nothing the
+		// harness says after it changes that.
+		refused *writeRefusal
+		// refusalReadFailed keeps an unreadable record file to one log line.
+		refusalReadFailed bool
+		// holdSteers is the driver's steer gate; held is what it has held,
+		// written at the next turn boundary that another turn follows, and
+		// refused visibly if none does.
+		holdSteers = a.cfg.driver().HoldsSteers()
+		held       []string
 	)
+
+	// refuseHeld refuses, on the stream and before the terminal, every steer
+	// still held when the task ends with no turn left for it: after the
+	// loop, and on the eviction arm's early returns. An abandoned task's
+	// terminal is the dispatcher's, so nothing goes out for it.
+	refuseHeld := func() {
+		if a.abandoned() {
+			return
+		}
+		for _, text := range held {
+			a.publishSteerRefusal(text, "")
+		}
+		held = nil
+	}
 
 	// stopForAbandon reports an abandon, from whichever arm finds it first,
 	// and kills the harness once. The loop still waits for it to exit and
@@ -966,7 +1026,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	events := proc.events
 	for events != nil || !exited {
 		select {
-		case ev, ok := <-events:
+		case evs, ok := <-events:
 			if !ok {
 				events = nil
 				continue
@@ -976,60 +1036,123 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			if stopForAbandon() {
 				continue
 			}
-			switch ev.Type {
-			case "system":
-				if ev.Subtype == "init" {
-					a.harnessSession = ev.SessionID
-					var dropped bool
-					a.harnessModel, dropped = ev.model()
-					log.Info("harness session started", "harnessSession", ev.SessionID, "model", a.harnessModel)
-					if dropped {
+			for _, ev := range evs {
+				// A harness stopped at a write refusal is drained, not
+				// published, but for what its turn cost.
+				if refused != nil {
+					if ev.Kind == EventResult {
+						a.publishUsage(ctx, ev.Telemetry)
+					}
+					continue
+				}
+				switch ev.Kind {
+				case EventToolResult:
+					// A tool step's result is in: the call that wrote a
+					// record has exited. Only the record is read, never the
+					// result.
+					if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
+						continue
+					}
+					r, err := readWriteRefusal(a.cfg.WriteRefusalFile, a.taskID)
+					if err != nil && !refusalReadFailed {
+						refusalReadFailed = true
+						log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
+					}
+					if refused = r; refused != nil {
+						// Stopped the way cancel stops it: closed stdin,
+						// SIGTERM to the process group, SIGKILL after
+						// KillGrace. The loop still drains its stdout and
+						// reaps it before the terminal below.
+						log.Info("the broker refused a write; stopping the harness",
+							"task", a.taskID, "rule", refused.rule, "verb", refused.verb)
+						proc.closeStdin()
+						proc.kill(a.cfg.KillGrace)
+					}
+				case EventInit:
+					a.harnessSession = ev.Session
+					a.harnessModel = ev.Model
+					log.Info("harness session started", "harnessSession", ev.Session, "model", a.harnessModel)
+					if ev.ModelDropped {
 						log.Warn("the init line's model is not a string; the usage parts carry no model", "task", a.taskID)
 					}
-				}
-			case "assistant":
-				a.publishAssistant(ctx, ev)
-			case "result":
-				// What the turn cost goes out first, whatever the turn
-				// decided: a delegating turn, a steered one and an errored
-				// one all read tokens.
-				a.publishUsage(ctx, ev)
-				if delegated {
-					log.Info("harness result after delegation ignored", "task", a.taskID)
-					continue
-				}
-				// Drain steers that raced this result: they were published
-				// while the task was working and must be delivered, not
-				// dropped (assertion 21).
-				for drained := false; !drained; {
-					select {
-					case text := <-steerCh:
+				case EventThinking:
+					a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: ev.Text}, false)
+				case EventProgress:
+					a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
+				case EventActivity:
+					a.publishActivity(ctx, ev)
+				case EventResult:
+					// What the turn cost goes out first, whatever the turn
+					// decided: a delegating turn, a steered one and an errored
+					// one all read tokens.
+					a.publishUsage(ctx, ev.Telemetry)
+					if delegated {
+						log.Info("harness result after delegation ignored", "task", a.taskID)
+						continue
+					}
+					// Drain steers that raced this result: they were published
+					// while the task was working and must be delivered, not
+					// dropped (assertion 21). A driver that holds steers gets
+					// them after PrepareTurn, below, with the ones it held.
+					for drained := false; !drained; {
+						select {
+						case text := <-steerCh:
+							if holdSteers {
+								held = append(held, text)
+								continue
+							}
+							if err := proc.writeUser(text); err == nil {
+								pendingTurns++
+								log.Info("steer absorbed at turn boundary", "task", a.taskID)
+							} else {
+								log.Warn("steer write failed", "err", err)
+							}
+						default:
+							drained = true
+						}
+					}
+					pendingTurns--
+					// Another turn follows when a steer is held and the turn
+					// neither failed nor was ended by cancel or the deadline,
+					// whose kill is already on its way: the driver prepares
+					// that turn, then the oldest held steer goes onto stdin.
+					// One per boundary, so every turn the harness runs gets
+					// its own PrepareTurn; the rest wait for the next result.
+					if holdSteers && len(held) > 0 && !ev.Failed && !canceled && !deadlineHit {
+						if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
+							log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
+							sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+							proc.closeStdin()
+							continue
+						}
+						text := held[0]
+						held = held[1:]
 						if err := proc.writeUser(text); err == nil {
 							pendingTurns++
-							log.Info("steer absorbed at turn boundary", "task", a.taskID)
+							log.Info("held steer written at turn boundary", "task", a.taskID)
 						} else {
-							log.Warn("steer write failed", "err", err)
+							// The adapter held it, so the adapter owns
+							// saying it never arrived.
+							log.Warn("held steer write failed; refusing it", "task", a.taskID, "err", err)
+							a.publishSteerRefusal(text, "")
 						}
-					default:
-						drained = true
 					}
+					if ev.Failed {
+						sawResult = true
+						resultErr = ev.Token
+						resultText = ev.Text
+					} else if pendingTurns <= 0 {
+						sawResult = true
+						resultText = ev.Text
+					} else {
+						log.Info("turn result absorbed; steered turns pending",
+							"task", a.taskID, "pending", pendingTurns)
+						continue
+					}
+					// The deliverable (or the failure) is decided: close stdin
+					// so the harness wraps up and exits.
+					proc.closeStdin()
 				}
-				pendingTurns--
-				if ev.IsError || ev.Subtype != "success" {
-					sawResult = true
-					resultErr = ev.Subtype
-					resultText = ev.Result
-				} else if pendingTurns <= 0 {
-					sawResult = true
-					resultText = ev.Result
-				} else {
-					log.Info("turn result absorbed; steered turns pending",
-						"task", a.taskID, "pending", pendingTurns)
-					continue
-				}
-				// The deliverable (or the failure) is decided: close stdin
-				// so the harness wraps up and exits.
-				proc.closeStdin()
 			}
 
 		case text := <-steerCh:
@@ -1037,7 +1160,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				log.Info("steer for an abandoned task dropped", "task", a.taskID)
 				continue
 			}
-			if sawResult || exited {
+			if sawResult || exited || refused != nil {
 				// Post-deliverable steer: the deliverable is chosen and
 				// the harness is wrapping up, so this correction cannot be
 				// absorbed. The payload spec requires the refusal be
@@ -1049,6 +1172,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				// adapter-internal.
 				log.Warn("steer after deliverable; refusing visibly", "task", a.taskID)
 				a.publishSteerRefusal(text, "")
+				continue
+			}
+			if holdSteers {
+				// Written after this turn's result and PrepareTurn.
+				held = append(held, text)
+				log.Info("steer held until the turn boundary", "task", a.taskID)
 				continue
 			}
 			if err := proc.writeUser(text); err != nil {
@@ -1070,7 +1199,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Cancel and the deadline end the turn when they fire, not when
 			// the harness finally dies: a call in that window would publish
 			// a child and turn the canceled task into a completed one.
-			if sawResult || exited || canceled || deadlineHit || stopForAbandon() {
+			if sawResult || exited || canceled || deadlineHit || refused != nil || stopForAbandon() {
 				ask.reply <- delegateReply{Message: "this turn has already ended"}
 				continue
 			}
@@ -1138,8 +1267,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// wake the gateway could not route to this pod starts a fresh
 			// incarnation that retires it while the harness is still
 			// inside KillGrace.
+			refuseHeld()
 			if delegated {
 				return a.completeWith(resultText)
+			}
+			// Nor is it a failure of a task already stopped at a write
+			// refusal: that refusal is its end.
+			if refused != nil {
+				return a.endRefused(refused)
 			}
 			state := lib.StateFailed
 			err := a.finalize(state, a.evictedReason(), resultText)
@@ -1152,13 +1287,21 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 	}
 
+	// Steers held for a turn that never came: the task ended first. Each is
+	// refused where its sender can see it, before the terminal, like a steer
+	// that arrives after the deliverable.
+	refuseHeld()
+
 	// Harness exited and stdout is drained. Decide the terminal in strict
-	// precedence: a clean deliverable beats everything (cancel lost the
-	// race, legal per the payload spec), then deadline, then cancel, then
-	// failure with evidence.
+	// precedence: a write refusal that stopped the harness (no result line
+	// is read after it), then a clean deliverable (cancel lost the race,
+	// legal per the payload spec), then deadline, then cancel, then failure
+	// with evidence.
 	switch {
 	case a.abandoned():
 		return Result{Abandoned: true}, nil
+	case refused != nil:
+		return a.endRefused(refused)
 	case sawResult && resultErr == "":
 		return a.completeWith(resultText)
 	case sawResult:
@@ -1181,6 +1324,17 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	}
 }
 
+// endRefused publishes the terminal of a task stopped at a definitive write
+// refusal: failed (work ran first, so not rejected), which no supervisor
+// retries and the gateway renders with its reason's detail, carrying the
+// refused rule and verb and no other output.
+func (a *adapter) endRefused(r *writeRefusal) (Result, error) {
+	// failed, not rejected: work ran before the refusal, and rejected means
+	// refused before the start (spec-a2a-payloads.md).
+	state := lib.StateFailed
+	return Result{State: state}, a.finalize(state, writeRefusedReason(r), "")
+}
+
 // completeWith publishes the deliverable and the completed terminal: the
 // harness's clean result, or a delegating turn's one-line result. A result
 // that cannot be published fails the task with the publish error.
@@ -1200,8 +1354,8 @@ func (a *adapter) completeWith(resultText string) (Result, error) {
 // with no figure publishes nothing, so a reader sees absence rather than
 // zeroes. Best-effort, like the other stream telemetry: the deliverable and
 // the terminal are the load-bearing publishes.
-func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
-	t := ev.telemetry(a.harnessModel)
+func (a *adapter) publishUsage(ctx context.Context, t resultTelemetry) {
+	t.usage.Model = a.harnessModel
 	if len(t.dropped) > 0 {
 		// One line per result line: a harness that retyped a field would
 		// otherwise zero the figure install-wide with nothing to go on.
@@ -1227,37 +1381,21 @@ func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
 	a.publishArtifactChunk(ctx, lib.ArtifactUsage, part, false)
 }
 
-// publishAssistant maps one assistant message's content blocks onto the
-// reserved artifact names: thinking deltas to thinking, tool invocations to
-// activity, and the model's own prose to progress - the milestone stream the
-// gateway's rolling line renders at zero model cost. (The spec's explicit
-// progress tool is the stage 3 shape; mapping the narration is the
-// playground stand-in, recorded in the findings.)
-func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
-	if ev.Message == nil {
+// publishActivity publishes one tool invocation on the activity artifact.
+// Thinking and the model's own prose go to the thinking and progress
+// artifacts, the milestone stream the gateway's rolling line renders at zero
+// model cost. (The spec's explicit progress tool is the stage 3 shape;
+// mapping the narration is the playground stand-in, recorded in the
+// findings.) An input that does not marshal publishes nothing.
+func (a *adapter) publishActivity(ctx context.Context, ev Event) {
+	entry, err := json.Marshal(map[string]any{
+		"tool":  ev.Tool,
+		"input": ev.Input,
+	})
+	if err != nil {
 		return
 	}
-	for _, block := range ev.Message.Content {
-		switch block.Type {
-		case "thinking":
-			if block.Thinking != "" {
-				a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: block.Thinking}, false)
-			}
-		case "text":
-			if block.Text != "" {
-				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: block.Text}, false)
-			}
-		case "tool_use":
-			entry, err := json.Marshal(map[string]any{
-				"tool":  block.Name,
-				"input": json.RawMessage(block.Input),
-			})
-			if err != nil {
-				continue
-			}
-			a.publishArtifactChunk(ctx, lib.ArtifactActivity, lib.Part{Kind: "data", Data: entry}, false)
-		}
-	}
+	a.publishArtifactChunk(ctx, lib.ArtifactActivity, lib.Part{Kind: "data", Data: entry}, false)
 }
 
 // publishArtifactChunk publishes one part onto a named artifact, appending
@@ -1265,26 +1403,55 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 // is logged and the task continues - the deliverable and the terminal event
 // are the load-bearing publishes, not the telemetry.
 func (a *adapter) publishArtifactChunk(ctx context.Context, name string, part lib.Part, last bool) {
+	a.publishArtifactChunks(ctx, name, []lib.Part{part}, last)
+}
+
+// publishArtifactChunks is publishArtifactChunk for a chunk of several parts
+// in one artifact-update: a progress line's text and the chat message that
+// marks it.
+func (a *adapter) publishArtifactChunks(ctx context.Context, name string, parts []lib.Part, last bool) {
 	a.mu.Lock()
 	appendChunk := a.appended[name]
 	a.appended[name] = true
 	a.mu.Unlock()
-	if err := a.publishArtifactPart(ctx, name, part, appendChunk, last); err != nil {
+	if err := a.publishArtifactParts(ctx, name, parts, appendChunk, last); err != nil {
 		a.log.Warn("artifact publish failed", "name", name, "err", err)
 	}
+}
+
+// progressParts is one progress line as the hermes-bridge publishes it
+// (hermes-bridge/chat.go): the text, then a chat message carrying only the
+// ask's mark, which the gateway draws on the ask (markFrom) and which lays
+// nothing out, so the rolling line still renders the text. A mark the
+// chat message refuses leaves the bare text, as the bridge does.
+func progressParts(line, ask string) []lib.Part {
+	if ask == "" {
+		return []lib.Part{{Kind: "text", Text: line}}
+	}
+	parts, err := chatmsg.Parts(chatmsg.Progress, line, chatmsg.Message{Mark: &chatmsg.Mark{Ask: ask}})
+	if err != nil {
+		return []lib.Part{{Kind: "text", Text: line}}
+	}
+	return parts
 }
 
 // publishArtifactPart is the one place an artifact-update for this task is
 // built and published: one part on the named artifact, whose id is derived
 // from the task and the name. Callers own the chunking and the error policy.
 func (a *adapter) publishArtifactPart(ctx context.Context, name string, part lib.Part, appendChunk, last bool) error {
+	return a.publishArtifactParts(ctx, name, []lib.Part{part}, appendChunk, last)
+}
+
+// publishArtifactParts is publishArtifactPart for several parts in one
+// update.
+func (a *adapter) publishArtifactParts(ctx context.Context, name string, parts []lib.Part, appendChunk, last bool) error {
 	update := lib.ArtifactUpdate{
 		TaskID:    a.taskID,
 		ContextID: a.contextID,
 		Artifact: lib.Artifact{
 			ArtifactID: "artifact-" + a.taskID + "-" + name,
 			Name:       name,
-			Parts:      []lib.Part{part},
+			Parts:      parts,
 		},
 		Append:    appendChunk,
 		LastChunk: last,

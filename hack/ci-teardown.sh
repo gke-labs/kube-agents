@@ -160,11 +160,7 @@ echo "Location:  $REGION"
 echo "Namespace: $NAMESPACE"
 
 # Authenticates kubectl to target GKE cluster
-gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG || {
+get_cluster_credentials "$CLUSTER_NAME" "$REGION" "$PROJECT_ID" || {
   echo "ERROR: Failed to authenticate to GKE cluster ${CLUSTER_NAME} in project ${PROJECT_ID}! Aborting teardown for safety."
   exit 1
 }
@@ -260,8 +256,9 @@ finish_step() { # <name> <exit-status>
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Sweeping bench plants ==="
 # What a bench case's stack planted on the host cluster and a killed run left
-# behind: webhook configurations, node readiness rules, compute classes and
-# node pools labelled managed-by=kube-agents-bench (bench/README.md,
+# behind: webhook configurations, node readiness rules, compute classes,
+# custom resource definitions and node pools labelled
+# managed-by=kube-agents-bench (bench/README.md,
 # "Validated Capabilities suite", fixture rule 8). A run killed between its stack's
 # apply and destroy runs no destroy; a leftover class or hook is read by the
 # next lease's audits and a leftover pool bills. First, because nothing here
@@ -269,7 +266,9 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Sweeping bench plants ==="
 # deletes after it. The script is dry-run by default; --delete acts. Its exit
 # is 1 when a leg failed after every leg ran, which finish_step counts. Not
 # the namespaces a stack plants: each stack's own pre-clear removes its
-# leftover by name, and a namespace leg would reach every nightly stack.
+# leftover by name, and a namespace leg would reach every nightly stack. A
+# planted CRD's delete does remove the objects of its kind in those
+# namespaces, which is what an audit of the next lease would read.
 BENCH_SWEEP_STATUS=0
 "${BENCH_PLANT_SWEEP_SCRIPT}" --project "${PROJECT_ID}" --cluster "${CLUSTER_NAME}" \
   --location "${REGION}" --delete || BENCH_SWEEP_STATUS=$?

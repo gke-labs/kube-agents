@@ -258,6 +258,7 @@ AUDITS: dict[str, AuditSpec] = {
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
             "ingress-gateway-healthcheck-mismatch",
+            "image-pull-failing",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -405,6 +406,7 @@ AUDITS: dict[str, AuditSpec] = {
             "reservation-mismatch-risk",
             "autoscaler-out-of-resources",
             "dangling-compute-class",
+            "ccc-unbacked-manual-fallback",
         ),
         # §4's manifest note: the `project/<id>` entry carries the two
         # project-scoped checks. `reservation-mismatch-risk` sits under both
@@ -425,6 +427,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "reservation-mismatch-risk",
                     "autoscaler-out-of-resources",
                     "dangling-compute-class",
+                    "ccc-unbacked-manual-fallback",
                 ),
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
@@ -437,7 +440,7 @@ AUDITS: dict[str, AuditSpec] = {
         # finding; the join tells the arms apart by the collector's excerpt
         # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
         # validator cannot, and the SOP's step carries that distinction. The
-        # other eleven are capacity faults no
+        # other twelve are capacity faults no
         # declaration excuses: a quota near its limit, a ComputeClass with no
         # fallback, a Spot shape that gets preempted, an autoscaler that
         # already failed to add a node.
@@ -1292,6 +1295,7 @@ CHECK_PHRASES = {
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
+    "image-pull-failing": "{object} cannot pull its image",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -1349,6 +1353,7 @@ CHECK_PHRASES = {
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
+    "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists machine options that it cannot use",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -3191,7 +3196,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Twelve markers. A cost collector sets `service-fronted` on an idle
+# Thirteen markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -3242,6 +3247,11 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # other three are set by `collect.py` for the same reason, on §2.7,
 # §3.16 and §3.19; `collect.py`'s `TRIAGE_BY_SLUG` says what each fix risks.
 #
+# The stockout collector sets `manual-pool-fallback` on every §3.13 finding:
+# the fix adds a node pool for each rule that has none, or lets GKE create
+# node pools for the class, and the collector cannot tell which the owners
+# want.
+#
 # The text beside each marker is what the ledger prints after the finding's
 # title in the "fix needs a decision" block, so a reader sees why the sweep
 # passed over that one without opening it. Keep it a clause about the fix.
@@ -3258,6 +3268,8 @@ TRIAGE_REASONS = {
     "service-selector": "rewrites or deletes a Service on a judgement about its backend",
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
     "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
+    "manual-pool-fallback": "creates node pools or turns on automatic node pool creation, and which of the two is the owners' call",
+    "image-pull": "follows from why the pull fails, which the alert's triage establishes and this audit does not",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
@@ -4797,17 +4809,22 @@ def report_envelope(
     }
 
 
-def _adopt_owner(path: Path, owner: os.stat_result) -> None:
-    """Give `path` to `owner`'s uid and gid when this run is root.
+def _adopt_owner(descriptor: int, owner: os.stat_result) -> None:
+    """Give the open file or directory `descriptor` to `owner`'s uid and gid
+    when this run is root.
 
     Mode alone cannot fix a root hand-run: uid 1000 can read a root-owned 0755
     directory but cannot create the temp file or rename over `latest.json` in
     it, so every later run would lose its memory and fail its write. Root is
     the one writer that can hand what it creates to the store's owner, and
     any other uid creates what it owns.
+
+    Through a descriptor, never a name: the store's directories are the store
+    owner's, so an entry root just made can be swapped for a link before the
+    chown, and a chown by name would follow it to the link's target.
     """
     if os.geteuid() == ROOT_UID:
-        os.chown(path, owner.st_uid, owner.st_gid)
+        os.fchown(descriptor, owner.st_uid, owner.st_gid)
 
 
 def _make_store_dirs(path: Path) -> None:
@@ -4825,8 +4842,18 @@ def _make_store_dirs(path: Path) -> None:
         except FileExistsError:
             # A rival run made it, and chose its ownership then.
             continue
-        os.chmod(directory, REPORT_DIR_MODE)
-        _adopt_owner(directory, owner)
+        _settle_new_dir(directory, owner)
+
+
+def _settle_new_dir(directory: Path, owner: os.stat_result) -> None:
+    """Set a just-made directory's mode and owner through a no-follow open of
+    it, so neither lands on a link swapped in since the mkdir."""
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(descriptor, REPORT_DIR_MODE)
+        _adopt_owner(descriptor, owner)
+    finally:
+        os.close(descriptor)
 
 
 def _ownership_note(exc: BaseException) -> str:
@@ -4862,9 +4889,11 @@ def _atomic_write(path: Path, text: str) -> None:
     )
     try:
         with handle:
+            # Mode and owner through the open descriptor, not the name, which
+            # can be swapped for a link before the rename.
+            os.fchmod(handle.fileno(), REPORT_FILE_MODE)
+            _adopt_owner(handle.fileno(), path.parent.stat())
             handle.write(text)
-        os.chmod(handle.name, REPORT_FILE_MODE)
-        _adopt_owner(Path(handle.name), path.parent.stat())
         os.replace(handle.name, path)
     except BaseException:
         # Anything that leaves the temp file behind leaves it in the store,

@@ -683,8 +683,9 @@ SECRET_READ_COMMAND_RE = re.compile(
 # substitution whole, and gives each simple command to the same word walk. The
 # rule withholds when either read withholds, so the second read can only add a
 # withhold. It reads only text that the reader gives words for: text with an
-# unclosed quote, a redirect with no target or the reader's mark character is
-# the first read's alone.
+# unclosed quote or a redirect with no target has no words, and text with the
+# reader's mark character is kept away from the reader, so each of them is the
+# first read's alone.
 #
 # `gcloud auth`, as the first group behind `gcloud`: every subcommand withholds
 # but the ones named here, which print no token, and a flag right behind
@@ -706,6 +707,7 @@ GCLOUD_TOKEN_PRINTER_GROUPS = {
     "config-helper": GCLOUD_CONFIG_GROUP,
 }
 GCLOUD_TOKEN_PRINTERS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS)
+GCLOUD_TOKEN_PRINTER_GROUP_WORDS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS.values())
 # `gcloud compute ssh`: the remote command is behind `--`, or is the value of `--command`.
 GCLOUD_SSH_COMMAND = "ssh"
 SCRIPT_LONG_FLAG = "--command"
@@ -1527,11 +1529,19 @@ def mask_served_values(text: str, values: Sequence[tuple[tuple[str, int], ...]])
 
 
 def as_json_structure(text: str) -> Any:
+    """The JSON object or array that `text` is, or `None` for text that is not one.
+
+    Raises `RecursionError` where the parser gives up for the depth. A caller
+    must not read that as "not a document": the text rules alone are a weaker
+    rule than a less deep document gets, which is withheld when the walk over
+    it reaches the recursion limit. `scrub_step_text` withholds the step on
+    the error, and `is_secret_read_tool_call` counts it as a secret read.
+    """
     if text.lstrip()[:1] not in JSON_STRUCTURE_OPENERS:
         return None
     try:
         parsed = json.loads(text)
-    except (ValueError, RecursionError):
+    except ValueError:
         return None
     return parsed if isinstance(parsed, (dict, list)) else None
 
@@ -1745,7 +1755,11 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     read as text and its other arguments as prose; a `tool_result` takes the
     inline-object rule and the rest-of-line mask (`VALUE_SPAN_LINE`); a reply
     keeps the first-token mask. Returns `withheld` for every kind when
-    `redactor` is `None` or the structure is deeper than Python recurses, so
+    `redactor` is `None`, or when the text, or a string value in it that the
+    walk parses, is a JSON document too deep to parse or too deep to walk, or
+    when an inline object in a tool result's line is too deep to parse. (A
+    string value that a rule masks whole is masked, not parsed.) Text that
+    the parser gives up on for its depth is withheld too, document or not. So
     an unscrubbable step is never served as written.
     """
     if redactor is None:
@@ -2214,6 +2228,22 @@ def _first_operands(words: Sequence[str], start: int) -> List[int]:
     return found
 
 
+def _token_printer_behind_its_group(words: Sequence[str]) -> bool:
+    """Whether a gcloud token printer stands behind its group word.
+
+    One pass: it keeps the group words met so far. A copy of the words
+    ahead of each printer made the read quadratic on a command that repeats
+    a printer word.
+    """
+    groups_ahead = set()
+    for word in words:
+        if word in GCLOUD_TOKEN_PRINTERS and GCLOUD_TOKEN_PRINTER_GROUPS[word] in groups_ahead:
+            return True
+        if word in GCLOUD_TOKEN_PRINTER_GROUP_WORDS:
+            groups_ahead.add(word)
+    return False
+
+
 def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: List[int]) -> bool:
     """Whether one command's words print a token or the environment."""
     words = list(words)
@@ -2223,7 +2253,7 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
         return False
     if any(word.endswith(ENVIRON_PATH_SUFFIX) for word in words):
         return True
-    if any(GCLOUD_TOKEN_PRINTER_GROUPS[word] in words[:index] for index, word in enumerate(words) if word in GCLOUD_TOKEN_PRINTERS):
+    if _token_printer_behind_its_group(words):
         return True
     steps = 0
     starts, read = [(0, False)], set()
@@ -2650,8 +2680,10 @@ def _read_script_prints(text: str, depth: int, budget: List[int], nesting: int =
 
     This is the rule's second read. It decides only on text that the reader
     gives words for. It serves the rest, which the first read decides: text
-    with an unclosed quote or a redirect with no target, and text that holds
-    the reader's mark character.
+    with an unclosed quote or a redirect with no target, for which the reader
+    gives no words, and text that holds the reader's mark character, which
+    this read keeps away from the reader. The reader has words for such text
+    too, so that guard is a choice of this rule and not a limit of the reader.
     """
     if len(budget) < READ_COUNT:
         # The first read made this budget, in a call by its own name.
@@ -2745,8 +2777,13 @@ def is_secret_read_tool_call(raw_args: Any) -> bool:
 
     `raw_args` is the arguments as Hermes stores them: a JSON string or an
     object whose `command`/`cmd` carries the shell line, or the bare line.
+    Arguments too deep to parse count as a secret read: nothing shows that
+    they are not one, and `scrub_step_text` withholds them too.
     """
-    parsed = as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
+    try:
+        parsed = as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
+    except RecursionError:
+        return True
     if isinstance(parsed, dict):
         cmd = next((parsed.get(k) for k in COMMAND_ARG_KEYS if parsed.get(k)), "")
         return isinstance(cmd, str) and command_reads_a_secret(cmd)
