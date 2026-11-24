@@ -1,4 +1,4 @@
-"""Publishing a nightly's recorded answers: only from runs that passed, each name written once."""
+"""Publishing a nightly's recorded answers: every one a graded run gave, passing or failing, each name written once."""
 
 import json
 import os
@@ -99,7 +99,7 @@ class PublishTest(unittest.TestCase):
         with open(os.path.join(pod_dir, "logs", "seg-1.jsonl"), "w") as handle:
             handle.write("\n".join(json.dumps(l) for l in lines) + "\n")
 
-    def test_only_answers_from_runs_that_passed_go_up(self):
+    def test_answers_from_passing_and_failing_runs_go_up(self):
         self.world.run("case-a", 1, "pass", ["t_11111111"])
         self.world.run("case-a", 2, "fail", ["t_22222222"])
         self.world.request(worker("t_11111111"), fp(1), recorded=True)
@@ -111,7 +111,7 @@ class PublishTest(unittest.TestCase):
         report = self.publisher.publish(final=True)
         objects = self.bucket.objects()
         self.assertIn(f"replay-cache/{VERSION}/answers/{fp(1)}.json", objects)
-        self.assertNotIn(f"replay-cache/{VERSION}/answers/{fp(2)}.json", objects)
+        self.assertIn(f"replay-cache/{VERSION}/answers/{fp(2)}.json", objects, "a failing run's answer too")
         self.assertNotIn(f"replay-cache/{VERSION}/answers/{fp(3)}.json", objects)
         self.assertEqual(report["decisions"], {"pass": 1, "fail": 1, "no_recording_line": 1})
 
@@ -132,9 +132,8 @@ class PublishTest(unittest.TestCase):
 
     def test_a_slot_goes_up_only_with_its_answer_and_variants_go_up_flat(self):
         self.world.run("case-a", 1, "pass", ["t_11111111"])
-        self.world.run("case-a", 2, "fail", ["t_22222222"])
         self.world.request(worker("t_11111111"), fp(1), recorded=True)
-        self.world.request(worker("t_22222222"), fp(2), recorded=True)
+        self.world.request(worker("t_99999999"), fp(2), recorded=True)  # no graded run's card
         self.answer(1)
         self.answer(2)
         self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)))
@@ -146,14 +145,15 @@ class PublishTest(unittest.TestCase):
         objects = self.bucket.objects()
         prefix = f"replay-cache/{VERSION}"
         self.assertIn(f"{prefix}/slots/{fp(10)}.json", objects)
-        self.assertNotIn(f"{prefix}/slots/{fp(11)}.json", objects, "its answer came from a failing run")
+        self.assertNotIn(f"{prefix}/slots/{fp(11)}.json", objects, "its answer came from no graded run")
         self.assertIn(f"{prefix}/variants/{fp(20)}-{'a' * 16}.json", objects)
         self.assertIn(f"{prefix}/messages/{'b' * 16}.json", objects)
 
-    def two_pods_one_slot(self, earlier_outcome):
-        """Each pod saved its own answer for one slot key, and its own pointer to it; EARLIER_POD sorts first."""
+    def two_pods_one_slot(self):
+        """Each pod saved its own answer for one slot key, and its own pointer to it; EARLIER_POD sorts first.
+
+        EARLIER_POD's answer came from a card no graded run worked, so it never goes up."""
         earlier = os.path.join(self.keep, "pods", EARLIER_POD)
-        self.world.run("case-a", 1, earlier_outcome, ["t_11111111"])
         mine = self.world.request(worker("t_11111111"), fp(1), recorded=True)
         theirs = self.world.request(worker("t_22222222"), fp(2), recorded=True)
         self.answer(1, pod_dir=earlier)
@@ -164,20 +164,20 @@ class PublishTest(unittest.TestCase):
         self.write_logs(lines=[theirs])
 
     def test_a_slot_whose_answer_did_not_go_up_does_not_hide_another_pods_for_the_same_key(self):
-        self.two_pods_one_slot("fail")
+        self.two_pods_one_slot()
         self.world.run("case-a", 2, "pass", ["t_22222222"])
         self.publisher.publish(final=True)
         slot = f"replay-cache/{VERSION}/slots/{fp(10)}.json"
         self.assertEqual(json.loads(self.bucket.objects().get(slot, "null")), fp(2),
-                         "the passing pod's pointer goes up, though the failing pod's sorts first")
+                         "the graded pod's pointer goes up, though the other pod's sorts first")
         objects = {o["name"]: o for o in self._records()[-1]["objects"][VERSION]}
         self.assertEqual(objects[f"slots/{fp(10)}.json"]["target"], fp(2))
 
     def test_a_slot_waits_for_its_answer_across_calls(self):
-        self.two_pods_one_slot("fail")
+        self.two_pods_one_slot()
         self.publisher.publish()
         self.assertEqual(self.bucket.objects().get(f"replay-cache/{VERSION}/slots/{fp(10)}.json"), None,
-                         "the passing pod's answer is not graded yet")
+                         "the second pod's answer is not graded yet")
         self.world.run("case-a", 2, "pass", ["t_22222222"])
         self.publisher.publish()
         self.assertEqual(json.loads(self.bucket.objects()[f"replay-cache/{VERSION}/slots/{fp(10)}.json"]), fp(2))
@@ -225,9 +225,9 @@ class PublishTest(unittest.TestCase):
             {"fingerprint": fp(n), "answer": {"content": f"answer {answer[0]}"}, "normalizer_version": version}),
             pod_dir)
 
-    def test_each_reps_answer_goes_up_only_when_its_run_passed(self):
-        # Two reps answered one request differently: rep 1 (failed) recorded
-        # first, which used to cost the key; rep 2 (passed) is kept beside it.
+    def test_each_reps_answer_goes_up_whether_its_run_passed_or_failed(self):
+        # Two reps answered one request differently: rep 1 (failed) and rep 2
+        # (passed) each keep their answer, beside each other.
         a, b = "a" * 64, "b" * 64
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
@@ -240,15 +240,16 @@ class PublishTest(unittest.TestCase):
         report = self.publisher.publish(final=True)
         objects = self.bucket.objects()
         self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{b}.json", objects)
-        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", objects, "the failing run's answer")
+        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", objects, "the failing run's answer too")
         self.assertIn(f"replay-cache/{VERSION}/slots/{fp(10)}.json", objects, "the key has an answer up")
         self.assertEqual(report["decisions"], {"pass": 1, "fail": 1})
         record = self._records()[-1]
-        self.assertEqual(record["produced"], {VERSION: {fp(1): [b]}})
+        self.assertEqual(record["produced"], {VERSION: {fp(1): [a, b]}})
+        self.assertEqual(record["produced_counts"], {VERSION: {fp(1): {a: 1, b: 1}}})
         slot = next(o for o in record["objects"][VERSION] if o["name"].startswith("slots/"))
         self.assertEqual(slot["target"], fp(1))
 
-    def test_the_same_answer_saved_by_a_failing_rep_goes_up_when_a_passing_rep_gave_it_too(self):
+    def test_the_same_answer_from_a_failing_and_a_passing_rep_goes_up_counted_twice(self):
         # Rep 1 failed and saved the shared answer first; rep 2 passed with the
         # same answer, which record mode did not save again (recorded=false).
         a = "a" * 64
@@ -260,12 +261,13 @@ class PublishTest(unittest.TestCase):
         self.write_logs()
         report = self.publisher.publish(final=True)
         self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", self.bucket.objects())
-        self.assertEqual(report["decisions"], {"pass": 1})
+        self.assertEqual(report["decisions"], {"fail": 1}, "decided by both graded runs, one of which failed")
         self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [a]}})
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 2}}})
 
-    def test_a_failing_reps_answer_is_not_published_by_a_passing_rep_whose_stored_answer_differs(self):
+    def test_look_alike_answers_are_each_decided_by_their_own_stored_answer(self):
         # kanban_show(12) and kanban_show(13): one answer_variant identity,
-        # two stored answers. The passing rep vouches for its own file only.
+        # two stored answers. Each rep vouches for its own file only.
         identity, x, y = "a" * 64, "c" * 64, "d" * 64
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
@@ -276,10 +278,10 @@ class PublishTest(unittest.TestCase):
         self.write_logs()
         report = self.publisher.publish(final=True)
         objects = self.bucket.objects()
-        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", objects, "the failing rep's stored answer")
+        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", objects)
         self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{y}.json", objects)
         self.assertEqual(report["decisions"], {"pass": 1, "fail": 1})
-        self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [y]}})
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {x: 1, y: 1}}})
 
     def test_an_untagged_cardless_answer_is_not_published_even_after_a_passing_continuation(self):
         # Two reps' front doors sent one request and answered in different
@@ -318,18 +320,18 @@ class PublishTest(unittest.TestCase):
     def published(self, answer):
         return f"replay-cache/{VERSION}/alts/{fp(1)}-{answer}.json" in self.bucket.objects()
 
-    def test_a_failing_reps_tagged_cardless_answer_is_not_published_and_a_passing_reps_is(self):
+    def test_tagged_cardless_answers_from_a_failing_and_a_passing_rep_are_both_published(self):
         # No card, no continuation logged: the tag alone decides each.
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
         self.tagged_openings()
         self.write_logs()
         report = self.publisher.publish(final=True)
-        self.assertFalse(self.published(self.X))
+        self.assertTrue(self.published(self.X))
         self.assertTrue(self.published(self.Y))
         self.assertEqual(report["decisions"], {"fail": 1, "pass": 1})
 
-    def test_an_interval_pass_with_the_failing_rep_ungraded_publishes_only_the_passing_answer(self):
+    def test_an_interval_pass_holds_an_ungraded_reps_answer_until_its_case_is_graded(self):
         self.world.run("case-a", 2, "pass", ["t_22222222"])  # rep 1 still running
         self.tagged_openings()
         self.write_logs()
@@ -339,7 +341,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(report["decisions"], {"pending": 1, "pass": 1})
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.publisher.publish(final=True)
-        self.assertFalse(self.published(self.X), "graded later, a fail")
+        self.assertTrue(self.published(self.X), "graded later, a fail, which publishes too")
 
     def test_a_cardless_answer_a_failing_and_a_passing_rep_gave_identically_goes_up(self):
         self.world.run("case-a", 1, "fail", ["t_11111111"])
@@ -348,7 +350,7 @@ class PublishTest(unittest.TestCase):
         self.write_logs()
         self.publisher.publish(final=True)
         self.assertTrue(self.published(self.X))
-        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {self.X: 1}}})
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {self.X: 2}}})
 
     def test_a_retried_attempts_cardless_answer_is_not_published(self):
         # Rep 2's first attempt answered Y and was retried; the graded attempt
@@ -389,10 +391,10 @@ class PublishTest(unittest.TestCase):
         self.alternate(1, a)
         self.write_logs()
         self.publisher.publish(final=True)
-        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 3}}},
-                         "rep 1 twice by tag, rep 2 by card; the failing and the untagged lines count nothing")
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 4}}},
+                         "rep 1 twice by tag, rep 2 by card, failing rep 3 by tag; the untagged line counts nothing")
 
-    def test_the_same_answer_from_failing_reps_only_stays(self):
+    def test_the_same_answer_from_failing_reps_only_goes_up(self):
         a = "a" * 64
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "fail", ["t_22222222"])
@@ -401,14 +403,43 @@ class PublishTest(unittest.TestCase):
         self.alternate(1, a)
         self.write_logs()
         report = self.publisher.publish(final=True)
-        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", self.bucket.objects())
+        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{a}.json", self.bucket.objects())
         self.assertEqual(report["decisions"], {"fail": 1})
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 2}}})
+
+    def test_an_infra_or_blocked_attempts_answers_go_up_and_count(self):
+        # bench-gate graded these attempts as neither pass nor fail, but the
+        # model really gave these answers to these requests.
+        a, b = "a" * 64, "b" * 64
+        self.world.run("case-a", 1, "infra", ["t_11111111"])
+        self.world.run("case-a", 2, "blocked", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=b, tag=World.tag("case-a", 2))
+        self.alternate(1, a)
+        self.alternate(1, b)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        self.assertTrue(self.published(a))
+        self.assertTrue(self.published(b))
+        self.assertEqual(report["decisions"], {"fail": 2}, "decided as not passing, and published")
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 1, b: 1}}})
+
+    def test_an_answer_only_background_traffic_gave_stays(self):
+        # A card no graded run worked (an alert's triage, another Cluster
+        # Agent's turn): not an eval run's answer, so it neither goes up nor counts.
+        a = "a" * 64
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.world.request(worker("t_99999999"), fp(1), recorded=True, answer=a)
+        self.alternate(1, a)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        self.assertFalse(self.published(a))
+        self.assertEqual(report["decisions"], {"unattributed": 1})
 
     def test_a_passing_reps_unstorable_copy_of_the_answer_is_no_evidence(self):
         a = "a" * 64
-        self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
-        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_99999999"), fp(1), recorded=True, answer=a)
         self.world.request(worker("t_22222222"), fp(1), answer=a, unstorable=["fallback"])
         self.alternate(1, a)
         self.write_logs()
@@ -452,11 +483,11 @@ class PublishTest(unittest.TestCase):
         with open(earlier) as handle:
             self.assertEqual(handle.read(), "an earlier night's copy of the same answer")
         self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [b]}},
-                         "tonight's passing run produced that answer, whichever night wrote the object")
+                         "tonight's graded run produced that answer, whichever night wrote the object")
 
-    def test_a_record_counts_how_often_passing_runs_produced_each_answer(self):
+    def test_a_record_counts_how_often_graded_runs_produced_each_answer(self):
         # Rep 1 asked twice and got a both times; rep 2 got a once and b once;
-        # rep 3 failed with a, which counts for nothing.
+        # rep 3 failed with a, which counts too.
         a, b = "a" * 64, "b" * 64
         self.world.run("case-a", 1, "pass", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
@@ -472,7 +503,7 @@ class PublishTest(unittest.TestCase):
         self.publisher.publish(final=True)
         record = self._records()[-1]
         self.assertEqual(record["produced"], {VERSION: {fp(1): [a, b]}})
-        self.assertEqual(record["produced_counts"], {VERSION: {fp(1): {a: 3, b: 1}}})
+        self.assertEqual(record["produced_counts"], {VERSION: {fp(1): {a: 4, b: 1}}})
 
     def test_a_later_call_counts_again_an_answer_an_earlier_call_put_up(self):
         a = "a" * 64
@@ -492,9 +523,8 @@ class PublishTest(unittest.TestCase):
     def test_an_answer_not_put_up_is_not_counted(self):
         a, b = "a" * 64, "b" * 64
         self.world.run("case-a", 1, "pass", ["t_11111111"])
-        self.world.run("case-a", 2, "fail", ["t_22222222"])
         self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
-        self.world.request(worker("t_22222222"), fp(1), recorded=True, answer=b)
+        self.world.request(worker("t_99999999"), fp(1), recorded=True, answer=b)
         self.alternate(1, a)
         self.alternate(1, b)
         self.write_logs()

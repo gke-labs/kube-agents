@@ -270,8 +270,10 @@ func TestDeniedForFiltersByAgentNamespaceAndForgetDropsIt(t *testing.T) {
 	if len(got) == 0 || !strings.Contains(got[0], "(in namespace team-a)") {
 		t.Fatalf("the team-a agent must see its own denials; got %v", got)
 	}
-	if all := checker.Denied(); len(all) != len(got) {
-		t.Errorf("Denied() = %v, want the same %d team-a denials", all, len(got))
+	// Denied() lists everything; DeniedFor leaves out the built-in
+	// renderer's schedule writes, which the renderer reports itself.
+	if all := checker.Denied(); len(all) != len(got)+len(agentScheduleWriteVerbs) {
+		t.Errorf("Denied() = %v, want the %d team-a denials plus the renderer's %d schedule writes", all, len(got), len(agentScheduleWriteVerbs))
 	}
 
 	checker.Forget("team-a")

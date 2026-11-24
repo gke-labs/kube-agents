@@ -87,3 +87,9 @@ variable "exclusion_window_hours" {
   type        = number
   default     = 2160 # 90 days
 }
+
+variable "post_merge_sync_projects" {
+  description = "Project IDs whose seeded-a runs GKE-managed Config Sync and the post-merge fixture (config-sync.tf). Empty by default, so a project, pool or dev, plans none of it and reads no secret until it is listed. List one only after its pool steps (docs/ci-pool-projects.md 5.13): the deploy key's secret, roles/gkehub.editor for the reconciler and anthosconfigmanagement.googleapis.com. A dev project passes -var 'post_merge_sync_projects=[\"<project>\"]'."
+  type        = list(string)
+  default     = []
+}

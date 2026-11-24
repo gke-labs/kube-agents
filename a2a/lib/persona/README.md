@@ -80,6 +80,13 @@ boundary. The platform agent image checks its own skill trees the same way
 leaves out a file of the manifest's name at any depth; here only the root
 manifest is left out, because a skill's files are rendered.
 
+`CheckTree(dir, scope)` runs the same check over the part of a directory
+that `scope` selects, for a tree that is not a persona directory. The
+session worker uses it on its Claude Code home, where only `CLAUDE.md` and
+`skills/` are the image's and the harness keeps its own state beside them.
+Paths outside the scope are not entered, and a manifest entry outside it is
+refused.
+
 A worker that predates this check refuses `skills_manifest.sha256` as a
 top-level file the format does not define. A persona image must not carry
 one until every worker it can run under accepts the name.

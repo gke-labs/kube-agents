@@ -62,7 +62,7 @@ spec:
     limits: { cpu: "1", memory: 2Gi }
 ```
 
-`harness.type` names the harness the worker image runs. Absent is `claude-code`, which is also the only value the CRD accepts today. Leave it out for Claude Code. The operator passes it to the worker as `A2A_HARNESS` only when it is set, so a profile without it keeps the pods it had. A manifest that sets it can't be applied to an older CRD that lacks the field.
+`harness.type` names the harness the worker image runs. Absent is `claude-code`, which is also the only value the CRD accepts today. Leave it out for Claude Code. The operator passes it to the worker as `A2A_HARNESS` only when it is set, so a profile without it keeps the pods it had. On an older CRD that lacks the field, a client that validates fields strictly, as kubectl does by default, refuses a manifest that sets it, and so does any server-side apply. Another client applies it with the field dropped, so the profile runs as Claude Code.
 
 The type is pod configuration only. It isn't on the profile's card, and no bus subject or permission depends on it. If a profile's type is one this operator doesn't render (an older, newer or edited CRD let it in), the operator refuses the profile: `IdentityReady` is False with reason `HarnessNotSupported`, and nothing is rendered for it.
 
@@ -97,7 +97,7 @@ The operator looks for AgentProfiles once, at startup. If the CRD isn't installe
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 
-`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
+`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Work a scheduled run delegates runs at `read`, but the gateway hands it only to a profile that also lists `unattended`. Absent means `read` alone.
 
 A listed tier name is at most 10 lowercase letters or digits, with no hyphen. It becomes part of the profile's bus identity (`profile-<name>-<tier>`, one 63-character label) and of its queue names, so the cap keeps every derived name valid, and the missing hyphen keeps two profiles' queue names from colliding. A longer or hyphenated `Tier` can exist, but no profile can list it.
 

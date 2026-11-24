@@ -386,10 +386,9 @@ An apply that stops before Terraform can shut down — a second Ctrl-C, a droppe
 SSH session, a `kill -9`, a lost machine — leaves remote state locked, and the
 next command fails with `Error acquiring the state lock`.
 
-One Ctrl-C at `lifecycle.sh apply`, run directly or through `upgrade.sh`, is a
-graceful stop: Terraform shuts down in order, saves state and releases the lock,
-which can take minutes, so wait for it. Through `install.sh` the same Ctrl-C ends
-the pipe the apply prints to, and the lock can stay.
+One Ctrl-C at `lifecycle.sh apply`, run directly or through `install.sh` or
+`upgrade.sh`, is a graceful stop: Terraform shuts down in order, saves state and
+releases the lock, which can take minutes, so wait for it.
 
 For a lock that was left, `terraform force-unlock` is the release, and it works
 here; what trips people up is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
