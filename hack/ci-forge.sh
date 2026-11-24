@@ -657,10 +657,7 @@ check_from_cluster() {
   fi
   local pod code
   pod="forge-check-$(date +%s)"
-  gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
-  # shellcheck disable=SC2086
-  gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" --quiet \
-    ${GKE_DNS_ENDPOINT_FLAG} >/dev/null || {
+  get_cluster_credentials "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" >/dev/null || {
     echo "ERROR: could not fetch credentials for ${CLUSTER_NAME} in ${PROJECT_ID}; not running the in-cluster check against another context (FORGE_SKIP_CLUSTER_CHECK=1 for a project with no host cluster yet)." >&2
     return 1
   }
@@ -684,9 +681,7 @@ check_from_cluster() {
 open_tunnel() {
   local code deadline
   if [ "${FORGE_SKIP_CLUSTER_CHECK:-}" = "1" ]; then
-    gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" --quiet ${GKE_DNS_ENDPOINT_FLAG} >/dev/null || {
+    get_cluster_credentials "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" >/dev/null || {
       echo "ERROR: could not fetch credentials for ${CLUSTER_NAME} in ${PROJECT_ID}; the gitlab-ce row needs the host cluster for its tunnel." >&2
       return 1
     }

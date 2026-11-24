@@ -915,6 +915,15 @@ MUTATIONS: list[Mutation] = [
         "operator makes to unblock a skill",
     ),
     Mutation(
+        "B1-write-refusal-mark-any-read-only-refusal",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),\n", "            ,\n"),
+        "test_B1_the_broker_marks_only_a_refused_write_as_one",
+        "mark every read-only refusal a write refusal, the shorter rule: a "
+        "profile task then stops at a refused read spelling and reports a "
+        "write it never attempted",
+    ),
+    Mutation(
         "B1-image-gate",
         "deploy/docker/Dockerfile",
         ("unexpected cluster CLI in the agent image", "cluster CLI note"),

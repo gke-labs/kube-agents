@@ -59,8 +59,9 @@ domain: chat-and-routing
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: lapis2002
 
-# No fixtures: the one check reads the delegated card's run rows, which the
-# harness captures from the agent's own board before purging the card.
+# No fixtures: the one check reads the workers' tagged results and the
+# delegated card's run rows, which the harness captures from the agent's own
+# sessions and board before purging the card.
 
 verification_spec:
   - name: the-worker-ran-under-the-150-turn-worker-budget
