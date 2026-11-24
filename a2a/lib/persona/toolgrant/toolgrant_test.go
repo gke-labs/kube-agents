@@ -115,6 +115,7 @@ func TestAnAmbiguousMCPToolNameIsRefused(t *testing.T) {
 		"meets a built-in":            {ReadFiles: true, MCP: []MCPGrant{{Server: "read", Tools: []string{"file"}}}},
 		"meets an ungranted built-in": {MCP: []MCPGrant{{Server: "fetch", Tools: []string{"url"}}}},
 		"meets a spawn tool":          {MCP: []MCPGrant{{Server: "spawn", Tools: []string{"agent"}}}},
+		"meets a skill tool":          {MCP: []MCPGrant{{Server: "load", Tools: []string{"skill"}}}},
 	} {
 		if _, err := p.CoreAgent(ws); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 			t.Errorf("%s: err %v", name, err)
@@ -158,5 +159,20 @@ func TestBadInputsAreRefused(t *testing.T) {
 func TestCoreAgentModeIsAllow(t *testing.T) {
 	if CoreAgentMode != "allow" {
 		t.Errorf("mode %q", CoreAgentMode)
+	}
+}
+
+// TestOnlyGrantableBuiltinsAreRegistrable: the harness re-checks a policy's
+// tool names against the same table.
+func TestOnlyGrantableBuiltinsAreRegistrable(t *testing.T) {
+	for _, ok := range []string{"bash", "read_file", "read_many_files", "view_file_outline", "write_file", "stat", "list_dir", "glob", "grep"} {
+		if !CoreAgentRegistrable(ok) {
+			t.Errorf("%s not registrable", ok)
+		}
+	}
+	for _, no := range []string{"edit_file", "delete_file", "fetch_url", "alert", "todo", "json_query", "record_plan", "sciontool_status", "wait_and_verify", "spawn_agent", "", "nonsense"} {
+		if CoreAgentRegistrable(no) {
+			t.Errorf("%s registrable", no)
+		}
 	}
 }

@@ -96,8 +96,21 @@ var coreAgentBuiltins = map[string]coreAgentClass{
 // MCP tool may take their names.
 var coreAgentSpawnTools = []string{"spawn_agent", "stop_agent"}
 
+// CoreAgentSkillTools are the tools a persona's skills toolset offers
+// (ADK's skilltoolset). They only read the persona's skills snapshot; a
+// skill's script runs, if at all, through bash and its gate. Every worker
+// with skills has them, and no MCP tool may take their names.
+var CoreAgentSkillTools = []string{"list_skills", "load_skill", "load_skill_resource"}
+
 // maxToolNameLen is the longest function name Gemini accepts.
 const maxToolNameLen = 64
+
+// CoreAgentRegistrable reports whether a grant may register the named
+// built-in: it is classified, and its class is one a Policy grants.
+func CoreAgentRegistrable(name string) bool {
+	c, ok := coreAgentBuiltins[name]
+	return ok && c != classNever
+}
 
 // CoreAgentBuiltinNames is every built-in name the table classifies,
 // sorted.
@@ -190,7 +203,7 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 	for _, b := range CoreAgentBuiltinNames() {
 		seen[b] = true
 	}
-	for _, s := range coreAgentSpawnTools {
+	for _, s := range slices.Concat(coreAgentSpawnTools, CoreAgentSkillTools) {
 		seen[s] = true
 	}
 	for server, tools := range g.MCP {
