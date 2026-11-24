@@ -399,28 +399,47 @@ func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, e
 	if err != nil {
 		return nil, fmt.Errorf("stream %s: %w", TasksStream, err)
 	}
+	env, _, err := c.LastEnvelopeOn(ctx, stream, subject)
+	return env, err
+}
+
+// LastEnvelopeOn is LastEnvelope on a TASKS stream handle the caller already
+// holds, with the message's stream sequence: a caller reading several
+// subjects in one pass looks the stream up once, and can order what it reads
+// across subjects (they share the stream's sequence). The envelope is
+// screened as LastEnvelope screens it; nil when the subject is empty or its
+// newest message is dropped. ProfileTask among opts applies the supervisor
+// cutoff as TaskReplayHeads does: a refused newest message reads as an empty
+// subject (sequence 0).
+func (c *Client) LastEnvelopeOn(ctx context.Context, stream jetstream.Stream, subject string, opts ...ReadOption) (*Envelope, uint64, error) {
 	msg, err := stream.GetLastMsgForSubject(ctx, subject)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("newest message on %s: %w", subject, err)
+		return nil, 0, fmt.Errorf("newest message on %s: %w", subject, err)
+	}
+	// The cutoff, as TaskReplayHeads applies it: a profile task's five-token
+	// supervisor message stored past it isn't the task's, so the subject
+	// reads as empty (the conservative reading TaskReplayHeads names).
+	if !c.AcceptSupervisorEvent(subject, msg.Time, readOptionsOf(opts).profileTask) {
+		return nil, 0, nil
 	}
 	env, err := ParseEnvelope(msg.Data)
 	if err != nil {
 		c.log.Error("a2a newest-message read skipping unparseable envelope", "subject", subject, "err", err)
-		return nil, nil
+		return nil, msg.Sequence, nil
 	}
 	if aerr := CheckSubjectAgreement(subject, env, c.opts.agreement); aerr != nil {
 		c.protocolViolations.Add(1)
 		if !IsAdvisoryDisagreement(aerr) {
 			c.log.Error("a2a newest-message read skipping envelope that disagrees with its subject", "subject", subject, "err", aerr)
-			return nil, nil
+			return nil, msg.Sequence, nil
 		}
 		// The advisory writer check, as in the replay: counted, returned.
 		c.log.Warn("a2a newest-message read returning envelope whose writer disagrees with its subject (advisory)", "subject", subject, "err", aerr)
 	}
-	return env, nil
+	return env, msg.Sequence, nil
 }
 
 // IsFinalStatus reports whether env is a status-update carrying final=true,

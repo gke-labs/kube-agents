@@ -6,7 +6,7 @@
   "cluster_slots": {
     "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the declared zonal pool and the pool that names a missing reservation (both at zero nodes), the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
-    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with cpuCfsQuota off where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
+    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with podPidsLimit 4096 where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
   },
   "roles": {
@@ -365,7 +365,7 @@
       "cluster_slot": "c",
       "namespace": null,
       "probes": [],
-      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota false, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
+      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.podPidsLimit 4096, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
       "state": [
         {
           "subject": "cluster",
@@ -376,10 +376,10 @@
         },
         {
           "subject": "cluster",
-          "path": "nodePools[?(@.name=='default-pool')].config.kubeletConfig.cpuCfsQuota",
+          "path": "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit",
           "op": "eq",
-          "value": false,
-          "why": "the kubelet-config half. False, not the default true, so the facet reads a difference whether it treats an absent key as unset or as the default; a key removed, or flipped to true by hand, reads here as drift and as a 4/4 agreement to the facet. GKE serializes an explicit false (the field is a wrapped bool), so `observed nothing` means the key was never set, which is what every project shows until the reconcile rolls it; the same re-apply restores it in place"
+          "value": 4096,
+          "why": "the kubelet-config half. GKE sets no pod PID limit unless asked, so the facet reads a difference whether it treats an absent key as unset or as the default; a key removed by hand reads here as drift and as a 4/4 agreement to the facet, and one changed to another value as drift alone. An integer on purpose: the pinned provider sends a non-zero integer on an update as on a create, where the explicit false this half first asserted (cpuCfsQuota) was sent only at pool creation and never reached a pool that already existed. `observed nothing` means the key is not set; a re-apply restores it in place"
         }
       ]
     },
@@ -863,6 +863,117 @@
           "op": "eq",
           "value": "calibration",
           "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a case that reads the parent grades a different grouping rule"
+        }
+      ]
+    },
+    "generated-name-job-family": {
+      "cluster_slot": "a",
+      "namespace": "seeded-family",
+      "probes": [
+        "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+        "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+        "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2"
+      ],
+      "fixture": "three finished Jobs named reindex-<uuid>, the shape a spawner leaves, with the common label app.kubernetes.io/part-of=reindex, no owner reference and no ttlSecondsAfterFinished, so each one stays in the cluster after it ran. The waste audit's terminal-pods check files each Job 7 days after it finished, under a name that no repository file declares, so only the template that creates the Jobs can fix them. The names are literals in the stack, the same on every project. Not ready, rather than drifted, for the first 7 days: completionTime is server-set, and a Job that is created again starts that clock again",
+      "state": [
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "status.succeeded",
+          "op": "eq",
+          "value": 1,
+          "why": "each member is a Job that ran to completion; a member that failed is a different defect, and the family then has fewer finished members than the cases were written against"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "status.succeeded",
+          "op": "eq",
+          "value": 1,
+          "why": "each member is a Job that ran to completion; a member that failed is a different defect, and the family then has fewer finished members than the cases were written against"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "status.succeeded",
+          "op": "eq",
+          "value": 1,
+          "why": "each member is a Job that ran to completion; a member that failed is a different defect, and the family then has fewer finished members than the cases were written against"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "spec.ttlSecondsAfterFinished",
+          "op": "absent",
+          "why": "the defect is the missing ttlSecondsAfterFinished: the terminal-pods check files no Job that has one, and the TTL controller deletes such a Job, so the member is gone"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "spec.ttlSecondsAfterFinished",
+          "op": "absent",
+          "why": "the defect is the missing ttlSecondsAfterFinished: the terminal-pods check files no Job that has one, and the TTL controller deletes such a Job, so the member is gone"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "spec.ttlSecondsAfterFinished",
+          "op": "absent",
+          "why": "the defect is the missing ttlSecondsAfterFinished: the terminal-pods check files no Job that has one, and the TTL controller deletes such a Job, so the member is gone"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "metadata.ownerReferences",
+          "op": "absent",
+          "why": "the terminal-pods check files no Job that a CronJob owns, and the family is the shape a spawner leaves: no owner object holds the members"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "metadata.ownerReferences",
+          "op": "absent",
+          "why": "the terminal-pods check files no Job that a CronJob owns, and the family is the shape a spawner leaves: no owner object holds the members"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "metadata.ownerReferences",
+          "op": "absent",
+          "why": "the terminal-pods check files no Job that a CronJob owns, and the family is the shape a spawner leaves: no owner object holds the members"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "status.completionTime",
+          "op": "ready_after_hours",
+          "value": 168,
+          "why": "the terminal-pods check files a Job once it finished 7 days ago (status.completionTime), so the member is invisible to the waste audit for its first 168 hours; until then the role is not ready, not drifted, and a case that reads the family waits for the date"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "status.completionTime",
+          "op": "ready_after_hours",
+          "value": 168,
+          "why": "the terminal-pods check files a Job once it finished 7 days ago (status.completionTime), so the member is invisible to the waste audit for its first 168 hours; until then the role is not ready, not drifted, and a case that reads the family waits for the date"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "status.completionTime",
+          "op": "ready_after_hours",
+          "value": 168,
+          "why": "the terminal-pods check files a Job once it finished 7 days ago (status.completionTime), so the member is invisible to the waste audit for its first 168 hours; until then the role is not ready, not drifted, and a case that reads the family waits for the date"
+        },
+        {
+          "subject": "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "reindex",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a finding that names the template's labels has nothing to name"
+        },
+        {
+          "subject": "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "reindex",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a finding that names the template's labels has nothing to name"
+        },
+        {
+          "subject": "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "reindex",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a finding that names the template's labels has nothing to name"
         }
       ]
     },
@@ -1390,6 +1501,34 @@
           "op": "serial_contains",
           "value": "Script \"startup-script\" failed with error",
           "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector finds no failure line and files nothing, so gce-startup-script-failure has no finding to grade. Each reconcile resets the VM to print it again"
+        }
+      ]
+    },
+    "rotated-console-vm": {
+      "cluster_slot": null,
+      "namespace": null,
+      "probes": ["instance/serial-flood-*"],
+      "fixture": "serial-flood-<prefix>, a standalone e2-micro in the fleet's zone whose startup script fails at boot and whose systemd timer then writes about 2 MiB of counted filler lines to serial port 1, one bounded pass two minutes after boot and one every 24 hours after. The serial buffer keeps about 1 MiB, so the boot's failure lines rotate out minutes after boot and only the filler remains: the rotated-console state the GCE compute audit's notes have to report. hack/fleet_reconcile.py does not reset this VM -- its reset reads only the state address google_compute_instance.startup_fail -- and must not: the rotated console is this fixture's healthy state, and the VM's own daily pass renews it. Project-scoped, as startup-fail-vm is",
+      "state": [
+        {
+          "subject": "instance/serial-flood-*",
+          "path": "status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "the GCE compute audit reads the serial console of RUNNING instances only; a stopped or terminated VM has no console read, and the rotated-console case has nothing to grade"
+        },
+        {
+          "subject": "instance/serial-flood-*",
+          "path": "metadata.items[?(@.key=='startup-script')].key",
+          "op": "any_eq",
+          "value": "startup-script",
+          "why": "the startup-script metadata is the fixture's declaration of the failing boot; the systemd units persist on the boot disk, so the VM floods at the next boot with or without it, and this assertion catches the drifted declaration, not a stopped flood"
+        },
+        {
+          "subject": "instance/serial-flood-*",
+          "op": "serial_contains",
+          "value": "eval fixture: serial-flood filler",
+          "why": "one flood pass is about twice the buffer, so filler in the buffer means the boot's failure lines have rotated out -- the state the rotated-console notes grade; a console without it still shows the boot, which is the startup-fail shape, not this one. For a few minutes after a boot the console shows the failure line and not yet the filler, so one scan in that window can read the role drifted; the next flood pass heals it. No reconcile reset repairs this role: the rotated console is the designed state, and the VM's own daily pass renews the filler against the guest agent's slow output"
         }
       ]
     },
