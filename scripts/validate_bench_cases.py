@@ -686,6 +686,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "required_phrases",
         "forbidden_phrases",
         "any_of_phrases",
+        "required_patterns",
+        "forbidden_patterns",
         "every_finding_named",
     ),
     # No field: the verifier's own model refuses a spec that binds nothing

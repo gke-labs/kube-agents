@@ -453,6 +453,17 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_ledger_check_with_only_patterns_asserts_something(self):
+        """`required_patterns` and `forbidden_patterns` carry a ledger check's
+        assertion as its phrase lists do; an empty list of either does not."""
+        for field in ("required_patterns", "forbidden_patterns"):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", field: ["x"]}, "check 'x'", problems)
+            self.assertEqual(problems, [])
+            validator._check_assertions({"type": "ledger_issue_contains", field: []}, "check 'x'", problems)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("can only pass", problems[0])
+
     def test_a_finding_scope_without_its_check_is_rejected(self):
         """The verifier's model refuses the pair after the cluster lease; this
         rule refuses it here."""

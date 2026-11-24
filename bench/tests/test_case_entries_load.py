@@ -113,15 +113,16 @@ def test_a_parser_that_raises_is_a_problem_of_its_entry(validator, tmp_path, cap
 
 
 def test_the_command_fails_and_names_the_case_and_the_entry(validator, tmp_path, capsys):
-    """The repetition of #6375: `ledger_issue_contains` has no `required_patterns`."""
-    check = {"type": "ledger_issue_contains", "audit": "fleet-wide-cost-analysis", "required_phrases": ["x"], "required_patterns": ["x"]}
+    """The repetition of #6375, a pattern field that `ledger_issue_contains`
+    does not have: `required_patterns` then, `any_of_patterns` now."""
+    check = {"type": "ledger_issue_contains", "audit": "fleet-wide-cost-analysis", "required_phrases": ["x"], "any_of_patterns": ["x"]}
     assert validator.main([str(_case_file(tmp_path, check))]) == 1
     out, err = capsys.readouterr()
     # The parser is here, so the command does not say that the rule did not run.
     assert err == ""
     assert f"{CASE_ID}:" in out
     assert f"check {ENTRY!r}" in out
-    assert "required_patterns" in out
+    assert "any_of_patterns" in out
 
 
 def test_no_case_of_the_tree_has_an_entry_that_does_not_load(validator):
