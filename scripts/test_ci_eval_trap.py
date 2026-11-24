@@ -18,7 +18,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -28,6 +27,9 @@ from eval_dashboard import collect  # noqa: E402
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 TRAP = "profile_and_dump_on_exit"
+# Bounds a hang in the cancel cases, in seconds. A passing run never waits for it:
+# each wait there ends on an event (the shell's exit, the units' end of output).
+CANCEL_HANG_TIMEOUT_S = 60
 
 
 def trap_body() -> str:
@@ -365,6 +367,14 @@ class CancelStopsModelCallsTest(unittest.TestCase):
         kill of the child alone leaves open. A second unit, not recorded as
         stackless, stands in for a unit with a stack; the last element says
         whether it ran to its end.
+
+        No unit runs against a clock. Each blocks on a read of the test's
+        pipe (fd 3) until the test closes it, and the test closes it only
+        once the shell has exited, which is after the trap has sent its
+        kills. A killed unit dies with the read still blocked; a unit left
+        running gets end-of-file and writes its marker. Every unit holds the
+        shell's stdout, so end-of-file there says the last of them is gone
+        and the markers are final.
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
         judge = tmp / "judge-called"
@@ -373,6 +383,8 @@ class CancelStopsModelCallsTest(unittest.TestCase):
         script = "\n".join(
             [
                 "set -euo pipefail",
+                # A background job's own stdin is /dev/null; fd 3 keeps the pipe.
+                "exec 3<&0",
                 self.constants(),
                 'readonly LITELLM_LOG_DEPLOYMENT="deployment/litellm"',
                 f'JOB_TYPE="{job_type}"',
@@ -386,21 +398,29 @@ class CancelStopsModelCallsTest(unittest.TestCase):
                 'FANOUT_STACKLESS_UNIT_PIDS=""',
                 self.lifted("freeze_process_tree"),
                 self.lifted("stop_model_calls_on_cancel"),
-                f'( bash -c \'sleep 1; : > "{child}"\' || true; : > "{judge}" ) &',
+                f'( bash -c \'cat <&3 >/dev/null; : > "{child}"\' || true; : > "{judge}" ) &',
                 'FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS} $!"',
-                f'( sleep 1; : > "{stack}" ) &',
+                f'( cat <&3 >/dev/null; : > "{stack}" ) &',
                 "echo ready",
                 "wait",
             ]
         )
         proc = subprocess.Popen(
-            ["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            ["bash", "-c", script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
+        # A failed assertion or a timeout below must not leave units blocked on the pipe.
+        self.addCleanup(proc.stdin.close)
         self.assertEqual(proc.stdout.readline().strip(), "ready")
         proc.send_signal(signal.SIGTERM)
-        out, _ = proc.communicate(timeout=10)
-        # Past the unit's sleep: a unit left running has written the marker.
-        time.sleep(2)
+        # The shell exits from its TERM trap, so its exit says the trap has run.
+        proc.wait(timeout=CANCEL_HANG_TIMEOUT_S)
+        # Closes the pipe, which releases the units the trap left running, and
+        # reads to the end of output, which comes when the last unit is gone.
+        out, _ = proc.communicate(timeout=CANCEL_HANG_TIMEOUT_S)
         return proc.returncode, out, [m for m in (child, judge) if m.exists()], stack.exists()
 
     def test_a_cancelled_presubmit_kills_the_units_and_scales_the_gateway(self):
