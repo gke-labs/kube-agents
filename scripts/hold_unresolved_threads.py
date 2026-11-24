@@ -51,7 +51,8 @@ POOL_LABELS = frozenset({"lgtm", "approved"})
 BOT_LOGIN = "github-actions[bot]"
 #: Opens the explanatory comment. A pull request that already carries one gets no second: a
 #: label removed by hand while threads stay open is re-applied every sweep, and the comment
-#: would otherwise be re-posted with it.
+#: would otherwise be re-posted with it. Two workflow runs of different triggers that label one
+#: pull request in the same instant can each pass the check and post one.
 COMMENT_MARKER = "<!-- hold-unresolved-threads -->"
 #: GraphQL's per-page ceiling; the thread query pages past it.
 PAGE = 100
