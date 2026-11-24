@@ -23,6 +23,9 @@
 set -euo pipefail
 # DO NOT MERGE: a session-route twin exports the session front door.
 export EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-session}"
+# DO NOT MERGE (#7014 burst twin): repetitions one at a time, so no two
+# repetitions' burst levels share the session cap.
+export EVAL_TASK_PARALLELISM=1
 
 # The eval rosters, four files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, what

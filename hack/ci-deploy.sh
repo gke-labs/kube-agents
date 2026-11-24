@@ -1785,6 +1785,7 @@ if [ "${EVAL_FRONT_DOOR}" = "session" ]; then
     MODE_NEXT_MAX_SESSIONS=""
   fi
 fi
+MODE_NEXT_MAX_SESSIONS=6 # DO NOT MERGE (#7014 burst twin): a cap of six for the burst's top level
 MAX_SESSIONS_HELM_SETS=()
 if [ -n "${MODE_NEXT_MAX_SESSIONS}" ]; then
   MAX_SESSIONS_HELM_SETS=(--set "${MAX_SESSIONS_HELM_VALUE}=${MODE_NEXT_MAX_SESSIONS}")
