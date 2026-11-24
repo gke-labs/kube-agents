@@ -11,6 +11,9 @@ import (
 	_ "github.com/go-steer/core-agent/v3/pkg/models/gemini"
 )
 
+// newModel builds the turn's model; tests replace it.
+var newModel = buildModel
+
 // placeholderKey stands in for the model credential: the Gemini client
 // refuses an empty key, and the worker's gateway proxy, the only endpoint it
 // reaches, drops it and authenticates the call itself.

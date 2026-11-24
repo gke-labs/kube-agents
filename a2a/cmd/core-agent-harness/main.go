@@ -2,8 +2,9 @@
 // (github.com/go-steer/core-agent), linked as a library. The worker adapter
 // starts it once per turn: it reads one coreagentwire.Envelope on stdin,
 // runs the turn, writes coreagentwire.Event lines on stdout and exits.
-// The conversation persists in the session log (--session-db) between
-// turns, so the next process resumes it by id.
+// The harness keeps no session file: the conversation's history comes in
+// on the Envelope and every event the turn adds goes out as an event line
+// (coreagentwire), so the adapter holds the conversation.
 //
 // It loads nothing on its own: no AGENTS.md, .agents/ config, skills or MCP
 // discovery from the workspace or HOME. Everything the turn sees comes from
@@ -21,13 +22,13 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/glebarez/sqlite"
 	"github.com/google/uuid"
+	"google.golang.org/adk/v2/session"
 	adktool "google.golang.org/adk/v2/tool"
 
 	"github.com/go-steer/core-agent/v3/pkg/agent"
+	"github.com/go-steer/core-agent/v3/pkg/childenv"
 	"github.com/go-steer/core-agent/v3/pkg/config"
-	"github.com/go-steer/core-agent/v3/pkg/eventlog"
 	"github.com/go-steer/core-agent/v3/pkg/permissions"
 	"github.com/go-steer/core-agent/v3/pkg/tools"
 
@@ -40,8 +41,6 @@ const userID = "worker"
 
 type options struct {
 	personaDir string
-	sessionDB  string
-	session    string
 	model      string
 }
 
@@ -52,25 +51,37 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// Non-dumpable before anything else: a same-UID command the turn runs
+	// can then neither read this process's memory or environ nor open its
+	// /proc/<pid>/fd, so it can't write forged event lines into stdout.
+	if err := childenv.Protect(); err != nil {
+		fmt.Fprintln(stderr, "core-agent-harness: protect:", err)
+		return 1
+	}
 	fs := flag.NewFlagSet("core-agent-harness", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var o options
 	fs.StringVar(&o.personaDir, "persona-dir", "", "the rendered persona (instructions.md, skills/<name>/SKILL.md), read once into memory")
-	fs.StringVar(&o.session, "session", "", "the conversation to resume from the session log; empty starts one")
-	fs.StringVar(&o.sessionDB, "session-db", "", "the SQLite session log the conversation is stored in and resumed from (required)")
 	fs.StringVar(&o.model, "model", "", "the model name (required)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if o.sessionDB == "" || o.model == "" {
-		fmt.Fprintln(stderr, "core-agent-harness: --session-db and --model are required")
+	if o.model == "" {
+		fmt.Fprintln(stderr, "core-agent-harness: --model is required")
 		return 2
 	}
 	out := json.NewEncoder(stdout)
 	emit := func(ev coreagentwire.Event) { _ = out.Encode(ev) }
 
 	var env coreagentwire.Envelope
-	if err := json.NewDecoder(stdin).Decode(&env); err != nil {
+	raw, err := io.ReadAll(io.LimitReader(stdin, coreagentwire.MaxEnvelopeBytes+1))
+	if err == nil && len(raw) > coreagentwire.MaxEnvelopeBytes {
+		err = fmt.Errorf("over %d bytes", coreagentwire.MaxEnvelopeBytes)
+	}
+	if err == nil {
+		err = json.Unmarshal(raw, &env)
+	}
+	if err != nil {
 		emit(coreagentwire.Event{Type: coreagentwire.TypeResult, Failed: true, Error: "reading the turn envelope: " + err.Error()})
 		return 1
 	}
@@ -83,11 +94,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 // turn builds the agent for one turn and runs it, emitting its events.
 func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(coreagentwire.Event)) error {
-	llm, err := buildModel(ctx, o.model)
+	llm, err := newModel(ctx, o.model)
 	if err != nil {
 		return fmt.Errorf("model: %w", err)
 	}
-	builtins, permOpts, plugins, err := policySetup(env.Policy)
+	workdir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("workspace: %w", err)
+	}
+	builtins, permOpts, plugins, err := policySetup(env.Policy, workdir)
 	if err != nil {
 		return fmt.Errorf("tool policy: %w", err)
 	}
@@ -106,17 +121,9 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	}
 	defer closeMCP()
 
-	log, err := eventlog.Open(ctx, sqlite.Open(o.sessionDB))
+	sessions, session, seeded, err := seedSession(ctx, env)
 	if err != nil {
-		return fmt.Errorf("session log: %w", err)
-	}
-	defer log.Close()
-	session := o.session
-	if session == "" {
-		session = env.Session
-	}
-	if session == "" {
-		session = uuid.NewString()
+		return fmt.Errorf("history: %w", err)
 	}
 
 	opts := []agent.Option{
@@ -125,7 +132,7 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 		agent.WithTools(reg.Tools),
 		agent.WithToolsets(append(append([]adktool.Toolset{}, skillsets...), mcpsets...)),
 		agent.WithPlugins(plugins...),
-		agent.WithEventLog(log),
+		agent.WithSessionService(sessions),
 		agent.WithSession(userID, session),
 	}
 	if instructions != "" {
@@ -138,13 +145,65 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 
 	emit(coreagentwire.Event{Type: coreagentwire.TypeInit, Session: session, Model: o.model})
 	m := newMapper(emit)
+	var runErr error
 	for ev, err := range a.Run(ctx, env.Message) {
 		if err != nil {
-			m.finish(err)
-			return nil
+			runErr = err
+			break
 		}
 		m.observe(ev)
 	}
-	m.finish(nil)
+	// The events the turn added, for the adapter to keep, before the result
+	// that ends the turn.
+	if err := emitAdded(context.WithoutCancel(ctx), sessions, session, seeded, emit); err != nil && runErr == nil {
+		runErr = fmt.Errorf("history: %w", err)
+	}
+	m.finish(runErr)
+	return nil
+}
+
+// seedSession is an in-memory session service holding the Envelope's
+// history under the conversation's id (a new id when it has none), and the
+// number of events seeded.
+func seedSession(ctx context.Context, env coreagentwire.Envelope) (session.Service, string, int, error) {
+	id := env.Session
+	if id == "" {
+		id = uuid.NewString()
+	}
+	svc := session.InMemoryService()
+	created, err := svc.Create(ctx, &session.CreateRequest{AppName: agent.DefaultAppName, UserID: userID, SessionID: id})
+	if err != nil {
+		return nil, "", 0, err
+	}
+	for i, raw := range env.History {
+		var ev session.Event
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return nil, "", 0, fmt.Errorf("event %d: %w", i, err)
+		}
+		if err := svc.AppendEvent(ctx, created.Session, &ev); err != nil {
+			return nil, "", 0, fmt.Errorf("event %d: %w", i, err)
+		}
+	}
+	return svc, id, len(env.History), nil
+}
+
+// emitAdded writes an event line for each event the session holds past the
+// first seeded.
+func emitAdded(ctx context.Context, svc session.Service, id string, seeded int, emit func(coreagentwire.Event)) error {
+	got, err := svc.Get(ctx, &session.GetRequest{AppName: agent.DefaultAppName, UserID: userID, SessionID: id})
+	if err != nil {
+		return err
+	}
+	i := 0
+	for ev := range got.Session.Events().All() {
+		if i >= seeded {
+			raw, err := json.Marshal(ev)
+			if err != nil {
+				return err
+			}
+			emit(coreagentwire.Event{Type: coreagentwire.TypeEvent, Event: raw})
+		}
+		i++
+	}
 	return nil
 }

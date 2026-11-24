@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
+	"sync"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
@@ -17,36 +17,68 @@ import (
 // servers with the user message: nothing that decides what a turn may do is
 // a file the harness's own commands could rewrite. Its output is one
 // coreagentwire.Event per line.
+//
+// The driver holds each conversation's history, in memory: the harness
+// keeps no session file, so nothing a turn's commands write can change what
+// the next turn resumes. The decoder keeps the event lines a turn emits and
+// the next turn's envelope carries them back.
 type coreAgentDriver struct {
 	// Policy and MCP are the turn's tool policy and MCP servers, set from
 	// the persona grant (SEAM: tigerteam-dev-1, tigerteam-dev-3).
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
+
+	conv *coreAgentConversations
 }
 
-// coreAgentSessionFlag resumes a conversation from the harness's session log.
-const coreAgentSessionFlag = "--session"
+// coreAgentConversations is each conversation's history and the id the
+// next turn resumes.
+type coreAgentConversations struct {
+	mu      sync.Mutex
+	history map[string][]json.RawMessage
+	resume  string
+}
+
+func newCoreAgentDriver() coreAgentDriver {
+	return coreAgentDriver{conv: &coreAgentConversations{history: map[string][]json.RawMessage{}}}
+}
 
 // coreAgentErrorToken is a failed turn's reason token.
 const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure reason token, not a credential
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
 
+// EncodeUser is the turn's envelope: the message, the policy and MCP
+// servers, and the history of the conversation WithResume named.
 func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
-	b, err := json.Marshal(coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP})
+	env := coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP}
+	if d.conv != nil {
+		d.conv.mu.Lock()
+		env.Session = d.conv.resume
+		env.History = append([]json.RawMessage(nil), d.conv.history[d.conv.resume]...)
+		d.conv.mu.Unlock()
+	}
+	b, err := json.Marshal(env)
 	if err != nil {
 		return nil, err
+	}
+	if len(b) > coreagentwire.MaxEnvelopeBytes {
+		return nil, fmt.Errorf("the conversation's history is over %d bytes", coreagentwire.MaxEnvelopeBytes)
 	}
 	return append(b, '\n'), nil
 }
 
-func (coreAgentDriver) NewDecoder() Decoder { return &coreAgentDecoder{} }
+func (d coreAgentDriver) NewDecoder() Decoder { return &coreAgentDecoder{conv: d.conv} }
 
-func (coreAgentDriver) WithResume(argv []string, id string) []string {
-	if id == "" {
-		return argv
+// WithResume names the conversation the next turn resumes; its history goes
+// in the envelope, not the argv.
+func (d coreAgentDriver) WithResume(argv []string, id string) []string {
+	if d.conv != nil {
+		d.conv.mu.Lock()
+		d.conv.resume = id
+		d.conv.mu.Unlock()
 	}
-	return append(slices.Clone(argv), coreAgentSessionFlag, id)
+	return argv
 }
 
 // WithDelegateServerEnv reports the delegate server unconfigured: MCP
@@ -71,7 +103,9 @@ func (coreAgentDriver) HoldsSteers() bool { return true }
 // coreAgentDecoder maps the harness's event lines onto Events: one
 // EventToolResult per tool call, an erroring step included.
 type coreAgentDecoder struct {
-	model string
+	conv    *coreAgentConversations
+	model   string
+	session string
 }
 
 func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
@@ -81,8 +115,15 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	}
 	switch ln.Type {
 	case coreagentwire.TypeInit:
-		d.model = ln.Model
+		d.model, d.session = ln.Model, ln.Session
 		return []Event{{Kind: EventInit, Session: ln.Session, Model: ln.Model}}, nil
+	case coreagentwire.TypeEvent:
+		if d.conv != nil && d.session != "" && len(ln.Event) > 0 {
+			d.conv.mu.Lock()
+			d.conv.history[d.session] = append(d.conv.history[d.session], ln.Event)
+			d.conv.mu.Unlock()
+		}
+		return nil, nil
 	case coreagentwire.TypeThinking:
 		return []Event{{Kind: EventThinking, Text: ln.Text}}, nil
 	case coreagentwire.TypeText:

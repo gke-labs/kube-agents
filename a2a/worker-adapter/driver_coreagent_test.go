@@ -75,3 +75,45 @@ func TestAFailedCoreAgentTurnCarriesItsReason(t *testing.T) {
 		t.Fatalf("events %+v, err %v", evs, err)
 	}
 }
+
+// The driver keeps the event lines a turn emits and sends them back in the
+// next turn's envelope for the same conversation; nothing else carries them.
+func TestTheCoreAgentDriverCarriesHistoryToTheNextTurn(t *testing.T) {
+	d := newCoreAgentDriver()
+	argv := d.WithResume([]string{"/h"}, "")
+	if len(argv) != 1 {
+		t.Fatalf("resume changed the argv: %v", argv)
+	}
+	dec := d.NewDecoder()
+	for _, l := range []string{
+		`{"type":"init","session":"s1","model":"m"}`,
+		`{"type":"event","event":{"author":"user","n":1}}`,
+		`{"type":"event","event":{"author":"model","n":2}}`,
+		`{"type":"result","text":"ok"}`,
+	} {
+		if _, err := dec.Decode([]byte(l)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.WithResume([]string{"/h"}, "s1")
+	b, err := d.EncodeUser("next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env coreagentwire.Envelope
+	if err := json.Unmarshal(b, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Session != "s1" || len(env.History) != 2 || !strings.Contains(string(env.History[1]), `"n":2`) {
+		t.Errorf("envelope %s", b)
+	}
+	d.WithResume([]string{"/h"}, "")
+	b, _ = d.EncodeUser("fresh")
+	env = coreagentwire.Envelope{}
+	if err := json.Unmarshal(b, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Session != "" || len(env.History) != 0 {
+		t.Errorf("a new conversation carried history: %s", b)
+	}
+}

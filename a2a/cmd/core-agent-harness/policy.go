@@ -18,8 +18,9 @@ import (
 // SEAM (tigerteam-dev-1): the before-tool plugin and the mapping from the
 // persona grant. What is here is the floor: only the named built-ins, in
 // allow mode with the policy's patterns, so a call no pattern allows is
-// refused without a prompt; background agents and spawns are never offered.
-func policySetup(p coreagentwire.Policy) (tools.BuiltinTools, permissions.Options, []*plugin.Plugin, error) {
+// refused without a prompt; file tools reach only workdir, the turn's
+// workspace; background agents and spawns are never offered.
+func policySetup(p coreagentwire.Policy, workdir string) (tools.BuiltinTools, permissions.Options, []*plugin.Plugin, error) {
 	var b tools.BuiltinTools
 	for _, name := range p.Tools {
 		if err := enable(&b, name); err != nil {
@@ -30,7 +31,11 @@ func policySetup(p coreagentwire.Policy) (tools.BuiltinTools, permissions.Option
 	if err != nil {
 		return b, permissions.Options{}, nil, fmt.Errorf("permission patterns: %w", err)
 	}
-	return b, permissions.Options{Mode: permissions.ModeAllow, Policy: policy}, nil, nil
+	scope, err := permissions.NewPathScope(workdir, "", nil)
+	if err != nil {
+		return b, permissions.Options{}, nil, fmt.Errorf("path scope: %w", err)
+	}
+	return b, permissions.Options{Mode: permissions.ModeAllow, Policy: policy, Scope: scope}, nil, nil
 }
 
 // enable turns on one built-in tool by name, refusing a name core-agent

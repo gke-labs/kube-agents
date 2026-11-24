@@ -6,18 +6,32 @@
 // servers) travels in the Envelope, never in a file: the harness's commands
 // run as the same UID, and a file they can reach could be rewritten during
 // one turn to widen the next.
+//
+// The conversation's history is the adapter's, by design, for the same
+// reason: the harness keeps no session file. Each turn's Envelope carries
+// the history so far, the harness runs on an in-memory session seeded from
+// it, and every event the turn adds comes back as an event line for the
+// adapter to keep. Nothing on disk records the conversation, so nothing a
+// turn's commands can write changes what the next turn sees.
 package coreagentwire
 
 import "encoding/json"
+
+// MaxEnvelopeBytes bounds one turn's Envelope. The harness refuses a larger
+// one, failing the turn: core-agent's compaction keeps a conversation's
+// history well under it.
+const MaxEnvelopeBytes = 16 << 20
 
 // Envelope is one turn's input, a single JSON object on stdin.
 type Envelope struct {
 	// Message is the user message for the turn.
 	Message string `json:"message"`
-	// Session resumes the conversation stored under this id in the session
-	// log, when the harness's --session flag doesn't name one; empty starts
-	// a new one, whose id the init event reports.
+	// Session is the conversation's id; empty starts a new one, whose id the
+	// init event reports.
 	Session string `json:"session,omitempty"`
+	// History is the conversation's events so far, each as an event line's
+	// Event carried it, oldest first.
+	History []json.RawMessage `json:"history,omitempty"`
 	// Policy is the turn's tool policy.
 	Policy Policy `json:"policy"`
 	// MCP lists the MCP servers the turn may use, built at the start of the
@@ -56,6 +70,9 @@ const (
 	TypeToolCall   = "tool_call"
 	TypeToolResult = "tool_result"
 	TypeResult     = "result"
+	// TypeEvent carries one event the turn added to the conversation, for
+	// the adapter to keep and send back in the next turn's History.
+	TypeEvent = "event"
 )
 
 // Event is one line of the harness's output.
@@ -79,6 +96,8 @@ type Event struct {
 	Error  string `json:"error,omitempty"`
 	// Usage is set on the result: the turn's token counts.
 	Usage *Usage `json:"usage,omitempty"`
+	// Event is an event line's conversation event, opaque to the adapter.
+	Event json.RawMessage `json:"event,omitempty"`
 }
 
 // Usage is one turn's token counts.
