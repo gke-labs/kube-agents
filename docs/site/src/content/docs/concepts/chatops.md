@@ -141,7 +141,7 @@ A scheduled brief posts flat in that channel, never inside a thread. A job that 
 
 The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report and fleet-audit reports into cards, and changes how the harness's own messages read on Slack (below).
 
-To turn the flag off, set `KAGE_SLACK_UX=false` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`); an install that never set it has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
+To turn the flag off, add `KAGE_SLACK_UX=false` to the chart value `platformAgent.deployment.env`; [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the `install.env` line. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply. An install that never set the flag has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
 
 #### What the reaction means
 
@@ -754,7 +754,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in the chart value `platformAgent.deployment.env`, or in `spec.deployment.env` on an install that no chart manages:
 
 ```yaml
 platformAgent:
