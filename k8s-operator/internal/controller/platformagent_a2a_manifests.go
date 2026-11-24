@@ -8599,13 +8599,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 				}
 			}
 		}
-	}
-
-	// Neither complete nor failed, with failed pods: the Job is retrying.
-	// The status writers carry it, and record its Warning event once the
-	// write lands, so a pass that errors before them doesn't repeat it.
-	if existing != nil && existing.DeletionTimestamp == nil && !state.done && !state.failed && existing.Status.Failed > 0 {
-		state.provisionRetrying = a2aProvisionRetryingMessage(existing.Name, existing.Namespace, existing.Status.Failed)
+		// Neither finished nor about to be, with failed pods: the Job is
+		// retrying. The status writers carry it, and record its Warning
+		// event once the write lands, so a pass that errors first doesn't
+		// repeat it.
+		if !state.done && !state.failed && !a2aProvisionJobFinishing(existing) && existing.Status.Failed > 0 {
+			state.provisionRetrying = a2aProvisionRetryingMessage(existing.Name, existing.Namespace, existing.Status.Failed)
+		}
 	}
 
 	// Superseded generations go now, not by TTL. A Job whose name the render
@@ -9389,6 +9389,18 @@ const (
 	a2aProvisionRetryingConditionType = "A2AProvisionRetrying"
 	a2aProvisionRetryingReason        = "ProvisionJobPodsFailing"
 )
+
+// a2aProvisionJobFinishing reports the Job controller's interim verdicts
+// (FailureTarget, SuccessCriteriaMet), set while its pods terminate and
+// before Failed or Complete: such a Job is no longer retrying.
+func a2aProvisionJobFinishing(job *batchv1.Job) bool {
+	for _, cond := range job.Status.Conditions {
+		if cond.Status == corev1.ConditionTrue && (cond.Type == batchv1.JobFailureTarget || cond.Type == batchv1.JobSuccessCriteriaMet) {
+			return true
+		}
+	}
+	return false
+}
 
 func a2aProvisionRetryingMessage(job, namespace string, failed int32) string {
 	return fmt.Sprintf("A2A provision Job %s has %d failed pod(s) and is retrying; `kubectl logs -n %s job/%s` shows why. If it stops retrying it is reported as A2AProvisionFailed",

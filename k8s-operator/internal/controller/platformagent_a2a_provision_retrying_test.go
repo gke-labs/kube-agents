@@ -165,6 +165,8 @@ func TestProvisionRetryingIsOnlyForAJobStillRetrying(t *testing.T) {
 		{"failed pods, still running", 2, "", true},
 		{"complete after failed pods", 2, batchv1.JobComplete, false},
 		{"failed", 20, batchv1.JobFailed, false},
+		{"failing, pods still terminating", 1, batchv1.JobFailureTarget, false},
+		{"succeeding, pods still terminating", 1, batchv1.JobSuccessCriteriaMet, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
