@@ -574,12 +574,13 @@ child still running is left active. A known limit: a child that hangs without en
 further delegation in its conversation until its terminal arrives (from its executor or the
 supervisor) or the record is reaped.
 
-One exception stands while its flag is on: the session pod's temporary read-only cluster view
+One exception stands while the view is on (the session route's default, or the operator's
+`A2A_SESSION_CLUSTER_VIEW=true`): the session pod's temporary read-only cluster view
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
 credential broker directly, with the platform agent's scope and no child task, so the only gate
 between the requester and that read is the gateway's ingress allowlist, not the target's
-`AllowedUsers`. Its replacement by the profile path is tracked in #6483. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with it on (#6538, 2026-11-20). Until it is replaced, on an install whose
-operator has turned the flag on and whose CR narrows the platform agent's allowlist, a person the
+`AllowedUsers`. Its replacement by the profile path is tracked in #6483. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with it on (#6538, 2026-11-20). Until it is replaced, on an install with the
+view on whose CR narrows the platform agent's allowlist, a person the
 gateway refuses a delegation to `platform` can still read its clusters through a session's view.
 
 Delegation ends the turn. A session's turn is a conversation turn, bounded at thirty minutes

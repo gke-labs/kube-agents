@@ -1295,8 +1295,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         - Automount stays off, so the default-audience token -- the one the API
           server accepts -- is never mounted.
         - Every token that is mounted is a projected token naming an audience
-          that is not the API server's: the bus, and, under the operator's
-          A2A_SESSION_CLUSTER_VIEW flag, the session audience accepted by
+          that is not the API server's: the bus, and, under the session pods'
+          cluster view (the session route's default, or the operator's
+          A2A_SESSION_CLUSTER_VIEW=true), the session audience accepted by
           kube-proxy and the credential broker. The API server refuses both for
           anything else, so neither is a cluster credential even though both
           are Kubernetes ones; TokenReview and each proxy's per-audience policy
@@ -1336,7 +1337,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "bus credential moved, this test has to move with it",
         )
         # The audiences a session pod may hold, by constant name: the bus, and
-        # the broker's session audience that the cluster-view flag projects.
+        # the broker's session audience that the cluster view projects.
         # Anything else is a token for a destination the fence never admitted.
         permitted_audiences = ("lib.BusTokenAudience", "credentialProxySessionAudience")
         for projection in projections:
