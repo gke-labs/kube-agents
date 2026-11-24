@@ -126,6 +126,11 @@ func warmClaimEligible(cfg *Config, rec *SessionRecord) bool {
 func (g *Gateway) claimOrMint(ctx context.Context, rec *SessionRecord) {
 	if pod := g.claimWarm(ctx, rec); pod != "" {
 		rec.BusSession, rec.Addressee, rec.warmClaim = pod, pod, pod
+		// The claim is in the index, so the cap now counts the pod as this
+		// conversation's live session (sessionPods). The slot the cap check
+		// granted is that pod: released now, or a turn checking the cap
+		// before ensureSessionPod returns would count the conversation twice.
+		g.releaseCapHold(rec.Key)
 		g.log.Info("claimed a warm session pod", "conversation", rec.Key, "pod", pod)
 		return
 	}
@@ -457,12 +462,17 @@ func (g *Gateway) warmPoolOnce(ctx context.Context) {
 		return
 	}
 	defer g.releaseCapCheck()
+	// The held slots before the pods, and counted as the cap check counts
+	// them (liveSessionCount): a slot is released only after its pod exists,
+	// so a slot missing from this snapshot is a pod in the list read after it,
+	// and a hold replacing a pod that is still listed is that one session.
+	holds := g.capHoldSnapshot("", time.Now())
 	pods, err := g.sessionPods(ctx)
 	if err != nil {
 		g.log.Error("warm pool: live count failed", "err", err)
 		return
 	}
-	live := len(pods) + len(g.capHoldSnapshot("", time.Now()))
+	live := liveSessionCount(pods, holds)
 	for n := len(fresh); n < warmPoolSize(g.cfg.WarmSessions, g.cfg.MaxSessions, live); n++ {
 		// A deposed leader creates nothing: the new one sizes the pool.
 		if !g.reg.StillLeading(ctx) {

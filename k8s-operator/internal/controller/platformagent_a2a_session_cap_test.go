@@ -1238,3 +1238,18 @@ func TestAPrunedSessionCapAloneShortensTheRequeue(t *testing.T) {
 		t.Errorf("usageStatusRequeue after the record expired = %s, want %s", got, secretEnvReprobeInterval)
 	}
 }
+
+// A served CRD that keeps the cap and drops status.effectiveWarmSessions
+// schedules the same 5-minute reprobe as a pruned cap, so applying the new
+// CRD renders the warm pod within it rather than at the 15-minute requeue.
+func TestAPrunedWarmCountSchedulesTheReprobe(t *testing.T) {
+	r := &PlatformAgentReconciler{}
+	agent := sessionRouteTestAgent()
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Fatalf("requeue with no pruned record = %s, want %s", got, secretEnvReprobeInterval)
+	}
+	r.sessionWarmPruned.Store(client.ObjectKeyFromObject(agent), time.Now())
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Errorf("requeue with a pruned warm count = %s, want the reprobe interval %s", got, usageStatusReprobeInterval)
+	}
+}

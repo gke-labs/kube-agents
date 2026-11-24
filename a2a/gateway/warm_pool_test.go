@@ -954,3 +954,44 @@ func TestTheWarmPoolSizesUnderTheSessionCapCheck(t *testing.T) {
 		t.Fatalf("the pool didn't refill once the cap check was free: %d creates", n)
 	}
 }
+
+// The pool counts live sessions as the cap check does (liveSessionCount): a
+// conversation replacing its own pod is one session, its hold beside the pod
+// it replaces, so the pool doesn't hold back a warm pod the cap has room for.
+func TestThePoolCountsAReplacingConversationOnceAsTheCapDoes(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmRig(t)
+	waitFor(t, "the leader's first warm pod", func() bool { return len(spawn.warmSpawned()) == 1 })
+	spawn.dropWarm(spawn.warmSpawned()...)
+	// Two sessions of a cap of four, one replacing its own pod: room for the
+	// pool's one warm pod (cap - 1 - live = 1). Counted twice it is three,
+	// and the pool would create none.
+	spawn.setSessionPods(sessionPod{PodName: "chat-a", SessionKey: "discord:g1/t-a"}, sessionPod{PodName: "chat-x", SessionKey: "discord:g1/t-x"})
+	r.g.holdCapSlot("discord:g1/t-x", "chat-x")
+	defer r.g.releaseCapHold("discord:g1/t-x")
+	r.g.warmPoolOnce(context.Background())
+	if n := len(spawn.warmSpawned()); n != 2 {
+		t.Fatalf("%d warm creates; want the refill the cap has room for (the replacing conversation counted once)", n)
+	}
+}
+
+// A claim puts the warm pod in the cap's count straight away (the claim
+// index), so the slot the cap check granted the turn is released at the
+// claim: a turn checking the cap before the claimer's task starts sees the
+// conversation once, not as a hold beside its pod.
+func TestAClaimReleasesTheTurnsCapHold(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmRig(t)
+	waitFor(t, "the leader's first warm pod", func() bool { return len(spawn.warmSpawned()) == 1 })
+	spawn.setWarm(readyWarm(spawn.warmSpawned()[0]))
+	conv := "discord:g1/t-claim-hold"
+	r.g.holdCapSlot(conv, "")
+	rec := &SessionRecord{Key: conv, Profile: sessionProfile, SessionRouted: true}
+	r.g.claimOrMint(context.Background(), rec)
+	if rec.warmClaim == "" {
+		t.Fatal("no warm pod was claimed")
+	}
+	if holds := r.g.capHoldSnapshot("", time.Now()); len(holds) != 0 {
+		t.Fatalf("the turn's cap hold outlived its claim (%d held), so the cap counts the conversation twice", len(holds))
+	}
+}
