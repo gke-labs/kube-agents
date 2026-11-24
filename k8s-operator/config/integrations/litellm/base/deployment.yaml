@@ -96,10 +96,19 @@ spec:
             # See the pod securityContext above: the only writable directory.
             - name: HOME
               value: /tmp
-            # LiteLLM v1.104.0+ refuses to boot without a master key unless permitted.
-            # In kube-agents, LiteLLM is an in-cluster gateway on a private Service
-            # protected by NetworkPolicy, and internal callers authenticate at the
-            # transport boundary rather than via LiteLLM's user-auth layer.
+            # The master key general_settings.master_key reads. Optional here,
+            # unlike the chart, which generates the Secret: kustomize cannot
+            # generate a random value, so this base only reads a
+            # litellm-master-key Secret someone created. Without it LiteLLM
+            # v1.104.0+ refuses to boot unless permitted, hence the next
+            # variable; the caller-auth hook still runs and admits callers by
+            # their keys, and no key reaches the admin routes.
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-master-key
+                  key: LITELLM_MASTER_KEY
+                  optional: true
             - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
               value: "true"
             - name: GEMINI_API_KEY
@@ -165,12 +174,25 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_thinking_replay_callback.py
               subPath: litellm_thinking_replay_callback.py
+            - name: config-volume
+              mountPath: /app/litellm_caller_auth.py
+              subPath: litellm_caller_auth.py
+            # As the chart: the caller-key map, a directory so the kubelet's
+            # updates reach the file the hook re-reads.
+            - name: caller-keys
+              mountPath: /etc/litellm/caller-keys
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
+        - name: caller-keys
+          secret:
+            secretName: litellm-caller-keys
+            optional: true
+            defaultMode: 288
         # As the chart (templates/litellm.yaml): HOME and the tokenizer caches.
         - name: tmp
           emptyDir:

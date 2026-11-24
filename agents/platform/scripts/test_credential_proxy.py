@@ -13700,6 +13700,45 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
                     with self.assertRaises(credential_proxy.AuthenticationError):
                         self._authenticator().authenticate(self._headers("Bearer agent-token"))
 
+    def test_a_body_that_the_parser_refuses_for_its_depth_is_a_rejection(self):
+        # The depth that the JSON parser refuses is the interpreter's and differs
+        # between Python versions, so the parser's refusal is given directly.
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(urllib.request.OpenerDirector, "open", return_value=Response(b"[]")), \
+                mock.patch.object(credential_proxy.json, "load", side_effect=RecursionError("too deep")):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_status_with_a_value_of_the_wrong_type_is_a_rejection(self):
+        for label, overrides in (
+            ("the user is a string", {"user": "system:serviceaccount:kubeagents-system:agent"}),
+            ("the user is a list", {"user": [self.CALLER]}),
+            ("the username is a list", {"user": {"username": [self.CALLER]}}),
+            ("the audiences are a number", {"audiences": 1}),
+            ("the audiences are a mapping", {"audiences": {self.AUDIENCE: True}}),
+            ("the groups are a number", {"user": {"username": self.CALLER, "groups": 1}}),
+            ("the groups are a mapping", {"user": {"username": self.CALLER, "groups": {"system:serviceaccounts": True}}}),
+            ("the groups are text", {"user": {"username": self.CALLER, "groups": "system:serviceaccounts"}}),
+            ("the uid is a list", {"user": {"username": self.CALLER, "uid": ["sa-uid"]}}),
+        ):
+            with self.subTest(label):
+                authenticator = self._with_review(self._authenticator(), self._ok_status(**overrides))
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_an_own_token_file_that_is_not_utf8_is_a_rejection(self):
+        self.own_token.write_bytes(b"\xff\xfe not text")
+        with mock.patch.object(urllib.request.OpenerDirector, "open") as opened:
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+        opened.assert_not_called()
+
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
         captured = {}
@@ -14147,6 +14186,12 @@ class RequiredRoleTest(unittest.TestCase):
             credential_proxy.required_roles("/v1/chat/api"),
         )
 
+    def test_the_teams_intake_admits_the_chat_role_and_the_inbound_receiver(self):
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_TEAMS_INBOUND),
+            credential_proxy.required_roles(credential_proxy.TEAMS_INBOUND_ROUTE),
+        )
+
     def test_the_a2a_event_route_stays_its_own(self):
         self.assertEqual(
             (credential_proxy.CALLER_ROLE_A2A_CHAT,),
@@ -14172,16 +14217,25 @@ class RequiredRoleTest(unittest.TestCase):
             credential_proxy._teams_route_roles(True),
         )
         for armed in (False, True):
+            consumer = credential_proxy._teams_route_roles(armed)
+            # The intake's exact entry carries the consumer roles plus the
+            # inbound receiver's; the prefix entry carries the consumer roles.
             table = tuple(
-                (prefix, credential_proxy._teams_route_roles(armed)) if prefix == "/v1/chat/teams/" else (prefix, roles)
+                (prefix, consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,))
+                if prefix == credential_proxy.TEAMS_INBOUND_ROUTE
+                else (prefix, consumer) if prefix == "/v1/chat/teams/" else (prefix, roles)
                 for prefix, roles in credential_proxy.ROUTE_ROLES
             )
             credential_proxy._validate_route_roles(table)
             with mock.patch.object(credential_proxy, "ROUTE_ROLES", table):
                 for path in teams_paths:
-                    self.assertEqual(
-                        credential_proxy._teams_route_roles(armed), credential_proxy.required_roles(path), (armed, path)
-                    )
+                    # The intake entry is a prefix like the rest of the table, so
+                    # the pull and its receipts resolve to it too; _role_permits,
+                    # not this table, holds the receiver to POST on the exact path.
+                    want = consumer
+                    if path.startswith(credential_proxy.TEAMS_INBOUND_ROUTE):
+                        want = consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,)
+                    self.assertEqual(want, credential_proxy.required_roles(path), (armed, path))
                 self.assertEqual(
                     (credential_proxy.CALLER_ROLE_CHAT,),
                     credential_proxy.required_roles("/v1/chat/slack/events"),
@@ -14324,6 +14378,37 @@ class RolePermitsTest(unittest.TestCase):
             workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role
         )
         return handler, principal
+
+    def test_the_teams_inbound_receiver_reaches_the_intake_by_post_alone(self):
+        """ROUTE_ROLES admits the receiver under the intake's prefix, which also
+        covers the pull (GET on the same path) and the receipts under it; the
+        guard above the table holds it to POST on the exact path."""
+        intake = credential_proxy.TEAMS_INBOUND_ROUTE
+        role = credential_proxy.CALLER_ROLE_TEAMS_INBOUND
+        handler, principal = self._handler(intake, role)
+        handler.command = "POST"
+        self.assertTrue(handler._role_permits(principal))
+        self.assertEqual([], handler.replies)
+        for command, path in (
+            ("GET", intake),
+            ("POST", intake + "/ack"),
+            ("POST", intake + "/nack"),
+            ("POST", "/v1/chat/api"),
+            ("POST", "/v1/chat/teams/api"),
+            ("GET", "/v1/exec"),
+        ):
+            with self.subTest(command=command, path=path):
+                handler, principal = self._handler(path, role)
+                handler.command = command
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    self.assertFalse(handler._role_permits(principal))
+                status, payload = handler.replies[0]
+                self.assertEqual((HTTPStatus.FORBIDDEN, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        # The chat role's own reach of the intake and the pull is unchanged.
+        for command in ("GET", "POST"):
+            handler, principal = self._handler(intake, credential_proxy.CALLER_ROLE_CHAT)
+            handler.command = command
+            self.assertTrue(handler._role_permits(principal))
 
     def test_the_shell_cannot_reach_a_chat_route(self):
         handler, principal = self._handler(
@@ -19298,6 +19383,32 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(self.upstream_requests))
 
+    def test_the_get_credentials_check_is_refused_for_a_held_cluster(self):
+        # spec.hold answers on the same route, under its own rule, and
+        # the cluster's describe without the header stays a control-plane read.
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "scope.json").write_text("{}", encoding="utf-8")
+        (directory / "hold.json").write_text(json.dumps({"clusters": [
+            {"projectId": "acme-prod", "location": "us-central1", "clusterName": "paused"}], "reason": "INC-9"}),
+            encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(directory / "scope.json"),
+            holds=scope_exclude.Holds(path=lambda: str(directory / "hold.json")),
+        )
+        self.reply["body"] = b'{"name":"paused","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="paused"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, body["rule"])
+        self.assertIn("INC-9", body["message"])
+        self.assertEqual([], self.upstream_requests)
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="paused"))
+        self.assertEqual(200, status)
+
     def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
         self._exclude("acme-prod", "us-central1", "secret-cluster")
         self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
@@ -23008,6 +23119,44 @@ class ExcludedClusterPathTest(unittest.TestCase):
                 result = executor.execute(["kubectl", "get", "pods"])
                 self.assertNotIn("ExcludedCluster", result.stderr)
 
+    def hold(self, document):
+        """Rewrite hold.json, as an edit to spec.hold lands in its ConfigMap mount."""
+        text = json.dumps(document)
+        self.hold_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(text)
+        os.utime(self.hold_file, ns=(stamp, stamp))
+
+    def held_executor(self):
+        import scope_exclude
+
+        self.hold_file = Path(self.temp_dir.name) / "hold.json"
+        executor = self.executor()
+        executor.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(self.scope_file), holds=scope_exclude.Holds(path=lambda: str(self.hold_file)))
+        return executor
+
+    def test_a_held_cluster_is_refused_until_the_hold_is_lifted_and_its_describe_stays_allowed(self):
+        import scope_exclude
+
+        executor = self.held_executor()
+        self.hold({"clusters": [{"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": self.EXCLUDED}],
+                   "reason": "INC-7"})
+        for call in (
+            lambda: executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)),
+            lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True),
+        ):
+            with self.assertRaises(scope_exclude.HeldCluster) as caught:
+                call()
+            self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, caught.exception.rule)
+            self.assertIn("INC-7", str(caught.exception))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.hold({})
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+
     def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
         """Control-plane reads are the project's, and stay allowed."""
         self.exclude(self.EXCLUDED)
@@ -23262,6 +23411,125 @@ class DecisionMemoryChecksMetricTest(unittest.TestCase):
         self.assertEqual(status, HTTPStatus.FORBIDDEN, body)
         self.assertEqual(body.get("code"), "FORBIDDEN_COMMIT_IDENTITY")
         self.assertIn("reviewer@company.com", body.get("error", ""))
+
+
+class TeamsInboundCallerBindingTest(unittest.TestCase):
+    """The teams-inbound role is bound to the inbound receiver's ServiceAccount in
+    both directions, with the mcp binding's meaning: no callers named means the
+    audience confers nothing. The receiver is the one component the internet
+    reaches, so it holds no other audience and nobody else holds its role.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    TEAMS_INBOUND = "kubeagents-credential-proxy-teams-inbound"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    RECEIVER_SA = "system:serviceaccount:kubeagents-system:agent-teams-inbound"
+
+    def _authenticator(self, teams_inbound_callers=frozenset({RECEIVER_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.TEAMS_INBOUND: credential_proxy.CALLER_ROLE_TEAMS_INBOUND,
+            },
+            allowed_callers=frozenset({self.AGENT, self.RECEIVER_SA}),
+            teams_inbound_callers=teams_inbound_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_the_receiver_presenting_any_other_audience_is_refused(self):
+        for audience in (self.SHELL, self.CHAT):
+            with self.subTest(audience=audience):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only the teams-inbound audience"
+                ):
+                    self._authenticator()._principal_from(self._review(self.RECEIVER_SA, audience))
+
+    def test_the_receiver_presenting_its_audience_is_the_teams_inbound_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.RECEIVER_SA, self.TEAMS_INBOUND))
+        self.assertEqual(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, principal.role)
+
+    def test_another_caller_presenting_the_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only for the Teams inbound receiver"
+        ):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.TEAMS_INBOUND))
+
+    def test_with_no_callers_named_the_audience_confers_nothing(self):
+        for caller in (self.AGENT, self.RECEIVER_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for the Teams inbound receiver"
+                ):
+                    self._authenticator(frozenset())._principal_from(self._review(caller, self.TEAMS_INBOUND))
+
+    def test_the_callers_and_audience_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.RECEIVER_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-teams-inbound",
+            credential_proxy.TEAMS_INBOUND_CALLERS_ENV: f" {self.RECEIVER_SA} , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset({self.RECEIVER_SA}), authenticator.teams_inbound_callers)
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_TEAMS_INBOUND, authenticator.audience_roles["aud-teams-inbound"]
+        )
+        principal = authenticator._principal_from(self._review(self.RECEIVER_SA, "aud-teams-inbound"))
+        self.assertEqual(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, principal.role)
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(
+                self._review(self.RECEIVER_SA, credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE)
+            )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-teams-inbound"))
+
+    def test_the_audience_without_callers_warns_and_confers_nothing(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": self.AGENT,
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-teams-inbound",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.teams_inbound_callers)
+        self.assertTrue(any(credential_proxy.TEAMS_INBOUND_CALLERS_ENV in line for line in logs.output))
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-teams-inbound"))
+
+    def test_a_colliding_audience_is_not_conferred(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.RECEIVER_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-chat",
+            credential_proxy.TEAMS_INBOUND_CALLERS_ENV: self.RECEIVER_SA,
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                authenticator = credential_proxy.build_authenticator()
+        self.assertNotIn(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, authenticator.audience_roles.values())
 
 
 if __name__ == "__main__":
