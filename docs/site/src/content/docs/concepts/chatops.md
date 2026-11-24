@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The interactive channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled. An experimental **Microsoft Teams** Bot Framework outbound relay (`spec.integration.teams`, [below](#microsoft-teams)) also ships for outbound activity delivery and in-pod event queue scaffolding, but does not yet include external webhook ingress. Proactive alerts and reports reach a Teams home only with the gateway's Teams backend armed.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The interactive channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled. An experimental **Microsoft Teams** Bot Framework outbound relay (`spec.integration.teams`, [below](#microsoft-teams)) also ships: it delivers the agent's replies and posts, and an inbound receiver, off by default, takes the messages people type in Teams ([Microsoft Teams app setup](/kube-agents/install/teams-app/)). Proactive alerts and reports reach a Teams home only with the gateway's Teams backend armed.
 
 Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand). It files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails.
 
@@ -141,7 +141,7 @@ A scheduled brief posts flat in that channel, never inside a thread. A job that 
 
 The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report and fleet-audit reports into cards, and changes how the harness's own messages read on Slack (below).
 
-To turn the flag off, set `KAGE_SLACK_UX=false` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`); an install that never set it has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
+To turn the flag off, add `KAGE_SLACK_UX=false` to the chart value `platformAgent.deployment.env`; [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the `install.env` line. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply. An install that never set the flag has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
 
 #### What the reaction means
 
@@ -609,11 +609,11 @@ An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) c
 
 The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the Hermes gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched.
 
-Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`).
+Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack, and to the Teams home channel once the gateway's Teams backend is armed. Without that backend, a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`).
 
 When the operator runs with `A2A_TEAMS_BACKEND=true`, the A2A chat gateway consumes that queue instead of the Hermes adapter (`a2a/gateway/teams.go`, the `A2A_TEAMS_*` env), the broker admits the gateway pod as a caller, and the Hermes Teams platform is not rendered.
 
-What this means for an evaluator: enabling `spec.integration.teams` alone gives you the outbound half. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams reaches the agent only with the inbound receiver on (`spec.integration.teams.inbound.enabled`, with `tenantId`). The operator then runs a pod that accepts the requests Microsoft delivers for the bot, verifies Microsoft's signature on each one, and hands the message to the install. You expose its Service with your own Ingress and TLS certificate and register that address as the bot's messaging endpoint; the setup guide walks through it.
+What this means for an evaluator: enabling `spec.integration.teams` alone gives you the outbound half. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams reaches the agent only with the inbound receiver on (`spec.integration.teams.inbound.enabled`, with `tenantId`). The operator then runs a pod that accepts the requests Microsoft delivers for the bot, verifies Microsoft's signature on each one, and hands the message to the install. You expose its Service with your own Ingress and TLS certificate and register that address as the bot's messaging endpoint; [Microsoft Teams app setup](/kube-agents/install/teams-app/) walks through it.
 
 ## Proactive alerts (both channels)
 
@@ -754,7 +754,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in the chart value `platformAgent.deployment.env`, or in `spec.deployment.env` on an install that no chart manages:
 
 ```yaml
 platformAgent:
