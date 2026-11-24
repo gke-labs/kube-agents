@@ -42,8 +42,14 @@ func TestARenderingReadsBackIntoMemory(t *testing.T) {
 	for _, s := range p.Skills {
 		for _, f := range s.Files {
 			got, err := fs.ReadFile(r.Skills, s.Name+"/"+f.Path)
-			if err != nil || string(got) != string(f.Data) {
+			if err != nil {
 				t.Errorf("%s/%s: %v", s.Name, f.Path, err)
+				continue
+			}
+			if f.Path == "SKILL.md" {
+				sameSkill(t, s.Name, f.Data, got)
+			} else if string(got) != string(f.Data) {
+				t.Errorf("%s/%s differs", s.Name, f.Path)
 			}
 		}
 	}

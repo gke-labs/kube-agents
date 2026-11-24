@@ -67,38 +67,54 @@ func (Adapter) Render(p *persona.Persona, _ persona.Target) (persona.Output, err
 			if f.Executable {
 				return persona.Output{}, fmt.Errorf("skills/%s/%s: an executable skill file can't be rendered for core-agent, which reads a skill's files and doesn't run them", s.Name, f.Path)
 			}
+			data := f.Data
 			if f.Path == "SKILL.md" {
-				if err := checkFrontmatter(s.Name, f.Data); err != nil {
+				canonical, err := canonicalSkill(s.Name, f.Data)
+				if err != nil {
 					return persona.Output{}, err
 				}
+				data = canonical
 			}
-			out.Files = append(out.Files, persona.File{Path: path.Join(SkillsDir, s.Name, f.Path), Data: f.Data})
+			out.Files = append(out.Files, persona.File{Path: path.Join(SkillsDir, s.Name, f.Path), Data: data})
 		}
 	}
 	return out, nil
 }
 
-// checkFrontmatter refuses a SKILL.md frontmatter key the harness doesn't
-// read, and allowed-tools. The persona loader has already checked the
-// frontmatter's shape; this is what core-agent takes of it.
-func checkFrontmatter(skill string, data []byte) error {
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	rest, ok := strings.CutPrefix(text, "---\n")
-	if !ok {
-		return fmt.Errorf("skills/%s/SKILL.md: no frontmatter", skill)
+// canonicalSkill rewrites a SKILL.md as the harness is to read it: its
+// frontmatter, which ends at the first line that is exactly "---", decoded
+// strictly (a repeated key is refused) and written back with only the keys
+// the harness reads, then the body unchanged. A key outside those, and
+// allowed-tools, is refused. Writing the frontmatter back rather than
+// passing the original bytes leaves no line the harness's own parser could
+// read differently.
+func canonicalSkill(skill string, data []byte) ([]byte, error) {
+	lines := strings.SplitAfter(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	if len(lines) == 0 || strings.TrimRight(lines[0], "\n") != "---" {
+		return nil, fmt.Errorf("skills/%s/SKILL.md: no frontmatter", skill)
 	}
-	front, _, ok := strings.Cut(rest, "\n---")
-	if !ok {
-		return fmt.Errorf("skills/%s/SKILL.md: unterminated frontmatter", skill)
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimRight(lines[i], " \t\n") == "---" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return nil, fmt.Errorf("skills/%s/SKILL.md: unterminated frontmatter", skill)
 	}
 	var keys map[string]any
-	if err := yaml.Unmarshal([]byte(front), &keys); err != nil {
-		return fmt.Errorf("skills/%s/SKILL.md: frontmatter: %w", skill, err)
+	if err := yaml.UnmarshalStrict([]byte(strings.Join(lines[1:end], "")), &keys); err != nil {
+		return nil, fmt.Errorf("skills/%s/SKILL.md: frontmatter: %w", skill, err)
 	}
 	for key := range keys {
 		if !slices.Contains(frontmatterKeys, key) {
-			return fmt.Errorf("skills/%s/SKILL.md: frontmatter key %q can't be rendered for core-agent (it reads %s)", skill, key, strings.Join(frontmatterKeys, ", "))
+			return nil, fmt.Errorf("skills/%s/SKILL.md: frontmatter key %q can't be rendered for core-agent (it reads %s)", skill, key, strings.Join(frontmatterKeys, ", "))
 		}
 	}
-	return nil
+	front, err := yaml.Marshal(keys)
+	if err != nil {
+		return nil, fmt.Errorf("skills/%s/SKILL.md: frontmatter: %w", skill, err)
+	}
+	return []byte("---\n" + string(front) + "---\n" + strings.Join(lines[end+1:], "")), nil
 }

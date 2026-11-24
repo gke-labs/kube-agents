@@ -1,9 +1,12 @@
 package coreagent_test
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
@@ -50,7 +53,12 @@ func TestAShippedPersonaRendersWhole(t *testing.T) {
 	for _, s := range p.Skills {
 		for _, f := range s.Files {
 			want++
-			if got["skills/"+s.Name+"/"+f.Path] != string(f.Data) {
+			rendered := got["skills/"+s.Name+"/"+f.Path]
+			if f.Path == "SKILL.md" {
+				sameSkill(t, s.Name, f.Data, []byte(rendered))
+				continue
+			}
+			if rendered != string(f.Data) {
 				t.Errorf("skills/%s/%s differs from the persona's", s.Name, f.Path)
 			}
 		}
@@ -72,6 +80,25 @@ func TestAnMCPServerIsRefused(t *testing.T) {
 	}
 }
 
+// sameSkill checks a rendered SKILL.md against its source: the same
+// frontmatter keys and values, and the same body.
+func sameSkill(t *testing.T, skill string, src, rendered []byte) {
+	t.Helper()
+	split := func(b []byte) (map[string]any, string) {
+		parts := strings.SplitN(string(b), "\n---\n", 2)
+		var m map[string]any
+		if err := yaml.Unmarshal([]byte(strings.TrimPrefix(parts[0], "---\n")), &m); err != nil || len(parts) != 2 {
+			t.Fatalf("%s: %v", skill, err)
+		}
+		return m, parts[1]
+	}
+	sm, sb := split(src)
+	rm, rb := split(rendered)
+	if !reflect.DeepEqual(sm, rm) || sb != rb {
+		t.Errorf("skills/%s/SKILL.md: rendered frontmatter or body differs from the source's", skill)
+	}
+}
+
 func skillPersona(skill string, files ...persona.File) *persona.Persona {
 	return &persona.Persona{Instructions: "be useful\n", Skills: []persona.Skill{{Name: skill, Files: files}}}
 }
@@ -85,6 +112,11 @@ func TestWhatCoreAgentCantTakeIsRefused(t *testing.T) {
 		{"allowed-tools", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\nallowed-tools: [Bash]\n---\nbody\n")}), `"allowed-tools"`},
 		{"unknown key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\nhooks: x\n---\nbody\n")}), `"hooks"`},
 		{"no frontmatter", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("body\n")}), "no frontmatter"},
+		// A line that only starts with --- doesn't end the frontmatter, so the
+		// key after it is read, and refused, rather than hidden.
+		{"a near-terminator hiding a key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n---x\nallowed-tools: [Bash]\n---\nbody\n")}), "frontmatter"},
+		{"a repeated key", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\ndescription: e\n---\nbody\n")}), "frontmatter"},
+		{"unterminated", skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\n")}), "unterminated"},
 		{"executable", skillPersona("s",
 			persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\n---\n")},
 			persona.File{Path: "run.sh", Data: []byte("#!/bin/sh\n"), Executable: true}), "skills/s/run.sh"},
@@ -98,9 +130,16 @@ func TestWhatCoreAgentCantTakeIsRefused(t *testing.T) {
 }
 
 func TestEveryAgentSkillsKeyTheHarnessReadsPasses(t *testing.T) {
-	p := skillPersona("s", persona.File{Path: "SKILL.md", Data: []byte("---\nname: s\ndescription: d\nlicense: Apache-2.0\ncompatibility: any\nmetadata:\n  k: v\n---\nbody\n")})
-	if _, err := (coreagent.Adapter{}).Render(p, persona.Target{}); err != nil {
+	src := []byte("---\nname: s\ndescription: d\nlicense: Apache-2.0\ncompatibility: any\nmetadata:\n  k: v\n---\nbody\n---\nmore body\n")
+	out, err := (coreagent.Adapter{}).Render(skillPersona("s", persona.File{Path: "SKILL.md", Data: src}), persona.Target{})
+	if err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// The rendered SKILL.md is the canonical form: the same keys, and the body
+	// (a later --- line included) after one terminator.
+	sameSkill(t, "s", src, out.Files[1].Data)
+	if !strings.HasPrefix(string(out.Files[1].Data), "---\n") {
+		t.Errorf("rendered SKILL.md = %q", out.Files[1].Data)
 	}
 }
 
