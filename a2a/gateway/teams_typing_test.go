@@ -118,3 +118,41 @@ func TestTeamsTypingSurvivesARefusedPost(t *testing.T) {
 	waitFor(t, "the indicator kept posting", func() bool { return teamsTypingCount(relay) >= 3 })
 	a.TaskTerminal(conversation, "task-1", lib.StateFailed, TerminalFromExecutor, "")
 }
+
+// Card work the gateway cannot see keeps the indicator on: an ask still
+// open after its task ended holds it (the session mark), until the ask
+// settles or waits on the person.
+func TestTeamsKeepsTypingWhileTheAskIsOpen(t *testing.T) {
+	for name, release := range map[string]func(a *TeamsAdapter, conversation string){
+		"the ask cleared":       func(a *TeamsAdapter, c string) { a.MarkChanged(c, "", "") },
+		"waiting on the person": func(a *TeamsAdapter, c string) { a.MarkChanged(c, "investigate", markSettleBlocked) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, relay := typingTeamsAdapter(t)
+			conversation := "teams:" + testTeamsChannel
+			a.TaskStarted(conversation, "task-1")
+			a.MarkChanged(conversation, "investigate", "")
+			a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+			before := teamsTypingCount(relay)
+			waitFor(t, "the indicator kept posting past the task's end", func() bool { return teamsTypingCount(relay) >= before+3 })
+			release(a, conversation)
+			settled := teamsTypingSettled(t, relay)
+			time.Sleep(10 * testTeamsTypingInterval)
+			if now := teamsTypingCount(relay); now != settled {
+				t.Fatalf("typing posts went on after the release: %d then %d", settled, now)
+			}
+		})
+	}
+}
+
+// A mark with no ask on a conversation nothing holds starts nothing.
+func TestTeamsDoesNotTypeForASettledMark(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "", markSettleFailed)
+	a.MarkChanged(conversation, "investigate", markSettleBlocked)
+	time.Sleep(10 * testTeamsTypingInterval)
+	if n := teamsTypingCount(relay); n != 0 {
+		t.Fatalf("%d typing posts for a settled or blocked mark, want none", n)
+	}
+}

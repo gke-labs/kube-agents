@@ -16,10 +16,16 @@ import (
 // or a plan sitting unchanged in the thread does not read as work going on.
 //
 // The gateway names each task as it starts and as it ends (TaskObserver),
-// under the session lock, so both calls only record and return; one loop per
+// and the conversation's session mark whenever it changes (MarkObserver):
+// an ask whose chain has ended but still carries its kind is card work
+// still open, which the gateway cannot see any other way, and a blocked
+// settle is work waiting on the person. So the indicator is held by each
+// running task and by an open ask that is not blocked, as Slack holds its
+// Working… status (slackSession.wanted). All of these calls arrive under
+// the session lock, so they only record and return; one loop per
 // conversation posts a `typing` activity through the broker's passthrough,
 // again every teamsTypingInterval because Teams clears the indicator a few
-// seconds after each, until the conversation's last task ends or
+// seconds after each, until the conversation's last hold is released or
 // teamsTypingMax has passed. A post that fails is dropped: the indicator is
 // a courtesy, and the next tick tries again.
 const (
@@ -33,42 +39,70 @@ const (
 	// teamsTypingMax ends the loop for a conversation whose task never
 	// reports an end, so no indicator outlives its work by more than this.
 	teamsTypingMax = 10 * time.Minute
+	// teamsTypingMarkHold is the hold an open ask keeps beside the task
+	// ids; no task id has this shape.
+	teamsTypingMarkHold = "mark:open-ask"
 )
 
-// teamsTyping is one conversation's running tasks and the channel that
-// stops its loop.
+// teamsTyping is one conversation's holds (its running tasks, and its open
+// ask) and the channel that stops its loop.
 type teamsTyping struct {
-	tasks map[string]struct{}
+	holds map[string]struct{}
 	stop  chan struct{}
 }
 
-var _ TaskObserver = (*TeamsAdapter)(nil)
+var (
+	_ TaskObserver = (*TeamsAdapter)(nil)
+	_ MarkObserver = (*TeamsAdapter)(nil)
+)
 
 // TaskStarted starts the conversation's indicator with its first task
 // (TaskObserver).
 func (a *TeamsAdapter) TaskStarted(conversation, taskID string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	t := a.typing[conversation]
-	if t == nil {
-		t = &teamsTyping{tasks: map[string]struct{}{}, stop: make(chan struct{})}
-		a.typing[conversation] = t
-		go a.keepTyping(conversation, t)
-	}
-	t.tasks[taskID] = struct{}{}
+	a.holdTyping(conversation, taskID)
 }
 
 // TaskTerminal stops the conversation's indicator with its last task
 // (TaskObserver).
 func (a *TeamsAdapter) TaskTerminal(conversation, taskID string, _ lib.TaskState, _ TerminalSource, _ string) {
+	a.releaseTyping(conversation, taskID)
+}
+
+// MarkChanged holds the indicator while the conversation's ask is open and
+// not waiting on the person, and releases it otherwise (MarkObserver).
+func (a *TeamsAdapter) MarkChanged(conversation string, ask, settle string) {
+	if ask != "" && settle != markSettleBlocked {
+		a.holdTyping(conversation, teamsTypingMarkHold)
+		return
+	}
+	a.releaseTyping(conversation, teamsTypingMarkHold)
+}
+
+// holdTyping adds a hold on conversation's indicator and starts its loop
+// with the first.
+func (a *TeamsAdapter) holdTyping(conversation, hold string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	t := a.typing[conversation]
+	if t == nil {
+		t = &teamsTyping{holds: map[string]struct{}{}, stop: make(chan struct{})}
+		a.typing[conversation] = t
+		go a.keepTyping(conversation, t)
+	}
+	t.holds[hold] = struct{}{}
+}
+
+// releaseTyping drops a hold on conversation's indicator and stops its
+// loop with the last.
+func (a *TeamsAdapter) releaseTyping(conversation, hold string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	t := a.typing[conversation]
 	if t == nil {
 		return
 	}
-	delete(t.tasks, taskID)
-	if len(t.tasks) == 0 {
+	delete(t.holds, hold)
+	if len(t.holds) == 0 {
 		close(t.stop)
 		delete(a.typing, conversation)
 	}
@@ -80,8 +114,8 @@ func (a *TeamsAdapter) TaskAccepted(string, string)    {}
 func (a *TeamsAdapter) CancelPublished(string, string) {}
 
 // keepTyping posts the indicator for conversation until t is stopped or
-// teamsTypingMax passes; at the bound it forgets t, so a late TaskTerminal
-// finds nothing to stop.
+// teamsTypingMax passes; at the bound it forgets t, so a late release finds
+// nothing to stop, and a later hold starts the indicator again.
 func (a *TeamsAdapter) keepTyping(conversation string, t *teamsTyping) {
 	bound := time.NewTimer(a.typingMax)
 	defer bound.Stop()
