@@ -5,6 +5,10 @@
 // workstation bridge (a2a/mcpbridge) both render with it, so the bridge
 // carries one copy of the rules without linking the server and its bus
 // client.
+//
+// DiffHeaderBSidePath renders nothing. It is here because both callers read
+// a file's path from a `diff --git` header with it before they show the
+// path, and the bridge keys its per-file patches by the result.
 package inerttext
 
 import (
@@ -227,9 +231,11 @@ func Field(s string) string {
 	return Cell(s[:runeFloor(s, maxFieldBytes)])
 }
 
-// DiffHeaderBSidePath is the post-image path of a `diff --git a/<p> b/<p>`
-// header line, tolerating git's C-style quoting (`"a/p q" "b/p q"`) for
-// paths with spaces or special characters. Adam Parco's, from #3689.
+// DiffHeaderBSidePath is the post-image path of the remainder of a `diff --git
+// a/<p> b/<p>` header line, the text after `diff --git `. It tolerates git's
+// C-style quoting (`"a/p q" "b/p q"`) for paths with spaces or special
+// characters, and an unquoted path that itself contains " b/" is split where
+// the a-side matches the b-side. Adam Parco's, from #3689.
 func DiffHeaderBSidePath(header string) string {
 	line := strings.TrimSpace(header)
 	if idx := strings.LastIndex(line, diffQuotedBPrefix); idx >= 0 {

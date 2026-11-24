@@ -295,9 +295,9 @@ func parseNumber(raw json.RawMessage) (int, error) {
 
 // FormatProposalViewMarkdown renders a view for the person, and the model,
 // reading it in their editor. Every string in v is the forge's: one-line
-// fields go through inerttext.Cell, and the description, comments and diff are fenced
-// blocks with format and control characters shown as <U+XXXX>, never acted
-// on, and a fence longer than any backtick run inside.
+// fields go through inerttext.Field, and the description, comments and diff
+// are fenced blocks with format and control characters shown as <U+XXXX>,
+// never acted on, and a fence longer than any backtick run inside.
 func FormatProposalViewMarkdown(repo string, number int, v *ProposalView, diffNote string) string {
 	return formatProposalView(repo, number, v, diffNote, "")
 }
