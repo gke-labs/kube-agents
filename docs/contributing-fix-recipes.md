@@ -75,7 +75,8 @@ in (see the last section). Stdlib only, like `fix.py`.
 The recipe's primary case is a bench task whose `post_merge_outcome` check carries
 `recipe: <kind>`; the recipe's `eval_case` names it. The check merges the agent's pull request,
 applies it to the fixture's cluster, runs the post-merge check and requires a record of that kind
-with the expected outcome. Its fields are in
+with the expected outcome; until the audit attaches a new kind's finding (see the last section),
+no such record is written. Its fields are in
 [`bench/CUSTOM-TASKS.md`](../bench/CUSTOM-TASKS.md), and
 [`post-merge-verified-fixed`](../bench/tasks/post-merge-verified-fixed/task.yaml) is `no-pdb`'s.
 Other cases may grade the same recipe with other outcomes, but every case's `recipe` must name a
@@ -103,11 +104,15 @@ tests with `python3 agents/platform/scripts/fix_recipes/<kind>/test_recipe.py`.
 
 ## What a new recipe does not get yet
 
-A merged recipe gets a dial row, a rules-file kind and post-merge records. It does not get
-auto-merge, and parts of it are not run, because these places still name `no-pdb` directly:
+A merged recipe gets a dial row and a rules-file kind, and the post-merge store accepts its kind.
+It gets no post-merge records and no auto-merge, and parts of it are not run, because these places
+still name `no-pdb` directly:
 
 - The broker's label gate labels only `automerge_eligibility.FIX_TYPE`.
-- The audit opens a generated fix pull request only for `audit_report.GENERATED_FIX_CHECK`.
+- The audit opens a generated fix pull request only for `audit_report.GENERATED_FIX_CHECK`, and
+  `audit_report.remediation_target` attaches the finding a pull request fixes only for that check.
+  The `pr_opened` plugin writes a post-merge record only when a finding is attached, so a new
+  kind's pull requests leave no record, and its end-to-end case fails with no record to read.
 - The pre-flight runs a kind's `checks.py` only when `fix_preflight.CHANGES` can read its change
   and `recheck.RECHECKS` holds it, so a new kind's checks never run there.
 - The re-check (`fleet-audit/scripts/recheck.py`) builds an entry for every recipe that sets
@@ -116,8 +121,8 @@ auto-merge, and parts of it are not run, because these places still name `no-pdb
   request as a recipe that sets `recheck_kinds`, or the pre-flight stops importing.
 
 So a new kind that should reach auto-merge still edits, today, `CHECK_NEEDS` and
-`SIBLING_NARROWING` in `recheck.py`, `CHANGES` in `fix_preflight.py`, `GENERATED_FIX_CHECK` in
-`audit_report.py` and `FIX_TYPE` in `automerge_eligibility.py`, until those move into the registry.
+`SIBLING_NARROWING` in `recheck.py`, `CHANGES` in `fix_preflight.py`, `GENERATED_FIX_CHECK` (and
+with it `remediation_target`) in `audit_report.py` and `FIX_TYPE` in `automerge_eligibility.py`, until those move into the registry.
 `make recipe-check` does not stop this: it only warns, only when `RECIPE_CHECK_BASE` is set, and of
 these files only `automerge_eligibility.py` is on its shared-plumbing list. Name each such edit in
 the pull request so a platform owner reviews it.
