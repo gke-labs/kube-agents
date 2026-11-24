@@ -40,6 +40,11 @@ _PROVIDER_OVERRIDE = "providers_lifecycle_override.tf"
 _SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
 # How long a Ctrl-C test waits for the stub apply to start, and then to exit.
 _SIGINT_DEADLINE_SECONDS = 10
+# Linux's per-process signal state: the SigIgn line is a hex mask of ignored
+# signals, bit (signal number - 1) set for each.
+_PROC_STATUS = "/proc/{pid}/status"
+_PROC_SIGIGN_KEY = "SigIgn:"
+_HEX = 16
 _SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
 _OVERRIDE_DATA_RE = re.compile(r'^data "(\w+)" "(\w+)"', re.MULTILINE)
 _OVERRIDE_OUTPUT_RE = re.compile(r'^output "(\w+)"', re.MULTILINE)
@@ -3167,6 +3172,19 @@ def _source(call):
     return f'KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"\n{call}\n'
 
 
+def _ignored_signals(pid):
+    """The signals pid ignores, or None where /proc does not say (macOS)."""
+    try:
+        status = pathlib.Path(_PROC_STATUS.format(pid=pid)).read_text()
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith(_PROC_SIGIGN_KEY):
+            mask = int(line.split()[1], _HEX)
+            return {sig for sig in signal.valid_signals() if mask >> (sig - 1) & 1}
+    return None
+
+
 def _read_until(fd, needle, timeout):
     """Bytes read from fd until needle shows up or timeout passes."""
     buf = b""
@@ -3354,6 +3372,14 @@ class RedactHelmReleaseMetadataTest(unittest.TestCase):
             proc.stdin.write(b"applying\n")
             proc.stdin.flush()
             self.assertIn(b"applying", _read_until(proc.stdout.fileno(), b"applying", 10))
+            # The shell that runs the function must ignore the signals itself,
+            # not only awk: a bash that has forked awk but not yet reached its
+            # wait dies of SIGINT, and whether it has got there by now is timing.
+            # awk has echoed a line, so the function is past the point where it
+            # sets the ignore.
+            ignored = _ignored_signals(proc.pid)
+            if ignored is not None:
+                self.assertLessEqual({signal.SIGINT, signal.SIGTERM}, ignored)
             os.killpg(proc.pid, signal.SIGINT)
             time.sleep(0.5)
             self.assertIsNone(proc.poll(), "the filter died of SIGINT")

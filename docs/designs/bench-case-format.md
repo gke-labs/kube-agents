@@ -289,7 +289,8 @@ starting it; every pause pass applies
 that, and a watch through the fan-out repeats it every few minutes, except while the
 `oobe-first-run-audits` stack has the stage armed. Until then a write from one of them mid-eval
 is still possible. `hack/ci_pause_scheduled_audits.py`'s header has the rule in full. An audit case starts its own run from its
-prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
+prompt, which a paused schedule doesn't affect; a case whose stack fires a scheduled job fires it
+through the pause and pauses it again after the run. A pause that still fails after its attempts
 stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
 charged to the cases.
 
@@ -395,7 +396,10 @@ lead), `report_times_in_window` (every date and time on a report line one of its
 `max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
 the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
+published; its `required_patterns` and `forbidden_patterns` are regular expressions searched over
+the text its phrases read under the same `scope`, without regard to case and with its line breaks
+kept, for a claim no substring binds, such as a check, a cluster and a severity on one findings row;
+`{cluster:<slot>}` is not expanded there and is refused), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
 names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
 repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds, including whether an added PodDisruptionBudget lets the planted workload drain), `github_writes` (every pull request or branch under the agent's
@@ -507,7 +511,7 @@ sandbox, then in the agent container, and passes when a `latest.json` for its `a
 the run started (or, with `since_state_file`, since the `fired_at` a case's stack recorded in that
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
-value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
+value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key; a key the envelope lacks reads `null`, so `precheck: null` holds a run to not having been closed by `precheck`), and, for each
 `required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `shadow_report_stored`, in its own module
 (`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, on the run's shadow
 stream (`stream`, required: the AgentSchedule's name for a scheduled canary, or `<audit>-shadow` for a run
@@ -840,10 +844,15 @@ Without the package the rule does not run, and the target's last line, on stderr
 The same holds when the installed package is another checkout's, or a copy that an install
 made: the line then says that the package is installed, but behind the tree. Only an editable
 install of this checkout counts. The rule knows the check types and the fields of the
-installed package and of the installed devops-bench, so after a pull that changes
-`bench/pyproject.toml`, install again: `make test-bench-deps` brings the package's entry
-points up to date; for a new devops-bench pin use `uv sync` in `bench/` or a new environment,
-because pip can keep the old commit when the version did not change.
+installed package and of the installed devops-bench, and an editable install does not follow a
+pull that changes `bench/pyproject.toml`. The target therefore compares two things with that
+file: the installed entry points of the `devops_bench.verifiers` group, and the commit of the
+installed devops-bench (an install with no recorded git commit differs). When one differs, the
+rule does not run, and the line names each difference. Then install again:
+`make test-bench-deps` brings the package's entry points up to date; for a new devops-bench
+pin, uninstall devops-bench first or use a new environment, because pip can keep the old commit
+when the version did not change. `uv sync` in `bench/` updates `bench/.venv` only, which the
+target reads only when that environment's `python3` runs it.
 The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
 the rule in the job that does, over every case in the tree.
 

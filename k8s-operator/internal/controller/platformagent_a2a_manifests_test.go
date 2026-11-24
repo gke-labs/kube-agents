@@ -1367,7 +1367,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT", "A2A_KUBE_PROXY_MODE"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1388,6 +1388,18 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
 		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
+	}
+	// The mode the gateway passes session pods is the one kube-proxy runs:
+	// their kubectl wrapper treats a failed write as refused only under a
+	// read-only mode.
+	var proxyMode string
+	for _, e := range buildKubeProxyDeployment(agent, "", true, "tls-hash").Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "KUBE_PROXY_MODE" {
+			proxyMode = e.Value
+		}
+	}
+	if proxyMode == "" || on["A2A_KUBE_PROXY_MODE"].Value != proxyMode {
+		t.Errorf("A2A_KUBE_PROXY_MODE = %+v, kube-proxy's KUBE_PROXY_MODE = %q; want them equal", on["A2A_KUBE_PROXY_MODE"], proxyMode)
 	}
 }
 
