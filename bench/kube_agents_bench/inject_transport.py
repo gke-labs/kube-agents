@@ -258,6 +258,18 @@ PROBE_USAGE_PARTIAL_KEY = "usagePartial"
 # say", never as "delegated nothing" (``delegated_to`` errors on it).
 PROBE_CHILD_ADDRESSEES_KEY = "childAddressees"
 USAGE_READ_ATTEMPTS = 2
+# How the usage read went, on ``Fold.usage_read``, so a result with null
+# buckets can say why (``tokens_note`` on the harness's result): no read was made (the
+# exchange had no terminal from an executor); the read was skipped, the deadline
+# having passed; the read raised; the door's answer did not cover the task;
+# the door answered. ``USAGE_READ_CANCEL_UNCONFIRMED`` is the harness's: a
+# graded timeout whose cancel settle reached no terminal, so no read followed.
+USAGE_READ_NOT_MADE = "not-made"
+USAGE_READ_SKIPPED = "skipped"
+USAGE_READ_FAILED = "failed"
+USAGE_READ_UNANSWERED = "unanswered"
+USAGE_READ_ANSWERED = "answered"
+USAGE_READ_CANCEL_UNCONFIRMED = "cancel-unconfirmed"
 USAGE_INPUT_KEY = "inputTokens"
 USAGE_OUTPUT_KEY = "outputTokens"
 # The keys of one activity part, as the executors publish them, and the two
@@ -834,6 +846,8 @@ class Fold:
     usage: dict[str, int | None] | None = None
     child_usage: dict[str, int | None] | None = None
     usage_partial: bool = False
+    # How that read went (:data:`USAGE_READ_NOT_MADE` and its siblings).
+    usage_read: str = USAGE_READ_NOT_MADE
     # Whom the chain delegated to (:data:`PROBE_CHILD_ADDRESSEES_KEY`), from
     # the latest read about this task that carried it, the polls' included
     # (:meth:`InjectTask._note`) and the read after the terminal last;
@@ -1935,7 +1949,9 @@ class InjectTask:
         replaces it. Made only inside the wait's deadline and bounded by what
         is left of it, so a run already past its budget, or a cancel past its
         settle bound, spends no time on it. Best effort: a read that fails, or
-        a door that sends no usage, leaves the counts as they stand.
+        a door that sends no usage, leaves the counts as they stand. How the
+        read went is kept on ``fold.usage_read``; once the door has answered,
+        a later attempt that is skipped or fails does not replace that.
         """
         seqs = [e.get("seq") for e in fold.entries]
         after = max((seq for seq in seqs if isinstance(seq, int)), default=0)
@@ -1956,15 +1972,19 @@ class InjectTask:
         for _ in range(USAGE_READ_ATTEMPTS):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._note_usage_read(fold, USAGE_READ_SKIPPED)
                 return
             timeout = min(remaining, POLL_TIMEOUT_MARGIN_SECONDS + PROBES_PER_POLL * PROBE_BOUND_SECONDS)
             try:
                 answered = Probe.from_body(_request(url, timeout, self.token))
             except InjectUnavailable as exc:
                 _log.info("inject: could not read the usage of %s after its terminal: %s", task_id, exc)
+                self._note_usage_read(fold, USAGE_READ_FAILED)
                 return
             if answered is None or not answered.could_look or answered.task_id != task_id:
+                self._note_usage_read(fold, USAGE_READ_UNANSWERED)
                 return
+            fold.usage_read = USAGE_READ_ANSWERED
             if answered.child_addressees is not None:
                 fold.child_addressees = answered.child_addressees
             if answered.usage is None and answered.child_usage is None and not answered.usage_partial:
@@ -1975,6 +1995,12 @@ class InjectTask:
             if not answered.usage_partial:
                 return
             _log.info("inject: the usage of %s is partial; reading it once more", task_id)
+
+    @staticmethod
+    def _note_usage_read(fold: Fold, how: str) -> None:
+        """Record how the usage read went, unless the door has answered one."""
+        if fold.usage_read != USAGE_READ_ANSWERED:
+            fold.usage_read = how
 
     def _never_started(self, fold: Fold, task_id: str, probe: Probe) -> Exchange:
         """The read showed nothing on the stream past the grace: nobody took it."""

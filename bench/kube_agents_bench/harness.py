@@ -443,18 +443,42 @@ _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
 # the top-level ``total`` too (:func:`_fold_worker_total`), so ``total`` is
 # everything the run billed, as on the api transport, while ``input`` and
 # ``output`` stay the front door's own and ``front_door`` keeps its buckets.
-# A run whose chain reported no usage keeps a null total whatever its
+# A run that holds no usage for the chain keeps a null total whatever its
 # workers billed, so the scorer's liveness rung still reads the task's
 # terminal there rather than passing on the workers' spend alone.
+# The buckets are also null when the harness holds no usage because the read
+# was not made, was skipped, or failed; the cause clause of that exchange's note
+# (``_INJECT_TOKENS_CAUSE_NOTES``) says which.
 _INJECT_TOKENS_NOTE = (
     "the inject transport's input and output buckets are the front door's turns as the "
     "gateway reported them: input counts cached reads too, and cached and reasoning are "
-    "null since Hermes reports no split; they are null when the gateway reported no usage; "
+    "null since Hermes reports no split; they are null when the harness holds no usage "
+    "for the front door; "
     "tokens.children holds the chain's child tasks (the platform router), and "
     "tokens.workers the delegated workers' counts when the delegation wait read them; "
     "total adds both to the front door's, as on the api transport, and stays null when "
-    "the chain reported no usage"
+    "the harness holds no usage for the chain"
 )
+# Appended to the note when the exchange holds no usage for the front door:
+# why, by how the usage read went (``Fold.usage_read``).
+_INJECT_TOKENS_CAUSE_PREFIX = "; no front door usage on this exchange: "
+_INJECT_TOKENS_CAUSE_NOTES = {
+    inject.USAGE_READ_NOT_MADE: (
+        "the exchange had no terminal from an executor, so the harness made no usage read"
+    ),
+    inject.USAGE_READ_SKIPPED: (
+        "the harness skipped the usage read, since the deadline of the wait, or of the "
+        "cancel's settle, had passed"
+    ),
+    inject.USAGE_READ_FAILED: "the usage read failed",
+    inject.USAGE_READ_UNANSWERED: "the gateway's answer to the usage read did not cover the task",
+    inject.USAGE_READ_ANSWERED: (
+        "the gateway answered the usage read with no count for the front door"
+    ),
+    inject.USAGE_READ_CANCEL_UNCONFIRMED: (
+        "no terminal confirmed the cancel after the timeout, so no usage read followed it"
+    ),
+}
 # Appended to the note when the gateway could not read a link of the chain.
 _INJECT_TOKENS_PARTIAL_NOTE = (
     "; partial: the gateway could not read every link of the chain, so the counts are "
@@ -2407,7 +2431,7 @@ def _fold_worker_total(tokens: dict[str, Any]) -> None:
     door's own buckets are copied under ``front_door`` first (its ``total``
     the front door's alone, without the chain's children). The other
     top-level buckets stay the front door's (:func:`_inject_tokens`). A run
-    whose chain reported no usage keeps its null ``total``: folding the
+    that holds no usage for the chain keeps its null ``total``: folding the
     workers in would let the scorer's liveness rung pass on the workers'
     spend alone, where it reads the task's terminal today.
     """
@@ -3059,6 +3083,14 @@ def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bo
             exchange.fold.usage = settled.fold.usage
             exchange.fold.child_usage = settled.fold.child_usage
             exchange.fold.usage_partial = settled.fold.usage_partial
+        if timed_out:
+            # Why the buckets are null, when they are: the settle's read if
+            # it made one, and otherwise the cancel no terminal confirmed.
+            exchange.fold.usage_read = (
+                settled.fold.usage_read
+                if settled is not None and settled.fold.usage_read != inject.USAGE_READ_NOT_MADE
+                else inject.USAGE_READ_CANCEL_UNCONFIRMED
+            )
         if timed_out and settled is not None and settled.fold.child_addressees is not None:
             exchange.fold.child_addressees = settled.fold.child_addressees
     return timed_out, stop_pending
@@ -3321,8 +3353,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     ``tool_called`` checks with no ``result`` pattern aside then, or when
     the marker reports a loss).
     Tokens are the front door's usage as the probe reported it, null when
-    it reported none (:func:`_inject_tokens`), and ``metadata`` says which
-    buckets mean what. ``identity`` is the run, case
+    the harness holds none (:func:`_inject_tokens`), and ``metadata`` says which
+    buckets mean what and why they are null (:func:`_inject_tokens_note`).
+    ``identity`` is the run, case
     and repetition the key and message id were built from,
     stored beside the task id so the record joins to the gateway's ingress
     log.
@@ -3360,10 +3393,19 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             # the ``a2a.activity`` entry in the trajectory.
             "activity": fold.activity_summary,
             "progress": fold.progress or None,
-            "tokens_note": _INJECT_TOKENS_NOTE
-            + (_INJECT_TOKENS_PARTIAL_NOTE if fold.usage_partial else ""),
+            "tokens_note": _inject_tokens_note(fold),
         },
     )
+
+
+def _inject_tokens_note(fold: inject.Fold) -> str:
+    """What the record's buckets mean, and why the front door's are null when they are."""
+    note = _INJECT_TOKENS_NOTE
+    if _usage_buckets(fold.usage) is None:
+        note += _INJECT_TOKENS_CAUSE_PREFIX + _INJECT_TOKENS_CAUSE_NOTES[fold.usage_read]
+    if fold.usage_partial:
+        note += _INJECT_TOKENS_PARTIAL_NOTE
+    return note
 
 
 def _execute_slack(prompt: str) -> AgentResult:
