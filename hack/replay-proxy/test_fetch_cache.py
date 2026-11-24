@@ -276,6 +276,42 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(result.removed, {"messages": 1})
         self.assertEqual(self.weights(fp(1)), {fp(7): 4, fp(8): 1})
 
+    def test_a_weights_file_the_real_alternates_leave_no_room_for_is_left_out_at_download(self):
+        # fp(7) is planned at no size (its confirming record aged out); its
+        # real copy leaves one byte less than the weights file the plan charged.
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, content="x" * (2 * FC.DISK_BLOCK_BYTES))
+        self.objects(VERSION, b)
+        self.record("100", 1, {VERSION: [a]}, created=NOW - 40 * HOUR, produced={VERSION: {fp(1): [fp(7)]}})
+        self.record("100", 2, {VERSION: []}, created=NOW - 10 * HOUR, counts={VERSION: {fp(1): {fp(7): 4}}})
+        self.record("101", 1, {VERSION: [b]}, produced={VERSION: {fp(1): [fp(8)]}})
+        alts = FC.disk_cost(self.sizes[a]) + FC.disk_cost(self.sizes[b]) + FC.DISK_BLOCK_BYTES
+        max_bytes = alts + FC.weights_cost({fp(7): 4, fp(8): 1}) - 1
+        result = self.fetcher(max_bytes=max_bytes).fetch(self.dest)
+        self.assertEqual((result.by_kind, result.left_out), ({"alts": 2}, {"weights": 1}))
+        self.assertFalse(os.path.exists(os.path.join(self.dest, "weights")))
+        self.assertLessEqual(alts, max_bytes)
+
+    def test_a_weights_file_the_plan_had_no_room_for_is_written_when_the_alternates_arrive_smaller(self):
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        recorded = 3 * FC.DISK_BLOCK_BYTES
+        self.record("101", 1, {VERSION: [(a, recorded, ""), (b, recorded, "")]},
+                    produced={VERSION: {fp(1): [fp(7), fp(8)]}}, counts={VERSION: {fp(1): {fp(7): 3, fp(8): 1}}})
+        planned = 2 * FC.disk_cost(recorded) + FC.DISK_BLOCK_BYTES
+        result = self.fetcher(max_bytes=planned).fetch(self.dest)
+        self.assertEqual((result.by_kind, result.left_out), ({"alts": 2, "weights": 1}, {}))
+        self.assertEqual(self.weights(fp(1)), {fp(7): 3, fp(8): 1})
+
+    def test_a_key_whose_second_alternate_did_not_arrive_counts_no_weights_left_out(self):
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a)  # b has expired since its record
+        self.record("101", 1, {VERSION: [(a, self.sizes[a], ""), (b, self.sizes[a], "")]},
+                    produced={VERSION: {fp(1): [fp(7), fp(8)]}})
+        planned = 2 * FC.disk_cost(self.sizes[a]) + FC.DISK_BLOCK_BYTES
+        result = self.fetcher(max_bytes=planned).fetch(self.dest)
+        self.assertEqual((result.by_kind, result.left_out), ({"alts": 1}, {}))
+
     def test_produced_counts_outside_their_shape_refuse_the_whole_download(self):
         message = f"messages/{'b' * 16}.json"
         for counts in ([1], {VERSION: [1]}, {VERSION: {"../x": {fp(7): 1}}}, {VERSION: {fp(1): [fp(7)]}},
