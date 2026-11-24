@@ -281,6 +281,7 @@ The manifest cannot move the leader-election Leases: it writes them to `kube-sys
 ## Chat platform
 
 - **Google Chat** (opt-in, but the interactive installer pre-selects it): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. The composition's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) creates the topic and subscription (`enable_google_chat = true`, or the installer's `--enable-google-chat`); you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
+- **Microsoft Teams** (opt-in): a Microsoft Entra tenant where you can register an app and a bot, and a public HTTPS address you can route to the install. [Microsoft Teams app setup](/kube-agents/install/teams-app/) covers both. The interactive installer does not ask about Teams; you turn it on after the install.
 - **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Many workspaces need an admin to approve a new app, so arrange that first. [Slack app setup](/kube-agents/install/slack-app/) covers the app. Slack is configured only if you enable it in the installer's chat menu or with `--enable-slack` (or set `enable_slack = true` in `terraform.tfvars`).
 
 **A GCP project holds one Chat app.** Google's rule is that "each Google Chat app that you create
