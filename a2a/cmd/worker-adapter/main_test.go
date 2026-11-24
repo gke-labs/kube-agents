@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
@@ -699,8 +700,8 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 	}
 }
 
-// harnessConfigDir is where the session check and the settings lookup both
-// look: $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
+// For the default harness, Claude Code, harnessConfigDir is
+// $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
 func TestHarnessConfigDir(t *testing.T) {
 	t.Setenv(claudeConfigDirEnv, "/cfg")
 	t.Setenv("HOME", "/home/u")
@@ -714,6 +715,49 @@ func TestHarnessConfigDir(t *testing.T) {
 	t.Setenv("HOME", "")
 	if got := harnessConfigDir(); got != "" {
 		t.Errorf("with neither: %q", got)
+	}
+}
+
+// On an Antigravity worker the session check reads agy's rendered persona,
+// never Claude Code's config directory, whatever the Claude variables say,
+// and it checks only the names an agy persona holds.
+func TestAnAgyWorkerChecksItsOwnPersonaTree(t *testing.T) {
+	prev := activeHarness
+	t.Cleanup(func() { activeHarness = prev })
+	activeHarness = agyBuilder{}
+	t.Setenv(claudeConfigDirEnv, "/cfg")
+	t.Setenv("HOME", "/home/u")
+	if got := harnessConfigDir(); got != agyPersonaDir {
+		t.Errorf("harnessConfigDir() = %q, want %q", got, agyPersonaDir)
+	}
+	for rel, want := range map[string]bool{
+		"GEMINI.md": true, "AGENTS.md": true, "skills/triage/SKILL.md": true,
+		"CLAUDE.md": false, "hooks.json": false, "mcp_config.json": false,
+	} {
+		if got := activeHarness.personaCovers(rel); got != want {
+			t.Errorf("personaCovers(%q) = %v, want %v", rel, got, want)
+		}
+	}
+}
+
+// The session check takes its scope from the active harness: an agy persona
+// with a manifest over GEMINI.md passes, where Claude Code's scope would
+// refuse GEMINI.md as outside the files it covers.
+func TestTheSessionCheckUsesTheActiveHarnessScope(t *testing.T) {
+	files := map[string][]byte{"GEMINI.md": []byte("persona\n")}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "GEMINI.md"), files["GEMINI.md"], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, persona.IntegrityManifestFile), persona.FormatIntegrityManifest(files), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := checkSessionPersona(agyBuilder{}, dir, log); err != nil {
+		t.Errorf("agy's scope: %v", err)
+	}
+	if err := checkSessionPersona(claudeBuilder{}, dir, log); err == nil {
+		t.Error("Claude Code's scope passed a manifest naming GEMINI.md")
 	}
 }
 

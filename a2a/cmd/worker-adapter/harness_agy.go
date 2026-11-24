@@ -1,6 +1,8 @@
 package main
 
 import (
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -41,6 +43,21 @@ const (
 )
 
 func (agyBuilder) defaultPath() string { return "" }
+
+// agyPersonaDir is where an Antigravity worker's rendered persona is to live
+// (#6710, #6713), in a directory of its own that agy reads through links in
+// its read-only home; agyPersonaNames are the names it may hold. Nothing
+// writes it yet, so the session check finds it missing and logs the persona
+// as unverified.
+const agyPersonaDir = "/var/lib/agy-persona"
+
+var agyPersonaNames = []string{"GEMINI.md", "AGENTS.md", "skills"}
+
+func (agyBuilder) configDir(func(string) string) string { return agyPersonaDir }
+
+func (agyBuilder) personaCovers(rel string) bool {
+	return slices.Contains(agyPersonaNames, rel) || strings.HasPrefix(rel, "skills/")
+}
 
 // command: `-p=` because agy's print switch takes a value, and the message
 // comes on stdin as stream-json.
