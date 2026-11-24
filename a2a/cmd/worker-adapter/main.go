@@ -334,7 +334,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 
 	harness, driver, builder, err := selectHarness(os.Getenv)
 	if err != nil {
-		log.Error("the worker's harness is not one it can run; set "+lib.EnvHarness+" to "+string(persona.ClaudeCode)+" or leave it unset",
+		log.Error("the worker's harness is not one it can run",
 			lib.EnvHarness, os.Getenv(lib.EnvHarness), lib.EnvProfileHarness, os.Getenv(lib.EnvProfileHarness), "err", err)
 		return workeradapter.Config{}, false
 	}
@@ -467,6 +467,7 @@ func harnessCommand() []string {
 		disallowed: disallowed,
 		prompts:    prompts,
 		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		turnBudget: harnessTurnBudget(),
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
@@ -501,11 +502,22 @@ func profileHarnessCommand() []string {
 		maxTurns = defaultMaxTurns
 	}
 	return activeHarness.command(harnessSpec{
-		path:     path,
-		model:    model,
-		maxTurns: maxTurns,
-		extra:    strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		path:       path,
+		model:      model,
+		maxTurns:   maxTurns,
+		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		turnBudget: harnessTurnBudget(),
 	})
+}
+
+// harnessTurnBudget is harnessSpec.turnBudget from the same variables
+// Config.TaskDeadline and Config.KillGrace read. A profile worker's task
+// deadline comes from its offer and can be shorter; the adapter's own
+// deadline still bounds that task, and only the harness's clean ending is
+// lost.
+func harnessTurnBudget() time.Duration {
+	return envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds) -
+		envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds)
 }
 
 // delegateToolEnabled is the delegate tool's single switch: everything that
@@ -700,9 +712,28 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	if err != nil {
 		return "", nil, nil, err
 	}
+	// Antigravity runs without the per-task HOME locking and workspace scrub
+	// it needs (#6710), so only a pod that says it accepts that may select
+	// it: a test, or a deliberate dev run. Nothing in the operator or chart
+	// sets it to allow. Where the operator renders A2A_HARNESS, it renders
+	// this one empty beside it, so the worker image's own ENV can't set it
+	// there: on a profile worker whose profile names spec.harness.type
+	// (#6832), and later on session pods (#6716). Elsewhere only the pod
+	// spec or the image's ENV can set it; a profile with no type gets
+	// neither variable, by design, since its image is already trusted code.
+	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
+		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
+			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
+	}
 	builder, err := builderFor(driver.Harness())
 	if err != nil {
 		return "", nil, nil, err
+	}
+	// A harness with no default path in the image needs one named, unless a
+	// test replaces the whole argv. Refused here, at startup, rather than at
+	// the first task's exec.
+	if builder.defaultPath() == "" && getenv("A2A_HARNESS_PATH") == "" && getenv("A2A_HARNESS_CMD") == "" {
+		return "", nil, nil, fmt.Errorf("harness %q has no default path in this image; set A2A_HARNESS_PATH", driver.Harness())
 	}
 	return driver.Harness(), driver, builder, nil
 }
@@ -714,6 +745,8 @@ func builderFor(h persona.Harness) (harnessBuilder, error) {
 	switch h {
 	case persona.ClaudeCode:
 		return claudeBuilder{}, nil
+	case persona.Antigravity:
+		return agyBuilder{}, nil
 	}
 	return nil, fmt.Errorf("harness %q has no argv builder", h)
 }
