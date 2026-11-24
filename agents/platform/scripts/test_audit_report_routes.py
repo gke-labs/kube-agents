@@ -487,12 +487,22 @@ class RefusalTest(RoutesTestCase):
         self.assertEqual(len(body), len(self.store.seen[0]["body"]))
 
     def test_a_chunked_or_unframed_body(self):
-        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
-        self.addCleanup(connection.close)
-        connection.request("PUT", f"{STREAM}/latest", body=iter([BODY]), encode_chunked=True,
-                           headers={credential_proxy.TASK_CREDENTIAL_HEADER: REPORT["token"]})
-        response = connection.getresponse()
-        self.assertEqual(411, response.status)
+        # Announced and not sent: the broker answers before reading a byte.
+        for case, extra_header, want_close in (
+            ("chunked", "Transfer-Encoding: chunked\r\n", True),
+            ("unframed", "", False),
+        ):
+            with self.subTest(case=case), socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as conn:
+                conn.sendall(
+                    f"PUT {STREAM}/latest HTTP/1.1\r\nHost: x\r\n"
+                    f"{credential_proxy.TASK_CREDENTIAL_HEADER}: {REPORT['token']}\r\n"
+                    f"{extra_header}\r\n".encode()
+                )
+                response = http.client.HTTPResponse(conn)
+                response.begin()
+                self.assertEqual(411, response.status)
+                if want_close:
+                    self.assertEqual("close", response.getheader("Connection"))
         self.assertEqual([], self.store.seen)
 
     def test_the_store_not_configured(self):
