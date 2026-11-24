@@ -655,7 +655,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Seven workflows hold it, and none can give an approval:
+        Eight workflows hold it, and none can give an approval:
 
         - auto-enqueue: `schedule`, `workflow_dispatch` and
           `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
@@ -685,6 +685,15 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           write is one comment on a pull request whose smoke run went red,
           edited in place on later runs. It explains a red; it cannot approve,
           label, or merge anything.
+        - merge-gate: its `dropped-push` job alone, on `pull_request_target:
+          closed` for a merged pull request; `permissions: {}` at the top,
+          job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch with `persist-credentials: false`,
+          the pull request number passed through the environment. Its one
+          write is a comment on a pull request that is already merged, which
+          names the commits the merge queue did not merge. It reports a
+          merge; it cannot approve, label, or merge anything. The two gate
+          jobs hold `pull-requests: read`.
         - retest-actions: `issue_comment` on a `/retest` that opens the
           comment, from an owner, member or collaborator; `permissions: {}`
           at the top, the grant job-scoped, checkout of the default branch
@@ -697,7 +706,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so an
-        eighth holder is a red test and a conversation rather than a silent
+        ninth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -720,6 +729,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                 "ci-health.yml",
                 "coverage-comment.yml",
                 "hold-unresolved-threads.yml",
+                "merge-gate.yml",
                 "retest-actions.yml",
                 "risk_classify.yml",
             ],

@@ -22,12 +22,25 @@ name: Merge Gate
 # request head, where a cancelled or failed run held the merge, so the job
 # has no concurrency group (a superseded pending run is cancelled) and on
 # that trigger no step can fail it.
+#
+# The `dropped-push` job is not a gate. After a merge, it tells the author
+# when the queue merged less than the pull request's last head.
 on:
-  # zizmor: ignore[dangerous-triggers] - the job checks out the default
-  # branch only (the script) and reads pull-request state through the API;
-  # no pull-request content reaches the write token's context.
+  # zizmor: ignore[dangerous-triggers] - each job checks out the default
+  # branch only (the script) and reads pull-request state through the API.
+  # The `dropped-push` job also has git fetch the merged pull request's
+  # commits, into an empty repository of its own, to merge their trees; it
+  # checks out and runs nothing from them.
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - labeled
+      - unlabeled
+      # For the `dropped-push` job alone.
+      - closed
     # `merge-queue-dry-run` is the scratch copy of `main` that the dry run
     # puts a queue on (`DRY_RUN_BASE` in the script). Its own copy of this
     # file widens the `merge_group` filter below; this one is read from
@@ -43,12 +56,13 @@ jobs:
   pull-request:
     name: Post the merge gate statuses on the pull request head
     # The repository guard, by the convention for workflows that write. The
-    # rest keeps events that cannot change a verdict off a runner: other
-    # labels, the statuses of every other context, which is most of the
-    # `status` events this repository sees.
+    # rest keeps events that cannot change a verdict off a runner: a closed
+    # pull request, other labels, the statuses of every other context, which
+    # is most of the `status` events this repository sees.
     if: >-
       github.repository == 'gke-labs/kube-agents' &&
       ((github.event_name == 'pull_request_target' &&
+        github.event.action != 'closed' &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
           github.event.label.name == 'lgtm' ||
           github.event.label.name == 'approved' ||
@@ -131,3 +145,42 @@ jobs:
           REF: ${{ github.event.merge_group.head_ref }}
           GATE: ${{ matrix.gate }}
         run: python3 scripts/merge_gate.py group --ref "$REF" --gate "$GATE"
+
+  dropped-push:
+    name: Tell the author when the queue merged less than the last head
+    # The queue merges the commit it built when the pull request entered it.
+    # A later push does not take the pull request out and does not merge, and
+    # GitHub still shows the pushed commit as the merged head. After a merge,
+    # `scripts/merge_queue_dropped_push.py` repeats the queue's merge with the
+    # final head; when the result differs from what merged, it posts one
+    # comment that names the missing commits. The script's docstring is the
+    # reference.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      github.event_name == 'pull_request_target' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the default branch: the script
+      pull-requests: write # read the merged pull request; post the one comment
+    steps:
+      # The default branch, never the pull request head: this job holds a
+      # writable token and must not run code from a fork. The script fetches
+      # the merged commit and the head into an empty repository, with no
+      # credential, to merge their trees; it checks out and runs neither.
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # The number goes in through the environment, never into the script
+      # text. A failure goes red: the pull request is merged, so the red holds
+      # nothing, and it is the only sign that a notice may be missing.
+      - name: Compare the merged commit with the final head
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 scripts/merge_queue_dropped_push.py --number "$NUMBER"

@@ -672,6 +672,15 @@ check, or a reason the comment does not name, a write user can re-add it with th
 comment if the push does not work. To keep a pull request out past its next push, add a hold
 (`/hold`).
 
+**Do not push to a pull request that is in the queue.** The queue merges the commit it built when
+the pull request entered it. A later push does not remove the pull request from the queue, and the
+pushed commits do not reach `main`, although GitHub shows the pushed commit as the merged head.
+After each merge, the `dropped-push` job in [`merge-gate.yml`](../.github/workflows/merge-gate.yml)
+runs `scripts/merge_queue_dropped_push.py`, which repeats the queue's merge with the final head.
+When the result differs from what merged, it posts one comment that names the missing commits; open
+a new pull request for them. A late push that only merges `main` into the branch loses nothing and
+gets no comment.
+
 The two labels are the two people:
 
 - **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment
