@@ -1,5 +1,7 @@
 package main
 
+import "github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
+
 // coreAgentBuilder starts core-agent-harness (a2a/cmd/core-agent-harness),
 // one process per turn. The turn's tool policy and MCP servers reach it in
 // the stdin envelope (workeradapter's coreAgentDriver), never in its argv or
@@ -30,3 +32,10 @@ func (coreAgentBuilder) env(env []string, _ func(string) bool) []string { return
 
 // userSettings: none; the harness reads no settings file.
 func (coreAgentBuilder) userSettings(func(string) string) string { return "" }
+
+// configDir is the rendered persona the harness reads, which the session
+// check verifies against its manifest; personaCovers is what a rendering
+// holds there (coreagent.Names).
+func (coreAgentBuilder) configDir(func(string) string) string { return coreAgentPersonaDir }
+
+func (coreAgentBuilder) personaCovers(rel string) bool { return coreagent.Covers(rel) }
