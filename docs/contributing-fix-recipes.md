@@ -115,8 +115,12 @@ auto-merge, and parts of it are not run, because these places still name `no-pdb
   `SIBLING_NARROWING` names each of its `recheck_siblings`. Add those entries in the same pull
   request as a recipe that sets `recheck_kinds`, or the pre-flight stops importing.
 
-Of these files only `automerge_eligibility.py` is on `make recipe-check`'s shared-plumbing list,
-so editing the others raises no warning; say so in the pull request.
+So a new kind that should reach auto-merge still edits, today, `CHECK_NEEDS` and
+`SIBLING_NARROWING` in `recheck.py`, `CHANGES` in `fix_preflight.py`, `GENERATED_FIX_CHECK` in
+`audit_report.py` and `FIX_TYPE` in `automerge_eligibility.py`, until those move into the registry.
+`make recipe-check` does not stop this: it only warns, only when `RECIPE_CHECK_BASE` is set, and of
+these files only `automerge_eligibility.py` is on its shared-plumbing list. Name each such edit in
+the pull request so a platform owner reviews it.
 
 The broker verifies only a fix that adds a file. A recipe that changes a field in an existing
 manifest needs the `edit-manifest` verb. Its editor
