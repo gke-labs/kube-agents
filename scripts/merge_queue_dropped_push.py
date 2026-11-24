@@ -22,8 +22,8 @@ that was merged.
   - Different tree: the queue merged an earlier head. The comment goes out. To
     name the missing commits, the same merge is tried on the head's ancestors,
     newest first; the first one that gives the merged tree is the head the
-    queue built from, and the commits after it, merges left out, are the
-    missing ones. When no ancestor gives it (the head was force-pushed after
+    queue built from, and the commits after it, plain merges left out, are
+    the missing ones. When no ancestor gives it (the head was force-pushed after
     the entry was made), the comment goes out without a list.
   - No answer: the final head conflicts with the merged commit's parent, or the
     merged commit is not a squash (one parent). Nothing is posted and the log
@@ -82,10 +82,14 @@ MERGE_CONFLICT = 1
 OBJECT_ABSENT = (1, 128)
 #: A squash commit has one parent.
 SQUASH_PARENTS = 1
+#: A merge of one branch into another has two.
+MERGE_PARENTS = 2
+#: What the comment shows for a commit with no subject: an empty code span does not render.
+NO_SUBJECT = "(no subject)"
 #: Keeps git from waiting on a prompt for credentials the fetch does not need.
 GIT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
-#: `git log` fields of one missing commit, split on the tab.
-COMMIT_FORMAT = "--format=%H%x09%s"
+#: `git log` fields of one missing commit: its id and its parents' ids, a tab, the subject.
+COMMIT_FORMAT = "--format=%H %P%x09%s"
 FIELD_SEPARATOR = "\t"
 
 COMPLETE = "complete"
@@ -164,14 +168,20 @@ def built_from(git, parent, head, tree):
 def missing_commits(git, built, head, merge_commit):
     """`(sha, subject)` of the commits on `head` that are neither on `built` nor on the base, oldest first.
 
-    Merge commits are left out: a merge of the base adds nothing of the author's, and the
-    commits it brings in are on the base already.
+    A merge commit is left out when it is the plain merge of its two parents: a merge of the
+    base adds nothing of the author's, and the commits it brings in are on the base already.
+    A merge that holds more than that, such as a conflict the author resolved, is listed.
     """
-    out = git.output(
-        "log", "--topo-order", "--reverse", "--no-merges", COMMIT_FORMAT, head, f"^{built}", f"^{merge_commit}"
-    )
-    # An empty subject leaves a line that ends at the separator, or at the commit id on the last line.
-    return [(sha, subject) for sha, _, subject in (line.partition(FIELD_SEPARATOR) for line in out.splitlines()) if sha]
+    out = git.output("log", "--topo-order", "--reverse", COMMIT_FORMAT, head, f"^{built}", f"^{merge_commit}")
+    commits = []
+    for line in out.splitlines():
+        # An empty subject leaves a line that ends at the separator, or before it on the last line.
+        ids, _, subject = line.partition(FIELD_SEPARATOR)
+        sha, *parents = ids.split()
+        if len(parents) == MERGE_PARENTS and merged_tree(git, *parents) == git.output("rev-parse", f"{sha}^{{tree}}"):
+            continue
+        commits.append((sha, subject))
+    return commits
 
 
 def decide(git, merge_commit, head):
@@ -203,7 +213,7 @@ def _result(verdict, why, built=None, commits=()):
 
 
 def _subject(text):
-    return text.replace(CODE_SPAN_DELIMITER, CODE_SPAN_REPLACEMENT)[:SUBJECT_MAX]
+    return text.replace(CODE_SPAN_DELIMITER, CODE_SPAN_REPLACEMENT)[:SUBJECT_MAX] or NO_SUBJECT
 
 
 def comment_body(base, merge_commit, head, built=None, commits=()):

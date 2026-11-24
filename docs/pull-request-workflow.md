@@ -674,8 +674,8 @@ comment if the push does not work. To keep a pull request out past its next push
 
 **Do not push to a pull request that is in the queue.** The queue merges the commit it built when
 the pull request entered it. GitHub does not remove the pull request from the queue on a later
-push, and the sweep removes it only when the push costs it a label and the sweep runs before the
-merge. Otherwise the pushed commits do not reach `main`, although GitHub shows the pushed commit as
+push, and the sweep removes it only when the push costs it a label or gains it a hold, and the
+sweep runs before the merge. Otherwise the pushed commits do not reach `main`, although GitHub shows the pushed commit as
 the merged head. After each merge, the `dropped-push` job in
 [`merge-gate.yml`](../.github/workflows/merge-gate.yml) runs `scripts/merge_queue_dropped_push.py`,
 which repeats the queue's merge with the final head. When the result differs from what merged, it

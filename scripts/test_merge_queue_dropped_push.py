@@ -160,7 +160,21 @@ class DecideTest(unittest.TestCase):
         head = self.repo.git.output("rev-parse", "HEAD")
         result = self.decide(merged, head)
         self.assertEqual(result["commits"], [(head, "")])
-        self.assertIn(f"- {head[:12]} ``", dropped.comment_body("main", merged, head, result["built"], result["commits"]))
+        body = dropped.comment_body("main", merged, head, result["built"], result["commits"])
+        self.assertIn(f"- {head[:12]} `(no subject)`", body)
+
+    def test_a_late_merge_of_the_base_that_also_holds_a_change_is_named(self):
+        main = self.repo.move_main()
+        merged = self.repo.squash(self.first)
+        late = self.repo.commit({"late.txt": "late\n"}, "fix: a late change")
+        self.repo.merge_main(main)
+        (self.repo.directory / "resolved.txt").write_text("resolved\n")
+        self.repo.git.run("add", "--all")
+        self.repo.git.run("commit", "--quiet", "--amend", "--no-edit")
+        head = self.repo.git.output("rev-parse", "HEAD")
+        result = self.decide(merged, head)
+        self.assertEqual(result["built"], self.first)
+        self.assertEqual(result["commits"], [(late, "fix: a late change"), (head, "Merge branch 'main' into pr")])
 
     def test_a_late_commit_that_changes_nothing_in_the_end_is_complete(self):
         merged = self.repo.squash(self.first)
