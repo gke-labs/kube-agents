@@ -1352,10 +1352,9 @@ func (g *Gateway) observeChainEnd(rec *SessionRecord, child TaskRef, stopped boo
 		}
 	}
 	g.observeTaskTerminal(rec, child.rootID(), end.State, end.Source, end.Reason)
-	// The root's own line said how its turn ended (completed, on the hand-off
-	// line); this one says the chain it started failed, as the observers
-	// were just told, so the log and the read route agree. A stopped chain
-	// logs no second line here.
+	// The root's own line says how its turn ended; this one says the chain
+	// it started failed, as the observers were just told, so the log and
+	// the read route agree. A stopped chain logs no chain-end line.
 	if !stopped {
 		g.logTaskTerminal(rec, rec.AddresseeFor(child.rootID()), child.rootID(), end.State, terminalLogChainEnd, end.Reason)
 	}
