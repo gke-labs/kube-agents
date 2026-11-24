@@ -237,6 +237,10 @@ def test_the_write_paths_are_forbidden():
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py push',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr create --title t --body-file /tmp/b.md',
         "python3 /opt/data/profiles/platform/skills/version-control/scripts/vcs.py proposal open --title t",
+        # argparse takes `--title` as `--title=t` and by any unambiguous prefix (`--ti` and up).
+        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py mr create --repo acme/infra --title=t',
+        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py proposal open --ti t',
+        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr open --titl=t --draft',
         "python3 audit_report.py remediate --finding f-1",
     ):
         assert _command_forbidden(command), command
@@ -248,6 +252,9 @@ def test_the_read_paths_are_not_forbidden():
         "--repo acme/infra --branch platform-agent/x",
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py clone https://github.com/acme/infra',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py proposal list --repo acme/infra --limit 1',
+        # The recorded spelling: `open` is the value of `--state`, not the `create` alias.
+        "python3 $HERMES_HOME/skills/version-control/scripts/vcs.py proposal list --repo acme/infra --state open",
+        'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py pr list --state open --target main',
         'python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py discard --repo acme/infra --branch platform-agent/x',
         "python3 inspect_repository.py clone --repo acme/charts --ref v1 --into /tmp/c",
     ):
