@@ -9,6 +9,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // TestAnUnknownSessionHarnessKeepsTheGatewayServing: A2A_SESSION_HARNESS
@@ -71,7 +73,7 @@ func TestASessionPodCarriesTheHarnessOnlyWhenNamedAndTheWaiverEmptyAlways(t *tes
 		for _, e := range pod.Spec.Containers[0].Env {
 			env[e.Name] = e
 		}
-		h, hasHarness := env[envHarness]
+		h, hasHarness := env[lib.EnvHarness]
 		want := ""
 		if c.set {
 			want = c.harness

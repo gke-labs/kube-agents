@@ -589,7 +589,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		c := &pod.Spec.Containers[0]
 		// Checked again here for a Config built without FromEnv.
 		if h := s.cfg.SessionHarness; h != "" && sessionHarnesses[h] {
-			c.Env = append(c.Env, corev1.EnvVar{Name: envHarness, Value: h})
+			c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvHarness, Value: h})
 		}
 		c.Env = append(c.Env, corev1.EnvVar{Name: envHarnessUnisolated, Value: ""})
 	}
@@ -1381,10 +1381,6 @@ func delegateToolFor(rec *SessionRecord, taskID string) string {
 	}
 	return "on"
 }
-
-// envHarness names the harness a session pod runs. It is the worker
-// adapter's selector (lib.EnvHarness once #6719's selector merges).
-const envHarness = "A2A_HARNESS"
 
 // envHarnessUnisolated is the worker adapter's waiver for running a harness
 // without its isolation; the spawner renders it empty on every session pod.
