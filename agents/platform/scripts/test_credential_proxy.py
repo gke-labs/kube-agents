@@ -20258,8 +20258,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         # ANDed onto the caller's filter, never parsed, so whatever it says the
         # excluded cluster's entries don't come back.
         self._exclude("kagents-dev", "us-east4", "scratch")
-        clause = ('NOT ((resource.labels.project_id="kagents-dev" AND resource.labels.location="us-east4"'
-                  ' AND resource.labels.cluster_name="scratch"))')
+        clause = 'NOT resource.labels.cluster_name=~"^(scratch)$"'
         for caller_filter, sent_filter in (
             (self.ENTRIES_BODY["filter"], f'(\n{self.ENTRIES_BODY["filter"]}\n) AND {clause}'),
             ('resource.labels.cluster_name="scratch"', f'(\nresource.labels.cluster_name="scratch"\n) AND {clause}'),

@@ -34,10 +34,7 @@ del _Route
 
 SHELL_SA = "system:serviceaccount:kubeagents-system:platform-agent"
 OTHER = "other-cluster"
-CLAUSE = (
-    f'NOT ((resource.labels.project_id="{TARGET.project}" AND resource.labels.location="{TARGET.location}"'
-    f' AND resource.labels.cluster_name="{OTHER}"))'
-)
+CLAUSE = f'NOT resource.labels.cluster_name=~"^({OTHER})$"'
 
 
 class MetadataScopeRouteTest(_RouteHarness):

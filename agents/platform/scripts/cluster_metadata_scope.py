@@ -14,8 +14,9 @@ include_holds).
     any excluded cluster has that name in that project.
   - `logging read [FILTER]` gets a clause ANDed onto its filter that drops every
     excluded cluster's entries (scope_exclude.Exclusions.
-    log_exclusion_clause), so the result can't include them whatever the
-    filter says. The filter isn't parsed for cluster names, which would be a
+    log_exclusion_clause, one regex term on the cluster name, since Cloud
+    Logging refuses a filter with too many AND/OR terms), so the result can't
+    include them whatever the filter says. The filter isn't parsed for cluster names, which would be a
     denylist on free text. A filter the clause can't be appended to safely
     (an open string, a single quote, a `--` comment or unbalanced parentheses,
     any of which could swallow the clause) is refused while anything is

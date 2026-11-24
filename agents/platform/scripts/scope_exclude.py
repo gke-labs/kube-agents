@@ -136,30 +136,25 @@ def _name_matches(triples: frozenset[tuple[str, str, str]], project: str, cluste
     )
 
 
-# Cloud Logging's resource labels for a GKE cluster's entries (the k8s_* and
-# gke_cluster resource types carry all three).
-LOG_PROJECT_LABEL = "resource.labels.project_id"
-LOG_LOCATION_LABEL = "resource.labels.location"
+# Cloud Logging's resource label for a GKE cluster's name (the k8s_*,
+# gke_cluster and gke_nodepool resource types carry it).
 LOG_CLUSTER_LABEL = "resource.labels.cluster_name"
-# How the clause joins the terms: entries matching none of them.
-LOG_CLAUSE_OPEN = "NOT ("
-LOG_CLAUSE_CLOSE = ")"
-LOG_TERM_JOIN = " OR "
-LOG_PART_JOIN = " AND "
+# The clause's parts: entries whose cluster label matches none of the names.
+LOG_CLAUSE_NOT = "NOT "
+LOG_REGEX_MATCH = "=~"
+LOG_REGEX_OR = "|"
 
 
-def _log_terms(triples: frozenset[tuple[str, str, str]]) -> list[str]:
-    """One Logging query term per triple, matching that cluster's entries. An entry
-    spelled by project number matches the location and name in any project, as
-    _matches does, since entries carry the project's ID. The parts are held to the
-    GKE name grammar by _parse_cluster_refs, so they need no escaping in quotes."""
-    terms = []
-    for project, location, cluster in sorted(triples):
-        parts = [f'{LOG_LOCATION_LABEL}="{location}"', f'{LOG_CLUSTER_LABEL}="{cluster}"']
-        if not PROJECT_NUMBER.match(project):
-            parts.insert(0, f'{LOG_PROJECT_LABEL}="{project}"')
-        terms.append("(" + LOG_PART_JOIN.join(parts) + ")")
-    return terms
+def _log_clause(triples: frozenset[tuple[str, str, str]]) -> str:
+    """One Logging query term that drops the entries of every cluster named by
+    triples: a single anchored regex on the cluster label, since Cloud Logging
+    refuses a filter with too many AND/OR terms ("Filter is too complex") and an
+    install can exclude many clusters. It matches the name alone, so an excluded
+    name's entries are dropped in any project and location: more than the
+    exclusion, never less. The names are held to the GKE name grammar by
+    _parse_cluster_refs, so they need no escaping in the regex or the quotes."""
+    names = sorted({cluster for _, _, cluster in triples})
+    return f'{LOG_CLAUSE_NOT}{LOG_CLUSTER_LABEL}{LOG_REGEX_MATCH}"^({LOG_REGEX_OR.join(names)})$"'
 
 
 class HoldState:
@@ -386,7 +381,6 @@ class Exclusions:
                 RULE_EXCLUDE_UNREADABLE,
                 f"{error}, so the broker can't tell which clusters' logs to leave out and reads none until it can",
             )
-        terms = _log_terms(triples)
-        if not terms:
+        if not triples:
             return None
-        return LOG_CLAUSE_OPEN + LOG_TERM_JOIN.join(terms) + LOG_CLAUSE_CLOSE
+        return _log_clause(triples)

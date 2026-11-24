@@ -33,10 +33,7 @@ PROJECT = "payments-staging"
 EXCLUDED = {"projectId": PROJECT, "location": "us-central1", "clusterName": "scratch"}
 HELD = {"projectId": PROJECT, "location": "us-east1", "clusterName": "paused"}
 NUMBERED = {"projectId": "123456789012", "location": "europe-west1", "clusterName": "legacy"}
-EXCLUDED_CLAUSE = (
-    'NOT ((resource.labels.project_id="payments-staging" AND resource.labels.location="us-central1"'
-    ' AND resource.labels.cluster_name="scratch"))'
-)
+EXCLUDED_CLAUSE = 'NOT resource.labels.cluster_name=~"^(scratch)$"'
 
 
 def scope(*clusters: dict) -> dict:
@@ -276,13 +273,17 @@ class MetadataScopeTest(unittest.TestCase):
     def test_numbered_clusters_join_the_clause_and_held_ones_do_not(self):
         exclusions = self.exclusions(EXCLUDED, NUMBERED, held=[HELD])
         out = scoped_argv(["gcloud", "logging", "read", "severity>=ERROR"], exclusions)
-        clause = out[3]
-        self.assertIn('resource.labels.cluster_name="scratch"', clause)
-        self.assertNotIn('"paused"', clause)
-        # A number-spelled entry matches its location and name in any project:
-        # entries carry the project's ID, never its number.
-        self.assertIn('(resource.labels.location="europe-west1" AND resource.labels.cluster_name="legacy")', clause)
-        self.assertNotIn("123456789012", clause)
+        # One regex term on the name, however many clusters are excluded: Cloud
+        # Logging refuses a filter with too many AND/OR terms. A number-spelled
+        # entry is just its name; a held cluster isn't in it.
+        self.assertEqual(out[3], '(\nseverity>=ERROR\n) AND NOT resource.labels.cluster_name=~"^(legacy|scratch)$"')
+
+    def test_many_exclusions_still_make_one_term(self):
+        many = [{"projectId": PROJECT, "location": "us-central1", "clusterName": f"c{i}"} for i in range(40)]
+        clause = self.exclusions(*many).log_exclusion_clause()
+        self.assertNotIn(" OR ", clause)
+        self.assertNotIn(" AND ", clause)
+        self.assertEqual(clause.count("=~"), 1)
 
     def test_filter_is_appendable(self):
         for text, want in (
