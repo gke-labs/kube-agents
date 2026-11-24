@@ -295,6 +295,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         "harness_cancel_reported": "bench/kube_agents_bench/stop_hook.py",
         "harness_pushed_report_stored": "bench/kube_agents_bench/pushed_report.py",
         "harness_burst_reads": "bench/kube_agents_bench/burst_reads.py",
+        "harness_session_cap_queued": "bench/kube_agents_bench/session_cap.py",
     }
     HARNESS_ENTRIES = frozenset(HARNESS_ENTRY_MODULES)
     HARNESS = "bench/kube_agents_bench/harness.py"

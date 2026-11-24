@@ -105,6 +105,9 @@ INCOMPLETE_RESULTS = "incomplete_results"
 # one: the forge call failed, as a gateway failure.
 TALLY_FAILED_STATUS = 502
 TALLY_FAILED_CODE = "FORGE_CALL_FAILED"
+# A labelled listing with a hit that has no usable number fails the same way.
+LISTING_FAILED_STATUS = TALLY_FAILED_STATUS
+LISTING_FAILED_CODE = TALLY_FAILED_CODE
 # The states the tally searches; `open` is the one count less these two.
 TALLY_QUALIFIERS = {
     "merged": "is:merged",
@@ -143,6 +146,16 @@ def _label_unchanged(existing: Any, body: Mapping[str, Any]) -> bool:
         return False
     description = body.get("description")
     return description is None or (existing.get("description") or "") == description
+
+
+def _item_number(node: Mapping[str, Any]) -> int | None:
+    """The `number` of a listed item when the forge sent an integer, else `None`.
+
+    The forge's answer is another party's text. A boolean is an `int` to Python
+    and is not an item's number; a list or an object is not a set element.
+    """
+    value = node.get("number")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _bare_host(host: str) -> str:
@@ -409,8 +422,8 @@ class GitHubForge(Forge):
             translate.comment(node, "review")
             for node in reviews
             # A review with no summary body is an approval or a state change,
-            # not an utterance.
-            if (node.get("body") or "").strip()
+            # not an utterance. A body that is not a text is no summary either.
+            if isinstance(node.get("body"), str) and node["body"].strip()
         ]
         # Any one of the three filling its page truncates the conversation, and
         # the reviews page is judged on what the forge sent rather than on what
@@ -588,7 +601,16 @@ class GitHubForge(Forge):
         if "page" in params:
             query["page"] = params["page"]
         nodes = api("GET", f"repos/{repo}/issues", params=query)
-        wanted = [node["number"] for node in nodes if "pull_request" in node]
+        # A hit whose number is not an integer cannot be read back as a pull request.
+        # Left out, it would read as "no pull request" to a caller that lists them
+        # all, so the listing fails by name.
+        wanted = [_item_number(node) for node in nodes if "pull_request" in node]
+        if None in wanted:
+            raise WorkspaceError(
+                "GitHub listed a pull request with a number that is not an integer",
+                status=LISTING_FAILED_STATUS,
+                code=LISTING_FAILED_CODE,
+            )
         pulls = self._pulls_by_number(api, repo, params["state"], wanted)
         proposals = [translate.proposal(pulls[number]) for number in wanted]
         if "base" in params:
@@ -626,11 +648,13 @@ class GitHubForge(Forge):
                 },
             ) or []
             for node in batch:
-                if node.get("number") in left:
-                    found[node["number"]] = node
-                    left.discard(node["number"])
+                number = _item_number(node)
+                if number in left:
+                    found[number] = node
+                    left.discard(number)
+            # A last row with no usable number reads as an absent one: older than any wanted.
             if len(batch) < MAX_PAGE_SIZE or (
-                left and batch[-1].get("number", 0) < min(left)
+                left and (_item_number(batch[-1]) or 0) < min(left)
             ):
                 break
             page += 1
