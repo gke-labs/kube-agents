@@ -1320,8 +1320,8 @@ spec:
   A GCP metadata read that names an excluded cluster is refused too, as `scope.excluded-cluster`:
   `gcloud container clusters describe`, `gcloud container node-pools list` and `describe`, and the
   `gke` MCP server's `get_cluster`, `get_node_pool` and `list_node_pools`. A logging read, through
-  `gcloud logging read` or the broker's Logging relay, leaves out the cluster's entries: the broker
-  adds a clause to the filter that matches the cluster's project, location and name, and refuses a
+  `gcloud logging read` or the broker's Logging relay, leaves out the cluster's entries. The broker
+  adds a clause to the filter that matches the cluster's project, location and name. It refuses a
   filter it can't add one to safely. The project-wide reads stay allowed, such as the project's
   cluster list. Exclusion keeps the agents out of a cluster's API, workloads, metadata and logs, not
   out of the project's cluster list. These still cover an excluded cluster, through project-wide
