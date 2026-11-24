@@ -11222,25 +11222,19 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
 
-    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
-        # An exec pod's state volume is sized for no gcloud log files; the
-        # broker and the sidecar roles keep gcloud's default.
-        for role, off in (
-            (credential_proxy_client.EXEC_ROLE, True),
-            ("broker", False),
-            ("combined", False),
-        ):
+    def test_serve_turns_gcloud_file_logging_off_in_every_role(self):
+        # No role's state volume is sized for gcloud's log files: each command
+        # leaves one, and gcloud keeps them for 30 days.
+        for role in (credential_proxy_client.EXEC_ROLE, "broker", "combined"):
             with self.subTest(role=role):
                 self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
                 env = CredentialProxyHandler.executor.environment
-                self.assertEqual(
-                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
-                )
+                self.assertEqual("1", env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV))
 
     def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_commands(self):
         # The proxy gives the commands it runs a fixed list of names from its
         # own environment. These two, which an operator can set on the pod
-        # (`platformAgent.deployment.env`), are not on it, and the exec role
+        # (`platformAgent.deployment.env`), are not on it, and every role
         # sets the gcloud name itself, to its own value. This keeps both in the
         # proxy's environment from the start of `serve` to the end of each
         # command, and reads what a gcloud and a kubectl command were given.
@@ -11265,8 +11259,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             stand_ins[argv[0]] = str(stand_in)
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role, **pod_environment})
             executor = CredentialProxyHandler.executor
@@ -11290,7 +11284,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         # bootstrap command does not reach that list. This starts `serve` with
         # one, for each role, with both names in the proxy's environment, and
         # reads what the command was given. On GKE the operator's bootstrap
-        # command runs gcloud. The exec role sets the gcloud name itself, to
+        # command runs gcloud. Every role sets the gcloud name itself, to
         # its own value; the pod's value must not replace it.
         pod_environment = {
             "MALLOC_ARENA_MAX": "2",
@@ -11306,8 +11300,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         )
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             with self.subTest(role=role):
                 self._serve_with(

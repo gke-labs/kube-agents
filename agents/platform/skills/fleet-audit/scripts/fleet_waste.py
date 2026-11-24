@@ -774,8 +774,9 @@ FAMILY_POD_PATTERN = (
     rf"(?:-{UUID_PATTERN}(?:-{K8S_GENERATED_CHARS}*)?|(?:-{UUID_PATTERN})?-{UUID_PREFIX_PATTERN})"
     rf"{K8S_GENERATED_CHARS}{{5}})$"
 )
-# Labels that say where a family's template is, when each member carries the
-# same value. They go into the excerpt and never decide the family.
+# Labels that say where a family's template is, when each member with a
+# Deployment object in the dump carries the same value. They go into the
+# excerpt and never decide the family.
 FAMILY_POINTER_LABELS = (_MANAGED_BY_LABEL, "app.kubernetes.io/part-of", "helm.sh/chart")
 # Said in a family's excerpt when the run read no repository declaration: a week with no index
 # and a week with one can then name one Deployment in two ways. It is not a `limitations` line:
@@ -2946,8 +2947,9 @@ def _generated_families(context: dict) -> dict[tuple[str, str], dict]:
     """`(namespace, Deployment name) -> family`, for each member of a family.
 
     A family is the Deployments of one namespace named `<stem>-<uuid>` with
-    one stem. Its `owner` and `labels` are what each member carries alike:
-    they tell a reader where the template is, and take no part in the grouping.
+    one stem. Its `owner` and `labels` are what each member with a Deployment
+    object in the dump carries alike: they tell a reader where the template
+    is, and take no part in the grouping. `unread` counts the other members.
 
     A live Deployment that has the stem's own name keeps that name, and the
     members then stay single: two findings may not share one identity.
@@ -2988,7 +2990,9 @@ def _generated_families(context: dict) -> dict[tuple[str, str], dict]:
         for stem, members in stems.items():
             if stem in lasting or len(members) < GENERATED_FAMILY_MIN_MEMBERS:
                 continue
-            metas = [deployments[member] for member in members]
+            # A member that only a pod names has no metadata here: it says nothing
+            # on what the members carry, so it does not hide what the others share.
+            metas = [deployments[member] for member in members if deployments[member]]
             owners = {_owner_key(meta.get("ownerReferences") or []) for meta in metas}
             owner = next(iter(owners)) if len(owners) == 1 else None
             labels = []
@@ -3003,6 +3007,7 @@ def _generated_families(context: dict) -> dict[tuple[str, str], dict]:
                 # either, and names no place to look.
                 "owner": f"{owner[0]}/{owner[1]}" if owner and not GENERATED_NAME_RE.match(owner[1]) else "",
                 "labels": labels,
+                "unread": len(members) - len(metas),
                 "no_index": no_index,
             }
             for member in members:
@@ -3071,7 +3076,9 @@ def _family_sentence(entry: dict, name: str, *, uncounted: int = 0) -> str:
     if family["labels"]:
         carried.append("carries " + " and ".join(f"`{label}`" for label in family["labels"]))
     if carried:
-        text += f" Each member {' and '.join(carried)}."
+        # The sentence speaks only for the members that the dump holds as a Deployment.
+        who = "Each member whose Deployment this audit read" if family["unread"] else "Each member"
+        text += f" {who} {' and '.join(carried)}."
     spread = _request_spread(entry["pods"])
     if spread:
         text += f" The members declare different requests ({spread} per pod), and the figures above take the hottest pod of any member."

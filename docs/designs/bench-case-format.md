@@ -120,6 +120,13 @@ later reports on a UTC day reply inside its first report's thread (one thread pe
 mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
 own. Slack transport only: the other transports refuse it, so
 such a case runs on the Slack lane alone and keeps no inject record.
+A first line of `[bench:reply-after-idle]`, with `opening:`, `idle_seconds:` (60 to 1800) and
+`reply:` lines under it, sends the opening as turn one, waits that long with the conversation
+idle, then sends the reply as a second message on it
+([`bench/kube_agents_bench/idle_reply.py`](../../bench/kube_agents_bench/idle_reply.py)). The
+reply turn's answer is the deliverable. The harness writes `harness_idle_wait`, which completes
+only when the reply ran on a different session pod from the opening's, so a case can grade
+that the reply was rehydrated. Inject transport only.
 A first line of `[bench:session-cap-queue]`, optionally with `max-cap=<n>` (default 2) and
 `hold=<seconds>`, with a `/session` ask under it, grades the gateway's session-cap line (#6882):
 the harness reads the install's session cap off the gateway Deployment, fills it with busy
@@ -564,7 +571,16 @@ scope skips every tagged entry, so a check written before the workers' calls wer
 still means what it meant. `scope: workers` counts the tagged entries instead and is the
 one deterministic check that sees which MCP tool a worker reached for — a worker invokes
 MCP tools through Hermes' `tool_call` wrapper, and the check reads the tool names inside
-it; `all` counts both.
+it; `all` counts both. For a worker's call, `require_success` reads through the
+wrapper: the pod takes the verdict on the tool's answer inside Hermes'
+`<untrusted_tool_result>` envelope by the rule it applies to a bare result, so an answer
+that carries `ok: false` or `success: false` is a failed call there too; a refusal the tool
+words as a plain `ERROR:` string still reads as completed, as does a `{"result": ...}`
+answer under 32 characters, which Hermes does not envelope, and the router's own entries are not read
+through the envelope. The pod reads a worker wrapper's tool names before it clips the
+arguments, so a wrapper too long to parse is still counted by name, unless the pod withheld
+the capture; an `arguments` pattern reads the wrapper's own arguments, not the wrapped
+call's.
 Either non-default scope returns `status: "error"` on a trajectory with no tagged entry (no
 card delegated, or the capture did not run) rather than passing on an absence. A
 cluster-mutation safeguard is still a cluster-state check (`resource_property`): a call the

@@ -4590,7 +4590,7 @@ class GeneratedNameFamilyTest(unittest.TestCase):
 
         [hit] = self.over(pods, deployments=[deployment(name) for name in members])
         self.assertEqual(hit["object"], "Deployment/calibration")
-        self.assertIn("owned by `CalibrationPool/lab-pool`", hit["excerpt"])
+        self.assertIn("Each member is owned by `CalibrationPool/lab-pool`", hit["excerpt"])
         self.assertIn("`app.kubernetes.io/managed-by: spawner`", hit["excerpt"])
         self.assertIn("`app.kubernetes.io/part-of: calibration`", hit["excerpt"])
         # A value that one member does not carry is not named, and neither is
@@ -4604,6 +4604,14 @@ class GeneratedNameFamilyTest(unittest.TestCase):
         for owners in ((f"run-{self.U3}", f"run-{self.U3}"), ("pool-a", "pool-b")):
             [hit] = self.over(pods, deployments=[deployment(name, owner=owner) for name, owner in zip(members, owners)])
             self.assertNotIn("owned by", hit["excerpt"])
+        # A member that the dump names only through its pod (its Deployment was
+        # gone when the audit read the Deployments, after the pod read) says
+        # nothing on what it carries. What the listed members share is still
+        # named, and the sentence says that it speaks for those.
+        [hit] = self.over(pods + [self.pod(self.member(self.U3))], deployments=[deployment(name) for name in members])
+        self.assertIn("stands for 3 generated-name Deployments", hit["excerpt"])
+        self.assertIn("Each member whose Deployment this audit read is owned by `CalibrationPool/lab-pool`", hit["excerpt"])
+        self.assertIn("`app.kubernetes.io/part-of: calibration`", hit["excerpt"])
 
     def test_a_family_finding_takes_no_declaration_by_its_name(self):
         """A file that declares `Deployment/calibration` declares another
