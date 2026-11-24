@@ -11,7 +11,16 @@ from pathlib import Path
 from unittest import mock
 
 import cluster_metadata_scope
-from cluster_metadata_scope import filter_is_appendable, scoped_argv
+from cluster_metadata_scope import check_cluster_reads, filter_is_appendable
+from cluster_metadata_scope import scoped_argv as rewrite_logging
+
+
+def scoped_argv(argv, exclusions):
+    """Both halves as the exec route runs them for a caller no task confines: the
+    logging rewrite before the gates, the cluster check after, on the same argv."""
+    out = rewrite_logging(argv, exclusions)
+    check_cluster_reads(out, exclusions)
+    return out
 from scope_exclude import (
     RULE_EXCLUDE_UNREADABLE,
     RULE_EXCLUDED_CLUSTER,
@@ -121,6 +130,50 @@ class MetadataScopeTest(unittest.TestCase):
         exclusions = self.exclusions(NUMBERED)
         argv = ["gcloud", "container", "clusters", "describe", "legacy", "--location", "europe-west1"]
         self.assertEqual(self.refused(argv, exclusions).rule, RULE_EXCLUDED_CLUSTER)
+
+    def test_spellings_the_broker_cannot_read_are_refused_while_any_is_excluded(self):
+        exclusions = self.exclusions(EXCLUDED)
+        for argv in (
+            ["gcloud", "container", "clusters", "describe",
+             f"https://container.googleapis.com/v1/projects/{PROJECT}/locations/us-central1/clusters/scratch"],
+            ["gcloud", "container", "clusters", "describe",
+             f"projects/{PROJECT}/locations/us-central1/clusters/prod/../scratch"],
+            ["gcloud", "container", "clusters", "describe",
+             f"projects/{PROJECT}/locations/us-central1/clusters/%73cratch"],
+            ["gcloud", "container", "node-pools", "describe",
+             f"projects/{PROJECT}/locations/us-central1/clusters/scratch/nodePools/default-pool",
+             "--cluster", "prod", "--location", "us-central1"],
+            ["gcloud", "container", "node-pools", "describe",
+             f"projects/{PROJECT}/locations/us-central1/clusters/prod/nodePools/../x", "--cluster", "prod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.refused(argv, exclusions).rule, RULE_EXCLUDED_CLUSTER)
+
+    def test_a_node_pool_named_in_full_for_an_in_scope_cluster_runs(self):
+        exclusions = self.exclusions(EXCLUDED)
+        argv = ["gcloud", "container", "node-pools", "describe",
+                f"projects/{PROJECT}/locations/us-central1/clusters/prod/nodePools/default-pool"]
+        self.assertIs(scoped_argv(argv, exclusions), argv)
+
+    def test_help_reads_nothing_and_passes(self):
+        exclusions = self.exclusions(EXCLUDED)
+        for argv in (
+            ["gcloud", "container", "clusters", "describe", "--help"],
+            ["gcloud", "container", "node-pools", "list", "--help"],
+            ["gcloud", "logging", "read", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIs(scoped_argv(argv, exclusions), argv)
+
+    def test_an_unreadable_flag_is_left_to_the_gates_and_refused_after_them(self):
+        # The rewrite leaves it for the policy gates and their own rules; the
+        # cluster check, which runs after them, refuses it while any is excluded.
+        exclusions = self.exclusions(EXCLUDED)
+        argv = ["gcloud", "container", "clusters", "describe", "prod", "--no-such-flag", "x"]
+        self.assertIs(rewrite_logging(argv, exclusions), argv)
+        with self.assertRaises(ExcludedCluster):
+            check_cluster_reads(argv, exclusions)
+        self.assertIsNone(check_cluster_reads(argv, self.exclusions()))
 
     def test_a_describe_naming_no_cluster_is_refused_while_any_is_excluded(self):
         exclusions = self.exclusions(EXCLUDED)

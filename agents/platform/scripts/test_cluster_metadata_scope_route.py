@@ -94,6 +94,18 @@ class MetadataScopeRouteTest(_RouteHarness):
             ran,
         )
 
+    def test_a_prohibited_flag_gets_its_own_rule_not_the_scope_rule(self):
+        argv = ["gcloud", "container", "clusters", "describe", OTHER, f"--location={TARGET.location}",
+                "--impersonate-service-account=x@y.iam.gserviceaccount.com"]
+        status, body = self.post({"argv": argv}, token=None)
+        self.assertEqual(403, status, body)
+        self.assertNotEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, body.get("rule"), body)
+        self.assertEqual([], self.executor.calls)
+
+    def test_help_on_a_describe_runs(self):
+        status, body = self.post({"argv": ["gcloud", "container", "clusters", "describe", "--help"]}, token=None)
+        self.assertEqual(200, status, body)
+
     def test_a_filter_that_could_swallow_the_clause_is_refused(self):
         argv = ["gcloud", "logging", "read", 'severity>=ERROR) OR (x="y', f"--project={TARGET.project}"]
         status, body = self.post({"argv": argv}, token=None)
@@ -118,6 +130,24 @@ class ProfileMetadataScopeRouteTest(_RouteHarness):
         CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
             path=lambda: str(scope_file), holds=scope_exclude.Holds(path=lambda: ""),
         )
+
+    def test_a_profile_s_bare_reads_of_its_own_target_run(self):
+        # Confinement pins a bare node-pools read and a describe to the task's
+        # target; the cluster check runs after it, on that argv, so an install
+        # that excludes another cluster doesn't refuse them.
+        for argv in (
+            ["gcloud", "container", "node-pools", "list"],
+            ["gcloud", "container", "clusters", "describe", TARGET.cluster],
+        ):
+            with self.subTest(argv=argv):
+                self.executor.calls.clear()
+                status, body = self.post({"argv": argv})
+                self.assertEqual(200, status, body)
+
+    def test_a_profile_s_read_of_an_excluded_cluster_is_refused(self):
+        status, body = self.post({"argv": ["gcloud", "container", "clusters", "describe", OTHER]})
+        self.assertEqual(403, status, body)
+        self.assertEqual([], self.executor.calls)
 
     def test_a_profile_logging_read_carries_the_clause_through_confinement(self):
         status, body = self.post({"argv": ["gcloud", "logging", "read", "severity>=ERROR"]})

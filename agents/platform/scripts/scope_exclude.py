@@ -28,8 +28,10 @@ started outside the operator, and excludes nothing.
 that no pod-template hash covers, so an operator's hold applies, and lifts,
 without a restart. A held cluster keeps its Cluster Agent profile and its place in
 fleet audits; only its Kubernetes API is refused, under `scope.held-cluster`, with the hold's
-reason. `all` holds every cluster. `Exclusions` checks both, so every route that
-refuses an excluded cluster refuses a held one.
+reason. `all` holds every cluster. `Exclusions` checks both, so every route to a
+cluster's Kubernetes API that refuses an excluded cluster refuses a held one. A
+metadata read checks the exclusions alone (`include_holds=False`), since a hold
+leaves the cluster's metadata readable.
 
 Standard library only. No refusal message repeats caller text beyond the three
 name parts, each of which the caller's target already held to `[a-z0-9-]`; a
@@ -277,7 +279,8 @@ class Exclusions:
     The mount is a ConfigMap directory, so an edit lands in place; the file's
     identity (inode, size, mtime) is checked on every call and the parse is
     redone only when it moves. Each check also consults the holds (Holds), so a
-    caller of check or check_unnamed refuses a held cluster too.
+    caller of check or check_unnamed refuses a held cluster too, unless it passes
+    include_holds=False, as the metadata reads do.
     """
 
     def __init__(

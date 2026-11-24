@@ -15991,11 +15991,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
-        # A GCP metadata read about a cluster is held to the install's
-        # exclusions for every caller, before confinement and policy read it,
-        # so each judges the command that will run: a describe of an excluded
-        # cluster is refused, and a `logging read` filter gets the clause that
-        # drops those clusters' entries (cluster_metadata_scope).
+        # A `logging read` filter gets the clause that drops the install's
+        # excluded clusters' entries, for every caller, before confinement and
+        # policy read it, so each judges the command that will run
+        # (cluster_metadata_scope). The describe and node-pool checks run after
+        # the gates below, on the argv that will run.
         exclusions = getattr(self, "exclusions", None)
         if exclusions is not None:
             try:
@@ -16215,6 +16215,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 count(TOOL_STATUS_BLOCKED)
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return
+
+            # A describe or node-pool read naming an excluded cluster, for every
+            # caller: after confinement, so a profile caller's argv carries its
+            # target's project, location and cluster, and after the gates, so a
+            # command they refuse has had its own rule (cluster_metadata_scope).
+            exclusions = getattr(self, "exclusions", None)
+            if exclusions is not None:
+                try:
+                    cluster_metadata_scope.check_cluster_reads(exec_argv, exclusions)
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, count)
+                    return
 
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.

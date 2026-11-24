@@ -386,13 +386,17 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
             self.k8s_call("projects/p/locations/us-east4/clusters/other"),
             self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/other"),
             self.metadata_call("get_node_pool", "projects/p/locations/us-east4/clusters/other/nodePools/default-pool"),
+            # A field mask is not a resource name: the gke-reliability skill's call.
+            {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "get_cluster", "arguments": {
+                "name": "projects/p/locations/us-east4/clusters/other",
+                "readMask": "location,locations,nodePools.locations"}}},
             tools_call("list_clusters"),
         ):
             with self.subTest(message=message):
                 status, _, body = self._request(message=message)
                 self.assertEqual(status, 200, body)
                 self.assertNotIn("isError", json.loads(body).get("result", {}))
-        self.assertEqual(len(self.upstream_requests), 4)
+        self.assertEqual(len(self.upstream_requests), 5)
 
     def test_a_write_tool_never_reaches_the_upstream(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:

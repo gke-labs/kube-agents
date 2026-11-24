@@ -43,6 +43,7 @@ DEFAULT_PROJECT_ENV = "GKE_PROJECT_ID"
 
 CLUSTERS_DESCRIBE = ("container", "clusters", "describe")
 NODE_POOL_COMMANDS = frozenset({("container", "node-pools", "list"), ("container", "node-pools", "describe")})
+_NODE_POOL_WORDS = 3
 LOGGING_READ = ("logging", "read")
 
 # A cluster's full resource name, which gcloud also takes in place of a bare
@@ -51,6 +52,9 @@ _RESOURCE_SEPARATOR = "/"
 _RESOURCE_PROJECTS = "projects"
 _RESOURCE_LOCATION_KEYS = frozenset({"locations", "zones"})
 _RESOURCE_CLUSTERS = "clusters"
+_RESOURCE_NODE_POOLS = "nodePools"
+# `--help` (and `-h`) prints gcloud's own synopsis and reads nothing.
+HELP_FLAGS = frozenset({"--help", "-h"})
 _RESOURCE_PARTS = 6
 GCLOUD = "gcloud"
 # The words that mark an argv this module would act on, for an argv whose flags
@@ -121,17 +125,32 @@ def _flag(flags: dict[str, str], names: frozenset[str] | tuple[str, ...]) -> str
 
 def _resource_cluster(value: str) -> tuple[str, str, str] | None:
     """(project, location, cluster) from a full resource name, else None."""
-    parts = value.strip(_RESOURCE_SEPARATOR).split(_RESOURCE_SEPARATOR)
+    parts = value.split(_RESOURCE_SEPARATOR)
     if (len(parts) == _RESOURCE_PARTS and parts[0] == _RESOURCE_PROJECTS
-            and parts[2] in _RESOURCE_LOCATION_KEYS and parts[4] == _RESOURCE_CLUSTERS and all(parts)):
+            and parts[2] in _RESOURCE_LOCATION_KEYS and parts[4] == _RESOURCE_CLUSTERS
+            and all(scope_exclude.NAME_PART.match(parts[index]) for index in (1, 3, 5))):
         return parts[1], parts[3], parts[5]
     return None
+
+
+def _resource_node_pool(value: str) -> tuple[str, str, str] | None:
+    """(project, location, cluster) from a node pool's full resource name, else None."""
+    head, separator, pool = value.rpartition(_RESOURCE_SEPARATOR)
+    head, separator2, key = head.rpartition(_RESOURCE_SEPARATOR)
+    if not (separator and separator2 and key == _RESOURCE_NODE_POOLS and scope_exclude.NAME_PART.match(pool)):
+        return None
+    return _resource_cluster(head)
 
 
 def _check_cluster(exclusions: scope_exclude.Exclusions, named: str, flags: dict[str, str]) -> None:
     resource = _resource_cluster(named)
     if resource is not None:
         exclusions.check(*resource, include_holds=False)
+        return
+    if not scope_exclude.NAME_PART.match(named):
+        # Neither a bare name nor the canonical resource name (a selfLink URL,
+        # a `..` path, an escape): one the broker can't tie to a cluster.
+        exclusions.check_unnamed(include_holds=False)
         return
     project = _flag(flags, (PROJECT_FLAG,)) or os.environ.get(DEFAULT_PROJECT_ENV, "")
     location = _flag(flags, tuple(sorted(LOCATION_FLAGS)))
@@ -203,45 +222,88 @@ def _with_log_exclusion(argv: list[str], surface: list[tuple[int, str]], clause:
 
 
 def scoped_argv(argv: list[str], exclusions: scope_exclude.Exclusions) -> list[str]:
-    """argv as the broker runs it against the install's exclusions.
+    """argv with a `logging read` filter scoped to the install's exclusions.
 
-    Raises scope_exclude.ExcludedCluster when the command names an excluded
-    cluster, or can't be read or rewritten while any is. Returns argv itself when nothing applies.
+    Called before task confinement and policy, so each judges the command that
+    will run. Raises scope_exclude.ExcludedCluster when the filter can't be
+    scoped while any cluster is excluded. Returns argv itself when nothing
+    applies, an argv whose flags can't be walked included: the gates after
+    refuse it with their own rule, and check_cluster_reads refuses it as
+    unreadable if it gets that far.
+    """
+    walked = _gcloud_walk(argv)
+    if walked is None:
+        return argv
+    flags, surface, words = walked
+    if words[:len(LOGGING_READ)] != LOGGING_READ or _is_help(flags):
+        return argv
+    clause = exclusions.log_exclusion_clause()
+    if clause is None:
+        return argv
+    return _with_log_exclusion(argv, surface, clause)
+
+
+def check_cluster_reads(argv: list[str], exclusions: scope_exclude.Exclusions) -> None:
+    """Raise scope_exclude.ExcludedCluster when a describe or node-pool read names
+    an excluded cluster, names it in a spelling the broker can't read while any
+    is excluded, or leaves it to gcloud's default while any is.
+
+    Called after task confinement and the policy gates, on the argv that will
+    run: a profile caller's then carries its target's project, location and
+    cluster, and a command a gate refuses has had its own rule first. A
+    `--help` query reads nothing and passes.
     """
     if not argv or os.path.basename(argv[0]) != GCLOUD:
-        return argv
-    walked = _walk(argv)
+        return
+    walked = _gcloud_walk(argv)
     if walked is None:
-        # The read-only gate refuses an unreadable flag first; with enforcement
-        # off, such a command still can't be tied to a cluster.
-        words, _ = command_policy._gcloud_words_and_flag(argv)
-        if words is None and _names_target_command(argv) and _anything_excluded(exclusions):
+        if _names_target_command(argv) and _anything_excluded(exclusions):
             raise scope_exclude.ExcludedCluster(scope_exclude.RULE_EXCLUDED_CLUSTER, UNREADABLE_COMMAND)
-        return argv
-    flags, positionals = walked
-    surface = _surface(positionals)
-    words = tuple(word for _, word in surface)
+        return
+    flags, surface, words = walked
+    if _is_help(flags):
+        return
     if words[:len(CLUSTERS_DESCRIBE)] == CLUSTERS_DESCRIBE:
         names = words[len(CLUSTERS_DESCRIBE):]
         if names:
             _check_cluster(exclusions, names[0], flags)
         else:
             exclusions.check_unnamed(include_holds=False)
-        return argv
-    if words[:len(next(iter(NODE_POOL_COMMANDS)))] in NODE_POOL_COMMANDS:
+        return
+    if words[:_NODE_POOL_WORDS] in NODE_POOL_COMMANDS:
         cluster = flags.get(CLUSTER_FLAG, "")
+        pools = words[_NODE_POOL_WORDS:]
+        named_pool = pools[0] if pools else ""
+        if _RESOURCE_SEPARATOR in named_pool:
+            # A positional node pool's full name carries its own cluster.
+            resource = _resource_node_pool(named_pool)
+            if resource is None:
+                exclusions.check_unnamed(include_holds=False)
+            else:
+                exclusions.check(*resource, include_holds=False)
         if cluster:
             _check_cluster(exclusions, cluster, flags)
-        else:
+        elif _RESOURCE_SEPARATOR not in named_pool:
             # gcloud's container/cluster default, which the broker can't see.
             exclusions.check_unnamed(include_holds=False)
-        return argv
-    if words[:len(LOGGING_READ)] == LOGGING_READ:
-        clause = exclusions.log_exclusion_clause()
-        if clause is None:
-            return argv
-        return _with_log_exclusion(argv, surface, clause)
-    return argv
+        return
+
+
+def _gcloud_walk(argv: list[str]) -> tuple[dict[str, str], list[tuple[int, str]], tuple[str, ...]] | None:
+    """(flags, surface positionals, surface words) of a gcloud argv, or None for
+    another executable or an argv whose flags can't be walked."""
+    if not argv or os.path.basename(argv[0]) != GCLOUD:
+        return None
+    walked = _walk(argv)
+    if walked is None:
+        return None
+    flags, positionals = walked
+    surface = _surface(positionals)
+    return flags, surface, tuple(word for _, word in surface)
+
+
+def _is_help(flags: dict[str, str]) -> bool:
+    return any(name in flags for name in HELP_FLAGS)
 
 
 def _names_target_command(argv: list[str]) -> bool:
@@ -254,4 +316,3 @@ def _anything_excluded(exclusions: scope_exclude.Exclusions) -> bool:
         return exclusions.log_exclusion_clause() is not None
     except scope_exclude.ExcludedCluster:
         return True
-

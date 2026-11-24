@@ -122,6 +122,9 @@ NODE_POOL_RESOURCE = re.compile(
     r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)/nodePools/[a-z0-9][a-z0-9-]*"
 )
 NODE_POOL_TOOL = "get_node_pool"
+# The arguments a cluster-metadata tool names its resource in: get_cluster and
+# get_node_pool take `name`, list_node_pools `parent`.
+METADATA_NAME_ARGUMENTS = ("name", "parent")
 CLUSTER_RESOURCE = re.compile(
     r"projects/(?P<project>(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
     r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)"
@@ -457,13 +460,14 @@ def filter_tools_list(server_name: str, body: bytes, allowed: frozenset[str] | N
 
 
 def metadata_tool_clusters(server_name: str, message: dict[str, Any] | None) -> list[tuple[str, str, str]] | None:
-    """The clusters a gke cluster-metadata tool call names, or None when it isn't one.
+    """The cluster a gke cluster-metadata tool call names, or None when it isn't one.
 
-    As strict as `k8s_tool_clusters`: every string argument that looks like a
-    resource name has to be, whole, exactly one cluster's resource name (a
-    node pool's, for get_node_pool), and at least one has to. Otherwise the
-    list is empty, a call the broker can't tie to a cluster, which the caller
-    refuses while any cluster is excluded. So is a `-` location.
+    Read from the arguments that carry the resource name (METADATA_NAME_ARGUMENTS),
+    each held whole to its grammar (a node pool's for get_node_pool), so a field
+    mask that names `locations` is left alone. At least one has to be there and
+    every one present has to match; otherwise the list is empty, a call the
+    broker can't tie to a cluster, which the caller refuses while any cluster is
+    excluded. So is a `-` location.
     """
     if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
         return None
@@ -471,18 +475,15 @@ def metadata_tool_clusters(server_name: str, message: dict[str, Any] | None) -> 
     if not isinstance(params, dict) or params.get("name") not in GKE_CLUSTER_METADATA_TOOLS:
         return None
     arguments = params.get("arguments")
-    values = list(arguments.values()) if isinstance(arguments, dict) else []
+    arguments = arguments if isinstance(arguments, dict) else {}
+    grammar = NODE_POOL_RESOURCE if params.get("name") == NODE_POOL_TOOL else CLUSTER_RESOURCE
     clusters = []
-    while values:
-        value = values.pop()
-        if isinstance(value, dict):
-            values.extend(value.values())
-        elif isinstance(value, list):
-            values.extend(value)
-        elif isinstance(value, str) and RESOURCE_LIKE.search(value):
-            grammar = NODE_POOL_RESOURCE if params.get("name") == NODE_POOL_TOOL else CLUSTER_RESOURCE
-            match = grammar.fullmatch(value)
-            if match is None or match["location"] == "-":
-                return []
-            clusters.append((match["project"], match["location"], match["cluster"]))
+    for key in METADATA_NAME_ARGUMENTS:
+        if key not in arguments:
+            continue
+        value = arguments[key]
+        match = grammar.fullmatch(value) if isinstance(value, str) else None
+        if match is None or match["location"] == "-":
+            return []
+        clusters.append((match["project"], match["location"], match["cluster"]))
     return clusters
