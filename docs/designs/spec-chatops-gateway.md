@@ -3069,9 +3069,12 @@ relays replies to Bot Framework (`/v1/chat/teams/api`), so the gateway's `teams`
 (`a2a/gateway/teams.go`) long-polls that queue with the projected a2a-chat token, acks each
 receipt before the turn is handed over (at-most-once, as the Chat adapter argues; the relay's
 nack route has no caller here), and posts through the passthrough. The gateway opens no port
-for Teams; the question of an inbound endpoint on the gateway does not arise, and the public
-receiver stays a separate piece of work outside this repository, so the authority block names
-what is checked here (`teams-relay+allowlist`), not a JWT nothing in this tree verified.
+for Teams. The public endpoint is its own pod, the Teams inbound receiver (`a2a/teamsinbound`,
+rendered by the operator under `spec.integration.teams.inbound`, behind an Ingress the admin
+owns): it verifies Bot Framework's JWT against Microsoft's published keys, pins the tenant, and
+posts the activity to the broker's intake under a role that reaches that one route by POST
+(`teams-inbound`). The authority block still names what the gateway itself checked
+(`teams-relay+allowlist`); the JWT was verified a pod earlier, by the receiver.
 
 Identity is Chat's rule with one allowance: the Entra object id Bot Framework asserts
 (`from.aadObjectId`, immutable; never the display name or UPN) is the principal, gated by

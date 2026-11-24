@@ -3339,6 +3339,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("apps", "statefulsets"),
         ("batch", "jobs"),
         ("coordination.k8s.io", "leases"),
+        ("kubeagents.x-k8s.io", "agentschedules"),
         ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
         ("networking.gke.io", "fqdnnetworkpolicies"),
         ("networking.k8s.io", "networkpolicies"),
