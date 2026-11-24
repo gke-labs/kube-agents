@@ -743,9 +743,16 @@ func ChildResultOf(parts []Part) (ChildResult, bool) {
 // (#4860). A refused request mints nothing, so there is no child to end and no
 // childResult to send; without this the parent waits to its deadline. Text is
 // the notice the room sees, at most ChildResultTextCap bytes. A parent that
-// waits on children reads it as the end of the whole wait.
+// waits on children reads a first refusal as the end of the whole wait.
+//
+// Repeat marks a refusal of a request the task made after an earlier one had
+// already minted its child or batch: that earlier request's children are
+// still the task's to wait for, so the refusal ends nothing. It is a bool,
+// and omitted when false, so a first refusal reads as it always has; any
+// other JSON type there makes the part no refusal at all (DelegationRefusalOf).
 type DelegationRefusal struct {
-	Text string `json:"text"`
+	Text   string `json:"text"`
+	Repeat bool   `json:"repeat,omitempty"`
 }
 
 const delegationRefusedKey = "delegationRefused"

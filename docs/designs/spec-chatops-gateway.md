@@ -864,7 +864,9 @@ trigger. A child below a scheduled run, at any depth, goes only to a profile who
 (`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
 child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, and a refusal as a
-`delegationRefused` one (#4860), which the parent reads while it waits open, and the parent holds the conversation again, so a stop or a steer
+`delegationRefused` one (#4860), which the parent reads while it waits open. A request the parent makes after
+its first one minted or ended is refused as a repeat (`delegation.busy`), on its `.in` with `repeat` set, and ends
+none of the wait on the first one's children. The parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
 chain's end, delegated or not. A stop while the child runs cancels the child and every profile
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,

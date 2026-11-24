@@ -681,3 +681,46 @@ func TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText(t *testing
 		t.Fatal("an empty refusal was read")
 	}
 }
+
+// TestDelegationRefusalRepeatRoundTripsAndIsStrict: a first refusal goes out
+// with no repeat field, as it did before the field, and a repeat round-trips
+// tagged. A repeat that isn't a JSON bool makes the part no refusal, rather
+// than a first refusal that would end the parent's wait; a repeat refusal
+// is held to the same text bounds as a first one.
+func TestDelegationRefusalRepeatRoundTripsAndIsStrict(t *testing.T) {
+	first, err := DelegationRefusalPart(DelegationRefusal{Text: "no"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(first.Data), "repeat") {
+		t.Fatalf("a first refusal carries the repeat field: %s", first.Data)
+	}
+	if got, ok := DelegationRefusalOf([]Part{first}); !ok || got.Repeat {
+		t.Fatalf("first refusal read back = %+v, %v; want untagged", got, ok)
+	}
+	rep, err := DelegationRefusalPart(DelegationRefusal{Text: "again", Repeat: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"delegationRefused":{"text":"again","repeat":true}}`; string(rep.Data) != want {
+		t.Fatalf("repeat refusal = %s, want %s", rep.Data, want)
+	}
+	if got, ok := DelegationRefusalOf([]Part{rep}); !ok || !got.Repeat || got.Text != "again" {
+		t.Fatalf("repeat refusal read back = %+v, %v", got, ok)
+	}
+	for _, raw := range []string{
+		`{"delegationRefused":{"text":"x","repeat":"true"}}`,
+		`{"delegationRefused":{"text":"x","repeat":1}}`,
+		`{"delegationRefused":{"text":"x","repeat":{}}}`,
+		`{"delegationRefused":{"text":"","repeat":true}}`,
+	} {
+		if got, ok := DelegationRefusalOf([]Part{{Kind: "data", Data: []byte(raw)}}); ok {
+			t.Errorf("%s read as %+v", raw, got)
+		}
+	}
+	for _, text := range []string{"", strings.Repeat("a", ChildResultTextCap+1)} {
+		if _, err := DelegationRefusalPart(DelegationRefusal{Text: text, Repeat: true}); err == nil {
+			t.Fatalf("a repeat refusal with %d bytes of text was built", len(text))
+		}
+	}
+}

@@ -106,6 +106,9 @@ const (
 	// noticeProfileDoesNotDelegate refuses a task of a profile whose card
 	// doesn't say it delegates (AgentProfile spec.delegates, #6789).
 	noticeProfileDoesNotDelegate = "%s isn't set up to hand tasks on"
+	// noticeDelegationRepeat refuses a profile parent's request made after
+	// its first one minted: the tasks that one started still report back.
+	noticeDelegationRepeat = "this task has already handed its work on; the tasks it started will still report back"
 )
 
 // How noticeParamUndeclared and noticeParamMissing spell a profile's
