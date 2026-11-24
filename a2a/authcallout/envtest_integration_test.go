@@ -241,9 +241,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		t.Fatalf("the callout could not connect: %v", err)
 	}
 	t.Cleanup(svcConn.Close)
-	if _, err := svc.Subscribe(svcConn); err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	serveCallout(t, svc, validator, svcConn)
 
 	// The readiness probe reads the real connection, not a stand-in, so the
 	// live tests below exercise both halves of it against a real server.

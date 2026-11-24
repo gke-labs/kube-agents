@@ -108,6 +108,16 @@ narrower read, when its measured cost does not fit. Costs are measured per fleet
 whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
 [`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
 
+The operator passes the tier to the shell sandbox and, under the session cluster view, to the
+session Pods the A2A gateway starts. On the `default` tier at the default session memory limit
+(2 GiB), their kubectl runs with no admission. On the `fleet` tier at that limit, a session Pod
+runs the admission against its own memory limit. It refuses a cluster-wide list that the fleet
+figures charge above what one read may take there, such as `kubectl get pods -A`, whatever the
+cluster's real size, as the shell does. Raise the session Pods' limit with
+[`harness.tuning.sessionResources.limits.memory`](/kube-agents/operator/platformagent-fields/#spec),
+or read per namespace or with a selector. A session Pod never refuses a read for being busy; it
+waits, then runs.
+
 Two more stacks add to the total:
 
 - **Hindsight memory** (`platformAgent.harness.memory.provider: kube_agents_memory`): the API
@@ -267,7 +277,8 @@ caveat beside it:
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
-the shell sandbox, where the audits run, and passes every name it does not reserve to the
+the shell sandbox, where the audits run, sends `KUBEAGENTS_KUBECTL_COST_TIER` to the A2A gateway for
+its session Pods too, and passes every name it does not reserve to the
 credential proxy and `agent-api-auth` containers. The name in the example reaches the container
 that reads it.
 

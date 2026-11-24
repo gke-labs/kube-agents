@@ -37,6 +37,7 @@ _READINGS_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "vcs_readings.py
 _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
 _MANIFESTS_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
+_CURATOR_METRICS_GO = _REPO_ROOT / "a2a" / "memory" / "metrics.go"
 _A2A_LIB_PAYLOAD_GO = _REPO_ROOT / "a2a" / "lib" / "payload.go"
 _COMMON_TYPES_GO = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _FEEDBACK_SUMMARY_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "feedback_summary.py"
@@ -261,6 +262,18 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _go_const(_WATCHER_METRICS_GO, "processStartTimeMetric"))
         self.assertEqual(name, _py_const("PROCESS_START_TIME_METRIC", _CHAT_METRICS_PY))
         self.assertEqual(name, _go_const(_A2A_METRICS_GO, "processStartTimeName"))
+        self.assertEqual(name, _go_const(_CURATOR_METRICS_GO, "processStartTimeName"))
+
+    def test_decision_memory_series_and_verdicts_are_closed(self):
+        import credential_proxy as cp
+
+        self.assertEqual(
+            _py_const("DECISION_MEMORY_CHECKS_METRIC"),
+            "kubeagents_credential_proxy_decision_memory_checks_total",
+        )
+        self.assertEqual(cp.DECISION_MEMORY_VERDICTS, frozenset({"allow", "warn", "block", "error"}))
+        self.assertEqual(_go_const(_CURATOR_METRICS_GO, "metricsNamespace"), "kubeagents")
+        self.assertEqual(_go_const(_CURATOR_METRICS_GO, "metricsSubsystem"), "curator")
 
     def test_the_counted_outcomes_are_the_brokers_success_and_error(self):
         counted = _go_set(_SCRAPE_GO, "toolInvocationsCountedStatuses")

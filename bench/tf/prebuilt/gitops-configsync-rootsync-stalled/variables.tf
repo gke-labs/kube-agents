@@ -40,6 +40,28 @@ variable "target_resource_name" {
   default     = "root-sync"
 }
 
+variable "reconciler_state" {
+  type        = string
+  description = "What the planted RootSync's reconciler is doing: `stalled` plants the status Config Sync writes when the reconciler cannot come up; `out-of-memory` plants a sync object that reads healthy beside a reconciler pod that is killed for memory in a loop."
+  default     = "stalled"
+  validation {
+    condition     = contains(["stalled", "out-of-memory"], var.reconciler_state)
+    error_message = "reconciler_state must be stalled or out-of-memory."
+  }
+}
+
+variable "memory_limit_mib" {
+  type        = number
+  description = "Memory limit of the stand-in reconciler container, in MiB (out-of-memory state). Must be below allocate_mib."
+  default     = 64
+}
+
+variable "allocate_mib" {
+  type        = number
+  description = "What the stand-in reconciler container allocates at each start, in MiB (out-of-memory state). Must exceed memory_limit_mib."
+  default     = 96
+}
+
 variable "prow_build_id" {
   type        = string
   description = "Prow BUILD_ID of the run creating this infra"

@@ -373,6 +373,7 @@ def healthy_world(*projects):
         "instances": [
             {"name": "startup-fail-seeded", "status": "RUNNING", "zone": "https://x/zones/us-central1-a", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
             {"name": "world-open-seeded", "status": "RUNNING", "networkInterfaces": [{"accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}]},
+            {"name": "serial-flood-seeded", "status": "RUNNING", "zone": "https://x/zones/us-central1-a", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
         ],
         "firewall-rules": [
             {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
@@ -396,8 +397,9 @@ def healthy_world(*projects):
         "clusters": {project: fleet for project in projects},
         "compute": {project: compute for project in projects},
         "github": {pool_repo(project): {NOTE_PATH: SEEDED_NOTE_SHA} for project in projects},
-        # The startup-fail VM's console still holds the boot that ran its script.
-        "serial": {project: {"startup-fail-seeded": 'Script "startup-script" failed with error: exit status 1\n'} for project in projects},
+        # The startup-fail VM's console still holds the boot that ran its
+        # script; the serial-flood VM's holds only its flood filler.
+        "serial": {project: {"startup-fail-seeded": 'Script "startup-script" failed with error: exit status 1\n', "serial-flood-seeded": "eval fixture: serial-flood filler 40960 of 40960\n"} for project in projects},
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
@@ -696,10 +698,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 55, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 56, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 55, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 56, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -766,7 +768,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 109, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 111, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
 
 
     def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
@@ -785,7 +787,7 @@ class Drift(ScanHarness):
         self.assertEqual(len(detail), 1, detail)
         self.assertIn("ready_after_hours 2184", detail[0])
         self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 54, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 55, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
         self.assertEqual(doc["summary"]["not_ready"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 0)
         self.assertEqual(fixture_state.drift_map(doc), {})
@@ -816,7 +818,7 @@ class NotChecked(ScanHarness):
         states = self.states(doc)
         # The project-scoped roles are read with gcloud compute, not through a
         # cluster, so a refused cluster list leaves them readable.
-        project_roles = {"startup-fail-vm", "world-open-ingress", "declared-mtu-peering", "declared-orphan-snapshot", "orphan-snapshot"}
+        project_roles = {"startup-fail-vm", "rotated-console-vm", "world-open-ingress", "declared-mtu-peering", "declared-orphan-snapshot", "orphan-snapshot"}
         self.assertEqual({s for r, s in states.items() if r not in project_roles}, {"not_checked"})
         self.assertEqual({states[r] for r in project_roles}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
