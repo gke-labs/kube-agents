@@ -5114,6 +5114,10 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 			if teams.TenantId != "" {
 				envVars = append(envVars, corev1.EnvVar{Name: "TEAMS_TENANT_ID", Value: teams.TenantId})
 			}
+			// The inbound receiver's audience and caller binding, while it runs
+			// (platformagent_teams_inbound.go): the one caller of the Teams
+			// intake that is not a chat consumer.
+			envVars = append(envVars, teamsInboundBrokerEnv(agent)...)
 		}
 	}
 	// Rendered here, in the broker's managed env and nowhere else: the broker
@@ -5212,6 +5216,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// the a2a-chat role. Rendered only while a relay is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
+		// The Teams inbound receiver's audience and callers: one that could
+		// set them would choose who may post onto the Teams queue.
+		credentialProxyTeamsInboundAudienceEnvVar,
+		credentialProxyTeamsInboundCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
 		// (a2a_report_reader.go, a2aReportsEnvNames).
 		credentialProxyA2AReportsAudienceEnvVar,
@@ -5243,6 +5251,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		// One that could set the hold file would lift an operator's hold.
+		credentialProxyHoldFileEnvVar,
 		credentialProxyCuratorAudienceEnvVar,
 		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
@@ -7472,25 +7482,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
 	// so domain-level filtering is strictly enforced by FQDNNetworkPolicy.
 	if !fqdnEnabled {
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
-			},
-			To: []networkingv1.NetworkPolicyPeer{
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "0.0.0.0/0",
-						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"},
-					},
-				},
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "::/0",
-						Except: []string{"fc00::/7", "fe80::/10", "ff00::/8"},
-					},
-				},
-			},
-		})
+		egressRules = append(egressRules, publicHTTPSEgressRule())
 	}
 
 	// 8. GKE Managed OpenTelemetry Collector (Trace Export). Skipped when the agent is

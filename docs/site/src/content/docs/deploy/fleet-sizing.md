@@ -34,10 +34,13 @@ need the raises below.
 (`charts/kube-agents/values.yaml` defaults an omitted `sizingProfile` to `small`; `install.sh` and `upgrade.sh` default `PLATFORM_AGENT_SIZING_PROFILE`, and Terraform defaults `platform_agent_sizing_profile`, to `auto`, which begins at `small` below 10 clusters and steps up automatically at the 10- and 25-cluster thresholds above.)
 
 The host-cluster row is the one that sizes the operator. The manager caches every Deployment,
-StatefulSet, Service and PersistentVolumeClaim in the cluster it runs in, so a shared host
-cluster with thousands of them needs the operator memory raise even at a small fleet. The other
-rows size the credential proxy, the event watcher and the data volumes, which grow with what the
-agent reads.
+StatefulSet, Service, ConfigMap, ServiceAccount, PersistentVolumeClaim, NetworkPolicy,
+PodDisruptionBudget and RBAC object in the cluster it runs in. Those informers take about 3.7 MiB
+of live heap per 1,000 objects across a balanced mix, and 7.9 to 8.5 MiB per 1,000 StatefulSets or
+Deployments; see [Manager cache and memory sizing](/kube-agents/operator/#manager-cache-and-memory-sizing).
+A shared host cluster with tens of thousands of them therefore needs the operator memory raise even
+at a small fleet. The other rows size the credential proxy, the event watcher and the data volumes,
+which grow with what the agent reads.
 
 ## What each pod needs
 
@@ -104,6 +107,16 @@ The shell's kubectl admission refuses such a read before it starts, with a reaso
 narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet
 whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
 [`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
+
+The operator passes the tier to the shell sandbox and, under the session cluster view, to the
+session Pods the A2A gateway starts. On the `default` tier at the default session memory limit
+(2 GiB), their kubectl runs with no admission. On the `fleet` tier at that limit, a session Pod
+runs the admission against its own memory limit. It refuses a cluster-wide list that the fleet
+figures charge above what one read may take there, such as `kubectl get pods -A`, whatever the
+cluster's real size, as the shell does. Raise the session Pods' limit with
+[`harness.tuning.sessionResources.limits.memory`](/kube-agents/operator/platformagent-fields/#spec),
+or read per namespace or with a selector. A session Pod never refuses a read for being busy; it
+waits, then runs.
 
 Two more stacks add to the total:
 
@@ -241,7 +254,9 @@ sets what the chart exposes for the `fleet` tier, each key with its reason and i
 caveat beside it:
 
 - `operator.resources`: 1 GiB memory, request and limit alike, for a host cluster at or past
-  50,000 objects. The chart's floor on the limit is 512 MiB.
+  50,000 watched objects (or 180 MiB of cached live heap under the per-kind formula in
+  [Manager cache and memory sizing](/kube-agents/operator/#manager-cache-and-memory-sizing)). The
+  chart's floor on the limit is 512 MiB.
 - `platformAgent.storage.size: 100Gi`: both data claims. A claim cannot shrink, and each GiB
   counts twice against a namespace `requests.storage` quota. For a fleet of more than about 230
   clusters, also set `platformAgent.storage.expectedClusterProfiles`
@@ -262,7 +277,8 @@ caveat beside it:
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
-the shell sandbox, where the audits run, and passes every name it does not reserve to the
+the shell sandbox, where the audits run, sends `KUBEAGENTS_KUBECTL_COST_TIER` to the A2A gateway for
+its session Pods too, and passes every name it does not reserve to the
 credential proxy and `agent-api-auth` containers. The name in the example reaches the container
 that reads it.
 

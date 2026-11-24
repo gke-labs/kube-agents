@@ -1,6 +1,8 @@
 package lib
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -68,5 +70,37 @@ func TestValidateTriggerHoldsAScriptToALabel(t *testing.T) {
 	}
 	if err := ValidateTrigger("schedule", TriggerOriginBuiltin, "", "compliance-audit"); err == nil {
 		t.Error("accepted a script on a bare schedule trigger, which names no schedule")
+	}
+}
+
+// triggerScriptNames is the case list AgentSchedule.spec.script's CRD test
+// reads too (k8s-operator TestAgentScheduleScriptNamesEnvtest), so the CRD's
+// rule and this one hold the same names.
+type triggerScriptNames struct {
+	Accepted []string `json:"accepted"`
+	Refused  []string `json:"refused"`
+}
+
+func TestValidateTriggerScriptNamesMatchTheCRD(t *testing.T) {
+	raw, err := os.ReadFile("testdata/trigger-script-names.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names triggerScriptNames
+	if err := json.Unmarshal(raw, &names); err != nil {
+		t.Fatal(err)
+	}
+	if len(names.Accepted) == 0 || len(names.Refused) == 0 {
+		t.Fatalf("the case list is empty: %+v", names)
+	}
+	for _, name := range names.Accepted {
+		if err := ValidateTrigger("schedule/a", TriggerOriginBuiltin, "a", name); err != nil {
+			t.Errorf("script %q refused: %v", name, err)
+		}
+	}
+	for _, name := range names.Refused {
+		if err := ValidateTrigger("schedule/a", TriggerOriginBuiltin, "a", name); err == nil {
+			t.Errorf("script %q accepted", name)
+		}
 	}
 }

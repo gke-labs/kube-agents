@@ -21,8 +21,18 @@ Fail-closed: when the broker is told where the file is and can't read or parse
 it, every cluster target is refused until it can. The variable unset is a broker
 started outside the operator, and excludes nothing.
 
+`spec.hold` is refused the same way, from a file of its own
+(`CREDENTIAL_PROXY_HOLD_FILE`, the `<agent>-hold` ConfigMap's `hold.json`)
+that no pod-template hash covers, so an operator's hold applies, and lifts,
+without a restart. A held cluster keeps its Cluster Agent profile and its place in
+fleet audits; only its Kubernetes API is refused, under `scope.held-cluster`, with the hold's
+reason. `all` holds every cluster. `Exclusions` checks both, so every route that
+refuses an excluded cluster refuses a held one.
+
 Standard library only. No refusal message repeats caller text beyond the three
-name parts, each of which the caller's target already held to `[a-z0-9-]`.
+name parts, each of which the caller's target already held to `[a-z0-9-]`; a
+hold's reason is the operator's text, with control characters dropped and its
+length capped.
 """
 
 from __future__ import annotations
@@ -34,12 +44,22 @@ import threading
 from typing import Callable
 
 SCOPE_FILE_ENV = "CREDENTIAL_PROXY_SCOPE_FILE"
+HOLD_FILE_ENV = "CREDENTIAL_PROXY_HOLD_FILE"
 
 RULE_EXCLUDED_CLUSTER = "scope.excluded-cluster"
 RULE_EXCLUDE_UNREADABLE = "scope.exclude-unreadable"
+RULE_HELD_CLUSTER = "scope.held-cluster"
+RULE_HOLD_UNREADABLE = "scope.hold-unreadable"
 
 EXCLUDE_KEY = "exclude"
 CLUSTERS_KEY = "clusters"
+HOLD_ALL_KEY = "all"
+HOLD_REASON_KEY = "reason"
+# The CRD caps spec.hold.reason at 256; the broker holds it to that too.
+HOLD_REASON_MAX_LENGTH = 256
+HOLD_STOP_NOTICE = (
+    "An operator paused agent access to it; report this and stop, do not retry or work around it"
+)
 CLUSTER_REF_KEYS = ("projectId", "location", "clusterName")
 
 NAME_PART = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -52,6 +72,13 @@ class ExcludedCluster(Exception):
     def __init__(self, rule: str, message: str):
         super().__init__(message)
         self.rule = rule
+
+
+class HeldCluster(ExcludedCluster):
+    """A cluster target an operator's spec.hold pauses, or one it can't vouch for.
+
+    An ExcludedCluster, so every route that answers an exclusion answers a hold.
+    """
 
 
 def parse_exclusions(document: object) -> frozenset[tuple[str, str, str]]:
@@ -71,17 +98,141 @@ def parse_exclusions(document: object) -> frozenset[tuple[str, str, str]]:
     entries = exclude.get(CLUSTERS_KEY)
     if entries is None:
         return frozenset()
+    return _parse_cluster_refs(entries, "exclude.clusters")
+
+
+def _parse_cluster_refs(entries: object, label: str) -> frozenset[tuple[str, str, str]]:
+    """The `(project, location, cluster)` triples of a list the operator renders."""
     if not isinstance(entries, list):
-        raise ValueError("scope.json's exclude.clusters is not a list")
+        raise ValueError(f"{label} is not a list")
     triples = set()
     for entry in entries:
         if not isinstance(entry, dict):
-            raise ValueError("an exclude.clusters entry is not an object")
+            raise ValueError(f"a {label} entry is not an object")
         parts = tuple(entry.get(key) for key in CLUSTER_REF_KEYS)
         if not all(isinstance(part, str) and NAME_PART.match(part) for part in parts):
-            raise ValueError("an exclude.clusters entry lacks a valid projectId, location or clusterName")
+            raise ValueError(f"a {label} entry lacks a valid projectId, location or clusterName")
         triples.add(parts)
     return frozenset(triples)
+
+
+def _matches(triples: frozenset[tuple[str, str, str]], project: str, location: str, cluster: str) -> bool:
+    """Whether a target is one of triples, an entry spelled by project number matching
+    its location and name in any project."""
+    return (project, location, cluster) in triples or any(
+        PROJECT_NUMBER.match(p) and (l, c) == (location, cluster) for p, l, c in triples
+    )
+
+
+class HoldState:
+    """A parsed hold.json: every cluster, these clusters, and the operator's reason."""
+
+    def __init__(self, held_all: bool = False, triples: frozenset = frozenset(), reason: str = ""):
+        self.held_all = held_all
+        self.triples = triples
+        self.reason = reason
+
+    def reason_suffix(self) -> str:
+        return f": {self.reason}" if self.reason else ""
+
+
+def parse_holds(document: object) -> HoldState:
+    """The hold a rendered `hold.json` declares. `{}` holds nothing.
+
+    Raises ValueError on a document that isn't the shape the operator renders,
+    so a malformed hold refuses every cluster rather than none.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("hold.json is not an object")
+    held_all = document.get(HOLD_ALL_KEY, False)
+    if not isinstance(held_all, bool):
+        raise ValueError("hold.json's all is not a boolean")
+    reason = document.get(HOLD_REASON_KEY, "")
+    if not isinstance(reason, str):
+        raise ValueError("hold.json's reason is not a string")
+    entries = document.get(CLUSTERS_KEY)
+    triples = frozenset() if entries is None else _parse_cluster_refs(entries, "hold.clusters")
+    reason = "".join(ch for ch in reason if ch.isprintable()).strip()[:HOLD_REASON_MAX_LENGTH]
+    return HoldState(held_all, triples, reason)
+
+
+class Holds:
+    """The broker's view of spec.hold, re-read when the file changes.
+
+    The same identity check as Exclusions: the ConfigMap directory mount swaps
+    the file in place, and the parse is redone only when it moves. Fail-closed
+    on a configured file it can't read or parse; an unset variable holds nothing.
+    """
+
+    def __init__(self, path: Callable[[], str] = lambda: os.getenv(HOLD_FILE_ENV, "")):
+        self._path = path
+        self._lock = threading.Lock()
+        self._seen: tuple | None = None
+        self._state = HoldState()
+        self._error: str | None = None
+
+    def _load(self) -> tuple[HoldState, str | None]:
+        path = self._path()
+        if not path:
+            return HoldState(), None
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return HoldState(), "the install's hold file can't be read"
+        identity = (path, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        with self._lock:
+            if identity != self._seen:
+                try:
+                    with open(path, encoding="utf-8") as stream:
+                        self._state, self._error = parse_holds(json.load(stream)), None
+                except (OSError, ValueError):
+                    self._state, self._error = HoldState(), "the install's hold file can't be parsed"
+                self._seen = identity
+            return self._state, self._error
+
+    def check_unnamed(self) -> None:
+        """Raise HeldCluster for a call that reaches a cluster this broker can't name."""
+        state, error = self._load()
+        if error is not None:
+            raise HeldCluster(RULE_HOLD_UNREADABLE, f"{error}, so the broker reaches no cluster until it can")
+        if state.held_all:
+            raise HeldCluster(
+                RULE_HELD_CLUSTER,
+                f"every cluster is on hold (spec.hold.all){state.reason_suffix()}. {HOLD_STOP_NOTICE}",
+            )
+        if state.triples:
+            raise HeldCluster(
+                RULE_HELD_CLUSTER,
+                "this install holds clusters, and this call doesn't name its cluster by"
+                " projects/<project>/locations/<location>/clusters/<cluster>; name it that way",
+            )
+
+    def check(self, project: str, location: str, cluster: str) -> None:
+        """Raise HeldCluster when an operator's hold pauses this cluster."""
+        state, error = self._load()
+        if error is not None:
+            raise HeldCluster(
+                RULE_HOLD_UNREADABLE,
+                f"{error}, so the broker can't tell whether this cluster is on hold"
+                " and reaches no cluster until it can",
+            )
+        if state.held_all:
+            raise HeldCluster(
+                RULE_HELD_CLUSTER,
+                f"every cluster is on hold (spec.hold.all){state.reason_suffix()}. {HOLD_STOP_NOTICE}",
+            )
+        if _matches(state.triples, project, location, cluster):
+            raise HeldCluster(
+                RULE_HELD_CLUSTER,
+                f"cluster {cluster} ({project}, {location}) is on hold (spec.hold)"
+                f"{state.reason_suffix()}. {HOLD_STOP_NOTICE}",
+            )
+        if state.triples and PROJECT_NUMBER.match(project):
+            raise HeldCluster(
+                RULE_HELD_CLUSTER,
+                f"project {project} is named by its number while this install holds"
+                " clusters by project ID; name the project by its ID",
+            )
 
 
 class Exclusions:
@@ -89,11 +240,17 @@ class Exclusions:
 
     The mount is a ConfigMap directory, so an edit lands in place; the file's
     identity (inode, size, mtime) is checked on every call and the parse is
-    redone only when it moves.
+    redone only when it moves. Each check also consults the holds (Holds), so a
+    caller of check or check_unnamed refuses a held cluster too.
     """
 
-    def __init__(self, path: Callable[[], str] = lambda: os.getenv(SCOPE_FILE_ENV, "")):
+    def __init__(
+        self,
+        path: Callable[[], str] = lambda: os.getenv(SCOPE_FILE_ENV, ""),
+        holds: "Holds | None" = None,
+    ):
         self._path = path
+        self.holds = holds if holds is not None else Holds()
         self._lock = threading.Lock()
         self._seen: tuple | None = None
         self._triples: frozenset[tuple[str, str, str]] = frozenset()
@@ -134,6 +291,7 @@ class Exclusions:
                 "this install excludes clusters, and this call doesn't name its cluster by"
                 " projects/<project>/locations/<location>/clusters/<cluster>; name it that way",
             )
+        self.holds.check_unnamed()
 
     def check(self, project: str, location: str, cluster: str) -> None:
         """Raise ExcludedCluster when the broker must not reach this cluster."""
@@ -144,9 +302,7 @@ class Exclusions:
                 f"{error}, so the broker can't tell whether this cluster is excluded"
                 " and reaches no cluster until it can",
             )
-        if (project, location, cluster) in triples or any(
-            PROJECT_NUMBER.match(p) and (l, c) == (location, cluster) for p, l, c in triples
-        ):
+        if _matches(triples, project, location, cluster):
             raise ExcludedCluster(
                 RULE_EXCLUDED_CLUSTER,
                 f"cluster {cluster} ({project}, {location}) is excluded by this install's"
@@ -158,3 +314,4 @@ class Exclusions:
                 f"project {project} is named by its number while this install excludes"
                 " clusters by project ID; name the project by its ID",
             )
+        self.holds.check(project, location, cluster)

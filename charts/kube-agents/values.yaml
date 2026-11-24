@@ -384,6 +384,16 @@ litellm:
   # same name here. envFrom does not roll the pods on a Secret change:
   # `kubectl rollout restart deployment/litellm` after rotating it.
   envFromSecret: ""
+  masterKey:
+    # The gateway's admin key, in the litellm-master-key Secret (key
+    # LITELLM_MASTER_KEY). true: the chart generates it on first install and
+    # keeps it across upgrades with lookup. false: the chart renders no Secret
+    # and reads litellm-master-key only if you created it; without it the
+    # gateway runs with no admin key, and the caller-auth hook still checks
+    # every caller. Set false where the chart is rendered offline (Argo CD and
+    # other helm template pipelines), where lookup finds nothing and a
+    # generated key would change on every render.
+    generate: true
   # Empty selects the per-provider default (mirrors common.sh).
   # A Claude model (anthropic, vertex_ai with a claude-* name, or sap with an
   # anthropic--* name) gets
@@ -1435,11 +1445,12 @@ platformAgent:
       #     memory: 384Mi
       # defaultRoute is where the A2A gateway sends a plain conversation's first
       # message: platform to the Platform Agent, session to a session pod of the
-      # conversation's own. Unset means platform; a later release flips the
-      # default to session. The Platform Agent stays reachable by handle either
-      # way. A change rolls the gateway and the Platform Agent pod. Against a
-      # PlatformAgent CRD that predates the field the chart fails; apply crds/
-      # first (upgrade.sh does).
+      # conversation's own. Unset means platform, today's behaviour. session
+      # opts in, with the session cap fitted to the bus's TASKS stream
+      # (status.effectiveSessionCap). The Platform Agent stays reachable by
+      # handle either way. A change rolls the gateway and the Platform Agent
+      # pod. Against a PlatformAgent CRD that predates the field the chart
+      # fails; apply crds/ first (upgrade.sh does).
       # defaultRoute: platform
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
@@ -1556,7 +1567,8 @@ platformAgent:
     # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table
     # (deploy/sandbox/kubectl-costs.json) its admission charges fleet-wide reads
     # from; "fleet" for clusters of tens of thousands of Pods, unset for
-    # "default". Also forwarded to the shell sandbox only.
+    # "default". Forwarded to the shell sandbox and, under the session
+    # cluster view, to the A2A gateway for the session pods it starts.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
@@ -1916,6 +1928,9 @@ platformAgent:
   # The credential broker and kube-proxy refuse every route to an excluded
   # cluster's Kubernetes API; the project's cluster list and a cluster's
   # describe stay readable. Spell the project by its ID.
+  # spec.hold, an operator's pause on clusters, is not a chart value: set it on
+  # the PlatformAgent with kubectl patch; the chart never renders it, so an
+  # upgrade leaves it in place.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
@@ -2129,6 +2144,17 @@ platformAgent:
       homeChannel: ""
       # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
       adaptiveCards: true
+      # The receiver for the messages Microsoft delivers to the bot. Off, the
+      # bot can post to Teams but a message typed in Teams does not reach the
+      # agent: Bot Framework delivers by an HTTPS request to the address
+      # registered for the bot, and nothing in the install listens for it. On,
+      # the operator runs a small pod that verifies Microsoft's signed token on
+      # each request, pins tenantId (required), and hands the message to the
+      # broker's Teams queue; expose its Service (<agent>-teams-inbound, port
+      # 8100, path /api/v1/teams/events) with your own Ingress and TLS
+      # certificate and register that address as the bot's messaging endpoint.
+      inbound:
+        enabled: false
 
 # AgentPlugins deployed into the cluster.
 plugins:
@@ -2333,6 +2359,45 @@ profiles:
       activeDeadlineSeconds: 1800
       ttlSecondsAfterFinished: 600
     concurrency: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  # The fleet-audit profile (#5623, #5620): the parent of the install's
+  # fleet-wide scheduled audits and of onboarding's first inventory
+  # (`agents/fleet-audit/persona`). It reads no cluster itself: each cluster's
+  # checks run as a delegated `cluster` task. Off until the onboarding PR runs
+  # a schedule on it.
+  fleetAudit:
+    enabled: false
+    description: >-
+      Fleet-wide audit runner: hands each in-scope cluster's read-only checks
+      to the cluster profile as one delegated task per cluster, collects their
+      results, and composes the audit's findings and report. Never reads or
+      changes a cluster itself.
+    persona:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/persona-fleet-audit
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+    harness:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+      model: model-default
+      maxTurns: 120
+    # A scheduled audit runs at unattended. No read tier until the persona
+    # can do an on-demand run: a read tier on the card makes the profile a
+    # delegate target of every chat session, and today a run without dry_run
+    # only says it can't and stops.
+    allowedTiers:
+      - unattended
+    lifecycle:
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 600
+    concurrency: 1
     resources:
       requests:
         cpu: 250m

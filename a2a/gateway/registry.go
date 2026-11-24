@@ -356,7 +356,7 @@ type TaskRef struct {
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// Tier is the tier a task addressed to an AgentProfile runs at; empty
 	// for a task addressed to platform or a session. A profile task's child
-	// runs at its tier, and the child's end reaches it as a childResult on
+	// runs at its tier (at read below an unattended task, #6744), and the child's end reaches it as a childResult on
 	// its .in rather than as a wake (deliverChildResult).
 	Tier string `json:"tier,omitempty"`
 	// Scope is a profile task's scope, recorded at mint: its target's
@@ -372,6 +372,11 @@ type TaskRef struct {
 	// profile task waiting open. Carried rather than walked, because the
 	// bounded history can evict an ancestor and a walk would then miss it.
 	ProfileChain []string `json:"profileChain,omitempty"`
+	// Scheduled marks a profile task below a scheduled run (#6744): a child
+	// of an unattended task, or of one marked. Carried down the chain at
+	// mint, like ProfileChain, so a grandchild's profile is held to the
+	// same card check as a child's even though both run at read.
+	Scheduled bool `json:"scheduled,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.

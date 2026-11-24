@@ -19,9 +19,10 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `suspend` | `boolean` | no |  |  | Suspend skips every run while true. A slot that passes while suspended is counted, not run later. |
 | `profileRef` | `object` | yes |  |  | ProfileRef is the AgentProfile the runs go to. It must allow the unattended tier. |
 | `profileRef.name` | `string` | yes |  | min length `1`; max length `63` | Name is the AgentProfile's name, in the schedule's namespace. |
-| `prompt` | `string` | yes |  | min length `1`; max length `16384` | Prompt is what each run asks. |
+| `prompt` | `string` | no |  | min length `1`; max length `16384` | Prompt is what each run asks. Exactly one of prompt and script is set. |
+| `script` | `string` | no |  | min length `1`; max length `63`; pattern `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$` | Script names a helper script each run executes in place of a model turn: one of the profile's spec.scripts, by name, never a path. It is a DNS-1123 label (no dots), as the run's trigger carries it. Exactly one of prompt and script is set. Only a built-in schedule, one the PlatformAgent renders, may name a script: any other schedule that does is not accepted, and never runs. |
 | `parameters` | `map[string]string` | no |  | max properties `16` | Parameters are passed to each run as task parameters, at most 16, the bound every task submission has. A built-in schedule's report stream is its own name, carried on its trigger, not a parameter. |
-| `skills` | `[]string` | no |  | max items `16` | Skills the run asks the profile to use. |
+| `skills` | `[]string` | no |  | max items `16` | Skills the run asks the profile to use. A script run takes none: set it only with prompt. |
 | `delivery` | `object` | no | `{}` |  | Delivery is where each run's report goes. Omitted, it is the home channel (chat). |
 | `delivery.mode` | `string` | no | `chat` | one of `chat`, `local` | Mode is chat (the home channel) or local (kept, not posted). |
 | `delivery.silentWhenClean` | `boolean` | no |  |  | SilentWhenClean posts nothing for a run that found nothing. |
@@ -29,7 +30,7 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `concurrencyPolicy` | `string` | no | `Forbid` | one of `Forbid` | ConcurrencyPolicy is Forbid, the one policy: a slot that comes due while a run is still going is skipped and counted. |
 | `startingDeadlineSeconds` | `integer` | no | `900` | min `60`; max `86400` | StartingDeadlineSeconds is how late a slot may still start. A slot missed by more (an operator outage, a gateway that stayed down) is counted and skipped. Defaults to 900. |
 | `activeDeadlineSeconds` | `integer` | no |  | min `60`; max `86400` | ActiveDeadlineSeconds bounds a run. Past it, plus a grace, a run that never reported a terminal is recorded Lost and the schedule moves on. Unset, it is the profile's lifecycle.activeDeadlineSeconds, the ceiling its Job runs under. |
-| `maxTurns` | `integer` | no |  | min `1`; max `1000` | MaxTurns caps the run's model turns. |
+| `maxTurns` | `integer` | no |  | min `1`; max `1000` | MaxTurns caps the run's model turns. A script run takes none: set it only with prompt. |
 
 ## Status
 

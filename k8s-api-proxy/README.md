@@ -1,8 +1,8 @@
 # k8s-api-proxy
 
 The Kubernetes API proxy for the agent sandbox and A2A session pods (`<agent>-kube-proxy` deployment). Each caller's
-`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
-authenticates the caller (a `CallerAuthenticator`; the binary uses `pkg/tokenreview`), applies a per-request policy
+`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...` by default, without `--upstream-url`), and the proxy
+authenticates the caller (a `CallerAuthenticator`; the binary defaults to `pkg/tokenreview`), applies a per-request policy
 (`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
 caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), impersonation,
 `Audit-ID` and `Connection`-named headers (`pkg/k8sapiproxy/headers.go`), forwards the request to
@@ -11,26 +11,48 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
 `cmd/k8s-api-proxy` builds the production server binary.
 
-`tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's `CallerAuthenticator`: it accepts a bearer token
+`tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
 
-`jwtauth.NewAuthenticator` (`pkg/jwtauth`) is for an embedder whose platform mints a signed token
-per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer
+`jwtauth.NewAuthenticator` (`pkg/jwtauth`, `--auth-mode=jwt` in the binary) is for a platform that
+mints a signed token per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer
 JWT that names its key (`kid`), verifies against the issuer's JSON Web Key Set fetched over HTTPS
 (RS\*, PS\* or ES\*; never a symmetric algorithm), and carries the configured issuer, one of the
-configured audiences, and an expiry it has not passed by more than a minute of clock skew. The
-username and groups come from configurable claims (`sub` by default). An optional `Allow` func
+configured audiences, and an expiry it has not passed by more than a minute of clock skew. A
+bearer token over 16 KiB is refused before it is parsed, and one whose unverified `iss` is not the
+configured issuer is refused before any key set lookup, so another issuer's tokens cause no fetch. The
+username, UID, groups and partition come from configurable claims (`UsernameClaim`, `UIDClaim`,
+`GroupsClaim`, `PartitionClaim`; the username and UID are `sub` by default). Each is a claim path:
+dots separate the keys of nested JSON objects, and `\.` is a dot inside a key, so
+`example\.io.tenant` reads `claims["example.io"]["tenant"]`. This changes `UsernameClaim` and
+`GroupsClaim` for an embedder: they were top-level claim names, so a value holding a dot (such as
+`example.io/user`) is now read as a path and must be written with each dot escaped
+(`example\.io/user`). The grammar has that one escape: a backslash anywhere else is itself, so a
+key that ends in a backslash and is followed by a nested key cannot be expressed. A token without a non-empty string at a configured username, UID or
+partition path is refused; `PartitionClaim` fills `CallerIdentity.Partition` and never falls back
+to an empty partition. `AllowedPartitions` admits only the listed partitions (a list with only
+empty entries is an error, not "any"), and
+`RequiredSubPrefix` only a `sub` that starts with it. An optional `Allow` func
 can refuse a caller; without one, every token the issuer mints for that audience is admitted. The
 key set is cached for an hour and fetched again when a token names a key it lacks, at most every
 ten seconds whether or not the fetch succeeds, so a rotated key works without a restart. Keys the
 library cannot use (an unsupported type, an encryption key) are skipped. A key set that cannot be
 fetched is a 503, except that a key already cached keeps verifying for up to six hours past the
 set's expiry.
+`Config.KeySetURL` is optional when the issuer is an `https://` URL: the key set URL is then the
+`jwks_uri` of the metadata at `<issuer>/.well-known/openid-configuration`, used only when the
+metadata's `issuer` equals the configured one exactly and its `jwks_uri` is `https://`. Discovery
+runs as part of every key set fetch, under the same ten-second limit, so a key set the issuer
+moved is followed at the next fetch; metadata that cannot be fetched or used is a 503, except that
+cached keys keep verifying as below. The issuer must then have no query or fragment. A redirect on either fetch is
+followed only on `https://` to the host and port being fetched, a configured `KeySetURL` included.
+`Config.CAFile` names a PEM bundle of the roots the key set's and the metadata's server is
+verified against instead of the system roots; it is re-read when it changes, like the server
+certificate below, and the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
 
-`pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
-`gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
+`upstream.Transport` (`upstream.New`, distinct from `upstream.StaticTransport` below) sends `in-cluster`, and the proxy's `--host-cluster-id` `gke_` cluster, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
 Application Default Credentials): it describes the cluster through the Container API and picks its
 endpoint by rules 1, 2 and 4 of
@@ -41,9 +63,10 @@ seconds. An IP endpoint is verified against the cluster's own CA and never the s
 `http://` endpoint and a redirect are refused, and a `kind-` cluster has no upstream.
 
 The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) when the request
-ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
+ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller (with its partition and the authenticator that admitted it, when the
+authenticator names them), the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
-`unauthenticated`, `auth_unavailable` when the TokenReview fails, `refused` with its reason,
+`unauthenticated`, `auth_unavailable` when the TokenReview or a key set fetch fails, `refused` with its reason,
 `upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap
 answered 429, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
 written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
@@ -92,6 +115,20 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
+and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
+empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
+give its path to both flags. Files without a matching certificate and key stop the proxy at
+startup. The files are reloaded
+without a restart (`pkg/certreload`): at most once a second, a TLS handshake checks their size,
+modification time, device and inode (so a Secret or projected volume's `..data` symlink swap is
+seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
+not load, such as one read mid-rotation, is logged, counted in
+`kubeagents_kube_proxy_certificate_reload_failures_total`, and the last good certificate keeps
+being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
+`Transport` verifies each new connection against the current bundle, with hostname and IP SAN
+checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
+
 Cached responses and coalesced fetches are shared across callers, which is safe while the
 `UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
 transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
@@ -108,6 +145,63 @@ archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` 
 archive was built for; the `kube-proxy` image prints the commit it was built from, and a local build
 prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
 it carry none.
+
+For standalone sidecar or loopback bridge deployments outside a host cluster, `cmd/k8s-api-proxy`
+provides opt-in flags. `--auth-mode=none` (`KUBE_PROXY_AUTH_MODE`; default `token-review`)
+skips `TokenReview` setup, records `caller_username` as `unauthenticated`, logs a startup warning,
+and rejects `--allowed-callers`, `CREDENTIAL_PROXY_SESSION_AUDIENCE`, and
+`CREDENTIAL_PROXY_SESSION_CALLERS`. `--auth-mode=none` requires `--listen-addr`
+(`KUBE_PROXY_LISTEN_ADDR`) to be set explicitly, for example `127.0.0.1:8443` on a host loopback
+bridge. `--upstream-url=<url>` (`KUBE_PROXY_UPSTREAM_URL`) forwards
+`in-cluster` requests to one static `http://` or `https://` endpoint through `upstream.NewStatic`
+(`StaticConfig`, `StaticTransport`) without cloud credentials. It rejects `--host-cluster-id`,
+`--container-api-url`, `--scope-file`, `--hold-file`, `--exclude-host-cluster-id`, and
+`CREDENTIAL_PROXY_SCOPED_SA_POOL`, and sets `Config.DefaultClusterID` to `in-cluster` so bare
+`/api/...` and `/clusters/in-cluster/...` paths both work (`SplitClusterPathWithDefault`).
+`--deny-streaming` (`KUBE_PROXY_DENY_STREAMING`, `Policy.DenyStreaming`) refuses `watch` requests,
+`log` `follow` streams (`ReasonStreamingBlocked`), and protocol upgrades with `403 Forbidden`, and
+rejects `--allow-upgrade-subresources`.
+
+`--auth-mode` also takes `jwt`, alone or in a comma-separated list with `token-review`
+(`token-review,jwt`); `none` cannot be combined. `jwt` verifies callers with `pkg/jwtauth`, configured by
+the flags below, each defaulting to its environment variable. `--allowed-callers` is required only
+when `token-review` is listed, so `--auth-mode=jwt` with `--upstream-url` needs no host cluster
+ServiceAccount files. The binary sets no `Allow` func: it admits every token the issuer signs for
+one of the audiences, narrowed only by `--jwt-required-sub-prefix` and `--jwt-allowed-partitions`.
+A flag of an authenticator that is not listed (`--jwt-*` without `jwt`; `--allowed-callers` or the
+session variables without `token-review`) stops the proxy at startup instead of being ignored.
+Values are trimmed, and a whitespace-only value is unset.
+
+| Flag                        | Environment variable                 | Meaning                                                                                                            |
+| --------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `--jwt-issuer`              | `KUBE_PROXY_JWT_ISSUER`              | The `iss` a token must carry. Required.                                                                            |
+| `--jwt-jwks-url`            | `KUBE_PROXY_JWT_JWKS_URL`            | The key set's `https://` URL. Optional when the issuer is an `https://` URL (discovery).                           |
+| `--jwt-audiences`           | `KUBE_PROXY_JWT_AUDIENCES`           | Comma-separated `aud` values accepted. At least one is required.                                                   |
+| `--jwt-username-claim`      | `KUBE_PROXY_JWT_USERNAME_CLAIM`      | Claim path of the username; `sub` when empty.                                                                      |
+| `--jwt-uid-claim`           | `KUBE_PROXY_JWT_UID_CLAIM`           | Claim path of the UID; `sub` when empty.                                                                           |
+| `--jwt-groups-claim`        | `KUBE_PROXY_JWT_GROUPS_CLAIM`        | Claim path of the groups, a string or a list of strings.                                                           |
+| `--jwt-partition-claim`     | `KUBE_PROXY_JWT_PARTITION_CLAIM`     | Claim path of the caller's partition; a token without it is refused.                                               |
+| `--jwt-required-sub-prefix` | `KUBE_PROXY_JWT_REQUIRED_SUB_PREFIX` | Prefix the token's `sub` must start with.                                                                          |
+| `--jwt-allowed-partitions`  | `KUBE_PROXY_JWT_ALLOWED_PARTITIONS`  | Comma-separated partitions admitted; needs `--jwt-partition-claim`. Only separators is an error.                   |
+| `--jwt-ca-file`             | `KUBE_PROXY_JWT_CA_FILE`             | PEM bundle of the roots the issuer's server is verified against (`Config.CAFile`).                                 |
+| `--partition-by-caller`     | `KUBE_PROXY_PARTITION_BY_CALLER`     | `none` (default), `partition` or `username`: what `Config.CallerPartition` separates by. Passed empty is an error. |
+
+A list of several authenticators tries them in order and admits the caller the first one accepts.
+When none does, the answer is a 503 if any of them could not decide (a failed TokenReview, a key
+set or metadata that could not be fetched), and a 401 only when every one refused. Every listed
+authenticator sees the request's original `Authorization` header until one accepts it, so with `token-review` first a
+platform-issued token is sent to the host cluster's TokenReview API before `jwt` verifies it;
+list `jwt` first to keep it local. The audit record's `caller_authenticator` is the mode that
+admitted the caller (`token-review` or `jwt`, set by the binary for a single mode too), so a JWT
+caller named like a ServiceAccount is told apart from it.
+
+`--partition-by-caller=partition` keeps cached responses and coalesced fetches within one
+`CallerIdentity.Partition`, and needs `jwt` with `--jwt-partition-claim`; in a list with
+`token-review`, the callers TokenReview admits carry no partition and share the empty one.
+`--partition-by-caller=username` keeps them within one username, whichever authenticator named
+it, and is refused at startup with more than one mode in `--auth-mode`, where two authenticators
+could name different callers alike. The binary's upstreams pick no credential per caller, so the
+partition separates what callers can read from the cache, not what the upstream authorizes.
 
 It is a self-contained Go module. Run its checks from this directory:
 
