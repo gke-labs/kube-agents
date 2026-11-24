@@ -834,8 +834,8 @@ argv, and a profile task's call go to the broker as above. The read carries the
 `X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
 cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
 `get-credentials`, which refuses that cluster itself. The header only narrows:
-without it the read is unchanged, so other control-plane reads of an excluded
-cluster stay allowed.
+without it the read is unchanged, so the reconcile's existence check of an
+excluded cluster stays allowed.
 
 Consequences:
 

@@ -155,6 +155,13 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 # script row may name, root-owned and not worker-writable as script mode
 # requires. tests/test_worker_fleet_audit_scripts.py holds this list to its
 # sources, and the directory to that root.
+# The directories first, so they're 0755: a COPY --chmod creates every
+# missing directory on its destination path with the files' mode (BuildKit's
+# fsutil MkdirAll), and under buildx, which publishes the images, that left
+# /opt/kube-agents, the script root and this directory 0644, which the
+# worker's user can't enter. A directory that exists keeps its mode. mkdir
+# changes no mode test_script_root_ownership.py would have to vouch for.
+RUN mkdir -p /opt/kube-agents/scripts/fleet-audit
 COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
      agents/platform/skills/fleet-audit/scripts/report_status.py \
      agents/platform/skills/fleet-audit/scripts/manifest_delta.py \

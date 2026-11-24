@@ -1767,6 +1767,8 @@ class AnswerFirstVerifier(BaseVerifier):
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
 _TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
 _wrapped_tool_names = worker_trajectory.wrapped_tool_names
+# The wrapper's own top-level arguments, as Hermes reads them.
+_WRAPPER_OWN_ARGS = frozenset({"name", "arguments", "calls"})
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -1915,7 +1917,11 @@ class ToolCalledVerifier(BaseVerifier):
     A name in ``tool_names`` therefore also matches a ``tool_call`` entry
     whose wrapped name or ``calls`` list names it, else a worker's MCP calls
     would be invisible to this check by name. One wrapper entry counts once
-    however many of its calls match; ``require_success`` reads the wrapper's status.
+    however many of its calls match; ``require_success`` reads the wrapper's status,
+    which the pod takes on the tool's answer inside Hermes' ``<untrusted_tool_result>``
+    envelope (``worker_trajectory``'s ``failed``). The pod reads a worker wrapper's
+    names before it clips the arguments and records them on the entry, so a wrapper
+    too long to parse is still counted by name.
 
     ``agent``: optional Python regular expression. When set, only trajectory
     entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful
@@ -2033,7 +2039,13 @@ class ToolCalledVerifier(BaseVerifier):
                 if re.fullmatch(pattern, str(args[name])) is None:
                     return False
                 continue
-            if not clipped:
+            # A wrapper the pod named (`wrapped`) is counted by name though its
+            # arguments were clipped. Its own arguments are the wrapped call's
+            # name and arguments, which this filter does not read through, so
+            # an argument that is not one of the wrapper's own rules the call
+            # out as it does for a wrapper that fits, and as it did before the
+            # pod named it. One of its own that the clip cut is undecided.
+            if not clipped or (worker_trajectory.WRAPPED_NAMES_KEY in entry and name not in _WRAPPER_OWN_ARGS):
                 return False
             undecided = True
         return None if undecided else True
@@ -10362,8 +10374,9 @@ class AuditReportStoredVerifier(_StoredReportVerifier):
     from an older image, with no key, is read by ``finished_at`` alone -- has
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
-    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``,
+    which fails any other value and meets a required ``null``), has, for each
+    ``required_finding_phrases`` entry, a finding
     in its ``document`` whose id contains it, and has no finding whose id
     contains a ``forbidden_finding_phrases`` entry (the silent half of a case
     that plants a look-alike the check must leave alone), and, for each

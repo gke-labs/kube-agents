@@ -11682,8 +11682,12 @@ spec:
                             Kubernetes API, for every caller, the agents' own commands included: a
                             kubeconfig, get-credentials, kube-proxy, the watchers' relay and the gke
                             MCP server's in-cluster tools. Spell entries by project ID: one spelled
-                            by project number refuses its location and name in any project. Reads of the GKE control plane stay allowed (the project's cluster
-                            list, a cluster's describe), and these still cover it through them only:
+                            by project number refuses its location and name in any project. A GCP
+                            metadata read that names it is refused too (a cluster describe, a
+                            node-pool read, the gke MCP server's get_cluster, get_node_pool and
+                            list_node_pools), and a logging read leaves out its entries. Project-wide
+                            reads stay allowed (the project's cluster list, for one), and these
+                            still cover it through them only:
                             the daily upgrade-readiness watch's version table (its in-cluster
                             readiness rules skip the cluster), the networking audit's subnet usage,
                             the GCE audit's instance listing, and the gke MCP server's list_clusters.
@@ -12826,6 +12830,21 @@ spec:
                         whatever a hand-edited config says. Absent when the entry states none, so the
                         model thinks at its own default, and absent while the served CRD predates it.
                       type: string
+                  type: object
+                inferenceKeys:
+                  description: |-
+                    InferenceKeys records the inference gateway key Secrets the operator
+                    created. Absent until it creates one, and while the served CRD predates
+                    the field, in which case the operator creates none.
+                  properties:
+                    secretUIDs:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        SecretUIDs maps each such Secret's name to the UID it was created with.
+                        A tier key's Secret is in the profile namespace; every other one is in
+                        the PlatformAgent's namespace.
+                      type: object
                   type: object
                 lastReconcileTime:
                   description:
