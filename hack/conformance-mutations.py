@@ -824,6 +824,20 @@ MUTATIONS: list[Mutation] = [
         "and a values file decides whether the role reaches tiers",
     ),
     Mutation(
+        "C1-web-console-holds-the-gateway-master-key",
+        "charts/kube-agents/templates/web-console.yaml",
+        ("            - name: RELEASE_CHECK\n",
+         "            - name: LITELLM_MASTER_KEY\n"
+         "              valueFrom:\n"
+         "                secretKeyRef:\n"
+         "                  name: litellm-master-key\n"
+         "                  key: LITELLM_MASTER_KEY\n"
+         "            - name: RELEASE_CHECK\n"),
+        "test_C1_the_gateway_master_key_reaches_only_the_gateway_container",
+        "hand the web console the gateway's master key so its /model/info call "
+        "keeps working once the gateway checks keys",
+    ),
+    Mutation(
         "A4-web-console-reads-tiers",
         "charts/kube-agents/templates/web-console.yaml",
         ('    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]',
@@ -899,6 +913,15 @@ MUTATIONS: list[Mutation] = [
         "test_B1_kubectl_write_verbs_are_refused",
         "add delete to the read allowlist -- the single-line change an "
         "operator makes to unblock a skill",
+    ),
+    Mutation(
+        "B1-write-refusal-mark-any-read-only-refusal",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),\n", "            ,\n"),
+        "test_B1_the_broker_marks_only_a_refused_write_as_one",
+        "mark every read-only refusal a write refusal, the shorter rule: a "
+        "profile task then stops at a refused read spelling and reports a "
+        "write it never attempted",
     ),
     Mutation(
         "B1-image-gate",
