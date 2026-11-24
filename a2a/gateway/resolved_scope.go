@@ -64,6 +64,35 @@ type resolvedScope struct {
 	State            string        `json:"state"`
 	ExcludedProjects []string      `json:"excludedProjects"`
 	Projects         []resolvedRow `json:"projects"`
+	// Clusters is the publisher's listing of each member project's
+	// clusters (#5621), kept raw: it is read only for the scopeClusters
+	// page (resolvedClustersOf), so a malformed listing costs the page, never
+	// the admissions the rows decide.
+	Clusters json.RawMessage `json:"clusters,omitempty"`
+}
+
+// resolvedClusters is one member project's entry in the document's
+// `clusters` map: when its listing was read, and its clusters as
+// [location, name] pairs. A probe that fails keeps the previous entry, `at`
+// included; a project with no entry is one no probe has listed.
+type resolvedClusters struct {
+	At       string     `json:"at"`
+	Clusters [][]string `json:"clusters"`
+}
+
+// resolvedClustersOf is doc's `clusters` map, or false when the document
+// has none to give: no document, one whose state admits nothing, no map (the
+// publisher drops it first when the document is over its budget, and omits
+// an empty one), or a map that doesn't parse.
+func resolvedClustersOf(doc *resolvedScope) (map[string]resolvedClusters, bool) {
+	if doc == nil || doc.V != resolvedScopeVersion || doc.State != resolvedScopeStateOK || len(doc.Clusters) == 0 {
+		return nil, false
+	}
+	var out map[string]resolvedClusters
+	if err := json.Unmarshal(doc.Clusters, &out); err != nil || out == nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // resolvedRow is one container- or selector-derived member project.
@@ -251,12 +280,37 @@ func (g *Gateway) checkScope(decl *scopeDeclaration, t clusterTarget) error {
 	if !errors.As(err, &unresolved) || g.resolvedScope == nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), resolvedScopeReadTimeout)
-	defer cancel()
-	doc, lerr := g.resolvedScope.load(ctx)
+	doc, lerr := g.loadResolvedScope()
 	if lerr != nil {
 		g.log.Warn("resolved scope unreadable; refusing the target", "target", t.String(), "err", lerr)
-		doc = nil
 	}
 	return checkResolvedScope(doc, decl, time.Now(), t)
+}
+
+// loadResolvedScope is the resolved scope document, bounded by
+// resolvedScopeReadTimeout: nil with the error when it can't be read, and nil
+// when the gateway reads none.
+func (g *Gateway) loadResolvedScope() (*resolvedScope, error) {
+	if g.resolvedScope == nil {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), resolvedScopeReadTimeout)
+	defer cancel()
+	doc, err := g.resolvedScope.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return doc, nil
+}
+
+// scopeVerdict is checkScope against a document already read (nil for
+// none): the same two steps, so a caller checking many targets reads the
+// document once and every verdict comes from the same one.
+func (g *Gateway) scopeVerdict(decl *scopeDeclaration, doc *resolvedScope, armed bool, now time.Time, t clusterTarget) error {
+	err := checkTargetScope(decl, g.cfg.ManagementProject, t)
+	var unresolved errUnresolved
+	if !errors.As(err, &unresolved) || !armed {
+		return err
+	}
+	return checkResolvedScope(doc, decl, now, t)
 }
