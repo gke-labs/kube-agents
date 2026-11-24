@@ -105,6 +105,41 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+class _SteppedClockLoop(asyncio.SelectorEventLoop):
+    """An event loop that jumps its clock to the next timer instead of waiting for it.
+
+    The loop runs timers in the order of their due times and at exactly those
+    times on its own clock, however long the process stalls between them.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._clock = 0.0
+        wait = self._selector.select
+
+        def step(timeout=None):
+            # A timeout is the loop's wait for its next timer: take it at once.
+            if timeout:
+                self._clock += timeout
+                timeout = 0
+            return wait(timeout)
+
+        self._selector.select = step
+
+    def time(self):
+        return self._clock
+
+
+def _run_on_stepped_clock(coro):
+    """Run ``coro`` with the loop's timers and the runtime's ``time.monotonic`` on one stepped clock."""
+    loop = _SteppedClockLoop()
+    try:
+        with mock.patch.object(runtime.time, "monotonic", loop.time):
+            return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 class _Client:
     """A Slack client that records the calls this patch makes."""
 
@@ -1691,8 +1726,9 @@ class PlanTest(_RuntimeCase):
 
     def test_a_card_answered_beside_a_newer_plan_ends_on_its_own_timer(self):
         # The answered plan is armed well after the newer plan, so the newer
-        # plan's lapse is not what ends its processing. Every step sits at
-        # least 150 ms from the timer it must precede or follow.
+        # plan's lapse is not what ends its processing. The loop's timers and
+        # the runtime's time.monotonic read one stepped clock, so each lapse
+        # runs at its due time and no wall-clock margin decides the order.
         hold = 0.5
 
         async def scenario(adapter):
@@ -1711,7 +1747,7 @@ class PlanTest(_RuntimeCase):
 
         adapter = _Adapter()
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", hold):
-            _run(scenario(adapter))
+            _run_on_stepped_clock(scenario(adapter))
 
     def test_a_rolling_card_answered_after_the_lapse_resumes_its_plan(self):
         async def scenario(adapter):
