@@ -372,6 +372,11 @@ POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_na
 MONITORING_CURL_PREFIX = 'curl -sG --oauth2-bearer "$(gcloud auth print-access-token)"'
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
+# The CPU peak's primary period. `ALIGN_RATE` averages the counter over its
+# bucket, so `USAGE_ALIGNMENT_S` reads a 45-second burst at the limit as 15%
+# of that limit. 60 seconds is the period the metric is sampled at; memory's
+# `ALIGN_MAX` averages nothing and keeps the wider bucket.
+CPU_USAGE_ALIGNMENT_S = 60
 # Cloud Monitoring's aggregation enums, as the query string spells them.
 ALIGN_RATE = "ALIGN_RATE"
 ALIGN_MAX = "ALIGN_MAX"
@@ -1361,11 +1366,12 @@ def _pod_series_params(
     primary: str, secondary: str, window_hours: int,
 ) -> dict:
     """The query `_read_pod_series` sends, less paging; its label renders the same dict."""
+    alignment_s = CPU_USAGE_ALIGNMENT_S if metric == CPU_METRIC else USAGE_ALIGNMENT_S
     return {
         "filter": f'metric.type="{metric}" AND {_cluster_filter(cluster, location)}' + (MEM_NON_EVICTABLE_FILTER if metric == MEM_METRIC else ""),
         "interval.startTime": start.strftime(MONITORING_TIME_FORMAT),
         "interval.endTime": now.strftime(MONITORING_TIME_FORMAT),
-        "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
+        "aggregation.alignmentPeriod": f"{alignment_s}s",
         "aggregation.perSeriesAligner": primary,
         "aggregation.crossSeriesReducer": REDUCE_SUM,
         "aggregation.groupByFields": POD_GROUP_BY_FIELDS,
