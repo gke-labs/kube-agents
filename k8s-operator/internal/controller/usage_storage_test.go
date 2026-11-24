@@ -95,27 +95,91 @@ func TestDataVolume_ConditionCrossesWithHysteresis(t *testing.T) {
 	}
 }
 
-// The condition's message names the figures and, when True, what to do. It is
-// written when the status changes and left alone while it holds, so a volume
-// filling slowly does not rewrite the condition on every poll.
-func TestDataVolume_MessageIsWrittenOnTransition(t *testing.T) {
+// The condition's message names the two lines that decide the status, where
+// the current figures are and, when True, what to do. It holds no figure of
+// its own, so it is the same at a later poll on a fuller volume, and it stays
+// true there.
+func TestDataVolume_MessageHoldsNoFigureAndStaysTrue(t *testing.T) {
 	h := dataVolumeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)))
 	h.stub.setDataVolume(gatewayAddr(), testVolume, freeAt(92))
 	h.poll(5)
 	cond := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition)
-	if cond == nil || !strings.Contains(cond.Message, "92% full (9.2 of 10.0 GiB used)") || !strings.Contains(cond.Message, dataVolumeNearlyFullHint) {
-		t.Fatalf("True message = %q", cond.Message)
+	want := "The agent's data volume reached 90% full and is not back under 85%. " +
+		"The current figures are in status.storageStatus (capacityBytes and freeBytes, where the installed CRD has them) and in the kubeagents_data_volume_bytes metric. " +
+		dataVolumeNearlyFullHint
+	if cond == nil || cond.Message != want {
+		t.Fatalf("True message = %q, want %q", cond.Message, want)
 	}
-	h.stub.setDataVolume(gatewayAddr(), testVolume, freeAt(95))
+	// An old transition time, so that a write that moved it would show.
+	agent := h.agent()
+	since := metav1.NewTime(usageClock(0).Add(-48 * time.Hour).Truncate(time.Second))
+	meta.FindStatusCondition(agent.Status.Conditions, dataVolumeNearlyFullCondition).LastTransitionTime = since
+	if err := h.cl.Status().Update(context.Background(), agent); err != nil {
+		t.Fatalf("setting an old transition time: %v", err)
+	}
+	for _, figure := range []string{"92%", "9.2", "GiB"} {
+		if strings.Contains(cond.Message, figure) {
+			t.Fatalf("the True message holds the figure %q: %q", figure, cond.Message)
+		}
+	}
+	// A later poll, fuller: the byte fields move, the condition's text does not.
+	h.stub.setDataVolume(gatewayAddr(), testVolume, freeAt(97))
 	h.poll(10)
-	if again := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition); again.Message != cond.Message {
-		t.Fatalf("a held True condition was rewritten: %q -> %q", cond.Message, again.Message)
+	agent = h.agent()
+	if again := meta.FindStatusCondition(agent.Status.Conditions, dataVolumeNearlyFullCondition); again.Message != cond.Message || !again.LastTransitionTime.Equal(&since) {
+		t.Fatalf("a fuller volume rewrote the condition: %+v -> %+v", cond, again)
+	}
+	if agent.Status.StorageStatus.FreeBytes == nil || *agent.Status.StorageStatus.FreeBytes != freeAt(97) {
+		t.Fatalf("status.storageStatus.freeBytes = %v, want the later reading %d: the message points there", agent.Status.StorageStatus.FreeBytes, freeAt(97))
 	}
 	h.stub.setDataVolume(gatewayAddr(), testVolume, freeAt(40))
 	h.poll(15)
 	cleared := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition)
-	if cleared.Status != metav1.ConditionFalse || strings.Contains(cleared.Message, dataVolumeNearlyFullHint) {
+	if cleared.Status != metav1.ConditionFalse || cleared.Message != "The agent's data volume is under 90% full. "+dataVolumeFiguresHint {
 		t.Fatalf("False condition = %+v", cleared)
+	}
+}
+
+// The message points at the byte fields, so a change of status carries the
+// reading that caused it, also when free space moved by less than the write
+// step since the fields were last written.
+func TestDataVolume_AChangeOfStatusWritesTheReadingBesideIt(t *testing.T) {
+	h := dataVolumeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)))
+	below := testVolume * 105 / 1000 // 89.5% used
+	above := testVolume * 98 / 1000  // 90.2% used
+	h.stub.setDataVolume(gatewayAddr(), testVolume, below)
+	h.poll(5)
+	if meta.IsStatusConditionTrue(h.agent().Status.Conditions, dataVolumeNearlyFullCondition) {
+		t.Fatal("True at 89.5% used")
+	}
+	h.stub.setDataVolume(gatewayAddr(), testVolume, above)
+	h.poll(10)
+	agent := h.agent()
+	if !meta.IsStatusConditionTrue(agent.Status.Conditions, dataVolumeNearlyFullCondition) {
+		t.Fatal("not True at 90.2% used")
+	}
+	if got := ptr.Deref(agent.Status.StorageStatus.FreeBytes, -1); got != above {
+		t.Fatalf("freeBytes = %d beside the True condition, want this poll's reading %d (under a hundredth from the last write)", got, above)
+	}
+}
+
+// A condition that an earlier operator wrote, with the figures of its first
+// write in the text, has the same status and reason as this operator's. The
+// next poll writes this operator's text over it.
+func TestDataVolume_AnEarlierOperatorsMessageIsRewritten(t *testing.T) {
+	h := dataVolumeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)))
+	h.stub.setDataVolume(gatewayAddr(), testVolume, freeAt(92))
+	h.poll(5)
+	agent := h.agent()
+	stale := "The agent's data volume is 91% full (9.1 of 10.0 GiB used). " + dataVolumeNearlyFullHint
+	meta.FindStatusCondition(agent.Status.Conditions, dataVolumeNearlyFullCondition).Message = stale
+	if err := h.cl.Status().Update(context.Background(), agent); err != nil {
+		t.Fatalf("writing the earlier operator's condition: %v", err)
+	}
+	h.poll(10)
+	cond := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition)
+	if cond.Message == stale || strings.Contains(cond.Message, "GiB") {
+		t.Fatalf("the earlier operator's message stayed: %q", cond.Message)
 	}
 }
 
@@ -226,6 +290,9 @@ func TestDataVolume_APruningCRDIsProbedNotRewrittenEveryPoll(t *testing.T) {
 	after := h.patches
 	if c := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition); c == nil || c.Status != metav1.ConditionFalse {
 		t.Fatalf("the condition did not land under a pruning CRD: %+v", c)
+	} else if !strings.Contains(c.Message, dataVolumeSeries) || !strings.Contains(c.Message, "where the installed CRD has them") {
+		// The byte fields are not on this CR: the message must name another place for the figures.
+		t.Fatalf("under a pruning CRD the message names only the byte fields: %q", c.Message)
 	}
 	// Inside the reprobe interval an unchanged reading does not rewrite the
 	// pruned byte fields.
