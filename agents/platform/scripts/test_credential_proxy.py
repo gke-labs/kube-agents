@@ -20273,6 +20273,36 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
             headers={"Content-Type": "application/json", **(headers or {})},
         )
 
+    def test_an_entries_list_filter_drops_an_excluded_clusters_entries(self):
+        # The same clause `gcloud logging read` gets (cluster_metadata_scope):
+        # ANDed onto the caller's filter, never parsed, so whatever it says the
+        # excluded cluster's entries don't come back.
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        clause = 'NOT resource.labels.cluster_name=~"^(scratch)$"'
+        for caller_filter, sent_filter in (
+            (self.ENTRIES_BODY["filter"], f'(\n{self.ENTRIES_BODY["filter"]}\n) AND {clause}'),
+            ('resource.labels.cluster_name="scratch"', f'(\nresource.labels.cluster_name="scratch"\n) AND {clause}'),
+            (None, clause),
+        ):
+            with self.subTest(filter=caller_filter):
+                self.upstream_bodies.clear()
+                body = dict(self.ENTRIES_BODY)
+                if caller_filter is None:
+                    body.pop("filter")
+                else:
+                    body["filter"] = caller_filter
+                status, _, _ = self._entries_list(body)
+                self.assertEqual(200, status)
+                [sent] = self.upstream_bodies
+                self.assertEqual(sent_filter, json.loads(sent)["filter"])
+
+    def test_an_entries_list_filter_that_could_swallow_the_clause_is_refused(self):
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        status, _, payload = self._entries_list({**self.ENTRIES_BODY, "filter": 'x="open'})
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, payload["rule"])
+        self.assertEqual([], self.upstream_bodies)
+
     def test_an_entries_list_reaches_the_upstream_as_the_brokers_own_post(self):
         self.reply.update(body=b'{"entries":[{"insertId":"a"}],"nextPageToken":"t"}')
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
