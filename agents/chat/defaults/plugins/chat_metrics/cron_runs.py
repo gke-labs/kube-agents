@@ -22,7 +22,10 @@ Each ledger has a low-water mark, the rowid of the oldest run still in flight
 on. Hermes never changes a terminal row, so a row is counted the first time it
 is seen terminal, and the rowids counted at or after the mark are kept so that
 none is counted twice. Rows terminal at the first read are a baseline and
-count nothing; a run in flight then counts when it ends. So both families
+count nothing; a run in flight then counts when it ends. The baseline is the
+table as it stood at that first read, up to its newest rowid then: a table
+longer than one read takes is read over several, and a run that ends between
+them is above that rowid and counts. So both families
 start at zero in each process, like the other counters here.
 
 A series is served from zero. Each job met in a ledger, at the baseline too,
@@ -167,20 +170,25 @@ def reason_label(reason: Any) -> str:
 
 
 class _Ledger:
-    """Where the read of one ledger stands: which file it is, its low-water mark, the rowids seen terminal at or after it, and whether it is still taking its baseline."""
+    """Where the read of one ledger stands: which file it is, its low-water mark, the rowids seen terminal at or after it, its baseline's ceiling and the runs seen in flight."""
 
-    __slots__ = ("identity", "mark", "counted", "baselining")
+    __slots__ = ("identity", "mark", "counted", "ceiling", "pending")
 
-    def __init__(self, identity: tuple[int, int], baselining: bool) -> None:
+    def __init__(self, identity: tuple[int, int], ceiling: int) -> None:
         # The file's device and inode. A mark is a position in one file: a
         # profile removed and made again has a ledger of the same name that
         # numbers its rows from 1.
         self.identity = identity
         self.mark = _NO_MARK
         self.counted: set[int] = set()
-        # True until a read reaches the end of the table: the rows terminal
-        # until then were there before the count began.
-        self.baselining = baselining
+        # The table's newest rowid when the baseline was taken, 0 for a ledger
+        # with none. A row at or under it was there before the count began, so
+        # it counts only if it was seen in flight first. The ceiling is fixed
+        # when the ledger is first read: a baseline longer than one read takes
+        # several, and a run that ends between them is above it.
+        self.ceiling = ceiling
+        # Rowids seen in flight and not yet seen terminal.
+        self.pending: set[int] = set()
 
 
 class CronRunsCounter:
@@ -279,15 +287,17 @@ class CronRunsCounter:
             del self._ledgers[path]
             ledger = None
         newest, rows = self._rows(path, ledger.mark if ledger is not None else _NO_MARK)
+        newest_rowid = newest if isinstance(newest, int) else _NO_MARK
         if ledger is None:
-            ledger = self._ledgers[path] = _Ledger(identity, baselining=not self._baselined or path in self._unbaselined)
+            baseline = not self._baselined or path in self._unbaselined
+            ledger = self._ledgers[path] = _Ledger(identity, ceiling=newest_rowid if baseline else _NO_MARK)
             self._unbaselined.discard(path)
-        elif isinstance(newest, int) and newest < ledger.mark - 1:
-            # Rebuilt: the rowids kept no longer name the same rows, so what is
-            # terminal now is a baseline again.
-            ledger.mark, ledger.counted, ledger.baselining = _NO_MARK, set(), True
+        elif newest_rowid < ledger.mark - 1:
+            # Rebuilt: the rowids kept no longer name the same rows, so what the
+            # table holds now is a baseline again.
+            ledger.mark, ledger.counted, ledger.ceiling, ledger.pending = _NO_MARK, set(), newest_rowid, set()
         terminal: list[int] = []  # rowids of the terminal rows read
-        in_flight: Optional[int] = None  # rowid of the oldest row still in flight
+        pending: set[int] = set()  # rowids of the rows read that are still in flight
         last = ledger.mark - 1
         for rowid, job_id, status, reason in rows:
             if not isinstance(rowid, int):
@@ -295,19 +305,20 @@ class CronRunsCounter:
             last = rowid
             if status == SKIPPED_STATUS or status in RUN_OUTCOMES:
                 terminal.append(rowid)
-                self._count(job_id, status, reason, add=not ledger.baselining and rowid not in ledger.counted)
+                new = rowid > ledger.ceiling or rowid in ledger.pending
+                self._count(job_id, status, reason, add=new and rowid not in ledger.counted)
             else:
                 self._job(job_id)
-                if in_flight is None:
-                    in_flight = rowid
+                pending.add(rowid)
         cut = len(rows) >= self._max_rows
         # The next read starts at the oldest run in flight, else after the last
         # row read; a read cut at the limit moves on past its last row whatever
         # is in flight. The rowids kept are the terminal rows that read will see again.
-        ledger.mark = last + 1 if cut or in_flight is None else in_flight
+        ledger.mark = last + 1 if cut or not pending else min(pending)
         ledger.counted = {rowid for rowid in terminal if rowid >= ledger.mark}
-        if not cut:
-            ledger.baselining = False
+        # In flight: what this read saw at or after the new mark, and what an
+        # earlier read saw beyond where this one stopped.
+        ledger.pending = {rowid for rowid in pending if rowid >= ledger.mark} | {rowid for rowid in ledger.pending if rowid > last}
 
     def counts(self) -> tuple[dict[tuple[str, str], int], dict[tuple[str, str], int]]:
         """Runs by (job, outcome) and skips by (job, reason), after reading what the ledgers gained since the last call."""

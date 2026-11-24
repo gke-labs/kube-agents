@@ -577,6 +577,48 @@ class BoundTest(_VolumeTest):
     def test_the_skip_ledger_patch_is_where_the_comments_say(self):
         self.assertTrue(SKIP_LEDGER_PATCH.is_file(), SKIP_LEDGER_PATCH)
 
+    def test_a_baseline_of_exactly_the_row_limit_counts_the_first_run_after_it(self):
+        for minute in range(1, 4):
+            self.add("stall-watch", "completed", minute)
+        counter = cron.CronRunsCounter(root=lambda: self.root, max_rows=3)
+        self.assertEqual(({}, {}), self.both(counter))
+        self.add("stall-watch", "failed", 10)
+        self.assertEqual({("stall-watch", "failed"): 1}, self.counted(counter.counts()[0]))
+        self.assertEqual({("stall-watch", "failed"): 1}, self.counted(counter.counts()[0]))
+
+    def test_a_baseline_of_a_multiple_of_the_row_limit_counts_the_first_run_after_it(self):
+        for minute in range(1, 7):
+            self.add("stall-watch", "completed", minute)
+        counter = cron.CronRunsCounter(root=lambda: self.root, max_rows=3)
+        counter.counts()
+        counter.counts()
+        self.add("stall-watch", "failed", 10)
+        self.assertEqual({("stall-watch", "failed"): 1}, self.counted(counter.counts()[0]))
+
+    def test_a_run_that_ends_while_a_long_baseline_is_still_being_read_counts(self):
+        for minute in range(1, 9):
+            self.add("stall-watch", "completed", minute)
+        counter = cron.CronRunsCounter(root=lambda: self.root, max_rows=3)
+        self.assertEqual(({}, {}), self.both(counter))  # the listener's start: the first three rows
+        self.add("stall-watch", "failed", 10)
+        self.add("stall-watch", "skipped", 11, reason="missed_window")
+        for _ in range(6):
+            counter.counts()
+        runs, skips = self.both(counter)
+        self.assertEqual({("stall-watch", "failed"): 1}, runs)
+        self.assertEqual({("stall-watch", "missed_window"): 1}, skips)
+
+    def test_a_run_in_flight_at_a_long_baseline_counts_when_it_ends_after_its_chunk_is_read(self):
+        self.add("stall-watch", "completed", 1)
+        in_flight = self.add("compliance-audit", "running", 2)
+        for minute in range(3, 9):
+            self.add("stall-watch", "completed", minute)
+        counter = cron.CronRunsCounter(root=lambda: self.root, max_rows=20)
+        self.assertEqual(({}, {}), self.both(counter))
+        self.finish(in_flight, "failed")
+        self.assertEqual({("compliance-audit", "failed"): 1}, self.counted(counter.counts()[0]))
+        self.assertEqual({("compliance-audit", "failed"): 1}, self.counted(counter.counts()[0]))
+
     def test_a_full_read_moves_past_a_run_that_never_ends(self):
         counter = cron.CronRunsCounter(root=lambda: self.root, max_rows=3)
         counter.counts()
