@@ -1528,11 +1528,19 @@ def mask_served_values(text: str, values: Sequence[tuple[tuple[str, int], ...]])
 
 
 def as_json_structure(text: str) -> Any:
+    """The JSON object or array that `text` is, or `None` for text that is not one.
+
+    Raises `RecursionError` where the parser gives up for the depth. A caller
+    must not read that as "not a document": the text rules alone are a weaker
+    rule than a less deep document gets, which is withheld when the walk over
+    it reaches the recursion limit. `scrub_step_text` withholds the step on
+    the error, and `is_secret_read_tool_call` counts it as a secret read.
+    """
     if text.lstrip()[:1] not in JSON_STRUCTURE_OPENERS:
         return None
     try:
         parsed = json.loads(text)
-    except (ValueError, RecursionError):
+    except ValueError:
         return None
     return parsed if isinstance(parsed, (dict, list)) else None
 
@@ -1746,7 +1754,11 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     read as text and its other arguments as prose; a `tool_result` takes the
     inline-object rule and the rest-of-line mask (`VALUE_SPAN_LINE`); a reply
     keeps the first-token mask. Returns `withheld` for every kind when
-    `redactor` is `None` or the structure is deeper than Python recurses, so
+    `redactor` is `None`, or when the text, or a string value in it that the
+    walk parses, is a JSON document too deep to parse or too deep to walk, or
+    when an inline object in a tool result's line is too deep to parse. (A
+    string value that a rule masks whole is masked, not parsed.) Text that
+    the parser gives up on for its depth is withheld too, document or not. So
     an unscrubbable step is never served as written.
     """
     if redactor is None:
@@ -2748,8 +2760,13 @@ def is_secret_read_tool_call(raw_args: Any) -> bool:
 
     `raw_args` is the arguments as Hermes stores them: a JSON string or an
     object whose `command`/`cmd` carries the shell line, or the bare line.
+    Arguments too deep to parse count as a secret read: nothing shows that
+    they are not one, and `scrub_step_text` withholds them too.
     """
-    parsed = as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
+    try:
+        parsed = as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
+    except RecursionError:
+        return True
     if isinstance(parsed, dict):
         cmd = next((parsed.get(k) for k in COMMAND_ARG_KEYS if parsed.get(k)), "")
         return isinstance(cmd, str) and command_reads_a_secret(cmd)

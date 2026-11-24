@@ -1526,6 +1526,16 @@ RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
 # The refusal code a profile caller gets for a version-control verb its task
 # credential doesn't cover (no credential, or a write without the permit).
 CALLER_PERMIT_REQUIRED_CODE = "CALLER_PERMIT_REQUIRED"
+# A refusal body's mark of a definitive write refusal: a write refused however
+# it is attempted, which a retry or another spelling cannot get through. Set on
+# a policy rule's refusal of a mutating kubectl verb that is not a local render
+# (command_policy.kubectl_definitive_write): the read-only rule's
+# (read_only_refusal) and, for a profile caller, the flag rule's. Never on a
+# busy, rate or timeout answer, nor on a version-control refusal, whose answer
+# is the patch the version-control skill gives. The in-pod client (credential_proxy_client.WRITE_REFUSAL_KEY)
+# records such a refusal for the profile worker, which stops the task at the
+# first one; every other refusal carries it false or not at all.
+WRITE_REFUSAL_KEY = "write_refusal"
 # A profile caller's permitted write that names a proposal or branch this
 # install does not own (VcsBroker.require_agent_proposal, #3993).
 RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
@@ -14007,8 +14017,10 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     # so the shim can print them beside the rule: the agent runtime's refusal
     # stop reads those lines instead of re-deriving the verb from shell text.
     verb_words = list(decision.verb_tuple) if decision.verb_tuple else None
-    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE:
+    read_only_rule = decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE
+    if verb_words and read_only_rule:
         verb_words = verb_words[:2] if verb_words[1:2] and verb_words[1] in _KUBECTL_SUBCOMMANDS.get(verb_words[0], ()) else verb_words[:1]
+    rendered = read_only_rule and command_policy.local_render(argv)
     return (
         {
             "status": "blocked",
@@ -14016,7 +14028,13 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
             "rule": decision.rule_id,
             "message": decision.message,
             "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in verb_words] if verb_words else None,
-            "local_render": decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and command_policy.local_render(argv),
+            "local_render": rendered,
+            # A definitive write refusal: the read-only rule refused a mutating
+            # kubectl verb that was not a local render. The in-pod client
+            # records it for the profile worker's stop (WRITE_REFUSAL_KEY).
+            WRITE_REFUSAL_KEY: read_only_rule
+            and not rendered
+            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),
         },
         log_hint,
     )
@@ -15967,6 +15985,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         refused_flag = session_kubectl_flag_refusal(principal.role, argv)
         if refused_flag is not None:
+            # A profile caller's write the flag rule refused is refused outright:
+            # marked for the worker's stop like a read-only refusal, with the
+            # verb words the record names. Only this policy refusal and the
+            # read-only rule's are marked, never a busy, rate or timeout answer.
+            flag_write = command_policy.kubectl_definitive_write(argv) if principal.role == CALLER_ROLE_PROFILE else None
             LOGGER.warning(
                 "flag refused for role request_id=%s role=%s executable=%s flag=%s",
                 request_id,
@@ -15987,6 +16010,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "is not one of them (file inputs, file-backed output formats, streaming flags and the "
                         "API server's own endpoints under --raw are not available to a session)."
                     ),
+                    "verb": list(flag_write) if flag_write else None,
+                    WRITE_REFUSAL_KEY: flag_write is not None,
                 },
             )
             return
