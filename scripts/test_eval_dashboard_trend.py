@@ -582,6 +582,25 @@ class NightsTheCollectorLacksTest(unittest.TestCase):
         records = [self.record("case-19", eve, "2025-09-10T04:59:00Z")] + self.split_night()
         nights = trend.night_documents(records, data_with_nightly(DOMAINS, runs))
         self.assertEqual([(n["build"], n["cases"]) for n in nights], [(eve, 1), (self.MAIN, 2)])
+        # Mirrored: the re-run is the newer known build, four minutes after
+        # the cron builds, and the nearest is still the cron night. A part
+        # exactly between two known nights takes the newer, as filed_nights does.
+        soon, between = build_started_at("2025-09-10T00:04:10+00:00"), build_started_at("2025-09-10T00:02:10+00:00")
+        runs = [runs[1], timed_run(soon, NIGHT_1_RUN["job"], "2025-09-10T00:04:10+00:00", "2025-09-10T06:40:00+00:00", [])]
+        anchors = trend.night_anchors(self.split_night() + [self.record("case-19", soon, "2025-09-10T06:39:00Z"), self.record("case-24", between, "2025-09-10T03:00:00Z")],
+                                      data_with_nightly(DOMAINS, runs))
+        self.assertEqual((anchors[self.WRITERS], anchors[between]), (self.MAIN, soon))
+
+    def test_a_part_nearest_a_known_part_other_than_main_goes_under_the_nights_build(self):
+        """Main and writers on record, a third part not collected yet and
+        started nearest the writers build: it is filed under the build
+        the collector files the writers build under, the main one."""
+        third = build_started_at("2025-09-10T00:00:01+00:00")
+        runs = [timed_run(self.MAIN, NIGHT_1_RUN["job"], "2025-09-10T00:00:10+00:00", "2025-09-10T06:31:00+00:00", []),
+                timed_run(self.WRITERS, nightly.NIGHTLY_WRITERS_JOB, "2025-09-10T00:00:04+00:00", "2025-09-10T02:10:00+00:00", [])]
+        records = self.split_night() + [self.record("case-24", third, "2025-09-10T03:00:00Z")]
+        nights = trend.night_documents(sorted(records, key=lambda r: r["recorded_at"]), data_with_nightly(DOMAINS, runs))
+        self.assertEqual([(n["build"], n["cases"]) for n in nights], [(self.MAIN, 3)])
 
     def test_the_spread_is_measured_from_the_first_build_of_the_group(self):
         """00:00, 00:12 and 00:24: the third is within the spread of the
@@ -622,7 +641,8 @@ class NightsTheCollectorLacksTest(unittest.TestCase):
         early = (self.record("case-19", self.MAIN, "2025-09-09T12:00:00Z"), self.record("case-23", self.WRITERS, "2025-09-09T12:00:00Z"))
         late = (self.record("case-19", self.MAIN, "2025-09-12T06:30:00Z"), self.record("case-23", self.WRITERS, "2025-09-12T02:00:00Z"))
         odd = (self.record("case-19", "1234", "2025-09-10T06:30:00Z"), self.record("case-23", "1235", "2025-09-10T06:30:00Z"))
-        for pair in (early, late, odd):
+        words = (self.record("case-19", "a" * nightly.PROW_BUILD_ID_DIGITS, "2025-09-10T06:30:00Z"), self.record("case-23", "b" * nightly.PROW_BUILD_ID_DIGITS, "2025-09-10T06:30:00Z"))
+        for pair in (early, late, odd, words):
             with self.subTest(builds=[r["build"] for r in pair], at=pair[0]["recorded_at"]):
                 self.assertEqual(len(trend.night_documents(sorted(pair, key=lambda r: r["recorded_at"]), data_with_nightly(DOMAINS))), 2)
 

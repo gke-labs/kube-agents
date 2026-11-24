@@ -119,7 +119,7 @@ LATENCY_SERIES = {"turn1": nightly.REP_TURN1_S, "agent": nightly.REP_AGENT_S}
 LATENCY_SLOW_PCT = {"turn1": nightly.TURN1_TARGET_PCT, "agent": nightly.SLOW_PCT}
 MEDIAN_PCT = 50
 UTC = datetime.timezone.utc
-# How far apart the builds of one night start, for a night the collector's
+# How far apart the builds of one night start, for a build the collector's
 # runs lack (night_anchors). The parts are periodics on one cron, so their
 # starts differ by scheduling delay alone; the tolerance nightly.py dates a
 # build's start with bounds that delay too. A name of its own: the dating
@@ -254,8 +254,9 @@ def record_build_start(record: dict) -> datetime.datetime | None:
     no build, an id of another shape, or a start the record contradicts
     (``night_anchors`` dates a build by any of its records that agrees). A
     job stamps its records when it grades them, before it ends, so the
-    start is at or before ``recorded_at`` and within the longest part's
-    budget of it (``nightly.RUNNING_MAX_AGE``)."""
+    start is at or before ``recorded_at`` and within
+    ``nightly.RUNNING_MAX_AGE`` of it (the longest part's budget and the
+    minutes a job cut there takes to end)."""
     build = record.get("build")
     recorded = nightly.parse_iso(record.get("recorded_at"))
     if not isinstance(build, str) or len(build) != nightly.PROW_BUILD_ID_DIGITS or not build.isdecimal() or recorded is None:
@@ -279,14 +280,16 @@ def night_anchors(records: list[dict], data: dict) -> dict[str, str]:
     group's nearest known start under (the newer on a tie, as
     ``nightly.filed_nights`` picks a part's night), else, when ``data``
     knows none of the group, under the first to start. A build that started
-    later that date begins a group of its own, so a re-run stays apart from
-    the cron night, as ``nightly.filed_nights`` keeps a main re-run; a
+    later that date, past the spread, begins a group of its own, so a
+    re-run stays apart from the cron night, as ``nightly.filed_nights``
+    keeps a main re-run; a
     re-run of another part, which the collector's runs would fold into its
     night, also stays apart here, because nothing in the store says which
     part it ran. A build whose id does not date it (``record_build_start``)
-    stands alone. One limit: a re-run started inside the spread before the
-    cron builds, with none of them known to ``data``, is drawn as one night
-    with them."""
+    stands alone. The limit: a re-run that ``data`` lacks and that started
+    inside the spread of the cron builds, before or after them, is drawn in
+    their night until the collector has it; the collector's runs then file
+    a main re-run as a night of its own."""
     anchors = nightly.night_builds(data)
     starts: dict[str, datetime.datetime] = {}
     for record in records:
