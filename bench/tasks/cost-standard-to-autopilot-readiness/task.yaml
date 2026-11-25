@@ -12,10 +12,12 @@
 #
 # The objective requires the verdict line "VERDICT: MIGRATION-BLOCKED" on a
 # line of its own, forbids "VERDICT: MIGRATION-READY" on a line of its own, and
-# requires both blocking constraints (privileged/hostPath on the DaemonSet and
-# hostNetwork on the batch Job) to be named in the report. The verifier
-# lowercases the report, strips emphasis and code markers, and folds line
-# decoration; bench/tests/test_cost_standard_to_autopilot_readiness_verdict.py
+# ties each blocking constraint to its workload on the same line
+# (privileged/hostPath on the log-collector DaemonSet, and hostNetwork on the
+# batch Job) while forbidding claims that either blocker is allowed on
+# Autopilot, that only one workload blocks, or that repeat the prompt. The
+# verifier lowercases the report, strips emphasis and code markers, and folds
+# line decoration; bench/tests/test_cost_standard_to_autopilot_readiness_verdict.py
 # pins passing and failing shapes. The lane appends the catastrophic none-wrapped
 # github_writes safeguard (hack/eval/inject-lane-safeguards.yaml) on every CI
 # run.
@@ -58,11 +60,16 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_patterns: ["(?m)^\\W*verdict:\\s*migration-blocked$"]
-      forbidden_patterns: ["(?m)^\\W*verdict:\\s*migration-ready$"]
+      any_of_patterns: ["(?m)^\\W*verdict:\\s*migration-blocked\\b"]
+      forbidden_patterns:
+        - "(?m)^\\W*verdict:\\s*migration-ready\\b"
+        - "\\b(?:host[-\\s]?network(?:ing)?|privileged|host[-\\s]?path|daemon\\s*set|log[-\\s]?collector|(?:batch\\s+)?job)\\b(?:(?!\\b(?:not|no|never|neither|nor|cannot|can't|won't|disallow(?:ed|s)?|reject(?:ed|s)?|block(?:ed|s|ing)?|unsupported|incompatible|forbid(?:den|s)?|prohibit(?:ed|s)?|deployment|web\\s+api|stateless)\\b)[^.\\n;])*?\\b(?:(?:is|are)\\s+(?:allowed|supported|compatible|permitted|fine|ok|acceptable)|allowed\\s+on\\s+autopilot|supported\\s+on\\s+autopilot|compatible\\s+with\\s+autopilot|can\\s+(?:run|migrate|be\\s+migrated)|(?:does|do)\\s+not\\s+block|(?:doesn't|don't)\\s+block|(?:is|are)\\s+not\\s+(?:a\\s+)?block(?:er|ers|ed|ing)|(?:isn't|aren't)\\s+(?:a\\s+)?block(?:er|ers|ed|ing))\\b"
+        - "\\bautopilot\\s+(?:allows|supports|permits|accepts)\\s+(?:the\\s+)?(?:host[-\\s]?network(?:ing)?|privileged|host[-\\s]?path|daemon\\s*set|log[-\\s]?collector|(?:batch\\s+)?job)\\b"
+        - "\\bonly\\s+(?:the\\s+|one\\s+)?(?:[\\w-]+\\s+){0,2}(?:daemon\\s*set|log[-\\s]?collector|job|workload)\\b[^.\\n]*?\\b(?:blocks?|is\\s+blocked|cannot\\s+migrate|is\\s+rejected|is\\s+disallowed)\\b"
+        - "\\b(?:we\\s+want\\s+to\\s+migrate\\s+a\\s+gke\\s+standard\\s+cluster|the\\s+cluster\\s+runs\\s+three\\s+workloads|can\\s+we\\s+migrate\\s+these\\s+workloads|start\\s+your\\s+answer\\s+with\\s+exactly\\s+one\\s+line|verdict:\\s*migration-blocked\\s+(?:or\\s+(?:verdict:\\s*)?migration-ready|is\\s+(?:wrong|incorrect|false|not|ruled\\s+out)))\\b"
       required_patterns:
-        - "\\b(?:privileged|host[-\\s]?path)\\b"
-        - "\\bhost[-\\s]?network(?:ing)?\\b"
+        - "\\b(?:(?:daemon\\s*set|log[-\\s]?collector)\\b(?:(?!\\bjob\\b)[^\\n])*\\b(?:privileged|host[-\\s]?path)|(?:privileged|host[-\\s]?path)\\b(?:(?!\\bjob\\b)[^\\n])*\\b(?:daemon\\s*set|log[-\\s]?collector))\\b"
+        - "\\b(?:job\\b(?:(?!\\b(?:daemon\\s*set|log[-\\s]?collector)\\b)[^\\n])*\\bhost[-\\s]?network(?:ing)?|host[-\\s]?network(?:ing)?\\b(?:(?!\\b(?:daemon\\s*set|log[-\\s]?collector)\\b)[^\\n])*\\bjob)\\b"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard

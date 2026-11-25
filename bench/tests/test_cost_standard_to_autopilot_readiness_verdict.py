@@ -1,10 +1,12 @@
-"""cost-standard-to-autopilot-readiness reads the verdict line and both blockers.
+"""cost-standard-to-autopilot-readiness reads the verdict line and both workload-tied blockers.
 
 The objective passes when a line opens with ``VERDICT: MIGRATION-BLOCKED``, no
-line opens with ``VERDICT: MIGRATION-READY``, and the report names both the
+line opens with ``VERDICT: MIGRATION-READY``, and the report ties both the
 DaemonSet blocker (``privileged`` or ``hostPath``) and the batch Job blocker
-(``hostNetwork``). ``report_contains`` lowercases the report, drops emphasis
-and backticks, and folds line decoration before the patterns run.
+(``hostNetwork``) to their workloads without claiming either is allowed on
+Autopilot or merely repeating the prompt. ``report_contains`` lowercases the
+report, drops emphasis and backticks, and folds line decoration before the
+patterns run.
 """
 
 from __future__ import annotations
@@ -37,9 +39,16 @@ def _passes(report: str) -> bool:
 
 
 def test_migration_blocked_verdict_with_both_blockers_passes():
+    doc = yaml.safe_load(TASK.read_text())
     for report in (
+        doc["expected_output"],
         (
             "VERDICT: MIGRATION-BLOCKED\n\n"
+            "- The log-collector DaemonSet uses securityContext.privileged: true and a hostPath mount (/var/log).\n"
+            "- The batch Job uses hostNetwork: true."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED \u274c\n\n"
             "- The log-collector DaemonSet uses securityContext.privileged: true and a hostPath mount (/var/log).\n"
             "- The batch Job uses hostNetwork: true."
         ),
@@ -65,20 +74,16 @@ def test_migration_blocked_verdict_with_both_blockers_passes():
             "The privileged DaemonSet and hostNetwork batch Job cannot migrate as-is."
         ),
         (
-            "VERDICT: MIGRATION-BLOCKED.\n"
-            "- VERDICT: MIGRATION-READY is ruled out because the DaemonSet is privileged (hostPath) "
-            "and the batch Job uses hostNetwork.\n"
-        ),
-        (
             "VERDICT: MIGRATION-BLOCKED\n"
-            "VERDICT: MIGRATION-READY \u274c\n"
-            "The privileged hostPath DaemonSet and hostNetwork batch Job block migration."
+            "The DaemonSet (privileged, hostPath) and batch Job (hostNetwork) are not allowed on Autopilot, "
+            "while the stateless web API Deployment is allowed on Autopilot as-is."
         ),
     ):
         assert _passes(report), report
 
 
-def test_migration_ready_missing_blocker_or_prose_verdict_fails():
+def test_migration_ready_missing_blocker_wrong_claim_or_prompt_echo_fails():
+    doc = yaml.safe_load(TASK.read_text())
     for report in (
         (
             "VERDICT: MIGRATION-READY\n\n"
@@ -98,15 +103,6 @@ def test_migration_ready_missing_blocker_or_prose_verdict_fails():
             "2. **VERDICT: MIGRATION-READY**\n"
             "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
         ),
-        # Hedged or negated verdict lines are not a clean verdict on its own line.
-        (
-            "VERDICT: MIGRATION-BLOCKED?\n"
-            "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
-        ),
-        (
-            "VERDICT: MIGRATION-BLOCKED \u26a0\ufe0f\n"
-            "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
-        ),
         (
             "VERDICT: MIGRATION-BLOCKED or MIGRATION-READY\n"
             "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
@@ -114,6 +110,40 @@ def test_migration_ready_missing_blocker_or_prose_verdict_fails():
         (
             "VERDICT: MIGRATION-BLOCKED is wrong\n"
             "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
+        ),
+        # Wrong answer claiming only one workload blocks and the other is allowed.
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "Only the DaemonSet blocks (privileged). The Job with hostNetwork is allowed on Autopilot."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "Only the batch Job blocks (hostNetwork). The DaemonSet with privileged and hostPath is allowed on Autopilot."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The DaemonSet (privileged, hostPath) is rejected, and the batch Job with hostNetwork is supported on Autopilot."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The DaemonSet (privileged, hostPath) is rejected, and the batch Job with hostNetwork does not block migration."
+        ),
+        # Verdict line followed by the prompt itself.
+        f"VERDICT: MIGRATION-BLOCKED\n{doc['prompt']}",
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The cluster runs three workloads: (1) a stateless web API Deployment with CPU/memory requests, "
+            "(2) a log-collector DaemonSet mounting /var/log via hostPath with securityContext.privileged: true, "
+            "and (3) a batch Job using hostNetwork: true."
+        ),
+        # Constraint words present without tying each to its workload on the same line, or swapped.
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "Autopilot rejects privileged containers, hostPath volumes, and hostNetwork."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The DaemonSet uses hostNetwork and the batch Job uses privileged."
         ),
         # Missing the batch Job hostNetwork blocker.
         (
@@ -125,7 +155,7 @@ def test_migration_ready_missing_blocker_or_prose_verdict_fails():
             "VERDICT: MIGRATION-BLOCKED\n\n"
             "Only the batch Job is blocked because it uses hostNetwork: true."
         ),
-        # Verdict embedded in prose rather than on its own line.
+        # Verdict embedded in prose rather than opening a line.
         (
             "The result is VERDICT: MIGRATION-BLOCKED because the DaemonSet is privileged (hostPath) "
             "and the batch Job uses hostNetwork."
