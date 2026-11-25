@@ -620,8 +620,19 @@ setting `busReplicas` to 3 widens it and keeps its history. On any bus, a new va
 ([Recreating TASKS wider](#recreating-tasks-wider)). On an existing install, until the operator has read the width once, the
 provision Job waits; a new install starts at `maxSessions`. On `platform` none of this runs.
 
-The operator's `A2A_SESSION_CLUSTER_VIEW` doesn't change the route: with the session pods' cluster
-view on or off, `defaultRoute: session` routes plain conversations to session pods.
+#### The session pods' cluster view
+
+On the session route, session pods get the read-only cluster view by default: `kubectl` through
+`<name>-kube-proxy` and read-only `gcloud` through the credential broker's `session` role ([Security
+and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity)).
+The view follows the route the operator resolved, so an install held on `platform` (no room for a
+session, or a CRD that prunes the cap) gets none. The operator's `A2A_SESSION_CLUSTER_VIEW` overrides
+it, set as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes:
+`"true"` turns the view on on any route, and `"false"` turns it off on the session route too. Unset or empty, it follows the route, and any other value is off. The flag doesn't change the route itself.
+
+Whoever can set `spec.harness.tuning.defaultRoute` on the PlatformAgent turns the view on with it; whoever runs the operator can turn it off for every install with `"false"`. On a `fleet`-tier install, a session
+pod's cluster-wide `kubectl` lists need more than the default session memory limit ([What each pod
+needs](/kube-agents/deploy/fleet-sizing/#what-each-pod-needs)).
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short

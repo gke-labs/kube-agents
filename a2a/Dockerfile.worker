@@ -57,7 +57,8 @@ COPY a2a/worker-harness/package.json a2a/worker-harness/package-lock.json ./
 RUN npm ci \
     && npm cache clean --force
 
-# The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
+# The temporary cluster view (on by default on the session route, or the
+# operator flag A2A_SESSION_CLUSTER_VIEW): stock
 # kubectl at /usr/local/libexec/kubectl with a /usr/local/bin/kubectl wrapper
 # (deploy/sandbox/session-kubectl.sh) that routes through <agent>-kube-proxy
 # when KUBE_PROXY_URL is set, recording a failed write attempt under a
