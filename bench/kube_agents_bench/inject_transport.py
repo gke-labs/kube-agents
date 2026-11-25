@@ -216,7 +216,13 @@ ENTRY_STATUS_DONE = "completed"
 # whose ``input.calls[]`` names the tools it invoked (while its input fits
 # the executor's cap: :data:`ACTIVITY_INPUT_TRUNCATED_KEY`), which is the
 # shape the verifier already unwraps on the api path, so it is kept as one
-# entry rather than split. Whenever the probe body carried the key at all, even
+# entry rather than split. A part's ``callId``, when it is a non-empty
+# string, goes on its entry as ``call_id`` (:data:`ENTRY_CALL_ID_FIELD`),
+# beside ``args`` and never in it, so a ``tool_called`` argument pattern
+# reads the same input either way; it names the call for a reader joining
+# the trajectory to other records of the same call, such as the worker
+# adapter's log of a refused tool call. Whenever the probe body carried
+# the key at all, even
 # empty, the fold also writes one marker entry named ``a2a.activity`` with
 # ``args.calls`` (entries written) and ``args.dropped`` (calls the door or
 # the executor counted and did not carry). The marker states the DOOR's
@@ -269,6 +275,9 @@ ACTIVITY_TOOL_KEY = "tool"
 ACTIVITY_INPUT_KEY = "input"
 ACTIVITY_STATUS_KEY = "status"
 ACTIVITY_DROPPED_KEY = "dropped"
+ACTIVITY_CALL_ID_KEY = "callId"
+# The trajectory entry's field for the part's ``callId`` (above).
+ENTRY_CALL_ID_FIELD = "call_id"
 ACTIVITY_STATUS_CALLED = "called"
 ACTIVITY_STATUS_TRUNCATED = "truncated"
 # The bridge caps one call's ``input`` and replaces an input over the cap
@@ -978,14 +987,16 @@ class Fold:
             else:
                 args = {ACTIVITY_INPUT_KEY: raw_input}
             status = part.get(ACTIVITY_STATUS_KEY)
-            calls.append(
-                {
-                    "name": tool,
-                    "args": args,
-                    "result": None,
-                    "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
-                }
-            )
+            entry: dict[str, Any] = {
+                "name": tool,
+                "args": args,
+                "result": None,
+                "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
+            }
+            call_id = part.get(ACTIVITY_CALL_ID_KEY)
+            if isinstance(call_id, str) and call_id:
+                entry[ENTRY_CALL_ID_FIELD] = call_id
+            calls.append(entry)
         marker_args: dict[str, Any] = {
             ACTIVITY_CALLS_ARG: len(calls),
             ACTIVITY_DROPPED_ARG: dropped,
