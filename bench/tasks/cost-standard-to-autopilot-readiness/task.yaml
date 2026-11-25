@@ -58,8 +58,8 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_patterns: ["(?m)^\\W*verdict:\\s*migration-blocked\\b"]
-      forbidden_patterns: ["(?m)^\\W*verdict:\\s*migration-ready\\b"]
+      any_of_patterns: ["(?m)^\\W*verdict:\\s*migration-blocked$"]
+      forbidden_patterns: ["(?m)^\\W*verdict:\\s*migration-ready$"]
       required_patterns:
         - "\\b(?:privileged|host[-\\s]?path)\\b"
         - "\\bhost[-\\s]?network(?:ing)?\\b"

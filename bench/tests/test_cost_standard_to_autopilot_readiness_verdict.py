@@ -64,6 +64,16 @@ def test_migration_blocked_verdict_with_both_blockers_passes():
             "VERDICT: \u201cMIGRATION-BLOCKED\u201d\n"
             "The privileged DaemonSet and hostNetwork batch Job cannot migrate as-is."
         ),
+        (
+            "VERDICT: MIGRATION-BLOCKED.\n"
+            "- VERDICT: MIGRATION-READY is ruled out because the DaemonSet is privileged (hostPath) "
+            "and the batch Job uses hostNetwork.\n"
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "VERDICT: MIGRATION-READY \u274c\n"
+            "The privileged hostPath DaemonSet and hostNetwork batch Job block migration."
+        ),
     ):
         assert _passes(report), report
 
@@ -86,6 +96,23 @@ def test_migration_ready_missing_blocker_or_prose_verdict_fails():
         (
             "VERDICT: MIGRATION-BLOCKED\n"
             "2. **VERDICT: MIGRATION-READY**\n"
+            "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
+        ),
+        # Hedged or negated verdict lines are not a clean verdict on its own line.
+        (
+            "VERDICT: MIGRATION-BLOCKED?\n"
+            "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED \u26a0\ufe0f\n"
+            "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED or MIGRATION-READY\n"
+            "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED is wrong\n"
             "The DaemonSet is privileged with hostPath and the Job uses hostNetwork."
         ),
         # Missing the batch Job hostNetwork blocker.
