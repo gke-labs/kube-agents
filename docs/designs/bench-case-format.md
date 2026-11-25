@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `delegating_profile`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -288,6 +288,21 @@ tasks/<id>/task.yaml --context <ctx> --namespace <ns> --name <cr>` before devops
 after (restore takes no `--task`; `--wait` also waits `PROPAGATION_SECONDS` for the lift to reach
 the pods). The validator refuses a malformed value and a case that
 declares both `scope_hold` and `scope_exclude`. devops-bench ignores the key.
+
+`delegating_profile: true` is for a case that grades a profile task delegating to another profile
+(#6789). The eval install's chart profiles don't delegate, so the harness makes one per run: at the
+case's start it copies the live `cluster` AgentProfile with `spec.delegates: true` and
+`yieldToPinned: false` under a run-unique `delegating-<hex>` name, waits for its card, writes the name
+into the prompt's `{{BENCH_DELEGATING_PROFILE}}` (the `name` of the case's `[bench:profile ...]`
+directive), and deletes it in a `finally` whatever the run did, confirming the profile and its worker
+pool are gone. A setup or teardown it can't complete is recorded as infrastructure. On an install
+whose AgentProfile CRD has no `spec.delegates` the copy has no delegate tool and the case runs as it
+is, graded: that is its red. The access is the harness's own on the install (the same context and
+namespace as its other `kubectl` calls). `python -m kube_agents_bench.delegating_profile sweep`
+deletes labelled leftovers older than six hours, for a run killed before its `finally`. The
+validator refuses the placeholder without the key, the key without the placeholder as the
+directive's name, a literal throwaway name, and a case on the Slack lane, which can't address a
+profile. devops-bench ignores the key (`bench/kube_agents_bench/delegating_profile.py`).
 
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
