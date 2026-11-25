@@ -3289,6 +3289,30 @@ func TestAStopReachesAWakesOwnChild(t *testing.T) {
 	}
 }
 
+// TestAStopWalkEndsOnAChildAndWakeThatPointAtEachOther: the walk follows
+// Children and each child's wake, so a record where a wake lists its own
+// child (a corrupt or hand-edited one) would cycle; the visited set ends it,
+// each task visited once.
+func TestAStopWalkEndsOnAChildAndWakeThatPointAtEachOther(t *testing.T) {
+	t.Parallel()
+	r, _ := startRigWithSpawner(t)
+	rec := &SessionRecord{Key: "discord:g1/t-stop-cycle", Tasks: []TaskRef{
+		{ID: "root", Children: []string{"child"}},
+		{ID: "child", Role: taskRoleChild, ParentTaskID: "root", RootTaskID: "root"},
+		{ID: "wake", Role: taskRoleWake, ParentTaskID: "child", RootTaskID: "root", Children: []string{"child"}},
+	}}
+	done := make(chan struct{})
+	go func() {
+		r.g.stopTree(context.Background(), rec, "root", Authority{}, false)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stop walk didn't end on a child and wake that point at each other")
+	}
+}
+
 // TestAWakeAtTheDepthBoundHasNoToolAndIsRefusedIfItDelegatesAnyway: at the
 // bound the wake gets neither the mark nor the guide that invites a
 // delegation, and the gateway refuses one regardless, so the bound holds
