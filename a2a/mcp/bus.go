@@ -195,6 +195,14 @@ type ProfileSupervisorHealth struct {
 	Drops         int64  `json:"drops"`
 }
 
+// logger is the configured logger, or slog's default.
+func (b *NATSBus) logger() *slog.Logger {
+	if b.cfg.Logger != nil {
+		return b.cfg.Logger
+	}
+	return slog.Default()
+}
+
 // Events is the server's listener on its conversations' posts.
 func (b *NATSBus) Events() *Events { return b.events }
 
