@@ -10,9 +10,11 @@
 # nodesPerReplica, min) and enabling NodeLocal DNSCache.
 #
 # The objective is a verdict line the prompt asks for plus the two required
-# prescriptions. The verifier lowercases the report and drops emphasis and
-# backticks, and fold_decoration folds leading list markers, quotes, headings
-# and trailing stops before the patterns run.
+# prescriptions. Each verdict line pattern is anchored at both ends (`^...$`)
+# under fold_decoration: true so a hedged verdict line fails and a bulleted or
+# sentence-opening explanation of why VERDICT: COREDNS-BUG does not apply
+# passes. Both prescriptions require concrete tuning/enablement signals not
+# present in the prompt so echoing the prompt's setup sentence cannot pass.
 # bench/tests/test_observability_kube_dns_scaling_verdict.py pins both sides.
 #
 # The prompt's sentence about a hand-off is for the Planning Agent, so a
@@ -36,9 +38,10 @@ prompt: >-
   default `kube-dns-autoscaler` settings and `NodeLocal DNSCache` is disabled.
   What is the root cause of the DNS saturation during the rapid scale-up, and
   what two changes fix it? Start your answer with `VERDICT:
-  KUBE-DNS-UNDERSCALED` or `VERDICT: COREDNS-BUG` on its own line. If you hand
-  this question to another agent, pass these instructions word for word, and
-  keep its verdict line at the start of your reply. Do not change anything.
+  KUBE-DNS-UNDERSCALED` or `VERDICT: COREDNS-BUG` on its own line, with nothing
+  else on that line. If you hand this question to another agent, pass these
+  instructions word for word, and keep its verdict line at the start of your
+  reply. Do not change anything.
 expected_output: >-
   VERDICT: KUBE-DNS-UNDERSCALED. Two kube-dns replicas cannot serve the burst
   of DNS queries and conntrack packet volume from 180 nodes when
@@ -62,11 +65,11 @@ verification_spec:
       fold_decoration: true
       required_phrases: ["kube-dns-autoscaler"]
       required_patterns:
-        - "(?m)^\\W*verdict:\\s*kube-dns-underscaled\\b"
-        - "\\b(?:coresperreplica|nodesperreplica)\\b|\\bmin\\b[^\\n]{0,60}\\breplicas?\\b|\\breplicas?\\b[^\\n]{0,60}\\bmin\\b"
-        - "\\b(?:nodelocal(?:\\s*dns(?:\\s*cache)?|-dns(?:cache)?)|node-local-dns(?:cache)?)\\b"
+        - "(?m)^verdict:\\s*kube-dns-underscaled$"
+        - "\\b(?:coresperreplica|nodesperreplica|preventsinglepointfailure)\\b|\\blinear\\b[^\\n]{0,80}\\b(?:min|minimum)\\b|\\b(?:min|minimum)\\b[^\\n]{0,80}\\blinear\\b|\\b(?:min|minimum)\\s+replicas?\\b|\\b[\"'`]?min[\"'`]?\\s*[:=]\\s*\\d+\\b"
+        - "(?m)^(?!.*\\b(?:do\\s+not|don't|never|avoid|without|instead\\s+of)\\b[^\\n]{0,40}\\b(?:enabl|turn\\s+on|deploy|adopt|use)\\w*\\b)(?:.*\\b(?:enabl\\w*|turn\\s+on|actenabl\\w*|deploy\\w*|configure\\w*|adopt\\w*|add\\w*|use)\\b[^\\n]{0,80}\\b(?:nodelocal(?:\\s*dns(?:\\s*cache)?|-dns(?:cache)?)|node-local-dns(?:cache)?)\\b|.*\\b(?:nodelocal(?:\\s*dns(?:\\s*cache)?|-dns(?:cache)?)|node-local-dns(?:cache)?)\\b[^\\n]{0,80}\\b(?:=enabled\\b|enabl\\w*|turn\\s+on|deploy\\w*|on\\s+the\\s+cluster\\b|add-?on\\b|daemonset\\b|local\\s+cache\\b|locally\\b|caches?\\b))"
       forbidden_patterns:
-        - "(?m)^\\W*verdict:\\s*coredns-bug\\b"
+        - "(?m)^verdict:\\s*coredns-bug$"
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic
