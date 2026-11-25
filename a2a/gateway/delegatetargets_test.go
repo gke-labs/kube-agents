@@ -218,12 +218,16 @@ func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		wakeDelegate bool
-	}{{"a wake", false}, {"a wake the gateway let delegate", true}} {
-		t.Run(tc.name, func(t *testing.T) { wakeDelegateTargets(t, tc.wakeDelegate) })
+		overflow     bool
+	}{{"a wake", false, false}, {"a wake the gateway let delegate", true, false},
+		// Its child's steer authors overflowed, so the delegation refuses
+		// every target (delegateEntryCheck): the list offers none.
+		{"a wake the gateway let delegate whose child's steers overflowed", true, true}} {
+		t.Run(tc.name, func(t *testing.T) { wakeDelegateTargets(t, tc.wakeDelegate, tc.overflow) })
 	}
 }
 
-func wakeDelegateTargets(t *testing.T, wakeDelegate bool) {
+func wakeDelegateTargets(t *testing.T, wakeDelegate, overflow bool) {
 	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	rec := &SessionRecord{Key: "discord:g1/t-wk", ContextID: "ctx-wk", Kind: "group"}
@@ -233,7 +237,7 @@ func wakeDelegateTargets(t *testing.T, wakeDelegate bool) {
 	r.awaitTask(t, session)
 	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
 	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
-		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, WakeDelegate: wakeDelegate})
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, WakeDelegate: wakeDelegate, SteerAuthorsOverflow: overflow})
 	if !ok {
 		t.Fatal("the wake wasn't submitted")
 	}
@@ -247,6 +251,12 @@ func wakeDelegateTargets(t *testing.T, wakeDelegate bool) {
 	targets, found, _ := lib.DelegateTargetsOf(messageParts(t, wake))
 	if found != wakeDelegate {
 		t.Fatalf("wake (delegate=%v) carried delegate targets: %v", wakeDelegate, found)
+	}
+	if overflow {
+		if len(targets.Targets) != 0 {
+			t.Fatalf("a wake whose child's steers overflowed offered %v, want none", targetNames(targets))
+		}
+		return
 	}
 	if wakeDelegate && !slices.Contains(targetNames(targets), targetPlatform) {
 		t.Fatalf("a wake that may delegate carried %v, want platform listed", targetNames(targets))

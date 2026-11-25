@@ -3257,6 +3257,38 @@ func TestAWokenSessionMayDelegateAgainOneLevelDeeper(t *testing.T) {
 	}
 }
 
+// TestAStopReachesAWakesOwnChild: a wake isn't on its child's Children, so
+// the tree-wide stop follows each child to its wake (wakeOf) as chainLast
+// does. A stop from the chain's first turn reaches the child a woken session
+// delegated, which a walk down Children alone never did.
+func TestAStopReachesAWakesOwnChild(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake-stop"
+	wake, _, wexec, child := wokenSession(t, r, spawn, conv, "checkout-gateway on seeded-a has no PodDisruptionBudget")
+	if err := wexec.PublishArtifact(ctx, delegateArtifact(t, "platform", "open the PodDisruptionBudget pull request")); err != nil {
+		t.Fatal(err)
+	}
+	second := awaitSubmission(t, r, targetPlatform, 1)
+	waitForRecord(t, r, conv, "the second child on the record", func(rec *SessionRecord) bool {
+		_, ok := rec.TaskRefFor(second.TaskID)
+		return ok
+	})
+	first := refOf(t, r, conv, child.TaskID).ParentTaskID
+	l := r.g.lockSession(conv)
+	l.Lock()
+	rec, _ := r.g.reg.Get(ctx, conv)
+	r.g.stopTree(ctx, rec, first, Authority{}, false)
+	l.Unlock()
+	if !cancelSentTo(t, r, targetPlatform, second.TaskID) {
+		t.Fatalf("the stop from %s never reached the wake %s's child %s", first, wake.TaskID, second.TaskID)
+	}
+	if ref, _ := rec.TaskRefFor(second.TaskID); !ref.Canceled {
+		t.Fatal("the wake's child isn't marked canceled")
+	}
+}
+
 // TestAWakeAtTheDepthBoundHasNoToolAndIsRefusedIfItDelegatesAnyway: at the
 // bound the wake gets neither the mark nor the guide that invites a
 // delegation, and the gateway refuses one regardless, so the bound holds

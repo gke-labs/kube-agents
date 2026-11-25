@@ -3540,6 +3540,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	var extra []lib.Part
 	if ts.Route == nil && (ts.Role != taskRoleWake || ts.WakeDelegate) && ownSession {
 		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
+		// A wake carries its child's steer authors (startWake), which the
+		// delegation checks (delegateEntryCheck) but the record's session set
+		// doesn't hold yet, so the list is built for them too.
+		for _, a := range ts.SteerAuthors {
+			if !slices.Contains(authors, a) {
+				authors = append(authors, a)
+			}
+		}
+		unknown = unknown || ts.SteerAuthorsOverflow || len(authors) > sessionAuthorCap
 		if unknown && approximate {
 			// The record's people overflow the cap, but the pod's seeded set
 			// (the primer's turns) may not: no list, so the tool falls back

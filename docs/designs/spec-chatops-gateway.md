@@ -1028,7 +1028,7 @@ the capability check, its own consumer on its own `…in` subject for steering a
 deadline and its own terminal. The harness is started again for each task with
 `--resume <session id>`, the id the previous run reported, so the model has the conversation
 without a primer; the primer goes to the first harness run only. The delegate tool is decided per
-task as well: off for a wake (see "The wake" above). SIGTERM while the shim is idle exits 0 with
+task as well: off for a wake the gateway didn't let delegate again, on for one it did (see "The wake" above). SIGTERM while the shim is idle exits 0 with
 nothing published; mid-task it is that task's eviction, as before. A harness run that reports no
 session, or a task that ended without its terminal reaching the bus, ends the process instead of
 waiting for the next task: the pod reaches a terminal phase, Sweep closes what is owed, and the
