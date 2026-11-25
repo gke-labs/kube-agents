@@ -13428,7 +13428,7 @@ class VcsRouteTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}), mock.patch.object(
             credential_proxy, "managed_repositories", return_value=frozenset()
         ):
-            for verb in ("clone", "proposal-view", "issue-create", "issue-comment", "label-ensure"):
+            for verb in ("clone", "proposal-view", "proposal-classify-risk", "issue-create", "issue-comment", "label-ensure"):
                 with self.subTest(verb=verb):
                     status, payload = self._handler(
                         f"/v1/vcs/{verb}", {"repository": "https://github.com/acme/infra"}, self.broker()

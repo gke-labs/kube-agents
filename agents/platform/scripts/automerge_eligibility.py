@@ -38,6 +38,7 @@ PRACTICE_LABEL = "kube-agents:would-auto-merge"
 AUTOMERGE_LABEL = "kube-agents:auto-merge"
 RESERVED_LABELS = (PRACTICE_LABEL, AUTOMERGE_LABEL)
 #: Deterministic risk-tier labels reserved for the credential broker alone.
+RISK_LABEL_PREFIX = "risk:"
 RISK_LABELS = ("risk:low", "risk:medium", "risk:high", "risk:critical", "risk:unknown")
 LABEL_FOR_SWITCH = {"practice": PRACTICE_LABEL, "on": AUTOMERGE_LABEL}
 LABELLING_SWITCH_VALUES = frozenset(LABEL_FOR_SWITCH)
@@ -100,7 +101,7 @@ def reserved_label_refusal(verb: str, payload: Any) -> str | None:
         if field == "labels" and verb.endswith("-list"):
             continue
         value = payload.get(field)
-        named += value if isinstance(value, list) else [value]
+        named += list(value) if isinstance(value, (list, tuple)) else [value]
     # Split on commas too: a forge that takes labels as one comma-joined
     # parameter (GitLab's `add_labels`) reads `x,<label>` as two labels.
     names = [part.strip().casefold() for label in named if isinstance(label, str) for part in label.split(",")]
@@ -110,10 +111,10 @@ def reserved_label_refusal(verb: str, payload: Any) -> str | None:
             "applies them itself to a fix it judged safe to merge (proposal-practice-label), "
             "and no request may add, remove or create them."
         )
-    if any(name in risk_reserved for name in names):
+    if any(name in risk_reserved or name.startswith(RISK_LABEL_PREFIX) for name in names):
         return (
-            f"The labels {', '.join(RISK_LABELS)} are reserved: the credential broker "
-            "computes and applies them deterministically from git state, "
+            f"The labels {', '.join(RISK_LABELS)} (and all `{RISK_LABEL_PREFIX}*` labels) are reserved: "
+            "the credential broker computes and applies them deterministically from git state, "
             "and no request may add, remove or create them."
         )
     return None

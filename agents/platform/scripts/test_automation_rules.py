@@ -1,5 +1,6 @@
 """Tests for automation_rules, the parser for the customer's `.kube-agents/automation.yaml`."""
 
+import contextlib
 import io
 import json
 import os
@@ -499,6 +500,99 @@ class TestRiskRules(unittest.TestCase):
         self.assertEqual(parsed_deny.status, ar.LOADED)
         self.assertFalse(ar.decide(parsed_deny, "no-pdb", "dev").allowed)
         self.assertTrue(ar.decide_risk(parsed_deny, "low", "dev").allowed)
+
+    def test_deny_risk_supports_high_critical_and_wildcard(self):
+        text = (
+            "version: 1\n"
+            "automerge:\n"
+            "  allow:\n"
+            "    - max_risk: medium\n"
+            "      environments: [dev]\n"
+            "  deny:\n"
+            "    - risk: high\n"
+            "      environments: [dev]\n"
+            "    - risk: critical\n"
+            "      environments: [dev]\n"
+            "    - risk: '*'\n"
+            "      environments: [prod]\n"
+        )
+        rules = ar.parse(text)
+        self.assertEqual(rules.status, ar.LOADED, rules.error)
+        self.assertTrue(ar.decide_risk(rules, "medium", "dev").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "prod").allowed)
+        for bad in ("unknown", "bogus"):
+            bad_rules = ar.parse(f"version: 1\nautomerge:\n  deny:\n    - risk: {bad}\n      environments: [dev]\n")
+            self.assertEqual(bad_rules.status, ar.INVALID)
+
+    def test_decide_risk_classification_mapping_supported_flag_and_environment_validation(self):
+        rules = ar.parse("version: 1\nautomerge:\n  allow:\n    - max_risk: medium\n      environments: [dev]\n")
+        unsup = ar.decide_risk(rules, "low", "dev", supported=False)
+        self.assertFalse(unsup.allowed)
+        self.assertIn("unsupported", unsup.reason)
+
+        # Full valid classification dict succeeds
+        ok_cls = {
+            "risk_level": "low",
+            "disruptiveness": "non_disruptive",
+            "revertability": "easy",
+            "effective_changes": True,
+            "supported": True,
+        }
+        self.assertTrue(ar.decide_risk(rules, None, "dev", classification=ok_cls).allowed)
+
+        # Missing fields in classification dict fail closed
+        self.assertFalse(ar.decide_risk(rules, None, "dev", classification={"risk_level": "low"}).allowed)
+        self.assertFalse(ar.decide_risk(rules, None, "dev", classification={}).allowed)
+
+        # 4-state disruptiveness & revertability error messages name exact required values
+        for d_state in ("disruptive", "destructive", "unknown"):
+            dec = ar.decide_risk(rules, "low", "dev", disruptiveness=d_state)
+            self.assertFalse(dec.allowed)
+            self.assertIn("requires `non_disruptive`", dec.reason)
+        for r_state in ("moderate", "difficult", "irreversible", "unknown"):
+            dec = ar.decide_risk(rules, "low", "dev", revertability=r_state)
+            self.assertFalse(dec.allowed)
+            self.assertIn("requires `easy`", dec.reason)
+
+        # Invalid environment strings fail closed
+        for bad_env in ("Prod", "dev;rm", " "):
+            dec = ar.decide_risk(rules, "low", bad_env)
+            self.assertFalse(dec.allowed)
+
+    def test_cli_risk_flags_and_mutual_exclusion(self):
+        text = "version: 1\nautomerge:\n  allow:\n    - max_risk: low\n      environments: [staging]\n"
+        root = _tree(text)
+        fake = types.ModuleType("kubeagents_switches")
+        fake.switch = lambda name: "on"
+        buf = io.StringIO()
+        with mock.patch.dict(sys.modules, {"kubeagents_switches": fake}), redirect_stdout(buf):
+            code = ar.main([
+                str(root),
+                "--risk", "low",
+                "--disruptiveness", "non_disruptive",
+                "--revertability", "easy",
+                "--environment", "staging",
+            ])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(buf.getvalue())["decision"]["allowed"])
+
+        buf2 = io.StringIO()
+        with mock.patch.dict(sys.modules, {"kubeagents_switches": fake}), redirect_stdout(buf2):
+            code2 = ar.main([
+                str(root),
+                "--risk", "low",
+                "--disruptiveness", "destructive",
+                "--revertability", "easy",
+                "--environment", "staging",
+            ])
+        self.assertEqual(code2, 0)
+        dec2 = json.loads(buf2.getvalue())["decision"]
+        self.assertFalse(dec2["allowed"])
+        self.assertIn("requires `non_disruptive`", dec2["reason"])
+
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf), self.assertRaises(SystemExit):
+            ar.main([str(root), "--fix", "no-pdb", "--risk", "low", "--environment", "staging"])
 
 
 if __name__ == "__main__":

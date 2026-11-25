@@ -92,9 +92,13 @@ class Rule:
         )
 
     def matches_risk_allow(self, risk_level: str, environment: str) -> bool:
-        if not self.max_risk or risk_level not in ALLOWABLE_RISK_LEVELS:
+        if not isinstance(risk_level, str) or not isinstance(environment, str):
             return False
-        if self.max_risk not in ALLOWABLE_RISK_LEVELS:
+        if not self.max_risk or self.fix or self.risk:
+            return False
+        if risk_level not in ALLOWABLE_RISK_LEVELS or self.max_risk not in ALLOWABLE_RISK_LEVELS:
+            return False
+        if environment == WILDCARD or WILDCARD in self.environments:
             return False
         return (
             CONCRETE_RISK_ORDER[risk_level] <= CONCRETE_RISK_ORDER[self.max_risk]
@@ -102,6 +106,8 @@ class Rule:
         )
 
     def matches_risk_deny(self, risk_level: str, environment: str) -> bool:
+        if not isinstance(environment, str):
+            return False
         env_match = WILDCARD in self.environments or environment in self.environments
         if not env_match:
             return False
@@ -109,7 +115,7 @@ class Rule:
         # auto-merge in that environment too, so existing prod denials stay closed.
         if self.fix == WILDCARD or self.risk == WILDCARD:
             return True
-        if self.risk in CONCRETE_RISK_ORDER and risk_level in CONCRETE_RISK_ORDER:
+        if isinstance(risk_level, str) and self.risk in CONCRETE_RISK_ORDER and risk_level in CONCRETE_RISK_ORDER:
             return CONCRETE_RISK_ORDER[risk_level] >= CONCRETE_RISK_ORDER[self.risk]
         return False
 
@@ -238,9 +244,10 @@ def _parse_rule(raw: Any, where: str, *, wildcard_ok: bool, warnings: list[str])
         return Rule(max_risk=max_risk, environments=tuple(envs))
 
     risk = data["risk"]
-    valid_deny_risks = set(ALLOWABLE_RISK_LEVELS) | {WILDCARD}
+    deny_risk_levels = tuple(CONCRETE_RISK_ORDER)
+    valid_deny_risks = set(deny_risk_levels) | {WILDCARD}
     if not isinstance(risk, str) or risk not in valid_deny_risks:
-        allowed_str = ", ".join(f"`{r}`" for r in (*ALLOWABLE_RISK_LEVELS, WILDCARD))
+        allowed_str = ", ".join(f"`{r}`" for r in (*deny_risk_levels, WILDCARD))
         raise RulesError(f"{where}.risk: expected one of {allowed_str}")
     return Rule(risk=risk, environments=tuple(envs))
 
@@ -408,22 +415,49 @@ def decide_risk(
     disruptiveness: str = "non_disruptive",
     revertability: str = "easy",
     effective_changes: bool = True,
+    supported: bool = True,
     install_max_risk: str | None = None,
+    classification: Mapping[str, Any] | None = None,
 ) -> Decision:
-    """Whether rules + safety gates allow a PR at `risk_level` in `environment` to auto-merge."""
+    """Whether rules + safety gates allow a PR at `risk_level` in `environment` to auto-merge.
+
+    When `classification` is provided (from live broker/git classification), all 4 axes plus
+    `supported` and `effective_changes` are read directly from it with fail-closed defaults so
+    an untrusted `risk:*` label or partial payload can never authorize auto-merge.
+    """
+    if classification is not None:
+        if not isinstance(classification, Mapping):
+            return Decision(False, "invalid classification payload; nothing merges unattended")
+        raw_level = classification.get("risk_level")
+        risk_level = raw_level if isinstance(raw_level, str) and raw_level else "unknown"
+        raw_disrupt = classification.get("disruptiveness")
+        disruptiveness = raw_disrupt if isinstance(raw_disrupt, str) and raw_disrupt else "unknown"
+        raw_revert = classification.get("revertability")
+        revertability = raw_revert if isinstance(raw_revert, str) and raw_revert else "unknown"
+        effective_changes = classification.get("effective_changes") is True
+        supported = classification.get("supported") is True
+
     if rules.status == SWITCH_OFF:
         return Decision(False, "KUBEAGENTS_AUTOMERGE is off; the rules file was not read")
     if rules.status == ABSENT:
         return Decision(False, f"no {RULES_FILE}; nothing merges unattended")
     if rules.status != LOADED:
         return Decision(False, f"{RULES_FILE} refused ({rules.error}); nothing merges unattended")
-    if risk_level not in ALLOWABLE_RISK_LEVELS:
+    if supported is not True:
+        return Decision(False, "unsupported changes are never eligible for unattended auto-merge")
+    if not isinstance(risk_level, str) or risk_level not in ALLOWABLE_RISK_LEVELS:
         return Decision(False, f"risk level `{risk_level}` is never eligible for unattended auto-merge")
     if disruptiveness != "non_disruptive":
-        return Decision(False, f"changes with disruptiveness `{disruptiveness}` are not eligible for auto-merge")
+        return Decision(
+            False,
+            f"changes with disruptiveness `{disruptiveness}` are not eligible for auto-merge (requires `non_disruptive`)",
+        )
     if revertability != "easy":
-        return Decision(False, f"changes with revertability `{revertability}` are not eligible for auto-merge")
-    if not effective_changes:
+        return Decision(
+            False,
+            f"changes with revertability `{revertability}` are not eligible for auto-merge (requires `easy`)",
+        )
+    if effective_changes is not True:
         return Decision(False, "no effective runtime changes to auto-merge")
     if install_max_risk is not None:
         if install_max_risk == "off" or install_max_risk not in ALLOWABLE_RISK_LEVELS:
@@ -433,8 +467,10 @@ def decide_risk(
                 False,
                 f"risk level `{risk_level}` exceeds install ceiling {INSTALL_MAX_RISK_ENV}={install_max_risk}",
             )
-    if not environment:
+    if not isinstance(environment, str) or not environment:
         return Decision(False, "the cluster declares no environment label")
+    if not _ENV_RE.fullmatch(environment):
+        return Decision(False, f"invalid cluster environment label `{environment}`")
     for index, rule in enumerate(rules.deny):
         if rule.matches_risk_deny(risk_level, environment):
             return Decision(False, f"denied by automerge.deny[{index}]")
@@ -577,8 +613,25 @@ def _insert_after_line(text: str, index: int, lines: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=f"Check a GitOps checkout's {RULES_FILE}.")
     parser.add_argument("tree", type=Path, help="the checkout's root")
-    parser.add_argument("--fix", default="", help="also decide for this fix type")
-    parser.add_argument("--risk", default="", help="also decide for this PR risk level (low, medium, high, critical, unknown)")
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--fix", default="", help="also decide for this fix type")
+    selector.add_argument(
+        "--risk",
+        default="",
+        help="also decide for this PR risk level (low, medium, high, critical, unknown)",
+    )
+    parser.add_argument(
+        "--disruptiveness",
+        default="non_disruptive",
+        choices=("non_disruptive", "disruptive", "destructive", "unknown"),
+        help="PR disruptiveness axis when evaluating --risk (default: non_disruptive)",
+    )
+    parser.add_argument(
+        "--revertability",
+        default="easy",
+        choices=("easy", "moderate", "difficult", "irreversible", "unknown"),
+        help="PR revertability axis when evaluating --risk (default: easy)",
+    )
     parser.add_argument("--environment", default="", help="and this environment")
     args = parser.parse_args(argv)
     rules = read_rules(args.tree)
@@ -599,6 +652,8 @@ def main(argv: list[str] | None = None) -> int:
             rules,
             args.risk,
             args.environment,
+            disruptiveness=args.disruptiveness,
+            revertability=args.revertability,
             install_max_risk=install_max_risk_ceiling(),
         )
         out["decision"] = {"allowed": decision.allowed, "reason": decision.reason}

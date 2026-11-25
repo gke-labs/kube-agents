@@ -509,9 +509,50 @@ def _reserved_labels_on(proposal: Mapping[str, Any]) -> list[str]:
 
 
 def _risk_labels_on(proposal: Mapping[str, Any]) -> list[str]:
-    """The deterministic `risk:*` labels a proposal carries, in canonical spelling."""
-    names = {str(label).casefold() for label in proposal.get("labels") or []}
-    return [label for label in risk_classifier.RISK_LABELS if label.casefold() in names]
+    """All `risk:*` labels a proposal carries, preserving exact forge spellings."""
+    found: list[str] = []
+    for raw in proposal.get("labels") or []:
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip()
+        if name.casefold().startswith(risk_classifier.RISK_LABEL_PREFIX) and name not in found:
+            found.append(name)
+    return found
+
+
+def _extract_expected_head_sha(payload: Mapping[str, Any]) -> str:
+    """Validate optional `expected_head_sha` / `expectedRevision` pinned by caller."""
+    raw = payload.get("expected_head_sha")
+    if raw is None:
+        raw = payload.get("expectedRevision")
+    if raw is None or raw == "":
+        return ""
+    return validate_revision(raw, "expected_head_sha")
+
+
+def _risk_summary_payload(risk_res: Mapping[str, Any]) -> dict[str, Any]:
+    """Concise 4-axis risk classification and auto-merge summary for write responses."""
+    reasons = risk_res.get("reasons")
+    if not isinstance(reasons, list):
+        cls_dict = risk_res.get("classification")
+        reasons = cls_dict.get("reasons") if isinstance(cls_dict, Mapping) else []
+    top_reasons = list(reasons[:10]) if isinstance(reasons, list) else []
+    return {
+        "number": risk_res.get("number"),
+        "sourceRevision": risk_res.get("sourceRevision", ""),
+        "stale_base": bool(risk_res.get("stale_base", False)),
+        "risk_level": risk_res.get("risk_level"),
+        "risk_label": risk_res.get("risk_label"),
+        "blast_radius": risk_res.get("blast_radius"),
+        "revertability": risk_res.get("revertability"),
+        "disruptiveness": risk_res.get("disruptiveness"),
+        "supported": bool(risk_res.get("supported", False)),
+        "effective_changes": bool(risk_res.get("effective_changes", False)),
+        "labelled": bool(risk_res.get("labelled", False)),
+        "label": risk_res.get("label"),
+        "reason": risk_res.get("reason", ""),
+        "reasons": top_reasons,
+    }
 
 
 def _automerge_switch() -> str:
@@ -1973,14 +2014,23 @@ class VcsBroker:
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
-        if existing_head:
+        risk_summaries: list[dict[str, Any]] = []
+        if existing_head or advance:
             open_numbers = self._drop_practice_label(bound, branch)
             if self._auto_label_risk:
                 for num in open_numbers:
-                    self._best_effort_risk_label(bound, payload, num)
+                    r_res = self._best_effort_risk_label(
+                        bound, payload, num, expected_head_sha=tip
+                    )
+                    if isinstance(r_res, dict):
+                        risk_summaries.append(_risk_summary_payload(r_res))
         result: dict[str, Any] = {"branch": branch, "revision": tip}
         if dm_markdown:
             result["decisionMemoryMarkdown"] = dm_markdown
+        if risk_summaries:
+            result["risk"] = risk_summaries[0]
+            if len(risk_summaries) > 1:
+                result["proposals_risk"] = risk_summaries
         return bound.stamp(result)
 
     def _require_install_commit_identities(
@@ -3089,12 +3139,20 @@ class VcsBroker:
     def proposal_create(self, payload):
         self._refuse_decision_override_labels(payload)
         created = self._forge_verb("proposal-create", payload, pinned_target=True)
-        if self._auto_label_risk:
-            prop = created.get("proposal") if isinstance(created, dict) else None
+        if self._auto_label_risk and isinstance(created, dict):
+            prop = created.get("proposal")
             num = prop.get("number") if isinstance(prop, dict) else None
             if type(num) is int and num > 0:
                 bound = self._bind(payload)
-                self._best_effort_risk_label(bound, payload, num)
+                raw_sha = str(prop.get("sourceRevision") or "")
+                expected_sha = raw_sha if _OBJECT_ID.fullmatch(raw_sha) else ""
+                risk_res = self._best_effort_risk_label(
+                    bound, payload, num, expected_head_sha=expected_sha
+                )
+                if isinstance(risk_res, dict):
+                    created["risk"] = _risk_summary_payload(risk_res)
+                    if isinstance(risk_res.get("applied_labels"), list):
+                        prop["labels"] = list(risk_res["applied_labels"])
         return created
 
     def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3177,10 +3235,32 @@ class VcsBroker:
         # `proposal-create`, and the rule stays true the day an adapter learns
         # to retarget.
         self._refuse_decision_override_labels(payload)
-        return self._forge_verb(
+        updated = self._forge_verb(
             "proposal-update", payload,
             pinned_target=payload.get("target") is not None,
         )
+        if payload.get("target") is not None and isinstance(updated, dict):
+            prop = updated.get("proposal")
+            num = prop.get("number") if isinstance(prop, dict) else None
+            if type(num) is int and num > 0:
+                bound = self._bind(payload)
+                if self._auto_label_risk:
+                    risk_res = self._best_effort_risk_label(bound, payload, num)
+                    if isinstance(risk_res, dict):
+                        updated["risk"] = _risk_summary_payload(risk_res)
+                        if isinstance(risk_res.get("applied_labels"), list):
+                            prop["labels"] = list(risk_res["applied_labels"])
+                elif getattr(bound.forge, "labels", False) and not bound.forge.text_sets_labels:
+                    carried = _reserved_labels_on(prop) + _risk_labels_on(prop)
+                    if carried and prop.get("state") == OPEN_PROPOSAL_STATE:
+                        try:
+                            bound.forge.proposal_update(
+                                bound.api, bound.repo, {"number": num, "labelsRemove": carried}
+                            )
+                            prop["labels"] = [lbl for lbl in (prop.get("labels") or []) if lbl not in carried]
+                        except Exception as exc:  # noqa: BLE001
+                            LOGGER.warning("proposal_update label strip failed repo=%s number=%s: %s", bound.repo, num, exc)
+        return updated
 
     def proposal_close(self, payload):
         return self._forge_verb("proposal-close", payload)
@@ -3285,6 +3365,7 @@ class VcsBroker:
         view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": on}) or {}
         proposal = view.get("proposal") or {}
         checks: list[dict] = []
+        risk_verdict: risk_classifier.ClassificationResult | None = None
         if on:
             viewer = ""
             try:
@@ -3313,8 +3394,13 @@ class VcsBroker:
                 and viewer
                 and _login_key(str(proposal.get("author") or "")) == _login_key(viewer)
             ):
-                if self._practice_risk_qualifies(bound, payload, number, proposal, switch):
+                qualifies, risk_reason, risk_verdict = self._practice_risk_qualifies(
+                    bound, payload, number, proposal, switch
+                )
+                if qualifies:
                     reason = None
+                elif risk_verdict is not None and risk_reason:
+                    reason = risk_reason
         else:
             # Off reads no cluster and no rules; it only takes back a label an
             # earlier `practice` or `on` left.
@@ -3358,7 +3444,7 @@ class VcsBroker:
             after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
         # A label this call just added was never earned by a head that moved,
         # so it comes off whatever the state; an older one stays on a merge.
-        if stale and (added or (after or {}).get("state") == OPEN_PROPOSAL_STATE):
+        if stale and getattr(bound.forge, "labels", False) and (added or (after or {}).get("state") == OPEN_PROPOSAL_STATE):
             bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
         LOGGER.info(
             "practice label repo=%s number=%s switch=%s labelled=%s reason=%s checks=%s",
@@ -3368,15 +3454,21 @@ class VcsBroker:
         # The caller learns which checks passed, not what the cluster read
         # said: the details name workloads and budgets on whatever cluster the
         # budget named, and stay in this log.
-        return bound.stamp(
-            {
-                "labelled": reason is None,
-                "label": want,
-                "switch": switch,
-                "reason": reason or "eligible",
-                "checks": [{"name": c["name"], "passed": c["passed"]} for c in checks],
-            }
-        )
+        out_practice: dict[str, Any] = {
+            "labelled": reason is None,
+            "label": want,
+            "switch": switch,
+            "reason": reason or "eligible",
+            "checks": [{"name": c["name"], "passed": c["passed"]} for c in checks],
+        }
+        if risk_verdict is not None:
+            out_practice["risk_level"] = risk_verdict.risk_level
+            out_practice["risk_label"] = risk_verdict.risk_label
+            out_practice["blast_radius"] = risk_verdict.blast_radius
+            out_practice["revertability"] = risk_verdict.revertability
+            out_practice["disruptiveness"] = risk_verdict.disruptiveness
+            out_practice["reasons"] = [r.to_dict() for r in risk_verdict.reasons[:10]]
+        return bound.stamp(out_practice)
 
     def _practice_refusal(
         self,
@@ -3578,9 +3670,15 @@ class VcsBroker:
                     open_numbers.append(num)
                 carried = _reserved_labels_on(proposal) + _risk_labels_on(proposal)
                 if carried:
-                    bound.forge.proposal_update(
-                        bound.api, bound.repo, {"number": proposal["number"], "labelsRemove": carried}
-                    )
+                    try:
+                        bound.forge.proposal_update(
+                            bound.api, bound.repo, {"number": proposal["number"], "labelsRemove": carried}
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- continue stripping sibling proposals
+                        LOGGER.warning(
+                            "practice label not dropped after a push repo=%s branch=%s number=%s: %s",
+                            bound.repo, branch, num, exc,
+                        )
         except Exception as exc:  # noqa: BLE001 -- the push stands either way
             LOGGER.warning("practice label not dropped after a push repo=%s branch=%s: %s", bound.repo, branch, exc)
         return open_numbers
@@ -3595,6 +3693,8 @@ class VcsBroker:
         number: int,
         *,
         proposal_override: dict[str, Any] | None = None,
+        expected_head_sha: str = "",
+        out_context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], risk_classifier.ClassificationResult, list[str], bool]:
         """Fetch target & proposal refs into one bare scratch repo and classify in-process.
 
@@ -3614,7 +3714,7 @@ class VcsBroker:
         state = str(proposal.get("state") or "")
         source_repo = str(proposal.get("sourceRepo") or "")
         # Non-merged PRs must explicitly originate from this repository (an empty
-        # `sourceRepo` on GitLab/GitHub/Gitea means a fork or deleted fork).
+        # `sourceRepo` on a forge means an external or deleted fork).
         if state != "merged" and (not source_repo or source_repo.casefold() != bound.repo.casefold()):
             return (
                 proposal,
@@ -3630,6 +3730,18 @@ class VcsBroker:
         source_branch = str(proposal.get("source") or "")
         expected_rev = str(proposal.get("sourceRevision") or "")
         merge_commit = str(proposal.get("mergeCommit") or "")
+
+        if expected_head_sha and state != "merged":
+            if not expected_rev or expected_rev.lower() != expected_head_sha.lower():
+                return (
+                    proposal,
+                    risk_classifier.unknown_result(
+                        "HEAD_SHA_MISMATCH",
+                        f"proposal head revision {(expected_rev or 'missing')[:12]} does not match expected_head_sha {expected_head_sha[:12]}",
+                    ),
+                    [],
+                    False,
+                )
 
         if not target_branch or target_branch.startswith("-") or any(ch.isspace() or ord(ch) < 0x20 for ch in target_branch):
             return (
@@ -3652,6 +3764,17 @@ class VcsBroker:
                 False,
             )
 
+        if state == OPEN_PROPOSAL_STATE and (not expected_rev or not _OBJECT_ID.fullmatch(expected_rev)):
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    "MISSING_HEAD_REVISION",
+                    "open proposal has no verified commit revision id",
+                ),
+                [],
+                False,
+            )
+
         if state == "merged" and (not merge_commit or not _OBJECT_ID.fullmatch(merge_commit)):
             return (
                 proposal,
@@ -3668,6 +3791,37 @@ class VcsBroker:
         bare = root / "repo.git"
         git = bound.git
         bare_git = functools.partial(bound.git, bare=True)
+        last_watch, stopped_ceiling = [0.0], [False]
+
+        def over_ceiling() -> bool:
+            now = time.monotonic()
+            if now - last_watch[0] < CLONE_WATCH_SECONDS:
+                return False
+            last_watch[0] = now
+            stopped_ceiling[0] = _tree_bytes(bare, self.max_clone_bytes) > self.max_clone_bytes
+            return stopped_ceiling[0]
+
+        def guarded_fetch(*fetch_args: str, check: bool = False) -> subprocess.CompletedProcess:
+            remedy = "The fetched git objects exceed the broker clone ceiling."
+            proc = bare_git(
+                bare,
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "origin",
+                *fetch_args,
+                check=False,
+                stop=over_ceiling,
+            )
+            if stopped_ceiling[0]:
+                raise self._clone_too_large(bound.repo, remedy)
+            self._enforce_ceiling(bare, bound.repo, remedy=remedy)
+            if check and proc.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, ["git", "fetch", *fetch_args], proc.stdout, proc.stderr
+                )
+            return proc
+
         try:
             git(root, "init", "--bare", "--quiet", str(bare))
             bare_git(bare, "remote", "add", "origin", bound.forge.clone_url(bound.repo))
@@ -3678,19 +3832,21 @@ class VcsBroker:
             stale_base = False
 
             if state == "merged":
-                # Merged PR: fetch target branch (or mergeCommit directly) and verify parent topology
-                bare_git(
-                    bare,
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    "origin",
-                    f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}",
-                )
+                # Merged PR: try shallow `--depth=2 <merge_commit>` first so we avoid
+                # fetching full target-branch history and still succeed when a release
+                # target branch was deleted after merge.
+                guarded_fetch("--depth=2", merge_commit, check=False)
                 probe = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^{{commit}}", check=False)
-                if probe.returncode != 0:
-                    bare_git(bare, "fetch", "--quiet", "--no-tags", "origin", merge_commit)
                 parent_proc = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^1", check=False)
+                if probe.returncode != 0 or parent_proc.returncode != 0:
+                    guarded_fetch(
+                        f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}",
+                        check=False,
+                    )
+                    probe = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^{{commit}}", check=False)
+                    if probe.returncode != 0:
+                        guarded_fetch(merge_commit, check=True)
+                    parent_proc = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^1", check=False)
                 if parent_proc.returncode != 0:
                     return (
                         proposal,
@@ -3702,19 +3858,43 @@ class VcsBroker:
                         False,
                     )
                 second_parent = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^2", check=False)
-                if second_parent.returncode != 0:
+                if second_parent.returncode == 0:
+                    third_parent = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^3", check=False)
+                    if third_parent.returncode == 0:
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "MERGED_PR_OCTOPUS_MERGE",
+                                f"merged proposal #{number} used an octopus merge commit; parent delta is ambiguous",
+                            ),
+                            [],
+                            False,
+                        )
+                    p2_sha = second_parent.stdout.strip()
+                    if expected_rev and _OBJECT_ID.fullmatch(expected_rev) and p2_sha.lower() != expected_rev.lower():
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "MERGED_PR_AMBIGUOUS_PARENTS",
+                                f"merged proposal #{number} mergeCommit second parent {p2_sha[:12]} does not match proposal revision {expected_rev[:12]}",
+                            ),
+                            [],
+                            False,
+                        )
+                else:
                     # Single-parent mergeCommit: exact for 1-commit PRs (rebase/ff/squash),
                     # ambiguous for multi-commit PRs (squash vs rebase-and-merge where
                     # mergeCommit^1..mergeCommit would miss earlier rebased commits).
                     commits: Any = None
+                    commits_truncated = False
                     if hasattr(bound.forge, "proposal_commits"):
                         try:
-                            commits = (
-                                bound.forge.proposal_commits(bound.api, bound.repo, {"number": number}) or {}
-                            ).get("commits")
+                            commits_resp = bound.forge.proposal_commits(bound.api, bound.repo, {"number": number}) or {}
+                            commits = commits_resp.get("commits")
+                            commits_truncated = bool(commits_resp.get("truncated"))
                         except Exception:  # noqa: BLE001
                             commits = None
-                    if not isinstance(commits, list) or len(commits) != 1:
+                    if commits_truncated or not isinstance(commits, list) or len(commits) != 1:
                         return (
                             proposal,
                             risk_classifier.unknown_result(
@@ -3731,19 +3911,26 @@ class VcsBroker:
                 refspecs = [f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}"]
                 if source_branch:
                     refspecs.append(f"refs/heads/{source_branch}:refs/remotes/origin/{source_branch}")
-                fetched = bare_git(bare, "fetch", "--quiet", "--no-tags", "origin", *refspecs, check=False)
+                fetched = guarded_fetch(*refspecs, check=False)
                 if fetched.returncode != 0:
-                    # Head branch may have been deleted; fetch target first, then try expected_rev
-                    bare_git(
-                        bare,
-                        "fetch",
-                        "--quiet",
-                        "--no-tags",
-                        "origin",
+                    if state == OPEN_PROPOSAL_STATE:
+                        # An open PR whose source or target branch cannot be fetched fails closed.
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "HEAD_REVISION_UNAVAILABLE",
+                                f"could not fetch open proposal branch {source_branch!r} or target {target_branch!r}",
+                            ),
+                            [],
+                            False,
+                        )
+                    # Closed-unmerged PR: head branch may have been deleted; fetch target first, then try expected_rev
+                    guarded_fetch(
                         f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}",
+                        check=True,
                     )
                     if expected_rev and _OBJECT_ID.fullmatch(expected_rev):
-                        rev_fetch = bare_git(bare, "fetch", "--quiet", "--no-tags", "origin", expected_rev, check=False)
+                        rev_fetch = guarded_fetch(expected_rev, check=False)
                         if rev_fetch.returncode != 0:
                             return (
                                 proposal,
@@ -3772,11 +3959,34 @@ class VcsBroker:
                     else None
                 )
                 head_sha = head_probe.stdout.strip() if (head_probe and head_probe.returncode == 0) else ""
-                if expected_rev and head_sha != expected_rev:
-                    # Either branch moved or was fetched by SHA directly
+                if state == OPEN_PROPOSAL_STATE:
+                    # Live git branch tip MUST match the forge proposal's sourceRevision.
+                    # Never fall back to classifying a stale ancestor if the git branch
+                    # already advanced ahead of an eventually-consistent forge API response.
+                    if not head_sha or head_sha.lower() != expected_rev.lower():
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "PROPOSAL_BRANCH_MOVED",
+                                "the proposal's git branch tip differs from its reported revision",
+                            ),
+                            [],
+                            False,
+                        )
+                elif expected_rev and head_sha and head_sha.lower() != expected_rev.lower():
+                    return (
+                        proposal,
+                        risk_classifier.unknown_result(
+                            "PROPOSAL_BRANCH_MOVED",
+                            "the proposal's git branch tip differs from its reported revision",
+                        ),
+                        [],
+                        False,
+                    )
+                elif expected_rev and not head_sha:
                     sha_probe = bare_git(bare, "rev-parse", "--verify", f"{expected_rev}^{{commit}}", check=False)
                     if sha_probe.returncode != 0 and _OBJECT_ID.fullmatch(expected_rev):
-                        bare_git(bare, "fetch", "--quiet", "--no-tags", "origin", expected_rev, check=False)
+                        guarded_fetch(expected_rev, check=False)
                         sha_probe = bare_git(bare, "rev-parse", "--verify", f"{expected_rev}^{{commit}}", check=False)
                     if sha_probe.returncode != 0:
                         return (
@@ -3822,17 +4032,72 @@ class VcsBroker:
                 disable_gitattributes=True,
             )
 
-            # For open PRs, check if target branch advanced on any of the same paths
+            # For open PRs, check if target branch advanced on any of the same paths.
+            # Scope diff-tree to changed_paths in chunks and fail closed on error/truncation.
             if state == OPEN_PROPOSAL_STATE and target_tip and target_tip != diff_base and changed_paths:
-                adv = bare_git(bare, "diff-tree", "-r", "--name-only", "-z", diff_base, target_tip, check=False)
-                if adv.returncode == 0 and adv.stdout:
-                    raw_adv = adv.stdout if isinstance(adv.stdout, bytes) else adv.stdout.encode("utf-8", errors="replace")
-                    target_paths = {p.decode("utf-8", errors="replace") for p in raw_adv.split(b"\x00") if p}
-                    if target_paths & set(changed_paths):
+                for start in range(0, len(changed_paths), 200):
+                    chunk = changed_paths[start : start + 200]
+                    adv = bare_git(
+                        bare,
+                        "--literal-pathspecs",
+                        "diff-tree",
+                        "-r",
+                        "--name-only",
+                        "-z",
+                        diff_base,
+                        target_tip,
+                        "--",
+                        *chunk,
+                        check=False,
+                    )
+                    if adv.returncode != 0 or getattr(adv, "truncated", False):
                         stale_base = True
+                        break
+                    if adv.stdout:
+                        raw_adv = (
+                            adv.stdout
+                            if isinstance(adv.stdout, bytes)
+                            else adv.stdout.encode("utf-8", errors="replace")
+                        )
+                        if any(p for p in raw_adv.split(b"\x00") if p):
+                            stale_base = True
+                            break
+
+            if out_context is not None and state == OPEN_PROPOSAL_STATE and target_tip:
+                if "_practice_base" not in self.__dict__:
+                    pinned = self._pinned_base(bound.forge, bound.repo)
+                    resolved_base = pinned or self._default_branch_of_remote(
+                        bare_git, bare, self._tls_refusal
+                    )
+                else:
+                    resolved_base = self._practice_base(bound)
+                out_context["base"] = resolved_base
+                if (
+                    resolved_base
+                    and target_branch == resolved_base
+                    and "_practice_rules" not in self.__dict__
+                ):
+                    out_context["rules"] = self._read_rules_from_bare(
+                        bare_git, bare, root, target_tip
+                    )
 
             return proposal, verdict, changed_paths, stale_base
-        except (WorkspaceError, subprocess.CalledProcessError, OSError, ValueError) as exc:
+        except WorkspaceError as exc:
+            code = str(exc.fields.get("code") or "GIT_CLASSIFICATION_ERROR")
+            LOGGER.info(
+                "risk classifier: workspace refusal repo=%s number=%s code=%s: %s",
+                bound.repo, number, code, str(exc)[:400],
+            )
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    code if code == "CLONE_TOO_LARGE" else "GIT_CLASSIFICATION_ERROR",
+                    f"failed to classify proposal from git: {code}",
+                ),
+                [],
+                False,
+            )
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
             LOGGER.info(
                 "risk classifier: git read failed repo=%s number=%s: %s",
                 bound.repo, number, str(exc)[:400],
@@ -3933,6 +4198,103 @@ class VcsBroker:
         env = automation_rules.cluster_environment(labels)
         return (env, "") if env else (automation_rules.UNKNOWN_ENVIRONMENT, "the cluster declares no environment label")
 
+    def _read_rules_from_bare(
+        self,
+        bare_git: Callable[..., Any],
+        bare: Path,
+        root: Path,
+        target_tip: str,
+    ) -> automation_rules.Rules:
+        """Read `.kube-agents/automation.yaml` directly from `target_tip` in `bare`."""
+        dir_listed = bare_git(
+            bare,
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            SNAPSHOT_LISTING_FORMAT,
+            target_tip,
+            "--",
+            ".kube-agents",
+            check=False,
+        )
+        if dir_listed.returncode != 0 or getattr(dir_listed, "truncated", False):
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not read")
+        dir_out = (dir_listed.stdout or "").strip("\x00")
+        if not dir_out:
+            return automation_rules.Rules(status=automation_rules.ABSENT)
+        dir_parts = dir_out.split(" ", 2)
+        if len(dir_parts) != 3 or dir_parts[0] != GIT_MODE_TREE or dir_parts[2] != ".kube-agents":
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+
+        file_listed = bare_git(
+            bare,
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            SNAPSHOT_LISTING_FORMAT,
+            target_tip,
+            "--",
+            automation_rules.RULES_FILE,
+            check=False,
+        )
+        if file_listed.returncode != 0 or getattr(file_listed, "truncated", False):
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not read")
+        entries = [e for e in (file_listed.stdout or "").split("\x00") if e]
+        if not entries:
+            return automation_rules.Rules(status=automation_rules.ABSENT)
+        if len(entries) != 1:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        parts = entries[0].split(" ", 2)
+        if len(parts) != 3 or parts[2] != automation_rules.RULES_FILE:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        mode, size_str, _ = parts
+        if mode == GIT_MODE_SYMLINK or mode in GIT_MODES_DIRECTORY:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        try:
+            blob_size = int(size_str)
+        except ValueError:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        if blob_size > automation_rules.MAX_FILE_BYTES:
+            return automation_rules.Rules(
+                status=automation_rules.INVALID,
+                error=f"larger than {automation_rules.MAX_FILE_BYTES} bytes",
+            )
+
+        attributes = bare / SNAPSHOT_ATTRIBUTES_FILE
+        attributes.parent.mkdir(parents=True, exist_ok=True)
+        attributes.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
+        rules_tar = root / "automation-rules.tar"
+        try:
+            written = bare_git(
+                bare,
+                "--literal-pathspecs",
+                "archive",
+                "--format=tar",
+                f"--output={rules_tar}",
+                target_tip,
+                "--",
+                automation_rules.RULES_FILE,
+                check=False,
+            )
+            if written.returncode != 0:
+                return automation_rules.Rules(status=automation_rules.INVALID, error="not read")
+            with tarfile.open(rules_tar) as tar:
+                members = [m for m in tar.getmembers() if not m.isdir()]
+                if len(members) != 1 or not members[0].isreg() or members[0].name != automation_rules.RULES_FILE:
+                    return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+                extracted = tar.extractfile(members[0])
+                if extracted is None:
+                    return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+                raw = extracted.read(automation_rules.MAX_FILE_BYTES + 1)
+        except (OSError, tarfile.TarError, ValueError) as exc:
+            return automation_rules.Rules(status=automation_rules.INVALID, error=f"not read ({exc})")
+        finally:
+            rules_tar.unlink(missing_ok=True)
+        try:
+            return automation_rules.parse(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not UTF-8")
+
     def _evaluate_risk_automerge(
         self,
         payload: dict[str, Any],
@@ -3951,7 +4313,15 @@ class VcsBroker:
             return None, "the autonomy dial is below Auto-merge"
         if stale_base:
             return None, "base branch modified the same file since this PR branched; rebase required"
-        rules = rules_override if rules_override is not None else self._practice_rules(payload, base)
+        if not verdict.supported:
+            first_code = verdict.reasons[0].code if verdict.reasons else "UNSUPPORTED"
+            first_msg = verdict.reasons[0].message if verdict.reasons else "proposal could not be deterministically classified"
+            return None, f"classification is unsupported ({first_code}: {first_msg})"
+        rules = (
+            rules_override
+            if (rules_override is not None and "_practice_rules" not in self.__dict__)
+            else self._practice_rules(payload, base)
+        )
         if rules.status != automation_rules.LOADED:
             return None, f"{automation_rules.RULES_FILE} on {base} allows nothing ({rules.status})"
         if not automation_rules.has_risk_allow_rules(rules):
@@ -3967,6 +4337,7 @@ class VcsBroker:
             disruptiveness=verdict.disruptiveness,
             revertability=verdict.revertability,
             effective_changes=verdict.effective_changes,
+            supported=verdict.supported,
             install_max_risk=ceiling,
         )
         if not decision.allowed:
@@ -3981,8 +4352,8 @@ class VcsBroker:
         number: int,
         proposal: dict[str, Any],
         switch: str,
-    ) -> bool:
-        """Return True if an open agent PR qualifies for auto-merge under `max_risk` rules.
+    ) -> tuple[bool, str, risk_classifier.ClassificationResult | None]:
+        """Return `(qualifies, reason, verdict)` if an open agent PR is evaluated under `max_risk` rules.
 
         Fast-paths out without cloning when `.kube-agents/automation.yaml` has no
         `max_risk` allow rules, keeping `no-pdb`-only repos zero-overhead.
@@ -3990,41 +4361,55 @@ class VcsBroker:
         try:
             base = self._practice_base(bound)
             if not base or proposal.get("target") != base:
-                return False
+                return False, "", None
             rules = self._practice_rules(payload, base)
             if not automation_rules.has_risk_allow_rules(rules):
-                return False
+                return False, "", None
             _, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
                 bound, number, proposal_override=proposal
             )
-            want, _ = self._evaluate_risk_automerge(
+            want, reason = self._evaluate_risk_automerge(
                 payload, base, switch, verdict, changed_paths, stale_base, rules_override=rules
             )
-            return want is not None
+            return want is not None, reason, verdict
         except Exception as exc:  # noqa: BLE001
             LOGGER.info("practice risk fallback failed repo=%s number=%s: %s", bound.repo, number, str(exc)[:300])
-            return False
+            return False, "", None
 
     def _risk_proposal_gate(
         self,
         bound: Binding,
         proposal: dict[str, Any],
+        *,
+        base_override: str | None = None,
+        expected_head_sha: str = "",
     ) -> tuple[bool, str, str]:
-        """Check forge capabilities, proposal state, author, and target base branch."""
+        """Check forge capabilities, proposal state, fork/SHA provenance, author, and target base branch."""
         if not getattr(bound.forge, "labels", False):
             return False, "this forge has no labels", ""
         if bound.forge.text_sets_labels:
             return False, "on this forge a comment or a description can set a label, so no label is the broker's alone", ""
         if proposal.get("state") != OPEN_PROPOSAL_STATE:
             return False, "the proposal is not open", ""
+        source_repo = str(proposal.get("sourceRepo") or "")
+        if not source_repo or source_repo.casefold() != bound.repo.casefold():
+            return False, "the proposal is from a fork, not this repository", ""
+        source_rev = str(proposal.get("sourceRevision") or "")
+        if not source_rev or not _OBJECT_ID.fullmatch(source_rev):
+            return False, "the proposal has no verified commit revision id", ""
+        if expected_head_sha and source_rev.lower() != expected_head_sha.lower():
+            return False, "the proposal's head revision does not match expected_head_sha", ""
         viewer = self._viewer(bound)
         if not viewer or _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
             return False, "the proposal is not this credential's own", ""
-        try:
-            base = self._practice_base(bound)
-        except (WorkspaceError, subprocess.CalledProcessError, OSError) as exc:
-            LOGGER.info("risk label: base lookup failed repo=%s: %s", bound.repo, str(exc)[:300])
-            base = ""
+        if base_override is not None and "_practice_base" not in self.__dict__:
+            base = base_override
+        else:
+            try:
+                base = self._practice_base(bound)
+            except (WorkspaceError, subprocess.SubprocessError, OSError) as exc:
+                LOGGER.info("risk label: base lookup failed repo=%s: %s", bound.repo, str(exc)[:300])
+                base = ""
         if not base or proposal.get("target") != base:
             return False, f"the proposal does not target the repository's base branch ({base or 'unknown'})", base
         return True, "", base
@@ -4036,23 +4421,38 @@ class VcsBroker:
         current autonomy-dial and `.kube-agents/automation.yaml` eligibility.
         """
         number = validate_number(payload.get("number"))
+        expected_sha = _extract_expected_head_sha(payload)
         bound = self._bind(payload)
         switch = self._automerge_switch()
         dial_ok = dial_allows_automerge()
         level = dial_level()
         ceiling = automation_rules.install_max_risk_ceiling()
 
-        proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(bound, number)
+        git_ctx: dict[str, Any] = {}
+        proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
+            bound, number, expected_head_sha=expected_sha, out_context=git_ctx
+        )
         want_label: str | None = None
         if switch not in automerge_eligibility.LABELLING_SWITCH_VALUES:
             am_reason = "KUBEAGENTS_AUTOMERGE is off"
         else:
-            gate_ok, gate_reason, base = self._risk_proposal_gate(bound, proposal)
+            gate_ok, gate_reason, base = self._risk_proposal_gate(
+                bound,
+                proposal,
+                base_override=git_ctx.get("base"),
+                expected_head_sha=expected_sha,
+            )
             if not gate_ok:
                 am_reason = gate_reason
             else:
                 want_label, am_reason = self._evaluate_risk_automerge(
-                    payload, base, switch, verdict, changed_paths, stale_base
+                    payload,
+                    base,
+                    switch,
+                    verdict,
+                    changed_paths,
+                    stale_base,
+                    rules_override=git_ctx.get("rules"),
                 )
 
         out = verdict.to_dict()
@@ -4073,12 +4473,24 @@ class VcsBroker:
     def proposal_risk_label(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Classify a PR from git and apply deterministic `risk:<level>` + auto-merge labels."""
         number = validate_number(payload.get("number"))
+        expected_sha = _extract_expected_head_sha(payload)
         bound = self._bind(payload)
         switch = self._automerge_switch()
 
-        proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(bound, number)
-        want_risk_label = verdict.risk_label
-        gate_ok, gate_reason, base = self._risk_proposal_gate(bound, proposal)
+        git_ctx: dict[str, Any] = {}
+        proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
+            bound, number, expected_head_sha=expected_sha, out_context=git_ctx
+        )
+        transient_mismatch = any(
+            r.code in ("PROPOSAL_BRANCH_MOVED", "HEAD_SHA_MISMATCH") for r in verdict.reasons
+        )
+        want_risk_label = None if transient_mismatch else verdict.risk_label
+        gate_ok, gate_reason, base = self._risk_proposal_gate(
+            bound,
+            proposal,
+            base_override=git_ctx.get("base"),
+            expected_head_sha=expected_sha,
+        )
 
         want_auto: str | None = None
         if not gate_ok:
@@ -4087,7 +4499,13 @@ class VcsBroker:
         else:
             want_risk_apply = want_risk_label
             want_auto, reason = self._evaluate_risk_automerge(
-                payload, base, switch, verdict, changed_paths, stale_base
+                payload,
+                base,
+                switch,
+                verdict,
+                changed_paths,
+                stale_base,
+                rules_override=git_ctx.get("rules"),
             )
 
         carried_risk = _risk_labels_on(proposal)
@@ -4095,7 +4513,13 @@ class VcsBroker:
         # Preserve an already-carried recipe auto-merge label (`no-pdb`) when risk
         # rules didn't independently grant one.
         keep_auto: set[str] = set()
-        if want_auto is None and carried_auto and gate_ok and switch in automerge_eligibility.LABELLING_SWITCH_VALUES:
+        if (
+            want_auto is None
+            and carried_auto
+            and gate_ok
+            and not transient_mismatch
+            and switch in automerge_eligibility.LABELLING_SWITCH_VALUES
+        ):
             try:
                 view_diff = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": True}) or {}
                 viewer = self._viewer(bound)
@@ -4107,8 +4531,14 @@ class VcsBroker:
             except Exception:  # noqa: BLE001
                 pass
 
+        carried_risk_fold = {lbl.casefold() for lbl in carried_risk}
+        carried_auto_fold = {lbl.casefold() for lbl in carried_auto}
         want_all = [lbl for lbl in (want_risk_apply, want_auto) if lbl is not None]
-        to_add = [lbl for lbl in want_all if lbl not in carried_risk and lbl not in carried_auto]
+        to_add = [
+            lbl
+            for lbl in want_all
+            if lbl.casefold() not in carried_risk_fold and lbl.casefold() not in carried_auto_fold
+        ]
         added: list[str] = []
         after: dict[str, Any] | None = None
 
@@ -4145,7 +4575,7 @@ class VcsBroker:
             bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsAdd": to_add})
             added = list(to_add)
             for lbl in added:
-                if lbl.startswith(risk_classifier.RISK_LABEL_PREFIX):
+                if lbl.casefold().startswith(risk_classifier.RISK_LABEL_PREFIX):
                     carried_risk.append(lbl)
                 else:
                     carried_auto.append(lbl)
@@ -4161,17 +4591,47 @@ class VcsBroker:
                     want_auto = None
                     keep_auto.clear()
 
-        stale_risk = [lbl for lbl in carried_risk if lbl != want_risk_apply] if (gate_ok or added) else []
-        stale_auto = [lbl for lbl in carried_auto if lbl != want_auto and lbl not in keep_auto] if (gate_ok or added) else []
+        can_manage_labels = bool(getattr(bound.forge, "labels", False)) and not bound.forge.text_sets_labels
+        should_reconcile_stale = can_manage_labels and (
+            gate_ok or bool(added) or proposal.get("state") == OPEN_PROPOSAL_STATE
+        )
+        stale_risk: list[str] = []
+        if should_reconcile_stale:
+            kept_primary = False
+            for lbl in carried_risk:
+                if (
+                    not kept_primary
+                    and want_risk_apply is not None
+                    and lbl.casefold() == want_risk_apply.casefold()
+                ):
+                    kept_primary = True
+                else:
+                    stale_risk.append(lbl)
+        stale_auto = (
+            [lbl for lbl in carried_auto if lbl != want_auto and lbl not in keep_auto]
+            if should_reconcile_stale
+            else []
+        )
         stale = stale_risk + stale_auto
+        base_labels = list((after if after is not None else proposal).get("labels") or [])
+        for lbl in added:
+            if all(str(existing).strip().casefold() != lbl.casefold() for existing in base_labels):
+                base_labels.append(lbl)
+        removed_stale = False
         if stale:
             if after is None:
                 after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+                base_labels = list(after.get("labels") or [])
             # Rollback newly added labels if branch moved; strip stale labels while open
             if added and after.get("sourceRevision") != proposal.get("sourceRevision"):
                 bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
+                removed_stale = True
             elif after.get("state") == OPEN_PROPOSAL_STATE:
                 bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
+                removed_stale = True
+        if removed_stale:
+            stale_fold = {lbl.casefold() for lbl in stale}
+            base_labels = [lbl for lbl in base_labels if str(lbl).strip().casefold() not in stale_fold]
 
         LOGGER.info(
             "risk label repo=%s number=%s risk=%s blast=%s revert=%s disrupt=%s risk_label=%s automerge_label=%s switch=%s reason=%s",
@@ -4196,22 +4656,38 @@ class VcsBroker:
                 "revertability": verdict.revertability,
                 "disruptiveness": verdict.disruptiveness,
                 "supported": verdict.supported,
+                "effective_changes": verdict.effective_changes,
                 "risk_label": want_risk_apply,
                 "labelled": want_auto is not None,
                 "label": want_auto,
+                "applied_labels": base_labels,
                 "switch": switch,
                 "dial_allows_automerge": dial_allows_automerge(),
                 "reason": reason,
+                "reasons": [r.to_dict() for r in verdict.reasons],
                 "classification": verdict.to_dict(),
             }
         )
 
-    def _best_effort_risk_label(self, bound: Binding, payload: dict[str, Any], number: int) -> None:
+    def _best_effort_risk_label(
+        self,
+        bound: Binding,
+        payload: dict[str, Any],
+        number: int,
+        *,
+        expected_head_sha: str = "",
+    ) -> dict[str, Any] | None:
         """Auto-classify and label an open agent PR inside the broker without failing the write."""
         try:
-            self.proposal_risk_label({"repository": payload.get("repository"), "number": number})
+            req: dict[str, Any] = {"repository": payload.get("repository"), "number": number}
+            if isinstance(payload.get("cluster"), str) and payload["cluster"].strip():
+                req["cluster"] = payload["cluster"]
+            if expected_head_sha:
+                req["expected_head_sha"] = expected_head_sha
+            return self.proposal_risk_label(req)
         except Exception as exc:  # noqa: BLE001 -- never fail proposal_create or publish
             LOGGER.warning("auto risk label skipped repo=%s number=%s: %s", bound.repo, number, str(exc)[:300])
+            return None
 
     def _practice_rules(self, payload: dict[str, Any], target: str) -> automation_rules.Rules:
         """The rules file on `target`, as `automation_rules` reads it: absent

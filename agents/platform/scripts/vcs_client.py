@@ -25,6 +25,7 @@ printed one.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import contextlib
 import functools
@@ -1824,3 +1825,189 @@ def forge(verb: str, payload: dict, repository: str | None = None, target: dict 
     sent = {key: value for key, value in payload.items() if value is not None}
     # Only a caller naming a target passes one, so a stand-in for `call` keeps its two arguments.
     return call(verb, sent, target=target) if target else call(verb, sent)
+
+
+def _validate_proposal_number(number: object) -> int:
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        raise VcsError("proposal number must be a positive integer", code="INVALID_ARGUMENT")
+    return number
+
+
+def _risk_request_payload(
+    number: object,
+    *,
+    cluster: str | None = None,
+    expected_head_sha: str | None = None,
+) -> dict:
+    payload: dict[str, object] = {"number": _validate_proposal_number(number)}
+    if cluster is not None:
+        if not isinstance(cluster, str) or not cluster.strip():
+            raise VcsError("cluster must be a non-empty string", code="INVALID_ARGUMENT")
+        payload["cluster"] = cluster.strip()
+    if expected_head_sha is not None:
+        if not isinstance(expected_head_sha, str) or not expected_head_sha.strip():
+            raise VcsError("expected_head_sha must be a non-empty commit SHA", code="INVALID_ARGUMENT")
+        payload["expected_head_sha"] = expected_head_sha.strip()
+    return payload
+
+
+def classify_proposal_risk(
+    number: int,
+    repository: str | None = None,
+    *,
+    cluster: str | None = None,
+    expected_head_sha: str | None = None,
+) -> dict:
+    """Deterministically classify a pull request across all 4 risk axes via the broker.
+
+    Read-only verb (`POST /v1/vcs/proposal-classify-risk`). Returns `risk_level`,
+    `risk_label`, `blast_radius`, `revertability`, `disruptiveness`, `supported`,
+    `effective_changes`, `stale_base`, `reasons`, and `automerge` eligibility.
+    """
+    payload = _risk_request_payload(
+        number, cluster=cluster, expected_head_sha=expected_head_sha
+    )
+    return forge("proposal-classify-risk", payload, repository)
+
+
+def label_proposal_risk(
+    number: int,
+    repository: str | None = None,
+    *,
+    cluster: str | None = None,
+    expected_head_sha: str | None = None,
+) -> dict:
+    """Classify a pull request via the broker and reconcile `risk:*` and auto-merge labels."""
+    payload = _risk_request_payload(
+        number, cluster=cluster, expected_head_sha=expected_head_sha
+    )
+    return forge("proposal-risk-label", payload, repository)
+
+
+def _format_risk_summary(result: dict) -> str:
+    """Format a concise multi-line 4-axis summary for operators and agents."""
+    number = result.get("number", "?")
+    repo = result.get("repo") or "unknown-repo"
+    rev = str(result.get("sourceRevision") or "")
+    rev_short = rev[:12] if rev else "unknown"
+    risk_level = result.get("risk_level", "unknown")
+    risk_label = result.get("risk_label") or f"risk:{risk_level}"
+    blast = result.get("blast_radius", "unknown")
+    revert = result.get("revertability", "unknown")
+    disrupt = result.get("disruptiveness", "unknown")
+    supported = bool(result.get("supported", False))
+    effective = bool(result.get("effective_changes", False))
+    stale_base = bool(result.get("stale_base", False))
+
+    lines = [
+        f"Proposal #{number} ({repo} @ {rev_short})",
+        f"  risk_level:     {risk_level} ({risk_label})",
+        f"  blast_radius:   {blast}",
+        f"  revertability:  {revert}",
+        f"  disruptiveness: {disrupt}",
+        f"  flags:          supported={supported}, effective_changes={effective}, stale_base={stale_base}",
+    ]
+
+    automerge = result.get("automerge")
+    if isinstance(automerge, dict):
+        eligible = bool(automerge.get("eligible_for_automerge", False))
+        would_label = automerge.get("would_label")
+        am_reason = automerge.get("reason") or ""
+        lbl_part = f" ({would_label})" if would_label else ""
+        lines.append(f"  automerge:      eligible={eligible}{lbl_part} - {am_reason}")
+    elif "labelled" in result:
+        labelled = bool(result.get("labelled", False))
+        label = result.get("label")
+        am_reason = result.get("reason") or ""
+        lbl_part = f" ({label})" if label else ""
+        lines.append(f"  automerge:      labelled={labelled}{lbl_part} - {am_reason}")
+
+    reasons = result.get("reasons")
+    if not isinstance(reasons, list):
+        cls_dict = result.get("classification")
+        reasons = cls_dict.get("reasons") if isinstance(cls_dict, dict) else []
+    if isinstance(reasons, list) and reasons:
+        lines.append("  reasons:")
+        for item in reasons[:10]:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("code", "REASON")
+            sev = item.get("severity", "")
+            msg = item.get("message", "")
+            loc = item.get("resource") or item.get("file") or ""
+            loc_suffix = f" [{loc}]" if loc else ""
+            sev_prefix = f"[{sev}] " if sev else ""
+            lines.append(f"    - {sev_prefix}{code}: {msg}{loc_suffix}")
+    return "\n".join(lines)
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for `vcs_client.py`."""
+    parser = argparse.ArgumentParser(
+        prog="vcs_client.py",
+        description="Broker-backed version-control risk classification and label helpers.",
+    )
+    verbs = parser.add_subparsers(dest="verb", required=True)
+
+    def _add_risk_verb(name: str, aliases: tuple[str, ...], help_text: str, fn) -> None:
+        sub = verbs.add_parser(name, aliases=list(aliases), help=help_text)
+        sub.add_argument("number", type=int, help="change proposal number")
+        sub.add_argument(
+            "--repo",
+            dest="repository",
+            help="repository URL or owner/name (defaults to current local session)",
+        )
+        sub.add_argument(
+            "--cluster",
+            help="optional GKE cluster coordinate (project/location/name)",
+        )
+        sub.add_argument(
+            "--expected-head-sha",
+            dest="expected_head_sha",
+            help="optional expected head commit SHA to pin against concurrent branch updates",
+        )
+        sub.add_argument(
+            "--format",
+            choices=("json", "summary"),
+            default="json",
+            help="output format: structured json (default) or human-readable summary",
+        )
+        sub.set_defaults(_handler=fn)
+
+    _add_risk_verb(
+        "proposal-classify-risk",
+        ("classify-proposal-risk",),
+        "deterministically classify a pull request across 4 risk axes (read-only)",
+        classify_proposal_risk,
+    )
+    _add_risk_verb(
+        "proposal-risk-label",
+        ("label-proposal-risk",),
+        "classify a pull request and reconcile its risk:* and auto-merge labels",
+        label_proposal_risk,
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_cli_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = args._handler(
+            args.number,
+            args.repository,
+            cluster=args.cluster,
+            expected_head_sha=args.expected_head_sha,
+        )
+    except VcsError as exc:
+        print(json.dumps(exc.as_json(), indent=2))
+        return 1
+    if args.format == "summary":
+        print(_format_risk_summary(result))
+    else:
+        print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

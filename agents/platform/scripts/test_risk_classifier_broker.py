@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -182,6 +184,8 @@ class _FakeForge:
             prop["labels"] = labels
             if self.on_label_add is not None:
                 self.on_label_add(prop)
+        if payload.get("target") is not None:
+            prop["target"] = payload["target"]
         if payload.get("labelsRemove"):
             rem = list(payload["labelsRemove"])
             self.label_removes.append((num, rem))
@@ -612,6 +616,459 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         self.assertFalse(res2["labelled"])
         self.assertIn("invalid cluster directory name", res2["reason"])
         self.assertEqual(called, [])
+
+    def test_arbitrary_risk_prefix_and_tuple_labels_cannot_be_forged(self) -> None:
+        """Any `risk:*` label (including spoofed tiers like `risk:none`) and tuple payloads are refused."""
+        for spoof in ("risk:none", "risk:safe", "RISK:ZERO", "  risk:minimal  "):
+            for verb, payload in (
+                ("proposal-create", {"title": "t", "labels": [spoof]}),
+                ("proposal-update", {"number": 1, "labelsAdd": (spoof,)}),
+                ("proposal-update", {"number": 1, "labelsRemove": [spoof]}),
+                ("issue-create", {"title": "i", "labels": (f"bug,{spoof}",)}),
+                ("issue-update", {"number": 2, "labelsAdd": [spoof]}),
+                ("label-ensure", {"name": spoof}),
+            ):
+                refusal = automerge_eligibility.reserved_label_refusal(verb, payload)
+                self.assertIsNotNone(refusal, f"{verb} {payload} must be refused")
+
+    def test_expected_head_sha_pin_prevents_stale_api_toctou_and_strips_stale_labels(self) -> None:
+        """If forge API still reports old SHA when caller pins new expected_head_sha, refuse and strip labels."""
+        sha_low = self._push_branch(
+            "platform-agent/toctou-sha",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        sha_crit = self._push_branch(
+            "platform-agent/toctou-sha",
+            {"clusters/dev-c1/web.yaml": None},  # Deleting Deployment -> destructive / high-critical
+        )
+        # Simulate eventual consistency: forge PR view still reports `sha_low` and stale labels!
+        self.forge.proposals[50] = {
+            "number": 50,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/toctou-sha",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha_low,
+            "target": "main",
+            "labels": ["risk:low", "kube-agents:auto-merge"],
+        }
+        broker = self._make_broker(switch="on")
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            c_res = broker.proposal_classify_risk(
+                {"repository": "acme/infra", "number": 50, "expected_head_sha": sha_crit}
+            )
+            self.assertEqual(c_res["risk_level"], "unknown")
+            self.assertEqual(c_res["reasons"][0]["code"], "HEAD_SHA_MISMATCH")
+            self.assertFalse(c_res["automerge"]["eligible_for_automerge"])
+
+            l_res = broker.proposal_risk_label(
+                {"repository": "acme/infra", "number": 50, "expected_head_sha": sha_crit}
+            )
+        self.assertEqual(l_res["risk_level"], "unknown")
+        self.assertIsNone(l_res["risk_label"])
+        self.assertFalse(l_res["labelled"])
+        self.assertEqual(self.forge.proposals[50]["labels"], [])
+
+    def test_git_branch_moved_ahead_of_forge_revision_fails_closed_without_expected_sha(self) -> None:
+        """Even without expected_head_sha, if git branch tip != proposal.sourceRevision, fail closed!"""
+        sha_low = self._push_branch(
+            "platform-agent/lagging-api",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        # Advance git branch to delete workload while forge proposal metadata still says `sha_low`
+        self._push_branch(
+            "platform-agent/lagging-api",
+            {"clusters/dev-c1/web.yaml": None},
+        )
+        self.forge.proposals[51] = {
+            "number": 51,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/lagging-api",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha_low,
+            "target": "main",
+            "labels": ["risk:low", "kube-agents:auto-merge"],
+        }
+        broker = self._make_broker(switch="on")
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            res = broker.proposal_risk_label({"repository": "acme/infra", "number": 51})
+        self.assertEqual(res["risk_level"], "unknown")
+        self.assertEqual(res["reasons"][0]["code"], "PROPOSAL_BRANCH_MOVED")
+        self.assertFalse(res["labelled"])
+        self.assertIsNone(res["risk_label"])
+        self.assertEqual(self.forge.proposals[51]["labels"], [])
+
+    def test_publish_and_proposal_create_return_4_axis_risk_summary_and_reconcile_push(self) -> None:
+        """`proposal_create` and `publish` attach 4-axis `risk` summaries and revoke auto-merge on destructive push."""
+        broker = self._make_broker(switch="on", auto_label_risk=True)
+
+        # Build a valid git bundle for round 1 (low-risk replica bump 3 -> 4)
+        clone_dir = self.root / "agent_clone"
+        subprocess.run(["git", "clone", "-q", str(self.remote), str(clone_dir)], check=True)
+        subprocess.run(["git", "config", "user.email", "bot@example.com"], cwd=clone_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Bot"], cwd=clone_dir, check=True)
+        base_rev = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=clone_dir, text=True).strip()
+        subprocess.run(["git", "checkout", "-q", "-b", "platform-agent/e2e-push"], cwd=clone_dir, check=True)
+        (clone_dir / "clusters" / "dev-c1" / "web.yaml").write_text(
+            DEPLOY_V1.replace("replicas: 3", "replicas: 4"), encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "."], cwd=clone_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "bump 3->4"], cwd=clone_dir, check=True)
+        b1 = self.root / "r1.bundle"
+        subprocess.run(["git", "bundle", "create", str(b1), "platform-agent/e2e-push", f"^{base_rev}"], cwd=clone_dir, check=True)
+
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            pub1 = broker.publish({
+                "repository": "acme/infra",
+                "branch": "platform-agent/e2e-push",
+                "target": "main",
+                "baseRevision": base_rev,
+                "clonedFrom": "main",
+                "bundleBase64": base64.b64encode(b1.read_bytes()).decode("ascii"),
+            })
+            created = broker.proposal_create({
+                "repository": "acme/infra",
+                "source": "platform-agent/e2e-push",
+                "target": "main",
+                "title": "Scale web",
+            })
+
+        num = created["proposal"]["number"]
+        self.assertIn("risk", created)
+        self.assertEqual(created["risk"]["risk_level"], "low")
+        self.assertEqual(created["risk"]["risk_label"], "risk:low")
+        self.assertEqual(created["risk"]["blast_radius"], "low")
+        self.assertEqual(created["risk"]["revertability"], "easy")
+        self.assertEqual(created["risk"]["disruptiveness"], "non_disruptive")
+        self.assertTrue(created["risk"]["labelled"])
+        self.assertEqual(sorted(created["proposal"]["labels"]), ["kube-agents:auto-merge", "risk:low"])
+
+        # Round 2: push a destructive commit deleting the Deployment onto the same open PR!
+        (clone_dir / "clusters" / "dev-c1" / "web.yaml").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=clone_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "delete deployment"], cwd=clone_dir, check=True)
+        tip2 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=clone_dir, text=True).strip()
+        b2 = self.root / "r2.bundle"
+        subprocess.run(
+            ["git", "bundle", "create", str(b2), "platform-agent/e2e-push", f"^{pub1['revision']}"],
+            cwd=clone_dir,
+            check=True,
+        )
+        # Update fake forge's sourceRevision on push when git push lands, or simulate forge updating at push
+        orig_git = broker._bind({"repository": "acme/infra"}).git
+
+        def sync_forge_on_push(cwd: Path, *args: str, **kw: Any) -> subprocess.CompletedProcess:
+            proc = orig_git(cwd, *args, **kw)
+            if args and args[0] == "push" and proc.returncode == 0:
+                self.forge.proposals[num]["sourceRevision"] = tip2
+            return proc
+
+        bound = broker._bind({"repository": "acme/infra"})
+        bound_synced = vcs_broker.Binding(bound.forge, bound.repo, lambda: bound.api, sync_forge_on_push)
+        broker._bind = lambda payload: bound_synced  # type: ignore[method-assign]
+
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            pub2 = broker.publish({
+                "repository": "acme/infra",
+                "branch": "platform-agent/e2e-push",
+                "target": "main",
+                "baseRevision": pub1["revision"],
+                "clonedFrom": "platform-agent/e2e-push",
+                "advance": True,
+                "bundleBase64": base64.b64encode(b2.read_bytes()).decode("ascii"),
+            })
+
+        self.assertIn("risk", pub2)
+        self.assertEqual(pub2["risk"]["disruptiveness"], "destructive")
+        self.assertFalse(pub2["risk"]["labelled"])
+        self.assertNotIn("kube-agents:auto-merge", self.forge.proposals[num]["labels"])
+        self.assertNotIn("risk:low", self.forge.proposals[num]["labels"])
+        self.assertEqual(self.forge.proposals[num]["labels"], [pub2["risk"]["risk_label"]])
+
+    def test_open_pr_failing_gate_strips_stale_labels_and_preserves_case_insensitive_match(self) -> None:
+        """Stale labels are stripped when an open PR fails `_risk_proposal_gate`; matching case-folded label is preserved."""
+        sha = self._push_branch(
+            "platform-agent/retargeted",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        # Case 1: Open PR carrying mixed/multiple labels but targeting `release-1.0` != `main`
+        self.forge.proposals[60] = {
+            "number": 60,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/retargeted",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha,
+            "target": "release-1.0",
+            "labels": ["RISK:LOW", "risk:high", "kube-agents:auto-merge"],
+        }
+        broker = self._make_broker(switch="on")
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            res = broker.proposal_risk_label({"repository": "acme/infra", "number": 60})
+        self.assertFalse(res["labelled"])
+        self.assertIsNone(res["risk_label"])
+        self.assertEqual(self.forge.proposals[60]["labels"], [])
+        self.assertEqual(res["applied_labels"], [])
+
+        # Case 2: Open PR on `main` carrying `RISK:LOW` + stale `risk:high` + spoofed `risk:none`
+        self.forge.proposals[61] = {
+            "number": 61,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/retargeted",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha,
+            "target": "main",
+            "labels": ["RISK:LOW", "risk:high", "risk:none", "custom:keep"],
+        }
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            res2 = broker.proposal_risk_label({"repository": "acme/infra", "number": 61})
+        self.assertTrue(res2["labelled"])
+        self.assertEqual(
+            sorted(self.forge.proposals[61]["labels"]),
+            ["RISK:LOW", "custom:keep", "kube-agents:auto-merge"],
+        )
+
+    def test_scratch_clone_ceiling_and_timeout_cleanup_leave_zero_temp_dirs(self) -> None:
+        """Exceeding `max_clone_bytes` or hitting `TimeoutExpired` fails closed as `unknown` and cleans scratch."""
+        sha = self._push_branch(
+            "platform-agent/ceiling-pr",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        self.forge.proposals[70] = {
+            "number": 70,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/ceiling-pr",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha,
+            "target": "main",
+            "labels": [],
+        }
+        broker = self._make_broker(switch="on")
+        broker.max_clone_bytes = 1
+        r_ceil = broker.proposal_classify_risk({"repository": "acme/infra", "number": 70})
+        self.assertEqual(r_ceil["risk_level"], "unknown")
+        self.assertEqual(r_ceil["reasons"][0]["code"], "CLONE_TOO_LARGE")
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+        # TimeoutExpired during git fetch -> fails closed and cleans up scratch dir!
+        def timeout_git_runner(
+            argv: list[str], cwd: Path, check: bool = True, config: tuple = (), **kw: Any
+        ) -> subprocess.CompletedProcess:
+            if "fetch" in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
+            return subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, check=check)
+
+        broker_to = vcs_broker.VcsBroker(
+            self.scratch,
+            git_runner=timeout_git_runner,
+            cluster_read=self._cluster_read,
+            automerge_switch=lambda: "on",
+            base_branch="main",
+        )
+        bound = vcs_broker.Binding(
+            self.forge,
+            "acme/infra",
+            lambda: mock.Mock(ensure=lambda: None, whoami=lambda: "kube-agents-bot"),
+            broker_to._git_with(lambda: (), False),
+        )
+        broker_to._bind = lambda payload: bound  # type: ignore[method-assign]
+        r_to = broker_to.proposal_classify_risk({"repository": "acme/infra", "number": 70})
+        self.assertEqual(r_to["risk_level"], "unknown")
+        self.assertEqual(r_to["reasons"][0]["code"], "GIT_CLASSIFICATION_ERROR")
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_merged_pr_deleted_target_branch_and_ambiguous_or_octopus_parents(self) -> None:
+        """Merged PRs handle deleted release branches via shallow mergeCommit fetch and fail closed on octopus/mismatched parents."""
+        subprocess.run(
+            ["git", "--git-dir", str(self.remote), "config", "uploadpack.allowReachableSHA1InWant", "true"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "--git-dir", str(self.remote), "config", "uploadpack.allowAnySHA1InWant", "true"],
+            check=True,
+        )
+        # 1. Merged PR onto `release-1.0`, then `release-1.0` AND feature branch are both deleted (while main still holds merge_sha or tag holds it)
+        subprocess.run(["git", "checkout", "-q", "-B", "release-1.0", "main"], cwd=self.work, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "release-1.0"], cwd=self.work, check=True)
+        pr_sha = self._push_branch(
+            "platform-agent/rel-fix",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+            base="release-1.0",
+        )
+        subprocess.run(["git", "checkout", "-q", "release-1.0"], cwd=self.work, check=True)
+        subprocess.run(["git", "merge", "-q", "--no-ff", pr_sha, "-m", "Merge rel fix"], cwd=self.work, check=True)
+        rel_merge_sha = self._rev("HEAD")
+        # Tag it so remote GC keeps it reachable, then delete BOTH `release-1.0` and `platform-agent/rel-fix`!
+        subprocess.run(["git", "tag", "archive/rel-1.0", rel_merge_sha], cwd=self.work, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "archive/rel-1.0"], cwd=self.work, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "--delete", "release-1.0"], cwd=self.work, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "--delete", "platform-agent/rel-fix"], cwd=self.work, check=True)
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.work, check=True)
+
+        self.forge.proposals[80] = {
+            "number": 80,
+            "state": "merged",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/rel-fix",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": pr_sha,
+            "mergeCommit": rel_merge_sha,
+            "target": "release-1.0",
+            "labels": [],
+        }
+        # Use file:// remote URL so git honors shallow `--depth=2 <sha>` natively!
+        self.forge._url = f"file://{self.remote}"
+        broker = self._make_broker(switch="off")
+        r_del_target = broker.proposal_classify_risk({"repository": "acme/infra", "number": 80})
+        self.assertEqual(r_del_target["risk_level"], "low")
+        self.assertEqual(r_del_target["disruptiveness"], "non_disruptive")
+
+        # 2. Mismatched second parent (mergeCommit^2 != sourceRevision) fails closed!
+        self.forge.proposals[81] = {
+            **self.forge.proposals[80],
+            "number": 81,
+            "sourceRevision": "b" * 40,
+        }
+        r_mismatch_p2 = broker.proposal_classify_risk({"repository": "acme/infra", "number": 81})
+        self.assertEqual(r_mismatch_p2["risk_level"], "unknown")
+        self.assertEqual(r_mismatch_p2["reasons"][0]["code"], "MERGED_PR_AMBIGUOUS_PARENTS")
+
+        # 3. Octopus merge (3 parents) fails closed!
+        b_a = self._push_branch(
+            "platform-agent/octo-a",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        b_b = self._push_branch(
+            "platform-agent/octo-b",
+            {"clusters/staging-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.work, check=True)
+        subprocess.run(["git", "merge", "-q", "--no-ff", b_a, b_b, "-m", "Octopus merge"], cwd=self.work, check=True)
+        octo_sha = self._rev("HEAD")
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=self.work, check=True)
+        self.forge.proposals[82] = {
+            "number": 82,
+            "state": "merged",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/octo-a",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": b_a,
+            "mergeCommit": octo_sha,
+            "target": "main",
+            "labels": [],
+        }
+        r_octo = broker.proposal_classify_risk({"repository": "acme/infra", "number": 82})
+        self.assertEqual(r_octo["risk_level"], "unknown")
+        self.assertEqual(r_octo["reasons"][0]["code"], "MERGED_PR_OCTOPUS_MERGE")
+
+    def test_concurrent_classifications_are_thread_safe_and_leave_clean_scratch(self) -> None:
+        """Concurrent `proposal_classify_risk` requests isolate scratch dirs and `out_context`."""
+        sha_low = self._push_branch(
+            "platform-agent/conc-low",
+            {"clusters/staging-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        sha_med = self._push_branch(
+            "platform-agent/conc-med",
+            {"clusters/dev-c1/worker.yaml": NEW_DEPLOY},
+        )
+        sha_prod = self._push_branch(
+            "platform-agent/conc-prod",
+            {"clusters/prod-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        self.forge.proposals[91] = {
+            "number": 91, "state": "open", "author": "kube-agents-bot",
+            "source": "platform-agent/conc-low", "sourceRepo": "acme/infra",
+            "sourceRevision": sha_low, "target": "main", "labels": [],
+        }
+        self.forge.proposals[92] = {
+            "number": 92, "state": "open", "author": "kube-agents-bot",
+            "source": "platform-agent/conc-med", "sourceRepo": "acme/infra",
+            "sourceRevision": sha_med, "target": "main", "labels": [],
+        }
+        self.forge.proposals[93] = {
+            "number": 93, "state": "open", "author": "kube-agents-bot",
+            "source": "platform-agent/conc-prod", "sourceRepo": "acme/infra",
+            "sourceRevision": sha_prod, "target": "main", "labels": [],
+        }
+        broker = self._make_broker(switch="on")
+        tasks = [91, 92, 93, 91, 92, 93, 91, 92]
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                results = list(
+                    pool.map(
+                        lambda n: broker.proposal_classify_risk({"repository": "acme/infra", "number": n}),
+                        tasks,
+                    )
+                )
+        expected = {
+            91: ("low", True),
+            92: ("medium", True),
+            93: ("medium", False),
+        }
+        for n, res in zip(tasks, results):
+            exp_risk, exp_elig = expected[n]
+            self.assertEqual(res["risk_level"], exp_risk)
+            self.assertEqual(res["automerge"]["eligible_for_automerge"], exp_elig)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_stale_base_diff_tree_truncation_or_nonzero_fails_closed(self) -> None:
+        """If `diff-tree` during `stale_base` check is truncated or returns non-zero, `stale_base` fails closed."""
+        pr_sha = self._push_branch(
+            "platform-agent/stale-trunc",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        # Advance main on an UNRELATED file so `target_tip != diff_base`
+        (self.work / "clusters" / "prod-c1" / "web.yaml").write_text(
+            DEPLOY_V1.replace("replicas: 3", "replicas: 5"), encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "."], cwd=self.work, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "advance main unrelated"], cwd=self.work, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=self.work, check=True)
+
+        self.forge.proposals[95] = {
+            "number": 95,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/stale-trunc",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": pr_sha,
+            "target": "main",
+            "labels": [],
+        }
+
+        for mode in ("truncated", "nonzero"):
+            def faulty_diff_tree_runner(
+                argv: list[str], cwd: Path, check: bool = True, config: tuple = (), _mode: str = mode, **kw: Any
+            ) -> subprocess.CompletedProcess:
+                if "diff-tree" in argv and "--literal-pathspecs" in argv:
+                    proc = subprocess.CompletedProcess(argv, 0 if _mode == "truncated" else 128, "", "err")
+                    if _mode == "truncated":
+                        proc.truncated = True  # type: ignore[attr-defined]
+                    return proc
+                return subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, check=check)
+
+            broker = vcs_broker.VcsBroker(
+                self.scratch,
+                git_runner=faulty_diff_tree_runner,
+                cluster_read=self._cluster_read,
+                automerge_switch=lambda: "on",
+                base_branch="main",
+            )
+            bound = vcs_broker.Binding(
+                self.forge,
+                "acme/infra",
+                lambda: mock.Mock(ensure=lambda: None, whoami=lambda: "kube-agents-bot"),
+                broker._git_with(lambda: (), False),
+            )
+            broker._bind = lambda payload: bound  # type: ignore[method-assign]
+            with self.subTest(mode=mode), mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+                res = broker.proposal_risk_label({"repository": "acme/infra", "number": 95})
+                self.assertTrue(res["stale_base"])
+                self.assertFalse(res["labelled"])
+                self.assertIn("rebase", res["reason"])
 
 
 if __name__ == "__main__":
