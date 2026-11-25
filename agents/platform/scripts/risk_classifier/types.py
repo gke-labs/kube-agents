@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 SCHEMA_VERSION = 2
@@ -18,25 +20,29 @@ RISK_LEVELS = (RISK_LOW, RISK_MEDIUM, RISK_HIGH, RISK_CRITICAL, RISK_UNKNOWN)
 
 # Policy-eligible ordering for concrete risk levels. `unknown` is intentionally
 # absent so policy comparisons can never accidentally treat `unknown` as low/medium.
-CONCRETE_RISK_ORDER: dict[str, int] = {
-    RISK_LOW: 0,
-    RISK_MEDIUM: 1,
-    RISK_HIGH: 2,
-    RISK_CRITICAL: 3,
-}
+CONCRETE_RISK_ORDER: Mapping[str, int] = MappingProxyType(
+    {
+        RISK_LOW: 0,
+        RISK_MEDIUM: 1,
+        RISK_HIGH: 2,
+        RISK_CRITICAL: 3,
+    }
+)
 
 # Anti-masking lattice for aggregating risk across files/resources:
 #   low < medium < unknown < high < critical
 # Unknown prevents claiming low/medium when any part of the PR is unsupported,
 # while known high/critical can never be downgraded to unknown by adding an
 # unsupported file alongside a dangerous change.
-_RISK_COMBINE_RANK: dict[str, int] = {
-    RISK_LOW: 0,
-    RISK_MEDIUM: 1,
-    RISK_UNKNOWN: 2,
-    RISK_HIGH: 3,
-    RISK_CRITICAL: 4,
-}
+_RISK_COMBINE_RANK: Mapping[str, int] = MappingProxyType(
+    {
+        RISK_LOW: 0,
+        RISK_MEDIUM: 1,
+        RISK_UNKNOWN: 2,
+        RISK_HIGH: 3,
+        RISK_CRITICAL: 4,
+    }
+)
 
 # Blast radius levels (scope of impact)
 BLAST_LOW = "low"
@@ -47,13 +53,15 @@ BLAST_UNKNOWN = "unknown"
 
 BLAST_LEVELS = (BLAST_LOW, BLAST_MEDIUM, BLAST_HIGH, BLAST_CRITICAL, BLAST_UNKNOWN)
 
-_BLAST_COMBINE_RANK: dict[str, int] = {
-    BLAST_LOW: 0,
-    BLAST_MEDIUM: 1,
-    BLAST_UNKNOWN: 2,
-    BLAST_HIGH: 3,
-    BLAST_CRITICAL: 4,
-}
+_BLAST_COMBINE_RANK: Mapping[str, int] = MappingProxyType(
+    {
+        BLAST_LOW: 0,
+        BLAST_MEDIUM: 1,
+        BLAST_UNKNOWN: 2,
+        BLAST_HIGH: 3,
+        BLAST_CRITICAL: 4,
+    }
+)
 
 # Revertability levels
 REVERT_EASY = "easy"
@@ -74,13 +82,15 @@ REVERTABILITY_LEVELS = (
 #   easy < moderate < difficult < unknown < irreversible
 # Unknown dominates easy/moderate/difficult so an unmodeled change can never be
 # masked as moderate by a nearby rename; irreversible dominates everything.
-_REVERT_COMBINE_RANK: dict[str, int] = {
-    REVERT_EASY: 0,
-    REVERT_MODERATE: 1,
-    REVERT_DIFFICULT: 2,
-    REVERT_UNKNOWN: 3,
-    REVERT_IRREVERSIBLE: 4,
-}
+_REVERT_COMBINE_RANK: Mapping[str, int] = MappingProxyType(
+    {
+        REVERT_EASY: 0,
+        REVERT_MODERATE: 1,
+        REVERT_DIFFICULT: 2,
+        REVERT_UNKNOWN: 3,
+        REVERT_IRREVERSIBLE: 4,
+    }
+)
 
 # Disruptiveness levels (separating live outage/disruption from data/resource destruction)
 DISRUPT_NONE = "non_disruptive"
@@ -99,12 +109,14 @@ DISRUPTIVENESS_LEVELS = (
 #   non_disruptive < unknown < disruptive < destructive
 # Unknown prevents claiming non_disruptive when any file is unsupported, while
 # known disruptive/destructive impact can never be downgraded to unknown.
-_DISRUPT_COMBINE_RANK: dict[str, int] = {
-    DISRUPT_NONE: 0,
-    DISRUPT_UNKNOWN: 1,
-    DISRUPT_DISRUPTIVE: 2,
-    DISRUPT_DESTRUCTIVE: 3,
-}
+_DISRUPT_COMBINE_RANK: Mapping[str, int] = MappingProxyType(
+    {
+        DISRUPT_NONE: 0,
+        DISRUPT_UNKNOWN: 1,
+        DISRUPT_DISRUPTIVE: 2,
+        DISRUPT_DESTRUCTIVE: 3,
+    }
+)
 
 # Reason dimensions
 DIM_BLAST_RADIUS = "blast_radius"
@@ -114,85 +126,125 @@ DIM_SECURITY = "security"
 DIM_INPUT_INTEGRITY = "input_integrity"
 DIM_POLICY = "policy"
 
+REASON_DIMENSIONS = (
+    DIM_BLAST_RADIUS,
+    DIM_DISRUPTIVENESS,
+    DIM_REVERTABILITY,
+    DIM_SECURITY,
+    DIM_INPUT_INTEGRITY,
+    DIM_POLICY,
+)
+
 # File change types
 CHANGE_ADDED = "added"
 CHANGE_MODIFIED = "modified"
 CHANGE_DELETED = "deleted"
 CHANGE_RENAMED = "renamed"
 
+CHANGE_TYPES = (CHANGE_ADDED, CHANGE_MODIFIED, CHANGE_DELETED, CHANGE_RENAMED)
+
 # Resource action types
 ACTION_ADD = "add"
 ACTION_MODIFY = "modify"
 ACTION_DELETE = "delete"
 
+RESOURCE_ACTIONS = (ACTION_ADD, ACTION_MODIFY, ACTION_DELETE)
+
 # Deterministic risk labels (broker-owned, reserved against caller writes)
 RISK_LABEL_PREFIX = "risk:"
 RISK_LABELS = tuple(f"{RISK_LABEL_PREFIX}{level}" for level in RISK_LEVELS)
 
-RISK_LABEL_COLORS: dict[str, str] = {
-    "risk:low": "0e8a16",
-    "risk:medium": "fbca04",
-    "risk:high": "d93f0b",
-    "risk:critical": "b60205",
-    "risk:unknown": "cfd3d7",
-}
+RISK_LABEL_COLORS: Mapping[str, str] = MappingProxyType(
+    {
+        "risk:low": "0e8a16",
+        "risk:medium": "fbca04",
+        "risk:high": "d93f0b",
+        "risk:critical": "b60205",
+        "risk:unknown": "cfd3d7",
+    }
+)
 
-RISK_LABEL_DESCRIPTIONS: dict[str, str] = {
-    "risk:low": "kube-agents deterministic PR risk: low blast radius, non-disruptive, easy revert",
-    "risk:medium": "kube-agents deterministic PR risk: moderate impact requiring review or dev policy",
-    "risk:high": "kube-agents deterministic PR risk: high impact (security, disruption, deletion, or cluster scope)",
-    "risk:critical": "kube-agents deterministic PR risk: critical control-plane, RBAC, governance, or data-loss risk",
-    "risk:unknown": "kube-agents deterministic PR risk: unsupported or unverifiable PR content (auto-merge blocked)",
-}
+RISK_LABEL_DESCRIPTIONS: Mapping[str, str] = MappingProxyType(
+    {
+        "risk:low": "kube-agents deterministic PR risk: low blast radius, non-disruptive, easy revert",
+        "risk:medium": "kube-agents deterministic PR risk: moderate impact requiring review or dev policy",
+        "risk:high": "kube-agents deterministic PR risk: high impact (security, disruption, deletion, or cluster scope)",
+        "risk:critical": "kube-agents deterministic PR risk: critical control-plane, RBAC, governance, or data-loss risk",
+        "risk:unknown": "kube-agents deterministic PR risk: unsupported or unverifiable PR content (auto-merge blocked)",
+    }
+)
+
+
+def _norm_level(value: Any, rank_map: Mapping[str, int], fallback: str) -> str:
+    if isinstance(value, str) and value in rank_map:
+        return value
+    return fallback
 
 
 def risk_label_for(risk_level: str) -> str:
     """Return the canonical `risk:<level>` label for `risk_level`."""
-    level = risk_level if risk_level in _RISK_COMBINE_RANK else RISK_UNKNOWN
+    level = _norm_level(risk_level, _RISK_COMBINE_RANK, RISK_UNKNOWN)
     return f"{RISK_LABEL_PREFIX}{level}"
 
 
 def combine_risk(a: str, b: str) -> str:
     """Combine two risk levels using the anti-masking lattice."""
-    ra = _RISK_COMBINE_RANK.get(a, _RISK_COMBINE_RANK[RISK_UNKNOWN])
-    rb = _RISK_COMBINE_RANK.get(b, _RISK_COMBINE_RANK[RISK_UNKNOWN])
-    return b if rb > ra else a
+    na = _norm_level(a, _RISK_COMBINE_RANK, RISK_UNKNOWN)
+    nb = _norm_level(b, _RISK_COMBINE_RANK, RISK_UNKNOWN)
+    return nb if _RISK_COMBINE_RANK[nb] > _RISK_COMBINE_RANK[na] else na
 
 
 def combine_blast_radius(a: str, b: str) -> str:
     """Combine two blast radius levels using the anti-masking lattice."""
-    ra = _BLAST_COMBINE_RANK.get(a, _BLAST_COMBINE_RANK[BLAST_UNKNOWN])
-    rb = _BLAST_COMBINE_RANK.get(b, _BLAST_COMBINE_RANK[BLAST_UNKNOWN])
-    return b if rb > ra else a
+    na = _norm_level(a, _BLAST_COMBINE_RANK, BLAST_UNKNOWN)
+    nb = _norm_level(b, _BLAST_COMBINE_RANK, BLAST_UNKNOWN)
+    return nb if _BLAST_COMBINE_RANK[nb] > _BLAST_COMBINE_RANK[na] else na
 
 
 def combine_revertability(a: str, b: str) -> str:
     """Combine two revertability levels using the anti-masking lattice."""
-    ra = _REVERT_COMBINE_RANK.get(a, _REVERT_COMBINE_RANK[REVERT_UNKNOWN])
-    rb = _REVERT_COMBINE_RANK.get(b, _REVERT_COMBINE_RANK[REVERT_UNKNOWN])
-    return b if rb > ra else a
+    na = _norm_level(a, _REVERT_COMBINE_RANK, REVERT_UNKNOWN)
+    nb = _norm_level(b, _REVERT_COMBINE_RANK, REVERT_UNKNOWN)
+    return nb if _REVERT_COMBINE_RANK[nb] > _REVERT_COMBINE_RANK[na] else na
 
 
 def combine_disruptiveness(a: str, b: str) -> str:
     """Combine two disruptiveness values (`destructive > disruptive > unknown > non_disruptive`)."""
-    ra = _DISRUPT_COMBINE_RANK.get(a, _DISRUPT_COMBINE_RANK[DISRUPT_UNKNOWN])
-    rb = _DISRUPT_COMBINE_RANK.get(b, _DISRUPT_COMBINE_RANK[DISRUPT_UNKNOWN])
-    return b if rb > ra else a
+    na = _norm_level(a, _DISRUPT_COMBINE_RANK, DISRUPT_UNKNOWN)
+    nb = _norm_level(b, _DISRUPT_COMBINE_RANK, DISRUPT_UNKNOWN)
+    return nb if _DISRUPT_COMBINE_RANK[nb] > _DISRUPT_COMBINE_RANK[na] else na
 
 
 def escalate_risk(level: str, *, high_impact: bool = False) -> str:
     """Escalate a concrete risk level by one step for production environments.
 
     `low -> medium`, `medium -> high`, and `high -> critical` when disruptive,
-    destructive, irreversible, or security-sensitive. `unknown` and `critical` stay as-is.
+    destructive, irreversible, or security-sensitive. `unknown` and `critical` stay as-is;
+    unrecognized inputs fail closed to `unknown`.
     """
-    if level == RISK_LOW:
+    norm = _norm_level(level, _RISK_COMBINE_RANK, RISK_UNKNOWN)
+    if norm == RISK_LOW:
         return RISK_MEDIUM
-    if level == RISK_MEDIUM:
+    if norm == RISK_MEDIUM:
         return RISK_HIGH
-    if level == RISK_HIGH and high_impact:
+    if norm == RISK_HIGH and high_impact:
         return RISK_CRITICAL
-    return level
+    return norm
+
+
+def _require_choice(value: Any, allowed: tuple[str, ...], field_name: str) -> None:
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"invalid {field_name}: {value!r} (expected one of {allowed})")
+
+
+def _require_bool(value: Any, field_name: str) -> None:
+    if not isinstance(value, bool):
+        raise TypeError(f"{field_name} must be a bool, got {type(value).__name__}")
+
+
+def _require_nonneg_int(value: Any, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative int, got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -210,6 +262,17 @@ class FileChange:
     oversized: bool = False
     integrity_error: str = ""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str):
+            raise TypeError(f"FileChange.path must be str, got {type(self.path).__name__}")
+        _require_choice(self.change_type, CHANGE_TYPES, "FileChange.change_type")
+        if self.before is not None and not isinstance(self.before, bytes):
+            raise TypeError(f"FileChange.before must be bytes or None, got {type(self.before).__name__}")
+        if self.after is not None and not isinstance(self.after, bytes):
+            raise TypeError(f"FileChange.after must be bytes or None, got {type(self.after).__name__}")
+        _require_bool(self.is_binary, "FileChange.is_binary")
+        _require_bool(self.oversized, "FileChange.oversized")
+
 
 @dataclass(frozen=True)
 class ResourceRef:
@@ -220,6 +283,11 @@ class ResourceRef:
     kind: str
     namespace: str
     name: str
+
+    def __post_init__(self) -> None:
+        for attr in ("group", "version", "kind", "namespace", "name"):
+            if not isinstance(getattr(self, attr), str):
+                raise TypeError(f"ResourceRef.{attr} must be str")
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -246,6 +314,16 @@ class Reason:
     field_path: str = ""
     resource: ResourceRef | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, str) or not self.code.strip():
+            raise ValueError("Reason.code must be a non-empty string")
+        _require_choice(self.dimension, REASON_DIMENSIONS, "Reason.dimension")
+        _require_choice(self.severity, RISK_LEVELS, "Reason.severity")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("Reason.message must be a non-empty string")
+        if self.resource is not None and not isinstance(self.resource, ResourceRef):
+            raise TypeError("Reason.resource must be a ResourceRef or None")
+
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "code": self.code,
@@ -261,15 +339,20 @@ class Reason:
             out["resource"] = self.resource.to_dict()
         return out
 
-    def sort_key(self) -> tuple[int, str, str, str, str, str]:
-        sev_rank = -_RISK_COMBINE_RANK.get(self.severity, 2)
+    def sort_key(self) -> tuple[int, str, str, tuple[str, str, str, str, str], str, str, str]:
+        sev_rank = -_RISK_COMBINE_RANK.get(self.severity, _RISK_COMBINE_RANK[RISK_UNKNOWN])
         res_key = (
-            f"{self.resource.group}/{self.resource.version}/{self.resource.kind}/"
-            f"{self.resource.namespace}/{self.resource.name}"
-            if self.resource
-            else ""
+            (
+                self.resource.group,
+                self.resource.version,
+                self.resource.kind,
+                self.resource.namespace,
+                self.resource.name,
+            )
+            if self.resource is not None
+            else ("", "", "", "", "")
         )
-        return (sev_rank, self.code, self.file, res_key, self.field_path, self.message)
+        return (sev_rank, self.code, self.file, res_key, self.field_path, self.message, self.dimension)
 
 
 @dataclass(frozen=True)
@@ -284,6 +367,18 @@ class ResourceVerdict:
     revertability: str
     disruptiveness: str
     supported: bool = True
+
+    def __post_init__(self) -> None:
+        _require_choice(self.action, RESOURCE_ACTIONS, "ResourceVerdict.action")
+        if not isinstance(self.ref, ResourceRef):
+            raise TypeError("ResourceVerdict.ref must be a ResourceRef")
+        _require_choice(self.risk_level, RISK_LEVELS, "ResourceVerdict.risk_level")
+        _require_choice(self.blast_radius, BLAST_LEVELS, "ResourceVerdict.blast_radius")
+        _require_choice(self.revertability, REVERTABILITY_LEVELS, "ResourceVerdict.revertability")
+        _require_choice(self.disruptiveness, DISRUPTIVENESS_LEVELS, "ResourceVerdict.disruptiveness")
+        _require_bool(self.supported, "ResourceVerdict.supported")
+        if self.risk_level == RISK_UNKNOWN and self.supported:
+            raise ValueError("ResourceVerdict.supported cannot be True when risk_level is 'unknown'")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -316,6 +411,16 @@ class FileVerdict:
     supported: bool = True
     old_path: str = ""
 
+    def __post_init__(self) -> None:
+        _require_choice(self.change_type, CHANGE_TYPES, "FileVerdict.change_type")
+        _require_choice(self.risk_level, RISK_LEVELS, "FileVerdict.risk_level")
+        _require_choice(self.blast_radius, BLAST_LEVELS, "FileVerdict.blast_radius")
+        _require_choice(self.revertability, REVERTABILITY_LEVELS, "FileVerdict.revertability")
+        _require_choice(self.disruptiveness, DISRUPTIVENESS_LEVELS, "FileVerdict.disruptiveness")
+        _require_bool(self.supported, "FileVerdict.supported")
+        if self.risk_level == RISK_UNKNOWN and self.supported:
+            raise ValueError("FileVerdict.supported cannot be True when risk_level is 'unknown'")
+
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "path": self.path,
@@ -346,6 +451,20 @@ class PRStats:
     unsupported_resources: int = 0
     parse_errors: int = 0
 
+    def __post_init__(self) -> None:
+        for attr in (
+            "files_changed",
+            "resources_added",
+            "resources_modified",
+            "resources_deleted",
+            "namespaces_touched",
+            "clusters_touched",
+            "unsupported_files",
+            "unsupported_resources",
+            "parse_errors",
+        ):
+            _require_nonneg_int(getattr(self, attr), f"PRStats.{attr}")
+
     def to_dict(self) -> dict[str, int]:
         return {
             "files_changed": self.files_changed,
@@ -374,6 +493,24 @@ class ClassificationResult:
     files: tuple[FileVerdict, ...] = ()
     resources: tuple[ResourceVerdict, ...] = ()
     stats: PRStats = field(default_factory=PRStats)
+
+    def __post_init__(self) -> None:
+        _require_choice(self.risk_level, RISK_LEVELS, "ClassificationResult.risk_level")
+        _require_choice(self.blast_radius, BLAST_LEVELS, "ClassificationResult.blast_radius")
+        _require_choice(self.revertability, REVERTABILITY_LEVELS, "ClassificationResult.revertability")
+        _require_choice(self.disruptiveness, DISRUPTIVENESS_LEVELS, "ClassificationResult.disruptiveness")
+        _require_bool(self.supported, "ClassificationResult.supported")
+        _require_bool(self.effective_changes, "ClassificationResult.effective_changes")
+        if self.risk_level == RISK_UNKNOWN and self.supported:
+            raise ValueError("ClassificationResult.supported cannot be True when risk_level is 'unknown'")
+        if not isinstance(self.reasons, tuple):
+            object.__setattr__(self, "reasons", tuple(self.reasons))
+        if not isinstance(self.files, tuple):
+            object.__setattr__(self, "files", tuple(self.files))
+        if not isinstance(self.resources, tuple):
+            object.__setattr__(self, "resources", tuple(self.resources))
+        if not isinstance(self.stats, PRStats):
+            raise TypeError("ClassificationResult.stats must be a PRStats instance")
 
     @property
     def risk_label(self) -> str:
@@ -404,6 +541,7 @@ def unknown_result(
     file: str = "",
 ) -> ClassificationResult:
     """Construct a fail-closed `unknown` verdict for unsupported or unreadable PRs."""
+    effective_files = max(files_changed, 1) if file else files_changed
     return ClassificationResult(
         risk_level=RISK_UNKNOWN,
         blast_radius=BLAST_UNKNOWN,
@@ -421,7 +559,7 @@ def unknown_result(
             ),
         ),
         stats=PRStats(
-            files_changed=files_changed,
-            unsupported_files=max(files_changed, 1) if file else files_changed,
+            files_changed=effective_files,
+            unsupported_files=effective_files,
         ),
     )
