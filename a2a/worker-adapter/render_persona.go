@@ -96,7 +96,7 @@ func RenderPersonaTo(in, out string, h persona.Harness, relay persona.Relay, req
 		return err
 	}
 	done = true
-	if err := os.Chmod(out, sealedDirMode); err != nil {
+	if err := os.Chmod(out, sealedDirMode); err != nil { // #nosec G302 -- sealed read-only; the harness user lists it by design
 		return err
 	}
 	return os.Remove(tmp)
@@ -109,12 +109,16 @@ func removeSealed(root string) error {
 	if _, err := os.Lstat(root); errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && d.IsDir() {
-			_ = os.Chmod(p, 0o700) // #nosec G302 -- the directory is about to be removed
-		}
-		return nil
-	})
+	// Through os.Root, so the walk can't be led out of root.
+	if r, err := os.OpenRoot(root); err == nil {
+		_ = fs.WalkDir(r.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = r.Chmod(rel, 0o700) // #nosec G302 -- the directory is about to be removed
+			}
+			return nil
+		})
+		_ = r.Close()
+	}
 	return os.RemoveAll(root)
 }
 
@@ -123,33 +127,35 @@ func removeSealed(root string) error {
 func seal(root string, files []persona.File) error {
 	exec := map[string]bool{}
 	for _, f := range files {
-		exec[filepath.FromSlash(f.Path)] = f.Executable
+		exec[f.Path] = f.Executable
 	}
+	// Through os.Root, so the walk can't be led out of root.
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
 	var dirs []string
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(r.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			dirs = append(dirs, p)
+			dirs = append(dirs, rel)
 			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return err
 		}
 		mode := fs.FileMode(sealedFileMode)
 		if exec[rel] {
 			mode = sealedExecMode
 		}
-		return os.Chmod(p, mode)
+		return r.Chmod(rel, mode) // #nosec G302 -- sealed read-only; readable by the harness user by design
 	})
 	if err != nil {
 		return err
 	}
 	slices.Reverse(dirs)
 	for _, d := range dirs {
-		if err := os.Chmod(d, sealedDirMode); err != nil {
+		if err := r.Chmod(d, sealedDirMode); err != nil { // #nosec G302 -- sealed read-only; the harness user lists it by design
 			return err
 		}
 	}
