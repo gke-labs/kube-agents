@@ -119,8 +119,43 @@ func TestCheckPersonaDirFailsClosed(t *testing.T) {
 	real := personaDir(t)
 	link := filepath.Join(tempDir(t), "persona")
 	must(t, os.Symlink(real, link))
-	if err := CheckPersonaDir(link, otherUID, otherGID); err == nil {
-		t.Error("a symlinked persona dir accepted")
+	// lstat follows a link written with a trailing "/" or "/.".
+	for _, spelled := range []string{link, link + "/", link + "/.", link + "/./", link + "//"} {
+		if err := CheckPersonaDir(spelled, otherUID, otherGID); err == nil {
+			t.Errorf("a symlinked persona dir accepted as %q", spelled)
+		}
+	}
+}
+
+// TestCheckPersonaDirResolvesDotDotAfterALink: the persona's contents are
+// checked where the kernel resolves the path, not where its text cleans to.
+// safe/link points at real/sub, so safe/link/../persona is real/persona,
+// whose skills tree holds a file others can write; safe/persona, where the
+// text cleans to, is read-only. The check, and the load, must refuse it.
+func TestCheckPersonaDirResolvesDotDotAfterALink(t *testing.T) {
+	real := tempDir(t)
+	must(t, os.Mkdir(filepath.Join(real, "sub"), 0o755))
+	rp := filepath.Join(real, "persona")
+	write(t, filepath.Join(rp, "AGENTS.md"), "x")
+	write(t, filepath.Join(rp, "skills", "triage", "SKILL.md"), "evil")
+	lockDown(t, real)
+	must(t, os.Chmod(filepath.Join(rp, "skills", "triage", "SKILL.md"), 0o666)) // others could rewrite the skill
+	safe := tempDir(t)
+	sp := filepath.Join(safe, "persona")
+	write(t, filepath.Join(sp, "AGENTS.md"), "x")
+	write(t, filepath.Join(sp, "skills", "triage", "SKILL.md"), "good")
+	must(t, os.Symlink(filepath.Join(real, "sub"), filepath.Join(safe, "link")))
+	lockDown(t, safe)
+	must(t, os.Chmod(filepath.Join(real, "sub"), 0o555)) // lockDown's chmod followed the link
+	spelled := safe + "/link/../persona"
+	if err := CheckPersonaDir(spelled, otherUID, otherGID); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("CheckPersonaDir(%s) = %v; the kernel reads %s, whose skill is writable", spelled, err, rp)
+	}
+	if _, err := LoadPersona(spelled, otherUID, otherGID); err == nil {
+		t.Fatalf("LoadPersona(%s) loaded the unchecked tree", spelled)
+	}
+	if err := CheckPersonaDir(sp, otherUID, otherGID); err != nil {
+		t.Fatalf("the plain safe path: %v", err)
 	}
 }
 
