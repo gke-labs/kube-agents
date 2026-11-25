@@ -1,9 +1,9 @@
 """monitoring-alert-policy-read's state check, on the folded text the verifier grades.
 
 A bullet list puts the policy's name on one line and its state on the next.
-The "<name>: enabled" forbidden pattern must stay on the policy's own line: read
-across the line break it took the next bullet's "Enabled:" label for an enabled
-state, and failed answers that report the planted policy disabled.
+The forbidden "<name>: enabled" pattern reads an "Enabled" or "Active" state that
+starts the next line too, but not one whose line goes on to say false or no:
+that is the "Enabled: false" label of a disabled report, which it used to fail.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ NAME = "ka-bench orbital-checkout restart storm"
         f"- {NAME}\n  - Enabled: false\n",
         f"| Policy | Enabled |\n|---|---|\n| {NAME} | false |\n",
         f"{NAME} is disabled.\n",
+        f"{NAME}\n  enabled:\n    false\n",
     ],
 )
 def test_a_disabled_report_passes_whatever_its_layout(report):
@@ -38,6 +39,13 @@ def test_a_disabled_report_passes_whatever_its_layout(report):
         f"{NAME} is enabled.\n",
         f"- **Display name:** {NAME}\n- **Enabled:** true\n",
         f"| Policy | Enabled |\n|---|---|\n| {NAME} | true |\n",
+        # The next line's state, with a neighbour named disabled nearby: main
+        # caught these by reading across the line break, and still must.
+        f"- {NAME}\n  - Enabled: \u2705\n- ka-bench other policy\n  - Enabled: \u274c disabled\n",
+        f"- **Display name:** {NAME}\n- **Enabled:** \u2705\n- Another policy: disabled\n",
+        f"- {NAME}\n  - Active\n- ka-bench other: disabled\n",
+        f"**{NAME}**\nEnabled: on\nNotifications: disabled\n",
+        f"{NAME}\n\nEnabled\n\nother: disabled\n",
     ],
 )
 def test_an_enabled_report_still_fails(report):
