@@ -1299,29 +1299,6 @@ _MAX_AWAITED_TASKS = 32
 # same case after _MAX_SILENT_TURNS turns that report nothing for it.
 _MAX_UNKNOWN_CARD_READS = 3
 
-
-def _vanished_card_error(task_id: str, created_at: int | None, floor: int | None) -> str:
-    """The error for an awaited card the board stopped having a row for.
-
-    A card filed before the run started (``created_at`` under the pod-clock
-    ``floor``) is an earlier repetition's that this run's create was handed by
-    its idempotency key, and the purge owing it deletes it once it stops
-    running, possibly before this wait reads it settled (#4794). Saying so
-    keeps the record honest: the repetition adopted another run's card, which
-    makes it not independent, rather than losing a card of its own.
-    """
-    message = (
-        f"card {task_id} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
-        "dropped from the delegation wait, nothing graded for it"
-    )
-    if created_at is not None and floor is not None and created_at < floor:
-        message += (
-            "; it was filed before this run started, so this run's create was handed an earlier "
-            "repetition's card by its idempotency key, and the purge owing that card deleted it: "
-            "this repetition is not independent"
-        )
-    return message
-
 # Consecutive status turns that may report nothing before the wait is
 # abandoned. One off-turn is cheap to absorb; a run of them means the agent will
 # not read the board.
@@ -1331,6 +1308,37 @@ _MAX_SILENT_TURNS = 3
 # abandoned. An idle keepalive dropping between turns is not a broken agent, and
 # retrying costs one poll interval against the whole delegated result.
 _MAX_TRANSPORT_FAILURES = 3
+
+
+def _predates_run(created_at: int | None, floor: int | None) -> bool:
+    """Whether a card was filed before the run started (``created_at`` under the pod-clock ``floor``).
+
+    Such a card is not this run's: its create was handed an existing card by
+    its idempotency key, most likely an earlier repetition's (#4794), so the
+    repetition that waits on it is not independent.
+    """
+    return created_at is not None and floor is not None and created_at < floor
+
+
+def _vanished_card_error(task_id: str, created_at: int | None, floor: int | None) -> str:
+    """The error for an awaited card the board stopped having a row for.
+
+    For a card that predates the run (:func:`_predates_run`) it says what was
+    checked, and only names the likely cause: a purge that owed an earlier
+    repetition's card deletes it once it stops running, possibly before this
+    wait reads it settled.
+    """
+    message = (
+        f"card {task_id} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
+        "dropped from the delegation wait, nothing graded for it"
+    )
+    if _predates_run(created_at, floor):
+        message += (
+            "; it was filed before this run started, so this run did not file it and this repetition "
+            "is not independent (most likely an earlier repetition's card, handed back by its "
+            "idempotency key and deleted by the purge that owed it)"
+        )
+    return message
 
 
 def _append_final(result: AgentResult, sections: list[str]) -> None:
@@ -5863,7 +5871,10 @@ class KubeAgentsHarness(AgentHarness):
         :data:`_MAX_AWAITED_TASKS`, and lets a card the session files later
         join the wait. A card the board has no row for on
         :data:`_MAX_UNKNOWN_CARD_READS` reads running is dropped from the
-        wait with a line on ``errors``, and nothing is graded for it.
+        wait with a line on ``errors`` (:func:`_vanished_card_error`), and
+        nothing is graded for it. A card filed before the run started
+        (:func:`_predates_run`), settled or dropped, is listed in
+        ``metadata["delegated_cards_adopted"]``.
 
         Every read is retried up to :data:`_MAX_TRANSPORT_FAILURES` times
         running. Returns ``False``, having changed nothing else, when the store
@@ -5942,10 +5953,14 @@ class KubeAgentsHarness(AgentHarness):
         awaited: list[str] = []
         capped = False
         # Each awaited card's ``created_at`` from the last read that had its row,
-        # so a card that leaves the board can still be told apart: one filed
-        # before the run started is an earlier run's, handed back by its
-        # idempotency key, which a purge owing it may delete mid-wait (#4794).
+        # and the awaited cards filed before the run started (_predates_run): this
+        # run did not file them, so it is not independent whether they settle or
+        # leave the board mid-wait (#4794). Recorded in metadata, not errors,
+        # which the scorer reads: what such a run counts for is #4658's call.
+        # devops-bench drops metadata from results.json, so this is in-process
+        # only; a dropped one also gets its errors line.
         created: dict[str, int | None] = {}
+        adopted: list[str] = []
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
             _purge_card_state(
@@ -5983,6 +5998,8 @@ class KubeAgentsHarness(AgentHarness):
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
                 if t in read.cards:
                     created[t] = read.cards[t].get("created_at")
+                    if t not in adopted and _predates_run(created[t], self._pod_floor):
+                        adopted.append(t)
             gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
             for t in gone:
                 result.errors.append(_vanished_card_error(t, created.get(t), self._pod_floor))
@@ -6029,6 +6046,8 @@ class KubeAgentsHarness(AgentHarness):
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
         if missing:
             result.metadata["delegated_cards_missing"] = list(missing)
+        if adopted:
+            result.metadata["delegated_cards_adopted"] = list(adopted)
         if timed_out:
             _record_ceiling(
                 result,

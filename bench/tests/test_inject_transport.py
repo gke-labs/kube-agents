@@ -4059,9 +4059,10 @@ def test_an_earlier_runs_card_deleted_mid_wait_is_named_as_adopted_not_lost(
 
     (error,) = result.errors
     assert error.startswith(f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait")
-    assert "filed before this run started" in error
+    assert "filed before this run started, so this run did not file it" in error
     assert "this repetition is not independent" in error
     assert result.metadata["delegated_cards_missing"] == [CARD_A]
+    assert result.metadata["delegated_cards_adopted"] == [CARD_A]
 
 
 def test_a_card_of_this_runs_own_that_vanishes_keeps_the_plain_message(
@@ -4074,6 +4075,31 @@ def test_a_card_of_this_runs_own_that_vanishes_keeps_the_plain_message(
         f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait, "
         "nothing graded for it"
     ]
+    assert "delegated_cards_adopted" not in result.metadata
+
+
+def test_an_earlier_runs_card_that_settles_is_graded_and_recorded_as_adopted(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commoner #4794 case: the adopted card stays and is graded as this run's answer. No new
+    error (the scorer reads errors), but the record names the card this run did not file."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (floor - 60, CARD_A))
+    real = local_shell(tmp_path, monkeypatch)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    assert f"Result of delegated task {CARD_A}:\nall 3 clusters healthy" in result.metadata["final_message"]
+    assert result.metadata["delegated_cards_adopted"] == [CARD_A]
+
 
 def test_one_cap_counts_every_card_and_awaits_the_moving_ones_first(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch

@@ -67,8 +67,8 @@ clock read before the agent is invoked, is not this run's and stays, files inclu
 both waits below. When the clock or the board cannot be read, such a card is taken like the run's
 own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
 other than a follow-up linked to its creator. What a purge keeps, or all of it when the board step
-fails, is written down in the agent pod, and the next repetition retries it before its agent is
-invoked, each purge under its own start time, so a card an earlier purge owes goes even when a later
+fails, is written down in the agent pod, and every later purge retries it, the next repetition's
+before its agent is invoked included, each purge under its own start time, so a card an earlier purge owes goes even when a later
 run's create returned it; anything owed for over a day is given up. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
@@ -634,7 +634,11 @@ store kept none, the `kanban_notify_subs` rows addressed to the session, through
 `kubectl exec` the board read uses. It caps the cards at the harness's one cap, pending first,
 and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
 passes; a card the board has no row for on three reads in a row is dropped from the wait with a
-line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
+line on the record's errors, and nothing is graded for it. A card created before the run started
+was not filed by this run, so the repetition is not independent: its dropped line says so, and
+every such card, settled or dropped, is listed in the harness result's `delegated_cards_adopted`
+metadata, which devops-bench does not persist; marking a settled one in the record would change
+grading. Then it reads `tasks.result` and the
 newest `task_runs.summary` of the cards the board shows terminal, and for a blocked card the
 newest block's kind and reason. No status turn is sent, because
 none could carry a result back through the door. Only a terminal card reaches the settle step,
