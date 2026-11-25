@@ -44,6 +44,8 @@ _REQUIRED = [
     "--set", "platformAgent.harness.projectId=ci-project",
 ]
 _VALUE_PATH = "platformAgent.security.scopedServiceAccountPool"
+_RETIRED_KEY = "scopedServiceAccounts"
+_RETIRED_VALUE_PATH = "platformAgent.security." + _RETIRED_KEY
 _FAIL_MESSAGE = "requires at least one serviceAccounts entry"
 _CRD_LOOKUP = 'lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io"'
 _CRD_DIG = 'dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "security" "properties" (dict) .'
@@ -132,6 +134,14 @@ class ScopedPoolBlockShapeTest(unittest.TestCase):
         self.assertIs(member["additionalProperties"], False)
         self.assertEqual(set(member["properties"]), {"projectId", "serviceAccountEmail"})
 
+    def test_the_schema_does_not_declare_the_retired_per_cluster_key(self):
+        # The closed `security` block is what refuses the retired key, so the
+        # block stays closed and the key stays out of its properties.
+        schema = json.loads((_CHART / "values.schema.json").read_text())
+        security = schema["properties"]["platformAgent"]["properties"]["security"]
+        self.assertIs(security["additionalProperties"], False)
+        self.assertNotIn(_RETIRED_KEY, security["properties"])
+
 
 @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
 class ScopedPoolBlockRenderTest(unittest.TestCase):
@@ -215,24 +225,20 @@ class ScopedPoolBlockRenderTest(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("scopedServiceAccountPool", proc.stderr)
 
-    def test_the_retired_per_cluster_key_is_tolerated_empty_and_refused_populated(self):
-        # Every release the composition applied before the pool moved to
-        # projects recorded `platformAgent.security.scopedServiceAccounts: []`,
-        # and a harness- or operator-mode retag re-applies the recorded values
-        # over this chart after checking them against the schema. The empty
-        # list is therefore admitted for one release and renders nothing, so
-        # the first retag after the move is the no-op it was before; a
-        # populated list was a pool armed under the old field, and that
-        # install takes a full upgrade, so the schema refuses it by name.
-        empty = self._render("--set-json", "platformAgent.security.scopedServiceAccounts=[]")
-        self.assertEqual(empty.returncode, 0, empty.stderr)
-        self.assertNotIn("scopedServiceAccounts", empty.stdout)
-        self.assertNotIn("scopedServiceAccountPool", empty.stdout)
-        populated = self._render("--set-json", "platformAgent.security.scopedServiceAccounts=" + json.dumps(
-            [{"projectId": "p", "location": "l", "clusterName": "c",
-              "serviceAccountEmail": "ka-c-12345678@p.iam.gserviceaccount.com"}]))
-        self.assertNotEqual(populated.returncode, 0)
-        self.assertIn("scopedServiceAccounts", populated.stderr)
+    def test_the_retired_per_cluster_key_is_refused_by_name_empty_or_not(self):
+        # Releases the composition applied before the pool moved to projects
+        # recorded `platformAgent.security.scopedServiceAccounts: []`, and the
+        # schema admitted that empty list for one release so that a retag from
+        # such a record passed. The tolerance is gone: the closed `security`
+        # block refuses the key by name, empty or populated, and an install
+        # whose record still carries it takes a full upgrade.
+        for retired in ([],
+                        [{"projectId": "p", "location": "l", "clusterName": "c",
+                          "serviceAccountEmail": "ka-c-12345678@p.iam.gserviceaccount.com"}]):
+            with self.subTest(retired=retired):
+                proc = self._render("--set-json", f"{_RETIRED_VALUE_PATH}=" + json.dumps(retired))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(_RETIRED_KEY, proc.stderr)
 
     def test_a_non_boolean_switch_is_refused_by_the_schema(self):
         # `--set ...enabled=yes` is a string, which the CRD would reject at

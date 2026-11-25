@@ -45,7 +45,7 @@ HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v))
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check recipe-new recipe-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check recipe-new recipe-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance persona-manifests
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -974,9 +974,21 @@ skills-verify-upstream: ## Compare each upstream copy with google/skills at its 
 # <!-- BEGIN GENERATED --> regions.
 # The SOP line numbers each governance cron prompt cites are recomputed first,
 # so the cron-job-example regions below render the prompt with them current.
-docs-generate: ## Regenerate the generated doc regions and files from their sources.
+docs-generate: persona-manifests ## Regenerate the generated doc regions and files from their sources, and the shipped personas' content manifests.
 	@python3 scripts/generate_sop_geography.py
 	@python3 scripts/generate_docs.py
+
+# A shipped persona's skills_manifest.sha256 is committed beside it, because a
+# persona image's Dockerfile is only FROM and COPY (hack/check-image-inventory.sh);
+# a2a/cmd/persona's tests fail while one doesn't match its persona. --git
+# covers only the files a clean checkout holds, which is what CI builds the
+# image from, so an ignored local file (a __pycache__) is left out and left
+# alone.
+PERSONA_DIRS := $(wildcard agents/*/persona)
+persona-manifests: ## Rewrite each shipped persona's content manifest (agents/*/persona/skills_manifest.sha256).
+	@for d in $(PERSONA_DIRS); do \
+		go -C a2a run ./cmd/persona manifest --git --in "../$$d" || exit 1; \
+	done
 
 # Everything CI enforces about the docs, in one command.
 docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory ## Run every documentation check CI runs.

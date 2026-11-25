@@ -46,6 +46,18 @@
 # (5 of 1000 TERMs in a tight loop), so a loop here runs to its end. All of
 # it also runs on bash 3.2, the macOS /bin/bash the unit tests can land in
 # on a developer machine.
+#
+# The interval sleep runs in the background under `wait`. bash runs a trap
+# only after a foreground child returns, so a foreground sleep held a TERM,
+# and with it the job's stdout pipe, for up to the whole interval; `wait`
+# returns as soon as the signal lands. summary then kills the sleep, which
+# holds the same pipe, by job spec (`kill %%`): bash records the job when it
+# forks, so no TERM can land between the fork and a pid being stored, a
+# finished job is gone from the table so no stale pid is signalled, and it
+# needs no $(jobs -p). One window stays open on bash 3.2 only: a sleep
+# signalled after the fork and before its exec still holds this shell's trap
+# and drops the signal, so it holds the pipe for up to the interval, as
+# every sleep did before. bash 5.2 does not drop it.
 
 set -uo pipefail
 
@@ -59,7 +71,7 @@ BOSKOS_HEARTBEAT_LOG="${BOSKOS_HEARTBEAT_LOG:-${ARTIFACTS:-/tmp}/boskos-heartbea
 # Where an external command's output lands to be read back (see the header
 # on why not a $(...)). Removed by the stop summary; a SIGKILL leaves it.
 # Per process: consecutive steps each run a daemon on the same log, and one
-# that lingers in its last sleep must not remove the next one's file.
+# that lingers in its last beat must not remove the next one's file.
 readonly CAPTURE_FILE="${BOSKOS_HEARTBEAT_LOG}.capture.$$"
 # Where each beat's HTTP code goes for a caller that needs the answer before
 # it acts (ci-teardown.sh); empty writes nothing.
@@ -100,6 +112,9 @@ summary() {
   fi
   echo "${LOG_PREFIX} stopping for ${BOSKOS_RESOURCE_NAME}: ${beats_sent} beats sent, ${beats_failed} failed (detail: ${BOSKOS_HEARTBEAT_LOG})"
   rm -f "${CAPTURE_FILE}"
+  # The interval sleep, if one is running (see the header); "no such job"
+  # otherwise.
+  kill %% 2>/dev/null
   exit 0
 }
 trap summary TERM INT
@@ -167,5 +182,6 @@ while true; do
     fi
     last_status="${status}"
   fi
-  sleep "${BOSKOS_HEARTBEAT_INTERVAL_SECONDS}"
+  sleep "${BOSKOS_HEARTBEAT_INTERVAL_SECONDS}" &
+  wait "$!"
 done

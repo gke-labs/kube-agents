@@ -163,7 +163,7 @@ Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is the agent API transpor
    turn and every wake that continued its chain
    (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), reports
    the chain's child tasks apart (`tokens.children`, added into `total` with the workers'), and
-   leaves them null when it carries none. The scorer's liveness rule
+   leaves them null when it carries none; they are also null when the harness made no such read or got no answer to it. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
    `working` and the terminal, is a trajectory entry under the status-event name, the latency
