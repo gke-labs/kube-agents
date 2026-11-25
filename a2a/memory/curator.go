@@ -3754,8 +3754,12 @@ func (c *Curator) collectQueryRecordsLocked() []repoScopedRecord {
 func gitopsStateFilePaths() (managedPath, contextPath string) {
 	if statePath := strings.TrimSpace(os.Getenv(gitopsStateEnv)); statePath != "" {
 		clean := filepath.Clean(statePath)
-		if st, err := os.Stat(clean); err == nil && st.IsDir() {
-			return filepath.Join(clean, defaultManagedReposFile), filepath.Join(clean, defaultContextReposFile)
+		if root, err := os.OpenRoot(filepath.Dir(clean)); err == nil {
+			st, statErr := root.Stat(filepath.Base(clean))
+			_ = root.Close()
+			if statErr == nil && st.IsDir() {
+				return filepath.Join(clean, defaultManagedReposFile), filepath.Join(clean, defaultContextReposFile)
+			}
 		}
 		return clean, filepath.Join(filepath.Dir(clean), defaultContextReposFile)
 	}
