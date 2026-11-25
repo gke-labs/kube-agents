@@ -324,6 +324,20 @@ type Gateway struct {
 	capCheck chan struct{}
 	capMu    sync.Mutex
 	capHolds map[string]capHold
+	// warmMu guards warmClaiming and warmDeleting, the warm pods a turn is
+	// claiming and the pool is deleting right now, so neither acts on a pod
+	// the other has in hand (warm_pool.go). It is held only to read and mark
+	// them, never across an API call.
+	warmMu       sync.Mutex
+	warmClaiming map[string]bool
+	warmDeleting map[string]bool
+	// warmMint, when set, mints the warm pool's pod names in place of
+	// mintSessionName: a test hook, so a name TASKS holds can be minted on
+	// purpose.
+	warmMint func(profile string) string
+	// warmUsedErr, when set, fails warmPodUsed for the pods it returns an
+	// error for: a test hook for a TASKS read that fails on one pod.
+	warmUsedErr func(pod string) error
 	// capQueue, guarded by capMu, is the line of turns waiting at the cap
 	// (session_cap_queue.go), oldest first; capTicket numbers the head's tries.
 	// capKick nudges the line's loop when a slot may have freed.
@@ -344,6 +358,10 @@ type Gateway struct {
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
 	reapCursor string
+	// waitingPass caches the reap pass's waiting-children counts by profile
+	// and tier (waitingChildren, #7015); reapOnce starts each pass with a
+	// fresh one.
+	waitingPass map[string]int
 	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
 	// Returning false halts the reap scan early.
 	reapScanHook func(rec *SessionRecord) bool
@@ -1040,6 +1058,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
 		go g.capQueueLoop(ctx)
+	}
+	if g.warmPoolOn() {
+		go g.warmPoolLoop(ctx)
 	}
 
 	// The adapter's delivery goroutines only enqueue (or refuse a console
@@ -1778,6 +1799,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			if rec.Profile == "" {
 				rec.Profile = sessionProfile
 			}
+			// Always minted, never a warm pod: a one-shot Delegate on a
+			// fixed-route conversation must not inherit a reused pod's
+			// lifetime (warmClaimEligible).
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
 			msg = wordsAfter(msg, rest)
@@ -1816,8 +1840,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				}
 				rec.SessionRouted = true
 				rec.Profile = sessionProfile
-				rec.BusSession = mintSessionName(rec.Profile)
-				rec.Addressee = rec.BusSession
+				g.claimOrMint(ctx, rec)
 			}
 		}
 		// The busy notice: counted once the task is on the bus, leaving the
@@ -1942,13 +1965,6 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// conversation for its children: they are what is healed, not its own
 	// hand-off line (healFanOut). A batch cut short heals below, where its
 	// request is read back from the stream and finished (delegationHandled).
-	// A profile parent waiting on its batch has its children healed first,
-	// an end the relay missed or couldn't send going to it now
-	// (healProfileBatch), and is then healed below as any task is: its own
-	// terminal is its end.
-	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
-		g.healProfileBatch(ctx, rec, ref)
-	}
 	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier == "" && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
 		g.healFanOut(ctx, rec, active, ref)
 		return
@@ -1960,6 +1976,27 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
 	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID, g.profileRead(rec, active.TaskID, addressee))
+	// A profile parent still waiting on its batch has its children healed
+	// first, an end the relay missed or couldn't send going to it now
+	// (healProfileBatch), and is then healed below as any task is: its own
+	// terminal is its end. One whose own terminal is already on the stream
+	// (the relay missed it) has ended: its children's ends are still booked
+	// (a child that completed is recorded completed, not cancelled as live
+	// below), but none is sent to it: for that pass it is marked endedUnread,
+	// in memory only, which profileParentListens reads. Its own terminal is
+	// then handled below as always (TerminalObserved, its result's delivery).
+	// A read that failed leaves it unmarked, and the batch heal sends as
+	// before.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
+		ended := err == nil && task.Final
+		if ended {
+			rec.setEndedUnread(active.TaskID, true)
+		}
+		g.healProfileBatch(ctx, rec, ref)
+		if ended {
+			rec.setEndedUnread(active.TaskID, false)
+		}
+	}
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
@@ -2653,8 +2690,9 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	if !g.retireIncarnation(ctx, rec, "session route", retireRefusalNotStarted) {
 		return false
 	}
-	rec.BusSession = mintSessionName(rec.Profile)
-	rec.Addressee = rec.BusSession
+	// A new conversation's first turn may be handed a warm pod instead of a
+	// fresh name (warm_pool.go); everything else mints, as before.
+	g.claimOrMint(ctx, rec)
 	return true
 }
 
@@ -3046,8 +3084,11 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 // ends join on taskId. It is logged by the task's own id, for every task
 // that wrote an ingress line - a delegated child and a wake included - and
 // not from observeTaskTerminal, which names a chain by its root and is
-// called only for the task whose end is the chain's (observedAs). The
-// addressee is the one the task was published to, which is what ingress
+// called only for the task whose end is the chain's (observedAs). The one
+// line under a task's id that is not that task's own terminal is a chain's
+// wake-not-started end, logged under its root with its own source
+// (observeChainEnd, terminalLogChainEnd).
+// The addressee is the one the task was published to, which is what ingress
 // logged; after a Delegate re-home rec.Addressee is not it, so each caller
 // passes the one it holds. Chat already showed the user the reason; the log
 // keeps only its token (reasonToken), so a failing install's log says how

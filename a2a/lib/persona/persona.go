@@ -57,6 +57,7 @@ type Harness string
 const (
 	ClaudeCode  Harness = "claude-code"
 	Antigravity Harness = "antigravity"
+	CoreAgent   Harness = "core-agent"
 )
 
 // Persona is a loaded, validated persona directory.

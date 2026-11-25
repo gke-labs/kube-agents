@@ -648,7 +648,10 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 				cfg.HarnessCommandNoDelegate = cfg.HarnessCommand
 				cfg.HarnessCommand = append(append([]string(nil), base...), w.personaDelegate.Args...)
 			}
-			cfg.HarnessEnv = append(cfg.HarnessEnv, cfg.driver().ConfigDirEnv(dir))
+			// A harness that reads no config dir names none.
+			if kv := cfg.driver().ConfigDirEnv(dir); kv != "" {
+				cfg.HarnessEnv = append(cfg.HarnessEnv, kv)
+			}
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)

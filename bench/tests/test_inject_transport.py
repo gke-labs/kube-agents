@@ -2348,6 +2348,55 @@ def test_an_earlier_task_s_posts_are_not_this_task_s_answer() -> None:
     assert fold.deliverable == "the second answer"
 
 
+def test_a_relayed_report_is_never_this_task_s_answer() -> None:
+    """A card's report relayed over the inject notify route lands on the
+    conversation as a post the door marks `report`. Inside this task's window
+    it is still not the reply: the deliverable is the task's own post, and the
+    report is kept apart, edits included."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True, replyTo="inj-0"))
+    fold.apply(entry(4, inject.ENTRY_EDIT, text="card report, final", messageId="inj-2", report=True))
+
+    assert fold.deliverable == "the answer"
+    assert [p["messageId"] for p in fold.window_posts] == ["inj-1"]
+    assert [(r["kind"], r["text"]) for r in fold.reports] == [
+        (inject.ENTRY_POST, "card report"), (inject.ENTRY_EDIT, "card report, final")]
+    assert fold.reports[0]["replyTo"] == "inj-0"
+    assert "inj-2" not in fold.edited
+
+
+def test_a_window_with_only_a_report_does_not_fall_back_to_an_earlier_task() -> None:
+    """With this task's marker seen and only a relayed report in its window,
+    the answer is empty, not the earlier task's post."""
+    fold = inject.Fold("task-two")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="first answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_TASK, taskId="task-two"))
+    fold.apply(entry(4, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True))
+    assert fold.deliverable == ""
+    assert fold.window_posts == []
+
+
+def test_an_edit_marked_report_on_an_ordinary_post_still_rewrites_it() -> None:
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="Working on it...", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_EDIT, text="card report", messageId="inj-1", report=True))
+    fold.apply(entry(4, inject.ENTRY_POST, text="answer", messageId="inj-2"))
+    assert fold.deliverable == "answer"
+
+
+def test_a_post_marked_report_false_is_an_ordinary_post() -> None:
+    """Only a true `report` sets a post aside; anything else is read as before."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1", report=False))
+    assert fold.deliverable == "the answer"
+    assert fold.reports == []
+
+
 @pytest.mark.parametrize(
     ("text", "token"),
     [
@@ -2563,8 +2612,20 @@ def test_the_trace_the_door_carries_becomes_tool_entries_behind_a_marker(
             "result": None,
             "status": "completed",
         },
-        {"name": "kanban_create", "args": {"title": "list the fleet"}, "result": None, "status": "completed"},
-        {"name": "terminal", "args": {"command": "kubectl get nodes"}, "result": None, "status": "error"},
+        {
+            "name": "kanban_create",
+            "args": {"title": "list the fleet"},
+            "result": None,
+            "status": "completed",
+            "call_id": "call_1",
+        },
+        {
+            "name": "terminal",
+            "args": {"command": "kubectl get nodes"},
+            "result": None,
+            "status": "error",
+            "call_id": "call_2",
+        },
     ]
     # The block follows the lifecycle rather than interleaving with it.
     names = [e["name"] for e in result.trajectory]
@@ -2587,6 +2648,60 @@ def test_the_trace_the_door_carries_becomes_tool_entries_behind_a_marker(
     # existing reads and no read was added for it.
     probed = [p["task"] for p in stub_gateway.polls if p["probe"]]
     assert probed[0] == "" and probed[1:] and all(t == stub_gateway.task_id for t in probed[1:])
+
+
+def test_a_part_without_a_call_id_writes_no_call_id_field(stub_gateway: _StubGatewayServer) -> None:
+    """An executor that publishes no ``callId`` (or an empty or non-string
+    one) gives an entry in the api shape with no ``call_id`` key at all,
+    rather than one carrying a placeholder."""
+    no_id = {k: v for k, v in CALL_CREATE.items() if k != inject.ACTIVITY_CALL_ID_KEY}
+    empty_id = {**CALL_FAILED, inject.ACTIVITY_CALL_ID_KEY: ""}
+    numeric_id = {**CALL_FAILED, inject.ACTIVITY_CALL_ID_KEY: 7}
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed t_1")
+    stub_gateway.probe_activity = [no_id, empty_id, numeric_id]
+
+    result = KubeAgentsHarness().run("file a card")
+
+    calls = trace_block(result.trajectory)[1:]
+    assert [c["name"] for c in calls] == ["kanban_create", "terminal", "terminal"]
+    assert all(inject.ENTRY_CALL_ID_FIELD not in c for c in calls)
+
+
+def test_the_call_id_never_changes_what_tool_called_matches(stub_gateway: _StubGatewayServer) -> None:
+    """``call_id`` sits beside ``args``: the same calls with and without a
+    ``callId`` grade the same under ``tool_called``, by name, by an argument
+    pattern, and by success, and the id never appears in ``args``."""
+    from kube_agents_bench.verifiers import ToolCalledVerifier
+
+    def grades(activity: list[dict[str, Any]]) -> list[str]:
+        stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed t_1")
+        stub_gateway.probe_activity = activity
+        result = KubeAgentsHarness().run("file a card")
+        assert all(
+            inject.ENTRY_CALL_ID_FIELD not in c["args"] and inject.ACTIVITY_CALL_ID_KEY not in c["args"]
+            for c in trace_block(result.trajectory)[1:]
+        )
+        return [
+            ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"]).verify(5.0).status,
+            ToolCalledVerifier(
+                type="tool_called", tool_names=["terminal"], arguments={"command": "(?is).*kubectl.*"}
+            )
+            .verify(5.0)
+            .status,
+            ToolCalledVerifier(
+                type="tool_called", tool_names=["kanban_create"], arguments={inject.ENTRY_CALL_ID_FIELD: "(?is).*call_1.*"}
+            )
+            .verify(5.0)
+            .status,
+            ToolCalledVerifier(type="tool_called", tool_names=["terminal"], require_success=True)
+            .verify(5.0)
+            .status,
+        ]
+
+    without = [{k: v for k, v in c.items() if k != inject.ACTIVITY_CALL_ID_KEY} for c in (CALL_CREATE, CALL_FAILED)]
+    with_ids = grades([CALL_CREATE, CALL_FAILED])
+    assert with_ids == grades(without)
+    assert with_ids == ["pass", "pass", "fail", "fail"]
 
 
 def test_an_empty_trace_still_writes_the_marker(stub_gateway: _StubGatewayServer) -> None:
@@ -2669,7 +2784,13 @@ def test_the_tool_call_wrapper_stays_one_entry_the_verifier_unwraps() -> None:
     fold.note_activity([CALL_WRAPPED], 0, 0)
     calls = trace_block(fold.trajectory)[1:]
     assert calls == [
-        {"name": "tool_call", "args": CALL_WRAPPED["input"], "result": None, "status": "completed"}
+        {
+            "name": "tool_call",
+            "args": CALL_WRAPPED["input"],
+            "result": None,
+            "status": "completed",
+            "call_id": CALL_WRAPPED["callId"],
+        }
     ]
     assert _wrapped_tool_names(calls[0]) == {"mcp__gke__list_clusters", "mcp__gke__get_cluster"}
     transcript.set("answer", fold.trajectory)

@@ -59,6 +59,14 @@ const (
 // terminal when the child ended and no wake could run (observeChildEnd).
 const reasonWakeNotStarted = "wake-not-started"
 
+// terminalLogChainEnd is the source on the "task terminal" line for a chain
+// that ended failed with reasonWakeNotStarted (observeChainEnd). The end is
+// the gateway's word about the chain, not the executor's about the root's own
+// work, so the root's second line doesn't read as a duplicate of its first.
+// Only the log carries it: the observers and the counter are told the child's
+// source (ChainEnd.Source).
+const terminalLogChainEnd TerminalSource = "gateway-chain-end"
+
 // reasonDelegationRefused and reasonDelegationNotStarted are the reason
 // tokens on the root terminal an observer is told for a session turn that
 // asked to delegate and minted no child (TaskRef.DelegationEnd,
@@ -1432,6 +1440,12 @@ func (g *Gateway) observeChainEnd(rec *SessionRecord, child TaskRef, stopped boo
 		}
 	}
 	g.observeTaskTerminal(rec, child.rootID(), end.State, end.Source, end.Reason)
+	// The root's own line says how its turn ended; this one says the chain
+	// it started failed, as the observers were just told, so the log and
+	// the read route agree. A stopped chain logs no chain-end line.
+	if !stopped {
+		g.logTaskTerminal(rec, rec.AddresseeFor(child.rootID()), child.rootID(), end.State, terminalLogChainEnd, end.Reason)
+	}
 	// The chain ends at the child, so its mark settles here, as the chain's
 	// end the observers were just told (terminalMark leaves a child's
 	// terminal to this or to the wake).
