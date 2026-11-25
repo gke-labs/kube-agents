@@ -48,6 +48,13 @@ const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
 
+// WithMCP is the driver with servers in its envelopes; the conversation
+// history it holds is shared, as every turn of the pod's needs it.
+func (d coreAgentDriver) WithMCP(servers []coreagentwire.MCPServer) Driver {
+	d.MCP = servers
+	return d
+}
+
 // EncodeUser is the turn's envelope: the message, the policy and MCP
 // servers, and the history of the conversation WithResume named.
 func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
