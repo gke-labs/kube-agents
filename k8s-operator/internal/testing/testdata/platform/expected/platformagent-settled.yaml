@@ -3117,7 +3117,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "c825e0fa8fe7db93",
+      "version": "a061086025c30f47",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3146,6 +3146,8 @@ data:
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
               "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -3158,6 +3160,8 @@ data:
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -3240,11 +3244,14 @@ data:
               "$KV.session-state.>",
               "$KV.feedback.>",
               "$KV.people.>",
+              "$KV.SCHEDULED_REPORTS.>",
+              "$KV.SCHEDULE_THREADS.>",
               "chat.console.*.out",
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
               "chat.board",
               "a2a.trigger.reply.>",
+              "chat.incident",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.CONSUMER.CREATE.TASKS.>",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3262,6 +3269,10 @@ data:
               "$JS.API.DIRECT.GET.KV_people.>",
               "$JS.API.CONSUMER.CREATE.KV_people.>",
               "$JS.API.CONSUMER.DELETE.KV_people.*",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+              "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
+              "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+              "$JS.API.DIRECT.GET.KV_SCHEDULE_THREADS.>",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
               "$JS.ACK.TASKS.>",
@@ -3287,6 +3298,7 @@ data:
               "a2a.trigger.*.submit",
               "a2a.trigger.*.status",
               "a2a.trigger.*.stop",
+              "chat.incident.reply.gateway.>",
               "_INBOX.gateway.>"
             ],
             "denyPublish": [
@@ -3340,7 +3352,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: c825e0fa8fe7db93
+    kubeagents.x-k8s.io/a2a-authmap-version: a061086025c30f47
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3904,6 +3916,7 @@ stringData:
           { stream: "a2a.cap.reply.>", accounts: [ APP ] }
           { stream: "chat.notify.reply.agent.>", accounts: [ APP ] }
           { stream: "chat.board", accounts: [ APP ] }
+          { stream: "chat.incident", accounts: [ APP ] }
           { stream: "_INBOX.bridge.>", accounts: [ APP ] }
           { stream: "_INBOX.web.>", accounts: [ APP ] }
           { stream: "chat.console.*.out", accounts: [ CONSOLE ] }
@@ -3921,6 +3934,7 @@ stringData:
           { stream: { account: APP, subject: "chat.notify.teams" } }
           { stream: { account: APP, subject: "chat.notify.console" } }
           { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+          { stream: { account: APP, subject: "chat.incident.reply.gateway.>" } }
         ]
         users [
           # task requester, chat-session supervisor, session-registry owner.
@@ -3934,7 +3948,9 @@ stringData:
           # (#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on
           # TASKS, and INFO, DIRECT.GET and consumer create/delete on
           # KV_session-state, its own registry, on KV_feedback, the kept
-          # answer ratings, and on KV_people, one hashed key per chat person.
+          # answer ratings, and on KV_people, one hashed key per chat person;
+          # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs,
+          # and on KV_SCHEDULE_THREADS, a schedule's thread for the day.
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
@@ -3954,11 +3970,14 @@ stringData:
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
+                  "$KV.SCHEDULED_REPORTS.>",
+                  "$KV.SCHEDULE_THREADS.>",
                   "chat.console.*.out",
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
                   "chat.board",
                   "a2a.trigger.reply.>",
+                  "chat.incident",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
                   "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3976,6 +3995,10 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULE_THREADS.>",
                   "$JS.API.STREAM.INFO.DIRECTORY",
                   "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
@@ -4017,6 +4040,7 @@ stringData:
                   "a2a.trigger.*.submit",
                   "a2a.trigger.*.status",
                   "a2a.trigger.*.stop",
+                  "chat.incident.reply.gateway.>",
                   "_INBOX.gateway.>"
                 ]
                 deny = [
@@ -4076,6 +4100,10 @@ stringData:
                   "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
                   "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
                   "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
                   "_INBOX.seed.>"
                 ]
               }
@@ -4239,6 +4267,7 @@ stringData:
           { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
           { stream: "chat.notify.console", accounts: [ TRUSTED ] }
           { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+          { stream: "chat.incident.reply.gateway.>", accounts: [ TRUSTED ] }
         ]
         imports [
           { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
@@ -4265,6 +4294,7 @@ stringData:
           { stream: { account: TRUSTED, subject: "a2a.cap.reply.>" } }
           { stream: { account: TRUSTED, subject: "chat.notify.reply.agent.>" } }
           { stream: { account: TRUSTED, subject: "chat.board" } }
+          { stream: { account: TRUSTED, subject: "chat.incident" } }
           { stream: { account: TRUSTED, subject: "_INBOX.bridge.>" } }
           { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
         ]
@@ -4298,7 +4328,8 @@ stringData:
                   "$JS.FC.>",
                   "_INBOX.bridge.>",
                   "a2a.cap.verify.platform",
-                  "chat.board.reply.gateway.>"
+                  "chat.board.reply.gateway.>",
+                  "chat.incident.reply.gateway.>"
                 ]
                 deny = [
                   "$JS.API.*.*.KV_cap",
@@ -4321,6 +4352,7 @@ stringData:
                   "$KV.runtime-state.>",
                   "a2a.cap.reply.platform.>",
                   "chat.board",
+                  "chat.incident",
                   "_INBOX.bridge.>"
                 ]
                 deny = [
@@ -6468,7 +6500,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-c9e5a390
+  name: platformagent-a2a-provision-f4590109
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6706,6 +6738,29 @@ spec:
               so a restarted one can still read\n# every lease it has to re-adopt or fail.\n$NATS
               kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1
               --replicas=\"${STREAM_REPLICAS}\" --storage=file --max-bucket-size=67108864\n\n#
+              SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the\n#
+              report and whether and where it was posted (a2a/gateway/scheduled_reports.go;\n#
+              docs/designs/scheduling-on-profiles.md section 4). Written only by the\n#
+              gateway, before any post, so a run is on record whether it posts or not.\n#
+              History 1: each record moves through its statuses in place, and only the\n#
+              last is read. It is the durable record later readers enumerate, so the max\n#
+              age is long, 90 days, rather than none: KV is discard=new, and a bucket
+              with\n# no age would fill and refuse every later run's record, which posts
+              nothing.\n# The gateway cuts a report at 24KiB, and a value is capped at
+              256KiB, room\n# for that report's JSON escaping at its worst; a full-size
+              record is about\n# 25KB, so 256MiB holds about ten thousand, over a hundred
+              runs a day for the\n# 90 days.\n$NATS kv info SCHEDULED_REPORTS >/dev/null
+              2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+              --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h\n\n#
+              SCHEDULE_THREADS: the home-channel thread each schedule posts into for one\n#
+              UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;\n#
+              docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read\n#
+              only by the gateway, so a failover keeps posting into the day's thread.\n#
+              History 1; a 48h max age keeps a day's entry past its day and then drops\n#
+              it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a\n#
+              value is capped at 4KiB.\n$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1
+              || $NATS kv add SCHEDULE_THREADS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+              --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h\n\n#
               PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task\n# (a2a.submit.<profile>.<tier>.<kind>.<task>),
               published by the gateway and\n# held by the dispatcher on the operator's
               durables (contract on #3655). It is\n# its own stream so that the operator
