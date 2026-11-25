@@ -552,18 +552,21 @@ def test_sweep_tries_every_leftover_and_reports_the_failures(monkeypatch: pytest
     assert second.name not in cluster.profiles
 
 
-def test_a_stop_during_teardown_is_held_then_raised_and_the_handlers_are_put_back() -> None:
+def test_teardown_installs_no_signal_handler() -> None:
+    # A second stop during teardown is not held (Brian, #7191, B): it can cut
+    # the teardown short, and the leftover is the sweep's.
     before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
-    finished = False
-    with pytest.raises(delegating_profile.Interrupted):
-        with delegating_profile.signals_deferred():
-            signal.raise_signal(signal.SIGTERM)
-            finished = True
-    assert finished, "the held SIGTERM cut the teardown short"
-    assert {sig: signal.getsignal(sig) for sig in before} == before
-    with pytest.raises(KeyboardInterrupt):
-        with delegating_profile.signals_deferred():
-            signal.raise_signal(signal.SIGINT)
+    seen: list[Any] = []
+    cluster = FakeCluster(pools_linger=0)
+    made = _made(cluster, "fade")
+    real = cluster.__call__
+
+    def kubectl(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        seen.append(signal.getsignal(signal.SIGTERM))
+        return real(*args, stdin=stdin)
+
+    delegating_profile.teardown(kubectl, made, sleep=lambda _s: None, log=_quiet)
+    assert all(h == before[signal.SIGTERM] for h in seen), "teardown changed the SIGTERM handler"
     assert {sig: signal.getsignal(sig) for sig in before} == before
 
 

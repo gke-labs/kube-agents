@@ -39,8 +39,9 @@ published (READY_SECONDS), which is when the gateway can address it. The
 placeholder is then replaced with the name. :func:`teardown` runs in the
 harness's ``finally``, whatever the run did: on a graded run, an errored one,
 an exception, Ctrl-C, or SIGTERM (:func:`signals_raise`; on the main
-thread, and within the runner's grace period before its SIGKILL). A stop that
-arrives during the teardown is held until it's done, then raised. It deletes the
+thread, and within the runner's grace period before its SIGKILL). A second
+stop during the teardown can cut it short; the profile it leaves is the
+sweep's (below). It deletes the
 profile and waits (TEARDOWN_SECONDS) until neither the profile nor any of its
 pool Deployments (``agentprofile-<name>-<tier>`` in ``<namespace>-profiles``)
 is left; one it cannot confirm makes the run an infrastructure failure.
@@ -151,8 +152,7 @@ class NameTaken(DelegatingProfileError):
 
 
 class Interrupted(BaseException):
-    """SIGTERM arrived during setup, the run or the teardown
-    (:func:`signals_raise`, :func:`signals_deferred`)."""
+    """SIGTERM arrived during setup or the run (:func:`signals_raise`)."""
 
 
 Kubectl = Callable[..., subprocess.CompletedProcess]
@@ -398,8 +398,7 @@ def teardown(
     Raises:
         DelegatingProfileError: Something is left after TEARDOWN_SECONDS.
     """
-    with signals_deferred():
-        _teardown(kubectl, profile, sleep=sleep or time.sleep, clock=clock or time.monotonic, log=log)
+    _teardown(kubectl, profile, sleep=sleep or time.sleep, clock=clock or time.monotonic, log=log)
 
 
 def _teardown(
@@ -430,33 +429,6 @@ def _teardown(
         if clock() >= deadline:
             raise DelegatingProfileError(f"{RESOURCE}/{profile.name} not torn down after {TEARDOWN_SECONDS}s: {left}")
         sleep(POLL_SECONDS)
-
-
-@contextlib.contextmanager
-def signals_deferred() -> Iterator[None]:
-    """SIGTERM and SIGINT are held for the duration, so a second stop can't
-    abort a teardown half done (a teardown is bounded by TEARDOWN_SECONDS),
-    and are raised once it's over: a held SIGTERM as :class:`Interrupted`, a
-    held SIGINT as KeyboardInterrupt, so the stop still stops the run. Only
-    the main thread can set a handler; elsewhere this does nothing."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    held: list[int] = []
-
-    def hold(signum: int, _frame: Any) -> None:
-        held.append(signum)
-
-    previous = {sig: signal.signal(sig, hold) for sig in (signal.SIGTERM, signal.SIGINT)}
-    try:
-        yield
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-    if signal.SIGINT in held:
-        raise KeyboardInterrupt
-    if held:
-        raise Interrupted(f"signal {held[0]} held during teardown")
 
 
 @contextlib.contextmanager
