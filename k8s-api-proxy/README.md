@@ -206,7 +206,9 @@ and `Options.Version` is what `--version` and the startup log report after the n
 `k8s-api-proxy`. Everything else is the binary's: the same flags, environment variables and
 defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
 the binary exits on, and `nil` after `--version` or a drained shutdown. It registers the flags on
-`flag.CommandLine`, so a process calls it once; a flag that does not parse exits the process there.
+`flag.CommandLine`, so a process calls it once. A flag that does not parse exits the process there;
+if the program gave `flag.CommandLine` another error handling, `Run` returns the parse error and
+starts nothing.
 
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
@@ -342,6 +344,6 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
 `AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
-`AuditEvent` and `proxyserver.Options` may change in any release. The version moves with every
+`AuditEvent`, `proxyserver.Run` and `proxyserver.Options` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

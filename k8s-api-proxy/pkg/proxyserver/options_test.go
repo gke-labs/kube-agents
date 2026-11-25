@@ -3,6 +3,7 @@ package proxyserver
 import (
 	"context"
 	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"net/http"
@@ -46,14 +47,27 @@ func newHeaderUpstream(t *testing.T) *headerUpstream {
 	return u
 }
 
-// embedderConfig is the configuration a loopback bridge in front of upstreamURL starts
-// with, plus what an embedding binary's opts add, as Run assembles it.
+// testFlagSet is a flag set that returns a parse error, as flag.CommandLine does once an
+// embedder has given it flag.ContinueOnError, and prints nothing.
+func testFlagSet() *flag.FlagSet {
+	fs := flag.NewFlagSet(binaryName, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	return fs
+}
+
+// embedderConfig is the configuration Run assembles for a loopback bridge in front of
+// upstreamURL in a binary that passes opts.
 func embedderConfig(t *testing.T, upstreamURL string, opts Options) proxyConfig {
 	t.Helper()
 	clearProxyEnv(t)
-	cfg := parseTestFlags(t, "--auth-mode=none", "--listen-addr=127.0.0.1:18443", "--upstream-url="+upstreamURL)
-	loadEnvOnlyConfig(&cfg)
-	cfg.embedder = opts
+	args := []string{"--auth-mode=none", "--listen-addr=127.0.0.1:18443", "--upstream-url=" + upstreamURL}
+	cfg, mode, versionOnly, err := assemble(testFlagSet(), args, opts)
+	if err != nil || versionOnly {
+		t.Fatalf("assemble(%q) = versionOnly %v, err %v; want a configuration", args, versionOnly, err)
+	}
+	if mode != k8sapiproxy.ModeReadOnlyWithDryRun {
+		t.Fatalf("assemble(%q) mode = %q, want the default %q", args, mode, k8sapiproxy.ModeReadOnlyWithDryRun)
+	}
 	return cfg
 }
 
@@ -153,6 +167,62 @@ func TestOptionsInvalidExtraCallerHeaderFailsStartup(t *testing.T) {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("err = %q, want it to contain %q", err, want)
 			}
+		}
+	}
+}
+
+// --version is decided from the flags alone: nothing else is read, so a variable or a mode
+// the server would refuse does not stop a binary from naming its build.
+func TestAssembleVersionOnlyReadsNoEnvironment(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv(sessionAudienceEnv, testReviewAudience)
+	cfg, _, versionOnly, err := assemble(testFlagSet(), []string{"--version", "--mode=no-such-mode"}, Options{Authorize: func(k8sapiproxy.AuthorizeAttributes) error { return nil }})
+	if err != nil || !versionOnly {
+		t.Fatalf("assemble(--version) = versionOnly %v, err %v; want true, nil", versionOnly, err)
+	}
+	if cfg.sessionAudience != "" {
+		t.Errorf("sessionAudience = %q after --version, want the environment unread", cfg.sessionAudience)
+	}
+
+	// Without --version the same environment is read.
+	cfg, _, versionOnly, err = assemble(testFlagSet(), nil, Options{})
+	if err != nil || versionOnly {
+		t.Fatalf("assemble() = versionOnly %v, err %v; want false, nil", versionOnly, err)
+	}
+	if cfg.sessionAudience != testReviewAudience {
+		t.Errorf("sessionAudience = %q, want %q from %s", cfg.sessionAudience, testReviewAudience, sessionAudienceEnv)
+	}
+}
+
+func TestAssembleRefusesAnInvalidMode(t *testing.T) {
+	clearProxyEnv(t)
+	_, parseErr := k8sapiproxy.ParseMode("no-such-mode")
+	if parseErr == nil {
+		t.Fatal("ParseMode accepted no-such-mode")
+	}
+	_, _, versionOnly, err := assemble(testFlagSet(), []string{"--mode=no-such-mode"}, Options{})
+	if err == nil || versionOnly {
+		t.Fatalf("assemble(--mode=no-such-mode) = versionOnly %v, err %v; want an error", versionOnly, err)
+	}
+	if got, want := err.Error(), "invalid mode: "+parseErr.Error(); got != want {
+		t.Errorf("err = %q, want %q, the line the binary exits on", got, want)
+	}
+}
+
+// A flag set that does not exit on a parse error gets the error back, and no configuration
+// to start a server on.
+func TestAssembleReturnsAFlagParseError(t *testing.T) {
+	clearProxyEnv(t)
+	for _, args := range [][]string{
+		{"--no-such-flag"},
+		{"--auth-mode=none", "--max-in-flight=many"},
+	} {
+		cfg, _, versionOnly, err := assemble(testFlagSet(), args, Options{ExtraCallerHeaders: []string{testEmbedderHeader}})
+		if err == nil || versionOnly {
+			t.Fatalf("assemble(%q) = versionOnly %v, err %v; want the parse error", args, versionOnly, err)
+		}
+		if cfg.authMode != "" || cfg.embedder.ExtraCallerHeaders != nil {
+			t.Errorf("assemble(%q) returned a configuration with its error: authMode %q, embedder %v", args, cfg.authMode, cfg.embedder.ExtraCallerHeaders)
 		}
 	}
 }

@@ -586,27 +586,44 @@ func versionString(version string) string {
 	return binaryName + " " + version
 }
 
+// assemble is everything Run decides before it starts anything: it registers the flags on
+// fs and parses args, and unless they ask for the version alone (versionOnly, with nothing
+// else read) it reads the environment-only variables, attaches what opts adds and parses
+// the mode. The configuration it returns is the one the handler is built from.
+func assemble(fs *flag.FlagSet, args []string, opts Options) (cfg proxyConfig, mode k8sapiproxy.Mode, versionOnly bool, err error) {
+	if err := parseFlags(fs, args, &cfg); err != nil {
+		return proxyConfig{}, "", false, err
+	}
+	if cfg.showVersion {
+		return cfg, "", true, nil
+	}
+	loadEnvOnlyConfig(&cfg)
+	cfg.embedder = opts
+
+	mode, err = k8sapiproxy.ParseMode(cfg.modeRaw)
+	if err != nil {
+		return proxyConfig{}, "", false, fmt.Errorf("invalid mode: %w", err)
+	}
+	return cfg, mode, false, nil
+}
+
 // Run is the whole of the server binary's main: it parses args (os.Args[1:]) into
 // flag.CommandLine, reads the environment, builds the handler with what opts adds, and
 // serves until ctx ends or the process gets SIGINT or SIGTERM, then drains in-flight
 // requests. It returns nil after --version or a drained shutdown, and the error the binary
 // exits on otherwise; the caller logs it and exits non-zero. A flag that does not parse
-// exits the process, as flag.CommandLine does. Run registers its flags on
-// flag.CommandLine, so a process calls it once, and flags the caller registered there
+// exits the process while flag.CommandLine has its default flag.ExitOnError; under another
+// error handling Run returns the parse error and starts nothing. Run registers its flags
+// on flag.CommandLine, so a process calls it once, and flags the caller registered there
 // first are parsed with the server's.
 func Run(ctx context.Context, args []string, opts Options) error {
-	var cfg proxyConfig
-	_ = parseFlags(flag.CommandLine, args, &cfg)
-	if cfg.showVersion {
+	cfg, mode, versionOnly, err := assemble(flag.CommandLine, args, opts)
+	if err != nil {
+		return err
+	}
+	if versionOnly {
 		fmt.Println(versionString(opts.Version))
 		return nil
-	}
-	loadEnvOnlyConfig(&cfg)
-	cfg.embedder = opts
-
-	mode, err := k8sapiproxy.ParseMode(cfg.modeRaw)
-	if err != nil {
-		return fmt.Errorf("invalid mode: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
