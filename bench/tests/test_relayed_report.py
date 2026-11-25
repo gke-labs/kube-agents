@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pytest
 from devops_bench.agents import AgentResult
 
-from kube_agents_bench import cases, harness, relayed_report
+from kube_agents_bench import board, cases, harness, relayed_report
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench.relayed_report import RelayTurn, ReportPost
 
@@ -42,6 +42,12 @@ fact2: 92%
 """
 REPORT = "Capacity watch: node pool np-quartz-7 in seeded-a is at 92% allocatable CPU."
 POST = ReportPost("fake:c", REPORT, position="4", evidence="flagged report")
+
+
+@pytest.fixture(autouse=True)
+def _no_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pause before the first reply, which a test has no use for.
+    monkeypatch.setattr(relayed_report, "REPLY_SETTLE_SECONDS", 0.0)
 
 
 def _result(answer: str, *, errors: list[str] | None = None, name: str = "kubectl") -> AgentResult:
@@ -66,7 +72,11 @@ class FakeTransport:
         post: ReportPost | None = POST,
         sessions: tuple[str, str] = ("pod-a", "pod-a"),
         fail: str = "",
+        opening_answer: str = "Card started; I'll report back.",
+        opening_ended: str = "",
     ) -> None:
+        self.opening_answer = opening_answer
+        self.opening_ended = opening_ended
         self.answers = list(answers)
         self.sessions = list(sessions)
         self.post = post
@@ -80,7 +90,7 @@ class FakeTransport:
     def open_turn(self, conversation: str, text: str) -> RelayTurn:
         self.calls.append(("open_turn", conversation, text))
         self._maybe_fail("open_turn")
-        return RelayTurn(_result("Card started; I'll report back.", name="board"), "fake:c", "task-0", "pod-a")
+        return RelayTurn(_result(self.opening_answer, name="board"), "fake:c", "task-0", "pod-a", self.opening_ended)
 
     def wait_for_report_post(self, conversation: str, timeout: float) -> ReportPost | None:
         self.calls.append(("wait_for_report_post", conversation, timeout))
@@ -136,6 +146,50 @@ def test_a_fact_matches_as_report_contains_would():
     assert relayed_report.carries("Pool **NP-Quartz-7** is\nfull", "np-quartz-7 is full")
     assert not relayed_report.carries("np-quartz-8", "np-quartz-7")
     assert not relayed_report.carries("anything", "  ")
+
+
+@pytest.mark.parametrize(
+    ("answer", "fact", "found"),
+    [
+        ("it was 42.", "42", True),
+        ("it was 420", "42", False),
+        ("it was 1420", "42", False),
+        ("np-quartz-70 is full", "np-quartz-7", False),
+        ("(np-quartz-7)", "np-quartz-7", True),
+        ("at **92%** of CPU", "92%", True),
+        ("at 92% of CPU", "2%", False),
+    ],
+)
+def test_a_fact_matches_as_a_whole_token(answer, fact, found):
+    assert relayed_report.carries(answer, fact) is found
+
+
+@pytest.mark.parametrize(
+    ("ask", "fact"),
+    [
+        ("opening", "np-quartz-7"),
+        ("reply1", "np-quartz-7"),
+        ("reply2", "92%"),
+        ("reply1", "92%"),
+    ],
+)
+def test_a_case_whose_asks_state_a_fact_is_refused(ask, fact):
+    fields = {
+        "opening": "Check node pool capacity on seeded-a and report back.",
+        "reply1": "Which pool did that report say was close to full?",
+        "fact1": "np-quartz-7",
+        "reply2": "And what share of its allocatable CPU was in use?",
+        "fact2": "92%",
+    }
+    fields[ask] += f" Was it {fact}?"
+    prompt = DIRECTIVE + "\n" + "\n".join(f"{k}: {v}" for k, v in fields.items())
+    with pytest.raises(ValueError, match=f"{ask} states"):
+        relayed_report.parse(prompt)
+
+
+def test_a_case_whose_asks_hold_a_fact_only_inside_a_longer_token_parses():
+    prompt = PROMPT.replace("report back.", "report back on pool np-quartz-70.")
+    assert relayed_report.parse(prompt) is not None
 
 
 # --- the run over a fake transport ------------------------------------------
@@ -203,9 +257,53 @@ def test_replies_on_different_sessions_are_infrastructure():
         relayed_report.run(FakeTransport(sessions=("pod-a", "pod-b")), relayed_report.parse(PROMPT), "run/case/1")
 
 
-def test_a_transport_that_cannot_name_the_session_is_not_held_to_it():
-    got = relayed_report.run(FakeTransport(sessions=("", "pod-b")), relayed_report.parse(PROMPT), "run/case/1")
+@pytest.mark.parametrize(("sessions", "which"), [(("", "pod-a"), "first"), (("pod-a", ""), "second")])
+def test_a_reply_whose_session_is_unknown_is_infrastructure(sessions, which):
+    with pytest.raises(relayed_report.RelayInfrastructure, match=f"could not name the session the {which} reply"):
+        relayed_report.run(FakeTransport(sessions=sessions), relayed_report.parse(PROMPT), "run/case/1")
+
+
+def test_an_ended_opening_is_graded_as_the_opening_and_nothing_more_is_sent():
+    transport = FakeTransport(opening_ended="the opening turn ended failed")
+    got = relayed_report.run(transport, relayed_report.parse(PROMPT), "run/case/1")
+    assert [c[0] for c in transport.calls] == ["open_turn"]
+    assert got.errors == [f"{DIRECTIVE}: the opening turn ended failed, so no reply was sent"]
+    assert not any(e.get("name") in (relayed_report.POSTED_ENTRY, relayed_report.REPLIES_ENTRY) for e in got.trajectory)
+
+
+def test_an_opening_answer_carrying_a_fact_is_infrastructure_before_the_wait():
+    transport = FakeTransport(opening_answer="Pool np-quartz-7 is the one to watch; card filed.")
+    with pytest.raises(relayed_report.RelayInfrastructure, match="already carries 'np-quartz-7'"):
+        relayed_report.run(transport, relayed_report.parse(PROMPT), "run/case/1")
+    assert [c[0] for c in transport.calls] == ["open_turn"]
+
+
+def test_an_opening_answer_with_a_fact_only_inside_a_longer_token_goes_on():
+    transport = FakeTransport(opening_answer="Card filed for np-quartz-70; 920 nodes to read.")
+    got = relayed_report.run(transport, relayed_report.parse(PROMPT), "run/case/1")
     assert _entry(got, relayed_report.REPLIES_ENTRY)["status"] == "completed"
+
+
+def test_a_kept_report_carrying_neither_fact_is_infrastructure_and_no_reply_is_sent():
+    blocked = ReportPost("fake:c", "Card blocked: the worker has no access to seeded-a.", position="4")
+    transport = FakeTransport(post=blocked)
+    with pytest.raises(relayed_report.RelayInfrastructure, match="carries neither"):
+        relayed_report.run(transport, relayed_report.parse(PROMPT), "run/case/1")
+    assert [c[0] for c in transport.calls] == ["open_turn", "wait_for_report_post"]
+
+
+def test_a_kept_report_carrying_one_fact_is_graded():
+    half = ReportPost("fake:c", "Capacity watch: node pool np-quartz-7 in seeded-a is nearly full.", position="4")
+    got = relayed_report.run(FakeTransport(post=half), relayed_report.parse(PROMPT), "run/case/1")
+    assert _entry(got, relayed_report.POSTED_ENTRY)["result"]["facts_in_post"] == [True, False]
+
+
+def test_the_first_reply_waits_the_settle_bound_after_the_post(monkeypatch):
+    monkeypatch.setattr(relayed_report, "REPLY_SETTLE_SECONDS", 0.25)
+    slept: list[float] = []
+    monkeypatch.setattr(relayed_report.time, "sleep", slept.append)
+    relayed_report.run(FakeTransport(), relayed_report.parse(PROMPT), "run/case/1")
+    assert slept == [0.25]
 
 
 def test_the_fake_satisfies_the_seam():
@@ -278,7 +376,11 @@ def test_the_directive_is_known_to_the_guard():
 # the entries after `after`, with a probe carrying the session record's
 # contextId. The inject notify route's report is a post marked `report` with
 # `replyTo` naming the task whose turn filed the card (PostNotifyFrame),
-# appended once the opening turn's answer has been read.
+# appended once the opening turn's answer has been read. As the gateway does
+# on an inject conversation (relayedReport: not thread-keyed), a later turn
+# is under the kept report only when its POST names the report's root as its
+# `replyTo`; a reply under no report answers without the facts. The session
+# pod each turn ran on is the stub's too (harness._session_pod_of patched).
 
 TOKEN = "stub-inject-token"
 RUN_ID = "run-relay"
@@ -288,6 +390,7 @@ KEY = f"{RUN_ID}/{CASE_ID}/{REPETITION}"
 CONVERSATION = "inject:" + KEY
 OPENING_ANSWER = "Card filed; I'll report back here."
 REPLY_ANSWERS = ("The report named np-quartz-7.", "It was at 92% allocatable CPU.")
+NO_REPORT_ANSWER = "I don't have a report in front of me."
 
 
 class _StubDoorHandler(BaseHTTPRequestHandler):
@@ -339,6 +442,10 @@ class _StubDoorHandler(BaseHTTPRequestHandler):
                 probe: dict[str, Any] = {"backend": "inject", "injectOnly": True, "graceSeconds": 1, "active": False}
                 if self.server.context_ids.get(key):
                     probe["contextId"] = self.server.context_ids[key]
+                if self.server.child_addressees is not None:
+                    # Read only off a probe about the task being followed.
+                    probe["taskId"] = self.server.last_task.get(key, "")
+                    probe[inject.PROBE_CHILD_ADDRESSEES_KEY] = self.server.child_addressees
                 body["probe"] = probe
         self._respond(200, body)
 
@@ -347,9 +454,10 @@ class _StubDoorHandler(BaseHTTPRequestHandler):
 
 
 class _StubDoor(ThreadingHTTPServer):
-    """Scripted per test: the answers each turn posts, the contextId the
-    record reports after each turn, and the relayed entries the notify route
-    appends once the opening turn has ended."""
+    """Scripted per test: the answers each turn posts and the state it ends
+    in, the contextId the record reports and the session pod live after
+    each turn, and the relayed entries the notify route appends once the
+    opening turn has ended."""
 
     def setup(self) -> None:
         self.lock = threading.Lock()
@@ -361,6 +469,13 @@ class _StubDoor(ThreadingHTTPServer):
         self.tasks: dict[str, str] = {}
         self.answers = [OPENING_ANSWER, *REPLY_ANSWERS]
         self.sessions = ["ctx-a", "ctx-a", "ctx-a"]
+        self.states = ["completed", "completed", "completed"]
+        # The live session pod after each turn; None is a pod read that failed.
+        self.pods: list[str | None] = ["pod-a", "pod-a", "pod-a"]
+        self.child_addressees: list[str] | None = None
+        # The root each conversation's report was kept under, once relayed.
+        self.kept: dict[str, str] = {}
+        self.last_task: dict[str, str] = {}
         # (conversation, replyTo or None for the opening's task) per relayed
         # report post, appended after the opening turn's terminal.
         self.relayed: list[tuple[str, str | None]] = [(CONVERSATION, None)]
@@ -382,9 +497,13 @@ class _StubDoor(ThreadingHTTPServer):
         turn = len(self.submissions) - 1
         task_id = f"task-{turn}"
         self.tasks[message_id] = task_id
+        self.last_task[conversation] = task_id
+        answer = self.answers[turn]
+        if turn > 0 and (not self.kept.get(conversation) or request.get("replyTo") != self.kept[conversation]):
+            answer = NO_REPORT_ANSWER
         self._append(conversation, inject.ENTRY_TASK, taskId=task_id)
-        self._append(conversation, inject.ENTRY_POST, text=self.answers[turn], messageId=f"inj-{turn}-answer")
-        self._append(conversation, inject.ENTRY_TERMINAL, taskId=task_id, state="completed",
+        self._append(conversation, inject.ENTRY_POST, text=answer, messageId=f"inj-{turn}-answer")
+        self._append(conversation, inject.ENTRY_TERMINAL, taskId=task_id, state=self.states[turn],
                      source=inject.TERMINAL_SOURCE_EXECUTOR)
         self.context_ids[conversation] = self.sessions[turn]
         if turn == 0:
@@ -396,6 +515,7 @@ class _StubDoor(ThreadingHTTPServer):
                              replyTo=root, report=True)
                 self._append(target, inject.ENTRY_POST, text=REPORT, messageId=f"inj-relay-{target}",
                              replyTo=root, report=True, kept=True)
+                self.kept[target] = root
         return {"conversation": conversation, "taskId": task_id, "accepted": True, "messageId": message_id,
                 "entries": [], "firstEventGraceSeconds": 1}
 
@@ -419,6 +539,11 @@ def door(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubDoor, None, None]:
     # The bound the run waits for the report, shrunk: a stub that never
     # relays one should not hold the test for fifteen minutes.
     monkeypatch.setattr(relayed_report, "REPORT_POST_WAIT_SECONDS", 1.5)
+    # The session pod after the latest turn, as the stub scripts it.
+    monkeypatch.setattr(harness, "_session_pod_of", lambda conversation: server.pods[len(server.submissions) - 1])
+    # The opening's session store: it filed a card, unless a test says not.
+    server.session_cards = board.SessionCards(session_found=True, card_ids=["card-1"])
+    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: server.session_cards)
     try:
         yield server
     finally:
@@ -444,6 +569,10 @@ def test_inject_the_green_path_opens_waits_for_the_report_and_replies_twice(door
         "And what share of its allocatable CPU was in use?",
     ]
     assert {s["conversation"] for s in door.submissions[1:]} == {CONVERSATION}
+    # Both replies name the opening's task, the root the report was kept
+    # under; the opening names none.
+    assert "replyTo" not in door.submissions[0]
+    assert [s.get("replyTo") for s in door.submissions[1:]] == ["task-0", "task-0"]
     ids = [s["messageId"] for s in door.submissions]
     assert ids[1] == ids[0] + relayed_report.REPLY_SUFFIX + "1"
     assert ids[2] == ids[0] + relayed_report.REPLY_SUFFIX + "2"
@@ -489,11 +618,125 @@ def test_inject_a_report_about_another_task_is_not_the_openings(door):
     assert len(door.submissions) == 1
 
 
-def test_inject_replies_on_different_sessions_are_infrastructure(door):
-    door.sessions = ["ctx-a", "ctx-a", "ctx-b"]
+def test_inject_replies_on_different_session_pods_are_infrastructure(door):
+    door.pods = ["pod-a", "pod-a", "pod-b"]
     got = _run(door)
     assert _infra(got), got.errors
-    assert "session ctx-b" in got.errors[0] and "ctx-a" in got.errors[0]
+    assert "session pod-b" in got.errors[0] and "pod-a" in got.errors[0]
+
+
+def test_inject_one_context_id_on_two_pods_is_still_two_sessions(door):
+    # The contextId never changes on a conversation; the pod is what moved.
+    door.sessions = ["ctx-a", "ctx-a", "ctx-a"]
+    door.pods = ["pod-a", "pod-a", "pod-c"]
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert "session pod-c" in got.errors[0]
+
+
+def test_inject_the_sessions_are_the_pods(door):
+    door.sessions = ["ctx-a", "ctx-b", "ctx-c"]
+    got = _run(door)
+    assert not got.errors, got.errors
+    assert got.metadata["relayed_report"]["sessions"] == ["pod-a", "pod-a", "pod-a"]
+
+
+@pytest.mark.parametrize(("turn", "label"), [(0, "opening turn"), (1, "reply 1"), (2, "reply 2")])
+def test_inject_a_pod_read_that_fails_is_infrastructure_naming_the_turn(door, turn, label):
+    door.pods[turn] = None
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert f"could not be read after the {label}" in got.errors[0]
+
+
+def test_inject_no_live_pod_after_a_reply_is_infrastructure(door):
+    door.pods = ["pod-a", "", "pod-a"]
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert "no live session pod" in got.errors[0] and "reply 1" in got.errors[0]
+
+
+def test_inject_a_reply_under_no_report_does_not_carry_the_facts(door, monkeypatch):
+    # The stub attaches the kept report only on replyTo, as the gateway
+    # does on an inject conversation: a transport that sent none would be
+    # graded on answers with nothing to answer from.
+    original = harness.KubeAgentsHarness._send_reply_turn
+
+    def _without_reply_to(self, *args, **kwargs):
+        kwargs.pop("reply_to", None)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_send_reply_turn", _without_reply_to)
+    got = _run(door)
+    replies = _entry(got, relayed_report.REPLIES_ENTRY)
+    assert replies["status"] == "error"
+    assert [s.get("replyTo") for s in door.submissions[1:]] == [None, None]
+
+
+@pytest.mark.parametrize("state", ["failed", "canceled"])
+def test_inject_an_opening_that_did_not_complete_is_graded_as_the_opening(door, state):
+    door.states[0] = state
+    got = _run(door)
+    assert not _infra(got), got.errors
+    assert any(f"the opening turn ended {state}, so no reply was sent" in e for e in got.errors), got.errors
+    assert len(door.submissions) == 1
+    assert got.output == OPENING_ANSWER
+
+
+def test_inject_an_opening_that_filed_no_card_is_graded_without_the_wait(door, monkeypatch):
+    door.child_addressees = []
+    door.session_cards = board.SessionCards(session_found=True, card_ids=[])
+    monkeypatch.setattr(relayed_report, "REPORT_POST_WAIT_SECONDS", 30.0)
+    got = _run(door)
+    assert not _infra(got), got.errors
+    assert any("filed no card" in e for e in got.errors), got.errors
+    assert len(door.submissions) == 1
+    assert not [r for r in door.reads if not r["probe"]]  # no report wait
+
+
+@pytest.mark.parametrize(
+    ("child_addressees", "cards"),
+    [
+        (None, board.SessionCards(session_found=True, card_ids=[])),  # the door can't say who was delegated to
+        (["platform-router"], board.SessionCards(session_found=True, card_ids=[])),  # a delegate files them
+        ([], board.SessionCards(session_found=False)),  # the store doesn't know the session
+        ([], None),  # the read failed
+    ],
+)
+def test_inject_an_opening_whose_cards_cannot_be_told_waits_for_the_report(door, child_addressees, cards):
+    door.child_addressees = child_addressees
+    door.session_cards = cards
+    got = _run(door)
+    assert not got.errors, got.errors
+    assert len(door.submissions) == 3
+
+
+def test_inject_an_opening_answer_carrying_a_fact_is_infrastructure(door):
+    door.answers = ["Card filed; np-quartz-7 looks tight already.", *REPLY_ANSWERS]
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert "already carries" in got.errors[0]
+    assert len(door.submissions) == 1
+
+
+def test_inject_a_kept_report_with_neither_fact_is_infrastructure(door):
+    door.relayed = []
+    original = door.submit
+
+    def _blocked(request):
+        body = original(request)
+        if len(door.submissions) == 1:
+            conversation = body["conversation"]
+            door._append(conversation, inject.ENTRY_POST, text="Card blocked: no access to seeded-a.",
+                         messageId="inj-relay-blocked", replyTo=body["taskId"], report=True, kept=True)
+            door.kept[conversation] = body["taskId"]
+        return body
+
+    door.submit = _blocked
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert "carries neither" in got.errors[0]
+    assert len(door.submissions) == 1
 
 
 def test_inject_a_reply_missing_its_fact_is_graded(door):

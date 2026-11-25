@@ -173,6 +173,12 @@ LEAVE_LINE_MESSAGE_ID_SUFFIX = "-leave-line"
 # task's ``changeRequested``). A door not armed for it (A2A_INJECT_CONFIRM)
 # answers 400; the gateway refuses every other value, and so does this side.
 INTENT_FIELD = "intent"
+# The POST body's optional replyTo (``injectRequest.ReplyTo`` in
+# ``a2a/gateway/inject.go``): the task a relayed report on the conversation
+# was on, when the turn answers that report. The gateway attaches the report it
+# kept under that root in this conversation to the turn; an inject
+# conversation is not thread-keyed, so a turn without it carries none.
+REPLY_TO_FIELD = "replyTo"
 INTENT_CONFIRM = "confirm"
 INTENTS = frozenset({INTENT_CONFIRM})
 
@@ -1558,6 +1564,7 @@ class InjectTask:
         profile: str = "",
         parameters: dict[str, str] | None = None,
         intent: str = "",
+        reply_to: str = "",
     ) -> None:
         # Refused here, before anything is sent: a typo would otherwise cost a
         # lease to learn from the door's 400.
@@ -1576,6 +1583,9 @@ class InjectTask:
         # parameters (profile_hook, #5945); empty sends the turn as any other.
         self.profile = profile
         self.parameters = dict(parameters or {})
+        # The task whose relayed report the turn answers (REPLY_TO_FIELD);
+        # empty sends the turn under no report, as every turn was sent before.
+        self.reply_to = reply_to
         self.token = token
         self.author = author
         # The backend message id, which the gateway's ingress log joins to the
@@ -1677,6 +1687,8 @@ class InjectTask:
                 payload["parameters"] = self.parameters
         if self.intent:
             payload[INTENT_FIELD] = self.intent
+        if self.reply_to:
+            payload[REPLY_TO_FIELD] = self.reply_to
         self.unanswered_post = True
         try:
             body = _request(

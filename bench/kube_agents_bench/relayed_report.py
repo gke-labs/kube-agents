@@ -17,13 +17,21 @@ A prompt whose first line is :data:`DIRECTIVE` is three turns on one
 conversation. ``opening`` is the first: it leads to a report that the A2A
 gateway's notify route posts into that conversation (``a2a/gateway/notify.go``,
 ``Notifier.reply``), which is the one path on which the gateway keeps the
-report (``KeepReport``) and attaches it to the next human turn as a
-``pushedReport`` part. Once the post has landed, ``reply1`` asks about a fact
-only the report holds (``fact1``), and ``reply2``, a second human turn on the
-same conversation and the same session pod, asks about another
-(``fact2``). The worker frames a pushed report into its harness session once,
-so ``reply2`` answering shows the report survived in that session's history
-rather than riding along on the turn that carried it.
+report (``KeepReport``) and attaches it, as a ``pushedReport`` part, to a
+later human turn that names the report's task as its ``replyTo`` (on a
+thread-keyed chat conversation, to the next turn in the thread whatever it
+names; an inject or console conversation is not one). Once the post has
+landed, ``reply1`` asks about a fact only the report holds (``fact1``), and
+``reply2``, a second human turn on the same conversation and the same session
+pod, asks about another (``fact2``). Both name the opening turn's task. The
+worker frames a pushed report into its harness session once, so ``reply2``
+answering shows the report survived in that session's history rather than
+riding along on the turn that carried it.
+
+The facts must reach the model through the report alone: :func:`parse`
+refuses a case whose opening or either reply question already states one, and
+a run whose opening answer already carries one is infrastructure (the report
+was not needed to answer).
 
 This is a different row from :mod:`pushed_report`, which plants the
 hermes-bridge's fallback row in the session store. Here the gateway's own
@@ -33,10 +41,11 @@ route serves can implement, so nothing here assumes which. The one today is
 the inject door (``harness._InjectRelayTransport``): on an eval install the
 gateway's inject notify route (``chat.notify.inject``) relays a card's report
 into the ``inject:`` conversation the card was filed from as a transcript post
-the door marks ``report`` with ``replyTo`` naming the task whose turn filed
-it, keeps it by that root, and attaches it to the next human turn there as a
-``pushedReport`` part. On a lane no transport serves the harness reports the
-case as infrastructure (``harness._relay_transport``).
+the door marks ``report`` and ``kept`` with ``replyTo`` naming the task whose
+turn filed it, and keeps it by that root; an inject turn whose POST names that
+root as its ``replyTo`` carries it as a ``pushedReport`` part. On a lane no
+transport serves the harness reports the case as infrastructure
+(``harness._relay_transport``).
 
 The run writes two trajectory entries (``cases.HARNESS_WRITTEN_ENTRIES``
 names both):
@@ -44,7 +53,8 @@ names both):
 - :data:`POSTED_ENTRY`, ``completed``, once the report post landed in the
   conversation. A run where it never lands within
   :data:`REPORT_POST_WAIT_SECONDS` is infrastructure, not a model failure:
-  the path under test never ran.
+  the path under test never ran. So is a post that carries neither fact (a
+  card's block reason, say): the report never held what the replies ask.
 - :data:`REPLIES_ENTRY`, ``completed`` when both replies were answered and
   each answer carries its fact (matched as ``report_contains`` matches a
   phrase: case, emphasis and whitespace aside), ``error`` otherwise. A reply
@@ -52,9 +62,14 @@ names both):
   use it. A case's ``report_contains`` checks the facts over the merged
   answer too.
 
-A transport failure (:class:`RelayUnavailable`), a reply that ran on a
-different session than the other, or the report post never landing, is
-:class:`RelayInfrastructure`, which the harness records as infrastructure.
+An opening the transport marks ended (:attr:`RelayTurn.ended`: a terminal
+other than ``completed``, or no card filed) is graded as the opening, with
+the reason on ``errors``, and no reply is sent. A transport failure
+(:class:`RelayUnavailable`), a reply whose session the transport cannot
+name, the two replies on different sessions, the report post never landing
+or carrying neither fact, or an opening answer that already carries a fact,
+is :class:`RelayInfrastructure`, which the harness records as
+infrastructure.
 
 Nothing here imports ``devops_bench`` at module scope, like
 :mod:`pushed_report`.
@@ -63,6 +78,7 @@ Nothing here imports ``devops_bench`` at module scope, like
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -73,6 +89,7 @@ __all__ = [
     "DIRECTIVE",
     "POSTED_ENTRY",
     "REPLIES_ENTRY",
+    "REPLY_SETTLE_SECONDS",
     "REPLY_SUFFIX",
     "REPORT_POST_WAIT_SECONDS",
     "RelayInfrastructure",
@@ -105,6 +122,12 @@ REPLY_SUFFIX = "/relay-reply"
 #: run and report and the notify route has to post it; past this the path
 #: under test is taken not to have run.
 REPORT_POST_WAIT_SECONDS = 900.0
+#: How long the run waits after the report post lands before the first
+#: reply, in seconds: a small margin for the conversation's record to settle
+#: after the card's report (the opening's record releasing, the session
+#: taking in what the relay did) so the reply opens a turn of its own. A reply
+#: absorbed as a steer anyway is sent again (``harness._send_reply_turn``).
+REPLY_SETTLE_SECONDS = 2.0
 #: Between the two answers in the merged result the grader sees.
 ANSWER_SEPARATOR = "\n\n"
 
@@ -137,15 +160,18 @@ class RelayTurn:
     ``result`` is the turn as the grader would see it alone (output,
     ``final_message``, trajectory, tokens, errors). ``conversation`` is the
     transport's own spelling of the conversation the turn went to;
-    ``session`` names the session pod (or the transport's nearest stand-in)
-    that answered it, ``""`` when the transport cannot tell; ``task_id`` the
-    task the turn started.
+    ``session`` names the session pod that answered it, ``""`` when the
+    transport cannot tell (a reply's is then infrastructure); ``task_id`` the
+    task the turn started. ``ended``, on the opening only, says why the run
+    stops there and is graded as the opening stands (it ended other than
+    ``completed``, or filed no card, so no report can follow); ``""`` goes on.
     """
 
     result: AgentResult
     conversation: str
     task_id: str = ""
     session: str = ""
+    ended: str = ""
 
     @property
     def answer(self) -> str:
@@ -193,8 +219,10 @@ class RelayTransport(Protocol):
         ...
 
     def reply(self, conversation: str, text: str) -> RelayTurn:
-        """Send ``text`` as a further human turn on the conversation (the
-        gateway attaches a kept report to it) and follow it to its answer."""
+        """Send ``text`` as a further human turn on the conversation, under
+        the report (naming the opening turn's task where the conversation
+        needs it, so the gateway attaches the kept report), and follow it to
+        its answer."""
         ...
 
 
@@ -232,6 +260,11 @@ def parse(prompt: str) -> Relayed | None:
     missing = [name for name in _FIELDS if not fields.get(name)]
     if missing:
         raise ValueError(f"{DIRECTIVE} prompt is missing {', '.join(missing)}")
+    # A fact the asks already state reaches the model without the report.
+    for fact in ("fact1", "fact2"):
+        for ask in ("opening", "reply1", "reply2"):
+            if carries(fields[ask], fields[fact]):
+                raise ValueError(f"{DIRECTIVE} prompt's {ask} states {fact} ({fields[fact]!r}); only the report may carry it")
     return Relayed(**fields)
 
 
@@ -244,11 +277,15 @@ def _normalize(text: str) -> str:
 
 
 def carries(answer: str, fact: str) -> bool:
-    """Whether ``answer`` states ``fact``: a substring match with case,
-    Markdown emphasis and whitespace runs aside, as ``report_contains``
-    matches a required phrase."""
+    """Whether ``answer`` states ``fact``: with case, Markdown emphasis and
+    whitespace runs aside, as ``report_contains`` matches a required phrase,
+    and as a whole token: no letter, digit or underscore runs on from
+    either end, so ``42`` is not in ``420`` nor ``np-quartz-7`` in
+    ``np-quartz-70``."""
     want = _normalize(fact)
-    return bool(want) and want in _normalize(answer)
+    if not want:
+        return False
+    return re.search(rf"(?<!\w){re.escape(want)}(?!\w)", _normalize(answer)) is not None
 
 
 def _turn(transport: RelayTransport, label: str, call: Any, *args: Any) -> Any:
@@ -261,12 +298,28 @@ def _turn(transport: RelayTransport, label: str, call: Any, *args: Any) -> Any:
 def run(transport: RelayTransport, relayed: Relayed, conversation: str) -> AgentResult:
     """Open, wait for the report post, reply twice; one result for the grader.
 
+    An opening the transport marks ended (:attr:`RelayTurn.ended`) is the
+    run as it stands: its result, with the reason on ``errors``, and nothing
+    more is sent.
+
     Raises :class:`RelayInfrastructure` when the run cannot be graded: a
-    transport failure, no report post within :data:`REPORT_POST_WAIT_SECONDS`,
-    or the two replies answered on different sessions (``reply2`` then shows
-    nothing about the session's history).
+    transport failure; an opening answer that already carries a fact (the
+    replies could answer without the report); no report post within
+    :data:`REPORT_POST_WAIT_SECONDS`, or one carrying neither fact; a reply
+    whose session the transport cannot name; or the two replies answered on
+    different sessions (``reply2`` then shows nothing about the session's
+    history).
     """
     opening = _turn(transport, "opening turn", transport.open_turn, conversation, relayed.opening)
+    if opening.ended:
+        opening.result.errors.append(f"{DIRECTIVE}: {opening.ended}, so no reply was sent")
+        return opening.result
+    leaked = [fact for fact in (relayed.fact1, relayed.fact2) if carries(opening.answer, fact)]
+    if leaked:
+        raise RelayInfrastructure(
+            f"{DIRECTIVE}: {transport.name}: the opening turn's own answer already carries "
+            f"{', '.join(repr(f) for f in leaked)}, so the replies need no report and cannot show it was used"
+        )
     post = _turn(
         transport, "wait for the report post", transport.wait_for_report_post, conversation, REPORT_POST_WAIT_SECONDS
     )
@@ -275,10 +328,22 @@ def run(transport: RelayTransport, relayed: Relayed, conversation: str) -> Agent
             f"{DIRECTIVE}: {transport.name}: no report was posted into {opening.conversation} within "
             f"{REPORT_POST_WAIT_SECONDS:.0f}s of the opening turn's answer, so the relay under test never ran"
         )
+    if not carries(post.text, relayed.fact1) and not carries(post.text, relayed.fact2):
+        raise RelayInfrastructure(
+            f"{DIRECTIVE}: {transport.name}: the report kept in {post.conversation} carries neither "
+            f"{relayed.fact1!r} nor {relayed.fact2!r}, so the replies cannot show it was used"
+        )
     posted = posted_entry(transport.name, post, relayed)
+    time.sleep(REPLY_SETTLE_SECONDS)
     first = _turn(transport, "first reply", transport.reply, conversation, relayed.reply1)
     second = _turn(transport, "second reply", transport.reply, conversation, relayed.reply2)
-    if first.session and second.session and first.session != second.session:
+    for label, turn in (("first", first), ("second", second)):
+        if not turn.session:
+            raise RelayInfrastructure(
+                f"{DIRECTIVE}: {transport.name}: the transport could not name the session the {label} reply ran "
+                "on, so the case cannot show both replies ran on one session"
+            )
+    if first.session != second.session:
         raise RelayInfrastructure(
             f"{DIRECTIVE}: {transport.name}: the second reply ran on session {second.session}, the first on "
             f"{first.session}; the case needs both on one reused session to show the report survived in its history"
@@ -350,6 +415,7 @@ def merge(opening: RelayTurn, first: RelayTurn, second: RelayTurn, posted: dict,
         "opening_final_message": opening.answer,
         "opening_task_id": opening.task_id or None,
         "reply_task_ids": [first.task_id or None, second.task_id or None],
+        "sessions": [opening.session or None, first.session or None, second.session or None],
         "conversation": first.conversation,
     }
     trajectory = [*opening.result.trajectory, posted, *first.result.trajectory, *second.result.trajectory, replies]

@@ -427,13 +427,16 @@ _PUSHED_REPLY_RETRY_SECONDS = 10.0
 @dataclass(frozen=True)
 class _InjectFollowUp:
     """A second message on a conversation this run opened: the opening turn's
-    conversation and identity triple, and the suffix its message id takes."""
+    conversation and identity triple, and the suffix its message id takes.
+    ``reply_to``, when set, is the task whose relayed report the message
+    answers, sent as the POST's ``replyTo`` (:data:`inject.REPLY_TO_FIELD`)."""
 
     conversation: str
     run_id: str
     case_id: str
     repetition: str
     suffix: str
+    reply_to: str = ""
 # The three budgets both transports share, named here rather than spelled at
 # each _numeric_env call: one default per knob, or the two doors disagree
 # about how long a case may take.
@@ -2974,6 +2977,25 @@ def _inject_door_access() -> tuple[str, str, Callable[..., None]]:
     return f"http://127.0.0.1:{local_port}", token, _respawn
 
 
+def _opening_filed_no_card(result: AgentResult) -> bool:
+    """Whether the harness can tell the relayed-report opening ``result`` filed no card.
+
+    Only when the chain delegated to nobody (the probe's ``childAddressees``
+    read as ``[]``, not absent) and one read of the session store
+    (:func:`board.read_session_cards`) knows the turn's session and holds no
+    card for it. Anything it cannot tell -- no contextId, a door that does not
+    carry the addressees, a delegated chain, a read that failed, a session the
+    store does not know -- is ``False``, and the report wait decides.
+    """
+    if result.metadata.get("child_addressees") != []:
+        return False
+    session_id = board.api_session_id(str(result.metadata.get("context_id") or ""))
+    if not session_id:
+        return False
+    seen = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+    return seen is not None and seen.session_found and not seen.card_ids
+
+
 class _InjectRelayTransport:
     """:class:`relayed_report.RelayTransport` on the inject door (#6870).
 
@@ -2981,21 +3003,36 @@ class _InjectRelayTransport:
     key names, sent and followed to its answer by
     :meth:`KubeAgentsHarness._execute_inject` as a further message (no
     directive read, no delegation wait, no status turn: any other human turn
-    on the conversation would take the kept report before the first reply
-    does). The opening carries the run's own message id; each reply its
-    suffix (:data:`relayed_report.REPLY_SUFFIX` and its number), sent again
-    under a fresh id when the door absorbs it as a steer
+    on the conversation would come between the report and the first reply).
+    The opening carries the run's own message id; each reply its suffix
+    (:data:`relayed_report.REPLY_SUFFIX` and its number), sent again under a
+    fresh id when the door absorbs it as a steer
     (:meth:`KubeAgentsHarness._send_reply_turn`).
 
-    The report is the first transcript entry that is a post the door marks
-    ``report`` with ``replyTo`` naming the opening turn's task: what the
-    gateway's inject notify route appends (``InjectAdapter.PostNotifyFrame``)
-    for a card filed from that turn, and the root the gateway keeps the
-    report by (:meth:`inject_transport.InjectTask.await_relayed_report`).
+    The opening is gated as :meth:`KubeAgentsHarness._reply_after_idle`
+    gates its opening: one an executor ended other than ``completed`` (a
+    failed or canceled terminal, a task still working at its budget) is
+    graded as it stands (:attr:`relayed_report.RelayTurn.ended`), and so is
+    a completed one the harness can tell filed no card
+    (:func:`_opening_filed_no_card`), since no report can follow; a
+    completed opening the harness read only off the stream or at its budget
+    is infrastructure, since the replies could not be sent on its record.
 
-    A turn's session is the conversation's contextId as the door's read
-    reported it at the turn's end, the session record the bridge runs the
-    conversation's turns in; ``""`` when the door reported none.
+    The report is the first transcript entry that is a post the door marks
+    ``report`` and ``kept`` with ``replyTo`` naming the opening turn's task:
+    what the gateway's inject notify route appends
+    (``InjectAdapter.PostNotifyFrame``) for a card filed from that turn, and
+    the root the gateway keeps the report by
+    (:meth:`inject_transport.InjectTask.await_relayed_report`). An inject
+    conversation is not thread-keyed, so the gateway attaches a kept report
+    only to a turn that names its root: both replies carry ``replyTo`` set
+    to the opening's task (:data:`inject_transport.REPLY_TO_FIELD`).
+
+    A turn's session is the live session pod carrying the conversation's
+    session key, read after the turn ends (:func:`_session_pod_of`, the read
+    :mod:`idle_reply` uses). A read that fails, or finds no live pod, is
+    infrastructure naming which: the case is about one session's history,
+    and a turn whose pod is unknown cannot show it.
     """
 
     name = TRANSPORT_INJECT
@@ -3020,13 +3057,26 @@ class _InjectRelayTransport:
         self._replies = 0
 
     @staticmethod
-    def _turn(result: AgentResult, conversation: str) -> relayed_report.RelayTurn:
+    def _turn(result: AgentResult, conversation: str, session: str = "") -> relayed_report.RelayTurn:
         return relayed_report.RelayTurn(
             result=result,
             conversation=str(result.metadata.get("conversation") or conversation),
             task_id=str(result.metadata.get("task_id") or ""),
-            session=str(result.metadata.get("context_id") or ""),
+            session=session,
         )
+
+    @staticmethod
+    def _session_pod(conversation: str, label: str) -> str:
+        pod = _session_pod_of(conversation)
+        if pod is None:
+            raise relayed_report.RelayUnavailable(
+                f"the session pods could not be read after the {label} on {conversation}, so which pod ran it is unknown"
+            )
+        if not pod:
+            raise relayed_report.RelayUnavailable(
+                f"no live session pod carried {conversation}'s session key after the {label}, so which pod ran it is unknown"
+            )
+        return pod
 
     def open_turn(self, conversation: str, text: str) -> relayed_report.RelayTurn:
         run_id, case_id, repetition = self._identity
@@ -3043,6 +3093,20 @@ class _InjectRelayTransport:
         turn = self._turn(result, conversation)
         if not turn.task_id:
             raise relayed_report.RelayUnavailable(f"the door started no task for the opening turn on {turn.conversation}")
+        terminal = str(result.metadata.get("terminal_state") or "")
+        outcome = str(result.metadata.get("outcome") or "")
+        if terminal != inject.STATE_COMPLETED:
+            turn.ended = f"the opening turn ended {terminal or outcome or 'without a terminal'}"
+            return turn
+        if outcome != inject.OUTCOME_TERMINAL:
+            raise relayed_report.RelayUnavailable(
+                f"the opening turn on {turn.conversation} completed but its exchange ended {outcome}, "
+                "so the replies could not be sent on its record"
+            )
+        if _opening_filed_no_card(result):
+            turn.ended = "the opening turn completed and filed no card, so no report could be relayed"
+            return turn
+        turn.session = self._session_pod(turn.conversation, "opening turn")
         self._opening, self._conversation, self._root = result, turn.conversation, turn.task_id
         return turn
 
@@ -3084,13 +3148,16 @@ class _InjectRelayTransport:
             relayed_report.DIRECTIVE,
             f"{relayed_report.REPLY_SUFFIX}{self._replies}",
             self._retry_seconds,
+            reply_to=self._root,
         )
         if failure is not None:
             raise relayed_report.RelayUnavailable(
                 str(failure.metadata.get("infra_failure") or "; ".join(failure.errors) or "the reply failed")
             )
         assert result is not None
-        return self._turn(result, conversation)
+        turn = self._turn(result, conversation)
+        turn.session = self._session_pod(turn.conversation, f"reply {self._replies}")
+        return turn
 
 
 def _unknown_directive(prompt: str) -> str:
@@ -5074,6 +5141,8 @@ class KubeAgentsHarness(AgentHarness):
         directive: str,
         suffix_base: str,
         retry_seconds: float,
+        *,
+        reply_to: str = "",
     ) -> tuple[AgentResult | None, AgentResult | None]:
         """Send a two-turn replay's reply on the opening turn's conversation.
 
@@ -5086,6 +5155,8 @@ class KubeAgentsHarness(AgentHarness):
         :data:`_PUSHED_REPLY_ATTEMPTS` times in all, ``retry_seconds`` apart;
         a reply still refused after that is infrastructure, as is any other
         refusal and a reply whose exchange was lost in transport.
+        ``reply_to`` goes on every attempt as the POST's ``replyTo``
+        (:attr:`_InjectFollowUp.reply_to`).
         """
         for attempt in range(1, _PUSHED_REPLY_ATTEMPTS + 1):
             suffix = suffix_base if attempt == 1 else f"{suffix_base}-{attempt}"
@@ -5097,6 +5168,7 @@ class KubeAgentsHarness(AgentHarness):
                     case_id=str(opening.metadata.get("case_id") or ""),
                     repetition=str(opening.metadata.get("repetition") or ""),
                     suffix=suffix,
+                    reply_to=reply_to,
                 ),
             )
             absorbed = (
@@ -5605,6 +5677,8 @@ class KubeAgentsHarness(AgentHarness):
         )
         if target is not None and target.intent:
             addressed["intent"] = target.intent
+        if follow_up is not None and follow_up.reply_to:
+            addressed["reply_to"] = follow_up.reply_to
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
