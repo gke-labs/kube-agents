@@ -254,11 +254,24 @@ Both the chart and the kustomize base still load a pre-call hook that drops repl
 
 Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs.
 
-`litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`. Before LiteLLM calls the provider, the hook rewrites:
+`litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`.
 
-- `messages[].content` (strings and `text` parts);
-- each assistant message's `tool_calls[].function.arguments`, parsed, so a key name such as `password` counts as it does in a mapping;
-- embeddings `input` and completion `prompt`.
+Before LiteLLM calls the provider, the hook rewrites every top-level field of the request except generation settings and the gateway's own bookkeeping. That covers:
+
+- the conversation, in any shape the gateway serves: chat and Anthropic `messages`, and Gemini `contents` under `/v1beta/models/...`;
+- the system text, tool definitions, embeddings `input` and a completion `prompt`;
+- any newer field.
+
+Each field is walked whole, so a value is redacted wherever it sits: a tool's input, what a tool returned, or an assistant message's other fields. A tool call's arguments held as JSON in a string are decoded first. A key name such as `password` then counts as it does in a mapping, and the arguments stay valid JSON.
+
+A few fields are left as they came. They are kept only where the provider APIs put them: content parts, a tool result's own content list, the system blocks and Gemini parts. Nothing inside a tool's input or output is kept. The kept fields are:
+
+- in the assistant's own turn, a thinking block's text and signature, which the provider checks against each other. The model wrote that text from input the hook had already redacted;
+- redacted thinking and a thought signature, in the same turn;
+- provider-encrypted content, which the provider checks byte for byte. That is a Responses reasoning item's `encrypted_content`, and in the assistant's turn a web search result's `encrypted_content`, the `reasoning_details` data and signature, and the `thought_signature` LiteLLM carries on the message and its tool calls;
+- binary payloads of a listed type (common images, PDF, audio and video) that decode as base64 and start the way their media type does. A payload of any other type is refused.
+
+A request the hook cannot walk is refused. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64. Two payload positions are not among them: the content parts of a Responses `input` item (`input_file`, `input_image`) and the parts inside a Gemini function response. A base64 payload there isn't checked as a payload. The text rules still run over it, and a rule whose pattern happens to appear in the base64 text rewrites it, which corrupts the payload. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 
 The rendered default config does not change while the value is off.
 
@@ -312,7 +325,7 @@ The same switch reaches the agent pod. The chart projects this rule file there a
 
 Each process reads the file once at start. A changed rule file reaches the gateway on its next roll. In the agent pod a long-lived process keeps the rules it started with while each new worker process reads the current file, so roll the pod to move them all. The image parses the file with the grammar it shipped with, so keep the chart and the agent image at one version when this switch is on. It does not touch chat egress.
 
-A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
+A rule that fails to load stops the gateway pod at startup rather than forwarding requests it has not redacted. The render fails on a name, action or source it does not accept. An exception inside the hook, including a refused request shape, fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
 
 ### Pass-through trajectory logging
 
