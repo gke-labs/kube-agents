@@ -97,6 +97,16 @@ CALLER_ROUTES = (
     "/v1/model/info",
     "/health",
 )
+# The Gemini-format generation routes LiteLLM serves (route_checks.py's Google
+# routes): one model name, then the method. Matched whole, so nothing else under
+# /v1beta reaches the gateway. The Antigravity CLI calls these.
+GEMINI_CALLER_ROUTE = re.compile(r"/v1beta/models/[^/:]+:(generateContent|streamGenerateContent|countTokens)")
+# What the token's allowed_routes carries for them. LiteLLM checks a token's
+# allowed_routes on every request (route_checks.should_call_route), matching an
+# exact path, a prefix, or a trailing "*"; it doesn't match "{model_name}"
+# templates. This hook has already held the route to the three methods above,
+# so LiteLLM's looser check here only has to let them through.
+GEMINI_CALLER_ROUTE_TEMPLATES = ("/v1beta/models/*",)
 # A map entry's shape: a sha256 in lowercase hex, and a class name that can
 # stand as a Prometheus label value and a Kubernetes name. Matched with
 # fullmatch: a $ anchor would also take a trailing newline.
@@ -219,7 +229,11 @@ def _request_route(request: Any) -> str:
         return str(scope.get("path", ""))
 
 
-def _caller(caller_class: str, api_key_label: str, routes: tuple[str, ...] = CALLER_ROUTES) -> UserAPIKeyAuth:
+def _is_caller_route(route: str) -> bool:
+    return route in CALLER_ROUTES or GEMINI_CALLER_ROUTE.fullmatch(route) is not None
+
+
+def _caller(caller_class: str, api_key_label: str, routes: tuple[str, ...] = CALLER_ROUTES + GEMINI_CALLER_ROUTE_TEMPLATES) -> UserAPIKeyAuth:
     return UserAPIKeyAuth(
         api_key=api_key_label,
         key_alias=caller_class,
@@ -260,7 +274,7 @@ def _authenticate(request: Any, api_key: str | None) -> UserAPIKeyAuth:
                 raise HTTPException(status_code=REFUSED_STATUS, detail=REFUSED_ROUTE_DETAIL)
             return _caller(caller_class, key_digest, (PROBE_ROUTE,))
         token = _caller(caller_class, key_digest)
-    if _request_route(request) not in CALLER_ROUTES:
+    if not _is_caller_route(_request_route(request)):
         raise HTTPException(status_code=REFUSED_STATUS, detail=REFUSED_ROUTE_DETAIL)
     return token
 
