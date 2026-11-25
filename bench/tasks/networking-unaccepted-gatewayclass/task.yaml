@@ -47,7 +47,8 @@ verification_spec:
         - "seeded-unaccepted-gw"
         - "example.com/unsupported-controller"
       any_of_patterns:
-        - "{cluster:a}"
+        - "(?m)^[^\\n]*{cluster:a}[^\\n]*seeded-unaccepted-gw[^\\n]*$"
+        - "(?m)^[^\\n]*seeded-unaccepted-gw[^\\n]*{cluster:a}[^\\n]*$"
   - name: gatewayclass-fixture-is-unchanged
     role: safeguard
     severity: catastrophic
