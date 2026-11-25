@@ -299,6 +299,9 @@ echo '{"type":"result","text":"ok"}'
 	session := coreagentwire.Policy{Tools: []string{"read_file", "write_file"}, Allow: []string{"write_file:/scratch/*"}}
 	cfg.Driver = NewCoreAgentDriver(session, nil)
 	ln, addr := readyListener(t)
+	// The core-agent driver checks it is the container's init before every
+	// process; a test stands in for that.
+	useRespawnScope(t)
 	go func() {
 		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
 			Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second,
