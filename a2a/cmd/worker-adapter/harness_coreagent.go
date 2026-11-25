@@ -13,7 +13,7 @@ type coreAgentBuilder struct{}
 
 const (
 	// coreAgentPersonaDir is the persona the harness reads once per turn:
-	// rendered by a second UID, read-only to the harness (SEAM: dev-2, #6713).
+	// rendered by a second UID, read-only to the harness (#6713).
 	coreAgentPersonaDir = "/var/lib/agent-persona"
 	// coreAgentPersonaRequiredEnv, "true" on a pod the operator renders a
 	// persona for, makes a missing persona dir fail the turn
