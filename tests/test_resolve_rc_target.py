@@ -25,9 +25,12 @@ from tests.testing.common import (
     get_isolated_test_env,
 )
 from tests.testing.release import (
+    MOCK_AR_REGISTRY_PREFIX,
     MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
     commit_required_release_images,
+    create_mock_ar_curl_binary,
+    create_mock_gcloud_token_binary,
     create_mock_ghcr_curl_binary,
 )
 
@@ -177,6 +180,21 @@ class ResolveRcTargetTest(unittest.TestCase):
         for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
             self.assertNotIn(f"✗ {img}", result.stderr, f"{img} is not in the candidate's list")
         self.assertEqual(result.stdout.strip(), "")
+
+    def test_an_artifact_registry_prefix_is_asked_without_docker(self):
+        """With REGISTRY_PREFIX on Artifact Registry and no docker (the Prow
+        job image), the gate asks that registry as the job's Google identity:
+        published there passes, missing there is refused by name."""
+        for http_status, returncode in ((200, 0), (404, 1)):
+            with self.subTest(http_status=http_status):
+                create_mock_ar_curl_binary(self.bin_dir, manifest_http_status=http_status)
+                create_mock_gcloud_token_binary(self.bin_dir)
+                result = self.run_script(env={"REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX})
+                self.assertEqual(result.returncode, returncode, result.stderr)
+                if returncode:
+                    self.assertIn(f"{MOCK_AR_REGISTRY_PREFIX} is missing at least one of the required images", result.stderr)
+                else:
+                    self.assertEqual(result.stdout.strip(), self.shas[_NEWEST_RC])
 
     def test_a_repository_with_no_candidates_says_so(self):
         """The marker tag is deliberately left in place. `rc_*` matches it, so

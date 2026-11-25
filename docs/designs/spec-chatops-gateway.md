@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat, Slack and Teams adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod, the same four widened when the Teams backend is armed, `a2aRelayCaller`); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, its replacement by the profile path is tracked in #6483, and since 2026-11-20 it is on by default for the session route (#6538), so `defaultRoute: session` routes plain turns to session pods with the view on; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` when unset until the flip, a later change gated on evidence; `defaultRoute: session` opts an install in, with the session cap fitted to the live `TASKS` stream's width (`status.effectiveSessionCap`)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat, Slack and Teams adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod, the same four widened when the Teams backend is armed, `a2aRelayCaller`); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller) is built and on by default on the session route (#6538, #6987), with the operator's `A2A_SESSION_CLUSTER_VIEW` as an override until its replacement by the profile path (#6483), and the flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with the view on or off; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` when unset until the flip, a later change gated on evidence; `defaultRoute: session` opts an install in, with the session cap fitted to the live `TASKS` stream's width (`status.effectiveSessionCap`)
 
 ## Purpose
 
@@ -144,7 +144,7 @@ gives users today, the adapter owes the same stdin path to `input-required` anyw
 each steer carries its own `authority` block, so group-room attribution stays clean. A
 cancel affordance ("stop") maps to `kind: cancel` and stays the hard interrupt; its chat
 gesture is Slack's native Stop on an Agent Session and the drawn Stop button on Google Chat's
-status line (the adapter sections; amended 11/5), and none on the console or Discord.
+and Teams's status line (the adapter sections; amended 11/5), and none on the console or Discord.
 
 **The deterministic interceptors (amended 8/31).** The gateway holds no model, so its
 affordances are literal: a small set of normalized phrases and prefixes, deterministic
@@ -157,7 +157,7 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   live claim about the executor. It never reaches the executor.
 - **Stop.** "stop" / "cancel" / "abort", exact after normalization - the text form of
   the cancel affordance above; the backend gestures above land on the same path as
-  `IntentCancel` (amended 11/5). On Google Chat, the word with a task running and a
+  `IntentCancel` (amended 11/5). On Google Chat and on Teams, the word with a task running and a
   status line is answered as the Stop button's press is: on the line, with no post (The
   Stop button, in the Google Chat adapter section; amended 11/6). Every other backend keeps
   the posted replies: the console and Discord draw no button, and the posts are their
@@ -574,12 +574,13 @@ child still running is left active. A known limit: a child that hangs without en
 further delegation in its conversation until its terminal arrives (from its executor or the
 supervisor) or the record is reaped.
 
-One exception stands while its flag is on: the session pod's temporary read-only cluster view
+One exception stands while the view is on (the session route's default, or the operator's
+`A2A_SESSION_CLUSTER_VIEW=true`): the session pod's temporary read-only cluster view
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
 credential broker directly, with the platform agent's scope and no child task, so the only gate
 between the requester and that read is the gateway's ingress allowlist, not the target's
-`AllowedUsers`. Its replacement by the profile path is tracked in #6483. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with it on (#6538, 2026-11-20). Until it is replaced, on an install whose
-operator has turned the flag on and whose CR narrows the platform agent's allowlist, a person the
+`AllowedUsers`. Its replacement by the profile path is tracked in #6483. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with it on (#6538, 2026-11-20). Until it is replaced, on an install with the
+view on whose CR narrows the platform agent's allowlist, a person the
 gateway refuses a delegation to `platform` can still read its clusters through a session's view.
 
 Delegation ends the turn. A session's turn is a conversation turn, bounded at thirty minutes
@@ -836,8 +837,15 @@ steered into that task. A profile task may delegate in turn, under the same chec
 turn except the incarnation's author set, since a warm worker is reset between tasks. Like a
 session turn, it delegates once: a second request from the same task is dropped as a repeat,
 because nothing yet tells a new request from a redelivered one. A session turn's one request may
-be a batch (above, the delegation primitive); a profile task's may not yet, since nothing lets a
-parent waiting open take several child results. A profile parent is also held to its own chain
+be a batch (above, the delegation primitive), and so may a profile task's. A profile parent's
+batch is minted as a session's is, the checks below applying to every entry and the batch whole
+or not run, and the parent keeps the conversation while its children run. It isn't woken at the
+last end: each child's end reaches it as its own `childResult`, naming the batch entry, as that
+child ends (`spec-a2a-payloads.md`, "Task parameters and child results"). While the batch runs,
+text in the conversation is refused, as during any fan-out, since which task it was meant for
+isn't the gateway's to guess; a stop reaches the parent and every child. The parent's own end
+gives the conversation up, even with children still running, and those children are cancelled,
+as a stop would cancel them. A profile parent is also held to its own chain
 and scope, checked at the child's mint because the child is a fresh root the verifier never
 compares with its parent. Each profile task records its scope and the profiles of the waiting
 profile tasks above it (its chain) when it's minted. The chain starts afresh at a top submission,
@@ -879,11 +887,19 @@ whether its card declares them or not.
 The session manager is the demo's chatops code generalized from one-shot workers to
 long-lived sessions. Four operations:
 
+The session pod's harness follows the PlatformAgent's `spec.harness.sessionWorker.type`. The
+operator renders a value it supports on the gateway as `A2A_SESSION_HARNESS`, and the gateway passes it
+to each session pod as `A2A_HARNESS`; unset adds nothing and the worker runs Claude Code. A value
+the operator or the gateway doesn't know falls back to that default rather than stopping the shared
+gateway: the operator writes the `SessionHarness` condition and a Warning event, and the gateway logs an
+error at start. Every session
+pod also carries `A2A_HARNESS_UNISOLATED` set empty, so a worker image's own environment can't turn
+on the worker's isolation waiver.
+
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 150m/320Mi requests by default, set by
 `spec.harness.tuning.sessionResources` (#2371); egress
-fenced (8/31) to DNS, the bus, and LiteLLM, except, under the operator's
-`A2A_SESSION_CLUSTER_VIEW` flag, the credential broker (`spec-mode-switch.md`) - the
+fenced (8/31) to DNS, the bus, and LiteLLM, except, under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it), the credential broker (`spec-mode-switch.md`) - the
 deployment spec owns the policy),
 running the headless harness behind a thin shim that bridges bus envelopes to the CLI's
 stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
@@ -1659,14 +1675,15 @@ The paragraphs above are the history._
 
 ## Who may press Stop (added 11/9)
 
-Two backends have a Stop button: Slack's native Stop on an Agent Session's Working… line (the
-Slack adapter section) and the Stop button the Google Chat adapter draws under a task's line (the
-Google Chat adapter section, "The Stop button"). The rule is the same on both. Only a requester
+The backends with a Stop button are these: Slack's native Stop on an Agent Session's Working… line (the
+Slack adapter section), the Stop button the Google Chat adapter draws under a task's line (the
+Google Chat adapter section, "The Stop button") and the one the Teams adapter draws on the line's
+card ("The Teams adapter"). The rule is the same on each. Only a requester
 the conversation's record holds may press it: a task's requester or steer author, or a session
 author. Anyone else's press cancels nothing, and the gateway logs it; what the presser sees is
 below (added 11/11) (`mayStop` in `stopgate.go`, which holds the set of gated backends, `stopGatedBackends`). The
 presser is the message's author as the record stores a requester (`requesterSubject`: a Slack
-member id, a lowercased Google Chat email, pseudonymized under the install salt), so a Chat
+member id, a lowercased Google Chat email or a lowercased Teams sender id, pseudonymized under the install salt), so a Chat
 press compares against the record the same way a Chat ask was written to it. The gate reads the
 presser of a live task's button. A press on a task that is not the running one cancels nothing
 whoever presses it, so it is answered before the gate is read (`chatStopStale`), and anyone may
@@ -1691,6 +1708,17 @@ nothing, as before ("Unverified senders", in the Slack adapter section, which ho
 backend). A private thread reply Chat refuses is posted once more at the space's top level, still
 private, as the note card is; a second refusal, or any other failure, is logged and nothing more,
 since the typed `stop` the line names still works.
+
+On Teams the button is the adapter's drawing too, and a press arrives through the queue with no
+synchronous answer, so a silent refusal would read as a slow control there as well. Teams has no
+post only one member sees, so the refusal is said on the running task's line
+(`tellRefusedOnLine` in `chat_stop_press.go`), whichever line was pressed: the line reads `✋` and
+`refusedPressNotice`, its button kept, until the relay next updates the line. The relay skips an
+update that renders what it last wrote, so the refusal clears that memory (`relayState.lastLine`)
+and the next update lands even when its text is unchanged; a task that reports nothing more keeps
+the notice until it ends. It is visible to the conversation and names nobody. It is never written
+in a direct message, and not over a queued task's busy notice, which the relay holds until the
+task starts.
 
 A record that cannot tell who asked gates nobody: nothing ran, a requester was cleared past
 `AskTTL`, a steer or session author was dropped past its cap, or the history is at its cap
@@ -2601,8 +2629,8 @@ unmentioned Slack reply under one of the bot's own posts, #3246), which is dropp
 info-level log line only and does not count as the sender's notice. A shortcut's
 conversation is a thread under someone else's message, so the gateway posts no notice
 there either (`Shortcut`); the adapter sends it to the clicker alone through the
-shortcut's `response_url`, every time. Nor for a press of a Stop button, Slack's or Google
-Chat's: the press asked the bot for nothing, and the notice, which names the presser, would land
+shortcut's `response_url`, every time. Nor for a press of a Stop button, Slack's, Google
+Chat's or Teams's: the press asked the bot for nothing, and the notice, which names the presser, would land
 in a thread the channel reads; the press is dropped with the log line, does not count as the
 sender's notice, and their first typed message gets it. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
@@ -3121,6 +3149,20 @@ ask's own minute. What the
 passthrough does not serve the adapter says so about rather than guess: `OpenDirect` is refused
 (creating a conversation is outside the allowed paths), `Roster` is incomplete and empty,
 reactions are a nil no-op.
+
+A running task's line carries a Stop button on its card (`teams_press.go`): one Adaptive Card
+`Action.Submit` whose data names the task. Teams delivers its press as a message activity with no
+text, the button's data as its `value` and the pressed message as its `replyToId`, and asks the
+bot's endpoint for nothing in return, so a press travels the queue like any other activity.
+`Action.Execute` would not: Teams sends it as an `invoke` and shows the presser an error unless
+the endpoint answers at once, and the receiver in front of the queue answers each activity it
+queues "accepted" before the gateway has read it. The adapter turns the press into what Google Chat's
+is, `IntentCancel` marked a click, naming the task and the pressed message, so the requester gate
+and the answer on the line are the ones "Who may press Stop" and "The Stop button" describe
+(`stopGatedBackends`, `lineStopBackends`). The button rides the card: a line that goes out as
+plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`
+is the way to stop there. A typed `stop` on a task with a line is answered on the line as a
+press is (`isChatTypedStop`), so a line never keeps a live button beside a posted "cancel sent".
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object

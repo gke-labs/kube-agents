@@ -264,8 +264,7 @@ for the A2A gateway, and, when the Teams inbound receiver is enabled, `kubeagent
 for that receiver, which reaches one route by one method) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
-install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
-pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it), the session pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience
 `kubeagents-credential-proxy-profile`; see
@@ -834,8 +833,8 @@ argv, and a profile task's call go to the broker as above. The read carries the
 `X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
 cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
 `get-credentials`, which refuses that cluster itself. The header only narrows:
-without it the read is unchanged, so other control-plane reads of an excluded
-cluster stay allowed.
+without it the read is unchanged, so the reconcile's existence check of an
+excluded cluster stays allowed.
 
 Consequences:
 
@@ -917,7 +916,10 @@ Consequences:
   back and lands it at
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
-  cluster from later commands.
+  cluster from later commands. It writes the file and the pin only when its
+  caller owns `.kubeconfigs`; another caller gets neither, and is told to name
+  a file of its own
+  ([`kube-proxy.md`](designs/kube-proxy.md#4-sandbox-kubectl-and-kubeconfig-setup)).
 - A `kubectl` read that names no cluster that way and comes back empty or with
   a server NotFound says where it looked. For `get`, `describe`, `events`,
   `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr

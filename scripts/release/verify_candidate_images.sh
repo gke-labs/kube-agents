@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verifies that prebuilt container images exist in GHCR for a candidate commit SHA.
+# Verifies that prebuilt container images exist in the registry for a candidate commit SHA.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,7 +13,7 @@ if [ -z "${COMMIT_SHA}" ]; then
 fi
 
 registry_prefix="$(get_registry_prefix)"
-echo "🔍 Checking candidate container images in GHCR for commit ${COMMIT_SHA} (${registry_prefix})..."
+echo "🔍 Checking candidate container images for commit ${COMMIT_SHA} (${registry_prefix})..."
 
 # The candidate's own list: the names its scripts/release/common.sh carries,
 # which are the images its publish run built (required_release_images_at).
@@ -29,10 +29,10 @@ for img_name in "${candidate_images[@]}"; do
 
   echo "Checking image '${target_img}'..."
 
-  if ! docker manifest inspect "${target_img}" >/dev/null 2>&1; then
-    echo "❌ ERROR: Container image '${img_name}' for commit '${COMMIT_SHA}' not found in GHCR (${target_img})!" >&2
+  if ! registry_image_exists "${target_img}"; then
+    echo "❌ ERROR: Container image '${img_name}' for commit '${COMMIT_SHA}' not found (${target_img})!" >&2
     exit 1
   fi
 done
 
-echo "✅ All candidate container images verified successfully in GHCR!"
+echo "✅ All candidate container images verified successfully in ${registry_prefix}!"

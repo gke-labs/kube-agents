@@ -38,7 +38,9 @@
 # (docs/designs/agent-shell-sandboxing.md), so from #913 (2026-09-05) until
 # the single-stream allowance in skills/fleet-audit/SKILL.md the skill told
 # the worker to answer "queued" to this very prompt, which is the miss #1876
-# records. No eval case grades the scheduled path.
+# records. fleet-audit-scheduled-run-files-the-finding grades the report of
+# a run the cron tick claimed on this stream; its header says what of the
+# scheduled path it leaves out.
 #
 # A1 and A4 cleared together on 2026-08-25, when
 # GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
