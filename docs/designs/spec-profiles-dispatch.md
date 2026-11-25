@@ -623,17 +623,16 @@ leave open:
   regrant normally clears that in seconds, well inside the bound. A profile that has left the
   install config keeps its own give-up and log line above, not `terminal-unpublished`. An
   unlatched install keeps retrying, as before.
-  A terminal's envelope id is fixed per task, so a retry after a lost ack is a duplicate the stream
-  drops. The duplicate window is keyed on the id alone, whatever the subject, so on the six-token
-  form a duplicate ack is checked: a direct get of the task's six-token subject must find the
-  dispatcher's final status under the terminal's own envelope id, so another tier's or kind's
-  terminal for the same task id doesn't confirm it. With none there, the terminal is published
-  again under a fresh id, kept for the rest of that retry loop so its re-publishes dedupe onto
-  each other. A re-publish that fails is an ordinary failure, retried under the bound above. Only
-  a fresh id taken as a duplicate on its first send takes the `terminal-unpublished` settle at
-  once. A direct get that fails is not taken as the write landing: the terminal is re-published
-  under a fresh id the same way, so a retry whose first write did land can leave two identical
-  terminals, and readers fold past the second.
+  On the five-token form a terminal's envelope id is fixed per task, so a retry after a lost ack
+  is a duplicate the stream drops. The duplicate window is keyed on the id alone, whatever the
+  subject, so a fixed id is one another writer could store a message under first. On the
+  six-token form the id is therefore 128 random bits, drawn once per retry loop and kept in the
+  dispatcher's memory (#6883): a retry in the loop is a duplicate the stream drops, and since no
+  other writer can predict the id, a duplicate ack is always that loop's own earlier send. There
+  is no read-back and no grant for one. The cost is a dispatcher that restarts between the
+  publish and the settle: the redelivery writes the terminal again under a new id, so the
+  subject can hold two identical final statuses. Every reader takes the first final status as
+  the task's end; a later one, identical or not, is a post-final drop (`PostFinalDropped`).
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for
