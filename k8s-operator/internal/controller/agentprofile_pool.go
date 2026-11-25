@@ -549,12 +549,17 @@ const (
 )
 
 // coreAgentPersonaRenderContainer renders and seals the persona. It gets only
-// the broker's address, which the render names as its MCP servers' relay
-// target: no credential, token or bus configuration.
+// the broker's address, so the render accepts the MCP servers the persona
+// grants (it refuses one with no relay); the files it writes carry no MCP
+// configuration, and no credential, token or bus configuration reaches it.
 func coreAgentPersonaRenderContainer(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile, rendered profilepod.Rendered) corev1.Container {
 	// The worker's own persona mount, so the render reads the persona the
 	// way the worker does (with the payload subPath under image volumes).
-	persona, _ := rendered.PersonaMount()
+	persona, ok := rendered.PersonaMount()
+	if !ok {
+		// Every profile has a persona image; this is the same mount anyway.
+		persona = corev1.VolumeMount{Name: "persona", MountPath: profilepod.PersonaMountPath}
+	}
 	persona.ReadOnly = true
 	return corev1.Container{
 		Name:  coreAgentPersonaRenderName,

@@ -139,10 +139,10 @@ func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	// The two subcommands are not task runs: each is a stdio MCP server the
-	// harness launches as a subprocess of itself, with none of the task env
-	// below, so they are dispatched before configFromEnv rather than folded
-	// into it.
+	// The subcommands are not task runs, so they are dispatched before
+	// configFromEnv rather than folded into it: mcp-relay and mcp are stdio
+	// MCP servers the harness launches as subprocesses of itself, with none of
+	// the task env below, and render-persona runs in an init container.
 	//
 	// `worker-adapter mcp-relay <url>` is what a profile persona's broker
 	// servers are rendered as (worker-adapter/mcprelay.go): it carries

@@ -10,8 +10,9 @@ import (
 
 // VerifyRendering checks a rendering the harness is about to read: nothing
 // in it may be writable (no write bit on any entry, and none owned by uid,
-// the harness's user, which could add one; a negative uid skips that part), and its files must match the content
-// manifest the render step wrote beside them. A worker that requires its
+// the harness's user, which could add one; a negative uid skips that part),
+// and its files must match the content manifest the render step wrote
+// beside them. A worker that requires its
 // persona refuses one that fails, rather than read files it might have been
 // able to change.
 func VerifyRendering(root string, uid int) error {

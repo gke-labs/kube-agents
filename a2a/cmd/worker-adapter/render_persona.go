@@ -11,8 +11,10 @@ import (
 )
 
 // renderPersonaMain is `worker-adapter render-persona --harness H --in DIR
-// --out DIR`: the persona's rendering for the harness, with the MCP relay the
-// worker itself renders with, sealed read-only. The persona's integrity is
+// --out DIR`: the persona's rendering for the harness, sealed read-only. The
+// relay target comes from CREDENTIAL_PROXY_URL only so that the render
+// accepts the MCP servers the persona grants; the rendering itself carries no
+// MCP configuration. The persona's integrity is
 // required as lib.EnvPersonaIntegrity says, as for the worker.
 func renderPersonaMain(args []string, getenv func(string) string) int {
 	fs := flag.NewFlagSet(workeradapter.RenderPersonaCommand, flag.ContinueOnError)
