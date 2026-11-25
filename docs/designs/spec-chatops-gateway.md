@@ -1646,7 +1646,8 @@ The gateway tells the adapter a task's ends through an optional `TaskObserver` i
 Discord and Google Chat do not implement: a human reads the chat, so the rendered message is their
 whole interface, while a program must not have to parse `✅ **completed**` to know a task is
 over. (The Slack adapter implements it for one reason of its own, given in its section: a task
-starting or ending in a thread is what its session-thread cache keys on.) The
+starting or ending in a thread is what its session-thread cache keys on. The Teams adapter
+implements it for its typing indicator, in its section.) The
 start and the accept are separate calls because the id and the submission are different facts,
 as the refusal above turns on. The terminal says who declared it, which is the difference between
 an executor that failed, a task that never reached the bus, the supervisor's word about an
@@ -3287,12 +3288,14 @@ names a post (`postKindOf`), so an alert its triage edits stays as it was.
 While work is going on in a conversation the adapter keeps Teams's typing indicator on there
 (`teams_typing.go`): a `typing` activity posted through the passthrough, and again every three
 seconds because Teams clears it. Teams draws no reaction and no Working… status, and a line or a
-plan sitting unchanged does not read as work. The indicator is held by each task the gateway
+plan sitting unchanged does not read as work. The indicator is held by each chain the gateway
 started there (`TaskObserver`) and by the conversation's session mark while its ask is open and
 not blocked (`MarkObserver`), which is how card work the gateway cannot see keeps it on, as it
-keeps Slack's Working… status (`slackSession.wanted`). It stops with the last hold, when the
-settle is blocked (the work waits on the person), and ten minutes after it started at the
-latest (`teamsTypingMax`), since only a notify settles an older ask. A post that fails is
+keeps Slack's Working… status (`slackSession.wanted`). A blocked settle (the work waits on the person) releases the mark's hold and pauses the posts
+even under a chain still running, since "is typing" under a question would mislead. The
+indicator stops with the last hold, and ten minutes after the newest hold was added at the
+latest (`teamsTypingMax`), since only a notify settles an older ask; a later hold starts it
+again. A post that fails is
 dropped and the next one tries again.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager

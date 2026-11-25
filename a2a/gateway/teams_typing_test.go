@@ -156,3 +156,41 @@ func TestTeamsDoesNotTypeForASettledMark(t *testing.T) {
 		t.Fatalf("%d typing posts for a settled or blocked mark, want none", n)
 	}
 }
+
+// A task that asks the person a question is still running, and the mark
+// says the work waits on them: the indicator pauses there, and comes back
+// when the mark says the work is on again.
+func TestTeamsDoesNotTypeWhileARunningTaskWaitsOnThePerson(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 2 })
+	a.MarkChanged(conversation, "investigate", markSettleBlocked)
+	settled := teamsTypingSettled(t, relay)
+	time.Sleep(10 * testTeamsTypingInterval)
+	if now := teamsTypingCount(relay); now != settled {
+		t.Fatalf("typing posts went on while the work waited on the person: %d then %d", settled, now)
+	}
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator came back", func() bool { return teamsTypingCount(relay) >= settled+2 })
+	a.MarkChanged(conversation, "", "")
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+}
+
+// The bound runs from the newest hold: a second ask late in the first's
+// time is not cut off when the first's would have ended.
+func TestTeamsTypingBoundRunsFromTheNewestHold(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 12 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	start := time.Now()
+	a.TaskStarted(conversation, "task-1")
+	time.Sleep(8 * testTeamsTypingInterval)
+	a.TaskStarted(conversation, "task-2")
+	// Past the first hold's bound, inside the second's.
+	time.Sleep(time.Until(start.Add(15 * testTeamsTypingInterval)))
+	before := teamsTypingCount(relay)
+	waitFor(t, "the indicator went on for the second task", func() bool { return teamsTypingCount(relay) >= before+2 })
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+}
