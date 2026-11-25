@@ -44,6 +44,18 @@ func sweepAfterTurn() error {
 	}
 	killEveryoneButMe()
 	reapKilledChildren(leftoverReapBound)
+	return checkTurnBoundary()
+}
+
+// checkTurnBoundary is the second half of sweepAfterTurn on its own: the
+// adapter is the container's init and no other process is alive, waiting
+// briefly for any a kill just reached. A driver that takes one turn per
+// process calls it before each spawn (PrepareTurn), after the last
+// process's exit has run killLeftovers.
+func checkTurnBoundary() error {
+	if pid := adapterPID(); pid != containerInitPID {
+		return fmt.Errorf("starting a turn needs the adapter as the container's init (pid %d, not %d)", containerInitPID, pid)
+	}
 	var others []int
 	for deadline := time.Now().Add(sweepSettle); ; {
 		var err error
