@@ -1955,16 +1955,20 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// terminal is its end. One whose own terminal is already on the stream
 	// (the relay missed it) has ended: its children's ends are still booked
 	// (a child that completed is recorded completed, not cancelled as live
-	// below), but none is sent to it. It is marked observed first
-	// (profileParentListens reads the mark), as the heal below marks it for
-	// that same terminal: with its batch on the record its request was
-	// handled, so the terminal takes the plain final case. A read that
-	// failed leaves it unmarked, and the batch heal sends as before.
+	// below), but none is sent to it: for that pass it is marked endedUnread,
+	// in memory only, which profileParentListens reads. Its own terminal is
+	// then handled below as always (TerminalObserved, its result's delivery).
+	// A read that failed leaves it unmarked, and the batch heal sends as
+	// before.
 	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
-		if err == nil && task.Final {
-			rec.MarkTerminalObserved(active.TaskID)
+		ended := err == nil && task.Final
+		if ended {
+			rec.setEndedUnread(active.TaskID, true)
 		}
 		g.healProfileBatch(ctx, rec, ref)
+		if ended {
+			rec.setEndedUnread(active.TaskID, false)
+		}
 	}
 	healed := false
 	var healedSource TerminalSource

@@ -735,6 +735,11 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 // not when a stop cancelled it with its child, or it has ended. It logs a
 // result it won't deliver.
 func (g *Gateway) profileParentListens(ctx context.Context, parent *TaskRef, child string) bool {
+	if parent.endedUnread {
+		g.log.Info("child result not delivered: the parent has ended (its terminal is on the stream, not yet handled)",
+			"child", child, "parent", parent.ID)
+		return false
+	}
 	if !parent.Canceled && !parent.TerminalObserved && g.parentEnded(ctx, parent.ID) {
 		// The relay retires a task's index entry on its terminal and sets
 		// no flag on the history entry.

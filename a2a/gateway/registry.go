@@ -421,6 +421,13 @@ type TaskRef struct {
 	// from the stream), so a queued or redelivered relayTerminal does not
 	// double-count in task_terminals_total.
 	TerminalObserved bool `json:"terminalObserved,omitempty"`
+	// endedUnread marks, for one heal pass and never in the store (it is
+	// unexported, so JSON skips it), a profile parent whose own terminal the
+	// heal found on its stream before handling it (healActiveTask): its
+	// batch's ends are booked but none is sent to it (profileParentListens).
+	// TerminalObserved isn't used for that, since its delivery path reads
+	// the mark as "observed earlier".
+	endedUnread bool
 	// Requester, Attribution and StartedAt are what a child task minted on
 	// this turn's behalf, or the wake-up turn after it, inherits: the
 	// allowlist is checked against Requester, the child's authority block is
@@ -873,6 +880,16 @@ func (rec *SessionRecord) MarkTerminalObserved(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].TerminalObserved = true
+			return
+		}
+	}
+}
+
+// setEndedUnread sets the task entry's endedUnread mark (TaskRef).
+func (rec *SessionRecord) setEndedUnread(taskID string, ended bool) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].endedUnread = ended
 			return
 		}
 	}

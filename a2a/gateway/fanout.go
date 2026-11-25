@@ -469,7 +469,10 @@ func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, pare
 			}
 		case fresh.BatchEnd.Unsent:
 			end := *fresh.BatchEnd
-			if g.profileBatchChildEnded(ctx, rec, parent, fresh, end) {
+			// The parent as the record has it now, not the copy this pass
+			// started with: a mark set since (endedUnread, a stop) holds.
+			now, _ := rec.TaskRefFor(parent.ID)
+			if g.profileBatchChildEnded(ctx, rec, now, fresh, end) {
 				end.Unsent, end.Text = false, ""
 				rec.setBatchEnd(fresh.ID, &end)
 				changed = true

@@ -276,7 +276,9 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 // batchTextPast reports a fan-out child's entry holding result text
 // (BatchEnd.Text) past AskTTL from its start.
 func (g *Gateway) batchTextPast(ref TaskRef, now time.Time) bool {
-	return ref.BatchEnd != nil && ref.BatchEnd.Text != "" && !ref.StartedAt.IsZero() &&
+	// An unsent end counts with no text too (a failure with no message):
+	// past the bound it can't be sent, and clearBatchText drops it.
+	return ref.BatchEnd != nil && (ref.BatchEnd.Text != "" || ref.BatchEnd.Unsent) && !ref.StartedAt.IsZero() &&
 		now.Sub(ref.StartedAt) >= g.cfg.AskTTL
 }
 
