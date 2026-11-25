@@ -710,7 +710,9 @@ entry of the chain), and never names the child or the wake: no start, accept, de
 terminal under either id. The turn that delegated ends quietly, and the root's one deliverable and
 terminal come at the chain's end - the wake's result, then the wake's terminal, in that order; when
 no wake runs, the root ends `canceled` for a requester's `stop` and `failed` with
-`reason: wake-not-started - …` otherwise, with nothing delivered. The hand-off line
+`reason: wake-not-started - …` otherwise, with nothing delivered. The gateway logs the
+wake-not-started end as a second `task terminal` line under the root's id: its `state` is `failed`
+and its `source` is `gateway-chain-end`, a source only the log carries. The hand-off line
 (`delegated to <addressee>`) is never a deliverable: a session turn whose stream carries a delegate
 request and which minted no child ends the root `failed`, with nothing delivered -
 `reason: delegation-refused - <the room's notice>` when the gateway refused it, and
