@@ -296,6 +296,33 @@ func TestScopeClustersSkipsABadEntryAlone(t *testing.T) {
 	mustPart(t, got)
 }
 
+// TestScopeClustersListsAnExplicitProjectTheMapCarries: once the publisher
+// lists the explicit and management projects too (the broker scope role's
+// clusters-list widening), each is in the clusters map with no member row.
+// Their clusters are listed like a member's, and neither is counted unlisted.
+func TestScopeClustersListsAnExplicitProjectTheMapCarries(t *testing.T) {
+	t.Parallel()
+	decl := scopeFrom(t, scTestScope)
+	now := time.Now()
+	stamp := now.UTC().Format(time.RFC3339)
+	doc := scParseDoc(t, scTestDocument(t, decl, now, false))
+	doc.Clusters = json.RawMessage(`{
+		"explicit-a": {"at": "` + stamp + `", "clusters": [["us-west1", "e1"]]},
+		"` + scTestManagement + `": {"at": "` + stamp + `", "clusters": [["us-east4", "m1"]]},
+		"member-a": {"at": "` + stamp + `", "clusters": [["us-central1", "a1"]]}
+	}`)
+	got := scBuild(decl, doc, now, "")
+	want := lib.ScopeClusters{Count: 3, Clusters: []lib.ScopeCluster{
+		{Project: "explicit-a", Location: "us-west1", Cluster: "e1"},
+		{Project: "member-a", Location: "us-central1", Cluster: "a1"},
+		{Project: scTestManagement, Location: "us-east4", Cluster: "m1"},
+	}, UnlistedProjects: []string{"member-b", "member-c"}, UnlistedCount: 2, OldestListing: stamp}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("a map carrying the explicit and management projects =\n%+v\nwant\n%+v", got, want)
+	}
+	mustPart(t, got)
+}
+
 // TestScopeClustersAgeUnknownForAFutureListing: a listing stamped ahead of
 // this clock gives no age, so the page leaves the oldest listing out rather
 // than reporting the others' age as the page's.
