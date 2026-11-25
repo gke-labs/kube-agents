@@ -597,7 +597,7 @@ To move this group, needed: the dial and post-merge state somewhere other than t
 
 ## Designs for the Blockers
 
-- Blocker 15 ([#6674](https://github.com/gke-labs/kube-agents/issues/6674)): [`profile-pod-telemetry.md`](profile-pod-telemetry.md) proposes how a profile pod ships its log lines, its records of tool calls and messages, its traces and its metrics.
+- Blocker 15 ([#6674](https://github.com/gke-labs/kube-agents/issues/6674)): [`profile-pod-telemetry.md`](profile-pod-telemetry.md) proposes a counterpart, or "not needed" with a reason, for each signal that the platform agent's pod ships: log lines, records of tool calls and messages, traces and metrics.
 
 ## Counts
 
