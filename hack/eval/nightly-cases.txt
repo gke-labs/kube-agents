@@ -1192,10 +1192,12 @@
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
 # #7179 (#2799): read-only consistency probe over the seeded fleet's
-# drift-pool-outlier role on slot c, grading whether the reply names the
-# outlier cluster, names cpuCfsQuota, and explains that disabling cpuCfsQuota
-# leaves workload CPU limits unenforced (no CFS CPU throttling), without
-# mutating any cluster or opening a ledger run or pull request. deployer: noop.
+# drift-pool-outlier role on slot c (50 GB boot disk and
+# kubeletConfig.podPidsLimit: 4096), grading whether the reply names the
+# outlier cluster and its planted boot-disk and kubeletConfig drift, names
+# cpuCfsQuota, and explains that disabling cpuCfsQuota leaves workload CPU
+# limits unenforced (no CFS CPU throttling), without mutating any cluster or
+# opening a ledger run or pull request. deployer: noop.
 ./tasks/consistency-kcc-kubelet-cfs-quota-drift/task.yaml
 
 # #2800: the drift audit's kubelet-config facet, the second voted by node
