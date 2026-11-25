@@ -120,3 +120,37 @@ func unseal(t *testing.T, root string) {
 		return nil
 	})
 }
+
+// A rerun in the same pod, as an init container started again, replaces what
+// an earlier run left, sealed or half-written, with a whole sealed rendering.
+func TestARenderRerunReplacesWhatAnEarlierRunLeft(t *testing.T) {
+	parent := t.TempDir()
+	out := filepath.Join(parent, "persona")
+	t.Cleanup(func() { unseal(t, parent) })
+	if err := RenderPersonaTo("../../agents/fleet-audit/persona", out, persona.CoreAgent, renderRelay, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenderPersonaTo("../../agents/cluster/persona", out, persona.CoreAgent, renderRelay, false); err != nil {
+		t.Fatalf("a rerun over a sealed rendering: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "skills", "gke-stall-detection")); err != nil {
+		t.Errorf("the rerun's rendering isn't in place: %v", err)
+	}
+	// A half-written leftover (a writable directory with a stray file).
+	unseal(t, out)
+	if err := os.WriteFile(filepath.Join(out, "stray"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenderPersonaTo("../../agents/fleet-audit/persona", out, persona.CoreAgent, renderRelay, false); err != nil {
+		t.Fatalf("a rerun over a partial rendering: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "stray")); !os.IsNotExist(err) {
+		t.Errorf("the leftover's stray file survived: %v", err)
+	}
+	if entries, _ := os.ReadDir(parent); len(entries) != 1 {
+		t.Errorf("the parent holds %d entries, want only the rendering", len(entries))
+	}
+	if info, err := os.Stat(out); err != nil || info.Mode().Perm() != 0o555 {
+		t.Errorf("the rendering's top is %v, %v; want sealed 0555", info, err)
+	}
+}

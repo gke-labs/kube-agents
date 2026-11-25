@@ -44,6 +44,13 @@ func loadPersona(ctx context.Context, dir string, required bool) (string, []adkt
 		// own prompt.
 		return "", nil, nil
 	}
+	if required {
+		// A pod configured for a persona reads only a sealed rendering that
+		// matches the manifest written beside it.
+		if err := coreagent.VerifyRendering(dir, personaOwnerUID); err != nil {
+			return "", nil, err
+		}
+	}
 	r, err := coreagent.Snapshot(dir)
 	if err != nil {
 		return "", nil, err
@@ -127,3 +134,8 @@ func executables(skills fs.FS) (map[string][]string, error) {
 	})
 	return exec, err
 }
+
+// personaOwnerUID is the user a rendering must not belong to: the harness's
+// own, which could make it writable again. Tests, which write the rendering
+// as the same user, turn the check off.
+var personaOwnerUID = os.Getuid()

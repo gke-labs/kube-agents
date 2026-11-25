@@ -69,6 +69,34 @@ func checkCoreAgentPersonaRender(t *testing.T, imageVolumes bool) {
 			t.Errorf("the render mounts %s", m.Name)
 		}
 	}
+	// The render reads the persona as the worker does: the same mount, the
+	// payload subPath under image volumes included.
+	var renderPersona, workerPersona corev1.VolumeMount
+	for _, m := range render.VolumeMounts {
+		if m.Name == "persona" {
+			renderPersona = m
+		}
+	}
+	for _, m := range spec.Containers[0].VolumeMounts {
+		if m.Name == "persona" {
+			workerPersona = m
+		}
+	}
+	if !reflect.DeepEqual(renderPersona, workerPersona) || !renderPersona.ReadOnly || renderPersona.MountPath != "/persona" {
+		t.Errorf("the render's persona mount %+v, want the worker's %+v", renderPersona, workerPersona)
+	}
+	if imageVolumes && renderPersona.SubPath != "files" {
+		t.Errorf("under image volumes the render's persona subPath is %q, want files", renderPersona.SubPath)
+	}
+	// Requests and limits, as a quota or Autopilot needs.
+	for _, r := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+		if _, ok := render.Resources.Requests[r]; !ok {
+			t.Errorf("the render requests no %s", r)
+		}
+		if _, ok := render.Resources.Limits[r]; !ok {
+			t.Errorf("the render has no %s limit", r)
+		}
+	}
 
 	worker := spec.Containers[0]
 	var mount *corev1.VolumeMount

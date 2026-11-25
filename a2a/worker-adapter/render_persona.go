@@ -1,6 +1,7 @@
 package workeradapter
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -25,11 +26,14 @@ const (
 
 // RenderPersonaTo loads the persona at in (refusing one that differs from
 // its build-time manifest, or has none when requireIntegrity), renders it
-// for h with relay as the MCP relay target, writes the rendering into out
-// (which must be empty or absent) with a content manifest beside it, and
-// seals it: every directory 0555 and every file 0444 (0555 for a script).
-// The worker reads the rendering through a read-only mount; the modes are so
-// that nothing in it is writable whatever mounts it.
+// for h with relay as the MCP relay target, and puts the rendering at out
+// with a content manifest beside it, sealed: every directory 0555 and every
+// file 0444 (0555 for a script). The worker reads it through a read-only
+// mount; the modes are so that nothing in it is writable whatever mounts it.
+//
+// It renders into a new directory beside out and renames it into place, so
+// out is either the whole sealed rendering or absent, and a rerun in the same
+// pod (an init container started again) replaces what an earlier run left.
 func RenderPersonaTo(in, out string, h persona.Harness, relay persona.Relay, requireIntegrity bool) error {
 	p, err := persona.LoadWithOptions(in, persona.Options{RequireIntegrity: requireIntegrity})
 	if err != nil {
@@ -46,18 +50,67 @@ func RenderPersonaTo(in, out string, h persona.Harness, relay persona.Relay, req
 	if err := render.CheckOutput(output); err != nil {
 		return err
 	}
-	if err := render.WriteFiles(out, output.Files); err != nil {
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil { // #nosec G301 -- the parent the rendering is renamed into
+		return err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(out), "."+filepath.Base(out)+"-")
+	if err != nil {
+		return err
+	}
+	done := false
+	defer func() {
+		if !done {
+			_ = removeSealed(tmp)
+		}
+	}()
+	dir := filepath.Join(tmp, "r")
+	if err := render.WriteFiles(dir, output.Files); err != nil {
 		return err
 	}
 	files := map[string][]byte{}
 	for _, f := range output.Files {
 		files[f.Path] = f.Data
 	}
-	manifest := filepath.Join(out, persona.IntegrityManifestFile)
+	manifest := filepath.Join(dir, persona.IntegrityManifestFile)
 	if err := os.WriteFile(manifest, persona.FormatIntegrityManifest(files), sealedFileMode); err != nil { // #nosec G306 -- read-only, and readable by the harness user by design
 		return err
 	}
-	return seal(out, output.Files)
+	if err := seal(dir, output.Files); err != nil {
+		return err
+	}
+	// What an earlier run left goes first: a sealed rendering, or a part of one.
+	if err := removeSealed(out); err != nil {
+		return err
+	}
+	// A directory moves to another parent only while it is writable itself
+	// (its ".." changes), so the top is sealed once it is in place.
+	if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302 -- sealed below, once renamed
+		return err
+	}
+	if err := os.Rename(dir, out); err != nil {
+		return err
+	}
+	done = true
+	if err := os.Chmod(out, sealedDirMode); err != nil {
+		return err
+	}
+	return os.Remove(tmp)
+}
+
+// removeSealed removes root, a rendering this user wrote and may have
+// sealed, making its directories writable again first. An absent root is
+// nothing to remove.
+func removeSealed(root string) error {
+	if _, err := os.Lstat(root); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(p, 0o700) // #nosec G302 -- the directory is about to be removed
+		}
+		return nil
+	})
+	return os.RemoveAll(root)
 }
 
 // seal makes every file under root read-only (a script keeps its execute

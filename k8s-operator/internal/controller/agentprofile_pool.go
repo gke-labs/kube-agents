@@ -231,7 +231,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 			Name: profileWorkerAgentPersonaVolume, MountPath: coreAgentPersonaPath, SubPath: coreAgentPersonaSubPath, ReadOnly: true,
 		})
 		env = append(env, corev1.EnvVar{Name: coreAgentPersonaRequiredEnv, Value: "true"})
-		initContainers = append(append([]corev1.Container(nil), initContainers...), coreAgentPersonaRenderContainer(agent, profile))
+		initContainers = append(append([]corev1.Container(nil), initContainers...), coreAgentPersonaRenderContainer(agent, profile, rendered))
 	}
 	// Every writable mount is emptied by the worker after each task, so one
 	// task's files never reach the next on a warm pod. The list is derived
@@ -551,7 +551,11 @@ const (
 // coreAgentPersonaRenderContainer renders and seals the persona. It gets only
 // the broker's address, which the render names as its MCP servers' relay
 // target: no credential, token or bus configuration.
-func coreAgentPersonaRenderContainer(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile) corev1.Container {
+func coreAgentPersonaRenderContainer(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile, rendered profilepod.Rendered) corev1.Container {
+	// The worker's own persona mount, so the render reads the persona the
+	// way the worker does (with the payload subPath under image volumes).
+	persona, _ := rendered.PersonaMount()
+	persona.ReadOnly = true
 	return corev1.Container{
 		Name:  coreAgentPersonaRenderName,
 		Image: profile.Spec.Harness.Image,
@@ -561,9 +565,10 @@ func coreAgentPersonaRenderContainer(agent *agentv1alpha1.PlatformAgent, profile
 		},
 		Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)}},
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: profilepod.PersonaVolumeName, MountPath: profilepod.PersonaMountPath, ReadOnly: true},
+			persona,
 			{Name: profileWorkerAgentPersonaVolume, MountPath: coreAgentPersonaRenderPath},
 		},
+		Resources: profilepod.HelperResources(),
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                ptr.To(int64(coreAgentPersonaRenderUID)),
 			RunAsNonRoot:             ptr.To(true),
