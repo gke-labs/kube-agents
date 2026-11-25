@@ -73,9 +73,13 @@ var (
 	_ MarkObserver = (*TeamsAdapter)(nil)
 )
 
-// TaskStarted records a task running in the conversation, which keeps the
-// indicator off while its line shows the work, and restarts the bound of
-// an open ask (TaskObserver).
+// TaskStarted records the task running in the conversation, which keeps
+// the indicator off while its line shows the work, and restarts the bound
+// of an open ask (TaskObserver). A conversation has one top-level chain at
+// a time, so the new task takes the place of any earlier one: a stopped
+// task whose executor never confirms is replaced by the next ask with no
+// end announced, and would otherwise keep the indicator off for that ask's
+// card work until the bound.
 func (a *TeamsAdapter) TaskStarted(conversation, taskID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -84,7 +88,7 @@ func (a *TeamsAdapter) TaskStarted(conversation, taskID string) {
 		a.forgetTypingLocked(c, t, now)
 	}
 	t := a.typingLocked(conversation)
-	t.tasks[taskID] = now
+	t.tasks = map[string]time.Time{taskID: now}
 	t.deadline = now.Add(a.typingMax)
 	a.startTypingLocked(conversation, t)
 }

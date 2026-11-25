@@ -187,6 +187,20 @@ func TestTeamsForgetsATaskThatNeverEnds(t *testing.T) {
 	a.MarkChanged(conversation, "", "")
 }
 
+// A stopped task whose end is never announced is replaced by the next ask's
+// task: it does not keep the indicator off for that ask's card work.
+func TestTeamsTypesForTheAskAfterATaskThatNeverEnded(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	a.MarkChanged(conversation, "investigate", "")
+	a.TaskStarted(conversation, "task-2")
+	teamsTypingQuiet(t, relay, "while the second task was running")
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+	waitFor(t, "the indicator posted for the second ask's card work", func() bool { return teamsTypingCount(relay) >= 2 })
+	a.MarkChanged(conversation, "", "")
+}
+
 // A chain that ran past the bound and then hands off still gets the
 // indicator for its card work: the bound runs again from the chain's end.
 func TestTeamsTypesAfterALongTaskHandsOff(t *testing.T) {
