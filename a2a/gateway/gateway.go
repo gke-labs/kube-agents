@@ -3361,7 +3361,8 @@ type taskStart struct {
 	// the waiting profile tasks above it, set only by a profile parent's
 	// child mint.
 	ProfileChain []string
-	// Scheduled goes onto a profile task's history entry (TaskRef.Scheduled).
+	// Scheduled goes onto the task's history entry (TaskRef.Scheduled): a
+	// profile task's below a scheduled run, or a wake's continuing one.
 	Scheduled bool
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
@@ -3701,8 +3702,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.Tier = string(ts.Route.Tier)
 		ref.Scope = string(ts.Route.Scope)
 		ref.ProfileChain = ts.ProfileChain
-		ref.Scheduled = ts.Scheduled
 	}
+	// The schedule mark goes on whatever carries it: a profile task below a
+	// scheduled run, and a wake continuing such a chain, which has no route
+	// (startWake), so a delegation from it is refused as one below a schedule.
+	ref.Scheduled = ts.Scheduled
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
 		for i := range rec.Tasks {

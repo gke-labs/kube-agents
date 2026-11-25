@@ -866,7 +866,8 @@ stop record for a profile task, and nothing a canceled task writes afterwards re
 agents that turn's requester may delegate to, `platform` first and then each AgentProfile whose card
 admits them, by the same checks a delegation meets (the target's list and the A2A door's own-list
 rule, for the requester and everyone else whose text reached the session, and the card's tiers). A
-wake carries none, since it runs without the tool. A profile's entry carries its card's routing
+wake carries none unless the gateway let it delegate again (#6861), and then it carries the list a turn
+by its requester would; every other wake runs without the tool. A profile's entry carries its card's routing
 blurb and the parameters the card declares (`{"name", "required"?}`). The session's delegate tool
 names them, so the model is told what it can address. The part is a hint, not a grant: the gateway
 checks the delegation again when it arrives. It rides every turn, so a reused pod keeps up with

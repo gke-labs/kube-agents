@@ -620,8 +620,8 @@ by the `chat` profile's own deadline, and the executors it delegates to run to t
 two do not nest. When the session delegates, its turn completes with a reply that says so
 ("delegated to `platform`, task `t_…`"), the gateway relays the child's events into the
 thread as it does for any task, and the child's terminal wakes the session for one more turn
-with the child's result as its input, so the session can synthesize it (the wake can't delegate
-again; below). A follow-up
+with the child's result as its input, so the session can synthesize it (whether the wake may delegate
+again is the gateway's call; below). A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
 today: the platform executor queues each one and answers it after the current turn (on its
 `api` executor; the `cli` executor refuses it `no-resume`), and

@@ -253,6 +253,33 @@ func wakeDelegateTargets(t *testing.T, wakeDelegate bool) {
 	}
 }
 
+// TestAWakeBelowAScheduleKeepsTheMark: a wake has no route, and the schedule
+// mark still goes on its entry, so the gateway reads it as below a schedule
+// and refuses a delegation from it (delegateEntryCheck).
+func TestAWakeBelowAScheduleKeepsTheMark(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	rec := &SessionRecord{Key: "discord:g1/t-wk-sched", ContextID: "ctx-wk-sched", Kind: "group"}
+	r.adapter.inbox <- InboundMessage{Conversation: rec.Key, Kind: "group", AuthorID: "1001", MessageID: "wks-1", Text: "hello"}
+	waitFor(t, "the session spawned", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	r.awaitTask(t, session)
+	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
+	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, Scheduled: true})
+	if !ok {
+		t.Fatal("the wake wasn't submitted")
+	}
+	ref, found := got.TaskRefFor(taskID)
+	if !found || !ref.Scheduled || !ref.belowSchedule() {
+		t.Fatalf("the wake's entry = %+v (found %v), want the schedule mark", ref, found)
+	}
+	_, no := r.g.delegateEntryCheck(got, ref, false, lib.DelegateTask{Addressee: targetPlatform}, true)
+	if no == nil || no.rule != ruleDelegationUnattendedChild {
+		t.Fatalf("a delegation from the wake = %+v, want %s", no, ruleDelegationUnattendedChild)
+	}
+}
+
 // The people the list is checked for are the people the delegation will be
 // checked for: the incarnation's set with this turn's requester added, or,
 // for an incarnation whose set isn't started yet (a pod the primer will
