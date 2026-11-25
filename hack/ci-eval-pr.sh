@@ -4579,7 +4579,9 @@ echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(
 # child holds the job's stdout open, and it stops when the job's pod does.
 TWIN_WORKER_LOG_DIR="${ARTIFACT_DIR}/worker-logs"
 mkdir -p "${TWIN_WORKER_LOG_DIR}" || true
-(
+# Double-forked: the follower is a grandchild, so the fan-out's bare `wait`
+# (which waits for every child of this shell) never waits on it.
+( (
   set +e +o pipefail
   twin_kctl=(kubectl)
   if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then twin_kctl+=(--context "${AGENT_CLUSTER_CONTEXT}"); fi
@@ -4599,7 +4601,7 @@ mkdir -p "${TWIN_WORKER_LOG_DIR}" || true
     done
     sleep 15
   done
-) > "${TWIN_WORKER_LOG_DIR}/follower.log" 2>&1 < /dev/null &
+) > "${TWIN_WORKER_LOG_DIR}/follower.log" 2>&1 < /dev/null & )
 
 # How far a judged mean may fall below main's before rung 6 fires. 0.5 is
 # arithmetic on the measured spread, not a preference: three repetitions of one
