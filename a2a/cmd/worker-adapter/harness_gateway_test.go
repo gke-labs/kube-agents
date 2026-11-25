@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
@@ -322,4 +323,44 @@ func envCount(env []string, key string) int {
 		}
 	}
 	return n
+}
+
+// TestThePodsStreamIdleBoundReachesTheProxy: A2A_GATEWAY_PROXY_STREAM_IDLE_SECONDS
+// sets the proxy's idle bound, so a stalled answer breaks after it; an
+// unusable value is logged and the default is kept.
+func TestThePodsStreamIdleBoundReachesTheProxy(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]}}]}\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(up.Close)
+	env := map[string]string{gatewayProxyStreamIdleEnv: "1"}
+	start := gatewayProxyStarterFromEnv(func(k string) string { return env[k] }, quietLog())
+	p, err := start(up.URL, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	began := time.Now()
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Post(p.URL+"/v1beta/models/m:streamGenerateContent", "application/json", strings.NewReader("{}"))
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if err == nil || time.Since(began) > 8*time.Second {
+		t.Errorf("err %v after %v; want the connection broken about 1s in", err, time.Since(began))
+	}
+
+	var logged strings.Builder
+	_ = gatewayProxyStarterFromEnv(func(k string) string { return map[string]string{gatewayProxyStreamIdleEnv: "soon"}[k] }, slog.New(slog.NewTextHandler(&logged, nil)))
+	if !strings.Contains(logged.String(), gatewayProxyStreamIdleEnv) {
+		t.Errorf("an unusable value logged %q; want a warning naming the variable", logged.String())
+	}
 }

@@ -198,7 +198,7 @@ func run() int {
 	// proxy, started once and closed when the worker exits
 	// (startHarnessGateway). A proxy that can't start refuses the worker:
 	// the harness never runs pointed at anything else.
-	gatewayProxy, err := applyHarnessGateway(&cfg, os.Getenv, workeradapter.StartGatewayProxy, log)
+	gatewayProxy, err := applyHarnessGateway(&cfg, os.Getenv, gatewayProxyStarterFromEnv(os.Getenv, log), log)
 	if err != nil {
 		log.Error("worker refused", "err", err)
 		return 1

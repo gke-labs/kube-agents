@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
@@ -95,4 +97,25 @@ func applyHarnessGateway(cfg *workeradapter.Config, getenv func(string) string, 
 	}
 	cfg.HarnessEnv = env
 	return closer, nil
+}
+
+// gatewayProxyStreamIdleEnv sets the gateway proxy's stream idle bound, in
+// seconds (workeradapter.GatewayProxyOptions.StreamIdle). Unset, empty or
+// not a positive whole number: the default.
+const gatewayProxyStreamIdleEnv = "A2A_GATEWAY_PROXY_STREAM_IDLE_SECONDS"
+
+// gatewayProxyStarterFromEnv is the starter run() uses: the proxy with the
+// pod's stream idle bound, if it sets one.
+func gatewayProxyStarterFromEnv(getenv func(string) string, log *slog.Logger) gatewayProxyStarter {
+	var opts workeradapter.GatewayProxyOptions
+	if raw := getenv(gatewayProxyStreamIdleEnv); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			opts.StreamIdle = time.Duration(n) * time.Second
+		} else {
+			log.Warn("ignoring an unusable stream idle bound; using the default", gatewayProxyStreamIdleEnv, raw, "default", workeradapter.DefaultGatewayProxyStreamIdle.String())
+		}
+	}
+	return func(gateway string, log *slog.Logger) (*workeradapter.GatewayProxy, error) {
+		return workeradapter.StartGatewayProxyWith(gateway, log, opts)
+	}
 }
