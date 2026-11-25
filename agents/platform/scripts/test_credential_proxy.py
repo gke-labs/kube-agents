@@ -11222,25 +11222,19 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
 
-    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
-        # An exec pod's state volume is sized for no gcloud log files; the
-        # broker and the sidecar roles keep gcloud's default.
-        for role, off in (
-            (credential_proxy_client.EXEC_ROLE, True),
-            ("broker", False),
-            ("combined", False),
-        ):
+    def test_serve_turns_gcloud_file_logging_off_in_every_role(self):
+        # No role's state volume is sized for gcloud's log files: each command
+        # leaves one, and gcloud keeps them for 30 days.
+        for role in (credential_proxy_client.EXEC_ROLE, "broker", "combined"):
             with self.subTest(role=role):
                 self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
                 env = CredentialProxyHandler.executor.environment
-                self.assertEqual(
-                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
-                )
+                self.assertEqual("1", env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV))
 
     def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_commands(self):
         # The proxy gives the commands it runs a fixed list of names from its
         # own environment. These two, which an operator can set on the pod
-        # (`platformAgent.deployment.env`), are not on it, and the exec role
+        # (`platformAgent.deployment.env`), are not on it, and every role
         # sets the gcloud name itself, to its own value. This keeps both in the
         # proxy's environment from the start of `serve` to the end of each
         # command, and reads what a gcloud and a kubectl command were given.
@@ -11265,8 +11259,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             stand_ins[argv[0]] = str(stand_in)
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role, **pod_environment})
             executor = CredentialProxyHandler.executor
@@ -11290,7 +11284,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         # bootstrap command does not reach that list. This starts `serve` with
         # one, for each role, with both names in the proxy's environment, and
         # reads what the command was given. On GKE the operator's bootstrap
-        # command runs gcloud. The exec role sets the gcloud name itself, to
+        # command runs gcloud. Every role sets the gcloud name itself, to
         # its own value; the pod's value must not replace it.
         pod_environment = {
             "MALLOC_ARENA_MAX": "2",
@@ -11306,8 +11300,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         )
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             with self.subTest(role=role):
                 self._serve_with(
@@ -20279,6 +20273,36 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
             headers={"Content-Type": "application/json", **(headers or {})},
         )
 
+    def test_an_entries_list_filter_drops_an_excluded_clusters_entries(self):
+        # The same clause `gcloud logging read` gets (cluster_metadata_scope):
+        # ANDed onto the caller's filter, never parsed, so whatever it says the
+        # excluded cluster's entries don't come back.
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        clause = 'NOT resource.labels.cluster_name=~"^(scratch)$"'
+        for caller_filter, sent_filter in (
+            (self.ENTRIES_BODY["filter"], f'(\n{self.ENTRIES_BODY["filter"]}\n) AND {clause}'),
+            ('resource.labels.cluster_name="scratch"', f'(\nresource.labels.cluster_name="scratch"\n) AND {clause}'),
+            (None, clause),
+        ):
+            with self.subTest(filter=caller_filter):
+                self.upstream_bodies.clear()
+                body = dict(self.ENTRIES_BODY)
+                if caller_filter is None:
+                    body.pop("filter")
+                else:
+                    body["filter"] = caller_filter
+                status, _, _ = self._entries_list(body)
+                self.assertEqual(200, status)
+                [sent] = self.upstream_bodies
+                self.assertEqual(sent_filter, json.loads(sent)["filter"])
+
+    def test_an_entries_list_filter_that_could_swallow_the_clause_is_refused(self):
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        status, _, payload = self._entries_list({**self.ENTRIES_BODY, "filter": 'x="open'})
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, payload["rule"])
+        self.assertEqual([], self.upstream_bodies)
+
     def test_an_entries_list_reaches_the_upstream_as_the_brokers_own_post(self):
         self.reply.update(body=b'{"entries":[{"insertId":"a"}],"nextPageToken":"t"}')
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
@@ -21507,6 +21531,30 @@ class ScopeExecRouteTest(unittest.TestCase):
         self.assertEqual(200, status, body)
         self.assertEqual("c1 us-central1\n", body["stdout"])
         self.assertEqual(2, len(self.calls.read_text(encoding="utf-8").splitlines()))
+
+    def test_the_management_project_variable_opens_the_probe_for_that_project_alone(self):
+        mgmt_probe = [*SCOPE_PROBE[:5], "mgmt-proj", SCOPE_PROBE[6]]
+        self.refused({"argv": mgmt_probe}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        with mock.patch.dict(os.environ, {credential_proxy.scope_policy.MANAGEMENT_PROJECT_ENV: " mgmt-proj \n"}):
+            status, body = self.scope({"argv": mgmt_probe})
+            self.assertEqual(200, status, body)
+            self.assertEqual("c1 us-central1\n", body["stdout"])
+            # Only the clusters list takes it, and it opens nothing else.
+            self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+            self.refused({"argv": ["gcloud", "compute", "shared-vpc", "list-associated-resources", "mgmt-proj",
+                                   "--format=json(id,type)"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        self.assertEqual(["container clusters list --project mgmt-proj --format=value(name,location)"],
+                         self.calls.read_text(encoding="utf-8").splitlines())
+
+    def test_a_declared_project_opens_the_probe_unless_excluded(self):
+        declaration = json.loads(self.scope_file.read_text(encoding="utf-8"))
+        declaration["projects"] = ["team-a", "legacy-1"]
+        declaration["exclude"]["projects"] = ["legacy-*"]
+        self.scope_file.write_text(json.dumps(declaration), encoding="utf-8")
+        status, body = self.scope({"argv": [*SCOPE_PROBE[:5], "team-a", SCOPE_PROBE[6]]})
+        self.assertEqual(200, status, body)
+        self.refused({"argv": [*SCOPE_PROBE[:5], "legacy-1", SCOPE_PROBE[6]]},
+                     credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
 
     def test_a_failed_lookup_records_nothing(self):
         self.exit_file.write_text("1", encoding="utf-8")

@@ -10343,9 +10343,12 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "find . -exec true \\; -exec env \\;",
             "env$(true)",
             "python3 -c 'import os; print(os.environ)'",
+            # a service account's token from the metadata server
+            'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
         ]
         served = [
             "kubectl get secrets -n kube-system",
+            'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email',
             "kubectl get secret db -n prod --ignore-not-found",
             "kubectl get secrets -A 2>/dev/null",
             "kubectl get secrets -n prod | wc -l",

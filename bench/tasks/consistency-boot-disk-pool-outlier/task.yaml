@@ -1,0 +1,61 @@
+# The drift audit's `boot-disk` facet (fleet_consistency_drift_sop.md §4.15):
+# node pools vote on boot-disk type and size, and the pool that differs from
+# the cohort's pools is filed. The same full audit as
+# consistency-drift-outlier, graded on a different finding.
+#
+# Planted defect: seeded-c's default-pool runs a 50 GB boot disk where every
+# other pool in the stack runs 20 GB of the same type (bench/tf/fleet/main.tf,
+# seeded_c_default). Ten Linux pools vote, nine agree: 0.90, so the ladder
+# takes no step and the base-major finding stands. A cluster-level vote could
+# not grade this: three clusters of four is 0.75, two steps, and only a
+# base-critical facet survives that.
+#
+# Isolation class: cluster-read-only, GitOps-repo write (the ledger), as
+# consistency-drift-outlier documents.
+id: consistency-boot-disk-pool-outlier
+name: Drift audit names the node pool whose boot disk differs from its peers
+prompt: >-
+  Run the fleet consistency drift audit, following the
+  fleet-consistency-drift SOP.
+expected_output: >-
+  The ledger issue files a boot-disk finding against the default node pool of
+  the outlier cluster, names the boot-disk type and size the cohort's pools
+  hold and the one this pool holds, and says how many pools agree. The closing
+  response is the SOP's one line, carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: consistency
+
+# One role, by name, as bench-fleet-catalog.md requires. The role also asserts
+# the pool's kubelet setting, which the `kubelet-config` facet will read; while
+# that half reads drifted on a project, the lanes record this case there as
+# infrastructure.
+fixtures:
+  - drift-pool-outlier
+
+verification_spec:
+  # Graded against the ledger, not the chat reply: the SOP's closing line
+  # restates nothing. scope: finding_ids, because `boot-disk` is a roster slug
+  # and the body's evidence table prints it on a run that filed nothing.
+  - name: a-boot-disk-finding-was-filed
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
+      required_phrases: ["boot-disk", "seeded-c"]
+  # The finding is on the pool, not on the cluster: the object the ledger
+  # renders for a `boot-disk` finding is the planted pool.
+  - name: the-boot-disk-finding-names-the-planted-pool
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding
+      finding_check: ["boot-disk"]
+      required_phrases: ["NodePool/default-pool"]

@@ -270,7 +270,7 @@ def merge(
     the reply's buckets with the opening's added in, bucket by bucket and
     into the nested ones, as the card-wake merge sums two turns (an inject
     record's tokens are the chain's usage as the door reported it, null
-    where it reported none, and a null bucket adds nothing).
+    where the harness holds none, and a null bucket adds nothing).
 
     ``reply_wait_covered_session`` says that the reply turn's card wait ran
     and read the cards of the conversation's session, the opening turn's

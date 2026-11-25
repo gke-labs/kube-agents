@@ -160,6 +160,7 @@ Environment:
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import fcntl
 import http.client
 import hashlib
@@ -190,7 +191,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -381,6 +382,21 @@ _INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a cre
 _SESSION_CAP_JSONPATH = (
     'jsonpath={.spec.template.spec.containers[?(@.name=="gateway")].env[?(@.name=="A2A_MAX_SESSIONS")].value}'
 )
+# How soon after one respawn of the shared inject tunnel another is skipped:
+# a burst-reads run follows its conversations on threads, and every one of
+# them fails on the same dropped tunnel (burst_reads.py).
+_BURST_RESPAWN_DEBOUNCE_SECONDS = 5.0
+# The exchange outcomes that leave a task active, which the burst-reads run
+# cancels before its next level (the set _bound_stray cancels).
+_BURST_LEAVES_ACTIVE = frozenset(
+    {
+        inject.OUTCOME_DEADLINE,
+        inject.OUTCOME_QUEUED,
+        inject.OUTCOME_PARKED,
+        inject.OUTCOME_NEVER_STARTED,
+        inject.OUTCOME_UNCLASSIFIED,
+    }
+)
 # Appended to the run's message id on a delegation status turn, with the
 # turn's ordinal after it, so the ingress log tells the opening ask and each
 # follow-up apart -- and so the door's dedupe on the message id cannot fold a
@@ -445,18 +461,42 @@ _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
 # the top-level ``total`` too (:func:`_fold_worker_total`), so ``total`` is
 # everything the run billed, as on the api transport, while ``input`` and
 # ``output`` stay the front door's own and ``front_door`` keeps its buckets.
-# A run whose chain reported no usage keeps a null total whatever its
+# A run that holds no usage for the chain keeps a null total whatever its
 # workers billed, so the scorer's liveness rung still reads the task's
 # terminal there rather than passing on the workers' spend alone.
+# The buckets are also null when the harness holds no usage because the read
+# was not made, was skipped, or failed; the cause clause of that exchange's note
+# (``_INJECT_TOKENS_CAUSE_NOTES``) says which.
 _INJECT_TOKENS_NOTE = (
     "the inject transport's input and output buckets are the front door's turns as the "
     "gateway reported them: input counts cached reads too, and cached and reasoning are "
-    "null since Hermes reports no split; they are null when the gateway reported no usage; "
+    "null since Hermes reports no split; they are null when the harness holds no usage "
+    "for the front door; "
     "tokens.children holds the chain's child tasks (the platform router), and "
     "tokens.workers the delegated workers' counts when the delegation wait read them; "
     "total adds both to the front door's, as on the api transport, and stays null when "
-    "the chain reported no usage"
+    "the harness holds no usage for the chain"
 )
+# Appended to the note when the exchange holds no usage for the front door:
+# why, by how the usage read went (``Fold.usage_read``).
+_INJECT_TOKENS_CAUSE_PREFIX = "; no front door usage on this exchange: "
+_INJECT_TOKENS_CAUSE_NOTES = {
+    inject.USAGE_READ_NOT_MADE: (
+        "the exchange had no terminal from an executor, so the harness made no usage read"
+    ),
+    inject.USAGE_READ_SKIPPED: (
+        "the harness skipped the usage read, since the deadline of the wait, or of the "
+        "cancel's settle, had passed"
+    ),
+    inject.USAGE_READ_FAILED: "the usage read failed",
+    inject.USAGE_READ_UNANSWERED: "the gateway's answer to the usage read did not cover the task",
+    inject.USAGE_READ_ANSWERED: (
+        "the gateway answered the usage read with no count for the front door"
+    ),
+    inject.USAGE_READ_CANCEL_UNCONFIRMED: (
+        "no terminal confirmed the cancel after the timeout, so no usage read followed it"
+    ),
+}
 # Appended to the note when the gateway could not read a link of the chain.
 _INJECT_TOKENS_PARTIAL_NOTE = (
     "; partial: the gateway could not read every link of the chain, so the counts are "
@@ -2409,7 +2449,7 @@ def _fold_worker_total(tokens: dict[str, Any]) -> None:
     door's own buckets are copied under ``front_door`` first (its ``total``
     the front door's alone, without the chain's children). The other
     top-level buckets stay the front door's (:func:`_inject_tokens`). A run
-    whose chain reported no usage keeps its null ``total``: folding the
+    that holds no usage for the chain keeps its null ``total``: folding the
     workers in would let the scorer's liveness rung pass on the workers'
     spend alone, where it reads the task's terminal today.
     """
@@ -2888,6 +2928,7 @@ _KNOWN_DIRECTIVES = (
     profile_hook.PROFILE_DIRECTIVE,
     slack.HOME_POST_DIRECTIVE,
     session_cap.DIRECTIVE,
+    burst_reads.DIRECTIVE,
 )
 
 
@@ -3061,6 +3102,14 @@ def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bo
             exchange.fold.usage = settled.fold.usage
             exchange.fold.child_usage = settled.fold.child_usage
             exchange.fold.usage_partial = settled.fold.usage_partial
+        if timed_out:
+            # Why the buckets are null, when they are: the settle's read if
+            # it made one, and otherwise the cancel no terminal confirmed.
+            exchange.fold.usage_read = (
+                settled.fold.usage_read
+                if settled is not None and settled.fold.usage_read != inject.USAGE_READ_NOT_MADE
+                else inject.USAGE_READ_CANCEL_UNCONFIRMED
+            )
         if timed_out and settled is not None and settled.fold.child_addressees is not None:
             exchange.fold.child_addressees = settled.fold.child_addressees
     return timed_out, stop_pending
@@ -3323,8 +3372,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     ``tool_called`` checks with no ``result`` pattern aside then, or when
     the marker reports a loss).
     Tokens are the front door's usage as the probe reported it, null when
-    it reported none (:func:`_inject_tokens`), and ``metadata`` says which
-    buckets mean what. ``identity`` is the run, case
+    the harness holds none (:func:`_inject_tokens`), and ``metadata`` says which
+    buckets mean what and why they are null (:func:`_inject_tokens_note`).
+    ``identity`` is the run, case
     and repetition the key and message id were built from,
     stored beside the task id so the record joins to the gateway's ingress
     log.
@@ -3362,10 +3412,19 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             # the ``a2a.activity`` entry in the trajectory.
             "activity": fold.activity_summary,
             "progress": fold.progress or None,
-            "tokens_note": _INJECT_TOKENS_NOTE
-            + (_INJECT_TOKENS_PARTIAL_NOTE if fold.usage_partial else ""),
+            "tokens_note": _inject_tokens_note(fold),
         },
     )
+
+
+def _inject_tokens_note(fold: inject.Fold) -> str:
+    """What the record's buckets mean, and why the front door's are null when they are."""
+    note = _INJECT_TOKENS_NOTE
+    if _usage_buckets(fold.usage) is None:
+        note += _INJECT_TOKENS_CAUSE_PREFIX + _INJECT_TOKENS_CAUSE_NOTES[fold.usage_read]
+    if fold.usage_partial:
+        note += _INJECT_TOKENS_PARTIAL_NOTE
+    return note
 
 
 def _execute_slack(prompt: str) -> AgentResult:
@@ -3586,6 +3645,9 @@ class KubeAgentsHarness(AgentHarness):
         super().__init__(config)
         if os.environ.get(SKIP_REPORT_ONLY_JUDGES_ENV) == "1":
             _skip_report_only_judges()
+        from kube_agents_bench.cancel import install_cancel_scoring_guard
+
+        install_cancel_scoring_guard()
 
     # The purge's floor (:func:`_pod_start`), set by :meth:`run`; ``None`` for
     # a run that could not read it, or an ``_execute`` called without ``run``.
@@ -3691,6 +3753,12 @@ class KubeAgentsHarness(AgentHarness):
             result = self._execute_session_cap(prompt)
             _fold_worker_total(result.tokens)
             return result
+        if burst_reads.is_burst_reads_ask(prompt):
+            if transport != TRANSPORT_INJECT:
+                return AgentResult.errored(
+                    f"{burst_reads.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+                )
+            return self._execute_burst_reads(prompt)
         if transport == TRANSPORT_INJECT:
             result = self._execute_inject(prompt)
             _fold_worker_total(result.tokens)
@@ -3971,6 +4039,272 @@ class KubeAgentsHarness(AgentHarness):
         if unreleased:
             result.errors.append(_unreleased_note().lstrip("; "))
         return _recorded(result)
+
+    def _execute_burst_reads(self, prompt: str) -> AgentResult:
+        """A burst-reads ask (:mod:`burst_reads`, #7014): at each of the
+        directive's levels in turn, open that many ``/session``
+        conversations through the inject door at once, each with the case's
+        ask, and follow every one to its terminal, so the run records how
+        long concurrent sessions take when each fans out cluster reads.
+
+        Infrastructure, before anything is sent: a session cap below the
+        highest level or unreadable, and a budget below the gateway's floor
+        (refused as the inject transport refuses it). Infrastructure after:
+        a conversation queued or refused at submit, one no executor took,
+        one the gateway or supervisor ended, a door the harness could not
+        reach, and a straggler whose cancel was not published, which the
+        next level would overlap (:func:`burst_reads.infrastructure` names
+        the first). A level with one stops the run.
+
+        Graded otherwise: :data:`burst_reads.ENTRY` is completed when every
+        conversation of every level ended completed; a conversation still
+        running at ``AGENT_INJECT_TIMEOUT`` is cancelled and fails it. The
+        output is :func:`burst_reads.summary`; the trajectory carries the
+        entry, whose ``args`` hold the per-level and per-conversation
+        record, then each conversation's lifecycle tagged with its key. The
+        tunnel and its retry are the inject transport's
+        (:func:`_forward_inject_door`, :func:`_transport_retrying`), with
+        respawns from concurrent conversations collapsed into one. Every
+        task still running when the run ends is cancelled.
+        """
+        try:
+            ask = burst_reads.parse(prompt)
+            timeout = _numeric_env("AGENT_INJECT_TIMEOUT", _INJECT_DEFAULT_TIMEOUT, float)
+            local_port = _numeric_env("AGENT_INJECT_LOCAL_PORT", str(_INJECT_DEFAULT_LOCAL_PORT), int)
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+        assert ask is not None
+        directive = burst_reads.DIRECTIVE
+        agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
+        service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
+        author = os.environ.get("AGENT_INJECT_AUTHOR", inject.DEFAULT_AUTHOR)
+        token = os.environ.get("AGENT_INJECT_TOKEN", "").strip()
+        if not token:
+            return _infra_failure("AGENT_INJECT_TOKEN is unset and the inject door authenticates every request")
+
+        gateway = agent_service + _GATEWAY_LEASE_SUFFIX
+        raw = _kubectl_read(
+            ["get", "deployment", gateway, "-o", _SESSION_CAP_JSONPATH], f"deployment {gateway}'s session cap"
+        )
+        cap = session_cap.parse_cap(raw)
+        why = burst_reads.precondition(cap, ask.levels)
+        if why:
+            return _infra_failure(f"{directive}: {why}")
+
+        base_url = os.environ.get("AGENT_INJECT_URL")
+        own_tunnel = not base_url
+        respawn_lock = threading.Lock()
+        last_respawn = [0.0]
+
+        def _tunnel(reset: bool, after_standby: bool = False) -> None:
+            # Conversations run on threads and share one tunnel: the first
+            # to fail respawns it, and the others failing on the same drop
+            # retry through that one rather than tearing it down again.
+            if not own_tunnel:
+                return
+            with respawn_lock:
+                if reset and time.monotonic() - last_respawn[0] < _BURST_RESPAWN_DEBOUNCE_SECONDS:
+                    return
+                _forward_inject_door(local_port, agent_service, service, reset=reset, after_standby=after_standby)
+                if reset:
+                    last_respawn[0] = time.monotonic()
+
+        if own_tunnel:
+            failures = 0
+            while True:
+                try:
+                    _tunnel(reset=False)
+                    break
+                except RuntimeError as exc:
+                    failures += 1
+                    if failures >= _MAX_TRANSPORT_FAILURES:
+                        return _infra_failure(f"the inject tunnel failed to establish {failures} times running; last: {exc}")
+            base_url = f"http://127.0.0.1:{local_port}"
+        assert base_url
+
+        run_id, case_id, repetition = _inject_identity()
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
+        base = inject.conversation_key(run_id, case_id, repetition)
+        base_message = inject.message_id(run_id, case_id, repetition)
+        identity: dict[str, Any] = {"run_id": run_id, "case_id": case_id, "repetition": repetition}
+
+        def _new_task(level: int, index: int) -> inject.InjectTask:
+            return inject.InjectTask(
+                base_url=base_url, conversation=burst_reads.conversation_key(base, level, index),
+                prompt=ask.prompt, token=token, author=author,
+                message_id=burst_reads.message_id(base_message, level, index),
+            )
+
+        try:
+            # Refused before anything is started, as the inject transport
+            # refuses it: the read is of a fresh key and mints nothing.
+            probe = _new_task(ask.levels[0], 0)
+            probe.preflight()
+            inject.check_budget(timeout, probe.first_event_grace)
+        except inject.BudgetBelowFloor as exc:
+            return AgentResult.errored(f"AGENT_INJECT_TIMEOUT: {exc}")
+        except inject.InjectUnavailable as exc:
+            return _infra_failure(f"{directive}: the inject door could not be reached: {exc}")
+        identity["inject_only"] = probe.inject_only
+        identity["backend"] = probe.backend
+
+        levels: list[burst_reads.LevelRecord] = []
+        opened: list[tuple[inject.InjectTask, burst_reads.ConversationRecord]] = []
+        events: list[dict[str, Any]] = []
+        # Every conversation's usage, summed as the inject path records one
+        # conversation's (_inject_tokens), under the same lock as events.
+        tokens: dict[str, Any] = empty_tokens()
+        events_lock = threading.Lock()
+
+        def _follow(task: inject.InjectTask, rec: burst_reads.ConversationRecord, deadline: float) -> None:
+            """Submit one conversation, follow it to its terminal or the
+            deadline, cancel it at the deadline, and record what it did."""
+            rec.submitted_at = burst_reads.utc_stamp()
+            try:
+                task_id = _transport_retrying(task.submit, what=f"submit on {task.conversation}", respawn=_tunnel)
+            except inject.InjectUnavailable as exc:
+                # A POST nobody answered may still have started a task; its
+                # id is what the cancel on the way out has to name.
+                rec.task_id = task.recover_task_id()
+                rec.infrastructure = f"the inject door could not be reached at submit: {exc}"
+                return
+            rec.conversation = task.conversation
+            rec.task_id = task_id
+            if not task_id:
+                rec.refusal = task.refusal
+                rec.queued = task.refusal == inject.REFUSAL_QUEUED
+                rec.refused = not rec.queued
+                rec.infrastructure = (
+                    "the gateway queued it at the session cap, so something else holds session workers"
+                    if rec.queued
+                    else f"the gateway started no task ({task.refusal_text}): {task.note}"
+                )
+                return
+            try:
+                exchange = _transport_retrying(
+                    lambda: task.await_terminal(task_id, deadline=deadline),
+                    what=f"exchange on {task.conversation}",
+                    respawn=_tunnel,
+                )
+            except inject.InjectUnavailable as exc:
+                rec.infrastructure = f"the inject door could not be reached while following task {task_id}: {exc}"
+                return
+            rec.ended_at = burst_reads.utc_stamp()
+            leaves_active = exchange.outcome in _BURST_LEAVES_ACTIVE
+            timed_out, stop_pending = _bound_stray(task, exchange)
+            rec.timed_out = timed_out
+            rec.outcome = exchange.outcome
+            rec.terminal_state = exchange.fold.terminal
+            if leaves_active and not stop_pending:
+                rec.cancelled = True
+                if not task.cancel_sent:
+                    # Once more, as the session-cap fillers' release does.
+                    task.cancel(task_id, settle=0)
+                rec.cancel_published = task.cancel_sent
+                if not task.cancel_sent:
+                    rec.infrastructure = (
+                        f"task {task_id} was still active at the deadline and no cancel was published, "
+                        "so the next level would overlap it"
+                    )
+            if stop_pending:
+                rec.cancelled = True
+                rec.cancel_published = True
+            infrastructure = _inject_infrastructure(task, exchange, timeout, timed_out, stop_pending)
+            if infrastructure is not None and not rec.infrastructure:
+                rec.infrastructure = str(infrastructure.metadata.get("infra_failure") or infrastructure.errors[0])
+            tagged = [{**e, "args": {**(e.get("args") or {}), "conversation": task.conversation}} for e in exchange.fold.trajectory]
+            usage = _inject_tokens(exchange.fold.usage, exchange.fold.child_usage, exchange.fold.usage_partial)
+            with events_lock:
+                events.extend(tagged)
+                _sum_tokens(tokens, usage)
+
+        def _stop_all() -> None:
+            """Cancel every opened task not seen to end, and take a queued
+            turn out of the line."""
+            for task, rec in opened:
+                if rec.terminal_state or rec.cancelled:
+                    continue
+                if rec.task_id:
+                    task.cancel(rec.task_id, settle=0)
+                    rec.cancelled = True
+                    rec.cancel_published = task.cancel_sent
+                elif rec.queued:
+                    task.leave_line()
+
+        try:
+            for level in ask.levels:
+                record = burst_reads.LevelRecord(level=level, started_at=burst_reads.utc_stamp())
+                levels.append(record)
+                started = time.monotonic()
+                deadline = started + timeout
+                pairs = []
+                for index in range(level):
+                    task = _new_task(level, index)
+                    rec = burst_reads.ConversationRecord(level=level, index=index, conversation=task.conversation)
+                    pairs.append((task, rec))
+                    opened.append((task, rec))
+                    record.conversations.append(rec)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=level) as pool:
+                    futures = [pool.submit(_follow, task, rec, deadline) for task, rec in pairs]
+                for future in futures:
+                    future.result()
+                record.ended_at = burst_reads.utc_stamp()
+                record.wall_seconds = time.monotonic() - started
+                if burst_reads.infrastructure([record]):
+                    break
+                # A cancelled straggler still holds its session worker (and
+                # its children the profile pool) until the gateway confirms
+                # the end, and the next level would be refused at the cap or
+                # measured behind it. Wait for each to be released, bounded.
+                release_by = time.monotonic() + burst_reads.STRAGGLER_RELEASE_SECONDS
+                for task, rec in pairs:
+                    if not (rec.cancelled and rec.task_id):
+                        continue
+                    while True:
+                        # Released only when the gateway looked and saw it
+                        # gone; a door it couldn't reach, or a read that
+                        # couldn't look, counts as still running.
+                        try:
+                            running = not task.released(rec.task_id)
+                        except inject.InjectUnavailable:
+                            running = True
+                        if not running:
+                            break
+                        if time.monotonic() >= release_by:
+                            rec.infrastructure = (
+                                f"cancelled task {rec.task_id} was still running "
+                                f"{burst_reads.STRAGGLER_RELEASE_SECONDS:.0f}s after its cancel, so the next level "
+                                "would overlap it"
+                            )
+                            break
+                        time.sleep(burst_reads.STRAGGLER_POLL_SECONDS)
+                if burst_reads.infrastructure([record]):
+                    break
+        finally:
+            _stop_all()
+
+        entry = burst_reads.assess(levels, ask.levels)
+        metadata: dict[str, Any] = {
+            "transport": TRANSPORT_INJECT, **identity, "session_cap": cap, "burst_reads": entry["args"],
+        }
+        why = burst_reads.infrastructure(levels)
+        if why:
+            # The record still goes on the trajectory, which reaches the
+            # results file, so the levels that ran can be read beside the
+            # logs; errors[0] is what makes the run infrastructure.
+            result = _infra_failure(f"{directive}: {why}")
+            result.trajectory = [entry]
+            result.metadata.update(metadata)
+            return result
+        result = AgentResult(
+            output=burst_reads.summary(levels),
+            trajectory=[entry, *events],
+            errors=[] if entry["status"] == inject.STATE_COMPLETED else [entry["result"]],
+            metadata=metadata,
+            tokens=tokens,
+        )
+        _fold_worker_total(result.tokens)
+        return result
 
     def _execute_card_wait(self, prompt: str) -> AgentResult:
         """A card-wait stopped ask (:data:`stop_hook.CARD_WAIT_DIRECTIVE`, #5407).

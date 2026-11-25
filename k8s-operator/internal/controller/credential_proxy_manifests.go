@@ -271,8 +271,15 @@ const (
 	// the two emptyDir caps, for the writable layer and the container's logs.
 	// The sizing test holds the limit to the caps plus this.
 	credentialProxyEphemeralStorageHeadroom = "1Gi"
-	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
-	// vcs scratch). The kubelet evicts the pod when either
+	// The emptyDir sizeLimits of the broker's /tmp and of its state volume. The
+	// state volume holds the commands' HOME (gcloud's config, kubectl's caches),
+	// their kubeconfigs, their workspace and TMPDIR, and the vcs scratch trees.
+	// It holds no gcloud log files: the broker turns gcloud's file logging off
+	// for every command it runs (GCLOUD_FILE_LOGGING_OFF_ENV in
+	// credential_proxy.py). With it on, gcloud keeps a log file for each
+	// command for 30 days; the exec tier measured about 386KiB a command
+	// (#4536), and nothing bounded those files here. The kubelet evicts the
+	// pod when either
 	// fills, whatever the container's ephemeral-storage limit, and the default
 	// render keeps these figures, each under the container's limit so that a
 	// runaway in one volume cannot take the other's share. A CR override that
@@ -877,7 +884,7 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // the callers that have a reason to: the sandbox, whose wrapped CLIs are the
 // proxy's purpose; the gateway, which pulls chat events from the relay hosted
 // here; when the next stack takes Google Chat, the A2A gateway, which pulls the
-// same relay's A2A routes; and, under the cluster-view flag, the session pods.
+// same relay's A2A routes; and, under the session pods' cluster view, the session pods.
 // TokenReview already rejects a caller this pod does not serve; this is the
 // layer that keeps such a caller from opening the connection.
 //
@@ -892,7 +899,7 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // broker. buildAgentEgressNetworkPolicy enumerates the agent Pod's egress and
 // deliberately leaves this one alone.
 //
-// The session-pod peer admitted under the cluster-view flag is the bare
+// The session-pod peer admitted under the session pods' cluster view is the bare
 // part-of/component pair, because the spawner stamps no instance label. The
 // webhook admits one PlatformAgent per cluster, so no other agent's session
 // pods share this namespace; were that rule relaxed, this fence would admit
@@ -914,7 +921,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
 	})
 	if a2aSessionClusterViewEnabled(agent) {
-		// The session pods, under the cluster-view flag: the same selector
+		// The session pods, under the session pods' cluster view: the same selector
 		// the session fence and the bus fence name, on the credentialed port
 		// only. TokenReview, the session audience and the session-callers
 		// binding keep this peer to the session role; this is the layer
