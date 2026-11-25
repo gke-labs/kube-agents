@@ -141,6 +141,10 @@ func TestTheClaudeDriverKeepsTheHarnessContract(t *testing.T) {
 // "A <tool>", "OK <text>" and "ERR <token> <text>".
 type toyDriver struct {
 	hold bool
+	// restart makes it a driver that takes one user turn per process
+	// (turnRestarter), and budget one with a wall-clock bound
+	// (turnBudgeter, as --left <duration>).
+	restart, budget bool
 	// prepare, if set, runs for each PrepareTurn call, numbered from 1.
 	prepare func(n int, dirs TurnDirs) error
 
@@ -183,6 +187,15 @@ func (d *toyDriver) PrepareTurn(_ context.Context, dirs TurnDirs) error {
 }
 
 func (d *toyDriver) HoldsSteers() bool { return d.hold }
+
+func (d *toyDriver) RestartsPerTurn() bool { return d.restart }
+
+func (d *toyDriver) WithTurnBudget(argv []string, left time.Duration) []string {
+	if !d.budget {
+		return argv
+	}
+	return append(append([]string(nil), argv...), "--left", left.Round(time.Second).String())
+}
 
 func (d *toyDriver) prepared() (int, []TurnDirs) {
 	d.mu.Lock()

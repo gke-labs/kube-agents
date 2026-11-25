@@ -556,3 +556,46 @@ func TestTheBusTransportStampFollowsTheExecTierAddress(t *testing.T) {
 		t.Errorf("the stamp does not follow the exec URL a pod is handed: off %s, on %s, other %s", off, on, other)
 	}
 }
+
+// TestEverySecretSourcedSessionVariableIsNamedForTheWorker: a session pod's
+// container takes no envFrom Secret, and every env entry it takes from a
+// Secret is named in lib.EnvToolWithheld, so the worker withholds it from
+// its tools.
+func TestEverySecretSourcedSessionVariableIsNamedForTheWorker(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute, KubeProxyURL: "https://kp", UniverseDomain: "example.com"}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-secrets", Addressee: "chat-otter-secrets"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-secrets", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...) {
+		for _, from := range c.EnvFrom {
+			if from.SecretRef != nil {
+				t.Errorf("container %s takes envFrom Secret %s, whose keys the worker can't be told", c.Name, from.SecretRef.Name)
+			}
+		}
+		listed := map[string]bool{}
+		for _, e := range c.Env {
+			if e.Name == lib.EnvToolWithheld {
+				for _, n := range strings.Split(e.Value, ",") {
+					listed[n] = true
+				}
+			}
+		}
+		for _, e := range c.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && !listed[e.Name] {
+				t.Errorf("container %s takes %s from a Secret without naming it in %s", c.Name, e.Name, lib.EnvToolWithheld)
+			}
+		}
+	}
+	env := withToolWithheldList([]corev1.EnvVar{{Name: "PLAIN", Value: "x"}, {Name: "ACME_DSN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "dsn"}}}})
+	if last := env[len(env)-1]; last.Name != lib.EnvToolWithheld || last.Value != "ACME_DSN" {
+		t.Errorf("rendered %+v; want %s=ACME_DSN", last, lib.EnvToolWithheld)
+	}
+}
