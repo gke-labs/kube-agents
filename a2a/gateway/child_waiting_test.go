@@ -179,7 +179,7 @@ func TestTheGraceClosesAWaitingLineInPlace(t *testing.T) {
 }
 
 func TestGraceWords(t *testing.T) {
-	for d, want := range map[time.Duration]string{time.Minute: "1 minute", 10 * time.Minute: "10 minutes", 90 * time.Second: "1m30s"} {
+	for d, want := range map[time.Duration]string{time.Minute: "1 minute", 10 * time.Minute: "10 minutes", 90 * time.Second: "90 seconds", time.Second: "1 second"} {
 		if got := graceWords(d); got != want {
 			t.Errorf("graceWords(%v) = %q, want %q", d, got, want)
 		}

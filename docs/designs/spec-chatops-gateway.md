@@ -387,7 +387,7 @@ and given fresh state as the relay would give it, so the notice and the close be
 rollout. Doors that read the line as data (`busyNoticeBackend`, by the delegating turn's
 backend) get none. At the first-event grace, a line that carries the notice is closed in place
 to "⚠️ **didn't start** — the cluster agent didn't start on this in 10 minutes; ask again to
-start a new request (unless this one starts first)" instead of the grace's separate post, so no
+start a new request" instead of the grace's separate post, so no
 ⏳ is left on a line nothing will move. A child first seen past the grace, after an outage, gets
 no notice and the grace's post as before. The grace itself, its marker and its release are
 unchanged, and nothing is published.

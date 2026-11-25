@@ -33,7 +33,7 @@ const (
 	// runs out (noticeNoFirstEvent): one plain line, in place of the ⏳, that
 	// says the request didn't start and what to do instead, which is what the
 	// grace notice says for a line with no waiting notice.
-	stillWaitingNotice = "⚠️ **didn't start** — the %s agent didn't start on this in %s; ask again to start a new request (unless this one starts first)"
+	stillWaitingNotice = "⚠️ **didn't start** — the %s agent didn't start on this in %s; ask again to start a new request"
 )
 
 // graceWords renders the first-event grace for the closing line: whole
@@ -44,8 +44,11 @@ func graceWords(d time.Duration) string {
 		return "1 minute"
 	case d > 0 && d%time.Minute == 0:
 		return fmt.Sprintf("%d minutes", int(d/time.Minute))
+	case d == time.Second:
+		return "1 second"
 	default:
-		return d.Round(time.Second).String()
+		// Not whole minutes: in seconds, as words, never Go's 1m30s.
+		return fmt.Sprintf("%d seconds", int(d.Round(time.Second)/time.Second))
 	}
 }
 
