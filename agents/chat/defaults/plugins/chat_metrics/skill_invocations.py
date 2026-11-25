@@ -54,6 +54,7 @@ import threading
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Optional
 
+from chat_metrics.volume import hermes_root, profile_homes
 from common import audit_sink
 from common.audit_schema import EVENT_TYPE_KEY
 
@@ -97,40 +98,12 @@ MAX_RECORD_BYTES = 64 * 1024
 _READ_MODE = "rb"
 
 
-def hermes_root() -> Path:
-    """The data volume's Hermes home, whose ``logs/`` and ``profiles/*/logs/`` hold the audit files.
-
-    Not ``HERMES_HOME`` as it stands: a gateway run under a named profile (the
-    operator's ``platformFrontDoor``) has it set to ``<root>/profiles/<name>``,
-    and the other profiles' files are beside that home, not under it. Hermes'
-    own resolution is asked first; without it the profile home is mapped back
-    to the root the same way.
-    """
-    try:
-        from hermes_constants import get_default_hermes_root  # the running Hermes' own
-
-        return Path(get_default_hermes_root())
-    except Exception:  # noqa: BLE001 - outside Hermes, or a Hermes without it: the environment is the resolution
-        pass
-    home = Path(os.environ.get(audit_sink.HERMES_HOME_ENV) or audit_sink.DEFAULT_HERMES_HOME)
-    if home.parent.name == audit_sink.PROFILES_DIR_NAME:
-        return home.parent.parent
-    return home
-
-
 def audit_files(root: Path) -> list[Path]:
     """The live audit file of the front door and of each named profile under ``root``, existing or not.
 
-    Raises OSError when the profiles directory is there and cannot be listed:
-    a caller must tell "no profiles" from "could not look".
+    Raises OSError when the profiles directory is there and cannot be listed.
     """
-    files = [audit_sink.audit_file_path(root)]
-    try:
-        with os.scandir(root / audit_sink.PROFILES_DIR_NAME) as entries:
-            profiles = sorted(Path(entry.path) for entry in entries if entry.is_dir())
-    except FileNotFoundError:
-        return files
-    return files + [audit_sink.audit_file_path(profile) for profile in profiles]
+    return [audit_sink.audit_file_path(home) for home in profile_homes(root)]
 
 
 def profile_home(audit_file: Path) -> Path:

@@ -583,7 +583,13 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	reply := lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	// A completed run has no reason to record: only a run that ended
+	// otherwise (failed, rejected, canceled) carries one.
+	if task.Final && task.State != lib.StateCompleted && task.FinalMessage != nil {
+		reply.Reason = runReasonToken(joinTextParts(task.FinalMessage.Parts))
+	}
+	return reply
 }
 
 // triggerAuthority is the authority a trigger's task rides: the trigger as

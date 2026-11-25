@@ -89,6 +89,25 @@ type Config struct {
 	// pods only; a profile pod is refused it (validate).
 	SessionReuse bool
 
+	// Warm starts the pod with no task (lib.EnvSessionWarm): a pod the
+	// gateway's warm pool started before any conversation needed it. Run
+	// opens the task watcher on the pod's own `…in` subjects, writes
+	// WarmStatusAddr once its consumer exists, and runs the first task that
+	// arrives through the same path every later turn takes. TaskID must be
+	// empty and SessionReuse set (validate). Nothing about the pod's reach
+	// changes: the subjects and consumer names are the pod's own, and every
+	// task still needs a capability naming the pod.
+	Warm bool
+	// WarmIdle is how long a warm pod waits for its first task before it
+	// exits with nothing to publish (lib.EnvSessionWarmIdleSeconds). Zero
+	// waits until SIGTERM.
+	WarmIdle time.Duration
+	// WarmStatusAddr is the loopback address a warm pod answers
+	// lib.SessionWarmReadyPath on once its watcher is live, for as long as
+	// the process runs (lib.SessionWarmStatusPort in a pod). Empty serves
+	// nothing.
+	WarmStatusAddr string
+
 	// OriginSeq is the TASKS stream sequence of the submission this process
 	// exists to execute, from the spawner's own PubAck (lib.EnvOriginSeq).
 	//
@@ -235,6 +254,14 @@ func (c Config) validate() error {
 	// a watcher there would take tasks meant for its siblings.
 	if c.SessionReuse && (c.ProfileExecutor || c.Session == "") {
 		return fmt.Errorf("%s is set on a pod with no session of its own; only a session pod serves more than one task", lib.EnvSessionReuse)
+	}
+	if c.Warm {
+		if !c.SessionReuse {
+			return fmt.Errorf("%s is set without %s; a warm pod serves its conversation the way a reused pod does", lib.EnvSessionWarm, lib.EnvSessionReuse)
+		}
+		if c.TaskID != "" {
+			return fmt.Errorf("%s is set and so is TASK_ID (%q); a warm pod is started before any task exists", lib.EnvSessionWarm, c.TaskID)
+		}
 	}
 	if c.BusTokenFile == "" {
 		return nil
@@ -511,6 +538,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		return Result{}, err
 	}
 	defer closeBus()
+	if cfg.Warm {
+		return runWarm(ctx, cfg, b)
+	}
 
 	// The pod exists because the message is already durable, so the fetch
 	// cannot miss (spec ordering rule) - but consumer setup can race pod

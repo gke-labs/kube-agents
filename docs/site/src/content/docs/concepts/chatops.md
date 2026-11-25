@@ -544,9 +544,11 @@ Only a member on the [allowed users](#allowed-users-1) list sees the dashboard; 
 
 With `KUBEAGENTS_DIAL=on` (off by default), the **Autonomy dial** panel sits above the Home channel panel. It shows what the agent may change on its own: Explain (finds and explains, changes nothing), Propose fixes (opens a pull request, your team merges) or Auto-merge proven fixes (your pipeline merges proven fixes).
 
-Under the level, each kind of fix shows one repository's clean merges toward the auto-merge offer, for example `org/infra · 3 of 5 clean merges · off`, with a picker when the kind has fixes in more than one repository. The state is `off`, `Pending: rules PR #N` while the pull request that turns it on is open, or `auto-merges`. A note under the row says why the last change did nothing, when it did nothing. Until the post-merge check records outcomes, which nothing schedules yet, every count stays at 0.
+Under the level, each kind of fix shows one repository's clean merges toward the auto-merge offer, for example `org/infra · 3 of 5 clean merges · off`, with a picker when the kind has fixes in more than one repository. The state is `off`, `Pending: rules PR #N` while the pull request that changes it is open, or `auto-merges`. A note under the row says why the last change did nothing, when it did nothing, or that the kind is stepping down (below).
 
-A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons and a **Request auto-merge** or **Stop** button for the repository shown. Everyone else sees the same lines read-only. The agent checks the presser on every change, and its one-line answer appears under the panel for the person who pressed.
+When an auto-merged fix is still broken, the post-merge check opens a pull request that adds a [deny rule](/kube-agents/reference/automation-rules/#when-an-auto-merged-fix-is-still-broken). The row shows it as pending, with the note `Stepping down: PR #N was still broken after it merged.` Once the deny rule merges, the row reads `off` and the note `Stepped down: …`. If the pull request is closed instead, the row goes back to `auto-merges`. To allow the kind again, delete the step-down's deny rule from the rules file by hand.
+
+A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons and a **Request auto-merge** or **Stop** button for the repository shown. Everyone else sees the same lines read-only. The agent checks the presser on every change, and its one-line answer appears under the panel for the person who pressed. While a step-down's pull request is open, **Stop** answers that it is already stopping and opens nothing, and **Request auto-merge** is refused until that pull request is merged or closed.
 
 ### People seen
 

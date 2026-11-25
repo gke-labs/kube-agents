@@ -20,8 +20,9 @@ import (
 //
 // The driver holds each conversation's history, in memory: the harness
 // keeps no session file, so nothing a turn's commands write can change what
-// the next turn resumes. The decoder keeps the event lines a turn emits and
-// the next turn's envelope carries them back.
+// the next turn resumes. The decoder keeps the event lines a turn emits,
+// starting over at each compaction summary, and the next turn's envelope
+// carries them back.
 type coreAgentDriver struct {
 	// Policy and MCP are the turn's tool policy and MCP servers, set by
 	// NewCoreAgentDriver from the worker's grant: the session allowlist on a
@@ -201,7 +202,16 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 		d.ended = true
 		if !ln.Failed && d.conv != nil && d.session != "" {
 			d.conv.mu.Lock()
-			d.conv.history[d.session] = append(d.conv.history[d.session], d.pending...)
+			h := d.conv.history[d.session]
+			for _, e := range d.pending {
+				if coreagentwire.IsHistoryBoundary(e) {
+					// A compaction summary: core-agent starts its next
+					// request from it, so nothing before it is sent again.
+					h = nil
+				}
+				h = append(h, e)
+			}
+			d.conv.history[d.session] = h
 			d.conv.mu.Unlock()
 		}
 		d.pending = nil

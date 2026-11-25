@@ -305,7 +305,7 @@ def _cluster_c():
         # Since the ComputeClass fixtures (defects-c.tf): the pool carries the
         # class label, the NodeLocal DNSCache add-on is off (GKE omits the false
         # boolean, so the block is empty), and node auto-provisioning is unset.
-        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "kubeletConfig": {"podPidsLimit": "4096"}, "labels": {"cloud.google.com/compute-class": "general-ccc"}}}],
+        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "machineType": "e2-standard-2", "kubeletConfig": {"podPidsLimit": "4096"}, "labels": {"cloud.google.com/compute-class": "general-ccc"}}}],
         "addonsConfig": {"dnsCacheConfig": {}},
     }
 
