@@ -217,11 +217,12 @@ class ProvisionPostMergeSyncTest(unittest.TestCase):
 
     def test_the_declaration_is_the_fleet_stacks_deployment(self):
         defects = (_FLEET_TF / "defects-a.tf").read_text()
-        if '"order_ledger"' not in defects:
-            self.skipTest("bench/tf/fleet does not plant order-ledger on this branch")
+        header = 'resource "kubernetes_deployment_v1" "order_ledger"'
+        if header not in defects:
+            self.skipTest("bench/tf/fleet/defects-a.tf does not plant order-ledger on this branch")
         import yaml
 
-        block = defects[defects.index('resource "kubernetes_deployment_v1" "order_ledger"') :]
+        block = defects[defects.index(header) :]
         block = block[: block.index("\n}\n")]
         content = re.search(r"^readonly DECLARATION_CONTENT='(.*?)'$", _SCRIPT.read_text(), re.MULTILINE | re.DOTALL).group(1)
         doc = yaml.safe_load(content)
@@ -243,10 +244,12 @@ class ProvisionPostMergeSyncTest(unittest.TestCase):
         self.assertEqual("seeded-post-merge", doc["metadata"]["namespace"])
 
     def test_the_fleet_stack_reads_the_secret_this_script_writes(self):
-        stack = "".join(path.read_text() for path in sorted(_FLEET_TF.glob("*.tf")))
-        if "post_merge" not in stack:
-            self.skipTest("bench/tf/fleet does not read the deploy key yet")
-        self.assertIn(f'"{_SECRET}"', stack)
+        # The one file that reads the secret, not a glob: config-sync.tf turns
+        # Config Sync on and mentions post_merge without reading any secret.
+        reader = _FLEET_TF / "post-merge-sync.tf"
+        if not reader.is_file():
+            self.skipTest("bench/tf/fleet/post-merge-sync.tf, which reads the deploy key, is not on this branch yet")
+        self.assertIn(f'"{_SECRET}"', reader.read_text())
 
     def test_the_seeded_budget_is_the_one_the_case_stack_restores(self):
         budget = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "post-merge-sync-budget" / "budget.py"
