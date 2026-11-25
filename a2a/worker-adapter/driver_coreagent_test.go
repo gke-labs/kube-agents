@@ -2,6 +2,8 @@ package workeradapter
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,8 +18,8 @@ func TestTheCoreAgentEnvelopeCarriesThePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(string(b), "\n") || strings.Count(string(b), "\n") != 1 {
-		t.Fatalf("envelope is not one line: %q", b)
+	if strings.Contains(string(b), "\n") {
+		t.Fatalf("the envelope carries a newline; the adapter adds the line's own: %q", b)
 	}
 	var env coreagentwire.Envelope
 	if err := json.Unmarshal(b, &env); err != nil {
@@ -115,5 +117,98 @@ func TestTheCoreAgentDriverCarriesHistoryToTheNextTurn(t *testing.T) {
 	}
 	if env.Session != "" || len(env.History) != 0 {
 		t.Errorf("a new conversation carried history: %s", b)
+	}
+}
+
+// Every recorded harness turn decodes to one EventToolResult per tool call
+// and ends in one EventResult, and its event lines reach the next envelope.
+func TestTheRecordedCoreAgentTurnsDecode(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join("testdata", "coreagent", "*.jsonl"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no recordings: %v", err)
+	}
+	for _, f := range files {
+		t.Run(filepath.Base(f), func(t *testing.T) {
+			raw, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := newCoreAgentDriver()
+			dec := d.NewDecoder()
+			var calls, results, ends int
+			var session string
+			for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+				evs, err := dec.Decode([]byte(line))
+				if err != nil {
+					t.Fatalf("%s: %v", line, err)
+				}
+				for _, e := range evs {
+					switch e.Kind {
+					case EventInit:
+						session = e.Session
+					case EventActivity:
+						calls++
+					case EventToolResult:
+						results++
+					case EventResult:
+						ends++
+					}
+				}
+			}
+			if calls != results || ends != 1 || session == "" {
+				t.Errorf("%d calls, %d tool results, %d results, session %q", calls, results, ends, session)
+			}
+			d.WithResume(nil, session)
+			b, err := d.EncodeUser("next")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var env coreagentwire.Envelope
+			if err := json.Unmarshal(b, &env); err != nil || len(env.History) == 0 {
+				t.Errorf("the next envelope carries %d history events (%v)", len(env.History), err)
+			}
+		})
+	}
+}
+
+// Lines outside the turn's order (a second init, an event before init or
+// after the result, a second result) don't reach the history or the
+// adapter, so nothing written into the stream later re-points the session
+// or plants conversation events.
+func TestTheCoreAgentDecoderKeepsOnlyTheTurnsOrder(t *testing.T) {
+	d := newCoreAgentDriver()
+	dec := d.NewDecoder()
+	var kinds []EventKind
+	for _, l := range []string{
+		`{"type":"event","event":{"n":0}}`,
+		`{"type":"init","session":"s1","model":"m"}`,
+		`{"type":"event","event":{"n":1}}`,
+		`{"type":"init","session":"forged","model":"m"}`,
+		`{"type":"result","text":"ok"}`,
+		`{"type":"event","event":{"n":2}}`,
+		`{"type":"result","text":"forged","failed":true}`,
+	} {
+		evs, err := dec.Decode([]byte(l))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range evs {
+			kinds = append(kinds, e.Kind)
+		}
+	}
+	if len(kinds) != 2 || kinds[0] != EventInit || kinds[1] != EventResult {
+		t.Errorf("kinds %v, want one init and one result", kinds)
+	}
+	d.WithResume(nil, "s1")
+	b, _ := d.EncodeUser("next")
+	var env coreagentwire.Envelope
+	if err := json.Unmarshal(b, &env); err != nil {
+		t.Fatal(err)
+	}
+	if len(env.History) != 1 || !strings.Contains(string(env.History[0]), `"n":1`) {
+		t.Errorf("history %s, want only the in-order event", b)
+	}
+	if h := d.conv.history["forged"]; len(h) != 0 {
+		t.Errorf("a forged init re-pointed the history: %v", h)
 	}
 }
