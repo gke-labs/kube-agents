@@ -7809,6 +7809,13 @@ type a2aProvisionState struct {
 	// such a rollout, and the status writers carry it as
 	// a2aCalloutStalledConditionType so the wedged rollout is visible.
 	calloutStalled string
+	// provisionRetrying is the A2AProvisionRetrying message while the
+	// current provision Job has failed pods and has neither completed nor
+	// given up, "" otherwise. The Job retries up to its backoffLimit before
+	// JobFailed (and A2AProvisionFailed) appears, which can take over an
+	// hour; this makes the retries visible meanwhile without touching
+	// BusProvisioned, Ready or the phase (#7100).
+	provisionRetrying string
 	// calloutMap is what the callout pods' /status said about the identity
 	// map this pass rendered (A2AIdentityMapApplied, #4487); nil on a pass
 	// that did not get as far as rendering one.
@@ -8622,6 +8629,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 				}
 			}
 		}
+		// Neither finished nor about to be, with failed pods: the Job is
+		// retrying. The status writers carry it, and record its Warning
+		// event once the write lands, so a pass that errors first doesn't
+		// repeat it.
+		if !state.done && !state.failed && !a2aProvisionJobFinishing(existing) && existing.Status.Failed > 0 {
+			state.provisionRetrying = a2aProvisionRetryingMessage(existing.Name, existing.Namespace, existing.Status.Failed)
+		}
 	}
 
 	// Superseded generations go now, not by TTL. A Job whose name the render
@@ -9393,6 +9407,69 @@ func setA2ACalloutStalledCondition(agent *agentv1alpha1.PlatformAgent, callout s
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	})
+}
+
+const (
+	// a2aProvisionRetryingConditionType is present, True, while the current
+	// provision Job has failed pods and is still retrying, and absent
+	// otherwise. Informational: it changes neither BusProvisioned, Ready nor
+	// the phase, so a retry that clears by itself (NATS briefly unreachable)
+	// does not flip a Ready install or fail `helm upgrade --wait`, which
+	// waits on this CR's status.
+	a2aProvisionRetryingConditionType = "A2AProvisionRetrying"
+	a2aProvisionRetryingReason        = "ProvisionJobPodsFailing"
+)
+
+// a2aProvisionJobFinishing reports the Job controller's interim verdicts
+// (FailureTarget, SuccessCriteriaMet), set while its pods terminate and
+// before Failed or Complete: such a Job is no longer retrying.
+func a2aProvisionJobFinishing(job *batchv1.Job) bool {
+	for _, cond := range job.Status.Conditions {
+		if cond.Status == corev1.ConditionTrue && (cond.Type == batchv1.JobFailureTarget || cond.Type == batchv1.JobSuccessCriteriaMet) {
+			return true
+		}
+	}
+	return false
+}
+
+func a2aProvisionRetryingMessage(job, namespace string, failed int32) string {
+	return fmt.Sprintf("A2A provision Job %s has %d failed pod(s) and is retrying; `kubectl logs -n %s job/%s` shows why. If it stops retrying it is reported as A2AProvisionFailed",
+		job, failed, namespace, job)
+}
+
+// a2aProvisionRetryingConditionCurrent and setA2AProvisionRetryingCondition
+// carry a2aProvisionRetryingConditionType on the A2ACalloutRolloutStalled
+// pattern: present while a2aProvisionState.provisionRetrying holds a
+// message, and written by both status writers.
+func a2aProvisionRetryingConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aProvisionRetryingConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == a2aProvisionRetryingReason && existing.Message == msg
+}
+
+// setA2AProvisionRetryingCondition reports whether it set a message the CR
+// did not already carry: the failed-pod count rose, or a Job began retrying.
+// The caller records the Warning event after its status write succeeds.
+func setA2AProvisionRetryingCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) bool {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aProvisionRetryingConditionType)
+		return false
+	}
+	if a2aProvisionRetryingConditionCurrent(agent, msg) {
+		return false
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aProvisionRetryingConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             a2aProvisionRetryingReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+	return true
 }
 
 // a2aBusHoldSkippedReason is the Warning event's reason when the bus moves to

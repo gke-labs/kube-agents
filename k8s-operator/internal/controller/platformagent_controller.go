@@ -5029,6 +5029,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		retiredConversionRefusedAbsent(agent) &&
 		busMigratingConditionCurrent(agent) && busMigrationStatusCurrent(agent, a2a) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
+		a2aProvisionRetryingConditionCurrent(agent, a2a.provisionRetrying) &&
 		a2aBusMetaConditionCurrent(agent, a2a.busMeta) &&
 		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
@@ -5048,6 +5049,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			retiredConversionRefusedAbsent(live) &&
 			reflect.DeepEqual(live.Status.BusMigration, agent.Status.BusMigration) && busMigratingConditionCurrent(live) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
+			a2aProvisionRetryingConditionCurrent(live, a2a.provisionRetrying) &&
 			a2aBusMetaConditionCurrent(live, a2a.busMeta) &&
 			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
@@ -5069,6 +5071,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
 	setBusMigratingCondition(agent, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	retryingRose := setA2AProvisionRetryingCondition(agent, a2a.provisionRetrying, now)
 	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
@@ -5078,9 +5081,19 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
 	}
+	r.noteProvisionRetrying(agent, retryingRose, a2a.provisionRetrying)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	return nil
+}
+
+// noteProvisionRetrying records A2AProvisionRetrying's Warning event after
+// the status write that set a new message, so it fires once per rise the
+// operator sees, not once per pass that never saved it.
+func (r *PlatformAgentReconciler) noteProvisionRetrying(agent *agentv1alpha1.PlatformAgent, rose bool, msg string) {
+	if rose {
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aProvisionRetryingReason, msg)
+	}
 }
 
 // adoptRenderedStatus carries the render copy's status and resourceVersion
@@ -5556,6 +5569,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
+	a2aProvisionRetryingUnchanged := a2aProvisionRetryingConditionCurrent(agent, a2a.provisionRetrying)
 	a2aBusMetaUnchanged := a2aBusMetaConditionCurrent(agent, a2a.busMeta)
 	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
@@ -5647,7 +5661,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged && profileSupervisorFormUnchanged &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && a2aBusMetaUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged && builtinSchedulesUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && a2aProvisionRetryingUnchanged && a2aBusMetaUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged && builtinSchedulesUnchanged &&
 		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
@@ -5738,6 +5752,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	retryingRose := setA2AProvisionRetryingCondition(agent, a2a.provisionRetrying, now)
 	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
@@ -5755,6 +5770,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, a2aTasksWaitRequeue, err
 	}
+	r.noteProvisionRetrying(agent, retryingRose, a2a.provisionRetrying)
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteBusMigrationEcho(agent, wroteBusMigration)
