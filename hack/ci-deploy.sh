@@ -1733,7 +1733,7 @@ fi
 # its turns; shipped leaves the cap at the install default, what a customer
 # install gets, and an eviction, a wait or a refusal there is a finding about
 # that default.
-EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
+EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-session}" # DO NOT MERGE: twin-only, the session front door
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
 platform | session) ;;
@@ -1785,6 +1785,7 @@ if [ "${EVAL_FRONT_DOOR}" = "session" ]; then
     MODE_NEXT_MAX_SESSIONS=""
   fi
 fi
+MODE_NEXT_MAX_SESSIONS=6 # DO NOT MERGE (#7014 burst twin): a cap of six for the burst's top level
 MAX_SESSIONS_HELM_SETS=()
 if [ -n "${MODE_NEXT_MAX_SESSIONS}" ]; then
   MAX_SESSIONS_HELM_SETS=(--set "${MAX_SESSIONS_HELM_VALUE}=${MODE_NEXT_MAX_SESSIONS}")
@@ -2480,6 +2481,14 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
       exit 1
     fi
   fi
+  # DO NOT MERGE (#7014 twin): the operator's flag turns the session pods'
+  # cluster view on, so sessions hand their cluster reads to the cluster
+  # profile, the pool this measures.
+  _cv_i=0
+  for _cv_a in ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"}; do
+    case "${_cv_a}" in operator.extraEnv\[*\].name=*) _cv_i=$((_cv_i + 1)) ;; esac
+  done
+  A2A_OPERATOR_ENV_ARGS+=(--set-string "operator.extraEnv[${_cv_i}].name=A2A_SESSION_CLUSTER_VIEW" --set-string "operator.extraEnv[${_cv_i}].value=true")
   set +e
   helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
     --namespace "${NAMESPACE}" --create-namespace \
@@ -3433,6 +3442,11 @@ if ! verify_front_door; then
   report_cr_status "front-door-mismatch"
   exit 1
 fi
+
+# DO NOT MERGE (#7014 twin): what the operator rendered for the session pods'
+# cluster view, and the cluster profile's warm pool, for the evidence.
+echo "cluster view: gateway A2A_SESSION_CLUSTER_VIEW=$(kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" -n "${NAMESPACE}" -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_SESSION_CLUSTER_VIEW")]}{.value}{end}{end}' 2>/dev/null || true)"
+kubectl get deployments -A -l app.kubernetes.io/component=agentprofile-worker -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,REPLICAS:.spec.replicas 2>/dev/null || true
 
 # What the run has to show for itself, for the artifact log: the CR status,
 # the A2A stack, the ungated gateway, and the entrypoint's
