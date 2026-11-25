@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"iter"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	adkmodel "google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
@@ -152,5 +154,31 @@ func TestAnOversizedEnvelopeFailsTheTurn(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"failed":true`) {
 		t.Errorf("no failed result: %s", out.String())
+	}
+}
+
+// The harness reads its envelope to the newline and starts the turn while
+// stdin stays open, as the adapter leaves it.
+func TestTheHarnessStartsWithStdinStillOpen(t *testing.T) {
+	withModel(t, &echoModel{})
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go func() {
+		b, _ := json.Marshal(coreagentwire.Envelope{Message: "hi"})
+		pw.Write(append(b, '\n')) // and never close
+	}()
+	done := make(chan int, 1)
+	var out, errOut bytes.Buffer
+	wd, _ := os.Getwd()
+	os.Chdir(t.TempDir())
+	defer os.Chdir(wd)
+	go func() { done <- run(context.Background(), []string{"--model", "m"}, pr, &out, &errOut) }()
+	select {
+	case code := <-done:
+		if code != 0 || !strings.Contains(out.String(), `"type":"result"`) {
+			t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the harness waited for stdin to close before running the turn")
 	}
 }

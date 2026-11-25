@@ -291,3 +291,11 @@ func TestLoadingANameThatIsntASkillFails(t *testing.T) {
 		}
 	}
 }
+
+// A pod with no persona directory runs the turn with no persona.
+func TestAMissingPersonaDirIsNoPersona(t *testing.T) {
+	instructions, toolsets, err := loadPersona(context.Background(), filepath.Join(t.TempDir(), "absent"))
+	if err != nil || instructions != "" || len(toolsets) != 0 {
+		t.Fatalf("instructions %q, %d toolsets, err %v", instructions, len(toolsets), err)
+	}
+}

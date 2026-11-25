@@ -13,6 +13,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -73,10 +75,16 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	out := json.NewEncoder(stdout)
 	emit := func(ev coreagentwire.Event) { _ = out.Encode(ev) }
 
+	// The envelope is one line: the adapter keeps stdin open after writing
+	// it (as it does for every harness), so read to the newline, never to
+	// EOF, and no further than the cap.
 	var env coreagentwire.Envelope
-	raw, err := io.ReadAll(io.LimitReader(stdin, coreagentwire.MaxEnvelopeBytes+1))
-	if err == nil && len(raw) > coreagentwire.MaxEnvelopeBytes {
+	raw, err := bufio.NewReaderSize(io.LimitReader(stdin, coreagentwire.MaxEnvelopeBytes+1), 64<<10).ReadBytes('\n')
+	switch {
+	case len(raw) > coreagentwire.MaxEnvelopeBytes:
 		err = fmt.Errorf("over %d bytes", coreagentwire.MaxEnvelopeBytes)
+	case err == io.EOF && len(bytes.TrimSpace(raw)) > 0:
+		err = nil // a final line without its newline
 	}
 	if err == nil {
 		err = json.Unmarshal(raw, &env)

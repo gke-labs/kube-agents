@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -33,6 +35,11 @@ func loadPersona(ctx context.Context, dir string) (string, []adktool.Toolset, er
 	// shell by absolute path.
 	if !filepath.IsAbs(dir) {
 		return "", nil, fmt.Errorf("the persona directory %q is not absolute", dir)
+	}
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		// No persona rendered for this pod: the turn runs on core-agent's
+		// own prompt. Whether a pod must have one is PrepareTurn's check.
+		return "", nil, nil
 	}
 	r, err := coreagent.Snapshot(dir)
 	if err != nil {
