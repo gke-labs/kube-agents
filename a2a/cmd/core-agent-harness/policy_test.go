@@ -539,3 +539,21 @@ func (n namedTool) Description() string { return "" }
 func (n namedTool) IsLongRunning() bool { return false }
 
 func fakeTool(name string) adktool.Tool { return namedTool(name) }
+
+// TestShellCommandsReadsEitherRuleForm: the commands a grant names come from
+// a bare rule or its with-arguments form alike, and "*" stands for any.
+func TestShellCommandsReadsEitherRuleForm(t *testing.T) {
+	for _, c := range []struct {
+		allow []string
+		want  []string
+	}{
+		{[]string{"bash:kubectl", "bash:kubectl *", "read_file:/w/*"}, []string{"kubectl"}},
+		{[]string{"bash:gcloud *"}, []string{"gcloud"}},
+		{[]string{"bash:*"}, []string{"*"}},
+		{[]string{"read_file:/w/*"}, nil},
+	} {
+		if got := shellCommands(c.allow); !slices.Equal(got, c.want) {
+			t.Errorf("shellCommands(%q) = %q, want %q", c.allow, got, c.want)
+		}
+	}
+}
