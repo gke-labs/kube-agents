@@ -105,10 +105,11 @@ type Event struct {
 	Event json.RawMessage `json:"event,omitempty"`
 }
 
-// Usage is one turn's token counts.
+// Usage is one turn's token counts, summed over its model responses in
+// int64 so a long turn's total can't wrap.
 type Usage struct {
-	Input    int32 `json:"input"`
-	Output   int32 `json:"output"`
-	Cached   int32 `json:"cached,omitempty"`
-	Thoughts int32 `json:"thoughts,omitempty"`
+	Input    int64 `json:"input"`
+	Output   int64 `json:"output"`
+	Cached   int64 `json:"cached,omitempty"`
+	Thoughts int64 `json:"thoughts,omitempty"`
 }

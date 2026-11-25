@@ -79,7 +79,17 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 2
 	}
 	out := json.NewEncoder(stdout)
-	emit := func(ev coreagentwire.Event) { _ = out.Encode(ev) }
+	// Once ctx is done (the adapter's SIGTERM, for a cancel or the task's
+	// deadline) nothing more is written: no result, no history. The adapter
+	// decides a stopped task's state itself, and a result line would report
+	// the stop as this harness's failure, or as a completed turn. The
+	// stopped turn is left out of the conversation's history.
+	emit := func(ev coreagentwire.Event) {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = out.Encode(ev)
+	}
 
 	// The envelope is one line: the adapter keeps stdin open after writing
 	// it (as it does for every harness), so read to the newline, never to
@@ -101,6 +111,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	if err := turn(ctx, o, env, emit); err != nil {
 		emit(coreagentwire.Event{Type: coreagentwire.TypeResult, Failed: true, Error: err.Error()})
+		return 1
+	}
+	if ctx.Err() != nil {
 		return 1
 	}
 	return 0

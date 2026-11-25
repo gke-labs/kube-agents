@@ -246,6 +246,81 @@ func TestACoreAgentDriverWithAPolicyKeepsItsHistory(t *testing.T) {
 	}
 }
 
+// Every line outside the turn is ignored, not only history lines: progress,
+// activity and tool results before init or after the result, a result
+// before init that isn't a start failure, and an init after the result.
+func TestTheCoreAgentDecoderIgnoresEveryLineOutsideTheTurn(t *testing.T) {
+	outside := []string{
+		`{"type":"thinking","text":"early"}`,
+		`{"type":"text","text":"early"}`,
+		`{"type":"tool_call","id":"c0","tool":"bash"}`,
+		`{"type":"tool_result","id":"c0","tool":"bash","text":"early"}`,
+		`{"type":"result","text":"early, not failed"}`,
+	}
+	after := []string{
+		`{"type":"thinking","text":"late"}`,
+		`{"type":"text","text":"late"}`,
+		`{"type":"tool_call","id":"c9","tool":"bash"}`,
+		`{"type":"tool_result","id":"c9","tool":"bash","text":"late"}`,
+		`{"type":"init","session":"s2","model":"m"}`,
+		`{"type":"result","text":"late"}`,
+	}
+	dec := newCoreAgentDriver().NewDecoder()
+	var kinds []EventKind
+	lines := append(append(append([]string{}, outside...), `{"type":"init","session":"s1","model":"m"}`, `{"type":"result","text":"ok"}`), after...)
+	for _, l := range lines {
+		evs, err := dec.Decode([]byte(l))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range evs {
+			kinds = append(kinds, e.Kind)
+		}
+	}
+	if len(kinds) != 2 || kinds[0] != EventInit || kinds[1] != EventResult {
+		t.Errorf("kinds %v, want one init and one result", kinds)
+	}
+}
+
+// A turn that fails to start writes a failed result and no init; that
+// result still reaches the adapter, and it ends the turn.
+func TestACoreAgentStartFailureReachesTheAdapter(t *testing.T) {
+	dec := newCoreAgentDriver().NewDecoder()
+	evs, err := dec.Decode([]byte(`{"type":"result","failed":true,"error":"persona: required persona dir is missing"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].Kind != EventResult || !evs[0].Failed || !strings.Contains(evs[0].Token, "persona") {
+		t.Fatalf("got %+v, want one failed result naming the persona", evs)
+	}
+	if evs, _ := dec.Decode([]byte(`{"type":"init","session":"s1","model":"m"}`)); len(evs) != 0 {
+		t.Errorf("an init after the start failure got through: %+v", evs)
+	}
+}
+
+// A bad usage count is that field dropped and named; the other still
+// reaches the bus.
+func TestACoreAgentResultDropsOnlyTheBadUsageFigure(t *testing.T) {
+	dec := newCoreAgentDriver().NewDecoder()
+	if _, err := dec.Decode([]byte(`{"type":"init","session":"s1","model":"m"}`)); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := dec.Decode([]byte(`{"type":"result","text":"ok","usage":{"input":-5,"output":7}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
+	}
+	tel := evs[0].Telemetry
+	if tel.usage.InputTokens != 0 || tel.usage.OutputTokens != 7 {
+		t.Errorf("usage %+v, want input dropped and output 7", tel.usage)
+	}
+	if len(tel.dropped) != 1 || tel.dropped[0] != "usage.input" {
+		t.Errorf("dropped %v, want [usage.input]", tel.dropped)
+	}
+}
+
 // core-agent reads no config dir, so it names none for the harness env.
 func TestCoreAgentNamesNoConfigDir(t *testing.T) {
 	if kv := newCoreAgentDriver().ConfigDirEnv("/x"); kv != "" {
