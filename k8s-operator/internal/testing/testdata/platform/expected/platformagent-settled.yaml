@@ -3117,7 +3117,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "c825e0fa8fe7db93",
+      "version": "d6a342423e76b1d2",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3146,6 +3146,7 @@ data:
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
               "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -3158,6 +3159,7 @@ data:
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -3240,6 +3242,7 @@ data:
               "$KV.session-state.>",
               "$KV.feedback.>",
               "$KV.people.>",
+              "$KV.SCHEDULED_REPORTS.>",
               "chat.console.*.out",
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
@@ -3262,6 +3265,8 @@ data:
               "$JS.API.DIRECT.GET.KV_people.>",
               "$JS.API.CONSUMER.CREATE.KV_people.>",
               "$JS.API.CONSUMER.DELETE.KV_people.*",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+              "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
               "$JS.ACK.TASKS.>",
@@ -3340,7 +3345,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: c825e0fa8fe7db93
+    kubeagents.x-k8s.io/a2a-authmap-version: d6a342423e76b1d2
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3934,7 +3939,8 @@ stringData:
           # (#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on
           # TASKS, and INFO, DIRECT.GET and consumer create/delete on
           # KV_session-state, its own registry, on KV_feedback, the kept
-          # answer ratings, and on KV_people, one hashed key per chat person.
+          # answer ratings, and on KV_people, one hashed key per chat person;
+          # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs.
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
@@ -3954,6 +3960,7 @@ stringData:
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
+                  "$KV.SCHEDULED_REPORTS.>",
                   "chat.console.*.out",
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
@@ -3976,6 +3983,8 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
                   "$JS.API.STREAM.INFO.DIRECTORY",
                   "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
@@ -4076,6 +4085,8 @@ stringData:
                   "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
                   "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
                   "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
                   "_INBOX.seed.>"
                 ]
               }
@@ -6468,7 +6479,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-c9e5a390
+  name: platformagent-a2a-provision-ea3d1b3a
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6706,6 +6717,20 @@ spec:
               so a restarted one can still read\n# every lease it has to re-adopt or fail.\n$NATS
               kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1
               --replicas=\"${STREAM_REPLICAS}\" --storage=file --max-bucket-size=67108864\n\n#
+              SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the\n#
+              report and whether and where it was posted (a2a/gateway/scheduled_reports.go;\n#
+              docs/designs/scheduling-on-profiles.md section 4). Written only by the\n#
+              gateway, before any post, so a run is on record whether it posts or not.\n#
+              History 1: each record moves through its statuses in place, and only the\n#
+              last is read. It is the durable record later readers enumerate, so the max\n#
+              age is long, 90 days, rather than none: KV is discard=new, and a bucket
+              with\n# no age would fill and refuse every later run's record, which posts
+              nothing.\n# The gateway cuts a report at 24KiB, and a value is capped at
+              256KiB, room\n# for that report's JSON escaping at its worst; a full-size
+              record is about\n# 25KB, so 256MiB holds about ten thousand, over a hundred
+              runs a day for the\n# 90 days.\n$NATS kv info SCHEDULED_REPORTS >/dev/null
+              2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+              --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h\n\n#
               PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task\n# (a2a.submit.<profile>.<tier>.<kind>.<task>),
               published by the gateway and\n# held by the dispatcher on the operator's
               durables (contract on #3655). It is\n# its own stream so that the operator

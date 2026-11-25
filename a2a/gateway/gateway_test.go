@@ -113,6 +113,10 @@ func provision(t *testing.T, url string) {
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: capability.Bucket, History: 1}); err != nil {
 		t.Fatalf("create cap: %v", err)
 	}
+	// `nats kv add SCHEDULED_REPORTS`: a schedule trigger's runs.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.ScheduledReportsBucket, History: 1}); err != nil {
+		t.Fatalf("create %s: %v", lib.ScheduledReportsBucket, err)
+	}
 }
 
 // deleteTasksStream takes the task stream away, which is how a test makes the

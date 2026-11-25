@@ -3138,7 +3138,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "c825e0fa8fe7db93",
+      "version": "d6a342423e76b1d2",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3167,6 +3167,7 @@ data:
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
               "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -3179,6 +3180,7 @@ data:
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -3261,6 +3263,7 @@ data:
               "$KV.session-state.>",
               "$KV.feedback.>",
               "$KV.people.>",
+              "$KV.SCHEDULED_REPORTS.>",
               "chat.console.*.out",
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
@@ -3283,6 +3286,8 @@ data:
               "$JS.API.DIRECT.GET.KV_people.>",
               "$JS.API.CONSUMER.CREATE.KV_people.>",
               "$JS.API.CONSUMER.DELETE.KV_people.*",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+              "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
               "$JS.ACK.TASKS.>",
@@ -3361,7 +3366,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: c825e0fa8fe7db93
+    kubeagents.x-k8s.io/a2a-authmap-version: d6a342423e76b1d2
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3955,7 +3960,8 @@ stringData:
           # (#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on
           # TASKS, and INFO, DIRECT.GET and consumer create/delete on
           # KV_session-state, its own registry, on KV_feedback, the kept
-          # answer ratings, and on KV_people, one hashed key per chat person.
+          # answer ratings, and on KV_people, one hashed key per chat person;
+          # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs.
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
@@ -3975,6 +3981,7 @@ stringData:
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
+                  "$KV.SCHEDULED_REPORTS.>",
                   "chat.console.*.out",
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
@@ -3997,6 +4004,8 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
                   "$JS.API.STREAM.INFO.DIRECTORY",
                   "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
@@ -4097,6 +4106,8 @@ stringData:
                   "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
                   "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
                   "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
                   "_INBOX.seed.>"
                 ]
               }
