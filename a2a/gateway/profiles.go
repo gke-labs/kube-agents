@@ -100,6 +100,19 @@ const (
 const (
 	noticeTurnNotStarted       = "⚠️ not started: "
 	noticeDelegationRefusedFor = "⚠️ delegation refused: "
+	// noticeDelegationNotStarted begins a profile parent's word that its
+	// request was accepted but started no child (#4860).
+	noticeDelegationNotStarted = "⚠️ delegation didn't start: "
+	// noticeProfileDoesNotDelegate refuses a task of a profile whose card
+	// doesn't say it delegates (AgentProfile spec.delegates, #6789).
+	noticeProfileDoesNotDelegate = "%s isn't set up to hand tasks on"
+	// noticeDelegationRounds refuses a profile parent's request made once
+	// its task has used its delegation rounds (delegation.rounds), with
+	// the count.
+	noticeDelegationRounds = "this task has used its %d delegation round%s"
+	// noticeDelegationRoundsChildren follows noticeDelegationRounds when
+	// the rounds used minted children: they still report back.
+	noticeDelegationRoundsChildren = "; the tasks it started will still report back"
 )
 
 // How noticeParamUndeclared and noticeParamMissing spell a profile's
@@ -582,6 +595,16 @@ func fnmatchRegexp(pattern string) string {
 // parameters, so the submission names its target either way. A task with no
 // target is scoped to the install's namespace.
 func (g *Gateway) profileRouteFor(addressee string, params map[string]string, tier capability.Tier, kind string) (*profileRoute, error) {
+	return g.profileRouteWith(addressee, params, tier, kind, true)
+}
+
+// profileRouteWith is profileRouteFor, with the target's install-scope check
+// (checkScope) left out when scopeChecked is false. Only the probe behind a
+// profile parent's delegate list does that (profileDelegateTargets), for a
+// profile whose cluster the parent's worker will choose: whether that cluster
+// is in scope is checked when the delegation arrives, through
+// profileRouteFor. Every route a task is minted on is checked.
+func (g *Gateway) profileRouteWith(addressee string, params map[string]string, tier capability.Tier, kind string, scopeChecked bool) (*profileRoute, error) {
 	profile, target, err := resolveProfile(g.profiles, addressee, params)
 	if err != nil {
 		return nil, err
@@ -607,13 +630,15 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 		}
 		return route, nil
 	}
-	decl, err := loadScope(g.cfg.ScopeFile)
-	if err != nil {
-		g.log.Warn("scope file unreadable; refusing the target", "path", g.cfg.ScopeFile, "err", err)
-		decl = nil
-	}
-	if err := g.checkScope(decl, *target); err != nil {
-		return nil, err
+	if scopeChecked {
+		decl, err := loadScope(g.cfg.ScopeFile)
+		if err != nil {
+			g.log.Warn("scope file unreadable; refusing the target", "path", g.cfg.ScopeFile, "err", err)
+			decl = nil
+		}
+		if err := g.checkScope(decl, *target); err != nil {
+			return nil, err
+		}
 	}
 	if route.Params == nil {
 		route.Params = map[string]string{}
@@ -735,6 +760,11 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 // not when a stop cancelled it with its child, or it has ended. It logs a
 // result it won't deliver.
 func (g *Gateway) profileParentListens(ctx context.Context, parent *TaskRef, child string) bool {
+	if parent.endedUnread {
+		g.log.Info("child result not delivered: the parent has ended (its terminal is on the stream, not yet handled)",
+			"child", child, "parent", parent.ID)
+		return false
+	}
 	if !parent.Canceled && !parent.TerminalObserved && g.parentEnded(ctx, parent.ID) {
 		// The relay retires a task's index entry on its terminal and sets
 		// no flag on the history entry.

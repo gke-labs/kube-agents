@@ -111,10 +111,11 @@ cannot express comes back as a warning, never an error.
 with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
 `spec.harness.type` (and the gateway sets on session pods from the
 PlatformAgent's `spec.harness.sessionWorker.type`), or on a profile worker
-`PROFILE_HARNESS` when that is unset (`claude-code` or `antigravity`). A session
-pod refuses `antigravity` unless `A2A_HARNESS_UNISOLATED=allow` and
-`A2A_HARNESS_PATH` are set, until #6710 lands; a profile worker refuses it
-because it has no persona adapter yet.
+`PROFILE_HARNESS` when that is unset (`claude-code`, `antigravity` or
+`core-agent`). A session pod refuses `antigravity` unless
+`A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, and `core-agent`
+unless `A2A_HARNESS_UNISOLATED=allow` is set, until #6710 lands. A profile
+worker refuses both, because neither has a persona adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
@@ -137,6 +138,8 @@ because it has no persona adapter yet.
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
+- **`core-agent`**: not written yet (it comes with core-agent's persona
+  render, #6713); `render.For` refuses it by name.
 
 ## An example
 

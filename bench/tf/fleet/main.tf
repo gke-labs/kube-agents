@@ -820,10 +820,9 @@ resource "google_container_node_pool" "seeded_b_default" {
 # reason this fleet is at least three clusters and not two. Everything else
 # on C's control plane deliberately matches its peers; its default pool
 # differs on boot-disk size and kubelet config (seeded_c_default below):
-# the boot-disk facet reads the first, and no facet reads the second yet.
-# Two facets today, three once that lands, either count under the six at
-# which the split-cluster guard (SOP 3.6) stops calling C drift and calls
-# it a different kind of cluster.
+# the boot-disk facet reads the first and the kubelet-config facet the
+# second. Three facets, under the six at which the split-cluster guard
+# (SOP 3.6) stops calling C drift and calls it a different kind of cluster.
 resource "google_container_cluster" "seeded_c" {
   name     = "${var.cluster_prefix}-c"
   location = var.zone
@@ -877,13 +876,13 @@ resource "google_container_cluster" "seeded_c" {
 }
 
 # Defect (consistency, pool-level): the same cluster's default pool is the
-# outlier on two node facets, `boot-disk`, which the drift SOP reads, and
-# `kubelet-config`, which it does not read yet. Every other pool in this stack runs a 20 GB boot
+# outlier on the two node facets the drift SOP votes by pool, `boot-disk`
+# and `kubelet-config`. Every other pool in this stack runs a 20 GB boot
 # disk of the default type with no kubelet block; this one runs 50 GB (type
 # unchanged: size alone differed in the incident behind the facets) and
 # sets one kubelet key, pod_pids_limit, to 4096. GKE sets no pod PID limit
-# unless asked, so the facet reads a difference whether it treats an absent
-# key as unset or as the default, and a PID cap on a node whose only
+# unless asked, and the kubelet-config facet reads an absent key as unset,
+# so this pool differs from the others, and a PID cap on a node whose only
 # workload pods are the pause containers defects-c.tf plants changes
 # nothing anyone measures. An integer and not the cpu_cfs_quota = false
 # this block first carried: the pinned provider (8.4.0) force-sends an
@@ -892,13 +891,14 @@ resource "google_container_cluster" "seeded_c" {
 # existed; the key never reached a project older than the block. A
 # non-zero integer is sent on create and on update alike. A pool created
 # with the earlier key may keep it beside this one: the update request
-# leaves it out, and no assertion reads it. Both fields update in place:
+# leaves it out, and no assertion reads it. The facet does read it, as
+# part of the pool's token, and the pool is the outlier either way. Both fields update in place:
 # GKE recreates the pool's one node, the pool keeps its identity, and the
 # cluster's createTime does not move, so the drift SOP's 24-hour cohort
 # gate is untouched and no reconcile-allow entry is needed. The fixture
 # role is drift-pool-outlier (fixtures.json);
-# consistency-boot-disk-pool-outlier reads the disk, and the kubelet-config
-# facet and its case are the follow-up.
+# consistency-boot-disk-pool-outlier reads the disk, and
+# consistency-kubelet-config-pool-outlier the kubelet block.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
   location   = var.zone
