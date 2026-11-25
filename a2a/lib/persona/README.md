@@ -132,7 +132,6 @@ worker refuses `antigravity`, which has no persona adapter yet.
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
-
 - **`core-agent`** (`coreagent`): renders `instructions.md` and `skills/`,
   each skill in the Agent Skills layout (`<name>/SKILL.md` and its files),
   for a directory a user other than the harness's writes before the harness
