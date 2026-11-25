@@ -16,6 +16,17 @@ import (
 // reads its endpoint when no base URL is configured.
 const coreAgentGatewayURLEnv = "GOOGLE_GEMINI_BASE_URL"
 
+// gatewayProxyStreamIdleEnv sets the gateway proxy's stream idle bound, in
+// whole seconds from 1 to gatewayProxyStreamIdleMaxSeconds
+// (workeradapter.GatewayProxyOptions.StreamIdle). Unset, empty or anything
+// else: the default, with a warning for a value that was set.
+const (
+	gatewayProxyStreamIdleEnv = "A2A_GATEWAY_PROXY_STREAM_IDLE_SECONDS"
+	// gatewayProxyStreamIdleMaxSeconds is a day: longer than any task
+	// deadline, and far inside what a time.Duration holds.
+	gatewayProxyStreamIdleMaxSeconds = 24 * 60 * 60
+)
+
 // coreAgentWithheldPrefixes are dropped from core-agent's environment by
 // coreAgentBuilder.env: every model credential, endpoint and project
 // setting core-agent and its model library (go-steer/core-models) read.
@@ -99,17 +110,12 @@ func applyHarnessGateway(cfg *workeradapter.Config, getenv func(string) string, 
 	return closer, nil
 }
 
-// gatewayProxyStreamIdleEnv sets the gateway proxy's stream idle bound, in
-// seconds (workeradapter.GatewayProxyOptions.StreamIdle). Unset, empty or
-// not a positive whole number: the default.
-const gatewayProxyStreamIdleEnv = "A2A_GATEWAY_PROXY_STREAM_IDLE_SECONDS"
-
 // gatewayProxyStarterFromEnv is the starter run() uses: the proxy with the
 // pod's stream idle bound, if it sets one.
 func gatewayProxyStarterFromEnv(getenv func(string) string, log *slog.Logger) gatewayProxyStarter {
 	var opts workeradapter.GatewayProxyOptions
 	if raw := getenv(gatewayProxyStreamIdleEnv); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= gatewayProxyStreamIdleMaxSeconds {
 			opts.StreamIdle = time.Duration(n) * time.Second
 		} else {
 			log.Warn("ignoring an unusable stream idle bound; using the default", gatewayProxyStreamIdleEnv, raw, "default", workeradapter.DefaultGatewayProxyStreamIdle.String())

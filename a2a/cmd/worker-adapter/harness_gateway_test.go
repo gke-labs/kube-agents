@@ -358,9 +358,18 @@ func TestThePodsStreamIdleBoundReachesTheProxy(t *testing.T) {
 		t.Errorf("err %v after %v; want the connection broken about 1s in", err, time.Since(began))
 	}
 
+	// Not a number, not positive, or past a day (which would also overflow
+	// time.Duration well before Atoi's range ends): warned and ignored.
+	for _, bad := range []string{"soon", "0", "-5", "86401", "9223372037", "18446744074"} {
+		var logged strings.Builder
+		_ = gatewayProxyStarterFromEnv(func(k string) string { return map[string]string{gatewayProxyStreamIdleEnv: bad}[k] }, slog.New(slog.NewTextHandler(&logged, nil)))
+		if !strings.Contains(logged.String(), gatewayProxyStreamIdleEnv) {
+			t.Errorf("%q logged %q; want a warning naming the variable", bad, logged.String())
+		}
+	}
 	var logged strings.Builder
-	_ = gatewayProxyStarterFromEnv(func(k string) string { return map[string]string{gatewayProxyStreamIdleEnv: "soon"}[k] }, slog.New(slog.NewTextHandler(&logged, nil)))
-	if !strings.Contains(logged.String(), gatewayProxyStreamIdleEnv) {
-		t.Errorf("an unusable value logged %q; want a warning naming the variable", logged.String())
+	_ = gatewayProxyStarterFromEnv(func(k string) string { return map[string]string{gatewayProxyStreamIdleEnv: "86400"}[k] }, slog.New(slog.NewTextHandler(&logged, nil)))
+	if logged.Len() != 0 {
+		t.Errorf("a day logged %q; want it accepted silently", logged.String())
 	}
 }
