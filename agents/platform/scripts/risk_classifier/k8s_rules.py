@@ -59,8 +59,10 @@ SYSTEM_NAMESPACES = frozenset(
         "kubeagents-system",
         "gke-system",
         "gmp-system",
+        "gmp-public",
         "gke-managed-system",
         "gke-managed-cim",
+        "gke-mcs",
         "istio-system",
         "config-management-system",
         "cnrm-system",
@@ -69,11 +71,14 @@ SYSTEM_NAMESPACES = frozenset(
         "cert-manager",
         "gatekeeper-system",
         "kyverno",
+        "calico-system",
+        "metallb-system",
     }
 )
 
 ENV_LABEL_KEYS = ("kube-agents/environment", "environment", "env", "stage", "tier")
 PRODUCTION_VALUES = frozenset({"prod", "production", "prd", "live"})
+PRODUCTION_PATH_VALUES = frozenset({"prod", "production", "prd"})
 
 CLUSTER_SCOPED_KINDS: frozenset[tuple[str, str]] = frozenset(
     {
@@ -88,6 +93,18 @@ CLUSTER_SCOPED_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("admissionregistration.k8s.io", "MutatingWebhookConfiguration"),
         ("admissionregistration.k8s.io", "ValidatingAdmissionPolicy"),
         ("admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding"),
+        ("admissionregistration.k8s.io", "MutatingAdmissionPolicy"),
+        ("admissionregistration.k8s.io", "MutatingAdmissionPolicyBinding"),
+        ("flowcontrol.apiserver.k8s.io", "FlowSchema"),
+        ("flowcontrol.apiserver.k8s.io", "PriorityLevelConfiguration"),
+        ("audit.k8s.io", "Policy"),
+        ("certificates.k8s.io", "CertificateSigningRequest"),
+        ("certificates.k8s.io", "ClusterTrustBundle"),
+        ("authentication.k8s.io", "TokenReview"),
+        ("authentication.k8s.io", "SelfSubjectReview"),
+        ("authorization.k8s.io", "SubjectAccessReview"),
+        ("authorization.k8s.io", "SelfSubjectAccessReview"),
+        ("authorization.k8s.io", "SelfSubjectRulesReview"),
         ("storage.k8s.io", "StorageClass"),
         ("storage.k8s.io", "CSIDriver"),
         ("storage.k8s.io", "CSINode"),
@@ -95,13 +112,26 @@ CLUSTER_SCOPED_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("scheduling.k8s.io", "PriorityClass"),
         ("node.k8s.io", "RuntimeClass"),
         ("networking.k8s.io", "IngressClass"),
+        ("networking.k8s.io", "ServiceCIDR"),
+        ("networking.k8s.io", "IPAddress"),
+        ("resource.k8s.io", "DeviceClass"),
+        ("resource.k8s.io", "ResourceSlice"),
         ("gateway.networking.k8s.io", "GatewayClass"),
         ("snapshot.storage.k8s.io", "VolumeSnapshotContent"),
+        ("snapshot.storage.k8s.io", "VolumeSnapshotClass"),
         ("kyverno.io", "ClusterPolicy"),
         ("templates.gatekeeper.sh", "ConstraintTemplate"),
         ("configmanagement.gke.io", "ConfigManagement"),
         ("cert-manager.io", "ClusterIssuer"),
         ("external-secrets.io", "ClusterSecretStore"),
+        ("cloud.google.com", "ComputeClass"),
+        ("autoscaling.x-k8s.io", "CapacityQuota"),
+        ("networking.gke.io", "GKENetworkParamSet"),
+        ("networking.gke.io", "Network"),
+        ("monitoring.googleapis.com", "ClusterPodMonitoring"),
+        ("monitoring.googleapis.com", "ClusterNodeMonitoring"),
+        ("monitoring.googleapis.com", "ClusterRules"),
+        ("monitoring.googleapis.com", "GlobalRules"),
     }
 )
 
@@ -114,6 +144,7 @@ WORKLOAD_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("batch", "Job"),
         ("batch", "CronJob"),
         ("", "Pod"),
+        ("", "ReplicationController"),
     }
 )
 
@@ -134,8 +165,13 @@ DATA_STATEFUL_DELETE_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("", "Namespace"),
         ("snapshot.storage.k8s.io", "VolumeSnapshot"),
         ("snapshot.storage.k8s.io", "VolumeSnapshotContent"),
+        ("snapshot.storage.k8s.io", "VolumeSnapshotClass"),
         ("apiextensions.k8s.io", "CustomResourceDefinition"),
         ("storage.k8s.io", "StorageClass"),
+        ("networking.k8s.io", "ServiceCIDR"),
+        ("networking.k8s.io", "IPAddress"),
+        ("certificates.k8s.io", "ClusterTrustBundle"),
+        ("networking.gke.io", "ManagedCertificate"),
         ("postgresql.cnpg.io", "Cluster"),
         ("postgresql.cnpg.io", "ScheduledBackup"),
         ("container.cnrm.cloud.google.com", "ContainerCluster"),
@@ -146,6 +182,8 @@ DATA_STATEFUL_DELETE_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("spanner.cnrm.cloud.google.com", "SpannerDatabase"),
         ("alloydb.cnrm.cloud.google.com", "AlloyDBCluster"),
         ("alloydb.cnrm.cloud.google.com", "AlloyDBInstance"),
+        ("redis.cnrm.cloud.google.com", "RedisInstance"),
+        ("redis.cnrm.cloud.google.com", "RedisCluster"),
         ("storage.cnrm.cloud.google.com", "StorageBucket"),
         ("bigquery.cnrm.cloud.google.com", "BigQueryDataset"),
         ("bigquery.cnrm.cloud.google.com", "BigQueryTable"),
@@ -172,14 +210,102 @@ CONTROL_PLANE_EXTENSION_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("admissionregistration.k8s.io", "MutatingWebhookConfiguration"),
         ("admissionregistration.k8s.io", "ValidatingAdmissionPolicy"),
         ("admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding"),
+        ("admissionregistration.k8s.io", "MutatingAdmissionPolicy"),
+        ("admissionregistration.k8s.io", "MutatingAdmissionPolicyBinding"),
         ("apiregistration.k8s.io", "APIService"),
     }
 )
 
+FLOWCONTROL_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("flowcontrol.apiserver.k8s.io", "FlowSchema"),
+        ("flowcontrol.apiserver.k8s.io", "PriorityLevelConfiguration"),
+    }
+)
+
+CERT_AND_AUTH_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("certificates.k8s.io", "CertificateSigningRequest"),
+        ("certificates.k8s.io", "ClusterTrustBundle"),
+        ("", "TokenRequest"),
+        ("authentication.k8s.io", "TokenRequest"),
+        ("authentication.k8s.io", "TokenReview"),
+        ("authentication.k8s.io", "SelfSubjectReview"),
+        ("authorization.k8s.io", "SubjectAccessReview"),
+        ("authorization.k8s.io", "SelfSubjectAccessReview"),
+        ("authorization.k8s.io", "SelfSubjectRulesReview"),
+        ("authorization.k8s.io", "LocalSubjectAccessReview"),
+    }
+)
+
+COORDINATION_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("coordination.k8s.io", "Lease"),
+        ("coordination.k8s.io", "LeaseCandidate"),
+    }
+)
+
+DRA_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("resource.k8s.io", "DeviceClass"),
+        ("resource.k8s.io", "ResourceSlice"),
+        ("resource.k8s.io", "ResourceClaim"),
+        ("resource.k8s.io", "ResourceClaimTemplate"),
+    }
+)
+
+GKE_NETWORKING_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("networking.gke.io", "GCPBackendPolicy"),
+        ("networking.gke.io", "GCPGatewayPolicy"),
+        ("networking.gke.io", "HealthCheckPolicy"),
+        ("networking.gke.io", "FrontendConfig"),
+        ("networking.gke.io", "ManagedCertificate"),
+        ("networking.gke.io", "ServiceExport"),
+        ("networking.gke.io", "ServiceImport"),
+        ("networking.gke.io", "ServiceNetworkEndpointGroup"),
+        ("networking.gke.io", "GKENetworkParamSet"),
+        ("networking.gke.io", "Network"),
+        ("net.gke.io", "ServiceExport"),
+        ("net.gke.io", "ServiceImport"),
+        ("cloud.google.com", "BackendConfig"),
+    }
+)
+
+GKE_COMPUTE_AUTOSCALING_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("cloud.google.com", "ComputeClass"),
+        ("autoscaling.x-k8s.io", "ProvisioningRequest"),
+        ("autoscaling.x-k8s.io", "CapacityBuffer"),
+        ("autoscaling.x-k8s.io", "CapacityQuota"),
+    }
+)
+
+MONITORING_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("monitoring.googleapis.com", "PodMonitoring"),
+        ("monitoring.googleapis.com", "ClusterPodMonitoring"),
+        ("monitoring.googleapis.com", "ClusterNodeMonitoring"),
+        ("monitoring.googleapis.com", "Rules"),
+        ("monitoring.googleapis.com", "ClusterRules"),
+        ("monitoring.googleapis.com", "GlobalRules"),
+        ("monitoring.googleapis.com", "OperatorConfig"),
+        ("monitoring.coreos.com", "ServiceMonitor"),
+        ("monitoring.coreos.com", "PodMonitor"),
+        ("monitoring.coreos.com", "PrometheusRule"),
+        ("monitoring.coreos.com", "Probe"),
+        ("monitoring.coreos.com", "ScrapeConfig"),
+        ("monitoring.coreos.com", "AlertmanagerConfig"),
+        ("monitoring.coreos.com", "Prometheus"),
+        ("monitoring.coreos.com", "Alertmanager"),
+        ("monitoring.coreos.com", "ThanosRuler"),
+    }
+)
+
 GATEWAY_API_ROUTE_KINDS = frozenset({"HTTPRoute", "GRPCRoute", "TCPRoute", "TLSRoute", "UDPRoute"})
-ISTIO_TRAFFIC_KINDS = frozenset({"VirtualService", "DestinationRule", "Gateway", "ServiceEntry", "Sidecar"})
+ISTIO_TRAFFIC_KINDS = frozenset({"VirtualService", "DestinationRule", "Gateway", "ServiceEntry", "Sidecar", "WorkloadEntry", "WorkloadGroup"})
 ISTIO_SECURITY_KINDS = frozenset({"PeerAuthentication", "RequestAuthentication", "AuthorizationPolicy"})
-ISTIO_PROXY_KINDS = frozenset({"EnvoyFilter", "WasmPlugin"})
+ISTIO_PROXY_KINDS = frozenset({"EnvoyFilter", "WasmPlugin", "ProxyConfig"})
 
 GITOPS_RECONCILER_KINDS: frozenset[tuple[str, str]] = frozenset(
     {
@@ -211,6 +337,13 @@ CORE_KNOWN_KINDS: frozenset[tuple[str, str]] = (
     | CLUSTER_SCOPED_KINDS
     | RBAC_KINDS
     | CONTROL_PLANE_EXTENSION_KINDS
+    | FLOWCONTROL_KINDS
+    | CERT_AND_AUTH_KINDS
+    | COORDINATION_KINDS
+    | DRA_KINDS
+    | GKE_NETWORKING_KINDS
+    | GKE_COMPUTE_AUTOSCALING_KINDS
+    | MONITORING_KINDS
     | GITOPS_RECONCILER_KINDS
     | DATA_STATEFUL_DELETE_KINDS
     | frozenset(
@@ -218,9 +351,12 @@ CORE_KNOWN_KINDS: frozenset[tuple[str, str]] = (
             ("", "ConfigMap"),
             ("", "Secret"),
             ("", "Service"),
+            ("", "Endpoints"),
             ("", "ServiceAccount"),
+            ("", "PodTemplate"),
             ("", "ResourceQuota"),
             ("", "LimitRange"),
+            ("discovery.k8s.io", "EndpointSlice"),
             ("policy", "PodDisruptionBudget"),
             ("autoscaling", "HorizontalPodAutoscaler"),
             ("autoscaling.k8s.io", "VerticalPodAutoscaler"),
@@ -233,16 +369,23 @@ CORE_KNOWN_KINDS: frozenset[tuple[str, str]] = (
             ("gateway.networking.k8s.io", "TLSRoute"),
             ("gateway.networking.k8s.io", "UDPRoute"),
             ("gateway.networking.k8s.io", "ReferenceGrant"),
+            ("gateway.networking.k8s.io", "ReferencePolicy"),
+            ("gateway.networking.k8s.io", "BackendTLSPolicy"),
+            ("gateway.networking.k8s.io", "BackendLBPolicy"),
             ("networking.istio.io", "VirtualService"),
             ("networking.istio.io", "DestinationRule"),
             ("networking.istio.io", "Gateway"),
             ("networking.istio.io", "ServiceEntry"),
             ("networking.istio.io", "Sidecar"),
+            ("networking.istio.io", "WorkloadEntry"),
+            ("networking.istio.io", "WorkloadGroup"),
+            ("networking.istio.io", "ProxyConfig"),
             ("networking.istio.io", "EnvoyFilter"),
             ("security.istio.io", "PeerAuthentication"),
             ("security.istio.io", "RequestAuthentication"),
             ("security.istio.io", "AuthorizationPolicy"),
             ("extensions.istio.io", "WasmPlugin"),
+            ("telemetry.istio.io", "Telemetry"),
             ("kyverno.io", "Policy"),
             ("kyverno.io", "ClusterPolicy"),
             ("cert-manager.io", "Certificate"),
@@ -290,14 +433,31 @@ PROTECTED_METADATA_PREFIXES = (
     "kubeagents.",
     "pod-security.kubernetes.io/",
     "istio.io/",
+    "sidecar.istio.io/",
+    "traffic.sidecar.istio.io/",
+    "ambient.istio.io/",
     "security.istio.io/",
     "iam.gke.io/",
     "eks.amazonaws.com/",
     "azure.workload.identity/",
     "argocd.argoproj.io/",
+    "fluxcd.io/",
+    "kustomize.toolkit.fluxcd.io/",
+    "helm.toolkit.fluxcd.io/",
+    "configsync.gke.io/",
+    "configmanagement.gke.io/",
     "helm.sh/",
     "cnrm.cloud.google.com/",
     "nginx.ingress.kubernetes.io/",
+    "service.beta.kubernetes.io/",
+    "service.kubernetes.io/",
+    "external-dns.alpha.kubernetes.io/",
+    "cert-manager.io/",
+    "container.apparmor.security.beta.kubernetes.io/",
+    "seccomp.security.alpha.kubernetes.io/",
+    "k8s.v1.cni.cncf.io/",
+    "vault.hashicorp.com/",
+    "secrets-store.csi.k8s.io/",
     "kubernetes.io/",
     "k8s.io/",
     "networking.gke.io/",
@@ -307,15 +467,56 @@ PROTECTED_METADATA_PREFIXES = (
 )
 
 # Secret-like key names & high-confidence credential patterns
+_CAMEL_BOUNDARY_1_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_BOUNDARY_2_RE = re.compile(r"([a-z0-9])([A-Z])")
+_SECRET_KEY_EXACT_FILENAMES = frozenset(
+    {
+        "tls.key",
+        "server.key",
+        "client.key",
+        "ca.key",
+        "privkey.pem",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".dockerconfigjson",
+        ".dockercfg",
+        ".npmrc",
+        ".netrc",
+        ".htpasswd",
+        ".pgpass",
+        ".pypirc",
+        "credentials.json",
+        "service-account.json",
+    }
+)
 _SECRET_KEY_NAME_RE = re.compile(
-    r"(?:^|[._-])(?:PASSWORD|PASSWD|SECRET|PRIVATE[_-]?KEY|API[_-]?KEY|ACCESS[_-]?KEY|"
-    r"AUTH[_-]?TOKEN|BEARER|CLIENT[_-]?SECRET|CREDENTIALS?|DB[_-]?PASS|JWT[_-]?SECRET)(?:$|[._-])",
+    r"(?:^|[._-])(?:"
+    r"PASSWORD|PASSWD|SECRET|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|MASTER[_-]?KEY|"
+    r"API[_-]?KEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|STRIPE[_-]?KEY|WEBHOOK[_-]?SECRET|"
+    r"AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|SESSION[_-]?TOKEN|ID[_-]?TOKEN|API[_-]?TOKEN|"
+    r"BEARER(?:[_-]?TOKEN)?|GITHUB[_-]?TOKEN|GITLAB[_-]?TOKEN|SLACK[_-]?TOKEN|"
+    r"CLIENT[_-]?SECRET|CREDENTIALS?|DB[_-]?PASS|JWT[_-]?SECRET"
+    r")(?:$|[._-])",
     re.IGNORECASE,
 )
 
+
+def _is_secret_key_name(key: str) -> bool:
+    low = key.strip().lower()
+    if low in _SECRET_KEY_EXACT_FILENAMES:
+        return True
+    snake = _CAMEL_BOUNDARY_2_RE.sub(r"\1_\2", _CAMEL_BOUNDARY_1_RE.sub(r"\1_\2", key.strip()))
+    return bool(_SECRET_KEY_NAME_RE.search(key) or _SECRET_KEY_NAME_RE.search(snake))
+
+
 _DANGEROUS_ENV_KEY_RE = re.compile(
     r"^(?:LD_PRELOAD|LD_LIBRARY_PATH|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|"
-    r"NODE_TLS_REJECT_UNAUTHORIZED|PYTHONHTTPSVERIFY|SSL_CERT_FILE|GODEBUG|JAVA_TOOL_OPTIONS)$",
+    r"NODE_TLS_REJECT_UNAUTHORIZED|NODE_OPTIONS|NODE_EXTRA_CA_CERTS|"
+    r"PYTHONHTTPSVERIFY|PYTHONPATH|PYTHONSTARTUP|RUBYOPT|PERL5OPT|BASH_ENV|"
+    r"SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|"
+    r"GODEBUG|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|JVM_ARGS|GLIBC_TUNABLES|DOTNET_STARTUP_HOOKS)$",
     re.IGNORECASE,
 )
 
@@ -324,15 +525,23 @@ _CREDENTIAL_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")),
     ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("GCP API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("Google OAuth token", re.compile(r"\bya29\.[0-9A-Za-z_-]{30,}\b")),
     ("Slack token", re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}\b")),
     ("API secret key", re.compile(r"\bsk-(?:ant-|proj-|live_|test_)?[A-Za-z0-9_-]{20,}\b")),
     ("GitLab token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b")),
+    ("HuggingFace token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
+    ("npm access token", re.compile(r"\bnpm_[A-Za-z0-9]{30,}\b")),
+    ("SendGrid API key", re.compile(r"\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b")),
     ("JWT bearer token", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    (
+        "URI with embedded password",
+        re.compile(r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps)://[^/\s:@]*:[^/\s@]{3,}@"),
+    ),
 )
 
 # Image tag immutability patterns (3-part semver or explicit/full git SHA; rejects 2-part floating tags like :16.2)
 _SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_SEMVER_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z._-]+)?$")
+_SEMVER_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z._-]+)?(?:\+[0-9A-Za-z._-]+)?$")
 _GIT_SHA_TAG_RE = re.compile(r"^(?:(?:sha|git)-[0-9a-f]{7,40}|[0-9a-f]{40})$")
 _MUTABLE_TAG_TOKENS = frozenset(
     {
@@ -368,13 +577,40 @@ _CRITICAL_HOST_PATHS = (
     "/root",
     "/boot",
     "/lib",
+    "/lib64",
+    "/bin",
+    "/sbin",
     "/usr",
+    "/home",
     "/var/lib/kubelet",
     "/var/lib/docker",
     "/var/lib/containerd",
+    "/var/lib/crio",
+    "/var/lib/etcd",
     "/proc",
     "/sys",
     "/dev",
+)
+
+# Raw / network / SAN volume plugin fields in PodSpec.volumes
+_EXTERNAL_STORAGE_VOLUME_KEYS = (
+    "nfs",
+    "iscsi",
+    "fc",
+    "rbd",
+    "cephfs",
+    "glusterfs",
+    "cinder",
+    "vsphereVolume",
+    "awsElasticBlockStore",
+    "gcePersistentDisk",
+    "azureDisk",
+    "azureFile",
+    "portworxVolume",
+    "quobyte",
+    "scaleIO",
+    "storageos",
+    "flocker",
 )
 
 # Kubernetes resource quantity parsing
@@ -416,7 +652,13 @@ MIN_SAFE_MEM_B = 16 * 1024**2
 _SUPERUSER_ROLES = frozenset({"cluster-admin", "system:masters"})
 _CLUSTER_ADMIN_EQUIV_ROLES = frozenset({"admin", "edit"})
 _SUPERUSER_SUBJECTS = frozenset(
-    {"system:anonymous", "system:unauthenticated", "system:authenticated", "system:serviceaccounts"}
+    {
+        "system:anonymous",
+        "system:unauthenticated",
+        "system:authenticated",
+        "system:serviceaccounts",
+        "system:serviceaccounts:kube-system",
+    }
 )
 _PRIV_ESCALATION_VERBS = frozenset({"*", "impersonate", "escalate", "bind"})
 _SENSITIVE_RBAC_RESOURCES = frozenset(
@@ -425,11 +667,26 @@ _SENSITIVE_RBAC_RESOURCES = frozenset(
         "secrets",
         "pods/exec",
         "pods/attach",
+        "pods/ephemeralcontainers",
+        "pods/portforward",
         "nodes/proxy",
         "serviceaccounts/token",
+        "certificatesigningrequests",
         "certificatesigningrequests/approval",
+        "signers",
+        "tokenreviews",
+        "clusterroles",
+        "clusterrolebindings",
+        "roles",
+        "rolebindings",
         "mutatingwebhookconfigurations",
         "validatingwebhookconfigurations",
+        "validatingadmissionpolicies",
+        "validatingadmissionpolicybindings",
+        "mutatingadmissionpolicies",
+        "mutatingadmissionpolicybindings",
+        "apiservices",
+        "customresourcedefinitions",
     }
 )
 _CRITICAL_IAM_ROLES = frozenset(
@@ -437,19 +694,26 @@ _CRITICAL_IAM_ROLES = frozenset(
         "roles/owner",
         "roles/editor",
         "roles/iam.securityadmin",
+        "roles/iam.roleadmin",
         "roles/iam.serviceaccountkeyadmin",
+        "roles/iam.serviceaccounttokencreator",
         "roles/container.admin",
+        "roles/container.clusteradmin",
         "roles/resourcemanager.projectiamadmin",
+        "roles/resourcemanager.folderadmin",
+        "roles/resourcemanager.folderiamadmin",
         "roles/resourcemanager.organizationadmin",
     }
 )
 _PUBLIC_IAM_MEMBERS = frozenset({"allusers", "allauthenticatedusers"})
 
 _INGRESS_SNIPPET_KEYS = (
+    "-snippet",
     "configuration-snippet",
     "server-snippet",
     "stream-snippet",
     "lua-resty",
+    "fastcgi-params-configmap",
 )
 
 
@@ -643,8 +907,10 @@ def is_immutable_image_pin(image: str) -> bool:
     img = image.strip()
     if not img or any(ch.isspace() for ch in img) or img.count("@") > 1:
         return False
+    if "://" in img or "?" in img or "#" in img:
+        return False
     repo, tag, digest = split_image_ref(img)
-    if not repo:
+    if not repo or repo.startswith("/") or repo.endswith("/") or ".." in repo.split("/"):
         return False
     if digest:
         return bool(_SHA256_DIGEST_RE.match(digest))
@@ -656,11 +922,20 @@ def is_immutable_image_pin(image: str) -> bool:
     if _GIT_SHA_TAG_RE.match(low):
         return True
     if _SEMVER_TAG_RE.match(tag):
-        parts = re.split(r"[-._]", low)
+        parts = re.split(r"[-._+]", low)
         if any(p in _MUTABLE_TAG_TOKENS for p in parts):
             return False
         return True
     return False
+
+
+def is_kube_agents_group(group: str) -> bool:
+    low = group.lower()
+    return (
+        low in ("kubeagents.x-k8s.io", "kube-agents.x-k8s.io")
+        or low.endswith(".kubeagents.x-k8s.io")
+        or low.endswith(".kube-agents.x-k8s.io")
+    )
 
 
 def is_cloud_infra_group(group: str) -> bool:
@@ -701,22 +976,41 @@ def _meta_dict(obj: dict[str, Any] | None, key: str) -> dict[str, Any]:
     return val if isinstance(val, dict) else {}
 
 
+_NON_PROD_COMPOUND_RE = re.compile(
+    r"(?:^|(?<=[-_./\s]))(?:non|not|pre)[-_.]*(?:production|prod|prd|live)(?=$|[-_./\s])"
+)
+
+
+def _strip_negated_prod_compounds(text: str) -> str:
+    return _NON_PROD_COMPOUND_RE.sub(" ", text)
+
+
 def _is_production_labels(labels: dict[str, Any]) -> bool:
     for key in ENV_LABEL_KEYS:
         val = labels.get(key)
         if isinstance(val, str):
-            tokens = [t for t in _PROD_TOKEN_SPLIT_RE.split(val.strip().lower()) if t]
+            cleaned = _strip_negated_prod_compounds(val.strip().lower())
+            tokens = [t for t in _PROD_TOKEN_SPLIT_RE.split(cleaned) if t]
             if any(t in PRODUCTION_VALUES for t in tokens):
                 return True
     return False
 
 
 def _is_production_path(file_path: str) -> bool:
-    for seg in file_path.replace("\\", "/").lower().split("/"):
-        tokens = [t for t in _PROD_TOKEN_SPLIT_RE.split(seg) if t]
-        if any(t in PRODUCTION_VALUES for t in tokens):
+    parts = [p for p in file_path.replace("\\", "/").lower().split("/") if p]
+    if not parts:
+        return False
+    dir_parts, filename = parts[:-1], parts[-1]
+    for seg in dir_parts:
+        cleaned = _strip_negated_prod_compounds(seg).strip()
+        if cleaned == "live":
             return True
-    return False
+        tokens = [t for t in _PROD_TOKEN_SPLIT_RE.split(cleaned) if t]
+        if any(t in PRODUCTION_PATH_VALUES for t in tokens):
+            return True
+    cleaned_file = _strip_negated_prod_compounds(filename)
+    file_tokens = [t for t in _PROD_TOKEN_SPLIT_RE.split(cleaned_file) if t]
+    return any(t in PRODUCTION_PATH_VALUES for t in file_tokens)
 
 
 def _is_protected_metadata_key(key: str) -> bool:
@@ -767,6 +1061,15 @@ def _is_falsy_or_nonbool(val: Any) -> bool:
 def _extract_pod_spec(kind: str, obj: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(obj, dict):
         return None
+    if kind == "PodTemplate":
+        tmpl = obj.get("template")
+        if not isinstance(tmpl, dict):
+            spec = obj.get("spec")
+            tmpl = spec.get("template") if isinstance(spec, dict) else None
+        if not isinstance(tmpl, dict):
+            return None
+        ps = tmpl.get("spec")
+        return ps if isinstance(ps, dict) else None
     spec = obj.get("spec")
     if not isinstance(spec, dict):
         return None
@@ -789,6 +1092,15 @@ def _extract_pod_spec(kind: str, obj: dict[str, Any] | None) -> dict[str, Any] |
 def _extract_pod_template_meta(kind: str, obj: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(obj, dict):
         return {}
+    if kind == "PodTemplate":
+        tmpl = obj.get("template")
+        if not isinstance(tmpl, dict):
+            spec = obj.get("spec")
+            tmpl = spec.get("template") if isinstance(spec, dict) else None
+        if not isinstance(tmpl, dict):
+            return {}
+        m = tmpl.get("metadata")
+        return m if isinstance(m, dict) else {}
     spec = obj.get("spec")
     if not isinstance(spec, dict):
         return {}
@@ -832,6 +1144,80 @@ def _is_critical_host_path(path_str: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _check_uid_gid_field(ev: ResourceEval, sc: dict[str, Any], key: str, prefix: str) -> None:
+    if key not in sc or sc.get(key) is None:
+        return
+    val = sc.get(key)
+    if not _is_strict_int(val) or val < 0:
+        ev.add(
+            "MALFORMED_FIELD_TYPE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"{prefix}.{key} must be a non-negative integer, got {val!r}",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path=f"{prefix}.{key}",
+            security=True,
+        )
+    elif val == 0:
+        ev.add(
+            "SECURITY_CONTEXT_LOOSENED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"sets {prefix}.{key} to 0 (root)",
+            blast=BLAST_MEDIUM,
+            field_path=f"{prefix}.{key}",
+            security=True,
+        )
+
+
+def _check_confinement_profile(ev: ResourceEval, sc: dict[str, Any], key: str, prefix: str) -> None:
+    if key not in sc or sc.get(key) is None:
+        return
+    raw = sc.get(key)
+    prof = _as_dict(ev, raw, f"{prefix}.{key}")
+    if not isinstance(raw, dict):
+        return
+    ptype = prof.get("type")
+    if not isinstance(ptype, str) or ptype not in ("RuntimeDefault", "Localhost"):
+        ev.add(
+            "SECURITY_CONTEXT_LOOSENED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"sets {prefix}.{key}.type to non-hardened value {ptype!r}",
+            blast=BLAST_MEDIUM,
+            field_path=f"{prefix}.{key}.type",
+            security=True,
+        )
+    elif ptype == "Localhost":
+        lp = prof.get("localhostProfile")
+        if not isinstance(lp, str) or not lp.strip() or ".." in lp.replace("\\", "/").split("/"):
+            ev.add(
+                "SECURITY_CONTEXT_LOOSENED",
+                DIM_SECURITY,
+                RISK_HIGH,
+                f"sets invalid or traversal {prefix}.{key}.localhostProfile={lp!r}",
+                blast=BLAST_MEDIUM,
+                field_path=f"{prefix}.{key}.localhostProfile",
+                security=True,
+            )
+
+
+def _check_proc_mount(ev: ResourceEval, sc: dict[str, Any], prefix: str) -> None:
+    if "procMount" not in sc or sc.get("procMount") is None:
+        return
+    pm = sc.get("procMount")
+    if not isinstance(pm, str) or pm.strip() != "Default":
+        ev.add(
+            "SECURITY_CONTEXT_LOOSENED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"sets {prefix}.procMount to {pm!r} (only 'Default' is hardened)",
+            blast=BLAST_HIGH,
+            field_path=f"{prefix}.procMount",
+            security=True,
+        )
+
+
 def _check_security_hardening_removed(
     ev: ResourceEval,
     b_sc: dict[str, Any],
@@ -869,32 +1255,38 @@ def _check_security_hardening_removed(
             field_path=f"{prefix}.allowPrivilegeEscalation",
             security=True,
         )
-    b_sp = b_sc.get("seccompProfile")
-    a_sp = a_sc.get("seccompProfile")
-    if isinstance(b_sp, dict) and str(b_sp.get("type") or "") not in ("", "Unconfined"):
-        if not isinstance(a_sp, dict) or str(a_sp.get("type") or "") in ("", "Unconfined"):
+    for id_key in ("runAsUser", "runAsGroup", "fsGroup"):
+        b_id = b_sc.get(id_key)
+        a_id = a_sc.get(id_key)
+        if _is_strict_int(b_id) and b_id > 0 and (not _is_strict_int(a_id) or a_id <= 0):
             ev.add(
                 "SECURITY_HARDENING_REMOVED",
                 DIM_SECURITY,
                 RISK_HIGH,
-                f"removes or weakens {prefix}.seccompProfile",
+                f"removes or weakens non-root {prefix}.{id_key}={b_id}",
                 blast=BLAST_MEDIUM,
-                field_path=f"{prefix}.seccompProfile",
+                field_path=f"{prefix}.{id_key}",
                 security=True,
             )
-    b_aa = b_sc.get("appArmorProfile")
-    a_aa = a_sc.get("appArmorProfile")
-    if isinstance(b_aa, dict) and str(b_aa.get("type") or "") not in ("", "Unconfined"):
-        if not isinstance(a_aa, dict) or str(a_aa.get("type") or "") in ("", "Unconfined"):
-            ev.add(
-                "SECURITY_HARDENING_REMOVED",
-                DIM_SECURITY,
-                RISK_HIGH,
-                f"removes or weakens {prefix}.appArmorProfile",
-                blast=BLAST_MEDIUM,
-                field_path=f"{prefix}.appArmorProfile",
-                security=True,
+    for prof_key in ("seccompProfile", "appArmorProfile"):
+        b_p = b_sc.get(prof_key)
+        a_p = a_sc.get(prof_key)
+        if isinstance(b_p, dict) and b_p.get("type") in ("RuntimeDefault", "Localhost"):
+            weakened = (
+                not isinstance(a_p, dict)
+                or a_p.get("type") not in ("RuntimeDefault", "Localhost")
+                or (b_p.get("type") == "Localhost" and a_p != b_p)
             )
+            if weakened:
+                ev.add(
+                    "SECURITY_HARDENING_REMOVED",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"removes or weakens {prefix}.{prof_key}",
+                    blast=BLAST_MEDIUM,
+                    field_path=f"{prefix}.{prof_key}",
+                    security=True,
+                )
     b_caps = b_sc.get("capabilities")
     a_caps = a_sc.get("capabilities")
     b_drop = b_caps.get("drop") if isinstance(b_caps, dict) and isinstance(b_caps.get("drop"), list) else []
@@ -911,12 +1303,91 @@ def _check_security_hardening_removed(
         )
 
 
+def _check_probe_and_lifecycle_security(
+    ev: ResourceEval,
+    ctr: dict[str, Any],
+    before_ctr: dict[str, Any] | None,
+    prefix: str,
+) -> None:
+    """Inspect container probes and lifecycle hooks for exec RCE and kubelet host SSRF."""
+    for pk in ("readinessProbe", "livenessProbe", "startupProbe"):
+        raw_p = ctr.get(pk)
+        if raw_p is None:
+            continue
+        pdict = _as_dict(ev, raw_p, f"{prefix}.{pk}")
+        if not isinstance(raw_p, dict):
+            continue
+        b_pdict = before_ctr.get(pk) if isinstance(before_ctr, dict) and isinstance(before_ctr.get(pk), dict) else {}
+        if "exec" in pdict and pdict.get("exec") is not None:
+            _as_dict(ev, pdict.get("exec"), f"{prefix}.{pk}.exec")
+            if before_ctr is None or pdict.get("exec") != b_pdict.get("exec"):
+                ev.add(
+                    "PROBE_EXEC_COMMAND_CHANGED",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"sets or modifies {pk}.exec command on {prefix}",
+                    blast=BLAST_MEDIUM,
+                    field_path=f"{prefix}.{pk}.exec",
+                    security=True,
+                )
+        for hk in ("httpGet", "tcpSocket"):
+            hsub = pdict.get(hk)
+            if isinstance(hsub, dict) and hsub.get("host"):
+                b_hsub = b_pdict.get(hk) if isinstance(b_pdict.get(hk), dict) else {}
+                if before_ctr is None or hsub.get("host") != b_hsub.get("host"):
+                    ev.add(
+                        "PROBE_HOST_SSRF_RISK",
+                        DIM_SECURITY,
+                        RISK_HIGH,
+                        f"sets custom kubelet probe target {hk}.host={hsub.get('host')!r} on {prefix}.{pk}",
+                        blast=BLAST_MEDIUM,
+                        field_path=f"{prefix}.{pk}.{hk}.host",
+                        security=True,
+                    )
+
+    raw_lc = ctr.get("lifecycle")
+    if raw_lc is not None:
+        lc = _as_dict(ev, raw_lc, f"{prefix}.lifecycle")
+        b_lc = before_ctr.get("lifecycle") if isinstance(before_ctr, dict) and isinstance(before_ctr.get("lifecycle"), dict) else {}
+        for hook in ("postStart", "preStop"):
+            if lc.get(hook) is None:
+                continue
+            hd = _as_dict(ev, lc.get(hook), f"{prefix}.lifecycle.{hook}")
+            b_hd = b_lc.get(hook) if isinstance(b_lc.get(hook), dict) else {}
+            if hd.get("exec") is not None and (before_ctr is None or hd.get("exec") != b_hd.get("exec")):
+                _as_dict(ev, hd.get("exec"), f"{prefix}.lifecycle.{hook}.exec")
+                ev.add(
+                    "LIFECYCLE_EXEC_HOOK",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"defines or modifies lifecycle.{hook}.exec command on {prefix}",
+                    blast=BLAST_MEDIUM,
+                    field_path=f"{prefix}.lifecycle.{hook}.exec",
+                    security=True,
+                )
+            for hk in ("httpGet", "tcpSocket"):
+                hsub = hd.get(hk)
+                if isinstance(hsub, dict) and hsub.get("host"):
+                    b_hsub = b_hd.get(hk) if isinstance(b_hd.get(hk), dict) else {}
+                    if before_ctr is None or hsub.get("host") != b_hsub.get("host"):
+                        ev.add(
+                            "PROBE_HOST_SSRF_RISK",
+                            DIM_SECURITY,
+                            RISK_HIGH,
+                            f"sets custom kubelet lifecycle {hook}.{hk}.host={hsub.get('host')!r} on {prefix}",
+                            blast=BLAST_MEDIUM,
+                            field_path=f"{prefix}.lifecycle.{hook}.{hk}.host",
+                            security=True,
+                        )
+
+
 def _check_pod_spec_posture(
     ev: ResourceEval,
     pod_spec: dict[str, Any],
     *,
     before_pod_spec: dict[str, Any] | None = None,
     is_daemonset: bool = False,
+    require_containers: bool = True,
 ) -> None:
     """Inspect a PodSpec (on add or modify) for privilege escalation, host escape, and secret mounts."""
     b_ps = before_pod_spec if isinstance(before_pod_spec, dict) else {}
@@ -936,6 +1407,51 @@ def _check_pod_spec_posture(
                 security=True,
             )
 
+    # K8s User Namespaces: `hostUsers: false` is hardened (isolated userns); `hostUsers: true` is host userns
+    if "hostUsers" in pod_spec and pod_spec.get("hostUsers") is not None:
+        hu = pod_spec.get("hostUsers")
+        if not isinstance(hu, bool):
+            ev.add(
+                "MALFORMED_FIELD_TYPE",
+                DIM_SECURITY,
+                RISK_HIGH,
+                f"sets non-boolean PodSpec hostUsers={hu!r}",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="hostUsers",
+                security=True,
+            )
+        elif hu is True and before_pod_spec is not None and b_ps.get("hostUsers") is not True:
+            if b_ps.get("hostUsers") is False:
+                ev.add(
+                    "SECURITY_HARDENING_REMOVED",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    "disables user-namespace isolation (hostUsers: false -> true)",
+                    blast=BLAST_HIGH,
+                    field_path="hostUsers",
+                    security=True,
+                )
+            else:
+                ev.add(
+                    "POD_SECURITY_POSTURE_WIDENED",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    "explicitly sets PodSpec hostUsers=true",
+                    blast=BLAST_MEDIUM,
+                    field_path="hostUsers",
+                    security=True,
+                )
+    elif before_pod_spec is not None and b_ps.get("hostUsers") is False:
+        ev.add(
+            "SECURITY_HARDENING_REMOVED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            "removes PodSpec hostUsers=false user-namespace isolation",
+            blast=BLAST_HIGH,
+            field_path="hostUsers",
+            security=True,
+        )
+
     if "shareProcessNamespace" in pod_spec and _is_truthy_or_nonbool(pod_spec.get("shareProcessNamespace")):
         ev.add(
             "POD_SECURITY_POSTURE_WIDENED",
@@ -947,17 +1463,51 @@ def _check_pod_spec_posture(
             security=True,
         )
 
-    if before_pod_spec is not None:
-        if b_ps.get("automountServiceAccountToken") is False and pod_spec.get("automountServiceAccountToken") is not False:
+    if "automountServiceAccountToken" in pod_spec and pod_spec.get("automountServiceAccountToken") is not None:
+        asat = pod_spec.get("automountServiceAccountToken")
+        if not isinstance(asat, bool):
             ev.add(
-                "SECURITY_HARDENING_REMOVED",
+                "MALFORMED_FIELD_TYPE",
                 DIM_SECURITY,
                 RISK_HIGH,
-                "enables or removes automountServiceAccountToken=false",
-                blast=BLAST_MEDIUM,
+                f"sets non-boolean automountServiceAccountToken={asat!r}",
+                disrupt=DISRUPT_DISRUPTIVE,
                 field_path="automountServiceAccountToken",
                 security=True,
             )
+        elif asat is True and before_pod_spec is not None and b_ps.get("automountServiceAccountToken") is not True:
+            if b_ps.get("automountServiceAccountToken") is False:
+                ev.add(
+                    "SECURITY_HARDENING_REMOVED",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    "enables or removes automountServiceAccountToken=false",
+                    blast=BLAST_MEDIUM,
+                    field_path="automountServiceAccountToken",
+                    security=True,
+                )
+            else:
+                ev.add(
+                    "SERVICE_ACCOUNT_TOKEN_MOUNT",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    "explicitly enables PodSpec automountServiceAccountToken=true",
+                    blast=BLAST_MEDIUM,
+                    field_path="automountServiceAccountToken",
+                    security=True,
+                )
+    elif before_pod_spec is not None and b_ps.get("automountServiceAccountToken") is False:
+        ev.add(
+            "SECURITY_HARDENING_REMOVED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            "enables or removes automountServiceAccountToken=false",
+            blast=BLAST_MEDIUM,
+            field_path="automountServiceAccountToken",
+            security=True,
+        )
+
+    if before_pod_spec is not None:
         for net_sched_key in ("hostAliases", "dnsConfig", "dnsPolicy", "runtimeClassName", "nodeName", "imagePullSecrets"):
             if b_ps.get(net_sched_key) != pod_spec.get(net_sched_key):
                 ev.add(
@@ -970,7 +1520,7 @@ def _check_pod_spec_posture(
                     security=True,
                 )
     else:
-        for add_key in ("hostAliases", "runtimeClassName", "nodeName"):
+        for add_key in ("hostAliases", "dnsConfig", "runtimeClassName", "nodeName"):
             if pod_spec.get(add_key):
                 ev.add(
                     "POD_RUNTIME_OR_NETWORK_CHANGED",
@@ -981,8 +1531,25 @@ def _check_pod_spec_posture(
                     field_path=add_key,
                     security=True,
                 )
+        if pod_spec.get("dnsPolicy") and str(pod_spec.get("dnsPolicy")) != "ClusterFirst":
+            ev.add(
+                "POD_RUNTIME_OR_NETWORK_CHANGED",
+                DIM_SECURITY,
+                RISK_HIGH,
+                f"sets non-default PodSpec dnsPolicy={pod_spec.get('dnsPolicy')!r}",
+                blast=BLAST_MEDIUM,
+                field_path="dnsPolicy",
+                security=True,
+            )
 
-    # Volumes: hostPath, Secret mounts, and projected serviceAccountToken
+    # Index prior volumes & containers by name for diff-aware secret/CSI/PVC checks on MODIFY
+    b_vols_by_name: dict[str, dict[str, Any]] = {}
+    if before_pod_spec is not None and isinstance(b_ps.get("volumes"), list):
+        for bv in b_ps["volumes"]:
+            if isinstance(bv, dict) and isinstance(bv.get("name"), str) and bv["name"]:
+                b_vols_by_name[bv["name"]] = bv
+
+    secret_bearing_vnames: set[str] = set()
     volumes = _as_list(ev, pod_spec.get("volumes"), "volumes")
     for idx, vol in enumerate(volumes):
         if not isinstance(vol, dict):
@@ -1006,8 +1573,10 @@ def _check_pod_spec_posture(
                 security=True,
             )
         vname = raw_vname if isinstance(raw_vname, str) and raw_vname else str(idx)
-        hp = vol.get("hostPath")
-        if isinstance(hp, dict):
+        vol_changed = before_pod_spec is None or vname not in b_vols_by_name or b_vols_by_name[vname] != vol
+
+        if "hostPath" in vol and vol.get("hostPath") is not None:
+            hp = _as_dict(ev, vol.get("hostPath"), f"volumes.{vname}.hostPath")
             host_escape = True
             hpath = str(hp.get("path") or "")
             crit = is_daemonset or _is_critical_host_path(hpath)
@@ -1020,52 +1589,138 @@ def _check_pod_spec_posture(
                 field_path=f"volumes.{vname}.hostPath",
                 security=True,
             )
-        if isinstance(vol.get("secret"), dict):
+        if "gitRepo" in vol and vol.get("gitRepo") is not None:
+            _as_dict(ev, vol.get("gitRepo"), f"volumes.{vname}.gitRepo")
+            host_escape = True
             ev.add(
-                "SECRET_VOLUME_MOUNT",
+                "DEPRECATED_GITREPO_VOLUME",
                 DIM_SECURITY,
-                RISK_HIGH,
-                f"mounts Kubernetes Secret in volume {vname!r}",
-                blast=BLAST_MEDIUM,
-                field_path=f"volumes.{vname}.secret",
+                RISK_CRITICAL,
+                f"mounts deprecated gitRepo volume {vname!r} (kubelet host execution hazard)",
+                blast=BLAST_CRITICAL,
+                field_path=f"volumes.{vname}.gitRepo",
                 security=True,
             )
-        proj = vol.get("projected")
-        if isinstance(proj, dict):
+        if "flexVolume" in vol and vol.get("flexVolume") is not None:
+            _as_dict(ev, vol.get("flexVolume"), f"volumes.{vname}.flexVolume")
+            host_escape = True
+            ev.add(
+                "EXTERNAL_OR_RAW_STORAGE_VOLUME",
+                DIM_SECURITY,
+                RISK_CRITICAL if is_daemonset else RISK_HIGH,
+                f"mounts node-driver flexVolume in volume {vname!r}",
+                blast=BLAST_HIGH,
+                field_path=f"volumes.{vname}.flexVolume",
+                security=True,
+            )
+        for ext_vk in _EXTERNAL_STORAGE_VOLUME_KEYS:
+            if ext_vk in vol and vol.get(ext_vk) is not None:
+                _as_dict(ev, vol.get(ext_vk), f"volumes.{vname}.{ext_vk}")
+                ev.add(
+                    "EXTERNAL_OR_RAW_STORAGE_VOLUME",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"mounts direct {ext_vk} storage volume {vname!r}",
+                    blast=BLAST_HIGH,
+                    field_path=f"volumes.{vname}.{ext_vk}",
+                    security=True,
+                )
+        if "secret" in vol and vol.get("secret") is not None:
+            _as_dict(ev, vol.get("secret"), f"volumes.{vname}.secret")
+            secret_bearing_vnames.add(vname)
+            if vol_changed:
+                ev.add(
+                    "SECRET_VOLUME_MOUNT",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"mounts Kubernetes Secret in volume {vname!r}",
+                    blast=BLAST_MEDIUM,
+                    field_path=f"volumes.{vname}.secret",
+                    security=True,
+                )
+        if "projected" in vol and vol.get("projected") is not None:
+            proj = _as_dict(ev, vol.get("projected"), f"volumes.{vname}.projected")
             for src in _as_list(ev, proj.get("sources"), f"volumes.{vname}.projected.sources"):
                 if not isinstance(src, dict):
                     continue
-                if isinstance(src.get("secret"), dict):
+                if "secret" in src and src.get("secret") is not None:
+                    _as_dict(ev, src.get("secret"), f"volumes.{vname}.projected.secret")
+                    secret_bearing_vnames.add(vname)
+                    if vol_changed:
+                        ev.add(
+                            "SECRET_VOLUME_MOUNT",
+                            DIM_SECURITY,
+                            RISK_HIGH,
+                            f"mounts projected Secret in volume {vname!r}",
+                            blast=BLAST_MEDIUM,
+                            field_path=f"volumes.{vname}.projected",
+                            security=True,
+                        )
+                if "serviceAccountToken" in src and src.get("serviceAccountToken") is not None:
+                    _as_dict(ev, src.get("serviceAccountToken"), f"volumes.{vname}.projected.serviceAccountToken")
+                    secret_bearing_vnames.add(vname)
+                    if vol_changed:
+                        ev.add(
+                            "SERVICE_ACCOUNT_TOKEN_MOUNT",
+                            DIM_SECURITY,
+                            RISK_HIGH,
+                            f"mounts projected serviceAccountToken in volume {vname!r}",
+                            blast=BLAST_MEDIUM,
+                            field_path=f"volumes.{vname}.projected.serviceAccountToken",
+                            security=True,
+                        )
+                if "clusterTrustBundle" in src and src.get("clusterTrustBundle") is not None:
+                    _as_dict(ev, src.get("clusterTrustBundle"), f"volumes.{vname}.projected.clusterTrustBundle")
+                    if vol_changed:
+                        ev.add(
+                            "POD_SECURITY_POSTURE_WIDENED",
+                            DIM_SECURITY,
+                            RISK_HIGH,
+                            f"mounts projected clusterTrustBundle in volume {vname!r}",
+                            blast=BLAST_MEDIUM,
+                            field_path=f"volumes.{vname}.projected.clusterTrustBundle",
+                            security=True,
+                        )
+        if "csi" in vol and vol.get("csi") is not None:
+            csi = _as_dict(ev, vol.get("csi"), f"volumes.{vname}.csi")
+            secret_bearing_vnames.add(vname)
+            if vol_changed:
+                drv = str(csi.get("driver") or "")
+                is_sec_csi = any(tok in drv.lower() for tok in ("secret", "vault", "kms", "cert"))
+                ev.add(
+                    "SECRET_VOLUME_MOUNT" if is_sec_csi else "CSI_VOLUME_MOUNT",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"mounts CSI driver {drv!r} in volume {vname!r}",
+                    blast=BLAST_MEDIUM if is_sec_csi else BLAST_HIGH,
+                    field_path=f"volumes.{vname}.csi",
+                    security=True,
+                )
+        if "image" in vol and vol.get("image") is not None:
+            _as_dict(ev, vol.get("image"), f"volumes.{vname}.image")
+            secret_bearing_vnames.add(vname)
+            if vol_changed:
+                ev.add(
+                    "OCI_IMAGE_VOLUME_MOUNT",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"mounts OCI image volume {vname!r}",
+                    blast=BLAST_MEDIUM,
+                    field_path=f"volumes.{vname}.image",
+                    security=True,
+                )
+        for pvc_vk in ("persistentVolumeClaim", "ephemeral"):
+            if pvc_vk in vol and vol.get(pvc_vk) is not None:
+                _as_dict(ev, vol.get(pvc_vk), f"volumes.{vname}.{pvc_vk}")
+                if vol_changed:
                     ev.add(
-                        "SECRET_VOLUME_MOUNT",
-                        DIM_SECURITY,
-                        RISK_HIGH,
-                        f"mounts projected Secret in volume {vname!r}",
-                        blast=BLAST_MEDIUM,
-                        field_path=f"volumes.{vname}.projected",
-                        security=True,
+                        "STATEFUL_OR_EPHEMERAL_VOLUME",
+                        DIM_REVERTABILITY,
+                        RISK_MEDIUM,
+                        f"attaches {pvc_vk} storage in volume {vname!r}",
+                        revert=REVERT_MODERATE,
+                        field_path=f"volumes.{vname}.{pvc_vk}",
                     )
-                if isinstance(src.get("serviceAccountToken"), dict):
-                    ev.add(
-                        "SERVICE_ACCOUNT_TOKEN_MOUNT",
-                        DIM_SECURITY,
-                        RISK_HIGH,
-                        f"mounts projected serviceAccountToken in volume {vname!r}",
-                        blast=BLAST_MEDIUM,
-                        field_path=f"volumes.{vname}.projected.serviceAccountToken",
-                        security=True,
-                    )
-        csi = vol.get("csi")
-        if isinstance(csi, dict) and "secret" in str(csi.get("driver") or "").lower():
-            ev.add(
-                "SECRET_VOLUME_MOUNT",
-                DIM_SECURITY,
-                RISK_HIGH,
-                f"mounts CSI secrets driver {csi.get('driver')!r} in volume {vname!r}",
-                blast=BLAST_MEDIUM,
-                field_path=f"volumes.{vname}.csi",
-                security=True,
-            )
 
     # Pod-level securityContext
     psc = _as_dict(ev, pod_spec.get("securityContext"), "securityContext")
@@ -1083,26 +1738,12 @@ def _check_pod_spec_posture(
                 field_path="securityContext.runAsNonRoot",
                 security=True,
             )
-        if psc.get("runAsUser") == 0 and _is_strict_int(psc.get("runAsUser")):
-            ev.add(
-                "SECURITY_CONTEXT_LOOSENED",
-                DIM_SECURITY,
-                RISK_HIGH,
-                "sets pod securityContext.runAsUser to 0 (root)",
-                blast=BLAST_MEDIUM,
-                field_path="securityContext.runAsUser",
-                security=True,
-            )
-        if psc.get("fsGroup") == 0 and _is_strict_int(psc.get("fsGroup")):
-            ev.add(
-                "SECURITY_CONTEXT_LOOSENED",
-                DIM_SECURITY,
-                RISK_HIGH,
-                "sets pod securityContext.fsGroup to 0 (root group)",
-                blast=BLAST_MEDIUM,
-                field_path="securityContext.fsGroup",
-                security=True,
-            )
+        _check_uid_gid_field(ev, psc, "runAsUser", "securityContext")
+        _check_uid_gid_field(ev, psc, "runAsGroup", "securityContext")
+        _check_uid_gid_field(ev, psc, "fsGroup", "securityContext")
+        _check_proc_mount(ev, psc, "securityContext")
+        _check_confinement_profile(ev, psc, "seccompProfile", "securityContext")
+        _check_confinement_profile(ev, psc, "appArmorProfile", "securityContext")
         if psc.get("sysctls"):
             _as_list(ev, psc.get("sysctls"), "securityContext.sysctls")
             ev.add(
@@ -1116,7 +1757,7 @@ def _check_pod_spec_posture(
             )
         if psc.get("supplementalGroups"):
             sg = _as_list(ev, psc.get("supplementalGroups"), "securityContext.supplementalGroups")
-            if sg and (0 in sg or before_pod_spec is None or sg != b_psc.get("supplementalGroups")):
+            if sg and (0 in sg or any(not _is_strict_int(g) or g < 0 for g in sg) or before_pod_spec is None or sg != b_psc.get("supplementalGroups")):
                 ev.add(
                     "SECURITY_CONTEXT_LOOSENED",
                     DIM_SECURITY,
@@ -1137,43 +1778,23 @@ def _check_pod_spec_posture(
                 security=True,
             )
         wo = psc.get("windowsOptions")
-        if isinstance(wo, dict) and "hostProcess" in wo and _is_truthy_or_nonbool(wo.get("hostProcess")):
-            host_escape = True
-            ev.add(
-                "HOST_NAMESPACE_ACCESS",
-                DIM_SECURITY,
-                RISK_CRITICAL if is_daemonset else RISK_HIGH,
-                "sets pod securityContext.windowsOptions.hostProcess",
-                blast=BLAST_CRITICAL if is_daemonset else BLAST_HIGH,
-                field_path="securityContext.windowsOptions.hostProcess",
-                security=True,
-            )
-        sp = psc.get("seccompProfile")
-        if isinstance(sp, dict) and str(sp.get("type") or "") == "Unconfined":
-            ev.add(
-                "SECURITY_CONTEXT_LOOSENED",
-                DIM_SECURITY,
-                RISK_HIGH,
-                "sets pod seccompProfile.type to Unconfined",
-                blast=BLAST_MEDIUM,
-                field_path="securityContext.seccompProfile.type",
-                security=True,
-            )
-        aa = psc.get("appArmorProfile")
-        if isinstance(aa, dict) and str(aa.get("type") or "") == "Unconfined":
-            ev.add(
-                "SECURITY_CONTEXT_LOOSENED",
-                DIM_SECURITY,
-                RISK_HIGH,
-                "sets pod appArmorProfile.type to Unconfined",
-                blast=BLAST_MEDIUM,
-                field_path="securityContext.appArmorProfile.type",
-                security=True,
-            )
+        if wo is not None:
+            wo_d = _as_dict(ev, wo, "securityContext.windowsOptions")
+            if "hostProcess" in wo_d and _is_truthy_or_nonbool(wo_d.get("hostProcess")):
+                host_escape = True
+                ev.add(
+                    "HOST_NAMESPACE_ACCESS",
+                    DIM_SECURITY,
+                    RISK_CRITICAL if is_daemonset else RISK_HIGH,
+                    "sets pod securityContext.windowsOptions.hostProcess",
+                    blast=BLAST_CRITICAL if is_daemonset else BLAST_HIGH,
+                    field_path="securityContext.windowsOptions.hostProcess",
+                    security=True,
+                )
 
     # Incomplete workload fragment check (e.g. Kustomize patch missing spec.template.spec.containers)
     raw_ctrs = pod_spec.get("containers")
-    if not isinstance(raw_ctrs, list) or len(raw_ctrs) == 0:
+    if require_containers and (not isinstance(raw_ctrs, list) or len(raw_ctrs) == 0):
         b_ctrs = b_ps.get("containers")
         if isinstance(b_ctrs, list) and len(b_ctrs) > 0:
             ev.add(
@@ -1197,10 +1818,27 @@ def _check_pod_spec_posture(
                 supported=False,
             )
 
+    if before_pod_spec is None and pod_spec.get("ephemeralContainers"):
+        ev.add(
+            "EPHEMERAL_CONTAINER_SPECIFIED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"{ev.ref.gvk_label()} {ev.ref.name!r} defines ephemeralContainers in static manifest",
+            blast=BLAST_MEDIUM,
+            field_path="ephemeralContainers",
+            security=True,
+        )
+
     # Containers (regular, init, ephemeral)
     privileged_any = False
     for list_key in ("containers", "initContainers", "ephemeralContainers"):
         ctrs = _as_list(ev, pod_spec.get(list_key), list_key)
+        b_ctrs_by_name: dict[str, dict[str, Any]] = {}
+        if before_pod_spec is not None and isinstance(b_ps.get(list_key), list):
+            for bc_item in b_ps[list_key]:
+                if isinstance(bc_item, dict) and isinstance(bc_item.get("name"), str) and bc_item["name"].strip():
+                    b_ctrs_by_name[bc_item["name"]] = bc_item
+
         seen_names: set[str] = set()
         for idx, ctr in enumerate(ctrs):
             if not isinstance(ctr, dict):
@@ -1234,46 +1872,147 @@ def _check_pod_spec_posture(
             else:
                 seen_names.add(cname)
             label = cname if isinstance(cname, str) and cname.strip() else str(idx)
+            b_ctr = b_ctrs_by_name.get(cname) if isinstance(cname, str) else None
+            b_env_by_name: dict[str, dict[str, Any]] = {}
+            if isinstance(b_ctr, dict) and isinstance(b_ctr.get("env"), list):
+                for be in b_ctr["env"]:
+                    if isinstance(be, dict) and isinstance(be.get("name"), str):
+                        b_env_by_name[be["name"]] = be
 
-            # Secret env / envFrom & plaintext secret leaks
+            # Secret env / envFrom, dangerous env keys, & plaintext secret leaks
             for env_item in _as_list(ev, ctr.get("env"), f"{list_key}.{label}.env"):
                 if not isinstance(env_item, dict):
                     continue
-                vf = env_item.get("valueFrom")
-                if isinstance(vf, dict) and isinstance(vf.get("secretKeyRef"), dict):
+                ename = str(env_item.get("name") or "")
+                env_changed = b_ctr is None or b_env_by_name.get(ename) != env_item
+                if ename and _DANGEROUS_ENV_KEY_RE.match(ename) and env_changed:
                     ev.add(
-                        "SECRET_ENV_REF",
+                        "DANGEROUS_RUNTIME_CONFIG_KEY",
                         DIM_SECURITY,
                         RISK_HIGH,
-                        f"container {label!r} mounts Secret via env.valueFrom.secretKeyRef",
+                        f"container {label!r} sets security-sensitive env key {ename!r}",
                         blast=BLAST_MEDIUM,
-                        field_path=f"{list_key}.{label}.env",
+                        field_path=f"{list_key}.{label}.env.{ename}",
                         security=True,
                     )
+                vf = env_item.get("valueFrom")
+                if vf is not None:
+                    vf_d = _as_dict(ev, vf, f"{list_key}.{label}.env.{ename}.valueFrom")
+                    if "secretKeyRef" in vf_d and vf_d.get("secretKeyRef") is not None:
+                        _as_dict(ev, vf_d.get("secretKeyRef"), f"{list_key}.{label}.env.{ename}.valueFrom.secretKeyRef")
+                        if env_changed:
+                            ev.add(
+                                "SECRET_ENV_REF",
+                                DIM_SECURITY,
+                                RISK_HIGH,
+                                f"container {label!r} mounts Secret via env.valueFrom.secretKeyRef",
+                                blast=BLAST_MEDIUM,
+                                field_path=f"{list_key}.{label}.env",
+                                security=True,
+                            )
                 val = env_item.get("value")
+                if val is not None and str(val) != "" and ename and _is_secret_key_name(ename) and env_changed:
+                    ev.add(
+                        "PLAINTEXT_SECRET_KEY_IN_ENV",
+                        DIM_SECURITY,
+                        RISK_CRITICAL,
+                        f"container {label!r} sets literal value on secret-named env key {ename!r}",
+                        blast=BLAST_HIGH,
+                        revert=REVERT_IRREVERSIBLE,
+                        field_path=f"{list_key}.{label}.env.{ename}",
+                        security=True,
+                    )
                 if isinstance(val, str):
                     for _, pat_name in _scan_value_for_secrets(val):
                         ev.add(
                             "PLAINTEXT_SECRET_LEAK",
                             DIM_SECURITY,
                             RISK_CRITICAL,
-                            f"plaintext {pat_name} detected in container {label!r} env {env_item.get('name')!r}",
+                            f"plaintext {pat_name} detected in container {label!r} env {ename!r}",
                             blast=BLAST_HIGH,
                             revert=REVERT_IRREVERSIBLE,
                             field_path=f"{list_key}.{label}.env",
                             security=True,
                         )
+            b_ef_list = b_ctr.get("envFrom") if isinstance(b_ctr, dict) and isinstance(b_ctr.get("envFrom"), list) else []
             for ef in _as_list(ev, ctr.get("envFrom"), f"{list_key}.{label}.envFrom"):
-                if isinstance(ef, dict) and isinstance(ef.get("secretRef"), dict):
+                if isinstance(ef, dict) and "secretRef" in ef and ef.get("secretRef") is not None:
+                    _as_dict(ev, ef.get("secretRef"), f"{list_key}.{label}.envFrom.secretRef")
+                    if b_ctr is None or ef not in b_ef_list:
+                        ev.add(
+                            "SECRET_ENV_REF",
+                            DIM_SECURITY,
+                            RISK_HIGH,
+                            f"container {label!r} mounts Secret via envFrom.secretRef",
+                            blast=BLAST_MEDIUM,
+                            field_path=f"{list_key}.{label}.envFrom",
+                            security=True,
+                        )
+
+            # Volume mounts (mountPropagation, new mounts of existing secret/CSI volumes) & raw block volumeDevices
+            b_vm_pairs = {
+                (vm.get("name"), vm.get("mountPath"))
+                for vm in (b_ctr.get("volumeMounts") if isinstance(b_ctr, dict) and isinstance(b_ctr.get("volumeMounts"), list) else [])
+                if isinstance(vm, dict)
+            }
+            for vm in _as_list(ev, ctr.get("volumeMounts"), f"{list_key}.{label}.volumeMounts"):
+                if not isinstance(vm, dict):
+                    continue
+                mp_mode = vm.get("mountPropagation")
+                if mp_mode is not None and str(mp_mode) != "None":
                     ev.add(
-                        "SECRET_ENV_REF",
+                        "POD_SECURITY_POSTURE_WIDENED",
                         DIM_SECURITY,
                         RISK_HIGH,
-                        f"container {label!r} mounts Secret via envFrom.secretRef",
-                        blast=BLAST_MEDIUM,
-                        field_path=f"{list_key}.{label}.envFrom",
+                        f"container {label!r} sets volumeMount mountPropagation={mp_mode!r}",
+                        blast=BLAST_HIGH,
+                        field_path=f"{list_key}.{label}.volumeMounts",
                         security=True,
                     )
+                vm_name = vm.get("name")
+                if (
+                    before_pod_spec is not None
+                    and isinstance(vm_name, str)
+                    and vm_name in secret_bearing_vnames
+                    and (vm_name, vm.get("mountPath")) not in b_vm_pairs
+                ):
+                    ev.add(
+                        "SECRET_VOLUME_MOUNT",
+                        DIM_SECURITY,
+                        RISK_HIGH,
+                        f"container {label!r} adds volumeMount of secret/CSI volume {vm_name!r}",
+                        blast=BLAST_MEDIUM,
+                        field_path=f"{list_key}.{label}.volumeMounts",
+                        security=True,
+                    )
+
+            vdevs = _as_list(ev, ctr.get("volumeDevices"), f"{list_key}.{label}.volumeDevices")
+            if vdevs:
+                ev.add(
+                    "RAW_BLOCK_DEVICE_MOUNT",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"container {label!r} mounts raw block volumeDevices",
+                    blast=BLAST_HIGH,
+                    field_path=f"{list_key}.{label}.volumeDevices",
+                    security=True,
+                )
+
+            tm_path = ctr.get("terminationMessagePath")
+            if tm_path is not None and (not isinstance(tm_path, str) or tm_path.strip() != "/dev/termination-log" or ".." in tm_path):
+                if b_ctr is None or b_ctr.get("terminationMessagePath") != tm_path:
+                    ev.add(
+                        "POD_SECURITY_POSTURE_WIDENED",
+                        DIM_SECURITY,
+                        RISK_HIGH,
+                        f"container {label!r} sets custom terminationMessagePath={tm_path!r}",
+                        blast=BLAST_MEDIUM,
+                        field_path=f"{list_key}.{label}.terminationMessagePath",
+                        security=True,
+                    )
+
+            # Probes & lifecycle hooks (exec commands & kubelet SSRF)
+            _check_probe_and_lifecycle_security(ev, ctr, b_ctr, f"{list_key}.{label}")
 
             # Host ports
             for port in _as_list(ev, ctr.get("ports"), f"{list_key}.{label}.ports"):
@@ -1290,6 +2029,7 @@ def _check_pod_spec_posture(
 
             # Container securityContext
             sc = _as_dict(ev, ctr.get("securityContext"), f"{list_key}.{label}.securityContext")
+            b_csc = b_ctr.get("securityContext") if isinstance(b_ctr, dict) and isinstance(b_ctr.get("securityContext"), dict) else {}
             if sc:
                 if "privileged" in sc and _is_truthy_or_nonbool(sc.get("privileged")):
                     privileged_any = True
@@ -1322,49 +2062,12 @@ def _check_pod_spec_posture(
                         field_path=f"{list_key}.{label}.securityContext.runAsNonRoot",
                         security=True,
                     )
-                if sc.get("runAsUser") == 0 and _is_strict_int(sc.get("runAsUser")):
-                    ev.add(
-                        "SECURITY_CONTEXT_LOOSENED",
-                        DIM_SECURITY,
-                        RISK_HIGH,
-                        f"container {label!r} sets runAsUser to 0 (root)",
-                        blast=BLAST_MEDIUM,
-                        field_path=f"{list_key}.{label}.securityContext.runAsUser",
-                        security=True,
-                    )
-                if str(sc.get("procMount") or "") == "Unmasked":
-                    ev.add(
-                        "SECURITY_CONTEXT_LOOSENED",
-                        DIM_SECURITY,
-                        RISK_HIGH,
-                        f"container {label!r} sets procMount to Unmasked",
-                        blast=BLAST_HIGH,
-                        field_path=f"{list_key}.{label}.securityContext.procMount",
-                        security=True,
-                    )
-                sp = sc.get("seccompProfile")
-                if isinstance(sp, dict) and str(sp.get("type") or "") == "Unconfined":
-                    ev.add(
-                        "SECURITY_CONTEXT_LOOSENED",
-                        DIM_SECURITY,
-                        RISK_HIGH,
-                        f"container {label!r} sets seccompProfile.type to Unconfined",
-                        blast=BLAST_MEDIUM,
-                        field_path=f"{list_key}.{label}.securityContext.seccompProfile",
-                        security=True,
-                    )
-                aa = sc.get("appArmorProfile")
-                if isinstance(aa, dict) and str(aa.get("type") or "") == "Unconfined":
-                    ev.add(
-                        "SECURITY_CONTEXT_LOOSENED",
-                        DIM_SECURITY,
-                        RISK_HIGH,
-                        f"container {label!r} sets appArmorProfile.type to Unconfined",
-                        blast=BLAST_MEDIUM,
-                        field_path=f"{list_key}.{label}.securityContext.appArmorProfile",
-                        security=True,
-                    )
-                if sc.get("seLinuxOptions"):
+                _check_uid_gid_field(ev, sc, "runAsUser", f"{list_key}.{label}.securityContext")
+                _check_uid_gid_field(ev, sc, "runAsGroup", f"{list_key}.{label}.securityContext")
+                _check_proc_mount(ev, sc, f"{list_key}.{label}.securityContext")
+                _check_confinement_profile(ev, sc, "seccompProfile", f"{list_key}.{label}.securityContext")
+                _check_confinement_profile(ev, sc, "appArmorProfile", f"{list_key}.{label}.securityContext")
+                if sc.get("seLinuxOptions") and (b_ctr is None or sc.get("seLinuxOptions") != b_csc.get("seLinuxOptions")):
                     ev.add(
                         "SECURITY_CONTEXT_LOOSENED",
                         DIM_SECURITY,
@@ -1375,17 +2078,19 @@ def _check_pod_spec_posture(
                         security=True,
                     )
                 c_wo = sc.get("windowsOptions")
-                if isinstance(c_wo, dict) and "hostProcess" in c_wo and _is_truthy_or_nonbool(c_wo.get("hostProcess")):
-                    host_escape = True
-                    ev.add(
-                        "HOST_NAMESPACE_ACCESS",
-                        DIM_SECURITY,
-                        RISK_CRITICAL if is_daemonset else RISK_HIGH,
-                        f"container {label!r} sets securityContext.windowsOptions.hostProcess",
-                        blast=BLAST_CRITICAL if is_daemonset else BLAST_HIGH,
-                        field_path=f"{list_key}.{label}.securityContext.windowsOptions.hostProcess",
-                        security=True,
-                    )
+                if c_wo is not None:
+                    c_wo_d = _as_dict(ev, c_wo, f"{list_key}.{label}.securityContext.windowsOptions")
+                    if "hostProcess" in c_wo_d and _is_truthy_or_nonbool(c_wo_d.get("hostProcess")):
+                        host_escape = True
+                        ev.add(
+                            "HOST_NAMESPACE_ACCESS",
+                            DIM_SECURITY,
+                            RISK_CRITICAL if is_daemonset else RISK_HIGH,
+                            f"container {label!r} sets securityContext.windowsOptions.hostProcess",
+                            blast=BLAST_CRITICAL if is_daemonset else BLAST_HIGH,
+                            field_path=f"{list_key}.{label}.securityContext.windowsOptions.hostProcess",
+                            security=True,
+                        )
                 caps = _as_dict(ev, sc.get("capabilities"), f"{list_key}.{label}.securityContext.capabilities")
                 added_raw = _as_list(ev, caps.get("add"), f"{list_key}.{label}.securityContext.capabilities.add")
                 if added_raw:
@@ -1403,8 +2108,9 @@ def _check_pod_spec_posture(
 
             # Extended resources (GPU/TPU) & resource claims
             res = _as_dict(ev, ctr.get("resources"), f"{list_key}.{label}.resources")
+            b_res = b_ctr.get("resources") if isinstance(b_ctr, dict) and isinstance(b_ctr.get("resources"), dict) else {}
             if res:
-                if res.get("claims"):
+                if res.get("claims") and (b_ctr is None or res.get("claims") != b_res.get("claims")):
                     _as_list(ev, res.get("claims"), f"{list_key}.{label}.resources.claims")
                     ev.add(
                         "EXTENDED_RESOURCE_REQUEST",
@@ -1417,16 +2123,18 @@ def _check_pod_spec_posture(
                     )
                 for section in ("requests", "limits"):
                     rmap = _as_dict(ev, res.get(section), f"{list_key}.{label}.resources.{section}")
+                    b_rmap = b_res.get(section) if isinstance(b_res.get(section), dict) else {}
                     for rkey in sorted(rmap.keys(), key=str):
                         if "/" in str(rkey) or "gpu" in str(rkey).lower() or "tpu" in str(rkey).lower():
-                            ev.add(
-                                "EXTENDED_RESOURCE_REQUEST",
-                                DIM_BLAST_RADIUS,
-                                RISK_HIGH,
-                                f"container {label!r} specifies extended/accelerator resource {rkey!r}",
-                                blast=BLAST_MEDIUM,
-                                field_path=f"{list_key}.{label}.resources.{section}.{rkey}",
-                            )
+                            if b_ctr is None or b_rmap.get(rkey) != rmap.get(rkey):
+                                ev.add(
+                                    "EXTENDED_RESOURCE_REQUEST",
+                                    DIM_BLAST_RADIUS,
+                                    RISK_HIGH,
+                                    f"container {label!r} specifies extended/accelerator resource {rkey!r}",
+                                    blast=BLAST_MEDIUM,
+                                    field_path=f"{list_key}.{label}.resources.{section}.{rkey}",
+                                )
 
     if privileged_any and host_escape:
         ev.add(
@@ -1439,6 +2147,19 @@ def _check_pod_spec_posture(
         )
 
 
+_PROTECTED_ADD_EXEMPT_KEYS = frozenset(
+    {
+        "environment",
+        "env",
+        "stage",
+        "tier",
+        "app.kubernetes.io/instance",
+        "app.kubernetes.io/managed-by",
+        "storageclass.kubernetes.io/is-default-class",
+    }
+)
+
+
 def _check_rbac_superuser(ev: ResourceEval, obj: dict[str, Any]) -> None:
     """Detect cluster-admin/admin/edit bindings, wildcard rules, privilege escalation verbs, and broad subjects."""
     kind = ev.ref.kind
@@ -1446,7 +2167,7 @@ def _check_rbac_superuser(ev: ResourceEval, obj: dict[str, Any]) -> None:
     if kind in ("ClusterRoleBinding", "RoleBinding"):
         role_ref = _as_dict(ev, obj.get("roleRef"), "roleRef")
         rname = str(role_ref.get("name") or "")
-        if rname in _SUPERUSER_ROLES and (kind == "ClusterRoleBinding" or in_system):
+        if rname in _SUPERUSER_ROLES and (kind == "ClusterRoleBinding" or in_system or rname == "system:masters"):
             ev.add(
                 "CRITICAL_PRIVILEGED_RBAC",
                 DIM_SECURITY,
@@ -1479,7 +2200,7 @@ def _check_rbac_superuser(ev: ResourceEval, obj: dict[str, Any]) -> None:
                 )
     if kind in ("ClusterRole", "Role"):
         if kind == "ClusterRole" and obj.get("aggregationRule") is not None:
-            agg = _as_dict(ev, obj.get("aggregationRule"), "aggregationRule")
+            _as_dict(ev, obj.get("aggregationRule"), "aggregationRule")
             ev.add(
                 "RBAC_AGGREGATION_RULE",
                 DIM_SECURITY,
@@ -1496,22 +2217,25 @@ def _check_rbac_superuser(ev: ResourceEval, obj: dict[str, Any]) -> None:
             resources = {str(r).lower() for r in _as_list(ev, rule.get("resources"), f"rules[{idx}].resources")}
             non_res = _as_list(ev, rule.get("nonResourceURLs"), f"rules[{idx}].nonResourceURLs")
             is_cluster = kind == "ClusterRole" or in_system
-            if verbs & _PRIV_ESCALATION_VERBS and (is_cluster or (resources & _SENSITIVE_RBAC_RESOURCES)):
+            matches_sens = bool(resources & _SENSITIVE_RBAC_RESOURCES) or any(
+                r == "pods/*" or r.endswith(("/exec", "/attach", "/proxy", "/ephemeralcontainers")) for r in resources
+            )
+            if (verbs & (_PRIV_ESCALATION_VERBS | {"approve", "sign"})) and (is_cluster or matches_sens):
                 ev.add(
                     "CRITICAL_PRIVILEGED_RBAC",
                     DIM_SECURITY,
                     RISK_CRITICAL,
-                    f"{kind} {ev.ref.name!r} rule[{idx}] grants wildcard or privilege-escalation verbs {sorted(verbs & _PRIV_ESCALATION_VERBS)}",
+                    f"{kind} {ev.ref.name!r} rule[{idx}] grants wildcard or privilege-escalation verbs {sorted(verbs)}",
                     blast=BLAST_CRITICAL if is_cluster else BLAST_HIGH,
                     field_path=f"rules[{idx}]",
                     security=True,
                 )
-            elif is_cluster and (resources & _SENSITIVE_RBAC_RESOURCES) and (verbs - {"get", "list", "watch"} or "secrets" in resources or "*" in resources):
+            elif is_cluster and matches_sens and (verbs - {"get", "list", "watch"} or "secrets" in resources or "*" in resources):
                 ev.add(
                     "CRITICAL_PRIVILEGED_RBAC",
                     DIM_SECURITY,
                     RISK_CRITICAL,
-                    f"{kind} {ev.ref.name!r} rule[{idx}] grants cluster-wide access to sensitive resources {sorted(resources & _SENSITIVE_RBAC_RESOURCES)}",
+                    f"{kind} {ev.ref.name!r} rule[{idx}] grants cluster-wide access to sensitive resources {sorted(resources)}",
                     blast=BLAST_CRITICAL,
                     field_path=f"rules[{idx}]",
                     security=True,
@@ -1566,6 +2290,96 @@ def _check_cloud_iam(ev: ResourceEval, obj: dict[str, Any]) -> None:
                 )
 
 
+def _check_metadata_add(ev: ResourceEval, obj: dict[str, Any]) -> None:
+    """Validate metadata fields, finalizers, ownerReferences, and protected keys on ACTION_ADD."""
+    a_meta = obj.get("metadata")
+    if not isinstance(a_meta, dict):
+        return
+    _as_dict(ev, a_meta.get("labels"), "metadata.labels")
+    _as_dict(ev, a_meta.get("annotations"), "metadata.annotations")
+    if a_meta.get("generateName") is not None:
+        ev.add(
+            "METADATA_IDENTITY_MODIFIED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"sets non-deterministic metadata.generateName on {ev.ref.gvk_label()} {ev.ref.name!r}",
+            blast=BLAST_MEDIUM,
+            revert=REVERT_DIFFICULT,
+            field_path="metadata.generateName",
+            security=True,
+        )
+    if a_meta.get("finalizers") is not None:
+        fins = _as_list(ev, a_meta.get("finalizers"), "metadata.finalizers")
+        if fins:
+            ev.add(
+                "LIFECYCLE_METADATA_MODIFIED",
+                DIM_REVERTABILITY,
+                RISK_HIGH,
+                f"sets metadata.finalizers on {ev.ref.gvk_label()} {ev.ref.name!r}",
+                revert=REVERT_DIFFICULT,
+                field_path="metadata.finalizers",
+                security=True,
+            )
+    if a_meta.get("ownerReferences") is not None:
+        owners = _as_list(ev, a_meta.get("ownerReferences"), "metadata.ownerReferences")
+        if owners:
+            ev.add(
+                "LIFECYCLE_METADATA_MODIFIED",
+                DIM_REVERTABILITY,
+                RISK_HIGH,
+                f"sets metadata.ownerReferences on {ev.ref.gvk_label()} {ev.ref.name!r} (GC cascade-delete hazard)",
+                revert=REVERT_DIFFICULT,
+                disrupt=DISRUPT_DESTRUCTIVE,
+                field_path="metadata.ownerReferences",
+                security=True,
+            )
+    for mk in sorted(a_meta.keys(), key=str):
+        if mk not in _ALLOWED_METADATA_KEYS:
+            ev.add(
+                "METADATA_SYSTEM_FIELD_EDIT",
+                DIM_SECURITY,
+                RISK_HIGH,
+                f"sets system or unexpected metadata field metadata.{mk}",
+                blast=BLAST_MEDIUM,
+                field_path=f"metadata.{mk}",
+                security=True,
+            )
+    for meta_field in ("labels", "annotations"):
+        for mk, _ in sorted(_meta_dict(obj, meta_field).items(), key=str):
+            mks = str(mk)
+            low_k = mks.lower()
+            if low_k == "kube-agents/risk-class":
+                ev.add(
+                    "RISK_METADATA_TAMPERING",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    "sets kube-agents/risk-class override annotation",
+                    blast=BLAST_HIGH,
+                    field_path=f"metadata.{meta_field}.{mks}",
+                    security=True,
+                )
+            elif any(sn in low_k for sn in _INGRESS_SNIPPET_KEYS):
+                ev.add(
+                    "INGRESS_SNIPPET_INJECTION",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"sets raw proxy snippet annotation {mks!r}",
+                    blast=BLAST_CRITICAL,
+                    field_path=f"metadata.{meta_field}.{mks}",
+                    security=True,
+                )
+            elif low_k not in _PROTECTED_ADD_EXEMPT_KEYS and _is_protected_metadata_key(mks):
+                ev.add(
+                    "PROTECTED_METADATA_MODIFIED",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"sets protected metadata.{meta_field} key {mks!r}",
+                    blast=BLAST_MEDIUM,
+                    field_path=f"metadata.{meta_field}.{mks}",
+                    security=True,
+                )
+
+
 def _check_metadata_edits(
     ev: ResourceEval,
     before_obj: dict[str, Any],
@@ -1579,6 +2393,10 @@ def _check_metadata_edits(
     if isinstance(a_meta, dict):
         _as_dict(ev, a_meta.get("labels"), "metadata.labels")
         _as_dict(ev, a_meta.get("annotations"), "metadata.annotations")
+        if "finalizers" in a_meta and a_meta.get("finalizers") is not None:
+            _as_list(ev, a_meta.get("finalizers"), "metadata.finalizers")
+        if "ownerReferences" in a_meta and a_meta.get("ownerReferences") is not None:
+            _as_list(ev, a_meta.get("ownerReferences"), "metadata.ownerReferences")
 
     # Check production label / risk-class tampering explicitly
     b_labels = _meta_dict(before_obj, "labels")
@@ -1600,14 +2418,14 @@ def _check_metadata_edits(
 
     old_override = b_annos.get("kube-agents/risk-class")
     new_override = a_annos.get("kube-agents/risk-class")
-    if old_override is not None and new_override != old_override:
+    if (old_override is not None or new_override is not None) and new_override != old_override:
         ev.add(
             "RISK_METADATA_TAMPERING",
             DIM_SECURITY,
             RISK_CRITICAL,
-            "modifies or removes kube-agents/risk-class override annotation",
+            "sets, modifies, or removes kube-agents/risk-class override annotation",
             blast=BLAST_HIGH,
-            disrupt=DISRUPT_DISRUPTIVE,
+            disrupt=DISRUPT_DISRUPTIVE if old_override is not None else DISRUPT_NONE,
             field_path="metadata.annotations.kube-agents/risk-class",
             security=True,
         )
@@ -1616,15 +2434,29 @@ def _check_metadata_edits(
         if not d.tokens or d.tokens[0] != "metadata":
             continue
         sub = d.tokens[1] if len(d.tokens) > 1 else ""
-        if sub in ("finalizers", "ownerReferences"):
+        if sub in ("name", "generateName", "namespace"):
+            ev.add(
+                "METADATA_IDENTITY_MODIFIED",
+                DIM_SECURITY,
+                RISK_HIGH,
+                f"modifies resource identity field metadata.{sub} on {ev.ref.gvk_label()} {ev.ref.name!r}",
+                blast=BLAST_MEDIUM,
+                revert=REVERT_DIFFICULT,
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path=d.dotted,
+                security=True,
+            )
+        elif sub in ("finalizers", "ownerReferences"):
+            is_destructive = d.op == "remove" or sub == "ownerReferences"
             ev.add(
                 "LIFECYCLE_METADATA_MODIFIED",
                 DIM_REVERTABILITY,
                 RISK_HIGH,
                 f"modifies metadata.{sub} on {ev.ref.gvk_label()} {ev.ref.name!r}",
                 revert=REVERT_DIFFICULT,
-                disrupt=DISRUPT_DESTRUCTIVE if d.op == "remove" else DISRUPT_NONE,
+                disrupt=DISRUPT_DESTRUCTIVE if is_destructive else DISRUPT_NONE,
                 field_path=d.dotted,
+                security=True,
             )
         elif sub in ("labels", "annotations"):
             key = d.tokens[2] if len(d.tokens) > 2 else ""
@@ -1688,13 +2520,401 @@ def _check_metadata_edits(
             )
 
 
+def _check_pod_template_metadata(
+    ev: ResourceEval,
+    kind: str,
+    before_obj: dict[str, Any] | None,
+    after_obj: dict[str, Any],
+    *,
+    action: str,
+) -> None:
+    """Inspect Pod template metadata (`spec.template.metadata`) for selector breaks & protected annotations."""
+    if kind == "Pod":
+        return
+    a_tmeta = _extract_pod_template_meta(kind, after_obj)
+    b_tmeta = _extract_pod_template_meta(kind, before_obj) if before_obj is not None else {}
+    tmeta_prefix = (
+        "template.metadata"
+        if kind == "PodTemplate"
+        else ("spec.jobTemplate.spec.template.metadata" if kind == "CronJob" else "spec.template.metadata")
+    )
+    if a_tmeta:
+        _as_dict(ev, a_tmeta.get("labels"), f"{tmeta_prefix}.labels")
+        _as_dict(ev, a_tmeta.get("annotations"), f"{tmeta_prefix}.annotations")
+
+    a_tlbl = a_tmeta.get("labels") if isinstance(a_tmeta.get("labels"), dict) else {}
+    b_tlbl = b_tmeta.get("labels") if isinstance(b_tmeta.get("labels"), dict) else {}
+    a_tann = a_tmeta.get("annotations") if isinstance(a_tmeta.get("annotations"), dict) else {}
+    b_tann = b_tmeta.get("annotations") if isinstance(b_tmeta.get("annotations"), dict) else {}
+
+    if action == ACTION_MODIFY:
+        for k, old_v in sorted(b_tlbl.items(), key=str):
+            if k not in a_tlbl or a_tlbl[k] != old_v:
+                ev.add(
+                    "POD_TEMPLATE_LABEL_CHANGED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"changes or removes pod template label {k!r} (may detach Service/PDB/NetworkPolicy selectors)",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{tmeta_prefix}.labels.{k}",
+                )
+
+    for sub_name, b_map, a_map in (("labels", b_tlbl, a_tlbl), ("annotations", b_tann, a_tann)):
+        all_keys = set(a_map.keys()) if action == ACTION_ADD else (set(a_map.keys()) | set(b_map.keys()))
+        for k in sorted(all_keys, key=str):
+            if action == ACTION_MODIFY and b_map.get(k) == a_map.get(k):
+                continue
+            ks = str(k)
+            low_k = ks.lower()
+            if low_k == "kube-agents/risk-class":
+                ev.add(
+                    "RISK_METADATA_TAMPERING",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"sets or modifies kube-agents/risk-class on {tmeta_prefix}.{sub_name}",
+                    blast=BLAST_HIGH,
+                    field_path=f"{tmeta_prefix}.{sub_name}.{ks}",
+                    security=True,
+                )
+            elif any(sn in low_k for sn in _INGRESS_SNIPPET_KEYS):
+                ev.add(
+                    "INGRESS_SNIPPET_INJECTION",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"sets raw proxy snippet key {ks!r} on {tmeta_prefix}.{sub_name}",
+                    blast=BLAST_CRITICAL,
+                    field_path=f"{tmeta_prefix}.{sub_name}.{ks}",
+                    security=True,
+                )
+            elif (action == ACTION_MODIFY or low_k not in _PROTECTED_ADD_EXEMPT_KEYS) and _is_protected_metadata_key(ks):
+                ev.add(
+                    "PROTECTED_METADATA_MODIFIED",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"{action}s protected {tmeta_prefix}.{sub_name} key {ks!r}",
+                    blast=BLAST_MEDIUM,
+                    field_path=f"{tmeta_prefix}.{sub_name}.{ks}",
+                    security=True,
+                )
+
+
+def _is_aggressive_max_unavailable(max_unavail: Any, replicas_est: int = 1) -> bool:
+    if isinstance(max_unavail, str) and max_unavail.strip().endswith("%"):
+        try:
+            pct = float(max_unavail.strip()[:-1])
+            return pct > 50.0 or pct < 0.0 or not math.isfinite(pct)
+        except ValueError:
+            return True
+    if max_unavail is not None and not _is_strict_int(max_unavail):
+        return True
+    if _is_strict_int(max_unavail):
+        if max_unavail < 0:
+            return True
+        if max_unavail > 1 and replicas_est > 0 and max_unavail / replicas_est > 0.5:
+            return True
+    return False
+
+
+def _check_workload_add(ev: ResourceEval, obj: dict[str, Any]) -> None:
+    """Evaluate creation (ACTION_ADD) of Deployment, StatefulSet, DaemonSet, ReplicaSet, ReplicationController, Job, CronJob, Pod."""
+    kind = ev.ref.kind
+    is_daemonset = kind == "DaemonSet"
+    spec = _as_dict(ev, obj.get("spec"), "spec")
+    ps = _extract_pod_spec(kind, obj) or {}
+
+    _check_pod_template_metadata(ev, kind, None, obj, action=ACTION_ADD)
+    _check_pod_spec_posture(ev, ps, is_daemonset=is_daemonset)
+
+    # Validate replicas on new controller workloads
+    rep = 1
+    if kind in ("Deployment", "StatefulSet", "ReplicaSet", "ReplicationController") and "replicas" in spec and spec["replicas"] is not None:
+        rep_raw = spec.get("replicas")
+        if not _is_strict_int(rep_raw) or rep_raw < 0:
+            ev.add(
+                "INVALID_REPLICAS",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"sets invalid non-integer or negative spec.replicas={rep_raw!r} on {kind} {ev.ref.name!r}",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.replicas",
+            )
+        elif rep_raw == 0:
+            rep = 0
+            ev.add(
+                "WORKLOAD_SCALED_TO_ZERO",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"creates {kind} {ev.ref.name!r} with spec.replicas=0",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.replicas",
+            )
+        else:
+            rep = rep_raw
+            if rep > MAX_LOW_REPLICA_TOTAL:
+                ev.add(
+                    "WORKLOAD_LARGE_SCALE_UP",
+                    DIM_BLAST_RADIUS,
+                    RISK_HIGH,
+                    f"creates {kind} {ev.ref.name!r} with high replica count {rep} (above {MAX_LOW_REPLICA_TOTAL})",
+                    blast=BLAST_HIGH if rep >= 50 else BLAST_MEDIUM,
+                    field_path="spec.replicas",
+                )
+
+    if kind == "Deployment" and "strategy" in spec and spec.get("strategy") is not None:
+        strat = _as_dict(ev, spec.get("strategy"), "spec.strategy")
+        if str(strat.get("type") or "") == "Recreate":
+            ev.add(
+                "RECREATE_STRATEGY_SET",
+                DIM_REVERTABILITY,
+                RISK_MEDIUM,
+                f"creates Deployment {ev.ref.name!r} with Recreate strategy",
+                revert=REVERT_MODERATE,
+                field_path="spec.strategy.type",
+            )
+        else:
+            ru = strat.get("rollingUpdate") if isinstance(strat.get("rollingUpdate"), dict) else {}
+            if _is_aggressive_max_unavailable(ru.get("maxUnavailable"), rep):
+                ev.add(
+                    "AGGRESSIVE_ROLLOUT_STRATEGY",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"sets invalid or aggressive Deployment rollingUpdate.maxUnavailable={ru.get('maxUnavailable')!r}",
+                    revert=REVERT_MODERATE,
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path="spec.strategy.rollingUpdate.maxUnavailable",
+                )
+
+    if kind in ("CronJob", "Job") and "suspend" in spec and spec.get("suspend") is not None:
+        susp = spec.get("suspend")
+        if not isinstance(susp, bool):
+            ev.add(
+                "MALFORMED_FIELD_TYPE",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"sets non-boolean spec.suspend={susp!r} on {kind} {ev.ref.name!r}",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.suspend",
+            )
+        elif susp is True:
+            ev.add(
+                "CRONJOB_SUSPENDED",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"creates suspended {kind} {ev.ref.name!r}",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.suspend",
+            )
+
+    if kind == "StatefulSet":
+        vcts = _as_list(ev, spec.get("volumeClaimTemplates"), "spec.volumeClaimTemplates")
+        if vcts:
+            ev.add(
+                "STATEFULSET_CREATES_PVCS",
+                DIM_REVERTABILITY,
+                RISK_MEDIUM,
+                f"creates StatefulSet {ev.ref.name!r} with persistent volumeClaimTemplates",
+                revert=REVERT_DIFFICULT,
+                field_path="spec.volumeClaimTemplates",
+            )
+        ret = spec.get("persistentVolumeClaimRetentionPolicy")
+        if ret is not None:
+            ret_d = _as_dict(ev, ret, "spec.persistentVolumeClaimRetentionPolicy")
+            if str(ret_d.get("whenDeleted") or "") == "Delete" or str(ret_d.get("whenScaled") or "") == "Delete":
+                ev.add(
+                    "STATEFULSET_PVC_DELETE_POLICY",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    "creates StatefulSet with persistentVolumeClaimRetentionPolicy Delete",
+                    revert=REVERT_DIFFICULT,
+                    disrupt=DISRUPT_DESTRUCTIVE,
+                    field_path="spec.persistentVolumeClaimRetentionPolicy",
+                )
+
+    # Validate container image pinning & CPU/memory bounds + compound capacity delta on ADD
+    pod_prefix = (
+        "spec"
+        if kind == "Pod"
+        else ("spec.jobTemplate.spec.template.spec" if kind == "CronJob" else "spec.template.spec")
+    )
+    for list_key in ("containers", "initContainers", "ephemeralContainers"):
+        ctrs = ps.get(list_key) if isinstance(ps.get(list_key), list) else []
+        for idx, ctr in enumerate(ctrs):
+            if not isinstance(ctr, dict):
+                continue
+            cname = ctr.get("name") if isinstance(ctr.get("name"), str) and ctr.get("name").strip() else str(idx)
+            c_path = f"{pod_prefix}.{list_key}.{cname}"
+            cimg = ctr.get("image")
+            if isinstance(cimg, str) and cimg.strip() and not is_immutable_image_pin(cimg):
+                ev.add(
+                    "UNPINNED_IMAGE_TAG",
+                    DIM_REVERTABILITY,
+                    RISK_MEDIUM,
+                    f"container {cname!r} uses mutable/unpinned image reference {cimg!r}",
+                    revert=REVERT_UNKNOWN,
+                    field_path=f"{c_path}.image",
+                )
+            res = ctr.get("resources") if isinstance(ctr.get("resources"), dict) else {}
+            req = res.get("requests") if isinstance(res.get("requests"), dict) else {}
+            lim = res.get("limits") if isinstance(res.get("limits"), dict) else {}
+            cpu_req = parse_cpu_millicores(req.get("cpu"))
+            cpu_lim = parse_cpu_millicores(lim.get("cpu"))
+            mem_req = parse_memory_bytes(req.get("memory"))
+            mem_lim = parse_memory_bytes(lim.get("memory"))
+            if cpu_req is not None and cpu_lim is not None and cpu_req > cpu_lim:
+                ev.add(
+                    "RESOURCE_REQUEST_EXCEEDS_LIMIT",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"container {cname!r} CPU request exceeds limit",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.resources",
+                )
+            if mem_req is not None and mem_lim is not None and mem_req > mem_lim:
+                ev.add(
+                    "RESOURCE_REQUEST_EXCEEDS_LIMIT",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"container {cname!r} memory request exceeds limit",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.resources",
+                )
+            if list_key == "containers":
+                ev.cpu_delta_m += (cpu_req or 0.0) * rep
+                ev.mem_delta_bytes += (mem_req or 0.0) * rep
+            for section, rmap in (("requests", req), ("limits", lim)):
+                for rname, parser_fn, floor_val, max_val in (
+                    ("cpu", parse_cpu_millicores, MIN_SAFE_CPU_M, MAX_LOW_CONTAINER_CPU_M),
+                    ("memory", parse_memory_bytes, MIN_SAFE_MEM_B, MAX_LOW_CONTAINER_MEM_B),
+                ):
+                    rv_raw = rmap.get(rname)
+                    if rv_raw is None:
+                        continue
+                    rv = parser_fn(rv_raw)
+                    fp = f"{c_path}.resources.{section}.{rname}"
+                    if rv is None:
+                        ev.add(
+                            "INVALID_RESOURCE_QUANTITY",
+                            DIM_DISRUPTIVENESS,
+                            RISK_HIGH,
+                            f"unparseable {rname} quantity {rv_raw!r} on container {cname!r}",
+                            disrupt=DISRUPT_DISRUPTIVE,
+                            field_path=fp,
+                        )
+                    elif rv < floor_val:
+                        ev.add(
+                            "CONTAINER_RESOURCE_BELOW_FLOOR",
+                            DIM_DISRUPTIVENESS,
+                            RISK_HIGH,
+                            f"sets {section}.{rname} below safe floor on container {cname!r}",
+                            disrupt=DISRUPT_DISRUPTIVE,
+                            field_path=fp,
+                        )
+                    elif rv > max_val:
+                        ev.add(
+                            "CONTAINER_RESOURCE_LARGE_INCREASE",
+                            DIM_BLAST_RADIUS,
+                            RISK_HIGH,
+                            f"sets large {section}.{rname}={rv_raw!r} on container {cname!r}",
+                            blast=BLAST_HIGH,
+                            field_path=fp,
+                        )
+
+    if kind == "Job":
+        ev.add(
+            "JOB_CREATED",
+            DIM_REVERTABILITY,
+            RISK_HIGH,
+            f"creates batch/Job {ev.ref.name!r} (one-off execution is not cleanly revertable)",
+            revert=REVERT_IRREVERSIBLE,
+        )
+    elif kind == "DaemonSet":
+        ev.add(
+            "NEW_DAEMONSET",
+            DIM_BLAST_RADIUS,
+            RISK_HIGH,
+            f"creates DaemonSet {ev.ref.name!r} across cluster nodes",
+            blast=BLAST_HIGH,
+        )
+    else:
+        ev.add(
+            "NEW_WORKLOAD",
+            DIM_BLAST_RADIUS,
+            RISK_MEDIUM,
+            f"creates new {kind} {ev.ref.name!r}",
+            revert=REVERT_MODERATE if kind in ("Pod", "ReplicaSet", "ReplicationController", "StatefulSet") else REVERT_EASY,
+        )
+
+
+def _check_pod_template(
+    ev: ResourceEval,
+    action: str,
+    before_obj: dict[str, Any] | None,
+    after_obj: dict[str, Any],
+    diffs: list[FieldDiff],
+) -> None:
+    """Evaluate core v1/PodTemplate resources (top-level `template.spec` and `template.metadata`)."""
+    _check_pod_template_metadata(ev, "PodTemplate", before_obj, after_obj, action=action)
+    a_ps = _extract_pod_spec("PodTemplate", after_obj) or {}
+    b_ps = _extract_pod_spec("PodTemplate", before_obj) if action == ACTION_MODIFY and before_obj is not None else None
+    _check_pod_spec_posture(ev, a_ps, before_pod_spec=b_ps, require_containers=True)
+    for list_key in ("containers", "initContainers", "ephemeralContainers"):
+        for idx, ctr in enumerate(a_ps.get(list_key) if isinstance(a_ps.get(list_key), list) else []):
+            if isinstance(ctr, dict) and isinstance(ctr.get("image"), str) and not is_immutable_image_pin(ctr["image"]):
+                cname = ctr.get("name") if isinstance(ctr.get("name"), str) and ctr.get("name").strip() else str(idx)
+                ev.add(
+                    "UNPINNED_IMAGE_TAG",
+                    DIM_REVERTABILITY,
+                    RISK_MEDIUM,
+                    f"PodTemplate container {cname!r} uses mutable/unpinned image {ctr['image']!r}",
+                    revert=REVERT_UNKNOWN,
+                    field_path=f"template.spec.{list_key}.{cname}.image",
+                )
+    if action == ACTION_MODIFY and before_obj is not None:
+        for list_key in ("containers", "initContainers", "ephemeralContainers"):
+            b_ctrs = {
+                c["name"]: c
+                for c in ((b_ps or {}).get(list_key) if isinstance((b_ps or {}).get(list_key), list) else [])
+                if isinstance(c, dict) and isinstance(c.get("name"), str)
+            }
+            a_ctrs = {
+                c["name"]: c
+                for c in (a_ps.get(list_key) if isinstance(a_ps.get(list_key), list) else [])
+                if isinstance(c, dict) and isinstance(c.get("name"), str)
+            }
+            for cname in sorted(set(b_ctrs.keys()) | set(a_ctrs.keys())):
+                if cname not in b_ctrs:
+                    ev.add("CONTAINER_ADDED", DIM_SECURITY, RISK_HIGH, f"adds PodTemplate {list_key} {cname!r}", security=True)
+                elif cname not in a_ctrs:
+                    ev.add("CONTAINER_REMOVED", DIM_DISRUPTIVENESS, RISK_HIGH, f"removes PodTemplate {list_key} {cname!r}", disrupt=DISRUPT_DISRUPTIVE)
+                else:
+                    bc, ac = b_ctrs[cname], a_ctrs[cname]
+                    b_repo, _, _ = split_image_ref(str(bc.get("image") or ""))
+                    a_repo, _, _ = split_image_ref(str(ac.get("image") or ""))
+                    if b_repo != a_repo:
+                        ev.add("IMAGE_REPOSITORY_CHANGED", DIM_SECURITY, RISK_HIGH, f"changes PodTemplate {list_key} {cname!r} image repository", security=True)
+                    for exec_key in ("command", "args", "workingDir", "lifecycle"):
+                        if bc.get(exec_key) != ac.get(exec_key):
+                            ev.add("CONTAINER_ENTRYPOINT_CHANGED", DIM_SECURITY, RISK_HIGH, f"modifies PodTemplate {list_key} {cname!r} {exec_key}", security=True)
+                    b_csc = bc.get("securityContext") if isinstance(bc.get("securityContext"), dict) else {}
+                    a_csc = ac.get("securityContext") if isinstance(ac.get("securityContext"), dict) else {}
+                    if b_csc:
+                        _check_security_hardening_removed(ev, b_csc, a_csc, f"template.spec.{list_key}.{cname}.securityContext")
+    ev.add(
+        "POD_TEMPLATE_CHANGE",
+        DIM_BLAST_RADIUS,
+        RISK_MEDIUM,
+        f"{action}s PodTemplate {ev.ref.name!r} (referenced by downstream controllers/buffers)",
+        revert=REVERT_MODERATE,
+    )
+
+
 def _check_workload_modify(
     ev: ResourceEval,
     before_obj: dict[str, Any],
     after_obj: dict[str, Any],
     diffs: list[FieldDiff],
 ) -> None:
-    """Evaluate modifications to Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Pod."""
+    """Evaluate modifications to Deployment, StatefulSet, DaemonSet, ReplicaSet, ReplicationController, Job, CronJob, Pod."""
     kind = ev.ref.kind
     is_daemonset = kind == "DaemonSet"
     b_spec = before_obj.get("spec") if isinstance(before_obj.get("spec"), dict) else {}
@@ -1733,6 +2953,27 @@ def _check_workload_modify(
                 disrupt=DISRUPT_DESTRUCTIVE,
                 field_path=d.dotted,
             )
+        if kind == "Pod" and len(t) >= 2 and t[0] == "spec" and t[1] in (
+            "volumes",
+            "restartPolicy",
+            "serviceAccountName",
+            "serviceAccount",
+            "securityContext",
+            "hostNetwork",
+            "hostPID",
+            "hostIPC",
+            "hostUsers",
+            "nodeName",
+        ):
+            ev.add(
+                "IMMUTABLE_FIELD_CHANGED",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"modifies immutable standalone Pod field spec.{t[1]}",
+                revert=REVERT_MODERATE,
+                disrupt=DISRUPT_DESTRUCTIVE,
+                field_path=d.dotted,
+            )
 
     if kind == "Deployment":
         a_strat = a_spec.get("strategy")
@@ -1760,21 +3001,8 @@ def _check_workload_modify(
             else:
                 ru = a_strat.get("rollingUpdate") if isinstance(a_strat, dict) else None
                 max_unavail = ru.get("maxUnavailable") if isinstance(ru, dict) else None
-                aggressive_unavail = False
-                if isinstance(max_unavail, str) and max_unavail.strip().endswith("%"):
-                    try:
-                        pct = float(max_unavail.strip()[:-1])
-                        if pct > 50.0 or not math.isfinite(pct):
-                            aggressive_unavail = True
-                    except ValueError:
-                        aggressive_unavail = True
-                elif max_unavail is not None and not _is_strict_int(max_unavail):
-                    aggressive_unavail = True
-                elif _is_strict_int(max_unavail) and max_unavail > 1:
-                    b_rep_est = b_spec.get("replicas", 1)
-                    if _is_strict_int(b_rep_est) and b_rep_est > 0 and max_unavail / b_rep_est > 0.5:
-                        aggressive_unavail = True
-                if aggressive_unavail:
+                b_rep_est = b_spec.get("replicas", 1) if _is_strict_int(b_spec.get("replicas", 1)) else 1
+                if _is_aggressive_max_unavailable(max_unavail, b_rep_est):
                     ev.add(
                         "AGGRESSIVE_ROLLOUT_STRATEGY",
                         DIM_DISRUPTIVENESS,
@@ -1792,21 +3020,87 @@ def _check_workload_modify(
                         f"modifies Deployment {ev.ref.name!r} rollout strategy",
                         field_path="spec.strategy",
                     )
+        elif (
+            isinstance(a_strat, dict)
+            and str(a_strat.get("type") or "") == "Recreate"
+            and a_spec.get("template") != b_spec.get("template")
+        ):
+            ev.add(
+                "RECREATE_WORKLOAD_ROLLOUT",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"triggers pod rollout on Deployment {ev.ref.name!r} with Recreate strategy (causes downtime)",
+                revert=REVERT_MODERATE,
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.template",
+            )
 
-    if kind == "StatefulSet":
-        ret = a_spec.get("persistentVolumeClaimRetentionPolicy")
-        b_ret = b_spec.get("persistentVolumeClaimRetentionPolicy")
-        if isinstance(ret, dict) and str(ret.get("whenDeleted") or "") == "Delete":
-            if not (isinstance(b_ret, dict) and str(b_ret.get("whenDeleted") or "") == "Delete"):
+    if kind in ("DaemonSet", "StatefulSet"):
+        a_ustrat = a_spec.get("updateStrategy")
+        b_ustrat = b_spec.get("updateStrategy")
+        if a_ustrat != b_ustrat:
+            if a_ustrat is not None and not isinstance(a_ustrat, dict):
                 ev.add(
-                    "STATEFULSET_PVC_DELETE_POLICY",
+                    "MALFORMED_FIELD_TYPE",
                     DIM_DISRUPTIVENESS,
                     RISK_HIGH,
-                    "sets StatefulSet persistentVolumeClaimRetentionPolicy.whenDeleted to Delete",
-                    revert=REVERT_DIFFICULT,
-                    disrupt=DISRUPT_DESTRUCTIVE,
-                    field_path="spec.persistentVolumeClaimRetentionPolicy.whenDeleted",
+                    f"{kind} spec.updateStrategy is not a mapping",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path="spec.updateStrategy",
                 )
+            else:
+                ru = a_ustrat.get("rollingUpdate") if isinstance(a_ustrat, dict) else None
+                max_unavail = ru.get("maxUnavailable") if isinstance(ru, dict) else None
+                b_rep_est = b_spec.get("replicas", 1) if _is_strict_int(b_spec.get("replicas", 1)) else 1
+                if _is_aggressive_max_unavailable(max_unavail, b_rep_est):
+                    ev.add(
+                        "AGGRESSIVE_ROLLOUT_STRATEGY",
+                        DIM_DISRUPTIVENESS,
+                        RISK_HIGH,
+                        f"sets aggressive {kind} updateStrategy.rollingUpdate.maxUnavailable={max_unavail!r}",
+                        revert=REVERT_MODERATE,
+                        disrupt=DISRUPT_DISRUPTIVE,
+                        field_path="spec.updateStrategy.rollingUpdate.maxUnavailable",
+                    )
+
+    if kind == "StatefulSet":
+        ev.add(
+            "STATEFULSET_MODIFIED",
+            DIM_REVERTABILITY,
+            RISK_MEDIUM,
+            f"modifies StatefulSet {ev.ref.name!r} (ordered stateful workload)",
+            revert=REVERT_MODERATE,
+        )
+        ret = a_spec.get("persistentVolumeClaimRetentionPolicy")
+        b_ret = b_spec.get("persistentVolumeClaimRetentionPolicy")
+        for ret_key in ("whenDeleted", "whenScaled"):
+            if isinstance(ret, dict) and str(ret.get(ret_key) or "") == "Delete":
+                if not (isinstance(b_ret, dict) and str(b_ret.get(ret_key) or "") == "Delete"):
+                    ev.add(
+                        "STATEFULSET_PVC_DELETE_POLICY",
+                        DIM_DISRUPTIVENESS,
+                        RISK_HIGH,
+                        f"sets StatefulSet persistentVolumeClaimRetentionPolicy.{ret_key} to Delete",
+                        revert=REVERT_DIFFICULT,
+                        disrupt=DISRUPT_DESTRUCTIVE,
+                        field_path=f"spec.persistentVolumeClaimRetentionPolicy.{ret_key}",
+                    )
+    elif kind == "Pod":
+        ev.add(
+            "STANDALONE_POD_MODIFIED",
+            DIM_REVERTABILITY,
+            RISK_MEDIUM,
+            f"modifies standalone Pod {ev.ref.name!r} (no controller-managed rolling rollout)",
+            revert=REVERT_MODERATE,
+        )
+    elif kind in ("ReplicaSet", "ReplicationController"):
+        ev.add(
+            "DIRECT_REPLICASET_MODIFIED",
+            DIM_REVERTABILITY,
+            RISK_MEDIUM,
+            f"modifies {kind} {ev.ref.name!r} directly outside a Deployment rollout",
+            revert=REVERT_MODERATE,
+        )
 
     if kind in ("CronJob", "Job"):
         if "suspend" in a_spec or "suspend" in b_spec:
@@ -1839,6 +3133,16 @@ def _check_workload_modify(
                         f"resumes suspended {kind} {ev.ref.name!r}",
                         field_path="spec.suspend",
                     )
+        if kind == "CronJob" and a_spec.get("concurrencyPolicy") != b_spec.get("concurrencyPolicy"):
+            if str(a_spec.get("concurrencyPolicy") or "") == "Replace":
+                ev.add(
+                    "CRONJOB_CONCURRENCY_REPLACE",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"sets CronJob {ev.ref.name!r} concurrencyPolicy=Replace (terminates active jobs)",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path="spec.concurrencyPolicy",
+                )
 
     if kind == "Job":
         ev.add(
@@ -1868,7 +3172,25 @@ def _check_workload_modify(
         )
     elif "replicas" in b_spec or "replicas" in a_spec:
         if b_rep != a_rep:
-            if a_rep <= 0:
+            ret_pol = a_spec.get("persistentVolumeClaimRetentionPolicy")
+            sts_deletes_pvcs = (
+                kind == "StatefulSet"
+                and isinstance(a_spec.get("volumeClaimTemplates"), list)
+                and bool(a_spec["volumeClaimTemplates"])
+                and isinstance(ret_pol, dict)
+                and str(ret_pol.get("whenScaled") or "") == "Delete"
+            )
+            if a_rep < b_rep and sts_deletes_pvcs:
+                ev.add(
+                    "STATEFULSET_PVC_DESTRUCTIVE_SCALE_DOWN",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"scales down StatefulSet {ev.ref.name!r} ({b_rep} -> {a_rep}) with whenScaled=Delete (destroys PVCs)",
+                    revert=REVERT_IRREVERSIBLE,
+                    disrupt=DISRUPT_DESTRUCTIVE,
+                    field_path="spec.replicas",
+                )
+            elif a_rep <= 0:
                 ev.add(
                     "WORKLOAD_SCALED_TO_ZERO",
                     DIM_DISRUPTIVENESS,
@@ -1937,21 +3259,8 @@ def _check_workload_modify(
                         field_path="spec.replicas",
                     )
 
-    # 3. Pod template label removal (detaches pods from Services/PDBs/NetworkPolicies)
-    b_tmeta = _extract_pod_template_meta(kind, before_obj)
-    a_tmeta = _extract_pod_template_meta(kind, after_obj)
-    b_tlbl = b_tmeta.get("labels") if isinstance(b_tmeta.get("labels"), dict) else {}
-    a_tlbl = a_tmeta.get("labels") if isinstance(a_tmeta.get("labels"), dict) else {}
-    for k, old_v in sorted(b_tlbl.items(), key=str):
-        if k not in a_tlbl or a_tlbl[k] != old_v:
-            ev.add(
-                "POD_TEMPLATE_LABEL_CHANGED",
-                DIM_DISRUPTIVENESS,
-                RISK_HIGH,
-                f"changes or removes pod template label {k!r} (may detach Service/PDB/NetworkPolicy selectors)",
-                disrupt=DISRUPT_DISRUPTIVE,
-                field_path=f"spec.template.metadata.labels.{k}",
-            )
+    # 3. Pod template metadata (selector label removal + protected annotations/labels)
+    _check_pod_template_metadata(ev, kind, before_obj, after_obj, action=ACTION_MODIFY)
 
     # 4. PodSpec posture & container-level diffs
     b_ps = _extract_pod_spec(kind, before_obj) or {}
@@ -2039,12 +3348,12 @@ def _check_workload_modify(
             if b_csc:
                 _check_security_hardening_removed(ev, b_csc, a_csc, f"{c_path}.securityContext")
 
-            # Image diff
+            # Image diff (including digest-pin stripping check)
             b_img = str(bc.get("image") or "")
             a_img = str(ac.get("image") or "")
             if b_img != a_img:
-                b_repo, _, _ = split_image_ref(b_img)
-                a_repo, _, _ = split_image_ref(a_img)
+                b_repo, _, b_digest = split_image_ref(b_img)
+                a_repo, _, a_digest = split_image_ref(a_img)
                 if b_repo != a_repo:
                     ev.add(
                         "IMAGE_REPOSITORY_CHANGED",
@@ -2063,6 +3372,15 @@ def _check_workload_modify(
                         revert=REVERT_UNKNOWN,
                         field_path=f"{c_path}.image",
                     )
+                elif b_digest and not a_digest:
+                    ev.add(
+                        "IMAGE_DIGEST_PIN_REMOVED",
+                        DIM_REVERTABILITY,
+                        RISK_MEDIUM,
+                        f"strips immutable @sha256 digest pin from container {cname!r} image ({b_img!r} -> {a_img!r})",
+                        revert=REVERT_MODERATE,
+                        field_path=f"{c_path}.image",
+                    )
                 else:
                     ev.add(
                         "PINNED_IMAGE_UPDATE",
@@ -2072,7 +3390,7 @@ def _check_workload_modify(
                         field_path=f"{c_path}.image",
                     )
 
-            # Command / args / workingDir / lifecycle
+            # Command / args / workingDir / lifecycle / restartPolicy (sidecar initContainer mode)
             for exec_key in ("command", "args", "workingDir", "lifecycle"):
                 if bc.get(exec_key) != ac.get(exec_key):
                     ev.add(
@@ -2083,6 +3401,15 @@ def _check_workload_modify(
                         field_path=f"{c_path}.{exec_key}",
                         security=True,
                     )
+            if bc.get("restartPolicy") != ac.get("restartPolicy"):
+                ev.add(
+                    "CONTAINER_LIFECYCLE_MODE_CHANGED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"modifies {list_key} {cname!r} restartPolicy ({bc.get('restartPolicy')!r} -> {ac.get('restartPolicy')!r})",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.restartPolicy",
+                )
 
             # Health probe removals
             for probe_key in ("readinessProbe", "livenessProbe", "startupProbe"):
@@ -2099,19 +3426,113 @@ def _check_workload_modify(
             # Resources requests/limits
             _check_container_resources(ev, cname, c_path, bc, ac, b_rep=b_rep, a_rep=a_rep)
 
-            # Removals of ports / volumeMounts / env
-            for sub_list_key in ("ports", "volumeMounts", "env"):
-                b_items = bc.get(sub_list_key) if isinstance(bc.get(sub_list_key), list) else []
-                a_items = ac.get(sub_list_key) if isinstance(ac.get(sub_list_key), list) else []
-                if len(a_items) < len(b_items):
+            # Identity-aware removals/replacements of ports, volumeMounts, volumeDevices, env, envFrom
+            b_ports = bc.get("ports") if isinstance(bc.get("ports"), list) else []
+            a_ports = ac.get("ports") if isinstance(ac.get("ports"), list) else []
+            b_port_ids = {
+                (p.get("containerPort"), str(p.get("protocol") or "TCP").upper(), str(p.get("name") or ""))
+                for p in b_ports
+                if isinstance(p, dict)
+            }
+            a_port_ids = {
+                (p.get("containerPort"), str(p.get("protocol") or "TCP").upper(), str(p.get("name") or ""))
+                for p in a_ports
+                if isinstance(p, dict)
+            }
+            if len(a_ports) < len(b_ports) or (b_port_ids - a_port_ids):
+                ev.add(
+                    "CONTAINER_COMPONENT_REMOVED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"removes or changes exposed containerPort entries on container {cname!r}",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.ports",
+                )
+
+            b_vms = bc.get("volumeMounts") if isinstance(bc.get("volumeMounts"), list) else []
+            a_vms = ac.get("volumeMounts") if isinstance(ac.get("volumeMounts"), list) else []
+            b_vm_map = {
+                (vm.get("name"), vm.get("mountPath")): vm
+                for vm in b_vms
+                if isinstance(vm, dict)
+            }
+            a_vm_map = {
+                (vm.get("name"), vm.get("mountPath")): vm
+                for vm in a_vms
+                if isinstance(vm, dict)
+            }
+            if len(a_vms) < len(b_vms) or (set(b_vm_map.keys()) - set(a_vm_map.keys())):
+                ev.add(
+                    "CONTAINER_COMPONENT_REMOVED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"removes or relocates volumeMounts on container {cname!r}",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.volumeMounts",
+                )
+            for vm_key, b_vm in b_vm_map.items():
+                a_vm = a_vm_map.get(vm_key)
+                if isinstance(a_vm, dict) and b_vm.get("readOnly") is True and a_vm.get("readOnly") is not True:
                     ev.add(
-                        "CONTAINER_COMPONENT_REMOVED",
+                        "SECURITY_HARDENING_REMOVED",
+                        DIM_SECURITY,
+                        RISK_HIGH,
+                        f"removes readOnly=true on container {cname!r} volumeMount {vm_key[0]!r}",
+                        blast=BLAST_MEDIUM,
+                        field_path=f"{c_path}.volumeMounts",
+                        security=True,
+                    )
+
+            b_vds = bc.get("volumeDevices") if isinstance(bc.get("volumeDevices"), list) else []
+            a_vds = ac.get("volumeDevices") if isinstance(ac.get("volumeDevices"), list) else []
+            b_vd_ids = {(vd.get("name"), vd.get("devicePath")) for vd in b_vds if isinstance(vd, dict)}
+            a_vd_ids = {(vd.get("name"), vd.get("devicePath")) for vd in a_vds if isinstance(vd, dict)}
+            if len(a_vds) < len(b_vds) or (b_vd_ids - a_vd_ids):
+                ev.add(
+                    "CONTAINER_COMPONENT_REMOVED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"removes volumeDevices from container {cname!r}",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.volumeDevices",
+                )
+
+            b_envs = bc.get("env") if isinstance(bc.get("env"), list) else []
+            a_envs = ac.get("env") if isinstance(ac.get("env"), list) else []
+            b_env_map = {e["name"]: e for e in b_envs if isinstance(e, dict) and isinstance(e.get("name"), str)}
+            a_env_map = {e["name"]: e for e in a_envs if isinstance(e, dict) and isinstance(e.get("name"), str)}
+            if len(a_envs) < len(b_envs) or (set(b_env_map.keys()) - set(a_env_map.keys())):
+                ev.add(
+                    "CONTAINER_COMPONENT_REMOVED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"removes env entries from container {cname!r}",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.env",
+                )
+            for ek, b_ev_item in b_env_map.items():
+                a_ev_item = a_env_map.get(ek)
+                if isinstance(a_ev_item, dict) and b_ev_item.get("value") and a_ev_item.get("value") == "" and not a_ev_item.get("valueFrom"):
+                    ev.add(
+                        "CONTAINER_ENV_WIPED",
                         DIM_DISRUPTIVENESS,
                         RISK_HIGH,
-                        f"removes entries from container {cname!r} {sub_list_key}",
+                        f"wipes env {ek!r} to empty string on container {cname!r}",
                         disrupt=DISRUPT_DISRUPTIVE,
-                        field_path=f"{c_path}.{sub_list_key}",
+                        field_path=f"{c_path}.env.{ek}",
                     )
+
+            b_efs = bc.get("envFrom") if isinstance(bc.get("envFrom"), list) else []
+            a_efs = ac.get("envFrom") if isinstance(ac.get("envFrom"), list) else []
+            if len(a_efs) < len(b_efs) or any(item not in a_efs for item in b_efs):
+                ev.add(
+                    "CONTAINER_COMPONENT_REMOVED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"removes envFrom entries from container {cname!r}",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path=f"{c_path}.envFrom",
+                )
 
     # Check scheduling changes on DaemonSet (`nodeSelector`, `affinity`, `tolerations`)
     if is_daemonset:
@@ -2336,6 +3757,30 @@ def _check_container_resources(
 
 _CONFIGMAP_ALLOWED_TOP_KEYS = frozenset({"apiVersion", "kind", "metadata", "data", "binaryData", "immutable"})
 
+_KNOWN_GROUP_VERSIONS: dict[str, frozenset[str]] = {
+    "": frozenset({"v1"}),
+    "apps": frozenset({"v1"}),
+    "batch": frozenset({"v1", "v1beta1"}),
+    "rbac.authorization.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "policy": frozenset({"v1", "v1beta1"}),
+    "autoscaling": frozenset({"v2", "v2beta2", "v2beta1", "v1"}),
+    "networking.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "storage.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "scheduling.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "node.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "admissionregistration.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "apiextensions.k8s.io": frozenset({"v1", "v1beta1"}),
+    "apiregistration.k8s.io": frozenset({"v1", "v1beta1"}),
+    "coordination.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "discovery.k8s.io": frozenset({"v1", "v1beta1"}),
+    "certificates.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "authentication.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+    "authorization.k8s.io": frozenset({"v1", "v1beta1"}),
+    "flowcontrol.apiserver.k8s.io": frozenset({"v1", "v1beta3", "v1beta2", "v1beta1"}),
+    "resource.k8s.io": frozenset({"v1", "v1beta2", "v1beta1", "v1alpha3", "v1alpha2"}),
+    "audit.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
+}
+
 
 def _check_configmap(
     ev: ResourceEval,
@@ -2390,7 +3835,7 @@ def _check_configmap(
             val = amap[k]
             # Always scan added/modified keys for credential leaks, non-string types, and secret key names
             if action == ACTION_ADD or bmap.get(k) != val:
-                if _SECRET_KEY_NAME_RE.search(ks):
+                if _is_secret_key_name(ks):
                     ev.add(
                         "PLAINTEXT_SECRET_KEY_IN_CONFIGMAP",
                         DIM_SECURITY,
@@ -2441,10 +3886,13 @@ def _check_configmap(
                         field_path=f"binaryData.{ks}",
                     )
                 else:
+                    s_trim = val.strip()
                     is_complex = (
                         "\n" in val
                         or "://" in val
-                        or ks.lower().endswith((".yaml", ".yml", ".json", ".sh", ".conf", ".ini", ".toml", ".xml", ".sql"))
+                        or len(val) > 256
+                        or s_trim.startswith(("{", "["))
+                        or ks.lower().endswith((".yaml", ".yml", ".json", ".sh", ".conf", ".ini", ".toml", ".xml", ".sql", ".properties", ".env"))
                     )
                     if action == ACTION_MODIFY and k in bmap:
                         if val == "" and bmap.get(k):
@@ -2522,9 +3970,23 @@ def _check_configmap(
         )
 
 
+def _parse_int_or_pct(val: Any) -> tuple[str, float] | None:
+    """Parse Kubernetes IntOrString (`int` >= 0 or `NN%` in 0..100)."""
+    if _is_strict_int(val) and val >= 0:
+        return ("int", float(val))
+    if isinstance(val, str) and val.strip().endswith("%"):
+        try:
+            pct = float(val.strip()[:-1])
+            if math.isfinite(pct) and 0.0 <= pct <= 100.0:
+                return ("pct", pct)
+        except ValueError:
+            return None
+    return None
+
+
 def _check_pdb(ev: ResourceEval, action: str, obj: dict[str, Any]) -> None:
     """Evaluate PodDisruptionBudget creation or modification."""
-    spec = obj.get("spec") if isinstance(obj.get("spec"), dict) else {}
+    spec = _as_dict(ev, obj.get("spec"), "spec")
     sel = spec.get("selector")
     empty_sel = not isinstance(sel, dict) or (not sel.get("matchLabels") and not sel.get("matchExpressions"))
     negative_only_sel = False
@@ -2533,11 +3995,34 @@ def _check_pdb(ev: ResourceEval, action: str, obj: dict[str, Any]) -> None:
         if ops and ops.issubset({"NotIn", "DoesNotExist"}):
             negative_only_sel = True
 
-    max_unavail = spec.get("maxUnavailable")
-    min_avail = spec.get("minAvailable")
+    has_max_u = "maxUnavailable" in spec and spec.get("maxUnavailable") is not None
+    has_min_a = "minAvailable" in spec and spec.get("minAvailable") is not None
+    if has_max_u and has_min_a:
+        ev.add(
+            "INVALID_PDB_SPEC",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"PodDisruptionBudget {ev.ref.name!r} specifies both minAvailable and maxUnavailable",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec",
+        )
+        return
+    p_max = _parse_int_or_pct(spec.get("maxUnavailable")) if has_max_u else None
+    p_min = _parse_int_or_pct(spec.get("minAvailable")) if has_min_a else None
+    if (has_max_u and p_max is None) or (has_min_a and p_min is None):
+        ev.add(
+            "MALFORMED_FIELD_TYPE",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"PodDisruptionBudget {ev.ref.name!r} has invalid minAvailable/maxUnavailable value",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec",
+        )
+        return
+
     blocks_drains = (
-        max_unavail in (0, "0", "0%")
-        or min_avail in ("100%",)
+        (p_max is not None and p_max[1] == 0.0)
+        or (p_min is not None and p_min[0] == "pct" and p_min[1] >= 100.0)
     )
     if empty_sel or negative_only_sel or blocks_drains:
         ev.add(
@@ -2560,9 +4045,6 @@ def _check_pdb(ev: ResourceEval, action: str, obj: dict[str, Any]) -> None:
             field_path="spec",
         )
     else:
-        # Offline static analysis cannot verify live replica count or overlapping PDBs,
-        # so adding a PDB offline is `medium` with `moderate` revertability (requiring
-        # live cluster verification via the `no-pdb` recipe path before auto-merge).
         ev.add(
             "PDB_ADDED_OFFLINE",
             DIM_BLAST_RADIUS,
@@ -2571,6 +4053,21 @@ def _check_pdb(ev: ResourceEval, action: str, obj: dict[str, Any]) -> None:
             revert=REVERT_MODERATE,
             field_path="spec",
         )
+
+
+def _is_internal_lb_annotations(annos: dict[str, Any]) -> bool:
+    low_map = {str(k).lower(): str(v).strip().lower() for k, v in annos.items()}
+    if low_map.get("networking.gke.io/load-balancer-type") == "internal":
+        return True
+    if low_map.get("cloud.google.com/load-balancer-type") == "internal":
+        return True
+    if low_map.get("service.beta.kubernetes.io/aws-load-balancer-scheme") == "internal":
+        return True
+    if low_map.get("service.beta.kubernetes.io/aws-load-balancer-internal") == "true":
+        return True
+    if low_map.get("service.beta.kubernetes.io/azure-load-balancer-internal") == "true":
+        return True
+    return False
 
 
 def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None, after_obj: dict[str, Any], diffs: list[FieldDiff]) -> None:
@@ -2630,6 +4127,17 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
                 disrupt=DISRUPT_DESTRUCTIVE if b_type == "LoadBalancer" else DISRUPT_DISRUPTIVE,
                 field_path="spec.type",
             )
+    if svc_type == "LoadBalancer" and _is_internal_lb_annotations(_meta_dict(before_obj, "annotations")) and not _is_internal_lb_annotations(_meta_dict(after_obj, "annotations")):
+        ev.add(
+            "INTERNAL_LOADBALANCER_EXPOSED",
+            DIM_SECURITY,
+            RISK_CRITICAL,
+            f"removes internal load-balancer restriction on Service {ev.ref.name!r} (recreates as public LoadBalancer)",
+            blast=BLAST_CRITICAL,
+            disrupt=DISRUPT_DESTRUCTIVE,
+            field_path="metadata.annotations",
+            security=True,
+        )
     if b_spec.get("externalName") != a_spec.get("externalName"):
         ev.add(
             "SERVICE_EXTERNAL_NAME_CHANGED",
@@ -2671,16 +4179,17 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
             disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.ports",
         )
-    if b_spec.get("externalTrafficPolicy") != a_spec.get("externalTrafficPolicy"):
-        ev.add(
-            "SERVICE_TRAFFIC_POLICY_CHANGED",
-            DIM_DISRUPTIVENESS,
-            RISK_HIGH,
-            f"changes Service {ev.ref.name!r} externalTrafficPolicy",
-            blast=BLAST_MEDIUM,
-            disrupt=DISRUPT_DISRUPTIVE,
-            field_path="spec.externalTrafficPolicy",
-        )
+    for tp_key in ("externalTrafficPolicy", "internalTrafficPolicy"):
+        if b_spec.get(tp_key) != a_spec.get(tp_key):
+            ev.add(
+                "SERVICE_TRAFFIC_POLICY_CHANGED",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"changes Service {ev.ref.name!r} {tp_key}",
+                blast=BLAST_MEDIUM,
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path=f"spec.{tp_key}",
+            )
     b_lb_ranges = b_spec.get("loadBalancerSourceRanges")
     a_lb_ranges_raw = a_spec.get("loadBalancerSourceRanges")
     a_lb_ranges = _as_list(ev, a_lb_ranges_raw, "spec.loadBalancerSourceRanges")
@@ -2717,11 +4226,49 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
 
 
 def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None, after_obj: dict[str, Any], diffs: list[FieldDiff]) -> None:
+    a_spec = _as_dict(ev, after_obj.get("spec"), "spec")
+    if "scaleTargetRef" in a_spec and a_spec.get("scaleTargetRef") is not None:
+        _as_dict(ev, a_spec.get("scaleTargetRef"), "spec.scaleTargetRef")
+
+    # Normalize omitted/null minReplicas to Kubernetes default `1`; require maxReplicas >= 1
+    a_min_raw = 1 if a_spec.get("minReplicas") is None else a_spec.get("minReplicas")
+    a_max_present = "maxReplicas" in a_spec and a_spec.get("maxReplicas") is not None
+    a_max_raw = a_spec.get("maxReplicas")
+    a_min_valid = _is_strict_int(a_min_raw) and a_min_raw >= 0
+    a_max_valid = a_max_present and _is_strict_int(a_max_raw) and a_max_raw >= 1
+
     if action == ACTION_ADD:
+        if not a_min_valid or not a_max_valid or a_min_raw > a_max_raw:
+            ev.add(
+                "INVALID_HPA_REPLICAS",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"sets invalid HPA {ev.ref.name!r} minReplicas={a_min_raw!r} / maxReplicas={a_max_raw!r}",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec",
+            )
+        elif a_min_raw == 0:
+            ev.add(
+                "HPA_SCALED_TO_ZERO",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"creates HPA {ev.ref.name!r} with minReplicas=0",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.minReplicas",
+            )
+        elif a_max_raw > MAX_LOW_REPLICA_TOTAL or a_min_raw > MAX_LOW_REPLICA_TOTAL:
+            ev.add(
+                "HPA_LARGE_INCREASE",
+                DIM_BLAST_RADIUS,
+                RISK_HIGH,
+                f"creates HPA {ev.ref.name!r} with high replica ceiling ({a_max_raw} > {MAX_LOW_REPLICA_TOTAL})",
+                blast=BLAST_MEDIUM,
+                field_path="spec.maxReplicas",
+            )
         ev.add("NEW_HPA", DIM_BLAST_RADIUS, RISK_MEDIUM, f"creates new HorizontalPodAutoscaler {ev.ref.name!r}")
         return
+
     b_spec = before_obj.get("spec") if isinstance(before_obj, dict) and isinstance(before_obj.get("spec"), dict) else {}
-    a_spec = _as_dict(ev, after_obj.get("spec"), "spec")
     if b_spec.get("scaleTargetRef") != a_spec.get("scaleTargetRef"):
         ev.add(
             "HPA_TARGET_CHANGED",
@@ -2731,19 +4278,13 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
             disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.scaleTargetRef",
         )
-    b_min_raw = b_spec.get("minReplicas", 1)
-    a_min_raw = a_spec.get("minReplicas", 1)
-    b_max_raw = b_spec.get("maxReplicas", 1)
-    a_max_raw = a_spec.get("maxReplicas", 1)
-    a_min_valid = _is_strict_int(a_min_raw) and a_min_raw >= 0
-    a_max_valid = _is_strict_int(a_max_raw) and a_max_raw >= 1
+
+    b_min_raw = 1 if b_spec.get("minReplicas") is None else b_spec.get("minReplicas")
+    b_max_raw = 1 if b_spec.get("maxReplicas") is None else b_spec.get("maxReplicas")
     b_min_valid = _is_strict_int(b_min_raw) and b_min_raw >= 0
     b_max_valid = _is_strict_int(b_max_raw) and b_max_raw >= 1
-    if (
-        ("minReplicas" in a_spec and a_spec["minReplicas"] is not None and not a_min_valid)
-        or ("maxReplicas" in a_spec and not a_max_valid)
-        or (a_min_valid and a_max_valid and a_min_raw > a_max_raw)
-    ):
+
+    if not a_min_valid or not a_max_valid or a_min_raw > a_max_raw:
         ev.add(
             "INVALID_HPA_REPLICAS",
             DIM_DISRUPTIVENESS,
@@ -2752,7 +4293,7 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
             disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec",
         )
-    elif a_min_valid and b_min_valid and a_min_raw == 0 and b_min_raw > 0:
+    elif a_min_raw == 0 and b_min_valid and b_min_raw > 0:
         ev.add(
             "HPA_SCALED_TO_ZERO",
             DIM_DISRUPTIVENESS,
@@ -2761,18 +4302,20 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
             disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.minReplicas",
         )
-    elif a_max_valid and b_min_valid and a_max_raw < b_min_raw:
+    elif (
+        (b_min_valid and a_max_raw < b_min_raw)
+        or (b_min_valid and a_min_raw < b_min_raw and ((b_min_raw - a_min_raw) / max(b_min_raw, 1) > 0.5 or (b_min_raw >= 2 and a_min_raw == 1)))
+        or (b_max_valid and a_max_raw < b_max_raw and (b_max_raw - a_max_raw) / max(b_max_raw, 1) > 0.5)
+    ):
         ev.add(
             "HPA_CAPACITY_REDUCED",
             DIM_DISRUPTIVENESS,
             RISK_HIGH,
-            f"lowers HPA {ev.ref.name!r} maxReplicas ({a_max_raw}) below prior minReplicas ({b_min_raw})",
+            f"sharply reduces HPA {ev.ref.name!r} replica bounds ({b_min_raw}..{b_max_raw} -> {a_min_raw}..{a_max_raw})",
             disrupt=DISRUPT_DISRUPTIVE,
-            field_path="spec.maxReplicas",
+            field_path="spec",
         )
-    elif (a_min_valid and b_min_valid and a_min_raw < b_min_raw) or (
-        a_max_valid and b_max_valid and a_max_raw < b_max_raw
-    ):
+    elif (b_min_valid and a_min_raw < b_min_raw) or (b_max_valid and a_max_raw < b_max_raw):
         ev.add(
             "HPA_BOUNDS_LOWERED",
             DIM_BLAST_RADIUS,
@@ -2780,10 +4323,15 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
             f"lowers HPA {ev.ref.name!r} replica bounds",
             field_path="spec",
         )
-    elif (a_min_valid and b_min_valid and a_min_raw > b_min_raw) or (
-        a_max_valid and b_max_valid and a_max_raw > b_max_raw
-    ):
-        if a_max_valid and a_max_raw <= MAX_LOW_REPLICA_TOTAL and a_min_valid and a_min_raw <= MAX_LOW_REPLICA_TOTAL:
+    elif (b_min_valid and a_min_raw > b_min_raw) or (b_max_valid and a_max_raw > b_max_raw):
+        min_delta = a_min_raw - (b_min_raw if b_min_valid else 1)
+        min_factor = a_min_raw / max(b_min_raw if b_min_valid else 1, 1)
+        if (
+            a_max_raw <= MAX_LOW_REPLICA_TOTAL
+            and a_min_raw <= MAX_LOW_REPLICA_TOTAL
+            and min_delta <= MAX_LOW_REPLICA_DELTA
+            and min_factor <= MAX_LOW_REPLICA_FACTOR
+        ):
             ev.add(
                 "HPA_BOUNDS_BUMPED",
                 DIM_BLAST_RADIUS,
@@ -2796,9 +4344,9 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
                 "HPA_LARGE_INCREASE",
                 DIM_BLAST_RADIUS,
                 RISK_MEDIUM,
-                f"raises HPA {ev.ref.name!r} maxReplicas above {MAX_LOW_REPLICA_TOTAL}",
+                f"raises HPA {ev.ref.name!r} replica bounds steeply ({b_min_raw}..{b_max_raw} -> {a_min_raw}..{a_max_raw})",
                 blast=BLAST_MEDIUM,
-                field_path="spec.maxReplicas",
+                field_path="spec",
             )
     for d in diffs:
         if d.tokens and d.tokens[0] != "metadata" and not (
@@ -2885,7 +4433,9 @@ def _check_pvc(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
 
 
 def _kyverno_rules_weakened(b_spec: dict[str, Any], a_spec: dict[str, Any]) -> bool:
-    """Detect modern Kyverno per-rule validate.failureAction weakening or added exclude blocks."""
+    """Detect modern Kyverno per-rule validate.failureAction / verifyImages / failurePolicy weakening."""
+    if str(b_spec.get("failurePolicy") or "Fail").lower() == "fail" and str(a_spec.get("failurePolicy") or "Fail").lower() == "ignore":
+        return True
     b_rules = b_spec.get("rules") if isinstance(b_spec.get("rules"), list) else []
     a_rules = a_spec.get("rules") if isinstance(a_spec.get("rules"), list) else []
     b_by_name = {
@@ -2904,6 +4454,8 @@ def _kyverno_rules_weakened(b_spec: dict[str, Any], a_spec: dict[str, Any]) -> b
         a_val = ar.get("validate") if isinstance(ar.get("validate"), dict) else {}
         if str(b_val.get("failureAction") or "").lower() == "enforce" and str(a_val.get("failureAction") or "").lower() != "enforce":
             return True
+        if br.get("verifyImages") and ar.get("verifyImages") != br.get("verifyImages"):
+            return True
         if ar.get("exclude") and ar.get("exclude") != br.get("exclude"):
             return True
     return False
@@ -2916,7 +4468,6 @@ def _check_policy_engine(ev: ResourceEval, action: str, before_obj: dict[str, An
     spec = after_obj.get("spec") if isinstance(after_obj.get("spec"), dict) else {}
     b_spec = before_obj.get("spec") if isinstance(before_obj, dict) and isinstance(before_obj.get("spec"), dict) else {}
 
-    # Detect weakening validationFailureAction / per-rule failureAction / enforcementAction / exclude
     weakened = False
     if str(b_spec.get("validationFailureAction") or "").lower() == "enforce" and str(spec.get("validationFailureAction") or "").lower() != "enforce":
         weakened = True
@@ -2925,6 +4476,19 @@ def _check_policy_engine(ev: ResourceEval, action: str, before_obj: dict[str, An
     if action == ACTION_MODIFY and _kyverno_rules_weakened(b_spec, spec):
         weakened = True
 
+    enforces = (
+        str(spec.get("validationFailureAction") or "").lower() == "enforce"
+        or any(
+            isinstance(r, dict)
+            and (
+                (isinstance(r.get("validate"), dict) and str(r["validate"].get("failureAction") or "").lower() == "enforce")
+                or bool(r.get("mutate"))
+                or bool(r.get("verifyImages"))
+            )
+            for r in (spec.get("rules") if isinstance(spec.get("rules"), list) else [])
+        )
+        or (ev.ref.group == "constraints.gatekeeper.sh" and str(spec.get("enforcementAction") or "deny").lower() == "deny")
+    )
     sev = RISK_CRITICAL if (weakened or is_cluster) else RISK_HIGH
     ev.add(
         "POLICY_ENGINE_WEAKENED" if weakened else "POLICY_ENGINE_CHANGE",
@@ -2932,6 +4496,7 @@ def _check_policy_engine(ev: ResourceEval, action: str, before_obj: dict[str, An
         sev,
         f"{'weakens' if weakened else action + 's'} admission policy {ev.ref.gvk_label()} {ev.ref.name!r}",
         blast=BLAST_CRITICAL if is_cluster else BLAST_HIGH,
+        disrupt=DISRUPT_DISRUPTIVE if (action == ACTION_MODIFY or enforces) else DISRUPT_NONE,
         security=True,
     )
 
@@ -2943,14 +4508,23 @@ def _check_istio_security(ev: ResourceEval, action: str, before_obj: dict[str, A
     mtls = spec.get("mtls") if isinstance(spec.get("mtls"), dict) else {}
     mtls_mode = str(mtls.get("mode") or "").upper()
     loosened_mtls = ev.ref.kind == "PeerAuthentication" and mtls_mode in ("DISABLE", "PERMISSIVE")
-    broad_allow = ev.ref.kind == "AuthorizationPolicy" and str(spec.get("action") or "ALLOW").upper() == "ALLOW" and not spec.get("selector")
-    sev = RISK_CRITICAL if (mesh_wide and (loosened_mtls or broad_allow or action == ACTION_MODIFY)) else RISK_HIGH
+    authz_action = str(spec.get("action") or "ALLOW").upper()
+    broad_allow_or_deny_all = ev.ref.kind == "AuthorizationPolicy" and authz_action in ("ALLOW", "DENY") and not spec.get("selector")
+    is_disruptive = action == ACTION_MODIFY
+    if ev.ref.kind == "PeerAuthentication" and mtls_mode == "STRICT":
+        is_disruptive = True
+    elif ev.ref.kind == "AuthorizationPolicy" and authz_action != "AUDIT":
+        # Adding DENY, CUSTOM, or ALLOW (including empty rules deny-all) drops unmatched traffic
+        if authz_action in ("DENY", "CUSTOM") or not spec.get("rules") or spec.get("selector") or spec.get("targetRef"):
+            is_disruptive = True
+    sev = RISK_CRITICAL if (mesh_wide and (loosened_mtls or broad_allow_or_deny_all or action == ACTION_MODIFY)) else RISK_HIGH
     ev.add(
         "MESH_SECURITY_POLICY_CHANGE",
         DIM_SECURITY,
         sev,
         f"{action}s Istio {ev.ref.kind} {ev.ref.name!r} in {ev.ref.namespace or 'cluster'}",
         blast=BLAST_CRITICAL if mesh_wide else BLAST_HIGH,
+        disrupt=DISRUPT_DISRUPTIVE if is_disruptive else DISRUPT_NONE,
         security=True,
     )
 
@@ -2958,24 +4532,35 @@ def _check_istio_security(ev: ResourceEval, action: str, before_obj: dict[str, A
 def _check_gitops_reconciler(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None, after_obj: dict[str, Any]) -> None:
     """Evaluate ArgoCD, Flux, and Config Sync reconcilers."""
     kind = ev.ref.kind
-    spec = after_obj.get("spec") if isinstance(after_obj.get("spec"), dict) else {}
+    spec = _as_dict(ev, after_obj.get("spec"), "spec")
     b_spec = before_obj.get("spec") if isinstance(before_obj, dict) and isinstance(before_obj.get("spec"), dict) else {}
 
-    prune_enabled = False
-    if spec.get("prune") is True and b_spec.get("prune") is not True:
-        prune_enabled = True
+    prune_or_force = False
+    if "prune" in spec and _is_truthy_or_nonbool(spec.get("prune")) and b_spec.get("prune") is not True:
+        prune_or_force = True
+    if "force" in spec and _is_truthy_or_nonbool(spec.get("force")) and b_spec.get("force") is not True:
+        prune_or_force = True
     sync_pol = spec.get("syncPolicy")
-    if isinstance(sync_pol, dict) and isinstance(sync_pol.get("automated"), dict) and sync_pol["automated"].get("prune") is True:
-        b_sp = b_spec.get("syncPolicy") if isinstance(b_spec.get("syncPolicy"), dict) else {}
-        if not (isinstance(b_sp.get("automated"), dict) and b_sp["automated"].get("prune") is True):
-            prune_enabled = True
+    if isinstance(sync_pol, dict) and isinstance(sync_pol.get("automated"), dict) and "prune" in sync_pol["automated"]:
+        if _is_truthy_or_nonbool(sync_pol["automated"].get("prune")):
+            b_sp = b_spec.get("syncPolicy") if isinstance(b_spec.get("syncPolicy"), dict) else {}
+            if not (isinstance(b_sp.get("automated"), dict) and b_sp["automated"].get("prune") is True):
+                prune_or_force = True
 
     root_reconciler = kind in ("RootSync", "ApplicationSet", "AppProject", "ConfigManagement")
-    source_changed = (
-        action == ACTION_MODIFY
-        and (spec.get("source") != b_spec.get("source") or spec.get("sources") != b_spec.get("sources") or spec.get("git") != b_spec.get("git") or spec.get("url") != b_spec.get("url"))
+    source_or_dest_changed = action == ACTION_MODIFY and any(
+        spec.get(k) != b_spec.get(k)
+        for k in ("source", "sources", "git", "url", "oci", "helm", "destination", "project", "serviceAccountName", "kubeConfig")
     )
-    sev = RISK_CRITICAL if (root_reconciler or prune_enabled or source_changed) else RISK_HIGH
+    impersonation_set = action == ACTION_ADD and bool(spec.get("kubeConfig"))
+    suspended = "suspend" in spec and _is_truthy_or_nonbool(spec.get("suspend")) and b_spec.get("suspend") is not True
+
+    sev = RISK_CRITICAL if (root_reconciler or prune_or_force or source_or_dest_changed or impersonation_set) else RISK_HIGH
+    disrupt = (
+        DISRUPT_DESTRUCTIVE
+        if (prune_or_force or source_or_dest_changed)
+        else (DISRUPT_DISRUPTIVE if suspended else DISRUPT_NONE)
+    )
     ev.add(
         "GITOPS_RECONCILER_CHANGE",
         DIM_BLAST_RADIUS,
@@ -2983,8 +4568,313 @@ def _check_gitops_reconciler(ev: ResourceEval, action: str, before_obj: dict[str
         f"{action}s GitOps reconciler {ev.ref.gvk_label()} {ev.ref.name!r}",
         blast=BLAST_CRITICAL if root_reconciler else BLAST_HIGH,
         revert=REVERT_DIFFICULT,
-        disrupt=DISRUPT_DESTRUCTIVE if (prune_enabled or source_changed) else DISRUPT_NONE,
+        disrupt=disrupt,
         security=True,
+    )
+
+
+def _is_link_local_or_loopback_ip(ip_str: str) -> bool:
+    s = ip_str.strip().lower()
+    return (
+        s.startswith(("169.254.", "127.", "0."))
+        or s in ("0.0.0.0", "::1", "::", "localhost", "metadata.google.internal")
+        or s.startswith("fe80:")
+    )
+
+
+def _check_endpoints_or_slice(ev: ResourceEval, action: str, obj: dict[str, Any]) -> None:
+    """Evaluate manual v1/Endpoints and discovery.k8s.io/EndpointSlice resources."""
+    ips: list[str] = []
+    if ev.ref.kind == "Endpoints":
+        for sub in _as_list(ev, obj.get("subsets"), "subsets"):
+            if isinstance(sub, dict):
+                for addr in _as_list(ev, sub.get("addresses"), "subsets.addresses"):
+                    if isinstance(addr, dict) and isinstance(addr.get("ip"), str):
+                        ips.append(addr["ip"])
+    else:
+        for ep in _as_list(ev, obj.get("endpoints"), "endpoints"):
+            if isinstance(ep, dict):
+                for ip in _as_list(ev, ep.get("addresses"), "endpoints.addresses"):
+                    if isinstance(ip, str):
+                        ips.append(ip)
+    crit = (
+        ev.ref.name == "kubernetes"
+        or ev.ref.namespace in SYSTEM_NAMESPACES
+        or any(_is_link_local_or_loopback_ip(ip) for ip in ips)
+    )
+    ev.add(
+        "CRITICAL_ENDPOINT_HIJACK_OR_SSRF" if crit else "MANUAL_ENDPOINTS_CHANGE",
+        DIM_SECURITY,
+        RISK_CRITICAL if crit else RISK_HIGH,
+        f"{action}s {ev.ref.gvk_label()} {ev.ref.name!r}",
+        blast=BLAST_CRITICAL if crit else BLAST_HIGH,
+        disrupt=DISRUPT_DISRUPTIVE if (action == ACTION_MODIFY or crit) else DISRUPT_NONE,
+        security=True,
+    )
+
+
+def _check_control_plane_extension(ev: ResourceEval, action: str, obj: dict[str, Any]) -> None:
+    """Evaluate admission webhooks, CEL Validating/MutatingAdmissionPolicies, and APIService."""
+    kind = ev.ref.kind
+    spec = obj.get("spec") if isinstance(obj.get("spec"), dict) else {}
+    enforces_or_blocks = action == ACTION_MODIFY
+    if kind in ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration"):
+        webhooks = _as_list(ev, obj.get("webhooks"), "webhooks")
+        if any(isinstance(w, dict) and str(w.get("failurePolicy") or "Fail") != "Ignore" for w in webhooks):
+            enforces_or_blocks = True
+    elif kind == "ValidatingAdmissionPolicyBinding":
+        v_actions = spec.get("validationActions")
+        if isinstance(v_actions, list) and any(str(x) == "Deny" for x in v_actions):
+            enforces_or_blocks = True
+        elif spec.get("policyName") and v_actions is None:
+            enforces_or_blocks = True
+    elif kind in ("MutatingAdmissionPolicy", "MutatingAdmissionPolicyBinding"):
+        if spec:
+            enforces_or_blocks = True
+
+    ev.add(
+        "CRITICAL_CONTROL_PLANE_EXTENSION",
+        DIM_SECURITY,
+        RISK_CRITICAL,
+        f"{action}s cluster-wide API/admission extension {ev.ref.gvk_label()} {ev.ref.name!r}",
+        blast=BLAST_CRITICAL,
+        revert=REVERT_MODERATE,
+        disrupt=DISRUPT_DISRUPTIVE if enforces_or_blocks else DISRUPT_NONE,
+        security=True,
+    )
+
+
+def _check_gke_networking(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None, after_obj: dict[str, Any]) -> None:
+    """Evaluate GKE Gateway/Ingress/MCS/Multi-Networking CRDs (`networking.gke.io`, `net.gke.io`, `BackendConfig`)."""
+    kind = ev.ref.kind
+    a_spec = _as_dict(ev, after_obj.get("spec"), "spec")
+    b_spec = before_obj.get("spec") if isinstance(before_obj, dict) and isinstance(before_obj.get("spec"), dict) else {}
+
+    if kind in ("GKENetworkParamSet", "Network"):
+        ev.add(
+            "GKE_CLUSTER_NETWORK_CHANGE",
+            DIM_SECURITY,
+            RISK_CRITICAL,
+            f"{action}s cluster-scoped GKE network resource {ev.ref.gvk_label()} {ev.ref.name!r}",
+            blast=BLAST_CRITICAL,
+            revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return
+
+    if kind in ("BackendConfig", "GCPBackendPolicy"):
+        if action == ACTION_MODIFY:
+            if b_spec.get("securityPolicy") and not a_spec.get("securityPolicy"):
+                ev.add(
+                    "CLOUD_ARMOR_POLICY_REMOVED",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"removes Cloud Armor securityPolicy from {kind} {ev.ref.name!r}",
+                    blast=BLAST_CRITICAL,
+                    disrupt=DISRUPT_NONE,
+                    field_path="spec.securityPolicy",
+                    security=True,
+                )
+            b_iap = b_spec.get("iap") if isinstance(b_spec.get("iap"), dict) else {}
+            a_iap = a_spec.get("iap") if isinstance(a_spec.get("iap"), dict) else {}
+            if b_iap.get("enabled") is True and a_iap.get("enabled") is not True:
+                ev.add(
+                    "IAP_AUTH_DISABLED",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"disables Identity-Aware Proxy (IAP) on {kind} {ev.ref.name!r}",
+                    blast=BLAST_CRITICAL,
+                    field_path="spec.iap.enabled",
+                    security=True,
+                )
+        ev.add(
+            "GKE_BACKEND_POLICY_CHANGE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"{action}s GKE {kind} {ev.ref.name!r}",
+            blast=BLAST_HIGH,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return
+
+    if kind == "FrontendConfig":
+        if action == ACTION_MODIFY:
+            b_redir = b_spec.get("redirectToHttps") if isinstance(b_spec.get("redirectToHttps"), dict) else {}
+            a_redir = a_spec.get("redirectToHttps") if isinstance(a_spec.get("redirectToHttps"), dict) else {}
+            if (b_redir.get("enabled") is True and a_redir.get("enabled") is not True) or (b_spec.get("sslPolicy") and not a_spec.get("sslPolicy")):
+                ev.add(
+                    "TLS_HARDENING_WEAKENED",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"weakens HTTPS redirect or sslPolicy on GKE FrontendConfig {ev.ref.name!r}",
+                    blast=BLAST_HIGH,
+                    security=True,
+                )
+        ev.add(
+            "GKE_FRONTEND_CONFIG_CHANGE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"{action}s GKE FrontendConfig {ev.ref.name!r}",
+            blast=BLAST_HIGH,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return
+
+    if kind == "ManagedCertificate":
+        ev.add(
+            "GKE_MANAGED_CERTIFICATE_CHANGE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"{action}s GKE ManagedCertificate {ev.ref.name!r}",
+            blast=BLAST_HIGH,
+            revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return
+
+    if kind == "HealthCheckPolicy":
+        ev.add(
+            "GKE_HEALTH_CHECK_POLICY_CHANGE",
+            DIM_DISRUPTIVENESS if action == ACTION_MODIFY else DIM_BLAST_RADIUS,
+            RISK_HIGH,
+            f"{action}s GKE HealthCheckPolicy {ev.ref.name!r}",
+            blast=BLAST_HIGH,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+        )
+        return
+
+    ev.add(
+        "GKE_NETWORKING_POLICY_CHANGE",
+        DIM_SECURITY,
+        RISK_HIGH,
+        f"{action}s GKE networking resource {ev.ref.gvk_label()} {ev.ref.name!r}",
+        blast=BLAST_HIGH,
+        disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+        security=True,
+    )
+
+
+def _check_monitoring_resource(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None, after_obj: dict[str, Any]) -> None:
+    """Evaluate GKE Managed Prometheus (`monitoring.googleapis.com`) and Prometheus Operator (`monitoring.coreos.com`)."""
+    kind = ev.ref.kind
+    is_cluster = is_cluster_scoped_kind(ev.ref.group, kind)
+    spec = _as_dict(ev, after_obj.get("spec"), "spec")
+    b_spec = before_obj.get("spec") if isinstance(before_obj, dict) and isinstance(before_obj.get("spec"), dict) else {}
+
+    if is_cluster or kind in ("OperatorConfig", "Prometheus", "Alertmanager", "ThanosRuler"):
+        ev.add(
+            "CLUSTER_MONITORING_CHANGE",
+            DIM_BLAST_RADIUS,
+            RISK_HIGH,
+            f"{action}s monitoring infrastructure/cluster resource {ev.ref.gvk_label()} {ev.ref.name!r}",
+            blast=BLAST_HIGH,
+            revert=REVERT_MODERATE if kind in ("OperatorConfig", "Prometheus", "Alertmanager", "ThanosRuler") else REVERT_EASY,
+            disrupt=DISRUPT_DISRUPTIVE if (action == ACTION_MODIFY and kind in ("OperatorConfig", "Prometheus", "Alertmanager")) else DISRUPT_NONE,
+            security=(kind in ("OperatorConfig", "Prometheus", "Alertmanager")),
+        )
+        return
+
+    # Check secret references inside scrape endpoints
+    endpoints = spec.get("endpoints") if isinstance(spec.get("endpoints"), list) else (
+        spec.get("podMetricsEndpoints") if isinstance(spec.get("podMetricsEndpoints"), list) else []
+    )
+    b_endpoints = b_spec.get("endpoints") if isinstance(b_spec.get("endpoints"), list) else (
+        b_spec.get("podMetricsEndpoints") if isinstance(b_spec.get("podMetricsEndpoints"), list) else []
+    )
+    for ep in endpoints:
+        if isinstance(ep, dict) and any(ep.get(auth_k) for auth_k in ("basicAuth", "authorization", "oauth2", "bearerTokenSecret", "tls", "tlsConfig")):
+            if action == ACTION_ADD or ep not in b_endpoints:
+                ev.add(
+                    "MONITORING_SECRET_REF",
+                    DIM_SECURITY,
+                    RISK_HIGH,
+                    f"{ev.ref.gvk_label()} {ev.ref.name!r} configures endpoint auth/TLS credentials",
+                    blast=BLAST_MEDIUM,
+                    security=True,
+                )
+                break
+
+    if kind in ("Rules", "PrometheusRule", "AlertmanagerConfig") and action == ACTION_MODIFY:
+        ev.add(
+            "ALERTING_RULES_MODIFIED",
+            DIM_BLAST_RADIUS,
+            RISK_HIGH,
+            f"modifies alerting/recording {ev.ref.gvk_label()} {ev.ref.name!r}",
+            blast=BLAST_MEDIUM,
+        )
+        return
+
+    ev.add(
+        "POD_MONITORING_CHANGE",
+        DIM_BLAST_RADIUS,
+        RISK_MEDIUM,
+        f"{action}s {ev.ref.gvk_label()} {ev.ref.name!r}",
+        blast=BLAST_LOW,
+    )
+
+
+def _check_storage_resource(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None, after_obj: dict[str, Any]) -> None:
+    """Evaluate PV, CSIDriver, CSINode, VolumeAttachment, VolumeSnapshot, VolumeSnapshotContent, VolumeSnapshotClass."""
+    kind = ev.ref.kind
+    spec = _as_dict(ev, after_obj.get("spec"), "spec")
+    is_cluster = is_cluster_scoped_kind(ev.ref.group, kind)
+
+    if kind == "PersistentVolume":
+        hp = spec.get("hostPath")
+        loc = spec.get("local")
+        raw_path = str(hp.get("path") or "") if isinstance(hp, dict) else (str(loc.get("path") or "") if isinstance(loc, dict) else "")
+        if isinstance(hp, dict) or isinstance(loc, dict):
+            crit = _is_critical_host_path(raw_path)
+            ev.add(
+                "PV_HOST_PATH_MOUNT",
+                DIM_SECURITY,
+                RISK_CRITICAL if crit else RISK_HIGH,
+                f"PersistentVolume {ev.ref.name!r} exposes node path {raw_path!r}",
+                blast=BLAST_CRITICAL if crit else BLAST_HIGH,
+                revert=REVERT_DIFFICULT,
+                security=True,
+            )
+            return
+
+    if kind == "CSIDriver":
+        has_tok = bool(spec.get("tokenRequests"))
+        ev.add(
+            "CSI_DRIVER_CHANGE",
+            DIM_SECURITY,
+            RISK_CRITICAL if has_tok else RISK_HIGH,
+            f"{action}s CSIDriver {ev.ref.name!r}" + (" with kubelet tokenRequests" if has_tok else ""),
+            blast=BLAST_CRITICAL if has_tok else BLAST_HIGH,
+            revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return
+
+    if kind in ("VolumeAttachment", "CSINode"):
+        ev.add(
+            "NODE_STORAGE_ATTACHMENT_CHANGE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"{action}s node-level storage attachment {ev.ref.gvk_label()} {ev.ref.name!r}",
+            blast=BLAST_HIGH,
+            revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return
+
+    ev.add(
+        "CLUSTER_STORAGE_CHANGE",
+        DIM_REVERTABILITY,
+        RISK_HIGH,
+        f"{action}s storage resource {ev.ref.gvk_label()} {ev.ref.name!r}",
+        blast=BLAST_HIGH if is_cluster else BLAST_MEDIUM,
+        revert=REVERT_DIFFICULT,
+        security=is_cluster,
     )
 
 
@@ -3022,14 +4912,18 @@ def evaluate_resource(
         or _is_production_path(file_path)
     )
 
-    # Helper to apply production escalation consistently before returning
+    # Fail-closed finalizer: unmodeled changes NEVER silently pass as medium/easy
     def _finalize() -> ResourceEval:
         if not ev.reasons:
             ev.add(
                 "UNMODELED_RESOURCE_CHANGE",
                 DIM_BLAST_RADIUS,
-                RISK_MEDIUM,
-                f"{action}s {ref.gvk_label()} {ref.name!r}",
+                RISK_UNKNOWN,
+                f"unmodeled {action} on {ref.gvk_label()} {ref.name!r}",
+                blast=BLAST_UNKNOWN,
+                revert=REVERT_UNKNOWN,
+                disrupt=DISRUPT_UNKNOWN,
+                supported=False,
             )
         if is_prod and ev.risk_level in (RISK_LOW, RISK_MEDIUM, RISK_HIGH):
             escalate_high = (
@@ -3077,10 +4971,9 @@ def evaluate_resource(
                 field_path=patches[0][0],
                 supported=False,
             )
-            return _finalize()
 
-    # 1. Self-modification of kube-agents CRDs -> always critical
-    if ref.group == "kubeagents.x-k8s.io":
+    # 1. Self-modification of kube-agents CRDs (including `persona.kube-agents.x-k8s.io`) -> always critical
+    if is_kube_agents_group(ref.group):
         ev.add(
             "KUBE_AGENTS_SELF_MODIFICATION",
             DIM_SECURITY,
@@ -3088,10 +4981,25 @@ def evaluate_resource(
             f"{action}s kube-agents control-plane CR {ref.gvk_label()} {ref.name!r}",
             blast=BLAST_CRITICAL,
             revert=REVERT_DIFFICULT,
-            disrupt=DISRUPT_DESTRUCTIVE if action == ACTION_DELETE else DISRUPT_NONE,
+            disrupt=DISRUPT_DESTRUCTIVE if action == ACTION_DELETE else (DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE),
             security=True,
         )
-        return ev
+        return _finalize()
+
+    # Universal plaintext credential scan BEFORE early returns so unknown CRDs or
+    # namespace-less manifests can never mask leaked private keys or tokens.
+    if action != ACTION_DELETE:
+        for secret_path, pat_name in _scan_value_for_secrets(primary.sanitized):
+            ev.add(
+                "PLAINTEXT_SECRET_LEAK",
+                DIM_SECURITY,
+                RISK_CRITICAL,
+                f"plaintext {pat_name} detected in {ref.gvk_label()} {ref.name!r} at {secret_path}",
+                blast=BLAST_HIGH,
+                revert=REVERT_IRREVERSIBLE,
+                field_path=secret_path,
+                security=True,
+            )
 
     # 2. Unknown / unsupported CRD handling (never silently `low` or `medium`!)
     if not is_known_kind(ref.group, ref.kind):
@@ -3129,10 +5037,12 @@ def evaluate_resource(
                 disrupt=DISRUPT_UNKNOWN,
                 supported=False,
             )
-        return ev
+        return _finalize()
 
-    # 3. Missing namespace on a known namespaced resource -> fail closed as unknown
-    if not is_cluster_scoped and not ref.namespace:
+    # 3. Missing namespace on a known namespaced resource -> record `unknown` floor and
+    # CONTINUE evaluating security/posture rules so omitting `metadata.namespace` on a
+    # privileged/hostPath Pod or RBAC RoleBinding can never downgrade CRITICAL -> UNKNOWN.
+    if not is_cluster_scoped and not ref.namespace and ref.kind != "TokenRequest":
         ev.add(
             "MISSING_NAMESPACE",
             DIM_BLAST_RADIUS,
@@ -3143,7 +5053,24 @@ def evaluate_resource(
             disrupt=DISRUPT_DESTRUCTIVE if action == ACTION_DELETE else DISRUPT_UNKNOWN,
             supported=False,
         )
-        return ev
+        if action == ACTION_DELETE:
+            # Still run delete classification below so stateful/secret deletes stay CRITICAL/IRREVERSIBLE
+            pass
+
+    # 3b. Validate API version for standard Kubernetes API groups & version changes
+    allowed_versions = _KNOWN_GROUP_VERSIONS.get(ref.group)
+    if action != ACTION_DELETE and allowed_versions is not None and ref.version not in allowed_versions:
+        ev.add(
+            "UNRECOGNIZED_API_VERSION",
+            DIM_BLAST_RADIUS,
+            RISK_UNKNOWN,
+            f"unrecognized apiVersion '{ref.group + '/' if ref.group else ''}{ref.version}' for {ref.kind}",
+            blast=BLAST_UNKNOWN,
+            revert=REVERT_UNKNOWN,
+            disrupt=DISRUPT_UNKNOWN,
+            field_path="apiVersion",
+            supported=False,
+        )
 
     # 4. Handle deletions cleanly across all known resource families
     if action == ACTION_DELETE:
@@ -3158,12 +5085,12 @@ def evaluate_resource(
                 disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
-        if in_system_ns:
+        if in_system_ns or gk == ("", "Node"):
             ev.add(
                 "CRITICAL_SYSTEM_NAMESPACE_DELETE",
                 DIM_DISRUPTIVENESS,
                 RISK_CRITICAL,
-                f"deletes {ref.gvk_label()} {ref.name!r} in system namespace {ref.namespace!r}",
+                f"deletes {ref.gvk_label()} {ref.name!r}" + (f" in system namespace {ref.namespace!r}" if in_system_ns else ""),
                 blast=BLAST_CRITICAL,
                 revert=REVERT_IRREVERSIBLE if gk in DATA_STATEFUL_DELETE_KINDS else REVERT_MODERATE,
                 disrupt=DISRUPT_DESTRUCTIVE,
@@ -3181,26 +5108,36 @@ def evaluate_resource(
                 disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
-        if gk in CONTROL_PLANE_EXTENSION_KINDS or ref.group in ("kyverno.io", "templates.gatekeeper.sh", "constraints.gatekeeper.sh"):
+        if (
+            gk in CONTROL_PLANE_EXTENSION_KINDS
+            or gk in FLOWCONTROL_KINDS
+            or gk == ("audit.k8s.io", "Policy")
+            or ref.group in ("kyverno.io", "templates.gatekeeper.sh", "constraints.gatekeeper.sh")
+        ):
             ev.add(
                 "CRITICAL_CONTROL_PLANE_DELETE",
                 DIM_SECURITY,
                 RISK_CRITICAL,
-                f"deletes admission/policy control {ref.gvk_label()} {ref.name!r}",
+                f"deletes admission/policy/apiserver control {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_CRITICAL,
                 revert=REVERT_MODERATE,
                 disrupt=DISRUPT_DESTRUCTIVE,
                 security=True,
             )
             return _finalize()
-        if gk == ("", "Secret") or ref.kind in ("SealedSecret", "ExternalSecret"):
+        if (
+            gk == ("", "Secret")
+            or ref.kind in ("SealedSecret", "ExternalSecret")
+            or gk in (("external-secrets.io", "SecretStore"), ("external-secrets.io", "ClusterSecretStore"))
+            or ref.group == "cert-manager.io"
+        ):
             ev.add(
                 "SECRET_DELETED",
                 DIM_DISRUPTIVENESS,
-                RISK_CRITICAL if is_prod else RISK_HIGH,
+                RISK_CRITICAL if (is_prod or is_cluster_scoped) else RISK_HIGH,
                 f"deletes {ref.gvk_label()} {ref.name!r}",
-                blast=BLAST_MEDIUM,
-                revert=REVERT_IRREVERSIBLE,
+                blast=BLAST_CRITICAL if is_cluster_scoped else BLAST_MEDIUM,
+                revert=REVERT_IRREVERSIBLE if gk == ("", "Secret") or ref.kind in ("SealedSecret", "ExternalSecret") else REVERT_DIFFICULT,
                 disrupt=DISRUPT_DESTRUCTIVE,
                 security=True,
             )
@@ -3216,17 +5153,30 @@ def evaluate_resource(
                 disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
-        if is_cloud_infra_group(ref.group):
+        if is_cloud_infra_group(ref.group) or ref.group.endswith(".cnpg.io"):
             ev.add(
                 "CLOUD_INFRA_DELETED",
                 DIM_DISRUPTIVENESS,
                 RISK_CRITICAL if is_prod else RISK_HIGH,
-                f"deletes cloud infrastructure resource {ref.gvk_label()} {ref.name!r}",
+                f"deletes cloud/database infrastructure resource {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_HIGH,
                 revert=REVERT_IRREVERSIBLE,
                 disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
+        if gk == ("", "Service"):
+            svc_spec = primary.obj.get("spec") if isinstance(primary.obj.get("spec"), dict) else {}
+            if str(svc_spec.get("type") or "ClusterIP") == "LoadBalancer":
+                ev.add(
+                    "LOADBALANCER_SERVICE_DELETED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_CRITICAL if is_prod else RISK_HIGH,
+                    f"deletes LoadBalancer Service {ref.name!r} (releases external cloud load-balancer IP)",
+                    blast=BLAST_HIGH,
+                    revert=REVERT_DIFFICULT,
+                    disrupt=DISRUPT_DESTRUCTIVE,
+                )
+                return _finalize()
         ev.add(
             "RESOURCE_DELETED",
             DIM_DISRUPTIVENESS,
@@ -3234,29 +5184,25 @@ def evaluate_resource(
             f"deletes {ref.gvk_label()} {ref.name!r}",
             blast=BLAST_HIGH if is_cluster_scoped else BLAST_LOW,
             revert=REVERT_MODERATE,
-            disrupt=DISRUPT_DESTRUCTIVE,
+            disrupt=DISRUPT_DISRUPTIVE,
         )
         return _finalize()
 
-    # Compute diffs up front on MODIFY so metadata tampering, system metadata edits,
-    # and plaintext secret leaks are checked universally across EVERY resource kind.
+    # Compute diffs up front on MODIFY so metadata tampering, apiVersion changes,
+    # and system metadata edits are checked universally across EVERY resource kind.
     diffs = diff_objects(before.sanitized, after.sanitized) if (action == ACTION_MODIFY and before and after) else []
 
-    # Universal plaintext credential scan across all non-Secret fields (e.g. args,
-    # command, PVC/Namespace annotations, Istio/mesh configs, etc.)
-    for secret_path, pat_name in _scan_value_for_secrets(primary.sanitized):
-        ev.add(
-            "PLAINTEXT_SECRET_LEAK",
-            DIM_SECURITY,
-            RISK_CRITICAL,
-            f"plaintext {pat_name} detected in {ref.gvk_label()} {ref.name!r} at {secret_path}",
-            blast=BLAST_HIGH,
-            revert=REVERT_IRREVERSIBLE,
-            field_path=secret_path,
-            security=True,
-        )
-
     if action == ACTION_MODIFY and before is not None:
+        if before.ref.version != primary.ref.version or before.obj.get("apiVersion") != primary.obj.get("apiVersion"):
+            ev.add(
+                "API_VERSION_CHANGED",
+                DIM_BLAST_RADIUS,
+                RISK_HIGH,
+                f"changes apiVersion on {ref.gvk_label()} {ref.name!r} ({before.obj.get('apiVersion')!r} -> {primary.obj.get('apiVersion')!r})",
+                revert=REVERT_MODERATE,
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="apiVersion",
+            )
         _check_metadata_edits(
             ev,
             before.obj,
@@ -3265,33 +5211,7 @@ def evaluate_resource(
             allow_low_metadata=(gk in LOW_RISK_EDITABLE_KINDS),
         )
     elif action == ACTION_ADD:
-        a_meta = primary.obj.get("metadata")
-        if isinstance(a_meta, dict):
-            _as_dict(ev, a_meta.get("labels"), "metadata.labels")
-            _as_dict(ev, a_meta.get("annotations"), "metadata.annotations")
-            for mk in sorted(a_meta.keys(), key=str):
-                if mk not in _ALLOWED_METADATA_KEYS:
-                    ev.add(
-                        "METADATA_SYSTEM_FIELD_EDIT",
-                        DIM_SECURITY,
-                        RISK_HIGH,
-                        f"sets system or unexpected metadata field metadata.{mk}",
-                        blast=BLAST_MEDIUM,
-                        field_path=f"metadata.{mk}",
-                        security=True,
-                    )
-        for meta_field in ("labels", "annotations"):
-            for mk, _ in sorted(_meta_dict(primary.obj, meta_field).items(), key=str):
-                if any(sn in str(mk).lower() for sn in _INGRESS_SNIPPET_KEYS):
-                    ev.add(
-                        "INGRESS_SNIPPET_INJECTION",
-                        DIM_SECURITY,
-                        RISK_CRITICAL,
-                        f"sets raw proxy snippet annotation {mk!r}",
-                        blast=BLAST_CRITICAL,
-                        field_path=f"metadata.{meta_field}.{mk}",
-                        security=True,
-                    )
+        _check_metadata_add(ev, primary.obj)
 
     # 5. System namespace create/modify
     if in_system_ns:
@@ -3318,17 +5238,103 @@ def evaluate_resource(
         )
         return _finalize()
 
-    # 6. Control-plane admission webhooks & APIService
+    # 6. Control-plane admission webhooks, CEL Validating/MutatingAdmissionPolicies, APIService, FlowControl, Audit
     if gk in CONTROL_PLANE_EXTENSION_KINDS:
+        _check_control_plane_extension(ev, action, primary.obj)
+        return _finalize()
+
+    if gk in FLOWCONTROL_KINDS:
         ev.add(
-            "CRITICAL_CONTROL_PLANE_EXTENSION",
+            "APISERVER_FLOWCONTROL_CHANGE",
             DIM_SECURITY,
             RISK_CRITICAL,
-            f"{action}s cluster-wide API/admission extension {ref.gvk_label()} {ref.name!r}",
+            f"{action}s kube-apiserver traffic priority/fairness {ref.gvk_label()} {ref.name!r}",
+            blast=BLAST_CRITICAL,
+            revert=REVERT_MODERATE,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return _finalize()
+
+    if gk == ("audit.k8s.io", "Policy"):
+        ev.add(
+            "AUDIT_POLICY_CHANGE",
+            DIM_SECURITY,
+            RISK_CRITICAL,
+            f"{action}s Kubernetes audit Policy {ref.name!r}",
             blast=BLAST_CRITICAL,
             revert=REVERT_MODERATE,
             security=True,
         )
+        return _finalize()
+
+    # 6b. Certificates, Trust Bundles, TokenRequest & Auth Reviews
+    if gk in CERT_AND_AUTH_KINDS:
+        if gk == ("certificates.k8s.io", "CertificateSigningRequest"):
+            ev.add(
+                "CSR_RESOURCE_CHANGE",
+                DIM_SECURITY,
+                RISK_CRITICAL,
+                f"{action}s CertificateSigningRequest {ref.name!r}",
+                blast=BLAST_CRITICAL,
+                revert=REVERT_IRREVERSIBLE,
+                security=True,
+            )
+        elif gk == ("certificates.k8s.io", "ClusterTrustBundle"):
+            ev.add(
+                "CLUSTER_TRUST_BUNDLE_CHANGE",
+                DIM_SECURITY,
+                RISK_CRITICAL,
+                f"{action}s ClusterTrustBundle {ref.name!r} (cluster root trust anchor)",
+                blast=BLAST_CRITICAL,
+                revert=REVERT_DIFFICULT,
+                disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+                security=True,
+            )
+        elif ref.kind == "TokenRequest":
+            ev.add(
+                "TOKEN_REQUEST_MANIFEST",
+                DIM_SECURITY,
+                RISK_CRITICAL,
+                f"{action}s ServiceAccount TokenRequest {ref.name!r}",
+                blast=BLAST_HIGH,
+                revert=REVERT_IRREVERSIBLE,
+                security=True,
+            )
+        else:
+            ev.add(
+                "AUTH_REVIEW_MANIFEST",
+                DIM_SECURITY,
+                RISK_HIGH,
+                f"{action}s auth review manifest {ref.gvk_label()} {ref.name!r}",
+                blast=BLAST_MEDIUM,
+                security=True,
+            )
+        return _finalize()
+
+    # 6c. Coordination Leases (`kube-node-lease` / `kube-system` vs app leader election)
+    if gk in COORDINATION_KINDS:
+        if in_system_ns:
+            ev.add(
+                "SYSTEM_LEASE_CHANGE",
+                DIM_DISRUPTIVENESS,
+                RISK_CRITICAL,
+                f"{action}s control-plane or node heartbeat {ref.kind} {ref.name!r} in {ref.namespace!r}",
+                blast=BLAST_CRITICAL,
+                revert=REVERT_MODERATE,
+                disrupt=DISRUPT_DISRUPTIVE,
+                security=True,
+            )
+        else:
+            ev.add(
+                "LEASE_RESOURCE_CHANGE",
+                DIM_DISRUPTIVENESS if action == ACTION_MODIFY else DIM_BLAST_RADIUS,
+                RISK_HIGH,
+                f"{action}s leader-election {ref.kind} {ref.name!r}",
+                blast=BLAST_MEDIUM,
+                revert=REVERT_MODERATE,
+                disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            )
         return _finalize()
 
     # 7. CRDs (create / modify)
@@ -3340,6 +5346,7 @@ def evaluate_resource(
             f"{action}s CustomResourceDefinition {ref.name!r}",
             blast=BLAST_HIGH,
             revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3382,26 +5389,45 @@ def evaluate_resource(
 
     # 9. RBAC & ServiceAccount
     if gk in RBAC_KINDS:
+        role_ref_changed = action == ACTION_MODIFY and before is not None and before.obj.get("roleRef") != primary.obj.get("roleRef")
+        rbac_narrowed = False
+        if action == ACTION_MODIFY and before is not None and not role_ref_changed:
+            if ref.kind in ("RoleBinding", "ClusterRoleBinding"):
+                b_subjs = before.obj.get("subjects") if isinstance(before.obj.get("subjects"), list) else []
+                a_subjs = primary.obj.get("subjects") if isinstance(primary.obj.get("subjects"), list) else []
+                if any(s not in a_subjs for s in b_subjs):
+                    rbac_narrowed = True
+            else:
+                b_rules = before.obj.get("rules") if isinstance(before.obj.get("rules"), list) else []
+                a_rules = primary.obj.get("rules") if isinstance(primary.obj.get("rules"), list) else []
+                if len(a_rules) < len(b_rules):
+                    rbac_narrowed = True
         ev.add(
             "RBAC_CHANGE",
             DIM_SECURITY,
             RISK_HIGH,
             f"{action}s RBAC {ref.kind} {ref.name!r}",
             blast=BLAST_HIGH if is_cluster_scoped else BLAST_MEDIUM,
-            revert=REVERT_MODERATE if (action == ACTION_MODIFY and before and before.obj.get("roleRef") != primary.obj.get("roleRef")) else REVERT_EASY,
-            disrupt=DISRUPT_DESTRUCTIVE if (action == ACTION_MODIFY and before and before.obj.get("roleRef") != primary.obj.get("roleRef")) else DISRUPT_NONE,
+            revert=REVERT_MODERATE if role_ref_changed else REVERT_EASY,
+            disrupt=DISRUPT_DESTRUCTIVE if role_ref_changed else (DISRUPT_DISRUPTIVE if rbac_narrowed else DISRUPT_NONE),
             security=True,
         )
         _check_rbac_superuser(ev, primary.obj)
         return _finalize()
 
     if gk == ("", "ServiceAccount"):
+        annos = _meta_dict(primary.obj, "annotations")
+        b_annos = _meta_dict(before.obj if before else None, "annotations")
+        wi_keys = ("iam.gke.io/gcp-service-account", "eks.amazonaws.com/role-arn", "azure.workload.identity/client-id")
+        wi_changed = any(annos.get(wk) != b_annos.get(wk) and (annos.get(wk) or b_annos.get(wk)) for wk in wi_keys)
         ev.add(
-            "IDENTITY_CHANGE",
+            "WORKLOAD_IDENTITY_BINDING_CHANGE" if wi_changed else "IDENTITY_CHANGE",
             DIM_SECURITY,
-            RISK_HIGH,
-            f"{action}s ServiceAccount {ref.name!r}",
-            blast=BLAST_MEDIUM,
+            RISK_CRITICAL if (wi_changed and in_system_ns) else RISK_HIGH,
+            f"{action}s ServiceAccount {ref.name!r}" + (" cloud workload-identity federation" if wi_changed else ""),
+            blast=BLAST_HIGH if wi_changed else BLAST_MEDIUM,
+            revert=REVERT_MODERATE if wi_changed else REVERT_EASY,
+            disrupt=DISRUPT_DISRUPTIVE if (action == ACTION_MODIFY and wi_changed) else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3416,6 +5442,7 @@ def evaluate_resource(
             f"{action}s {ref.gvk_label()} {ref.name!r} (secret backend trust boundary)",
             blast=BLAST_CRITICAL if is_cluster_store else BLAST_HIGH,
             revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3476,25 +5503,61 @@ def evaluate_resource(
         if ref.kind in ISTIO_SECURITY_KINDS:
             _check_istio_security(ev, action, before.obj if before else None, primary.obj)
             return _finalize()
+        spec = primary.obj.get("spec") if isinstance(primary.obj.get("spec"), dict) else {}
+        if ref.kind == "ServiceEntry":
+            hosts = [str(h).lower() for h in (spec.get("hosts") if isinstance(spec.get("hosts"), list) else [])]
+            addrs = [str(a) for a in (spec.get("addresses") if isinstance(spec.get("addresses"), list) else [])]
+            hijack = any(h.endswith(".svc.cluster.local") or h == "kubernetes.default" for h in hosts) or any(
+                _is_link_local_or_loopback_ip(a) for a in addrs
+            )
+            if hijack:
+                ev.add(
+                    "MESH_TRAFFIC_HIJACK",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"ServiceEntry {ref.name!r} intercepts internal cluster DNS or link-local/metadata IP",
+                    blast=BLAST_CRITICAL,
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    security=True,
+                )
+                return _finalize()
+        if ref.kind == "DestinationRule" and action == ACTION_MODIFY and before is not None:
+            b_sp = before.obj.get("spec") if isinstance(before.obj.get("spec"), dict) else {}
+            b_tp = b_sp.get("trafficPolicy") if isinstance(b_sp.get("trafficPolicy"), dict) else {}
+            a_tp = spec.get("trafficPolicy") if isinstance(spec.get("trafficPolicy"), dict) else {}
+            b_tls = str((b_tp.get("tls") or {}).get("mode") or "").upper() if isinstance(b_tp.get("tls"), dict) else ""
+            a_tls = str((a_tp.get("tls") or {}).get("mode") or "").upper() if isinstance(a_tp.get("tls"), dict) else ""
+            if b_tls in ("ISTIO_MUTUAL", "MUTUAL", "SIMPLE") and a_tls in ("DISABLE", ""):
+                ev.add(
+                    "MESH_SECURITY_POLICY_CHANGE",
+                    DIM_SECURITY,
+                    RISK_CRITICAL,
+                    f"DestinationRule {ref.name!r} disables upstream TLS ({b_tls} -> {a_tls or 'NONE'})",
+                    blast=BLAST_HIGH,
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    security=True,
+                )
+                return _finalize()
         ev.add(
             "ISTIO_TRAFFIC_CHANGE",
             DIM_BLAST_RADIUS,
             RISK_HIGH,
-            f"{action}s Istio traffic resource {ref.kind} {ref.name!r}",
+            f"{action}s Istio mesh resource {ref.kind} {ref.name!r}",
             blast=BLAST_HIGH if ref.namespace == "istio-system" else BLAST_MEDIUM,
             disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
         )
         return _finalize()
 
-    # 15. Gateway API Resources
+    # 15. Gateway API Resources (`gateway.networking.k8s.io`)
     if ref.group == "gateway.networking.k8s.io":
-        if ref.kind == "ReferenceGrant":
+        if ref.kind in ("ReferenceGrant", "ReferencePolicy"):
             ev.add(
                 "CROSS_NAMESPACE_REFERENCE_GRANT",
                 DIM_SECURITY,
                 RISK_HIGH,
-                f"{action}s Gateway API ReferenceGrant {ref.name!r} (cross-namespace access)",
+                f"{action}s Gateway API {ref.kind} {ref.name!r} (cross-namespace access)",
                 blast=BLAST_HIGH,
+                disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
                 security=True,
             )
         elif ref.kind in ("Gateway", "GatewayClass"):
@@ -3503,10 +5566,29 @@ def evaluate_resource(
                 DIM_BLAST_RADIUS,
                 RISK_HIGH,
                 f"{action}s Gateway API {ref.kind} {ref.name!r}",
-                blast=BLAST_HIGH,
+                blast=BLAST_CRITICAL if ref.kind == "GatewayClass" else BLAST_HIGH,
                 revert=REVERT_MODERATE,
                 disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
                 security=True,
+            )
+        elif ref.kind == "BackendTLSPolicy":
+            ev.add(
+                "BACKEND_TLS_POLICY_CHANGE",
+                DIM_SECURITY,
+                RISK_HIGH,
+                f"{action}s Gateway API BackendTLSPolicy {ref.name!r}",
+                blast=BLAST_HIGH,
+                disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+                security=True,
+            )
+        elif ref.kind == "BackendLBPolicy":
+            ev.add(
+                "BACKEND_LB_POLICY_CHANGE",
+                DIM_BLAST_RADIUS,
+                RISK_HIGH,
+                f"{action}s Gateway API BackendLBPolicy {ref.name!r}",
+                blast=BLAST_MEDIUM,
+                disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             )
         else:
             ev.add(
@@ -3519,17 +5601,80 @@ def evaluate_resource(
             )
         return _finalize()
 
-    # 16. Ingress / IngressClass / NetworkPolicy
+    # 15b. GKE Networking, Gateway Policies & Compute/Autoscaling
+    if gk in GKE_NETWORKING_KINDS:
+        _check_gke_networking(ev, action, before.obj if before else None, primary.obj)
+        return _finalize()
+
+    if gk in GKE_COMPUTE_AUTOSCALING_KINDS:
+        spec = _as_dict(ev, primary.obj.get("spec"), "spec")
+        is_zero_quota = False
+        if ref.kind == "CapacityQuota":
+            lims = spec.get("limits") if isinstance(spec.get("limits"), dict) else {}
+            res_lims = lims.get("resources") if isinstance(lims.get("resources"), dict) else {}
+            is_zero_quota = any(parse_cpu_millicores(v) == 0.0 for k, v in res_lims.items() if k == "cpu")
+        ev.add(
+            "GKE_COMPUTE_OR_CAPACITY_CHANGE",
+            DIM_BLAST_RADIUS,
+            RISK_HIGH,
+            f"{action}s GKE compute/autoscaling {ref.gvk_label()} {ref.name!r}",
+            blast=BLAST_HIGH if is_cluster_scoped else BLAST_MEDIUM,
+            revert=REVERT_MODERATE,
+            disrupt=DISRUPT_DISRUPTIVE if (action == ACTION_MODIFY or is_zero_quota) else DISRUPT_NONE,
+        )
+        return _finalize()
+
+    # 15c. Observability & Monitoring (`monitoring.googleapis.com`, `monitoring.coreos.com`)
+    if gk in MONITORING_KINDS:
+        _check_monitoring_resource(ev, action, before.obj if before else None, primary.obj)
+        return _finalize()
+
+    # 16. Ingress / IngressClass / NetworkPolicy / ServiceCIDR / IPAddress / Endpoints / EndpointSlice
+    if gk in (("networking.k8s.io", "ServiceCIDR"), ("networking.k8s.io", "IPAddress")):
+        b_spec = before.obj.get("spec") if (action == ACTION_MODIFY and before and isinstance(before.obj.get("spec"), dict)) else {}
+        a_spec = primary.obj.get("spec") if isinstance(primary.obj.get("spec"), dict) else {}
+        cidrs_changed = action == ACTION_MODIFY and b_spec.get("cidrs") != a_spec.get("cidrs")
+        ev.add(
+            "CLUSTER_IPAM_CHANGE",
+            DIM_SECURITY,
+            RISK_CRITICAL,
+            f"{action}s cluster IPAM resource {ref.gvk_label()} {ref.name!r}",
+            blast=BLAST_CRITICAL if ref.kind == "ServiceCIDR" else BLAST_HIGH,
+            revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DESTRUCTIVE if cidrs_changed else (DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE),
+            security=True,
+        )
+        return _finalize()
+
+    if gk in (("", "Endpoints"), ("discovery.k8s.io", "EndpointSlice")):
+        _check_endpoints_or_slice(ev, action, primary.obj)
+        return _finalize()
+
     if gk == ("networking.k8s.io", "Ingress") or gk == ("networking.k8s.io", "IngressClass"):
         annos = _meta_dict(primary.obj, "annotations")
+        b_annos = _meta_dict(before.obj if before else None, "annotations")
         has_snippet = any(any(sn in str(k).lower() for sn in _INGRESS_SNIPPET_KEYS) for k in annos)
+        auth_removed = action == ACTION_MODIFY and any(
+            k in b_annos and k not in annos
+            for k in (
+                "nginx.ingress.kubernetes.io/auth-url",
+                "nginx.ingress.kubernetes.io/auth-type",
+                "nginx.ingress.kubernetes.io/auth-tls-verify-client",
+            )
+        )
+        imm_controller = (
+            ref.kind == "IngressClass"
+            and action == ACTION_MODIFY
+            and before is not None
+            and (before.obj.get("spec") or {}).get("controller") != (primary.obj.get("spec") or {}).get("controller")
+        )
         ev.add(
-            "INGRESS_SNIPPET_INJECTION" if has_snippet else "INGRESS_CHANGE",
-            DIM_SECURITY if has_snippet else DIM_BLAST_RADIUS,
-            RISK_CRITICAL if has_snippet else RISK_HIGH,
+            "INGRESS_SNIPPET_INJECTION" if has_snippet else ("INGRESS_AUTH_REMOVED" if auth_removed else "INGRESS_CHANGE"),
+            DIM_SECURITY if (has_snippet or auth_removed) else DIM_BLAST_RADIUS,
+            RISK_CRITICAL if (has_snippet or auth_removed) else RISK_HIGH,
             f"{action}s {ref.kind} {ref.name!r}" + (" with raw proxy snippet annotation" if has_snippet else ""),
-            blast=BLAST_CRITICAL if has_snippet else BLAST_HIGH,
-            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            blast=BLAST_CRITICAL if (has_snippet or auth_removed) else BLAST_HIGH,
+            disrupt=DISRUPT_DESTRUCTIVE if imm_controller else (DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE),
             security=True,
         )
         return _finalize()
@@ -3539,14 +5684,14 @@ def evaluate_resource(
             "NETWORK_POLICY_CHANGE",
             DIM_SECURITY,
             RISK_HIGH,
-            f"{action}s NetworkPolicy {ref.name!r} (can immediately block or expose pod traffic)",
+            f"{action}s NetworkPolicy {ref.name!r} (immediately isolates pods and can block or expose traffic)",
             blast=BLAST_HIGH,
-            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            disrupt=DISRUPT_DISRUPTIVE,
             security=True,
         )
         return _finalize()
 
-    # 17. Storage (PVC, PV, StorageClass, CSIDriver, VolumeSnapshot)
+    # 17. Storage & DRA (PVC, PV, StorageClass, CSIDriver, CSINode, VolumeAttachment, VolumeSnapshot*, resource.k8s.io)
     if gk == ("", "PersistentVolumeClaim"):
         _check_pvc(ev, action, before.obj if before else None, primary.obj)
         return _finalize()
@@ -3563,21 +5708,38 @@ def evaluate_resource(
             disrupt=DISRUPT_DESTRUCTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
         )
         return _finalize()
-    if gk in (("", "PersistentVolume"), ("storage.k8s.io", "CSIDriver"), ("snapshot.storage.k8s.io", "VolumeSnapshot"), ("snapshot.storage.k8s.io", "VolumeSnapshotContent")):
+    if gk in (
+        ("", "PersistentVolume"),
+        ("storage.k8s.io", "CSIDriver"),
+        ("storage.k8s.io", "CSINode"),
+        ("storage.k8s.io", "VolumeAttachment"),
+        ("snapshot.storage.k8s.io", "VolumeSnapshot"),
+        ("snapshot.storage.k8s.io", "VolumeSnapshotContent"),
+        ("snapshot.storage.k8s.io", "VolumeSnapshotClass"),
+    ):
+        _check_storage_resource(ev, action, before.obj if before else None, primary.obj)
+        return _finalize()
+    if gk in DRA_KINDS:
+        is_slice = ref.kind == "ResourceSlice"
         ev.add(
-            "CLUSTER_STORAGE_CHANGE",
-            DIM_REVERTABILITY,
-            RISK_HIGH,
-            f"{action}s storage resource {ref.gvk_label()} {ref.name!r}",
+            "DRA_CLUSTER_RESOURCE_CHANGE" if is_cluster_scoped else "DRA_RESOURCE_CLAIM_CHANGE",
+            DIM_SECURITY,
+            RISK_CRITICAL if is_slice else RISK_HIGH,
+            f"{action}s Dynamic Resource Allocation {ref.gvk_label()} {ref.name!r}",
             blast=BLAST_HIGH if is_cluster_scoped else BLAST_MEDIUM,
-            revert=REVERT_DIFFICULT,
+            revert=REVERT_MODERATE,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
         )
         return _finalize()
 
     # 18. PriorityClass / RuntimeClass / ResourceQuota / LimitRange / CertManager
     if gk == ("scheduling.k8s.io", "PriorityClass"):
         val = primary.obj.get("value")
-        is_glob = primary.obj.get("globalDefault") is True or (isinstance(val, int) and val >= 1_000_000_000)
+        is_glob = primary.obj.get("globalDefault") is True or (_is_strict_int(val) and val >= 1_000_000_000)
+        imm_pc = action == ACTION_MODIFY and before is not None and (
+            before.obj.get("value") != val or before.obj.get("preemptionPolicy") != primary.obj.get("preemptionPolicy")
+        )
         ev.add(
             "PRIORITY_CLASS_CHANGE",
             DIM_BLAST_RADIUS,
@@ -3585,9 +5747,11 @@ def evaluate_resource(
             f"{action}s PriorityClass {ref.name!r}",
             blast=BLAST_CRITICAL if is_glob else BLAST_HIGH,
             revert=REVERT_MODERATE,
+            disrupt=DISRUPT_DESTRUCTIVE if imm_pc else DISRUPT_NONE,
         )
         return _finalize()
     if gk == ("node.k8s.io", "RuntimeClass"):
+        imm_rc = action == ACTION_MODIFY and before is not None and before.obj.get("handler") != primary.obj.get("handler")
         ev.add(
             "RUNTIME_CLASS_CHANGE",
             DIM_SECURITY,
@@ -3595,20 +5759,26 @@ def evaluate_resource(
             f"{action}s RuntimeClass {ref.name!r}",
             blast=BLAST_HIGH,
             revert=REVERT_MODERATE,
+            disrupt=DISRUPT_DESTRUCTIVE if imm_rc else (DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE),
             security=True,
         )
         return _finalize()
     if gk in (("", "ResourceQuota"), ("", "LimitRange")):
         spec = primary.obj.get("spec") if isinstance(primary.obj.get("spec"), dict) else {}
         hard = spec.get("hard") if isinstance(spec.get("hard"), dict) else {}
-        zero_pods = str(hard.get("pods") or "").strip() == "0"
+        zero_quota = any(
+            str(hard.get(qk) or "").strip() == "0"
+            or (qk in ("requests.cpu", "limits.cpu", "cpu") and parse_cpu_millicores(hard.get(qk)) == 0.0)
+            or (qk in ("requests.memory", "limits.memory", "memory") and parse_memory_bytes(hard.get(qk)) == 0.0)
+            for qk in hard
+        )
         ev.add(
             "QUOTA_OR_LIMIT_CHANGE",
-            DIM_DISRUPTIVENESS if zero_pods else DIM_BLAST_RADIUS,
-            RISK_HIGH if (zero_pods or action == ACTION_MODIFY) else RISK_MEDIUM,
+            DIM_DISRUPTIVENESS if zero_quota else DIM_BLAST_RADIUS,
+            RISK_HIGH if (zero_quota or action == ACTION_MODIFY) else RISK_MEDIUM,
             f"{action}s {ref.kind} {ref.name!r}",
             blast=BLAST_MEDIUM,
-            disrupt=DISRUPT_DISRUPTIVE if zero_pods else DISRUPT_NONE,
+            disrupt=DISRUPT_DISRUPTIVE if (zero_quota or action == ACTION_MODIFY) else DISRUPT_NONE,
         )
         return _finalize()
     if ref.group == "cert-manager.io":
@@ -3619,6 +5789,7 @@ def evaluate_resource(
             f"{action}s cert-manager {ref.kind} {ref.name!r}",
             blast=BLAST_HIGH if is_cluster_scoped else BLAST_MEDIUM,
             revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3643,8 +5814,10 @@ def evaluate_resource(
         )
         return _finalize()
 
-    # 21. Remaining modify-capable kinds (ConfigMap, Service, HPA, Workloads)
-    if gk == ("", "ConfigMap"):
+    # 21. Remaining modify-capable kinds (PodTemplate, ConfigMap, Service, HPA, Workloads)
+    if gk == ("", "PodTemplate"):
+        _check_pod_template(ev, action, before.obj if before else None, primary.obj, diffs)
+    elif gk == ("", "ConfigMap"):
         _check_configmap(ev, action, before.obj if before else None, primary.obj, diffs)
     elif gk == ("", "Service"):
         _check_service(ev, action, before.obj if before else None, primary.obj, diffs)
@@ -3652,32 +5825,7 @@ def evaluate_resource(
         _check_hpa(ev, action, before.obj if before else None, primary.obj, diffs)
     elif gk in WORKLOAD_KINDS:
         if action == ACTION_ADD:
-            ps = _extract_pod_spec(ref.kind, primary.obj) or {}
-            _check_pod_spec_posture(ev, ps, is_daemonset=(ref.kind == "DaemonSet"))
-            if ref.kind == "Job":
-                ev.add(
-                    "JOB_CREATED",
-                    DIM_REVERTABILITY,
-                    RISK_HIGH,
-                    f"creates batch/Job {ref.name!r} (one-off execution is not cleanly revertable)",
-                    revert=REVERT_IRREVERSIBLE,
-                )
-            elif ref.kind == "DaemonSet":
-                ev.add(
-                    "NEW_DAEMONSET",
-                    DIM_BLAST_RADIUS,
-                    RISK_HIGH,
-                    f"creates DaemonSet {ref.name!r} across cluster nodes",
-                    blast=BLAST_HIGH,
-                )
-            else:
-                ev.add(
-                    "NEW_WORKLOAD",
-                    DIM_BLAST_RADIUS,
-                    RISK_MEDIUM,
-                    f"creates new {ref.kind} {ref.name!r}",
-                    revert=REVERT_MODERATE if ref.kind in ("Pod", "ReplicaSet") else REVERT_EASY,
-                )
+            _check_workload_add(ev, primary.obj)
         else:
             assert before is not None
             _check_workload_modify(ev, before.obj, primary.obj, diffs)
