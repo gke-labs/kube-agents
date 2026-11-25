@@ -1489,6 +1489,15 @@
 # it runs alone in the writers part.
 ./tasks/remediation-context-repository-owns-the-fix/task.yaml
 
+# Config Connector SQLInstance pre-merge review probe (#1883, #7183): a pure
+# Q&A prompt handing the agent a proposed production SQLInstance manifest that
+# omits `cnrm.cloud.google.com/deletion-policy: abandon` and sets
+# `ipv4Enabled: true`, graded on a `VERDICT: MISSING-SAFEGUARDS` decision line
+# and the required deletion-policy and private-IP fixes. deployer: noop, no
+# fixture, read-only. Nightly from its first merge; a presubmit seat waits on
+# its record.
+./tasks/remediation-kcc-stateful-deletion-policy-abandon/task.yaml
+
 # A fleet question on an install whose spec.scope.exclude.clusters names
 # seeded-b: the answer names seeded-a and seeded-c and does not report on
 # seeded-b (#3081, #3100). The runner excludes slot b for this case's
