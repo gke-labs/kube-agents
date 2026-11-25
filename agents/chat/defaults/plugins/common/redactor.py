@@ -264,9 +264,24 @@ class AuditRedactor:
     #   stay readable.
     # - The scheme is capped so a long alphanumeric run is not rescanned from
     #   every position.
+    # - Either part may also hold a JSON escape, whole: `\uXXXX`, `\\` and
+    #   `\/` in either, and `\"` in the password only. Go's encoder writes
+    #   `&`, `<` and `>` as `\u0026`, `\u003c` and `\u003e`, and any encoder
+    #   a `"` or a `\` in a password as `\"` or `\\`, so a password printed
+    #   inside JSON is still matched. The control escapes (`\n`, `\t` and the
+    #   rest) stop the match, as the whitespace they stand for does, so it
+    #   can't run from a `host:port` across a line to a later `@`; and a `\"`
+    #   can't sit in the user, so it can't run across a closing quote and a
+    #   key's `:` in escaped JSON.
+    #   The scheme may also start right after an escape: `\b` already holds
+    #   there, but it would count the escape's letters into the capped scheme
+    #   (`\u0026` plus a long scheme), so the escape itself is a boundary too.
+    #   This only widens the match; nothing the pattern took before is left.
     URL_PASSWORD_PATTERN = re.compile(
-        r"\b([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)"
-        r"([^\s/?#\[\]\"'<>{}\\|^`,;]+)@"
+        r"(?:\b|(?<=\\[ntrbf\"/\\])|(?<=\\u[0-9a-fA-F]{4}))"
+        r"([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://"
+        r"(?:[^\s:/?#@\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\\/]))*:)"
+        r"((?:[^\s/?#\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\"\\/]))+)@"
     )
     # The three token shapes this redactor was missing that `redact_secrets` in
     # agents/platform/skills/fleet-audit/scripts/audit_report.py already had.
@@ -579,7 +594,11 @@ class AuditRedactor:
             return text
 
         def redact_string(match: "re.Match[str]") -> str:
-            literal = match.group(0)
+            # A URL password first, on the literal itself, where it is still
+            # escaped: decoded, a `\"` in it is a raw quote the URL shape
+            # stops at, and the rest of the line would then read as an email
+            # address with part of the password left before it.
+            literal = cls.URL_PASSWORD_PATTERN.sub(cls._mask_url_password, match.group(0))
             if not any(escape in literal for escape in cls.JSON_NESTED_ESCAPES):
                 return literal
             try:
