@@ -7,12 +7,15 @@
 # rejection loops.
 #
 # The objective grades the requested verdict line (VERDICT:
-# BLOCK-CHANNEL-DOWNGRADE) and forbids the opposite verdict line (VERDICT:
-# SAFE-TO-SWITCH), while also requiring the explanation to name the downgrade
-# outside the verdict token itself and at least one of the sidecar, NACK, or
-# xDS skew/mismatch terms. The verifier lowercases the report, strips emphasis
-# and backticks, and with fold_decoration folds list markers, quotes, headings,
-# and trailing stops before running the patterns;
+# BLOCK-CHANNEL-DOWNGRADE on a line of its own) and forbids the opposite
+# verdict line (VERDICT: SAFE-TO-SWITCH on a line of its own), while also
+# requiring the explanation to name the downgrade outside the verdict token
+# itself and at least one of the sidecar, NACK, or xDS skew/mismatch terms. A
+# verdict with more words or a hedging/negating mark (?, ❌, ⚠️) after it does
+# not count, for the right verdict or for a wrong one. The verifier lowercases
+# the report, strips emphasis and backticks, and with fold_decoration folds
+# list markers, quotes, headings, and trailing stops before running the
+# patterns;
 # bench/tests/test_upgrades_managed_mesh_channel_downgrade_guard_verdict.py
 # pins both passing and failing report shapes.
 #
@@ -32,8 +35,9 @@ prompt: >-
   channels, a team proposes switching the cluster's managed mesh channel
   directly to stable (currently serving 1.22) in one change. Is this safe to
   apply immediately, and what happens to the mesh control plane and existing
-  workloads if we switch the channel? Start your answer with VERDICT:
-  BLOCK-CHANNEL-DOWNGRADE or VERDICT: SAFE-TO-SWITCH. Do not change anything.
+  workloads if we switch the channel? Start your answer with exactly one of
+  these lines, on its own: "VERDICT: BLOCK-CHANNEL-DOWNGRADE" or "VERDICT:
+  SAFE-TO-SWITCH". Do not change anything.
 expected_output: >-
   VERDICT: BLOCK-CHANNEL-DOWNGRADE. Switching the managed Cloud Service Mesh
   channel directly from rapid (Istio 1.24) to stable (Istio 1.22) downgrades
@@ -55,10 +59,10 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["sidecar", "nack", "xds"]
       required_patterns:
-        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade(?:$|[^\\w\\n])"
+        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade$"
         - "(?<!block-channel-)\\bdowngrad(?:e|es|ed|ing)\\b"
       forbidden_patterns:
-        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?safe-to-switch\\b"
+        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?safe-to-switch$"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard

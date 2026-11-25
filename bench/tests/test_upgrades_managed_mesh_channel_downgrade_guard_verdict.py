@@ -1,12 +1,13 @@
 """upgrades-managed-mesh-channel-downgrade-guard reads the verdict line and skew reasoning.
 
-The objective passes when a line opens with ``VERDICT: BLOCK-CHANNEL-DOWNGRADE``
-(followed by end of line or a non-word separator), no line opens with
-``VERDICT: SAFE-TO-SWITCH``, and the explanation names the downgrade outside the
-verdict token along with at least one of the ``sidecar``, ``nack``, or ``xds``
-skew/mismatch terms. ``report_contains`` lowercases the report, drops emphasis
-and backticks, and folds leading and trailing line decoration before the
-patterns run; prose contradiction is left to the judge rather than regexes.
+The objective passes when a line is ``VERDICT: BLOCK-CHANNEL-DOWNGRADE`` on its
+own, no line is ``VERDICT: SAFE-TO-SWITCH`` on its own, and the explanation
+names the downgrade outside the verdict token along with at least one of the
+``sidecar``, ``nack``, or ``xds`` skew/mismatch terms. ``report_contains``
+lowercases the report, drops emphasis and backticks, and folds leading and
+trailing line decoration before the patterns run. So a bolded, quoted,
+bulleted, or period-terminated verdict line counts; a verdict inside a sentence,
+or a verdict with a hedge or a cross after it, does not.
 """
 
 from __future__ import annotations
@@ -35,15 +36,17 @@ def test_blocking_verdict_with_downgrade_and_skew_terms_passes():
         "A control-plane downgrade below 1.24 sidecars is unsupported.",
         "VERDICT: \u201cBLOCK-CHANNEL-DOWNGRADE\u201d\n\n"
         "The channel switch is a control-plane downgrade that causes sidecar skew.",
-        "**VERDICT: BLOCK-CHANNEL-DOWNGRADE.** Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
-        'VERDICT: "BLOCK-CHANNEL-DOWNGRADE." Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.',
-        "VERDICT: BLOCK-CHANNEL-DOWNGRADE. This is not safe to apply immediately: switching from rapid (1.24) to stable (1.22) downgrades the control plane while sidecars stay at 1.24.",
-        'VERDICT: BLOCK-CHANNEL-DOWNGRADE \u2014 "rapid" (1.24) cannot downgrade directly to stable (1.22) while sidecars remain at 1.24.',
-        "VERDICT: BLOCK-CHANNEL-DOWNGRADE (switching from rapid to stable downgrades the control plane while sidecars remain at 1.24).",
-        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u2014 Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
-        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u2013 Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
-        "VERDICT: BLOCK-CHANNEL-DOWNGRADE - Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
-        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u2014 not SAFE-TO-SWITCH. Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
+        "**VERDICT: BLOCK-CHANNEL-DOWNGRADE.**\n\n"
+        "Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
+        'VERDICT: "BLOCK-CHANNEL-DOWNGRADE."\n\n'
+        "Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
+        # A sentence that opens with the rejected verdict is prose, not a standalone verdict line.
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE\n\n"
+        "- VERDICT: SAFE-TO-SWITCH is ruled out because switching channels downgrades the control plane below 1.24 sidecars.",
+        # A cross after the rejected verdict rejects it; the line is not that verdict.
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE\n"
+        "VERDICT: SAFE-TO-SWITCH \u274c\n\n"
+        "Switching channels downgrades the control plane and causes sidecar skew.",
         "VERDICT: BLOCK-CHANNEL-DOWNGRADE\n\n"
         "Do not recommend, endorse, or apply VERDICT: SAFE-TO-SWITCH because switching channels downgrades the control plane below 1.24 sidecars.",
         "VERDICT: BLOCK-CHANNEL-DOWNGRADE\n\n"
@@ -62,6 +65,20 @@ def test_safe_verdict_prose_only_or_missing_reasoning_fails():
         "This downgrade causes sidecar version skew.",
         "VERDICT: BLOCK-CHANNEL-DOWNGRADE\n2. **VERDICT: SAFE-TO-SWITCH**\n\n"
         "This downgrade causes Envoy NACK loops.",
+        # A verdict line with more words, a contradiction, or a hedging/negating mark after it is not a standalone verdict.
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE?\n\n"
+        "Switching from rapid to stable downgrades the control plane while sidecars stay at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u274c\n\n"
+        "Switching from rapid to stable downgrades the control plane while sidecars stay at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE: \u274c\n\n"
+        "Switching from rapid to stable downgrades the control plane while sidecars stay at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u26a0\ufe0f\n\n"
+        "Switching from rapid to stable downgrades the control plane while sidecars stay at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE; SAFE-TO-SWITCH\n\n"
+        "Switching from rapid to stable downgrades the control plane while sidecars stay at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE or SAFE-TO-SWITCH\n\n"
+        "Switching from rapid to stable downgrades the control plane while sidecars stay at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE is wrong; it is safe to switch because the downgrade and sidecar skew are benign.",
         "It would not be VERDICT: BLOCK-CHANNEL-DOWNGRADE if both channels served 1.24, avoiding a downgrade and sidecar skew.",
         "Do not apply this change: switching channels downgrades the control plane and causes sidecar skew and Envoy NACK loops.",
         # Missing downgrade explanation outside the verdict token itself.
