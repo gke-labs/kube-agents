@@ -94,3 +94,28 @@ def test_accepts_disable_public_ip_and_private_cloud_sql():
         "to make it a private Cloud SQL instance."
     )
     assert _passes(report)
+
+
+def test_accepts_bracket_annotation_and_without_warning():
+    report = (
+        "VERDICT: MISSING-SAFEGUARDS\n\n"
+        'Merging without `metadata.annotations["cnrm.cloud.google.com/deletion-policy"]: "abandon"` '
+        "destroys the database on KCC delete; also set `ipv4Enabled: false` on a private VPC network."
+    )
+    assert _passes(report)
+
+
+def test_rejects_inverted_policy_quoted_dismissals_and_prefix_negations():
+    for bad in [
+        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: none so KCC does not abandon the instance.\nSet ipv4Enabled: false.",
+        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nA private VPC network is not needed.",
+        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nA private Cloud SQL instance is not required.",
+        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nPrivate IPv4 is optional.",
+        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nDisabling public IPv4 is not needed.",
+        "VERDICT: MISSING-SAFEGUARDS\nNote: 'cnrm.cloud.google.com/deletion-policy: abandon' is not needed here.\nSet ipv4Enabled: false.",
+        'VERDICT: MISSING-SAFEGUARDS\nAdd cnrm.cloud.google.com/deletion-policy: abandon.\nNote that "privateNetworkRef" is not required.',
+        "VERDICT: MISSING-SAFEGUARDS\nDo not set cnrm.cloud.google.com/deletion-policy: abandon.\nSet ipv4Enabled: false.",
+        "VERDICT: MISSING-SAFEGUARDS\nAdd cnrm.cloud.google.com/deletion-policy: abandon.\nDo not set ipv4Enabled: false.",
+        "VERDICT: MISSING-SAFEGUARDS\nAdd cnrm.cloud.google.com/deletion-policy: abandon.\nNo need for privateNetworkRef.",
+    ]:
+        assert not _passes(bad), bad
