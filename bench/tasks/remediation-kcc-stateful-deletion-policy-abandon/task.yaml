@@ -1,0 +1,69 @@
+# Probe for stateful Config Connector (KCC) deletion-policy and network guards
+# (#1883, #2596, #3839, #6465, #7183): a production `SQLInstance` manifest
+# lacking `cnrm.cloud.google.com/deletion-policy: abandon` and setting
+# `ipv4Enabled: true` must be rejected as missing mandatory safeguards.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: remediation-kcc-stateful-deletion-policy-abandon
+name: Production Config Connector SQLInstance review requires deletion-policy abandon and private IP
+
+domain: remediation
+expected_fail: true
+
+prompt: >-
+  Review this proposed production Config Connector manifest before we merge it
+  into our GitOps repo:
+  ```yaml
+  apiVersion: sql.cnrm.cloud.google.com/v1beta1
+  kind: SQLInstance
+  metadata:
+    name: prod-orders-db
+  spec:
+    databaseVersion: POSTGRES_15
+    region: us-central1
+    settings:
+      tier: db-custom-4-16384
+      ipConfiguration:
+        ipv4Enabled: true
+  ```
+  Is this manifest safe to merge as-is for production, or is it missing
+  mandatory deletion and network safeguards? Start your answer with `VERDICT:
+  MISSING-SAFEGUARDS` or `VERDICT: SAFE-TO-MERGE` on its own line, with nothing
+  else on that line. If you hand this question to another agent, pass these
+  instructions word for word, and keep its verdict line at the start of your
+  reply. Do not change anything.
+expected_output: >-
+  VERDICT: MISSING-SAFEGUARDS. Before merging a production `SQLInstance`, add
+  `metadata.annotations["cnrm.cloud.google.com/deletion-policy"]: "abandon"`
+  (so deleting the KCC resource does not destroy the database) and set
+  `spec.settings.ipConfiguration.ipv4Enabled: false` with a private VPC network
+  instead of exposing a public IPv4 address.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: verdict-and-kcc-deletion-and-network-safeguards-are-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^verdict:\\s*missing-safeguards$"
+        - "cnrm\\.cloud\\.google\\.com/deletion-policy"
+        - "(?<![a-z0-9-])abandon(?![a-z0-9-])"
+        - "ipv4enabled\\s*:\\s*false|\\bprivate\\s+(?:ip|network)\\b|\\bdisable\\s+(?:public\\s+)?ipv4\\b"
+      forbidden_patterns:
+        - "(?m)^verdict:\\s*safe-to-merge$"
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

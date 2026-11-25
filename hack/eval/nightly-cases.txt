@@ -1543,6 +1543,11 @@
 # it runs alone in the writers part.
 ./tasks/remediation-context-repository-owns-the-fix/task.yaml
 
+# Stateful Config Connector (KCC) deletion-policy and IP guard (#1883, #7183):
+# production SQLInstance manifests require cnrm.cloud.google.com/deletion-policy:
+# abandon and ipv4Enabled: false (private IP). deployer: noop, no fixture.
+./tasks/remediation-kcc-stateful-deletion-policy-abandon/task.yaml
+
 # A fleet question on an install whose spec.scope.exclude.clusters names
 # seeded-b: the answer names seeded-a and seeded-c and does not report on
 # seeded-b (#3081, #3100). The runner excludes slot b for this case's
