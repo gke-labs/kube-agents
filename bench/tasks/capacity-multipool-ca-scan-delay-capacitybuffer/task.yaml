@@ -65,8 +65,8 @@ verification_spec:
       fold_decoration: true
       required_patterns:
         - "(?m)^verdict:\\s*use-namespace-default-and-capacitybuffer$"
-        - "(?m)^(?!verdict:).*\\bcloud\\.google\\.com/default-compute-class(?![a-z0-9-])"
-        - "(?m)^(?!verdict:).*\\b(?:capacitybuffers?|capacity[\\s-]+buffers?)\\b"
+        - "\\bcloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9-])"
+        - "(?<![a-z0-9-])(?:capacitybuffers?|capacity[\\s-]+buffers?)(?![a-z0-9-])"
       forbidden_patterns:
         - "(?m)^verdict:\\s*use-per-deployment-pr$"
   - name: front-door-stays-out-of-the-worker-verbs

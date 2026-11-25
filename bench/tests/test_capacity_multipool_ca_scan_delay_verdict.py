@@ -62,10 +62,36 @@ def test_accepts_decorated_verdict_and_prose_rejection_of_wrong_verdict():
     assert _passes(report)
 
 
+def test_accepts_non_daemonset_compute_class_label():
+    report = (
+        "VERDICT: USE-NAMESPACE-DEFAULT-AND-CAPACITYBUFFER\n\n"
+        "Set `cloud.google.com/default-compute-class-non-daemonset` and add a `CapacityBuffer`."
+    )
+    assert _passes(report)
+
+
+def test_accepts_mechanisms_on_verdict_rejection_line():
+    report = (
+        "VERDICT: USE-NAMESPACE-DEFAULT-AND-CAPACITYBUFFER\n\n"
+        "VERDICT: USE-PER-DEPLOYMENT-PR does not apply; set "
+        "`cloud.google.com/default-compute-class` and a `CapacityBuffer` instead."
+    )
+    assert _passes(report)
+
+
+def test_rejects_verdict_slug_echo_in_prose_without_capacity_buffer():
+    report = (
+        "VERDICT: USE-NAMESPACE-DEFAULT-AND-CAPACITYBUFFER\n\n"
+        "Choosing USE-NAMESPACE-DEFAULT-AND-CAPACITYBUFFER over USE-PER-DEPLOYMENT-PR "
+        "because `cloud.google.com/default-compute-class` handles dynamic names."
+    )
+    assert not _passes(report)
+
+
 def test_rejects_wrong_compute_class_label_suffix():
     report = (
         "VERDICT: USE-NAMESPACE-DEFAULT-AND-CAPACITYBUFFER\n\n"
-        "Use `cloud.google.com/default-compute-class-non-daemonset` and `CapacityBuffer`."
+        "Use `cloud.google.com/default-compute-class-daemonset` and `CapacityBuffer`."
     )
     assert not _passes(report)
 
