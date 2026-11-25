@@ -123,7 +123,6 @@ type harnessProc struct {
 	killTimers []*time.Timer
 }
 
-// startHarness is startHarnessWith for Claude Code.
 // oneTurnPerProcess is implemented by a driver whose harness process runs a
 // single turn and reads stdin once (core-agent). A later user message would
 // sit in the pipe unread: the write succeeds, the adapter counts a turn that
@@ -151,6 +150,7 @@ func processEncoder(d Driver) func(string) ([]byte, error) {
 	}
 }
 
+// startHarness is startHarnessWith for Claude Code.
 func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
 	return startHarnessWith(claudeDriver{}, argv, env, prompt, reapBound, log)
 }

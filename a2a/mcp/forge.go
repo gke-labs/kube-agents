@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 )
 
 // The credential broker's version-control read this server makes. The MCP pod
@@ -215,7 +217,7 @@ func (e *BrokerError) Error() string {
 		msg += " (" + e.Code + ")"
 	}
 	if e.Detail != "" {
-		msg += ": " + cell(e.Detail)
+		msg += ": " + inerttext.Cell(e.Detail)
 	}
 	return msg
 }

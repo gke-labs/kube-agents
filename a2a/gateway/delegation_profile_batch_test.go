@@ -1015,3 +1015,71 @@ func TestAWithdrawnProfileBatchRetriesAnEndThatFailsToSend(t *testing.T) {
 		t.Fatalf("entries ended = %v, want 1 and 2", seen)
 	}
 }
+
+// TestAHealedProfileParentEndGetsNoBatchEnds: when the relay missed a
+// profile parent's terminal, the heal reads the parent's own end first. The
+// parent has ended, so no batch end is sent to it: not a child's missed
+// terminal, nor an end recorded Unsent before. The children's own ends are
+// still booked (a completed child is recorded completed, not cancelled as
+// live), the live child is cancelled, and the parent's own result still
+// reaches the console's terminal frame.
+func TestAHealedProfileParentEndGetsNoBatchEnds(t *testing.T) {
+	t.Parallel()
+	r := startRestartableProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-healed-end-no-ends"
+	parent, origin, kids := profileBatchParent(t, r, conv, "a", "b", "c")
+	r2, _ := restartRig(t, r, func() {
+		completeChild(t, r, kids[0], "a is fine")
+		if err := parent.PublishArtifact(ctx, lib.Artifact{ArtifactID: "p-r", Name: lib.ArtifactResult,
+			Parts: []lib.Part{{Kind: "text", Text: "the audit is done"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := parent.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+	r2.adapter.setTakesTerminals()
+	// b's end was recorded unsent before the restart: the heal's resend
+	// path, which must not send it to a parent that has ended.
+	putRecord(t, r2, conv, func(rec *SessionRecord) {
+		rec.setBatchEnd(kids[1].TaskID, &BatchEnd{State: lib.StateCompleted, Text: "b is fine", Unsent: true})
+	})
+	r2.adapter.inbox <- InboundMessage{Conversation: conv, Backend: consoleBackend, Kind: "dm", AuthorID: consoleAuthor,
+		MessageID: "after-heal", Text: "anything new?"}
+	waitFor(t, "the live child cancelled by the heal", func() bool {
+		for _, e := range streamEnvelopes(t, r2.url, lib.TaskInSubject("cluster", kids[2].TaskID)) {
+			if e.env.Kind == lib.KindCancel {
+				return true
+			}
+		}
+		return false
+	})
+	if got := childResultsOn(t, r2, "chat", origin.TaskID); len(got) != 0 {
+		t.Fatalf("ends sent to a parent that had ended: %+v", got)
+	}
+	for _, e := range streamEnvelopes(t, r2.url, lib.TaskInSubject("cluster", kids[0].TaskID)) {
+		if e.env.Kind == lib.KindCancel {
+			t.Fatal("the completed child was cancelled as if it were live")
+		}
+	}
+	rec, _ := r2.g.reg.Get(ctx, conv)
+	if k, _ := rec.TaskRefFor(kids[0].TaskID); k.BatchEnd == nil || k.BatchEnd.State != lib.StateCompleted || k.Canceled {
+		t.Fatalf("completed child's entry = canceled %v end %+v, want its completed end booked", k.Canceled, k.BatchEnd)
+	}
+	if p, _ := rec.TaskRefFor(origin.TaskID); !p.TerminalObserved {
+		t.Fatal("the parent's own end wasn't marked observed by its heal")
+	}
+	waitFor(t, "the parent's terminal frame", func() bool { return len(r2.adapter.terminalPosts()) > 0 })
+	var frame *fakeTerminal
+	for _, f := range r2.adapter.terminalPosts() {
+		if f.TaskID == origin.TaskID {
+			f := f
+			frame = &f
+		}
+	}
+	if frame == nil || !strings.Contains(frame.Text, "the audit is done") || strings.Contains(frame.Text, completedNonTextResult) {
+		t.Fatalf("the parent's terminal frame = %+v, want its result text", frame)
+	}
+}
