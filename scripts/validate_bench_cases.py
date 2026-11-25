@@ -269,6 +269,15 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+    # A measurement, not a regression guard: six concurrent sessions each
+    # fanning out cluster reads, run by hand in held presubmit twins that
+    # restrict the smoke to it, before and after a change to the cluster
+    # pool. In a roster it would hold a lane for most of an hour on a one-pod
+    # pool and share session workers with the other cases.
+    "session-burst-cluster-reads": (
+        "#7014: a concurrency measurement run by hand in held smoke twins restricted to it; "
+        "a roster seat would share session workers with other cases and skew it"
+    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,

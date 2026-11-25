@@ -511,5 +511,86 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(1, len(self.upstream_requests))
 
 
+
+def _cluster(name, location="us-east4", project="p"):
+    # The gke server's shape (captured on a dev install, names redacted): each
+    # listed cluster is a JSON string, in content[].text and structuredContent.
+    return json.dumps({"name": name, "location": location, "status": "RUNNING",
+                       "selfLink": f"https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{name}"})
+
+
+def _listing_reply(key, items):
+    document = {key: items}
+    return json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+        "content": [{"type": "text", "text": json.dumps(document)}], "structuredContent": document}}).encode()
+
+
+class ListingReplyTest(unittest.TestCase):
+    """#7031: a gke listing's reply drops excluded clusters for the filtered callers.
+    It borrows McpRelayOverTheSocketTest's live relay and helpers, not its tests."""
+
+    _restore = staticmethod(McpRelayOverTheSocketTest._restore)
+    _request = McpRelayOverTheSocketTest._request
+    exclude = McpRelayOverTheSocketTest.exclude
+
+    def setUp(self):
+        McpRelayOverTheSocketTest.setUp(self)
+        original = credential_proxy.LISTING_FILTERED_ROLES
+        self.addCleanup(setattr, credential_proxy, "LISTING_FILTERED_ROLES", original)
+        # The platform agent's MCP children call as chat: option A's set.
+        credential_proxy.LISTING_FILTERED_ROLES = original | {credential_proxy.CALLER_ROLE_CHAT}
+
+    def listed(self, body, key):
+        result = json.loads(body)["result"]
+        text = json.loads(result["content"][0]["text"])[key]
+        structured = result["structuredContent"][key]
+        return [json.loads(i)["name"] for i in text], [json.loads(i)["name"] for i in structured]
+
+    def test_list_clusters_drops_an_excluded_cluster_in_both_places(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        self.reply["body"] = _listing_reply("clusters", [_cluster("scratch"), _cluster("prod"), _cluster("scratch", "us-west1")])
+        status, _, body = self._request(message=tools_call("list_clusters"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.listed(body, "clusters"), (["prod", "scratch"], ["prod", "scratch"]))
+
+    def test_list_operations_drops_operations_on_an_excluded_cluster(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        ops = [json.dumps({"name": n, "targetLink": f"https://container.googleapis.com/v1/projects/p/locations/us-east4/clusters/{c}"})
+               for n, c in (("op-1", "scratch"), ("op-2", "prod"),
+                            ("op-3", "scratch/nodePools/default-pool"))]
+        self.reply["body"] = _listing_reply("operations", ops)
+        status, _, body = self._request(message=tools_call("list_operations"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.listed(body, "operations"), (["op-2"], ["op-2"]))
+
+    def test_an_unreadable_listing_is_refused_while_any_is_excluded(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        for body in (
+            b'{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"not json"}]}}',
+            _listing_reply("clusters", [json.dumps({"name": "x"})]),
+            # No recognised carrier: the list sits somewhere the filter doesn't read.
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"clusters": [_cluster("scratch")]}}).encode(),
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).encode(),
+            # A carrier without the list key, in either place.
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": json.dumps({"items": [_cluster("scratch")]})}]}}).encode(),
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"items": [_cluster("scratch")]}}}).encode(),
+        ):
+            with self.subTest(body=body):
+                self.reply["body"] = body
+                status, _, _ = self._request(message=tools_call("list_clusters"))
+                self.assertEqual(status, 502)
+
+    def test_nothing_changes_with_nothing_excluded_or_for_an_unfiltered_caller(self):
+        body = _listing_reply("clusters", [_cluster("scratch")])
+        self.reply["body"] = body
+        status, _, out = self._request(message=tools_call("list_clusters"))
+        self.assertEqual((status, out), (200, body))
+        credential_proxy.LISTING_FILTERED_ROLES = frozenset()
+        self.exclude(("p", "us-east4", "scratch"))
+        status, _, out = self._request(message=tools_call("list_clusters"))
+        self.assertEqual((status, out), (200, body))
+
+
 if __name__ == "__main__":
     unittest.main()
