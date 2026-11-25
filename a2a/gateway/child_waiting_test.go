@@ -203,10 +203,13 @@ func TestTheWaitingCountReadsTheStreamAndCountsBatchChildren(t *testing.T) {
 		Key: "discord:g1/batch", ContextID: "ctx-batch", Kind: "group", LastActivity: time.Now().UTC(),
 		BusSession: "chat-otter-1", Addressee: "chat-otter-1",
 		Tasks: []TaskRef{
-			{ID: "batch-parent", Addressee: "chat-otter-1", Requester: &TaskRequester{Backend: "discord", Subject: "s"}},
-			{ID: "batch-0", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent",
-				StartedAt: time.Now().Add(-time.Minute).UTC()},
-			{ID: "batch-1", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent",
+			{ID: "batch-parent", Addressee: "chat-otter-1", Requester: &TaskRequester{Backend: "discord", Subject: "s"},
+				BatchSize: 2, Children: []string{"batch-0", "batch-1"}},
+			// Queued at the dispatcher past FirstEventGrace but inside the
+			// fan-out queue allowance (batchChildGrace): still waiting.
+			{ID: "batch-0", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent", BatchIndex: 1,
+				StartedAt: time.Now().Add(-(defaultFirstEventGrace + 10*time.Minute)).UTC()},
+			{ID: "batch-1", Addressee: "cluster", Tier: "read", Role: taskRoleChild, ParentTaskID: "batch-parent", BatchIndex: 2,
 				StartedAt: time.Now().Add(-time.Minute).UTC(), BatchEnd: &BatchEnd{}},
 		},
 	}
