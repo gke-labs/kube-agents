@@ -1482,6 +1482,16 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{list(fields)}, so it can only pass"
         )
 
+    # `min_children: 0` holds for every chain, so it populates the field
+    # without asserting anything; alone it can only pass, which the
+    # verifier's model refuses too.
+    if (
+        node_type == "delegated_to"
+        and node.get("min_children") == 0
+        and not any(_populated(node.get(f)) for f in ("required_addressees", "forbidden_addressees", "max_children"))
+    ):
+        problems.append(f"{where}: check 'delegated_to' sets only min_children: 0, so it can only pass")
+
     # The same two rules the verifier's model applies after the cluster lease:
     # the scope needs its check, a name or a list of names; the field is
     # refused, blank or not, under any other scope.

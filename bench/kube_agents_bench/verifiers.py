@@ -3733,9 +3733,10 @@ class DelegatedToVerifier(BaseVerifier):
     The inject door's read route names each child task's addressee once, in
     the order delegated (``childAddressees``): an AgentProfile's name, or
     ``platform``. The harness keeps that on the transcript
-    (``TranscriptSnapshot.child_addressees``). This reads it and nothing
-    else, so a case can grade which agent a session chose, which neither the
-    answer nor the trajectory says.
+    (``TranscriptSnapshot.child_addressees``), and the chain's child-task
+    count (``childCount``, ``TranscriptSnapshot.child_count``). This reads
+    those and nothing else, so a case can grade which agent a session chose,
+    and how often, which neither the answer nor the trajectory says.
 
     ``required_addressees``: Python regular expressions, each of which must
     ``re.fullmatch`` at least one addressee.

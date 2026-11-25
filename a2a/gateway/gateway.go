@@ -2605,7 +2605,10 @@ func chainChildAddressees(rec *SessionRecord, taskID string) []string {
 // two where chainChildAddressees names it once. A child minted without an
 // addressee still counts, since it is a delegation whomever it went to. Zero
 // when the chain delegated nothing; nil only when taskID is unknown, so the
-// wire tells "none" from "unknown" as the addressees do.
+// wire tells "none" from "unknown" as the addressees do. It counts the
+// children the record still holds: a long-lived conversation whose history
+// trim (trimHistory) dropped old child entries under a live root counts
+// fewer, which a fresh bench conversation never reaches.
 func chainChildCount(rec *SessionRecord, taskID string) *int {
 	ref, ok := rec.TaskRefFor(taskID)
 	if !ok {
