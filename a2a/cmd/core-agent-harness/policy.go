@@ -239,14 +239,17 @@ func logRefusal(w io.Writer, tool, callID string, err error) {
 // rule matches.
 const noAllowRule = "requires an allowlist entry in 'allow' mode"
 
-// shellCommands are the commands a grant's shell allow rules name ("bash:<cmd>",
-// beside "bash:<cmd> *"), sorted; "*" stands for any command.
+// shellCommands are the commands a grant's shell allow rules name ("bash:<cmd>"
+// or "bash:<cmd> *"), sorted; "*" stands for any command.
 func shellCommands(allow []string) []string {
 	var out []string
 	for _, a := range allow {
 		cmd, ok := strings.CutPrefix(a, "bash:")
-		if !ok || (strings.HasSuffix(cmd, " *") && cmd != "*") {
+		if !ok {
 			continue
+		}
+		if cmd != "*" {
+			cmd = strings.TrimSuffix(cmd, " *")
 		}
 		out = append(out, cmd)
 	}
@@ -254,18 +257,31 @@ func shellCommands(allow []string) []string {
 	return slices.Compact(out)
 }
 
+// shellMeta are the characters that make a command something other than one
+// plain command, wherever they sit, against a word or not.
+const shellMeta = "|&;<>()$`\\\"'\n"
+
 // shellRefusalHint tells the model why a shell command no allow rule matched
-// was refused, and what to do instead: when it starts with a command the
-// grant names (or the grant names any), its shape was the problem, a pipe,
-// redirection, chain or expansion; otherwise the command itself isn't
+// was refused, and what to do instead. The command's leading words are read
+// up to the first shell metacharacter, past any leading VAR=value
+// assignments: when they begin with a command the grant names (or the grant
+// names any), the shape was the problem, a pipe, redirection, chain,
+// expansion or environment prefix; otherwise the command itself isn't
 // granted. "" when the grant has no shell rules, as the refusal is then
 // the plugin's or a deny's business.
 func shellRefusalHint(command string, shell []string) string {
 	if len(shell) == 0 {
 		return ""
 	}
-	const shape = "The shell here runs one plain command at a time: pipes (|), redirections (>, 2>&1), chains (;, &&, ||), subshells and $ or backtick expansion are refused. Run a single command and shape its output with the command's own flags (for kubectl, -o json, -o jsonpath=... or -o custom-columns=...), then read the output yourself"
-	fields := strings.Fields(command)
+	const shape = "The shell here runs one plain command at a time: pipes (|), redirections (>, 2>&1), chains (;, &&, ||), subshells, environment prefixes (VAR=value) and $ or backtick expansion are refused. Run a single command and shape its output with the command's own flags (for kubectl, -o json, -o jsonpath=... or -o custom-columns=...), then read the output yourself"
+	head := command
+	if i := strings.IndexAny(head, shellMeta); i >= 0 {
+		head = head[:i]
+	}
+	fields := strings.Fields(head)
+	for len(fields) > 0 && strings.Contains(fields[0], "=") {
+		fields = fields[1:]
+	}
 	for _, c := range shell {
 		cf := strings.Fields(c)
 		if c == "*" || (len(cf) > 0 && len(fields) >= len(cf) && slices.Equal(fields[:len(cf)], cf)) {

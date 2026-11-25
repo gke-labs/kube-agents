@@ -284,6 +284,10 @@ func TestARefusedShellCommandTellsTheModelWhatToDo(t *testing.T) {
 		{"a granted command in a pipe", "kubectl get pods -A | grep -v Running", "one plain command at a time"},
 		{"a granted command with a redirect", "kubectl get pods 2>&1", "-o jsonpath"},
 		{"a command not granted", "gcloud info", "Only these commands may run here, each as one plain command: kubectl"},
+		{"a pipe against the prefix", "kubectl|grep Running", "one plain command at a time"},
+		{"a chain against the prefix", "kubectl;id", "one plain command at a time"},
+		{"an environment prefix", "FOO=1 kubectl get pods", "environment prefixes"},
+		{"a command not granted, in a pipe", "gcloud info | jq .", "Only these commands may run here"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := &replyModel{callModel: callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": c.command}}}}
