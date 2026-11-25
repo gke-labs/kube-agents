@@ -9903,6 +9903,24 @@ spec:
                           minimum: 90
                           type: integer
                       type: object
+                    sessionWorker:
+                      description: |-
+                        SessionWorker configures the session pods the gateway spawns for
+                        conversations.
+                      properties:
+                        type:
+                          description: |-
+                            Type is the harness the session worker image runs. Absent is
+                            claude-code. The operator passes it to the gateway as
+                            A2A_SESSION_HARNESS, only when it is set, and the gateway passes it
+                            to each session pod as A2A_HARNESS, which the worker adapter's
+                            harness selector reads. It is pod configuration only: no route, bus
+                            subject or permission depends on it. claude-code is the only value
+                            accepted today.
+                          enum:
+                            - claude-code
+                          type: string
+                      type: object
                     stallWatch:
                       description: |-
                         StallWatch tunes the controller stall watch — the stall-watch cron job on the
@@ -11687,9 +11705,11 @@ spec:
                             by project number refuses its location and name in any project. A GCP
                             metadata read that names it is refused too (a cluster describe, a
                             node-pool read, the gke MCP server's get_cluster, get_node_pool and
-                            list_node_pools), and a logging read leaves out its entries. Project-wide
-                            reads stay allowed (the project's cluster list, for one), and these
-                            still cover it through them only:
+                            list_node_pools), and a logging read leaves out its entries. A session's
+                            or profile task's gcloud container clusters list and operations list
+                            leave it out as well (by name, so a same-named cluster elsewhere too).
+                            Every other caller's project-wide reads stay allowed (the project's
+                            cluster list, for one), and these still cover it through them only:
                             the daily upgrade-readiness watch's version table (its in-cluster
                             readiness rules skip the cluster), the networking audit's subnet usage,
                             the GCE audit's instance listing, and the gke MCP server's list_clusters.
