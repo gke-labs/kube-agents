@@ -448,6 +448,9 @@ func sessionPrompts(getenv func(string) string) []string {
 	return nil
 }
 
+// harnessCommand builds the harness argv: the native binary driven over the
+// headless stream-json contract. A2A_HARNESS_CMD overrides the whole argv
+// (tests, stubs); A2A_HARNESS_EXTRA_ARGS appends without replacing.
 func harnessCommand() []string {
 	if cmd := os.Getenv("A2A_HARNESS_CMD"); cmd != "" {
 		return strings.Fields(cmd)

@@ -715,3 +715,52 @@ func TestEveryDriverEmitsOneToolResultPerToolStep(t *testing.T) {
 		})
 	}
 }
+
+// oneTurnToyDriver is toyDriver for a harness that runs one turn per process.
+type oneTurnToyDriver struct{ *toyDriver }
+
+func (oneTurnToyDriver) OneTurnPerProcess() {}
+
+// A steer held during the only turn a one-turn process runs is refused, and
+// the turn's result is the task's: the steer is not written into a pipe the
+// harness never reads again, which used to count a turn that never ran and
+// end the task stream-ended-without-result.
+func TestAOneTurnProcessRefusesAHeldSteerAndKeepsItsResult(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-toy-g7", "task-toy-oneturn"
+	origin := submit(t, c, session, taskID, "opening")
+	dir := t.TempDir()
+	started, steered := filepath.Join(dir, "started"), filepath.Join(dir, "steered")
+	// Like core-agent-harness: one message read, the result written while
+	// stdin is still open, then a moment's cleanup and a clean exit.
+	harness := stub(t, fmt.Sprintf(`
+echo 'S toy-oneturn'
+read first || exit 1
+: > %q
+for i in $(seq 1 50); do [ -e %q ] && break; sleep 0.1; done
+sleep 0.5
+echo 'OK turn one'
+sleep 1
+exit 0
+`, started, steered))
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.Driver = oneTurnToyDriver{&toyDriver{hold: true}}
+	done := runAdapter(context.Background(), cfg)
+	waitPath(t, started, "the harness never started its turn")
+	publishSteerFor(t, c, origin, session, "STEERWORD late")
+	if err := os.WriteFile(steered, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := waitOutcome(t, done, waitDeadline)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	if got := artifactText(foldTask(t, c, session, taskID), lib.ArtifactResult); got != "turn one" {
+		t.Errorf("result %q, want the turn's own", got)
+	}
+	if refusalBeforeTerminal(t, url, session, taskID) < 0 {
+		t.Error("the held steer was not refused")
+	}
+}
