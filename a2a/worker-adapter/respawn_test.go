@@ -2,6 +2,7 @@ package workeradapter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -47,9 +48,16 @@ func (s *respawnScope) alive() []int {
 // scopes the kill and the listing to what the test tracks.
 func useToyRespawn(t *testing.T, cfg *Config) (*respawnScope, *toyDriver) {
 	t.Helper()
-	s := &respawnScope{}
 	d := &toyDriver{hold: true, restart: true, budget: true, prepare: func(int, TurnDirs) error { return checkTurnBoundary() }}
 	cfg.Driver = d
+	return useRespawnScope(t), d
+}
+
+// useRespawnScope stands the adapter in as the container's init, with the
+// kill and the process listing scoped to the pids the returned scope tracks.
+func useRespawnScope(t *testing.T) *respawnScope {
+	t.Helper()
+	s := &respawnScope{}
 	prevPID, prevKill, prevReap, prevOthers, prevSettle := adapterPID, killEveryoneButMe, reapKilledChildren, otherProcesses, sweepSettle
 	t.Cleanup(func() {
 		adapterPID, killEveryoneButMe, reapKilledChildren, otherProcesses, sweepSettle = prevPID, prevKill, prevReap, prevOthers, prevSettle
@@ -70,7 +78,7 @@ func useToyRespawn(t *testing.T, cfg *Config) (*respawnScope, *toyDriver) {
 	}
 	otherProcesses = func() ([]int, error) { return s.alive(), nil }
 	sweepSettle = 300 * time.Millisecond
-	return s, d
+	return s
 }
 
 // toyRespawnStub is a toy-dialect harness for one turn per process. Each
@@ -372,5 +380,69 @@ func TestAStopBetweenProcessesRefusesEverySteer(t *testing.T) {
 		if !r.refused(t, text) {
 			t.Errorf("the steer %q was not refused on the task's stream", text)
 		}
+	}
+}
+
+// TestACoreAgentSteerHeldAtTheResultRunsOnAFreshProcess drives the real
+// core-agent driver with a stub speaking its wire format: a steer that
+// arrives during turn one is held, not written to that process; turn one's
+// process ends at its result, and a second process gets an envelope with
+// the steer as its message and turn one's conversation events as its
+// history.
+func TestACoreAgentSteerHeldAtTheResultRunsOnAFreshProcess(t *testing.T) {
+	dir := t.TempDir()
+	harness := stub(t, fmt.Sprintf(`
+dir=%q
+n=$(( $(cat "$dir/runs" 2>/dev/null || echo 0) + 1 )); echo $n > "$dir/runs"
+read -r envelope || exit 1
+printf '%%s\n' "$envelope" > "$dir/envelope.$n"
+echo '{"type":"init","session":"ca-1","model":"m"}'
+echo "{\"type\":\"event\",\"event\":{\"turn\":$n}}"
+echo 1 > "$dir/turn.$n"
+i=0; while [ ! -e "$dir/steer-sent" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done
+echo "{\"type\":\"result\",\"text\":\"done $n\"}"
+while read -r more; do echo "$more" >> "$dir/late.$n"; done
+exit 0
+`, dir))
+	url := startServer(t)
+	c := testClient(t, url)
+	session, taskID := "chat-ca-respawn", "task-ca-respawn"
+	origin := submit(t, c, session, taskID, "start")
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.Driver = newCoreAgentDriver()
+	useRespawnScope(t)
+	done := runAdapter(context.Background(), cfg)
+	waitFileFor(t, filepath.Join(dir, "turn.1"), 10*time.Second)
+	publishSteerFor(t, c, origin, session, respawnSteer)
+	time.Sleep(300 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(dir, "steer-sent"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("state=%q err=%v", out.res.State, out.err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "runs")); strings.TrimSpace(string(b)) != "2" {
+		t.Fatalf("%s processes ran; want 2", strings.TrimSpace(string(b)))
+	}
+	// The envelope ends in a newline the stub's read leaves behind; anything
+	// more is a second write.
+	if late, err := os.ReadFile(filepath.Join(dir, "late.1")); err == nil && len(strings.TrimSpace(string(late))) > 0 {
+		t.Errorf("turn one's process was written to after its envelope: %q", late)
+	}
+	var env2 struct {
+		Message string            `json:"message"`
+		Session string            `json:"session"`
+		History []json.RawMessage `json:"history"`
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "envelope.2"))
+	if err := json.Unmarshal(b, &env2); err != nil {
+		t.Fatalf("envelope 2 %q: %v", b, err)
+	}
+	if env2.Message != respawnSteer {
+		t.Errorf("process 2's message is %q; want the held steer", env2.Message)
+	}
+	if env2.Session != "ca-1" || len(env2.History) != 1 || !strings.Contains(string(env2.History[0]), `"turn":1`) {
+		t.Errorf("process 2 resumes session %q with history %s; want ca-1 with turn one's event", env2.Session, env2.History)
 	}
 }
