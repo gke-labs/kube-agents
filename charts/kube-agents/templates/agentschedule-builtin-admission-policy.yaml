@@ -28,8 +28,9 @@
 #      one, and an update may not add, change or remove one. Every kind, not only PlatformAgent,
 #      because the reconciler's controller check matches on the owner's uid alone.
 #   3. A built-in schedule's spec doesn't change, except spec.suspend: what it runs, on which
-#      profile, when and where its report goes are the operator's. Suspending it stays open, as the
-#      one way to pause a built-in audit until PlatformAgent.spec.schedules.overrides exists.
+#      profile, when and where its report goes are the operator's. Suspending it stays open. The
+#      supported way to pause a built-in is PlatformAgent.spec.schedules.overrides, which the
+#      operator writes into spec.suspend; with no override for it, a suspend set here stands.
 #
 # Anything else passes, so a person may still annotate a built-in schedule (`run-now`) or
 # edit a user schedule. A built-in schedule written before this policy existed isn't refused for
@@ -110,8 +111,8 @@ spec:
     # A built-in schedule's spec is the operator's too: what it runs, on which profile, when and
     # where its report goes all run at the unattended tier and write the audit's report stream.
     # Annotations (run-now) and the rest of the metadata still pass.
-    # spec.suspend is the exception, the one way to pause a built-in audit until
-    # PlatformAgent.spec.schedules.overrides exists.
+    # spec.suspend is the exception: PlatformAgent.spec.schedules.overrides is the supported way
+    # to set it, and with no override a suspend set directly stands.
     - expression: >-
         variables.oldOrigin != 'builtin' ||
         (object.spec.all(k, k == 'suspend' || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&

@@ -26,7 +26,7 @@ var sessionPodFixture = filepath.Join("..", "..", "k8s-operator", "internal", "c
 
 // TestSpawnedSessionPodsMatchTheAdmissionFixture spawns the session pod in
 // each shape Spawn has (plain, with the bus CA, reused for its conversation,
-// with the cluster view) under the namespace and account names the envtest
+// with the cluster view, with a named harness) under the namespace and account names the envtest
 // uses, and compares them with the fixture. Run with -update-session-pods to
 // rewrite it, then run the operator's TestTheGatewayPodPolicy envtest.
 func TestSpawnedSessionPodsMatchTheAdmissionFixture(t *testing.T) {
@@ -53,6 +53,7 @@ func TestSpawnedSessionPodsMatchTheAdmissionFixture(t *testing.T) {
 			c.KubeProxyCAConfigMap = "pa-kube-proxy-ca-bundle"
 			c.KubeProxyHostContext = "in-cluster"
 		}},
+		{"harness", func(c *Config, _ *SessionRecord) { c.SessionHarness = "claude-code" }},
 	}
 	var pods []corev1.Pod
 	for _, shape := range shapes {

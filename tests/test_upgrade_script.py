@@ -2078,6 +2078,86 @@ echo "INSTALL_CHECKOUT=$install_checkout"
         self.assertIn(f"but {upstream_url} names {commits['0.3.0']}", combined)
         self.assertEqual(self._reported(proc, "REPO_DIR"), str(clone_dir))
 
+    def _annotate_upstream_release_tag(self, home_dir, tag, commit):
+        """Make upstream's release tag an annotated one on the same commit; returns the tag object.
+
+        The releases publish annotated tags, and the fixture's `git tag <release>`
+        is lightweight. For a lightweight tag the remote's line is the commit
+        itself, so only an annotated one shows whether the remote check reads
+        the commit the tag names or the tag's own object.
+        """
+        # --git-dir, not cwd: a host with safe.bareRepository=explicit refuses to
+        # enter a bare repository.
+        upstream = ("--git-dir", str(home_dir.parent / "upstream.git"))
+        identity = ("-c", "user.name=Release", "-c", "user.email=release@example.com", "-c", "tag.gpgsign=false")
+        self._git(*upstream, *identity, "tag", "-f", "-a", "-m", f"Release {tag}", tag, commit, cwd=home_dir.parent)
+        tag_object = self._git(*upstream, "rev-parse", tag, cwd=home_dir.parent)
+        self.assertNotEqual(tag_object, commit)
+        return tag_object
+
+    def test_a_second_run_over_the_releases_annotated_tag_is_accepted(self):
+        """A retry of the same upgrade must not be told the release's own tag is forged.
+
+        The first run fetches the tag itself, so it is not cross-checked, and
+        leaves it in the checkout. The second run adopts it and asks the remote,
+        whose answer for an exact tag name is the tag object alone: the peeled
+        entry has a name of its own.
+        """
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        tag_object = self._annotate_upstream_release_tag(home_dir, "0.3.0", commits["0.3.0"])
+
+        first = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self._git("cat-file", "-t", "0.3.0", cwd=clone_dir), "tag")
+
+        second = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        combined = second.stdout + second.stderr
+        self.assertEqual(second.returncode, 0, combined)
+        self.assertNotIn("Refusing to upgrade from", combined)
+        self.assertNotIn(tag_object, combined)
+        self.assertEqual(self._reported(second, "REPO_DIR"), str(clone_dir))
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
+
+    def test_a_preview_over_the_releases_annotated_tag_does_not_warn(self):
+        """The preview arm asks the same question, and warned where the real run refused."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        tag_object = self._annotate_upstream_release_tag(home_dir, "0.3.0", commits["0.3.0"])
+        first = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0", preview_flag="PARAM_PLAN")
+
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertNotIn(f"but {upstream_url} names", combined)
+        self.assertNotIn(tag_object, combined)
+        self.assertEqual(self._reported(proc, "REPO_DIR"), str(clone_dir))
+
+    def test_a_forged_annotated_tag_is_refused_against_the_releases_annotated_tag(self):
+        """Reading the peeled entry must not let a forged tag through, annotated or not.
+
+        The refusal names the commit the release's tag names: the tag object is
+        not something an operator can check out or compare.
+        """
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        tag_object = self._annotate_upstream_release_tag(home_dir, "0.3.0", commits["0.3.0"])
+        self._git(
+            "-c", "user.name=Fork", "-c", "user.email=fork@example.com", "-c", "tag.gpgsign=false",
+            "tag", "-a", "-m", "not the release", "0.3.0", "HEAD", cwd=clone_dir,
+        )
+        forged = self._git("rev-parse", "0.3.0^{commit}", cwd=clone_dir)
+        self.assertNotEqual(forged, commits["0.3.0"])
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Refusing to upgrade from", combined)
+        self.assertIn(f"names {commits['0.3.0']}", combined)
+        self.assertNotIn(tag_object, combined)
+        self.assertNotIn("Verified upgrade scripts and image ref", combined)
+
     def test_an_unreachable_remote_refuses_an_adopted_checkouts_tag(self):
         """When KUBE_AGENTS_REPO_URL cannot be reached, a real upgrade refuses an adopted tag."""
         home_dir, clone_dir, _, _ = self._existing_clone_fixture("0.2.0")

@@ -45,7 +45,7 @@ HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v))
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream persona-manifests docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check recipe-new recipe-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance persona-manifests
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -217,6 +217,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
+	$(wildcard agents/platform/scripts/fix_recipes/*/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
@@ -884,15 +885,29 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # scripts/test_task_registration.py (the tree-level scans, the sanitizer and
 # the run-record guard, as assertions of their own there); this target is the
 # fast path to them. One rule loads each check entry with the harness's own
-# parser, which is in the bench package (`make test-bench-deps`): without the
-# package it does not run and the last line of the output says so, and its
-# gate in CI is bench/tests/test_case_entries_load.py.
+# parser, which is in the bench package (`make test-bench-deps`): without this
+# checkout's package, or with one whose installed data is behind
+# bench/pyproject.toml, it does not run and the last line of the output says
+# so, and its gate in CI is bench/tests/test_case_entries_load.py.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
 		exit 1; \
 	}
 	@python3 scripts/validate_bench_cases.py
+
+# The fix recipes (agents/platform/scripts/fix_recipes/). recipe-check flags a
+# change that edits a recipe and the shared plumbing beside it when given
+# RECIPE_CHECK_BASE, the commit to compare against; CI passes the pull
+# request's base.
+RECIPE_CHECK_BASE ?=
+recipe-new: ## Scaffold a fix recipe: make recipe-new KIND=<audit check id>.
+	@test -n "$(KIND)" || { echo "usage: make recipe-new KIND=<audit check id>"; exit 1; }
+	@python3 scripts/recipe_new.py "$(KIND)"
+
+recipe-check: ## Validate every fix recipe: it loads, its eval case names it back, no scaffold line is left.
+	@python3 -c "import yaml" 2>/dev/null || { echo "recipe-check needs PyYAML: python3 -m pip install pyyaml"; exit 1; }
+	@python3 scripts/check_recipes.py $(if $(RECIPE_CHECK_BASE),--base "$(RECIPE_CHECK_BASE)")
 
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).

@@ -37,6 +37,8 @@
 #
 # Exit 0 when every leg listed and every matched object was deleted (or would
 # be); 1 when a list or a delete failed, after every leg has run; 2 on usage.
+# On an Autopilot cluster the pool leg lists nothing, which is not a failure;
+# a failed read of the cluster's mode is one.
 # ==============================================================================
 
 set -uo pipefail
@@ -58,6 +60,10 @@ readonly PLANT_KINDS=(
 # STOPPING is a pool already deleting: a second delete answers 409.
 readonly POOL_LIST_FILTER="config.resourceLabels.managed-by=kube-agents-bench AND status!=STOPPING"
 readonly POOL_NAME_NEVER_DELETED="default-pool"
+# How the describe answers for an Autopilot cluster: value() renders the
+# boolean as True, and a field GKE did not set as an empty line.
+readonly AUTOPILOT_FORMAT="value(autopilot.enabled)"
+readonly AUTOPILOT_TRUE="True"
 # A CRD's delete takes every object of its kind. The CRD leg lists the
 # objects that do not carry the bench label first, and refuses on any.
 readonly CRD_KIND="customresourcedefinitions.apiextensions.k8s.io"
@@ -192,8 +198,19 @@ done
 
 # Node pools: the same pair as a GCE resource label on the pool
 # (`--labels managed-by=kube-agents-bench` at create). Empty output is zero
-# pools; a list that fails is a failed leg.
-if POOLS="$(gcloud container node-pools list --cluster "${CLUSTER}" \
+# pools; a list that fails is a failed leg. An Autopilot cluster is asked for
+# no list: a stack cannot plant a pool there, and its API refuses the call
+# (code 400, "Autopilot node pools cannot be accessed or modified"), which
+# would count one failed leg in every sweep. A describe that fails is a failed
+# leg: the pools were not read.
+if ! AUTOPILOT="$(gcloud container clusters describe "${CLUSTER}" \
+  --location "${LOCATION}" --project "${PROJECT}" \
+  --format="${AUTOPILOT_FORMAT}" </dev/null)"; then
+  echo "✗ node pools: could not read whether the cluster is Autopilot"
+  FAILED=$((FAILED + 1))
+elif [ "${AUTOPILOT}" = "${AUTOPILOT_TRUE}" ]; then
+  echo "node pools: Autopilot cluster, no pool to sweep"
+elif POOLS="$(gcloud container node-pools list --cluster "${CLUSTER}" \
   --location "${LOCATION}" --project "${PROJECT}" \
   --filter="${POOL_LIST_FILTER}" --format="value(name)" </dev/null)"; then
   while read -r pool; do

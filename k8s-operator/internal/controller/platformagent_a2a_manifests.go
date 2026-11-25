@@ -307,9 +307,17 @@ const (
 	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar   = "A2A_WORKER_IMAGE"
-	a2aImagePullRefsEnvVar = "A2A_IMAGE_PULL_REFS"
-	a2aImagePullRefsSep    = ","
+	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+	// a2aSessionHarnessEnvVar carries spec.harness.sessionWorker.type to
+	// the gateway (a2a/gateway/config.go reads it).
+	a2aSessionHarnessEnvVar = "A2A_SESSION_HARNESS"
+	// sessionHarnessCondition is False (reason sessionHarnessReasonNotSupported)
+	// while spec.harness.sessionWorker.type names a harness this operator
+	// doesn't render, and absent otherwise.
+	sessionHarnessCondition          = "SessionHarness"
+	sessionHarnessReasonNotSupported = "SessionHarnessNotSupported"
+	a2aImagePullRefsEnvVar           = "A2A_IMAGE_PULL_REFS"
+	a2aImagePullRefsSep              = ","
 
 	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
 	// read from the CONTROLLER's environment rather than from the CR.
@@ -5411,6 +5419,10 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// unset as 0); the workloads behind an opt-in operator flag come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
+	// The Teams inbound receiver, a CR field like the exec tier.
+	if teamsInboundEnabled(agent) {
+		n += int64(ptr.Deref(buildA2ATeamsInboundDeployment(agent).Spec.Replicas, 1))
+	}
 	// The profile dispatcher and the MCP server, each on unless its flag is
 	// "false" (operator.profileDispatcher.enabled and operator.mcpServer.enabled
 	// in the chart).
@@ -5482,10 +5494,12 @@ func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
 // (which the hermes-bridge sidecar copies) all come from here, so the two
 // cannot disagree.
 func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
-	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't hold
-	// the route off: since 2026-11-20 the view is on by default for the
-	// session route (gke-labs/kube-agents#6538), so an explicit `session`
-	// routes to session with the view on or off.
+	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't
+	// change the route: an explicit `session` routes to session with the
+	// view on or off. The view is on only where that flag is `true`
+	// (a2aSessionClusterViewEnabled); nothing sets it from defaultRoute, and
+	// making it the session route's default is a later step of
+	// gke-labs/kube-agents#6538.
 	// A CRD that prunes status.effectiveSessionCap can't keep the cap the
 	// session route renders from, so that install stays on platform.
 	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession ||
@@ -7277,6 +7291,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
+			{Name: "A2A_KUBE_PROXY_MODE", Value: kubeProxyMode},
 		}
 		// The kubectl admission's tier, normalised as for the shell sandbox;
 		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
@@ -7610,6 +7625,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
 	}
+	// The session worker's harness (spec.harness.sessionWorker.type), only
+	// when set: an install that leaves it out renders the gateway it had,
+	// so an operator upgrade doesn't roll the gateway for it. The gateway
+	// reads unset as Claude Code.
+	if t := a2aSessionHarness(agent); t != "" {
+		env = append(env, corev1.EnvVar{Name: a2aSessionHarnessEnvVar, Value: t})
+	}
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
@@ -7810,6 +7832,13 @@ type a2aProvisionState struct {
 	// the document goes stale, whichever is first; zero for no deadline.
 	scopeCondition *metav1.Condition
 	scopeRequeue   time.Duration
+	// builtinSchedulesCondition is the BuiltinSchedules condition
+	// reconcileBuiltinSchedules computed, nil when there's nothing to say;
+	// builtinSchedulesRequeue is how soon the renderer wants to look again
+	// (a replaced schedule's deletion in flight, a write that raced), zero
+	// for no need.
+	builtinSchedulesCondition *metav1.Condition
+	builtinSchedulesRequeue   time.Duration
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
@@ -7935,6 +7964,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	}
 	if a2aCuratorEnabled() {
 		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
+	}
+	if teamsInboundEnabled(agent) {
+		fences = append(fences, buildTeamsInboundNetworkPolicy(agent, dnsClusterIPs))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
@@ -8260,6 +8292,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.reconcileA2AConsole(ctx, agent); err != nil {
 		return state, err
 	}
+	if err := r.reconcileTeamsInbound(ctx, agent); err != nil {
+		return state, err
+	}
 	// The MCP server, the other console client, under its flag and for the
 	// same reasons: after the fences, ahead of the gateway's hold. Its
 	// broker identity first, so the ServiceAccount exists before the pod
@@ -8300,6 +8335,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	state.scopeCondition = scopeOutcome.condition
 	state.scopeRequeue = scopeOutcome.requeue
+
+	// The built-in AgentSchedules (platformagent_builtin_schedules.go).
+	builtinCondition, builtinRequeue, err := r.reconcileBuiltinSchedules(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	state.builtinSchedulesCondition = builtinCondition
+	state.builtinSchedulesRequeue = builtinRequeue
 
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
@@ -9764,4 +9807,66 @@ func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 // without a restart; the gateway reads it per routed task.
 func a2aGatewayScopeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
+}
+
+// a2aSessionHarnessSpec is spec.harness.sessionWorker.type as written, ""
+// when unset.
+func a2aSessionHarnessSpec(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness == nil || agent.Spec.Harness.SessionWorker == nil {
+		return ""
+	}
+	return agent.Spec.Harness.SessionWorker.Type
+}
+
+// a2aSessionHarnessSupported is whether the operator renders a session
+// harness: claude-code. Antigravity joins when its worker isolation lands.
+func a2aSessionHarnessSupported(t string) bool {
+	return t == agentv1alpha1.AgentProfileHarnessClaudeCode
+}
+
+// a2aSessionHarness is the session harness the gateway is given: the
+// spec's value when this operator supports it, else "". An unsupported
+// value (a CRD that admitted more than this operator knows) is not
+// rendered, so the shared gateway keeps serving and session pods run the
+// default harness; syncSessionHarness says so on the SessionHarness
+// condition and in a Warning event. A refused AgentProfile only loses its
+// own pool, so it is refused instead (HarnessNotSupported).
+func a2aSessionHarness(agent *agentv1alpha1.PlatformAgent) string {
+	if t := a2aSessionHarnessSpec(agent); a2aSessionHarnessSupported(t) {
+		return t
+	}
+	return ""
+}
+
+// syncSessionHarness writes the SessionHarness condition: False with
+// reason SessionHarnessNotSupported, and a Warning event once it is first
+// stored, while the spec names a session harness this operator doesn't
+// render; removed once the value is supported or unset.
+func (r *PlatformAgentReconciler) syncSessionHarness(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	t := a2aSessionHarnessSpec(agent)
+	if t == "" || a2aSessionHarnessSupported(t) {
+		if meta.RemoveStatusCondition(&agent.Status.Conditions, sessionHarnessCondition) {
+			return r.Status().Update(ctx, agent)
+		}
+		return nil
+	}
+	msg := fmt.Sprintf("spec.harness.sessionWorker.type %q is not a harness this operator renders (supported: %s); session pods run the default harness, %s", t, agentv1alpha1.AgentProfileHarnessClaudeCode, agentv1alpha1.AgentProfileHarnessClaudeCode)
+	prior := meta.FindStatusCondition(agent.Status.Conditions, sessionHarnessCondition)
+	first := prior == nil || prior.Reason != sessionHarnessReasonNotSupported || prior.Message != msg
+	if !meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: sessionHarnessCondition, Status: metav1.ConditionFalse, Reason: sessionHarnessReasonNotSupported,
+		Message: msg, ObservedGeneration: agent.Generation,
+	}) {
+		return nil
+	}
+	// The event only once the condition is stored: a write that conflicts
+	// leaves the condition unstored, so the next pass would read it as
+	// first and warn again.
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
+	if first {
+		r.recordEvent(agent, "Warning", sessionHarnessReasonNotSupported, msg)
+	}
+	return nil
 }

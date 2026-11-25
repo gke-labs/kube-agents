@@ -160,11 +160,7 @@ echo "Location:  $REGION"
 echo "Namespace: $NAMESPACE"
 
 # Authenticates kubectl to target GKE cluster
-gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG || {
+get_cluster_credentials "$CLUSTER_NAME" "$REGION" "$PROJECT_ID" || {
   echo "ERROR: Failed to authenticate to GKE cluster ${CLUSTER_NAME} in project ${PROJECT_ID}! Aborting teardown for safety."
   exit 1
 }

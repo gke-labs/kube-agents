@@ -824,6 +824,20 @@ MUTATIONS: list[Mutation] = [
         "and a values file decides whether the role reaches tiers",
     ),
     Mutation(
+        "C1-web-console-holds-the-gateway-master-key",
+        "charts/kube-agents/templates/web-console.yaml",
+        ("            - name: RELEASE_CHECK\n",
+         "            - name: LITELLM_MASTER_KEY\n"
+         "              valueFrom:\n"
+         "                secretKeyRef:\n"
+         "                  name: litellm-master-key\n"
+         "                  key: LITELLM_MASTER_KEY\n"
+         "            - name: RELEASE_CHECK\n"),
+        "test_C1_the_gateway_master_key_reaches_only_the_gateway_container",
+        "hand the web console the gateway's master key so its /model/info call "
+        "keeps working once the gateway checks keys",
+    ),
+    Mutation(
         "A4-web-console-reads-tiers",
         "charts/kube-agents/templates/web-console.yaml",
         ('    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]',
@@ -899,6 +913,15 @@ MUTATIONS: list[Mutation] = [
         "test_B1_kubectl_write_verbs_are_refused",
         "add delete to the read allowlist -- the single-line change an "
         "operator makes to unblock a skill",
+    ),
+    Mutation(
+        "B1-write-refusal-mark-any-read-only-refusal",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),\n", "            ,\n"),
+        "test_B1_the_broker_marks_only_a_refused_write_as_one",
+        "mark every read-only refusal a write refusal, the shorter rule: a "
+        "profile task then stops at a refused read spelling and reports a "
+        "write it never attempted",
     ),
     Mutation(
         "B1-image-gate",
@@ -1855,6 +1878,16 @@ Mutation(
         "trust the universe domain the environment names again, so a value "
         "the host's metadata server contradicts starts the broker and its "
         "credential goes to that domain's hosts",
+    ),
+    Mutation(
+        "C2-universe-domain-metadata-recheck",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        elif reported != configured:\n",
+         "        elif False and reported != configured:\n"),
+        "test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts",
+        "let a broker that started with no answer from the metadata server "
+        "keep the environment's value when the later answer contradicts it, "
+        "so its credential goes on to that domain's hosts",
     ),
     Mutation(
         "C3-policy-reads-a-file",

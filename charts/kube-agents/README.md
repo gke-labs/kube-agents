@@ -885,7 +885,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `appIdSecretRef` and `appPasswordSecretRef` (`name` and `key`). Optional
   single-tenant lock-down is set via `tenantId`, and user authorization is
   configured via `allowedUsers` (or `allowAllUsers: true`). Supports Microsoft
-  Adaptive Cards v1.5 with markdown fallback. Custom refs can likewise be
+  Adaptive Cards v1.5 with markdown fallback. `inbound.enabled: true` (with
+  `tenantId`) runs the receiver that accepts the messages Microsoft delivers for
+  the bot; expose its Service with your own Ingress. Custom refs can likewise be
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
@@ -1062,7 +1064,7 @@ operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads
 credential-proxy and `agent-api-auth` containers, and is left out.
 `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` is left out because it has no effect on `gcloud` there: the
 credential proxy does not pass the pod's value to the commands it runs, and sets the variable
-itself for the commands its exec tier runs. Pass the file beside your own values with
+itself for every command it runs. Pass the file beside your own values with
 `-f charts/kube-agents/examples/values-fleet.yaml`,
 after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
@@ -1506,6 +1508,9 @@ all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
 `platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
+The Teams inbound receiver is counted as one pod (`operatorRenderedPerReplica.teamsInboundReceiver`)
+while `platformAgent.integration.teams.inbound.enabled` is set beside `teams.enabled`; its cpu and
+memory are fixed in the operator.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.

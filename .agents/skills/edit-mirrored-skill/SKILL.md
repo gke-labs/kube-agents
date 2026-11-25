@@ -1,6 +1,6 @@
 ---
 name: edit-mirrored-skill
-description: Edit, sync or start mirroring a `gke-*` skill in `agents/platform/skills/` that is copied from google/skills. Use when changing one of those skills, updating it to upstream, or resolving a skill sync conflict.
+description: Edit, sync or start mirroring a `gke-*` skill in `agents/platform/skills/` that is copied from google/skills. Use when changing one of those skills, updating it to upstream, resolving a skill sync conflict, or reporting a general fix to google/skills from a `skills:upstream` tracking issue.
 ---
 
 # Task
@@ -126,6 +126,35 @@ a skill otherwise, patch it at its current pin ("Make a change").
    patches and the reason, any `append.md` note, and the patch count, share of lines changed and
    conflicts resolved. Question a retired patch whose `Retire-When:` does not start with `upstream`.
 7. To abandon a sync, delete `.skill-sync/<skill>/`. Nothing outside it has changed.
+
+## Report a general fix to google/skills
+
+A patch whose `Retire-When:` line starts with `upstream` gets a tracking issue (label
+`skills:upstream`) after a soak window
+([design](../../../docs/designs/upstream-skill-overlays.md#tracking-the-report-of-a-general-fix)).
+`.github/workflows/skill-upstream-tracking.yml` opens the issue, assigns the author of the commit
+that added the patch, and closes it. The task is for a person. As the assignee:
+
+1. Search the open and closed issues of `google/skills` for the fix. One issue there can serve
+   more than one patch.
+2. If no issue exists, file one. `google/skills` takes issues and no outside pull requests.
+3. Put the link to the `google/skills` issue in a comment on the tracking issue.
+4. When `google/skills` corrects the problem, sync the skill in its own pull request, with the
+   eval loop ("Sync to upstream").
+5. If the sync stops on a conflict in the patch, resolve to upstream's text. The sync then drops
+   the patch.
+6. If the patch stays after the sync, delete it ("Remove a change").
+7. If `google/skills` declines the fix, open a pull request that changes the line to
+   `Retire-When: never; <reason>`.
+
+- Do not close the tracking issue by hand; the workflow opens it again. The workflow closes it
+  when the patch file is gone from `main`, or when its `Retire-When:` line starts with `never;` or
+  `local`.
+- Write in comments only. Do not change the last line of the issue body, and do not remove the
+  label: the workflow finds the issue by both.
+- Do not rename a patch file by hand. If you do, the workflow closes the issue of the old name.
+  It opens an issue for the new name after a new soak window: then copy the `google/skills` link
+  to that issue.
 
 ## Start mirroring
 

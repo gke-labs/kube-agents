@@ -823,8 +823,9 @@ func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
 	// Sixteen held at once is the whole measurement: serial dispatch cannot
 	// show it, and the pool cannot show more. The wall clock is logged and
 	// not asserted, since sixty-four TLS handshakes on a loaded runner set
-	// it; the one-second bound the issue asks for is measured without them,
-	// in TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast.
+	// it; the four rounds the issue's one-second bound comes down to are
+	// counted without them, in
+	// TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast.
 	if peak != calloutWorkers {
 		t.Errorf("peak concurrent authorizations = %d, want exactly the %d slots: fewer means the sixteenth never arrived while the first was held, more means the pool bounds nothing", peak, calloutWorkers)
 	}
