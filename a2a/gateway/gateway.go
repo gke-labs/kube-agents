@@ -1938,13 +1938,6 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// conversation for its children: they are what is healed, not its own
 	// hand-off line (healFanOut). A batch cut short heals below, where its
 	// request is read back from the stream and finished (delegationHandled).
-	// A profile parent waiting on its batch has its children healed first,
-	// an end the relay missed or couldn't send going to it now
-	// (healProfileBatch), and is then healed below as any task is: its own
-	// terminal is its end.
-	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
-		g.healProfileBatch(ctx, rec, ref)
-	}
 	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier == "" && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
 		g.healFanOut(ctx, rec, active, ref)
 		return
@@ -1956,6 +1949,15 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
 	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID, g.profileRead(rec, active.TaskID, addressee))
+	// A profile parent still waiting on its batch has its children healed
+	// first, an end the relay missed or couldn't send going to it now
+	// (healProfileBatch), and is then healed below as any task is: its own
+	// terminal is its end. One whose own terminal is already on the stream
+	// (the relay missed it) has ended: nothing goes to it, and its heal
+	// below releases it and cancels its children (releaseEndedTask).
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() && !(err == nil && task.Final) {
+		g.healProfileBatch(ctx, rec, ref)
+	}
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only

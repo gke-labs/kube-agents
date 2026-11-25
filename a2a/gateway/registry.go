@@ -676,20 +676,13 @@ func (rec *SessionRecord) clearBatchText(parentID string) {
 func (ref *TaskRef) clearBatchText() {
 	end := *ref.BatchEnd
 	end.Text = ""
-	if end.Unsent {
-		// Not sent yet: the heal would send what is left, and an empty
-		// completed end (or a canceled one with no question) reads as a
-		// result. The parent is sent a failure that says the text was
-		// dropped instead, with no content of the child's.
-		end.State, end.Text = lib.StateFailed, unsentEndExpired
-	}
+	// An end not sent yet is dropped with its text: past AskTTL it can't be
+	// sent any more (the same bound clears the parent's attribution, which a
+	// send needs), and a resend of what is left would read as a result. The
+	// parent's own deadline bounds its wait, as for an end a restart drops.
+	end.Unsent = false
 	ref.BatchEnd = &end
 }
-
-// unsentEndExpired is the end a profile parent is sent for a batch child
-// whose end couldn't be sent before its text passed AskTTL
-// (TaskRef.clearBatchText).
-const unsentEndExpired = "the delegated task ended, but its result couldn't be sent before the gateway's retention for it ran out, so it was dropped"
 
 // markCardsPending marks a console chain's root (CardsPending).
 func (rec *SessionRecord) markCardsPending(rootID string) {

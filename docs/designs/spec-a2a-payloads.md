@@ -812,8 +812,8 @@ a single delegation, so its end has no `entry`. An end can arrive twice, so a pa
 batch dedupes its ends on `entry` and counts them to the batch's size, and a single delegation's
 on `childTaskId`. An end can also be late or lost. A send that fails is recorded unsent and sent again when the
 gateway's heal next reads the conversation, which also finds a child whose terminal the relay
-missed. If its text passes the ask's retention (`A2A_ASK_TTL`) before that, the end that goes is
-`failed`, saying the result was dropped, with none of the child's text. A withdrawn batch's ends
+missed. If its text passes the ask's retention (`A2A_ASK_TTL`) before that, the end is dropped, since nothing
+could send it then (the same bound clears what a send needs), and the parent's deadline bounds its wait. A withdrawn batch's ends
 are tried a few times on the spot instead, since the withdrawal leaves nothing for the heal to find;
 one that still fails is lost. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
 writes to, so the parent's own deadline is what bounds its wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the

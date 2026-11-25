@@ -240,6 +240,10 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]
 		if g.batchTextPast(*ref, now) {
+			if ref.BatchEnd.Unsent {
+				g.log.Warn("a batch child's end was never sent to its profile parent and is dropped at the ask bound; the parent's deadline bounds its wait",
+					"session", fresh.Key, "child", ref.ID, "parent", ref.ParentTaskID, "entry", ref.BatchIndex)
+			}
 			ref.clearBatchText()
 			batchTextIDs = append(batchTextIDs, ref.ID)
 			changed = true

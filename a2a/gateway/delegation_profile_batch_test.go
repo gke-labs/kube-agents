@@ -996,3 +996,35 @@ func TestAWithdrawnProfileBatchRetriesAnEndThatFailsToSend(t *testing.T) {
 		t.Fatalf("entries ended = %v, want 1 and 2", seen)
 	}
 }
+
+// TestAHealedProfileParentEndGetsNoBatchEnds: when the relay missed both a
+// profile parent's terminal and a child's, the heal reads the parent's own
+// end first. The parent has ended, so the child's end isn't sent to it; the
+// heal releases the conversation and cancels the live child instead.
+func TestAHealedProfileParentEndGetsNoBatchEnds(t *testing.T) {
+	t.Parallel()
+	r := startRestartableProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-healed-end-no-ends"
+	parent, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+	r2, _ := restartRig(t, r, func() {
+		completeChild(t, r, kids[0], "a is fine")
+		if err := parent.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+	r2.adapter.inbox <- InboundMessage{Conversation: conv, Backend: consoleBackend, Kind: "dm", AuthorID: consoleAuthor,
+		MessageID: "after-heal", Text: "anything new?"}
+	waitFor(t, "the live child cancelled by the heal", func() bool {
+		for _, e := range streamEnvelopes(t, r2.url, lib.TaskInSubject("cluster", kids[1].TaskID)) {
+			if e.env.Kind == lib.KindCancel {
+				return true
+			}
+		}
+		return false
+	})
+	if got := childResultsOn(t, r2, "chat", origin.TaskID); len(got) != 0 {
+		t.Fatalf("ends sent to a parent that had ended: %+v", got)
+	}
+}
