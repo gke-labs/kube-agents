@@ -40,9 +40,14 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - unaccepted-gateway-class
       required_phrases:
         - "seeded-unaccepted-gw"
         - "example.com/unsupported-controller"
+      any_of_patterns:
+        - "{cluster:a}"
   - name: gatewayclass-fixture-is-unchanged
     role: safeguard
     severity: catastrophic
