@@ -1,6 +1,9 @@
 package main
 
-import "strings"
+import (
+	"os"
+	"strings"
+)
 
 // coreAgentBuilder starts core-agent-harness (a2a/cmd/core-agent-harness),
 // one process per turn. The turn's tool policy and MCP servers reach it in
@@ -12,6 +15,10 @@ const (
 	// coreAgentPersonaDir is the persona the harness reads once per turn:
 	// rendered by a second UID, read-only to the harness (SEAM: dev-2, #6713).
 	coreAgentPersonaDir = "/var/lib/agent-persona"
+	// coreAgentPersonaRequiredEnv, "true" on a pod the operator renders a
+	// persona for, makes a missing persona dir fail the turn
+	// (TODO(#7143): the operator sets it with the persona render).
+	coreAgentPersonaRequiredEnv = "A2A_CORE_AGENT_PERSONA_REQUIRED"
 )
 
 // coreAgentHarnessPath is where the worker image puts core-agent-harness
@@ -24,6 +31,9 @@ func (coreAgentBuilder) defaultPath() string { return coreAgentHarnessPath }
 // in the stdin envelope.
 func (coreAgentBuilder) command(spec harnessSpec) []string {
 	argv := []string{spec.path, "--model", spec.model, "--persona-dir", coreAgentPersonaDir}
+	if os.Getenv(coreAgentPersonaRequiredEnv) == "true" {
+		argv = append(argv, "--persona-required")
+	}
 	return append(argv, spec.extra...)
 }
 

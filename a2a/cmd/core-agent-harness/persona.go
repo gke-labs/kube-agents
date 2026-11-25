@@ -22,14 +22,17 @@ import (
 // SEAM (dev-2): the persona's layout, rendered read-only to this process by
 // a second UID (#6713); PrepareTurn checks the directory before each spawn.
 // TODO(dev-2, #6713): replace this reader with coreagent.Snapshot(dir).
-func loadPersona(ctx context.Context, dir string) (string, []adktool.Toolset, error) {
+//
+// A missing dir is no persona, unless required: a pod configured for a
+// persona that finds none fails the turn rather than run without it.
+func loadPersona(ctx context.Context, dir string, required bool) (string, []adktool.Toolset, error) {
 	if dir == "" {
 		return "", nil, nil
 	}
 	root, err := os.OpenRoot(dir)
-	if errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, fs.ErrNotExist) && !required {
 		// No persona rendered for this pod: the turn runs on core-agent's
-		// own prompt. Whether a pod must have one is PrepareTurn's check.
+		// own prompt.
 		return "", nil, nil
 	}
 	if err != nil {
