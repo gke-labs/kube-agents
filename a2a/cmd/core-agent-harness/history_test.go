@@ -9,6 +9,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -227,8 +228,19 @@ func TestARefusedCallReachesTheHarnesssStderr(t *testing.T) {
 			lines = append(lines, l)
 		}
 	}
-	if len(lines) != 1 || lines[0] != `tool refused: "bash" (no allow rule matches)` {
-		t.Errorf("stderr refusal lines %q, want one for bash: %s", lines, errOut.String())
+	// The line names the call by the id the turn's tool_call event carries.
+	var callID string
+	for _, l := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev coreagentwire.Event
+		if json.Unmarshal([]byte(l), &ev) == nil && ev.Type == coreagentwire.TypeToolCall {
+			callID = ev.ID
+		}
+	}
+	if callID == "" {
+		t.Fatalf("no tool_call event: %s", out.String())
+	}
+	if want := `tool refused: "bash" (no allow rule matches) call ` + strconv.Quote(callID); len(lines) != 1 || lines[0] != want {
+		t.Errorf("stderr refusal lines %q, want [%q]: %s", lines, want, errOut.String())
 	}
 	if strings.Contains(errOut.String(), "secrets-xyz") {
 		t.Errorf("stderr carries the command: %s", errOut.String())

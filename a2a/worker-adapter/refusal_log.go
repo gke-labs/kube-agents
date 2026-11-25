@@ -17,7 +17,7 @@ const refusalLineMax = 512
 // refusalLine is a harness's refused-call line exactly: the prefix, a
 // Go-quoted tool name and a reason of plain words. Nothing else on the
 // harness's stderr, which can carry model or tool text, is logged.
-var refusalLine = regexp.MustCompile(`^` + regexp.QuoteMeta(coreagentwire.RefusalLogPrefix) + `("(?:[^"\\]|\\.){1,200}") \(([a-z' ]{1,64})\)$`)
+var refusalLine = regexp.MustCompile(`^` + regexp.QuoteMeta(coreagentwire.RefusalLogPrefix) + `("(?:[^"\\]|\\.){1,200}") \(([a-z' ]{1,64})\)(?: call ("(?:[^"\\]|\\.){1,200}"))?$`)
 
 // refusalLines is a harness stderr writer that logs each refused-call line
 // the harness writes (coreagentwire.RefusalLogPrefix), with its tool and
@@ -67,5 +67,13 @@ func (r *refusalLines) emit(line []byte) {
 	if err != nil {
 		return
 	}
-	r.log.Info("the harness refused a tool call", "tool", tool, "reason", string(m[2]))
+	attrs := []any{"tool", tool, "reason", string(m[2])}
+	if len(m[3]) > 0 {
+		call, err := strconv.Unquote(string(m[3]))
+		if err != nil {
+			return
+		}
+		attrs = append(attrs, "call", call)
+	}
+	r.log.Info("the harness refused a tool call", attrs...)
 }

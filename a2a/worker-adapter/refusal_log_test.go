@@ -25,6 +25,8 @@ func TestOnlyARefusedCallLineReachesTheWorkerLog(t *testing.T) {
 		"tool refused: \"bash\" (no allow rule matches) and the command was secret\n",
 		"tool refused: \"x\\nforged\" (no such tool)\n",
 		"tool refused: \"" + strings.Repeat("a", 600) + "\" (no such tool)\n",
+		"tool refused: \"grep\" (outside the workspace) call \"adk-7f3a\"\n",
+		"tool refused: \"grep\" (outside the workspace) call \"x\" and more\n",
 		"tool refused: \"edit_file\" (not in the turn's grant)",
 	} {
 		if _, err := r.Write([]byte(w)); err != nil {
@@ -40,9 +42,13 @@ func TestOnlyARefusedCallLineReachesTheWorkerLog(t *testing.T) {
 		if rec["task"] != "t1" {
 			t.Errorf("record %v has no task", rec)
 		}
-		got = append(got, rec["tool"].(string)+"|"+rec["reason"].(string))
+		entry := rec["tool"].(string) + "|" + rec["reason"].(string)
+		if call, ok := rec["call"].(string); ok {
+			entry += "|" + call
+		}
+		got = append(got, entry)
 	}
-	want := []string{"bash|no allow rule matches", "read_file|outside the workspace", "x\nforged|no such tool"}
+	want := []string{"bash|no allow rule matches", "read_file|outside the workspace", "x\nforged|no such tool", "grep|outside the workspace|adk-7f3a"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("logged %q, want %q", got, want)
 	}

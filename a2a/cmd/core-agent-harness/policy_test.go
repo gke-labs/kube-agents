@@ -440,7 +440,7 @@ func TestEachRefusedCallLogsOneLineWithoutItsArguments(t *testing.T) {
 				t.Fatal("no refusal to log")
 			}
 			var b strings.Builder
-			logRefusal(&b, c.tool, c.err)
+			logRefusal(&b, c.tool, "", c.err)
 			if got := strings.TrimSuffix(b.String(), "\n"); got != c.want {
 				t.Errorf("logged %q, want %q", got, c.want)
 			}
@@ -452,7 +452,7 @@ func TestEachRefusedCallLogsOneLineWithoutItsArguments(t *testing.T) {
 		})
 	}
 	var b strings.Builder
-	logRefusal(&b, "read_file", fmt.Errorf("open /scratch/missing: no such file or directory"))
+	logRefusal(&b, "read_file", "", fmt.Errorf("open /scratch/missing: no such file or directory"))
 	if b.Len() != 0 {
 		t.Errorf("a tool error that isn't a refusal logged %q", b.String())
 	}
