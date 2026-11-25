@@ -1448,6 +1448,14 @@ platformAgent:
       # pod. Against a PlatformAgent CRD that predates the field the chart
       # fails; apply crds/ first (upgrade.sh does).
       # defaultRoute: platform
+      # warmSessions is how many warm session pods the gateway keeps ready on
+      # the session route, so a new conversation's first turn skips scheduling
+      # and the image pull. Unset means 1. Each costs one session pod's requests
+      # (sessionResources) while it waits, billed on Autopilot; 0 turns the pool
+      # off. It never takes the session cap's last slot. Against a PlatformAgent
+      # CRD that predates the field the chart fails; apply crds/ first
+      # (upgrade.sh does).
+      # warmSessions: 0
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
