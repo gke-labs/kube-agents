@@ -66,9 +66,10 @@ April close every morning forever. Post a fresh one.
 
 The same rule covers a declared `no-pdb` finding whose PodDisruptionBudget `finish` writes itself.
 A merged or closed pull request that carried the budget stops `finish` writing it again, so the
-finding stays `manual`. A `/remediate` written after that pull request merged or closed sets it
-aside: `finish` writes the budget again and opens a new pull request. An older request leaves the
-finding `manual`, and is refused as not a `manifest`.
+finding stays `manual`. A `/remediate <finding-id>` naming it, written after that pull request
+merged or closed, sets it aside: `finish` writes the budget again and opens a new pull request. An older request leaves the
+finding `manual`, and is refused as not a `manifest`. `/remediate all` does not name it, so it does
+not set the pull request aside.
 
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
