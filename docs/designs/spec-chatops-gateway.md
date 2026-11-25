@@ -3285,21 +3285,23 @@ recorded without the answer's text and without the redraw, and a re-rating that 
 answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
 names a post (`postKindOf`), so an alert its triage edits stays as it was.
 
-While work is going on in a conversation the adapter keeps Teams's typing indicator on there
-(`teams_typing.go`): a `typing` activity posted through the passthrough, and again every three
-seconds because Teams clears it. Teams draws no reaction and no Working… status, and a line or a
-plan sitting unchanged does not read as work. The indicator is held by each chain the gateway
-started there (`TaskObserver`) and by the conversation's session mark while its ask is open and
-not blocked (`MarkObserver`), which is how card work the gateway cannot see keeps it on, as it
-keeps Slack's Working… status (`slackSession.wanted`). A blocked settle (the work waits on the person) releases the mark's hold and pauses the posts
-even under a chain still running, since "is typing" under a question would mislead; a chain
-starting, the person's answer, lifts the pause. The
-indicator stops with the last hold, and ten minutes after the newest hold was added at the
-latest (`teamsTypingMax`), since only a notify settles an older ask; a later hold starts it
-again. A post that fails is
-dropped and the next one tries again. Teams accepts the post in every conversation and draws
-it only in some: a live run showed the indicator in a one-to-one chat with the bot and nothing
-in a channel thread, so a channel has the line and the plan alone.
+While card work is open in a conversation with nothing on screen that shows it, the adapter
+keeps Teams's typing indicator on there (`teams_typing.go`): a `typing` activity posted through
+the passthrough, and again every three seconds. Teams draws no reaction and no Working… status,
+and an acknowledgement or a plan sitting unchanged does not read as work. The indicator is
+wanted while the conversation's session mark has an open ask that is not blocked
+(`MarkObserver`), which is how card work the gateway cannot see is known, as it is for Slack's
+Working… status (`slackSession.wanted`); a blocked settle (the work waits on the person) stops
+it. It is not posted while a chain the gateway started is running there (`TaskObserver`), nor
+within one interval of that chain's end. A live run showed why: Teams leaves the indicator on
+screen for about twenty seconds after the last post unless a new message from the bot clears
+it, and a chain's answer is an edit of its line, so typing beside a running chain sat under its
+answer. The hand-off's answer is a new message. The indicator stops ten minutes after the ask
+opened or the newest chain started at the latest (`teamsTypingMax`), since only a notify
+settles an older ask; a later chain starts it again. A post that fails is dropped and the next
+one tries again. Teams accepts the post in every conversation and draws it only in some: a
+live run showed the indicator in a one-to-one chat with the bot and nothing in a channel
+thread, so a channel has the line and the plan alone.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
