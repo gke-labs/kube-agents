@@ -1191,6 +1191,11 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# Node-pool kubelet cpuCfsQuota=false enforcement probe (#2599, #2799, #7179):
+# disabling cpuCfsQuota turns off kernel CPU limit enforcement for multi-tenant
+# workloads on that pool. deployer: noop, no fixture.
+./tasks/consistency-kcc-kubelet-cfs-quota-drift/task.yaml
+
 # #2800: the drift audit's kubelet-config facet, the second voted by node
 # pool. seeded-c's default-pool sets podPidsLimit where the stack's other
 # pools set no kubelet key the facet reads; graded on the ledger's
