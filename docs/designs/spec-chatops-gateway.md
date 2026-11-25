@@ -931,9 +931,11 @@ framing is the defence against an instruction in a child's text, and one that ge
 at most what the parent's own grant allows. The harness's next result is the task's deliverable,
 held to the same checks as any other answer (one that opens with unstructured reasoning is
 withheld), and the task's final status is what cancels any child still running. An open parent
-holds its worker pod, its task consumer and its dispatch lease for the whole fan-out. A profile
-task's submission carries no `delegateTargets` part, so its tool names only `platform` in the
-addressee description and offers no batch.
+holds its worker pod, its task consumer and its dispatch lease for the whole fan-out. A delegating
+profile task's submission carries the gateway's `delegateTargets` part (above), so its tool names
+the profiles the delegation would accept and offers a batch up to the width. A submission without
+the part (from a gateway that predates it) leaves the tool naming only `platform`, which a profile
+parent may not reach, with no batch.
 
 ## Session lifecycle
 
