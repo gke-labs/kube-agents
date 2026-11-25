@@ -91,7 +91,8 @@ func validate(args []string, stderr io.Writer) error {
 
 // manifestCmd writes --in's content manifest, then loads the persona with
 // the manifest required, so a persona that doesn't load fails the command
-// (its new manifest stays; fix the persona and run it again).
+// (its new manifest stays; fix the persona and run it again). With --git it
+// loads a clean copy of the files the manifest covers.
 func manifestCmd(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("manifest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -114,7 +115,37 @@ func manifestCmd(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return persona.WriteIntegrityManifestOf(*in, rels)
+	if err := persona.WriteIntegrityManifestOf(*in, rels); err != nil {
+		return err
+	}
+	return loadCleanCopy(*in, append(rels, persona.IntegrityManifestFile))
+}
+
+// loadCleanCopy copies rels (paths relative to dir, slash-separated) to a
+// temporary directory and loads that copy with the manifest required: what a
+// clean checkout of dir holds, so an ignored local file that --git left out
+// of the manifest can't fail the load. A path listed twice is copied once.
+func loadCleanCopy(dir string, rels []string) error {
+	tmp, err := os.MkdirTemp("", "persona-manifest-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	for _, rel := range rels {
+		data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(tmp, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return err
+		}
+	}
+	_, err = persona.LoadWithOptions(tmp, persona.Options{RequireIntegrity: true})
+	return err
 }
 
 // gitListArgs lists, relative to the directory git runs in, the files a

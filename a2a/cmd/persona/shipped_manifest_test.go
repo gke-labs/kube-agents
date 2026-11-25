@@ -280,3 +280,27 @@ func TestManifestCommandFromGitLeavesIgnoredFilesAlone(t *testing.T) {
 		t.Errorf("the ignored file was removed: %v", err)
 	}
 }
+
+// manifest --git loads what it covered, so a persona that doesn't load fails
+// the command (and make persona-manifests with it), not only the later test.
+func TestManifestCommandFromGitRefusesAPersonaThatDoesNotLoad(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	repo := t.TempDir()
+	dir := filepath.Join(repo, "persona")
+	if err := os.Rename(copyDir(t, "../../lib/persona/testdata/example"), dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "persona.yaml"), []byte("name: [unclosed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "-C", repo, "init", "-q")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	var out, errb strings.Builder
+	if code := run([]string{"manifest", "--git", "--in", dir}, &out, &errb); code == 0 {
+		t.Fatal("manifest --git accepted a persona whose persona.yaml doesn't parse")
+	}
+}
