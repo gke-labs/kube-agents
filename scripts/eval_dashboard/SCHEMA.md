@@ -264,7 +264,7 @@ layout and are collected from the moment they start running.
       billed on both transports: on the api transport the front door's
       session plus its delegated workers; on the inject transport the front
       door's turns plus the chain's child tasks plus the workers (and null
-      when the gateway reported no usage, whatever the workers billed).
+      when the harness holds no usage for the chain, whatever the workers billed).
       `input` and `output` differ by transport: on the api transport they
       include the workers and `input` excludes cached reads (unless the
       front door's session row could not be read); on the inject

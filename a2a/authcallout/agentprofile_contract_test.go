@@ -234,4 +234,7 @@ func TestTheOperatorsCardCarriesTheRoutingFieldsLibReads(t *testing.T) {
 	if !card.YieldToPinned {
 		t.Error("yieldToPinned didn't decode: the operator's JSON name and lib's differ")
 	}
+	if !card.Delegates {
+		t.Error("delegates didn't decode: the operator's JSON name and lib's differ")
+	}
 }

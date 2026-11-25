@@ -656,6 +656,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.DelegationWidthMax <= 0 {
 		o.Config.DelegationWidthMax = defaultDelegationWidthMax
 	}
+	o.Config.DelegationRoundsMax = clampDelegationRounds(o.Config.DelegationRoundsMax, log)
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
 	}
@@ -3505,6 +3506,20 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		} else {
 			extra = append(extra, part)
 		}
+	}
+	// A profile task submitted on its own, neither a child nor a wake (no
+	// via), of a profile whose card says it delegates, carries the profiles
+	// it may delegate to and the width, which its worker's delegate tool
+	// names (#6789): what the delegation will accept from it
+	// (profileDelegateTargets). Every other profile submission is as it was.
+	if ts.Route != nil && ts.Role == "" && ts.Authority.Via == nil {
+		// The entry startTaskWith writes below, as far as the delegation's
+		// checks read it.
+		requester := ts.Requester
+		parent := TaskRef{Addressee: addressee, Requester: &requester, Attribution: ts.Authority.Attribution(),
+			Depth: ts.Depth, Tier: string(ts.Route.Tier), Scope: string(ts.Route.Scope), ProfileChain: ts.ProfileChain}
+		parent.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
+		extra = append(extra, g.profileTargetsParts(rec, parent, taskID)...)
 	}
 	// A turn answering a report its client named carries the task that
 	// filed it, so the executor can read the report stored for that turn.

@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"regexp"
@@ -71,6 +72,15 @@ const defaultDelegationDepthMax = 3
 // defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationWidthMax = 10
+
+// delegationRoundsEnv sets DelegationRoundsMax.
+const delegationRoundsEnv = "A2A_DELEGATION_ROUNDS_MAX"
+
+// delegationRoundsSupportedMax is the most rounds New lets DelegationRoundsMax
+// keep: one, until a profile parent's later rounds (a new batch after the
+// first's ends are delivered) land. A higher setting is clamped to it, with a
+// warning, rather than advertised to a worker the gateway would then refuse.
+const delegationRoundsSupportedMax = 1
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
 // accepts: ten, the fleet question's width (#5682). The children queue to
@@ -874,6 +884,20 @@ type Config struct {
 	// does the depth bound, and one over 10.
 	DelegationWidthMax int
 
+	// DelegationRoundsMax bounds how many delegate requests one profile
+	// task may make (A2A_DELEGATION_ROUNDS_MAX), each minted or refused
+	// using up one; a request past it is refused under delegation.rounds.
+	// With rounds left, a request while the last round's children still run
+	// is no new round and stays a busy ignore; with none left (the default
+	// of one) it is refused like any other. A profile task's delegateTargets part
+	// advertises it when over one.
+	//
+	// Zero means 1. New clamps it to 1 to lib.DelegateRoundsCeiling, and
+	// then to delegationRoundsSupportedMax (1) with a warning, until rounds
+	// past the first are supported. FromEnv refuses a value that is not an
+	// integer.
+	DelegationRoundsMax int
+
 	// ScopeFile is the rendered spec.scope a profile task's target is
 	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
 	// routed task, so an edit reaches the gateway without a restart. A
@@ -1290,6 +1314,13 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
+	if v := strings.TrimSpace(os.Getenv(delegationRoundsEnv)); v != "" {
+		rm, err := strconv.Atoi(v)
+		if err != nil || rm < 1 {
+			return nil, fmt.Errorf("%s %q: need an integer from 1 to %d", delegationRoundsEnv, v, lib.DelegateRoundsCeiling)
+		}
+		cfg.DelegationRoundsMax = rm
+	}
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
 	ba, err := strconv.Atoi(busyAt)
 	if err != nil || ba < 1 {
@@ -1594,3 +1625,23 @@ const envSessionHarness = "A2A_SESSION_HARNESS"
 // sessionHarnesses are the harnesses the gateway spawns session pods for.
 // Antigravity joins when its worker isolation lands.
 var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
+
+// clampDelegationRounds is the DelegationRoundsMax New keeps: unset is one, a
+// value outside 1 to lib.DelegateRoundsCeiling is clamped into it, and any
+// value over delegationRoundsSupportedMax is clamped to that, with a warning
+// naming the variable, until rounds past the first are supported.
+func clampDelegationRounds(n int, log *slog.Logger) int {
+	if n == 0 {
+		return 1
+	}
+	set := n
+	n = max(1, min(n, lib.DelegateRoundsCeiling))
+	if n > delegationRoundsSupportedMax {
+		log.Warn(delegationRoundsEnv+": rounds above 1 are not supported yet; using 1", "set", set, "using", delegationRoundsSupportedMax)
+		return delegationRoundsSupportedMax
+	}
+	if n != set {
+		log.Warn(delegationRoundsEnv+": out of range; clamped", "set", set, "using", n, "max", lib.DelegateRoundsCeiling)
+	}
+	return n
+}
