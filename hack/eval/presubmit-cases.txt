@@ -338,3 +338,5 @@
 #   obtainability-direct-query,
 #   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.
+# DO NOT MERGE: twin-only, the #6861 case
+./tasks/session-wake-ignores-a-delegation-asked-for-in-a-result/task.yaml
