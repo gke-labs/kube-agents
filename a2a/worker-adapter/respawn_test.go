@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 )
 
 // respawnScope stands the adapter in as the container's init, with the
@@ -436,7 +437,9 @@ exit 0
 	session, taskID := "chat-ca-respawn", "task-ca-respawn"
 	origin := submit(t, c, session, taskID, "start")
 	cfg := adapterConfig(url, taskID, session, harness)
-	cfg.Driver = newCoreAgentDriver()
+	d := newCoreAgentDriver()
+	d.MCP = []coreagentwire.MCPServer{{Name: "srv", Command: "/bin/true", Tools: []string{"t"}}}
+	cfg.Driver = d
 	useRespawnScope(t)
 	done := runAdapter(context.Background(), cfg)
 	waitFileFor(t, filepath.Join(dir, "turn.1"), 10*time.Second)
@@ -458,9 +461,10 @@ exit 0
 		t.Errorf("turn one's process was written to after its envelope: %q", late)
 	}
 	var env2 struct {
-		Message string            `json:"message"`
-		Session string            `json:"session"`
-		History []json.RawMessage `json:"history"`
+		Message string                    `json:"message"`
+		Session string                    `json:"session"`
+		History []json.RawMessage         `json:"history"`
+		MCP     []coreagentwire.MCPServer `json:"mcp"`
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "envelope.2"))
 	if err := json.Unmarshal(b, &env2); err != nil {
@@ -468,6 +472,11 @@ exit 0
 	}
 	if env2.Message != respawnSteer {
 		t.Errorf("process 2's message is %q; want the held steer", env2.Message)
+	}
+	// The turn's driver starts the next process, so its per-turn state
+	// (here its MCP servers) is in that envelope too.
+	if len(env2.MCP) != 1 || env2.MCP[0].Name != "srv" {
+		t.Errorf("process 2's envelope carries MCP %+v; want the turn's server", env2.MCP)
 	}
 	if env2.Session != "ca-1" || len(env2.History) != 1 || !strings.Contains(string(env2.History[0]), `"turn":1`) {
 		t.Errorf("process 2 resumes session %q with history %s; want ca-1 with turn one's event", env2.Session, env2.History)

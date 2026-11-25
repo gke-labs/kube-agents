@@ -947,10 +947,14 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	// each later turn of this task on a fresh process that resumes the same
 	// conversation, started only after the last one and everything it
 	// started are gone and the driver has prepared the turn.
-	var respawn func(prompt string, left time.Duration) (*harnessProc, error)
+	var respawn *respawner
 	if restartsPerTurn(drv) {
 		resumed := plan.resume != ""
-		respawn = func(prompt string, left time.Duration) (*harnessProc, error) {
+		// Both halves use this turn's driver, drv, not a.cfg.Driver: a
+		// driver can carry per-turn state (its MCP servers, its rules) that
+		// the next process of the same turn must get too.
+		respawn = &respawner{prepare: func(dirs TurnDirs) error { return drv.PrepareTurn(ctx, dirs) }}
+		respawn.start = func(prompt string, left time.Duration) (*harnessProc, error) {
 			// The session the harness reported wins; the plan's resume id
 			// stands only if it reported none. The budget goes on argv as
 			// it was before the first process's, so each process carries
@@ -971,6 +975,14 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 
 	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh, respawn)
 	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
+}
+
+// respawner is a one-turn-per-process driver's next process: prepare runs
+// the driver's PrepareTurn for it and start starts it, both with the turn's
+// own driver.
+type respawner struct {
+	prepare func(TurnDirs) error
+	start   func(prompt string, left time.Duration) (*harnessProc, error)
 }
 
 // evictedReason is the terminal's reason when the pod is stopped mid-task.
@@ -1007,7 +1019,14 @@ const (
 	stopDeadline     supervisorStop = "deadline"
 	stopAbandoned    supervisorStop = "abandoned"
 	stopWriteRefused supervisorStop = "write-refused"
-	stopDelegated    supervisorStop = "delegated"
+	// stopDelegated is a record only in respawn mode: a delegation can't
+	// precede a respawn. The next process's steer is taken only at a turn's
+	// result, and the delegate arm refuses once one is taken (nextPrompt)
+	// or the result is in; a delegation before the result ends the turn
+	// with no steer taken, so the loop ends the task with the delegation
+	// line before any respawn decision. TestNoSupervisorStopStartsAnotherProcess
+	// pins that behaviour; this record backs it up.
+	stopDelegated supervisorStop = "delegated"
 	// stopEvicted: SIGTERM; supervise returns from that arm at once.
 	stopEvicted supervisorStop = "evicted"
 )
@@ -1025,7 +1044,7 @@ var supervisorStops = []supervisorStop{stopDecided, stopCanceled, stopDeadline, 
 // and once it has exited, drained and been reaped with everything it started
 // (killLeftovers), the driver prepares the next turn and respawn starts a
 // fresh harness on the same conversation with the steer as its prompt.
-func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-chan string, cancelCh <-chan struct{}, delegateCh <-chan delegateAsk, respawn func(prompt string, left time.Duration) (*harnessProc, error)) (Result, error) {
+func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-chan string, cancelCh <-chan struct{}, delegateCh <-chan delegateAsk, respawn *respawner) (Result, error) {
 	log := a.log
 	started := time.Now()
 	deadline := time.NewTimer(a.cfg.TaskDeadline)
@@ -1481,7 +1500,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				"task", a.taskID, "stops", halted, "exitErr", waitErr)
 			break
 		}
-		if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
+		if err := respawn.prepare(a.turnDirs(proc.cmd.Env)); err != nil {
 			log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
 			sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
 			halt(stopDecided)
@@ -1494,7 +1513,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		prompt := nextPrompt
 		nextPrompt = ""
-		next, err := respawn(prompt, a.cfg.TaskDeadline-time.Since(started))
+		next, err := respawn.start(prompt, a.cfg.TaskDeadline-time.Since(started))
 		if err != nil {
 			log.Warn("starting the next harness process failed; ending the task", "task", a.taskID, "err", err)
 			sawResult, resultErr, resultText = true, "spawn-failed"+reasonDetailSeparator+err.Error(), ""
