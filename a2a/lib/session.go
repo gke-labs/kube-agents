@@ -91,6 +91,13 @@ const (
 	// spec.harness.type.
 	EnvHarnessUnisolated   = "A2A_HARNESS_UNISOLATED"
 	HarnessUnisolatedAllow = "allow"
+
+	// EnvToolWithheld lists, comma-separated, the worker container's
+	// variables sourced from a Secret (an env entry's secretKeyRef). The
+	// worker withholds each one from the processes a turn's tools start. It
+	// names variables, not values. The operator renders the same name for
+	// profile workers (k8s-operator's envToolWithheld).
+	EnvToolWithheld = "A2A_TOOL_WITHHELD_ENV"
 	// EnvPersonaIntegrity sets whether a profile worker requires its persona
 	// to carry a build-time content manifest (persona.IntegrityManifestFile).
 	// PersonaIntegrityRequired refuses a persona without one; unset loads it
