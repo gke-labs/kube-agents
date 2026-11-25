@@ -21,9 +21,11 @@ import (
 // still open, which the gateway cannot see any other way, and a blocked
 // settle is work waiting on the person. So the indicator is held by each
 // running task and by an open ask that is not blocked, as Slack holds its
-// Working… status (slackSession.wanted), and it is not posted at all while
-// the settle is blocked: "is typing" under a question the person has to
-// answer would say the opposite of what is true. All of these calls arrive under
+// Working… status (slackSession.wanted), and it is not posted while the
+// settle is blocked: "is typing" under a question the person has to answer
+// would say the opposite of what is true. The person's answer starts a new
+// task, which is work again whatever the mark still says, so a task
+// starting lifts the pause. All of these calls arrive under
 // the session lock, so they only record and return; one loop per
 // conversation posts a `typing` activity through the broker's passthrough,
 // again every teamsTypingInterval because Teams clears the indicator a few
@@ -36,8 +38,9 @@ const (
 	// teamsTypingInterval is how often the indicator is posted again;
 	// Teams shows one for about three seconds.
 	teamsTypingInterval = 3 * time.Second
-	// teamsTypingRequestTimeout bounds one post, under the interval, so a
-	// stalled broker holds one request per conversation and not a queue.
+	// teamsTypingRequestTimeout bounds one post on the gateway's side,
+	// under the interval, so the loop never waits on a stalled broker. The
+	// broker's own call to Microsoft can outlive it.
 	teamsTypingRequestTimeout = 2 * time.Second
 	// teamsTypingMax ends the loop for a conversation whose task never
 	// reports an end, so no indicator outlives its work by more than this.
@@ -106,6 +109,9 @@ func (a *TeamsAdapter) holdTyping(conversation, hold string) {
 	if _, held := t.holds[hold]; !held {
 		t.holds[hold] = struct{}{}
 		t.deadline = time.Now().Add(a.typingMax)
+		if hold != teamsTypingMarkHold {
+			t.blocked = false
+		}
 	}
 }
 

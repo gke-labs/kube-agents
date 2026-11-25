@@ -49,6 +49,8 @@ func teamsTypingSettled(t *testing.T, relay *fakeTeamsRelay) int {
 // task runs; the task ending turns it off.
 func TestTeamsTypesWhileATaskRuns(t *testing.T) {
 	a, relay := typingTeamsAdapter(t)
+	m := NewMetrics()
+	a.SetMetrics(m)
 	conversation := "teams:" + testTeamsChannel
 	a.TaskStarted(conversation, "task-1")
 	waitFor(t, "the indicator posted more than once", func() bool { return teamsTypingCount(relay) >= 3 })
@@ -67,6 +69,14 @@ func TestTeamsTypesWhileATaskRuns(t *testing.T) {
 	}
 	if n := teamsCallCount(relay); n != 0 {
 		t.Fatalf("the indicator posted %d messages, want none", n)
+	}
+	// A typing post creates no message, so it is counted with the
+	// passthrough's other calls and not among the creates.
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(metricsLabelOther, teamsCallOK)); got < 3 {
+		t.Errorf("typing posts counted as other = %d, want every one", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodCreate, teamsCallOK)); got != 0 {
+		t.Errorf("typing posts counted as creates = %d, want none", got)
 	}
 }
 
@@ -191,6 +201,20 @@ func TestTeamsTypingBoundRunsFromTheNewestHold(t *testing.T) {
 	time.Sleep(time.Until(start.Add(15 * testTeamsTypingInterval)))
 	before := teamsTypingCount(relay)
 	waitFor(t, "the indicator went on for the second task", func() bool { return teamsTypingCount(relay) >= before+2 })
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+}
+
+// The person's answer to the agent's question starts a task while the mark
+// still says the work waits on them: the indicator comes back with it.
+func TestTeamsTypesAgainWhenThePersonAnswers(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	a.MarkChanged(conversation, "investigate", markSettleBlocked)
+	settled := teamsTypingSettled(t, relay)
+	a.TaskStarted(conversation, "task-2")
+	waitFor(t, "the indicator came back with the answer's task", func() bool { return teamsTypingCount(relay) >= settled+2 })
 	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
 	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
 }

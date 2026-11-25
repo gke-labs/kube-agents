@@ -3292,7 +3292,8 @@ plan sitting unchanged does not read as work. The indicator is held by each chai
 started there (`TaskObserver`) and by the conversation's session mark while its ask is open and
 not blocked (`MarkObserver`), which is how card work the gateway cannot see keeps it on, as it
 keeps Slack's Working… status (`slackSession.wanted`). A blocked settle (the work waits on the person) releases the mark's hold and pauses the posts
-even under a chain still running, since "is typing" under a question would mislead. The
+even under a chain still running, since "is typing" under a question would mislead; a chain
+starting, the person's answer, lifts the pause. The
 indicator stops with the last hold, and ten minutes after the newest hold was added at the
 latest (`teamsTypingMax`), since only a notify settles an older ask; a later hold starts it
 again. A post that fails is
