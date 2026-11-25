@@ -462,14 +462,11 @@ func scScaleDocument(t *testing.T, decl *scopeDeclaration, now time.Time, rows, 
 // bound measures the build rather than the suite's load.
 func TestScopeClustersAtScale(t *testing.T) {
 	const rows, perProject = 5000, 2
-	// The bound on one build after the read. A build here takes about 5ms
-	// with the map (3ms without); with the member hash and the row scan
-	// per project it took about 650ms, and re-parsing the listing on each
-	// build added about 9ms. A tenfold regression passes the bound.
-	// The fastest of the builds is held to it: that is the build's own cost,
-	// where the slowest also carries a scheduler or GC pause on a busy runner
-	// (CI saw 74ms once).
-	const buildBound = 40 * time.Millisecond
+	// The two costs this guards are counted, not timed (a wall-clock bound
+	// failed on shared runners): the member hash and the row scan once per
+	// project (about 650ms at 5000 rows) is one resolved index per page build,
+	// whatever the project count, and re-parsing the listing on each build is
+	// the parsed listing kept for the document read.
 	explicit := make([]string, 0, 40)
 	for i := range 40 {
 		explicit = append(explicit, fmt.Sprintf("explicit-%03d", i))
@@ -499,14 +496,19 @@ func TestScopeClustersAtScale(t *testing.T) {
 		g.cfg.Namespace = chainTestNamespace
 
 		got := g.profileScopeClusters(parent) // the read, the parse, and the first build
-		fastest := time.Duration(1<<63 - 1)
+		// This test isn't parallel, so no other test builds an index while
+		// the hook counts (parallel tests wait for the sequential ones).
+		indexes := 0
+		onResolvedIndex = func() { indexes++ }
 		for range 5 {
-			start := time.Now()
 			again := g.profileScopeClusters(parent)
-			fastest = min(fastest, time.Since(start))
 			if !reflect.DeepEqual(again, got) {
 				t.Fatalf("a second build differs: %+v", again)
 			}
+		}
+		onResolvedIndex = nil
+		if indexes != 5 {
+			t.Fatalf("with the map %v: 5 builds over %d projects built %d resolved indexes, want one each", withClusters, rows, indexes)
 		}
 		// The listing was parsed once for the document the source holds.
 		cache := g.resolvedScope.(*configMapResolvedScope)
@@ -540,9 +542,6 @@ func TestScopeClustersAtScale(t *testing.T) {
 		if len(got.UnlistedProjects) != lib.ScopeClustersUnlistedMax {
 			t.Fatalf("%d unlisted named, want %d", len(got.UnlistedProjects), lib.ScopeClustersUnlistedMax)
 		}
-		if fastest > buildBound {
-			t.Fatalf("with the map %v: the fastest of the builds over %d rows took %v, over %v", withClusters, rows, fastest, buildBound)
-		}
-		t.Logf("with the map %v: %d rows, %d-byte document, fastest build %v", withClusters, rows, len(raw), fastest)
+		t.Logf("with the map %v: %d rows, %d-byte document, one resolved index per build", withClusters, rows, len(raw))
 	}
 }

@@ -247,7 +247,14 @@ type resolvedIndex struct {
 	excluded map[string]bool
 }
 
+// onResolvedIndex, when set (tests only), runs each time newResolvedIndex
+// builds an index, so a test can count builds instead of timing them.
+var onResolvedIndex func()
+
 func newResolvedIndex(doc *resolvedScope, decl *scopeDeclaration) *resolvedIndex {
+	if onResolvedIndex != nil {
+		onResolvedIndex()
+	}
 	x := &resolvedIndex{doc: doc, bound: resolvedScopeBound(scopeMaxProjects(decl))}
 	if doc == nil || doc.V != resolvedScopeVersion {
 		return x
