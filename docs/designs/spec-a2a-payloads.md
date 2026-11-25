@@ -840,8 +840,9 @@ has used its rounds (`roundsMax`, one by default) is refused with the next round
 earlier request's children, if it minted any, are still the task's to wait for, and a waiting parent keeps
 waiting on them. The gateway mints nothing for that request, records nothing, and posts nothing to the room.
 With rounds left (`roundsMax` above one, which this gateway doesn't take yet), a task's next request waits
-for its current round to settle: every child's end recorded, or its single child ended and the task holding
-the conversation again. A request before that is ignored as busy. The next round's children carry its
+for its current round to settle: every child ended and no child still running (a batch child that asked is
+cancelled, and counts until that lands), every end sent to the task, and for a single child, the task
+holding the conversation again. A request before that is ignored as busy. The next round's children carry its
 number, their entries start again at 1, and the earlier rounds' children stay on the record for a stop to
 reach.
 `round` is a JSON number from 0 to 16 (`lib.DelegateRoundsCeiling`); a part whose `round` is another type or

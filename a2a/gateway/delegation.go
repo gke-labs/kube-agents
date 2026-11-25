@@ -179,7 +179,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 			g.log.Error("session record write failed after a delegation minted no child", "conversation", rec.Key, "err", err)
 		}
-		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, wireRound(round))
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, wireRound(round), false)
 	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
@@ -217,7 +217,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	refuseRounds := func(notice string, extra ...any) {
 		used := roundsUsed(parent)
 		log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationRounds, "roundsUsed", used, "roundsMax", g.cfg.DelegationRoundsMax}, audit...), extra...)...)
-		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+fmt.Sprintf(noticeDelegationRounds, used, plural(used))+notice), used+1)
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+fmt.Sprintf(noticeDelegationRounds, used, plural(used))+notice), used+1, true)
 	}
 	// A profile parent stays open after its request, so it can ask again
 	// after one that ended (DelegationEnd: refused, not started, or a batch
@@ -268,7 +268,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			// every child's end recorded (a batch) or the child ended and
 			// the conversation back with the parent (a single child). A
 			// request before that is no new round.
-			if !profileParent || profileChildrenRunning(rec, parent, last) {
+			if !profileParent || !g.roundSettled(ctx, rec, parent, last) {
 				ignore(ruleDelegationBusy, "child", last)
 				return
 			}
@@ -290,8 +290,12 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// the request is decided (startRound's callers), not here.
 	if profileParent {
 		used, started := roundsUsed(parent), 0
+		// A plan written with no child minted yet (the gateway stopped
+		// before the first) is the same request's round, as a batch cut
+		// short is: the plan stands, and mintBatch rewrites it.
+		planOnly := parent.BatchSize > 0 && len(parent.Children) == 0 && parent.DelegationEnd == ""
 		startRound = func() int {
-			if resuming {
+			if resuming || planOnly {
 				return roundOf(parent.DelegationRound)
 			}
 			if started == 0 {
@@ -735,9 +739,10 @@ func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID 
 		g.logTaskTerminal(rec, ref.Addressee, id, lib.StateCanceled, TerminalFromGateway,
 			"reason: "+reasonBatchWithdrawn+" - "+noticeBatchChildWithdrawn)
 	}
+	round := currentRoundOf(rec, taskID)
 	keep := rec.Tasks[:0]
 	for _, ref := range rec.Tasks {
-		if ref.Role == taskRoleChild && ref.ParentTaskID == taskID && !kept[ref.ID] {
+		if ref.Role == taskRoleChild && ref.ParentTaskID == taskID && roundOf(ref.BatchRound) == round && !kept[ref.ID] {
 			g.retireTaskRoute(ctx, ref.ID)
 			continue
 		}
@@ -1257,9 +1262,12 @@ func setParentLine(rec *SessionRecord, taskID, statusMsgID string) {
 // the failed one, and so is every link it holds. A batch that fails partway
 // is withdrawBatch's.
 func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, taskID string) {
+	// The current round's children only: an earlier round's stay on the
+	// record (EarlierChildren), routes and all.
+	round := currentRoundOf(rec, taskID)
 	kept := rec.Tasks[:0]
 	for _, ref := range rec.Tasks {
-		if ref.Role != taskRoleChild || ref.ParentTaskID != taskID {
+		if ref.Role != taskRoleChild || ref.ParentTaskID != taskID || roundOf(ref.BatchRound) != round {
 			kept = append(kept, ref)
 			continue
 		}
@@ -1518,7 +1526,7 @@ func refusedEnd(notice string) string {
 // round (lib.DelegationRefusal.Round) and ends nothing. Only such a parent
 // gets one: one with no earlier request is a first refusal, and a batch cut
 // short and being finished has its entries' ends coming instead.
-func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string, round int) {
+func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string, round int, overCap bool) {
 	parent, ok := rec.TaskRefFor(taskID)
 	if !ok || parent.Tier == "" || session != parent.Addressee {
 		return
@@ -1526,7 +1534,12 @@ func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionReco
 	if round <= 1 {
 		round = 0
 	}
-	repeat := round > 1
+	// A refusal for having used every round (overCap) is past the round the
+	// parent waits on; any other is the request's own round, whose batch
+	// plan, once written, gets its per-entry ends instead. Not read off the
+	// round number: from round two on, a request's own refusal is past one
+	// too.
+	repeat := overCap
 	if repeat {
 		if parent.DelegationEnd == "" && (len(parent.Children) == 0 || !parent.batchComplete()) {
 			return
@@ -1585,6 +1598,29 @@ func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionReco
 		return fmt.Errorf("publish: %w", err)
 	}
 	return nil
+}
+
+// roundSettled reports whether a profile parent's current round is over, so
+// its next request may start the next one: no child still to end
+// (profileChildrenRunning), no end still to send it (Unsent, which only the
+// current round's heal resends), and no child of the round still routed (a
+// batch child that asked is ended on the record but runs until its cancel
+// lands, and liveChild would refuse the next request for it). A lookup that
+// fails counts the child as running.
+func (g *Gateway) roundSettled(ctx context.Context, rec *SessionRecord, parent TaskRef, last string) bool {
+	if profileChildrenRunning(rec, parent, last) {
+		return false
+	}
+	for _, id := range parent.Children {
+		k, ok := rec.TaskRefFor(id)
+		if ok && k.BatchEnd != nil && k.BatchEnd.Unsent {
+			return false
+		}
+		if key, err := g.lookupTaskSession(ctx, id); err != nil || key != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // mintRound is the round a profile parent's child is minted in, as the child

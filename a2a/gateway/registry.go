@@ -603,6 +603,16 @@ func roundsUsed(parent TaskRef) int {
 	return 0
 }
 
+// currentRoundOf is the delegation round a parent on the record is in: its
+// DelegationRound, read as one when unset or when the parent isn't on the
+// record.
+func currentRoundOf(rec *SessionRecord, parentID string) int {
+	if parent, ok := rec.TaskRefFor(parentID); ok {
+		return roundOf(parent.DelegationRound)
+	}
+	return 1
+}
+
 // taskChildren is every child a task has minted, every round's: the stop
 // walks reach a finished round's children too.
 func (ref TaskRef) taskChildren() []string {
@@ -665,10 +675,7 @@ func (ref TaskRef) fanOut() bool {
 func (rec *SessionRecord) batchChildren(parentID string) []TaskRef {
 	// The parent's current round only: an earlier round's children are
 	// that round's, ended before this one began.
-	round := 1
-	if parent, ok := rec.TaskRefFor(parentID); ok {
-		round = roundOf(parent.DelegationRound)
-	}
+	round := currentRoundOf(rec, parentID)
 	var out []TaskRef
 	for _, ref := range rec.Tasks {
 		if ref.Role == taskRoleChild && ref.ParentTaskID == parentID && ref.BatchIndex > 0 && roundOf(ref.BatchRound) == round {

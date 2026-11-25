@@ -211,3 +211,102 @@ func TestAStopAfterRoundTwoCancelsItsChild(t *testing.T) {
 		return true
 	})
 }
+
+// TestARoundTwoRequestRefusedByItsChecksIsToldWithItsRound: a request in a
+// later round that its checks refuse carries its own round, and uses it.
+func TestARoundTwoRequestRefusedByItsChecksIsToldWithItsRound(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-rounds-refused-second"
+	parent, origin, first := profileBatchParent(t, r, conv, "a", "b")
+	r.g.cfg.DelegationRoundsMax = 3
+	completeChild(t, r, first[0], "a is fine")
+	completeChild(t, r, first[1], "b is fine")
+	waitFor(t, "round one's ends", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 2 })
+	r.g.cfg.DelegationWidthMax = 1 // round two's two tasks are too wide
+	if err := parent.PublishArtifact(ctx, twoClusterBatch(t, "c", "d")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "round two refused", func() bool { return len(refusalsOn(t, r, "chat", origin.TaskID)) == 1 })
+	if got := refusalsOn(t, r, "chat", origin.TaskID)[0]; got.Round != 2 {
+		t.Fatalf("round two's refusal carries Round %d, want 2", got.Round)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if p, _ := rec.TaskRefFor(origin.TaskID); p.DelegationRound != 2 || p.DelegationEnd == "" || len(p.EarlierChildren) != 2 {
+		t.Fatalf("parent after round two's refusal = round %d end %q earlier %v", p.DelegationRound, p.DelegationEnd, p.EarlierChildren)
+	}
+}
+
+// A failed mint in a later round drops that round's entries alone: the
+// earlier round's children stay on the record.
+func TestAFailedMintInALaterRoundKeepsTheEarlierRoundsChildren(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	rec := &SessionRecord{Key: "console:rounds-drop", Tasks: []TaskRef{
+		{ID: "p", Tier: "unattended", DelegationRound: 2, EarlierChildren: []string{"r1"}, Children: []string{"r2"}},
+		{ID: "r1", Role: taskRoleChild, ParentTaskID: "p", Tier: "read"},
+		{ID: "r2", Role: taskRoleChild, ParentTaskID: "p", Tier: "read", BatchRound: 2},
+	}}
+	r.g.dropFailedChildren(context.Background(), rec, "p")
+	if _, ok := rec.TaskRefFor("r1"); !ok {
+		t.Fatal("round one's child was dropped with round two's")
+	}
+	if _, ok := rec.TaskRefFor("r2"); ok {
+		t.Fatal("round two's failed child is still on the record")
+	}
+}
+
+// A round isn't settled while an end is still to send (Unsent) or a child of
+// the round is still routed, even with every end recorded.
+func TestARoundIsNotSettledWithAnUnsentEndOrARoutedChild(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	parent := TaskRef{ID: "p", Tier: "unattended", BatchSize: 2, Children: []string{"k1", "k2"}}
+	base := func(unsent bool) *SessionRecord {
+		return &SessionRecord{Key: "console:rounds-settled", Tasks: []TaskRef{parent,
+			{ID: "k1", Role: taskRoleChild, ParentTaskID: "p", BatchIndex: 1, BatchEnd: &BatchEnd{State: lib.StateCompleted}},
+			{ID: "k2", Role: taskRoleChild, ParentTaskID: "p", BatchIndex: 2, BatchEnd: &BatchEnd{State: lib.StateCompleted, Unsent: unsent}},
+		}}
+	}
+	if !r.g.roundSettled(ctx, base(false), parent, "k2") {
+		t.Fatal("a round with every end sent and no child routed reads as running")
+	}
+	if r.g.roundSettled(ctx, base(true), parent, "k2") {
+		t.Fatal("a round with an unsent end reads as settled")
+	}
+	r.g.mu.Lock()
+	r.g.taskSessions["k1"] = "console:rounds-settled"
+	r.g.mu.Unlock()
+	if r.g.roundSettled(ctx, base(false), parent, "k2") {
+		t.Fatal("a round with a child still routed reads as settled")
+	}
+}
+
+// From round two on, a request whose batch plan was written and then ended
+// gets its per-entry ends, not a refusal on top of them, as in round one; a
+// refusal for having used every round still goes.
+func TestARoundTwoRefusalIsHeldBackWhenItsPlanWasWritten(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:rounds-refusal-plan"
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-rounds-plan", Tasks: []TaskRef{
+		{ID: "task-rp", Addressee: "chat", Tier: "unattended", DelegationRound: 2, BatchSize: 2, Attribution: []byte(`{}`), CorrelationID: "corr-rp",
+			DelegationEnd: "reason: delegation-not-started - a child couldn't reach the bus"},
+	}}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.g.reg.IndexTask(ctx, "task-rp", conv); err != nil { // still routed: it listens
+		t.Fatal(err)
+	}
+	r.g.tellProfileParentNoChild(ctx, rec, "chat", "task-rp", "reason: delegation-not-started - x", 2, false)
+	time.Sleep(300 * time.Millisecond)
+	if got := refusalsOn(t, r, "chat", "task-rp"); len(got) != 0 {
+		t.Fatalf("a refusal went on top of the written plan's ends: %+v", got)
+	}
+	r.g.tellProfileParentNoChild(ctx, rec, "chat", "task-rp", "reason: delegation-refused - rounds", 3, true)
+	waitFor(t, "the past-cap refusal", func() bool { return len(refusalsOn(t, r, "chat", "task-rp")) == 1 })
+}
