@@ -90,7 +90,7 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 var refusalLog io.Writer = os.Stderr
 
 // RefusalLogPrefix starts every refused-call line.
-const RefusalLogPrefix = "tool refused: "
+const RefusalLogPrefix = coreagentwire.RefusalLogPrefix
 
 // toolPolicyPlugin refuses, before it runs, any tool call outside
 // permitted, and logs every refused call to log, whichever layer refused

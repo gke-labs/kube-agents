@@ -929,7 +929,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return broken(Result{State: state}, ferr)
 	}
 
-	proc, err := startHarnessWith(drv, argv, env, prompt, cfg.KillGrace, log)
+	// The harness's own log lines (stdout chatter, refused tool calls) name
+	// the task.
+	proc, err := startHarnessWith(drv, argv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
