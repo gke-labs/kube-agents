@@ -3313,3 +3313,22 @@ func TestAChildsResultThatAsksForADelegationIsDataAndAWakesDelegationIsChecked(t
 		t.Fatalf("%d submissions to platform, want only the first child's", n)
 	}
 }
+
+// TestASessionTurnBelowAScheduleIsRefusedIfItDelegatesAnyway: a session turn
+// in a chain a schedule started (a wake carries the mark) never gets the
+// delegate tool (wakeMayDelegate), and the gateway refuses a delegation from
+// it regardless, to any addressee, before any route is resolved: the
+// schedule rules that hold a profile parent's children to unattended
+// profiles don't apply to a session turn, so nothing else would check it.
+func TestASessionTurnBelowAScheduleIsRefusedIfItDelegatesAnyway(t *testing.T) {
+	g := &Gateway{}
+	for _, addressee := range []string{targetPlatform, "cluster"} {
+		route, no := g.delegateEntryCheck(&SessionRecord{}, TaskRef{ID: "wake-1", Scheduled: true}, false, lib.DelegateTask{Addressee: addressee}, true)
+		if no == nil || route != nil {
+			t.Fatalf("%s: route %+v, refusal %+v; want a refusal and no route", addressee, route, no)
+		}
+		if no.rule != ruleDelegationUnattendedChild || !strings.Contains(no.notice, noticeBelowScheduleSession) {
+			t.Errorf("%s: refused %s %q, want %s with the below-schedule notice", addressee, no.rule, no.notice, ruleDelegationUnattendedChild)
+		}
+	}
+}

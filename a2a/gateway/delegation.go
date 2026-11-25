@@ -453,6 +453,13 @@ func (g *Gateway) delegateEntryCheck(rec *SessionRecord, parent TaskRef, profile
 	if profileParent && addressee == targetPlatform {
 		return nil, refuseEntry(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
 	}
+	// A session turn below a schedule (a wake carries the mark, #6861) gets
+	// no delegate tool; the schedule rules below are a profile parent's, so
+	// one delegating anyway is refused outright rather than checked as an
+	// interactive turn's.
+	if !profileParent && parent.belowSchedule() {
+		return nil, refuseEntry(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+noticeBelowScheduleSession)
+	}
 	if addressee == targetPlatform && len(e.Parameters) > 0 {
 		// Only a profile route carries parameters; platform's would be dropped.
 		return nil, refuseEntry(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
