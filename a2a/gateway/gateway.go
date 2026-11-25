@@ -291,6 +291,9 @@ type Gateway struct {
 	// minted, with the entry's index; true stops the mint there, as a
 	// gateway that died partway through a batch would (tests only).
 	beforeBatchChild func(i int) bool
+	// childResultFails, when set, runs before each childResult publish;
+	// true fails that publish, as a bus fault would (tests only).
+	childResultFails func() bool
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -1698,8 +1701,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// text that asks for a change the task has no permit to make.
 		g.post(rec.Key, noticeTurnNotStarted+noticeConfirmWhileRunning)
 	case active != nil && !active.Detached && rec.fanOutPending(active.TaskID):
-		// Text while a batch runs steers nothing: the turn that asked has
-		// ended, and which child it was meant for isn't for the gateway to
+		// Text while a batch runs steers nothing: a session's turn that
+		// asked has ended, a profile parent is waiting on its children,
+		// and which task the text was meant for isn't for the gateway to
 		// guess.
 		parent, _ := rec.TaskRefFor(active.TaskID)
 		g.refuseFanOutSteer(rec, parent)
@@ -1934,7 +1938,14 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// conversation for its children: they are what is healed, not its own
 	// hand-off line (healFanOut). A batch cut short heals below, where its
 	// request is read back from the stream and finished (delegationHandled).
-	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
+	// A profile parent waiting on its batch has its children healed first,
+	// an end the relay missed or couldn't send going to it now
+	// (healProfileBatch), and is then healed below as any task is: its own
+	// terminal is its end.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
+		g.healProfileBatch(ctx, rec, ref)
+	}
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier == "" && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
 		g.healFanOut(ctx, rec, active, ref)
 		return
 	}
@@ -2119,7 +2130,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			}
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(state, ""), active.LineNote), "")
 		}
-		rec.ActiveTask = nil
+		g.releaseEndedTask(ctx, rec, active)
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is
 		// activity, and the session-thread window opens at the answer (the

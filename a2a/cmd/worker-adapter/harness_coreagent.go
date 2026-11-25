@@ -10,7 +10,7 @@ type coreAgentBuilder struct{}
 
 const (
 	// coreAgentPersonaDir is the persona the harness reads once per turn:
-	// rendered by a second UID, read-only to the harness (SEAM: dev-2, #6713).
+	// rendered by a second UID, read-only to the harness (#6713).
 	coreAgentPersonaDir = "/var/lib/agent-persona"
 	// coreAgentPersonaRequiredEnv, "true" on a pod the operator renders a
 	// persona for, makes a missing persona dir fail the turn
@@ -35,8 +35,7 @@ func (coreAgentBuilder) command(spec harnessSpec) []string {
 }
 
 // env passes the pod environment through: the model's base URL,
-// GOOGLE_GEMINI_BASE_URL, points at the loopback gateway proxy (SEAM:
-// tigerteam-dev-2), and the harness sends only a placeholder key.
+// GOOGLE_GEMINI_BASE_URL, points at the loopback gateway proxy, and the harness sends only a placeholder key.
 func (coreAgentBuilder) env(env []string, _ func(string) bool) []string { return env }
 
 // userSettings: none; the harness reads no settings file.

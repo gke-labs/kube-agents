@@ -26,7 +26,7 @@ const placeholderKey = "gateway-proxy-owns-the-key"
 // WebSearch does on Claude Code; it works only where the endpoint behind
 // the proxy offers it.
 //
-// SEAM (tigerteam-dev-2): the base URL and proxy wiring.
+// The base URL and its proxy wiring come with the model-routing change (#7158).
 func buildModel(ctx context.Context, name string, webSearch bool) (adkmodel.LLM, error) {
 	cfg := config.DefaultConfig()
 	cfg.Model.Provider = config.ProviderGemini

@@ -413,7 +413,7 @@ func isStreamingTool(tl adktool.Tool) bool {
 
 // TestEachGrantableBuiltinTurnsOnOnlyItsOwnSwitch: an empty policy offers
 // nothing, and each built-in a grant may register turns on exactly its own
-// BuiltinTools switch (dev-4's floor check, kept for the table-driven
+// BuiltinTools switch (the driver's floor check, kept for the table-driven
 // policy).
 func TestEachGrantableBuiltinTurnsOnOnlyItsOwnSwitch(t *testing.T) {
 	b, _, _, err := policySetup(coreagentwire.Policy{}, nil, t.TempDir())

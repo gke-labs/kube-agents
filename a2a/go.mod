@@ -7,6 +7,7 @@ toolchain go1.27.3
 require (
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/go-steer/core-agent/v3 v3.2.0
+	github.com/go-steer/core-models v0.15.5
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/jwt/v2 v2.8.3
 	github.com/nats-io/nats-server/v2 v2.15.3
@@ -18,6 +19,7 @@ require (
 	github.com/slack-go/slack v0.36.0
 	golang.org/x/net v0.62.0
 	golang.org/x/sync v0.25.0
+	golang.org/x/sys v0.50.0
 	golang.org/x/text v0.44.0
 	google.golang.org/adk/v2 v2.6.0
 	google.golang.org/genai v1.74.0
@@ -57,7 +59,6 @@ require (
 	github.com/go-openapi/swag/stringutils v0.27.1 // indirect
 	github.com/go-openapi/swag/typeutils v0.27.1 // indirect
 	github.com/go-openapi/swag/yamlutils v0.27.1 // indirect
-	github.com/go-steer/core-models v0.15.5 // indirect
 	github.com/go-steer/core-models/adkv2 v0.15.3 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
@@ -95,7 +96,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.6 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/oauth2 v0.38.0 // indirect
-	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/api v0.300.0 // indirect

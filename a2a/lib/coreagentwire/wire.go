@@ -60,8 +60,8 @@ type Policy struct {
 	WebSearch bool `json:"web_search,omitempty"`
 }
 
-// MCPServer is one MCP server a turn may use (SEAM: tigerteam-dev-3 for the
-// lifecycle, tigerteam-dev-1 for which tools it offers).
+// MCPServer is one MCP server a turn may use; the harness runs it for the
+// turn, and the persona grant decides which of its tools are offered.
 type MCPServer struct {
 	Name    string            `json:"name"`
 	Command string            `json:"command,omitempty"`
