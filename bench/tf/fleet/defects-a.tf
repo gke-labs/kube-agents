@@ -2818,6 +2818,19 @@ resource "kubernetes_manifest" "scaled_zero_gateway_class" {
   }
 }
 
+# Defect (fleet-audits, #1982, #7097): a cluster-scoped GatewayClass referencing
+# an unsupported controllerName (RFC 2606 example.com) so no controller accepts
+# it. Carries no Gateway, HTTPRoute, Pods, or Services, so it alters no other
+# audit stream. Asserted by networking-unaccepted-gatewayclass.
+resource "kubernetes_manifest" "unaccepted_gateway_class" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "GatewayClass"
+    metadata   = { name = "seeded-unaccepted-gw" }
+    spec       = { controllerName = "example.com/unsupported-controller" }
+  }
+}
+
 resource "kubernetes_manifest" "scaled_zero_gateway" {
   manifest = {
     apiVersion = "gateway.networking.k8s.io/v1"

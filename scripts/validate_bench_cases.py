@@ -430,6 +430,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Fixture planted in bench/tf/fleet/defects-a.tf (#7097, #1982); parked
+    # until the postsubmit fleet reconcile applies unaccepted-gateway-class
+    # across the pool projects, after which a follow-up moves it to nightly-cases.txt.
+    "networking-unaccepted-gatewayclass": (
+        "#7097 / #1982: needs unaccepted-gateway-class (gatewayclass/seeded-unaccepted-gw) applied to every pool project by the postsubmit fleet reconcile"
+    ),
     # Its harness applied the merged fix to a shared planted defect, which the
     # read-only fleet refuses and about thirty other cases read. It needs a fixture of
     # its own and Config Sync to apply the merge, as a customer's reconciler would.

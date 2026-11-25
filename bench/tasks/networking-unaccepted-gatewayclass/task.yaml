@@ -1,0 +1,57 @@
+# Probe for an unaccepted GatewayClass (#1982, #2599, #7097): a cluster-scoped
+# GatewayClass (`seeded-unaccepted-gw`) on `seeded-a` references an unsupported
+# `spec.controllerName` (`example.com/unsupported-controller`) with no
+# controller accepting it. The agent must name both the GatewayClass and the
+# unsupported controller path, and leave the GatewayClass untouched.
+#
+# Planted defect required: `unaccepted-gateway-class` role in
+# `bench/tf/fleet/fixtures.json` (`gatewayclass/seeded-unaccepted-gw` on
+# `seeded-a`). Parked in `FIXTURE_NOT_READY` until the postsubmit fleet
+# reconcile applies `defects-a.tf` across the evaluation pool.
+#
+# Isolation class: read-only.
+# Tier: nightly (once un-parked from FIXTURE_NOT_READY).
+id: networking-unaccepted-gatewayclass
+name: Gateway API probe names the unaccepted GatewayClass and its unsupported controller path
+
+domain: fleet-audits
+
+prompt: >-
+  Check the Gateway API configuration across the fleet. Report any
+  `GatewayClass` that no controller has accepted, name the cluster it lives on
+  and the unsupported controller path, and recommend next steps. Do not change
+  anything.
+expected_output: >-
+  A grounded report naming the unaccepted `GatewayClass` (`seeded-unaccepted-gw`),
+  identifying the cluster it runs on, naming the unsupported `spec.controllerName`
+  (`example.com/unsupported-controller`), and recommending updating the
+  GatewayClass or deploying a matching controller via GitOps rather than
+  mutating the cluster directly.
+infrastructure:
+  deployer: noop
+validated: false
+
+fixtures:
+  - unaccepted-gateway-class
+
+verification_spec:
+  - name: report-names-unaccepted-gatewayclass-and-controller
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        - "seeded-unaccepted-gw"
+        - "example.com/unsupported-controller"
+  - name: gatewayclass-fixture-is-unchanged
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: fleet_resource_property
+      fixture_role: unaccepted-gateway-class
+      kind: gatewayclass
+      resource_name: seeded-unaccepted-gw
+      path: spec.controllerName
+      op: eq
+      value: "example.com/unsupported-controller"
