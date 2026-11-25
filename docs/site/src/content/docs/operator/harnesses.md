@@ -35,8 +35,10 @@ A value the operator or gateway doesn't recognise isn't guessed at:
 
 ### Shell commands
 
-- **Profile workers.** A profile whose persona grants the shell can run any command. What such a command can reach is bounded by the worker sandbox and the credential broker, not by the shell grant.
-- **Session pods.** A session runs only the command prefixes it is granted: with the cluster view, `kubectl` and `gcloud`.
+- **Profile workers.** A profile worker whose persona grants `shell` can, in effect, run any command. The harness's gate refuses top-level pipes, chains, redirections and expansions, but passes a single command that is an interpreter (`bash -c '…'`, `python3 -c '…'`), which can compose anything. Its boundary is the sandbox and the credential broker, not the gate.
+- **Session pods.** A session pod's shell is limited to its granted prefixes: `kubectl` and `gcloud` under the cluster view, and none without it. Each prefix runs as one simple command with a literal argv. Refused:
+  - chaining, pipes, redirections, command substitution, variable expansion and environment prefixes;
+  - any interpreter or launcher wrapper: `bash -c`, `sh -c`, `python3 -c`, `env`, `xargs`, `nohup`, `timeout`, `command` and `exec`.
 
 ## Skills and MCP servers
 
