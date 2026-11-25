@@ -889,10 +889,13 @@ does a delegating profile's own task (#6789): a submission to a profile whose ca
 delegates, that is neither a child nor a wake, carries the profiles the delegation would accept from
 it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refused under), and the rounds
 (`roundsMax`, from `A2A_DELEGATION_ROUNDS_MAX`) when they are over one. The list
-runs the delegation's own checks on each profile, so it never offers one the delegation refuses:
-not `platform`, not a profile outside a cluster-scoped parent's cluster, only profiles that run at
-`read` and list `unattended` for a parent below a scheduled run, and nobody for a parent refused
-outright, such as one at the depth cap. A scheduled run of a delegating profile carries the list too, built
+runs the delegation's own checks on each profile, so it doesn't offer one the delegation refuses
+whatever cluster it is given: not `platform`, not a profile outside a cluster-scoped parent's
+cluster, only profiles that run at `read` and list `unattended` for a parent below a scheduled run,
+and nobody for a parent refused outright, such as one at the depth cap. The checks that depend on
+the cluster the worker picks for a profile that takes a target (that it is in scope, and a profile
+pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the delegation, which
+still refuses there. A scheduled run of a delegating profile carries the list too, built
 the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a

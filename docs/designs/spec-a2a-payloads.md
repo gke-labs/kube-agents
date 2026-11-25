@@ -875,8 +875,9 @@ below a scheduled run it lists only profiles that run at `read` and list `unatte
 delegation holds it to; a parent the delegation refuses outright (at the depth cap, or with no scope
 on its record) gets an empty list. A scheduled run of a delegating profile carries the part too, built
 the same way when the trigger ingress submits it, so a run can fan out to what it lists. The
-checks that read a cluster the worker will choose for a target-taking profile (in scope, pinned
-profiles' tiers) wait for the delegation. Every other profile submission carries no part and is
+checks that read a cluster the worker will choose for a target-taking profile (in scope, and a
+profile pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the
+delegation. Every other profile submission carries no part and is
 unchanged, and a worker that predates the part ignores it.
 
 - A name is an addressee (a subject token). A description is one line of at most 200 bytes, cut by
