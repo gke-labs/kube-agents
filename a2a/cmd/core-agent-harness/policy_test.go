@@ -269,14 +269,14 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 	}
 }
 
-// TestAPersonaShellRunsAnySimpleCommandAndNoCompound: a persona's shell
-// grant (toolgrant.Policy.Shell, which Claude Code grants as an unrestricted
-// Bash) through core-agent's real gate: any single simple command with a
-// literal argv runs, a persona script and an interpreter included; a
-// pipe, chain, redirection, expansion or substitution never does, and
-// core-agent's own verb checks still hold. This is the narrowing against
-// Claude Code the persona grant names.
-func TestAPersonaShellRunsAnySimpleCommandAndNoCompound(t *testing.T) {
+// TestAPersonaShellIsInEffectUnrestricted: a persona's shell grant
+// (toolgrant.Policy.Shell, which Claude Code grants as an unrestricted Bash)
+// through core-agent's real gate. Top-level composition is refused and the
+// verb checks hold, but a single command may be an interpreter that
+// composes anything (`bash -c`, `python3 -c`), and passes: the grant is in
+// effect an unrestricted shell, as on Claude Code, bounded by the sandbox
+// and the broker. Pinned both ways so neither is misread.
+func TestAPersonaShellIsInEffectUnrestricted(t *testing.T) {
 	g, err := toolgrant.Policy{Shell: true}.CoreAgent("/scratch")
 	if err != nil {
 		t.Fatal(err)
@@ -296,6 +296,9 @@ func TestAPersonaShellRunsAnySimpleCommandAndNoCompound(t *testing.T) {
 		"python3 /var/lib/agent-persona/skills/version-control/scripts/vcs.py status": true,
 		"jq -r .items /scratch/pods.json":                                             true,
 		"git status":                                                                  true,
+		"bash -c 'kubectl get pods | jq . > /scratch/o; id'":                          true,
+		"python3 -c 'import os; os.system(\"id\")'":                                   true,
+		"cat /etc/passwd":                                                             true,
 		"kubectl get pods | jq .":                                                     false,
 		"kubectl get pods; id":                                                        false,
 		"kubectl get pods && id":                                                      false,

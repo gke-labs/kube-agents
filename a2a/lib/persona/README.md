@@ -153,9 +153,12 @@ worker refuses `antigravity`, because it has no persona adapter yet.
     (`workeradapter.PersonaToolPolicy`) and grants what the Claude Code
     rendering does: `read_file` the read tools, `shell` any single simple
     command, `web_search` Gemini's server-side Google Search, and each MCP
-    server's listed tools; never writes. Two narrowings against Claude Code
-    are deliberate: reads stay inside the workspace, and the shell refuses
-    pipes, chains, redirections and expansions. Search is server-side and
+    server's listed tools; no file-write tool. Core-agent's read tools stay
+    inside the workspace, which Claude Code's don't. The shell is in effect
+    unrestricted on both: core-agent's gate refuses top-level pipes, chains,
+    redirections and expansions, but passes `bash -c` and interpreters, so
+    its boundary is the sandbox and the broker, as on Claude Code. A granted
+    shell can read and write anywhere it can reach. Search is server-side and
     not gated per call, as WebSearch is on Claude Code, and works only where
     the model endpoint offers it beside function calls (Gemini 3 or later,
     by model name).

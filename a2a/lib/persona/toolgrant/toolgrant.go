@@ -39,11 +39,14 @@ type Policy struct {
 	// WebSearch: search the web. Fetching an arbitrary URL is a separate
 	// grant no worker has, so URL fetch stays off.
 	WebSearch bool
-	// Shell: the shell may run any single simple command (a persona's
-	// `shell`, which Claude Code grants as an unrestricted Bash). core-agent
-	// allows it only as one command with a literal argv: no chaining,
-	// pipes, redirections, expansions or substitutions, and its own verb
-	// checks (git's read-only forms, find without -exec) hold.
+	// Shell: the shell may run any command (a persona's `shell`, which
+	// Claude Code grants as an unrestricted Bash). core-agent's gate refuses
+	// top-level composition (chaining, pipes, redirections, expansions,
+	// substitutions) and applies its verb checks, but a single command may
+	// be an interpreter (`bash -c '…'`, `python3 -c '…'`) that composes
+	// anything, so this is in effect an unrestricted shell. Its boundary is
+	// the sandbox and the credential broker, as on Claude Code; the gate
+	// only shapes how the model writes commands.
 	Shell bool
 	// ShellPrefixes are the only commands the shell may run, each a binary
 	// with optional subcommands ("kubectl", "gh pr list"). Empty, with no

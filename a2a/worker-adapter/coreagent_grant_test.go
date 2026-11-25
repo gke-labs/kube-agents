@@ -128,10 +128,22 @@ func coreAgentGrant(t *testing.T, p coreagentwire.Policy, workdir string) grantS
 				continue
 			}
 			g.MCP = append(g.MCP, name)
+		case slices.Contains(p.Tools, strings.TrimSuffix(a, ":"+workdir+"/*")) && a != "bash:"+workdir+"/*":
+			// A registered file tool's workspace rule, checked above.
+		default:
+			t.Errorf("allow rule %q is outside every grant", a)
+		}
+	}
+	// Every deny is a broad deny of a file or shell tool that isn't
+	// registered.
+	for _, d := range p.Deny {
+		tool, pat, _ := strings.Cut(d, ":")
+		if pat != "*" || slices.Contains(p.Tools, tool) || !slices.Contains([]string{"read_file", "read_many_files", "view_file_outline", "stat", "list_dir", "glob", "grep", "write_file", "bash"}, tool) {
+			t.Errorf("deny rule %q isn't a broad deny of an unregistered file or shell tool", d)
 		}
 	}
 	if g.Shell && !slices.Equal(bash, []string{"bash:*"}) {
-		t.Errorf("shell rules %q, want only bash:* (any simple command)", bash)
+		t.Errorf("shell rules %q, want only bash:*", bash)
 	}
 	if !g.Shell && len(bash) != 0 {
 		t.Errorf("shell rules %q without the shell", bash)

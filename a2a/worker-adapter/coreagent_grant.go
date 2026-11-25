@@ -26,15 +26,18 @@ func CoreAgentWirePolicy(p toolgrant.Policy, workdir string) (coreagentwire.Poli
 // server may expose. It grants what the Claude Code rendering of the same
 // persona grants, mapped to core-agent, and nothing wider:
 //   - read_file: the read tools, inside the workspace (Claude Code's Read
-//     isn't scoped; core-agent's reads are, by its path scope);
-//   - shell: any single simple command (Claude Code's is an unrestricted
-//     Bash; core-agent refuses pipes, chains, redirections and expansions);
+//     isn't scoped; core-agent's read tools are, by its path scope; the
+//     shell, where granted, still reads anywhere it can);
+//   - shell: in effect an unrestricted shell, as on Claude Code (the gate
+//     refuses top-level composition, but `bash -c` and interpreters pass,
+//     toolgrant.Policy.Shell);
 //   - web_search: Gemini's server-side Google Search, as WebSearch is
 //     server-side on Claude Code;
 //   - an MCP server or one of its tools: the tools its MCPServers entry
 //     lists, as Claude Code's allowlist names them.
 //
-// Writes aren't granted, as Claude Code's denylist refuses Write and Edit.
+// No file-write tool is granted, as Claude Code's denylist refuses Write and
+// Edit (a granted shell can still write, on both).
 // Anything the two don't agree on is an error, never a guess: a tool with no
 // mapping, a server that is started but not granted or granted but not
 // started, a server tool outside its grant, and the delegate server's
