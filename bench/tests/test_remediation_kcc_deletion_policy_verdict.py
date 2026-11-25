@@ -1,4 +1,12 @@
-"""remediation-kcc-stateful-deletion-policy-abandon checks verdict, deletion-policy, and IP."""
+"""remediation-kcc-stateful-deletion-policy-abandon reads three verdict lines, not prose.
+
+The objective passes when three standalone declaration lines state the verdict,
+the KCC deletion-policy decision, and the public IPv4 decision, and no line
+states a wrong decision. ``report_contains`` with ``fold_decoration: true``
+lowercases the report, strips emphasis/backticks, and folds leading list/quote
+markers and trailing stops, while leaving hedges (``?``, extra words) on the
+line so hedged or negated lines do not count.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +27,14 @@ TASK = (
 CHECK = "verdict-and-kcc-deletion-and-network-safeguards-are-named"
 TIMEOUT_SEC = 5.0
 
+VERDICT = "VERDICT: MISSING-SAFEGUARDS"
+POLICY = "DELETION-POLICY: ABANDON"
+IPV4 = "PUBLIC-IPV4: DISABLE"
+
+WRONG_VERDICT = "VERDICT: SAFE-TO-MERGE"
+WRONG_POLICIES = ("DELETION-POLICY: DELETE", "DELETION-POLICY: NONE-NEEDED")
+WRONG_IPV4 = "PUBLIC-IPV4: KEEP-ENABLED"
+
 
 @pytest.fixture(autouse=True)
 def _clean_transcript():
@@ -30,92 +46,46 @@ def _clean_transcript():
 def _passes(report: str) -> bool:
     doc = yaml.safe_load(TASK.read_text())
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
+    assert check["check"]["type"] == "all"
     transcript.set(report, [], final_message=report)
-    return ReportContainsVerifier(**check["check"]).verify(TIMEOUT_SEC).success
-
-
-def test_accepts_plain_verdict_and_safeguards():
-    report = (
-        "VERDICT: MISSING-SAFEGUARDS\n\n"
-        "Add `cnrm.cloud.google.com/deletion-policy: abandon` and set "
-        "`ipv4Enabled: false` with a private IP."
+    return all(
+        ReportContainsVerifier(**part).verify(TIMEOUT_SEC).success
+        for part in check["check"]["checks"]
     )
-    assert _passes(report)
 
 
-def test_rejects_wrong_verdict():
-    report = (
-        "VERDICT: SAFE-TO-MERGE\n\n"
-        "cnrm.cloud.google.com/deletion-policy: abandon and ipv4Enabled: false."
-    )
-    assert not _passes(report)
+def test_all_three_verdict_lines_pass():
+    for report in (
+        f"{VERDICT}\n{POLICY}\n{IPV4}\n\nAdd the abandon annotation and disable public IPv4.",
+        f"**{VERDICT}**\n**{POLICY}**\n**{IPV4}**\n",
+        f"`{VERDICT}`\n`{POLICY}`\n`{IPV4}`\n",
+        f"1. {VERDICT}\n2. {POLICY}\n3. {IPV4}\n",
+        f"> {VERDICT}\n> {POLICY}\n> {IPV4}\n",
+        f"{VERDICT}.\n{POLICY}.\n{IPV4}.\n",
+        # A sentence mentioning a rejected verdict in prose is not a verdict line.
+        f"{VERDICT}\n{POLICY}\n{IPV4}\n\n{WRONG_VERDICT} is ruled out for production.\n",
+    ):
+        assert _passes(report), report
 
 
-def test_rejects_missing_abandon_annotation():
-    report = (
-        "VERDICT: MISSING-SAFEGUARDS\n\n"
-        "Set `ipv4Enabled: false` for private networking."
-    )
-    assert not _passes(report)
-
-
-def test_accepts_private_network_ref_and_vpc_prose():
-    report = (
-        "VERDICT: MISSING-SAFEGUARDS\n\n"
-        "Add `cnrm.cloud.google.com/deletion-policy: abandon` and configure "
-        "`privateNetworkRef` on a private VPC network while disabling public IPv4."
-    )
-    assert _passes(report)
-
-
-def test_rejects_dismissed_private_ip():
-    report = (
-        "VERDICT: MISSING-SAFEGUARDS\n\n"
-        "Add `cnrm.cloud.google.com/deletion-policy: abandon`. "
-        "A private IP is not needed here; `ipv4Enabled: true` is fine."
-    )
-    assert not _passes(report)
-
-
-def test_rejects_dismissed_deletion_policy_and_optional_network():
-    for dismissed in [
-        "VERDICT: MISSING-SAFEGUARDS\nSet `ipv4Enabled: false`.\n`cnrm.cloud.google.com/deletion-policy: abandon` is not needed here.",
-        "VERDICT: MISSING-SAFEGUARDS\nAdd `cnrm.cloud.google.com/deletion-policy: abandon`.\n`ipv4Enabled: false` is not needed.",
-        "VERDICT: MISSING-SAFEGUARDS\nAdd `cnrm.cloud.google.com/deletion-policy: abandon`.\n`privateNetworkRef` is not required.",
-        "VERDICT: MISSING-SAFEGUARDS\nAdd `cnrm.cloud.google.com/deletion-policy: abandon`.\nA private IP is optional.",
-    ]:
-        assert not _passes(dismissed), dismissed
-
-
-def test_accepts_disable_public_ip_and_private_cloud_sql():
-    report = (
-        "VERDICT: MISSING-SAFEGUARDS\n\n"
-        "Add `cnrm.cloud.google.com/deletion-policy: abandon` and disable public IP "
-        "to make it a private Cloud SQL instance."
-    )
-    assert _passes(report)
-
-
-def test_accepts_bracket_annotation_and_without_warning():
-    report = (
-        "VERDICT: MISSING-SAFEGUARDS\n\n"
-        'Merging without `metadata.annotations["cnrm.cloud.google.com/deletion-policy"]: "abandon"` '
-        "destroys the database on KCC delete; also set `ipv4Enabled: false` on a private VPC network."
-    )
-    assert _passes(report)
-
-
-def test_rejects_inverted_policy_quoted_dismissals_and_prefix_negations():
-    for bad in [
-        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: none so KCC does not abandon the instance.\nSet ipv4Enabled: false.",
-        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nA private VPC network is not needed.",
-        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nA private Cloud SQL instance is not required.",
-        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nPrivate IPv4 is optional.",
-        "VERDICT: MISSING-SAFEGUARDS\nSet cnrm.cloud.google.com/deletion-policy: abandon.\nDisabling public IPv4 is not needed.",
-        "VERDICT: MISSING-SAFEGUARDS\nNote: 'cnrm.cloud.google.com/deletion-policy: abandon' is not needed here.\nSet ipv4Enabled: false.",
-        'VERDICT: MISSING-SAFEGUARDS\nAdd cnrm.cloud.google.com/deletion-policy: abandon.\nNote that "privateNetworkRef" is not required.',
-        "VERDICT: MISSING-SAFEGUARDS\nDo not set cnrm.cloud.google.com/deletion-policy: abandon.\nSet ipv4Enabled: false.",
-        "VERDICT: MISSING-SAFEGUARDS\nAdd cnrm.cloud.google.com/deletion-policy: abandon.\nDo not set ipv4Enabled: false.",
-        "VERDICT: MISSING-SAFEGUARDS\nAdd cnrm.cloud.google.com/deletion-policy: abandon.\nNo need for privateNetworkRef.",
-    ]:
-        assert not _passes(bad), bad
+def test_wrong_missing_hedged_or_prose_only_fails():
+    for report in (
+        f"{WRONG_VERDICT}\n{POLICY}\n{IPV4}\n",
+        f"{VERDICT}\n{WRONG_POLICIES[0]}\n{IPV4}\n",
+        f"{VERDICT}\n{WRONG_POLICIES[1]}\n{IPV4}\n",
+        f"{VERDICT}\n{POLICY}\n{WRONG_IPV4}\n",
+        # Missing any one of the three lines fails.
+        f"{VERDICT}\n{IPV4}\n",
+        f"{VERDICT}\n{POLICY}\n",
+        f"{POLICY}\n{IPV4}\n",
+        # Duplicate conflicting verdict line fails.
+        f"{VERDICT}\n{POLICY}\n{IPV4}\n{WRONG_VERDICT}\n",
+        f"{VERDICT}\n{POLICY}\n{IPV4}\n2. **{WRONG_POLICIES[1]}**\n",
+        # Hedged or negated lines do not count as verdicts.
+        f"{VERDICT}?\n{POLICY}\n{IPV4}\n",
+        f"{VERDICT}\n{POLICY} (not needed)\n{IPV4}\n",
+        f"{VERDICT}\n{POLICY}\n{IPV4} is optional\n",
+        # Prose-only without declaration lines fails.
+        "Add cnrm.cloud.google.com/deletion-policy: abandon and set ipv4Enabled: false.",
+    ):
+        assert not _passes(report), report

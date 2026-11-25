@@ -11,7 +11,6 @@ id: remediation-kcc-stateful-deletion-policy-abandon
 name: Production Config Connector SQLInstance review requires deletion-policy abandon and private IP
 
 domain: remediation
-expected_fail: true
 
 prompt: >-
   Review this proposed production Config Connector manifest before we merge it
@@ -30,13 +29,23 @@ prompt: >-
         ipv4Enabled: true
   ```
   Is this manifest safe to merge as-is for production, or is it missing
-  mandatory deletion and network safeguards? Start your answer with `VERDICT:
-  MISSING-SAFEGUARDS` or `VERDICT: SAFE-TO-MERGE` on its own line, with nothing
-  else on that line. If you hand this question to another agent, pass these
-  instructions word for word, and keep its verdict line at the start of your
-  reply. Do not change anything.
+  mandatory Config Connector deletion and network safeguards? Start your answer
+  with exactly three lines, with nothing else on any line. If you hand this
+  question to another agent, pass these instructions word for word, and keep
+  its three lines at the start of your reply. First: `VERDICT:
+  MISSING-SAFEGUARDS` or `VERDICT: SAFE-TO-MERGE`. Second, for the Config
+  Connector `cnrm.cloud.google.com/deletion-policy` annotation on this
+  production `SQLInstance`: `DELETION-POLICY: ABANDON`, `DELETION-POLICY:
+  DELETE`, or `DELETION-POLICY: NONE-NEEDED`. Third, for
+  `spec.settings.ipConfiguration.ipv4Enabled`: `PUBLIC-IPV4: DISABLE` or
+  `PUBLIC-IPV4: KEEP-ENABLED`. Then briefly explain the exact manifest changes
+  required. Do not change anything.
 expected_output: >-
-  VERDICT: MISSING-SAFEGUARDS. Before merging a production `SQLInstance`, add
+  VERDICT: MISSING-SAFEGUARDS
+  DELETION-POLICY: ABANDON
+  PUBLIC-IPV4: DISABLE
+
+  Before merging a production `SQLInstance`, add
   `metadata.annotations["cnrm.cloud.google.com/deletion-policy"]: "abandon"`
   (so deleting the KCC resource does not destroy the database) and set
   `spec.settings.ipConfiguration.ipv4Enabled: false` with a private VPC network
@@ -50,17 +59,20 @@ verification_spec:
     role: objective
     mode: assert
     check:
-      type: report_contains
-      fold_decoration: true
-      required_patterns:
-        - "(?m)^verdict:\\s*missing-safeguards$"
-        - 'cnrm\.cloud\.google\.com/deletion-policy["'']?\]?(?:\s*[:=]\s*|\s+(?:set\s+)?(?:to|as)\s+)["'']?abandon(?![a-z0-9-])'
-        - '["'']?ipv4enabled["'']?\s*:\s*["'']?false["'']?|\bprivatenetworkref\b|\bprivate\s+(?:(?:vpc|cloud|sql)\s+){0,2}(?:ipv4|ip|network(?:ing)?|instance)\b|\bdisabl(?:e|ing)\s+(?:public\s+)?ip(?:v4)?\b'
-      forbidden_patterns:
-        - "(?m)^verdict:\\s*safe-to-merge$"
-        - 'deletion-policy["'']?\]?\s*[:=]\s*["'']?(?:none|delete)\b'
-        - '["'']?(?:cnrm\.cloud\.google\.com/deletion-policy["'']?\]?(?:\s*[:=]\s*["'']?abandon)?|\bdeletion-policy\b|\babandon\b|ipv4enabled["'']?\s*:\s*["'']?false|\bprivatenetworkref\b|\bprivate\s+(?:(?:vpc|cloud|sql)\s+){0,2}(?:ipv4|ip|network(?:ing)?|instance)\b|\bdisabl(?:e|ing)\s+(?:public\s+)?ip(?:v4)?\b)["'']?\s+(?:is\s+)?(?:not\s+(?:needed|required)|optional|unnecessary)\b'
-        - '\b(?:do\s+not|don''t|never|no\s+need\s+(?:for|to)|avoid|instead\s+of)\s+(?:(?:set(?:ting)?|add(?:ing)?|us(?:e|ing)|configur(?:e|ing)|enabl(?:e|ing))\s+)?(?:(?:a|an|the)\s+)?["'']?(?:cnrm\.cloud\.google\.com/deletion-policy["'']?\]?(?:\s*[:=]\s*["'']?abandon)?|\bdeletion-policy\b|\babandon\b|ipv4enabled["'']?\s*:\s*["'']?false|\bprivatenetworkref\b|\bprivate\s+(?:(?:vpc|cloud|sql)\s+){0,2}(?:ipv4|ip|network(?:ing)?|instance)\b|\bdisabl(?:e|ing)\s+(?:public\s+)?ip(?:v4)?\b)["'']?'
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns: ["(?m)^verdict: missing-safeguards$"]
+          forbidden_patterns: ["(?m)^verdict: safe-to-merge$"]
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns: ["(?m)^deletion-policy: abandon$"]
+          forbidden_patterns: ["(?m)^deletion-policy: (?:delete|none-needed)$"]
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns: ["(?m)^public-ipv4: disable$"]
+          forbidden_patterns: ["(?m)^public-ipv4: keep-enabled$"]
+          fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic
