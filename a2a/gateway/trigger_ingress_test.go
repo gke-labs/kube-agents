@@ -55,7 +55,9 @@ func startTriggerRig(t *testing.T, tweak func(*Config)) *triggerRig {
 			tweak(c)
 		}
 	})
-	r.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}})
+	// fleet-audit delegates (spec.delegates, #6789), so a scheduled run of it
+	// may fan out (#6744).
+	r.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}, Delegates: true})
 	r.g.profiles.put("readonly", &lib.AgentCard{Name: "readonly", Tiers: []string{"read"}})
 	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Tiers: []string{"read", "unattended"}, Parameters: clusterParams})
 	nc, err := connectTest(r.url)
@@ -1566,7 +1568,7 @@ func TestAnInteractiveProfileParentsChildIsUntouchedByTheScheduleRules(t *testin
 	for _, tc := range []struct{ author, want string }{{"1001", "oncall"}, {"1002", "read"}} {
 		t.Run(tc.want, func(t *testing.T) {
 			r := startTierRig(t, "1001")
-			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Tiers: []string{"read", "oncall"}})
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Tiers: []string{"read", "oncall"}, Delegates: true})
 			ctx := context.Background()
 			conv := "discord:6744/" + tc.author
 			turn := profileTurn(conv, "chat", nil)

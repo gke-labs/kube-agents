@@ -28,7 +28,9 @@ transport; nothing here opens a socket.
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,6 +55,9 @@ BOT = "kube-agents-evals-token-minter[bot]"
 WINDOWED_LISTING = f"{API}/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1"
 WHOLE_LISTING = f"{API}/pulls?state=all&per_page=100&page=1"
 REFS_LISTING = f"{API}/git/matching-refs/heads/platform-agent/"
+# How long the FIFO test waits for a token read that must not block. The read
+# is two system calls, so the bound is slack for a loaded runner only.
+FIFO_READ_BOUND_SECONDS = 20
 
 
 def route_branches(github, names=None):
@@ -367,6 +372,29 @@ def test_a_token_file_that_is_not_one_token_falls_back_to_the_environment(
 def test_a_token_file_path_that_is_a_directory_falls_back_to_the_environment(env, monkeypatch, tmp_path):
     monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(tmp_path))
     assert forges.read_token(forges.FORGE_GITHUB) == "ghs_fake"
+
+
+def test_a_token_file_path_that_is_a_fifo_falls_back_to_the_environment(env, monkeypatch, tmp_path):
+    """Opening a FIFO that has no writer blocks, so a read with no
+    regular-file check never returns. The read runs on a thread and the
+    join is bounded, so that failure is a red here and not a hung suite."""
+    fifo = tmp_path / "ledger-token"
+    os.mkfifo(fifo)
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(fifo))
+    read: list[str | None] = []
+    reader = threading.Thread(target=lambda: read.append(forges.read_token(forges.FORGE_GITHUB)), daemon=True)
+    reader.start()
+    reader.join(FIFO_READ_BOUND_SECONDS)
+    blocked = reader.is_alive()
+    if blocked:
+        # Release the blocked open, so the thread does not outlive the test:
+        # a writer's open returns at once while a reader waits.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        reader.join(FIFO_READ_BOUND_SECONDS)
+    assert not blocked, "read_token blocked on a FIFO"
+    assert read == ["ghs_fake"]
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN")
+    assert "which was refused: not a regular file" in forges.missing_token_hint(forges.FORGE_GITHUB)
 
 
 def test_the_token_source_names_the_credential_read_token_returned(env, monkeypatch, tmp_path):

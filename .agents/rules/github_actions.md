@@ -112,8 +112,11 @@ the mirror.
 A floating tag resolves to the manifest the mirror last refreshed, which can trail Docker Hub by
 days; pin a digest where that matters. The kind node image the installer matrix starts is the one
 exception: kind pairs that image with its own release, so naming one on the mirror would also pin
-the Kubernetes version the matrix tests, and that is a separate decision. Cloud Build pulls from
-Google's egress and is out of scope.
+the Kubernetes version the matrix tests, and that is a separate decision. Cloud Build has no
+buildkitd mirror config: the smoke's `deploy/docker/cloudbuild-ci.yaml` passes each Dockerfile's
+Docker Hub base-image ARGs as `$_DOCKER_HUB_MIRROR/...` (#7033), checked by
+`tests/test_cloudbuild_ci_docker_hub_mirror.py`. The publish-side Cloud Build files and literal
+`FROM busybox:musl` lines still pull from Docker Hub.
 
 ## Cap the Actions cache segment download wait
 
