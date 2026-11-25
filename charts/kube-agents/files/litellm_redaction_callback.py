@@ -128,7 +128,8 @@ CONTROL_KEY_PREFIXES = ("litellm_", "langfuse_", "_")
 # - a binary payload (base64 image, document, audio or video, as a source, a
 #   `data:` URL or Gemini inline data): no text rule applies, and a
 #   substitution would corrupt it. It is kept only if its media type is a
-#   known binary one and its data is strict base64; anything else in that
+#   known binary one and its data is base64 (standard or URL-safe, padding
+#   optional) that starts the way that type does; anything else in that
 #   position is refused, since it may carry text the walk cannot read.
 TYPE_KEY = "type"
 THINKING_TYPE = "thinking"
@@ -168,7 +169,8 @@ _MPEG_AUDIO = (lambda d: d[:3] == b"ID3" or (len(d) > 1 and d[0] == 0xFF and d[1
 MEDIA_SIGNATURES = {
     "image/png": lambda d: d[:8] == b"\x89PNG\r\n\x1a\n",
     "image/jpeg": lambda d: d[:3] == b"\xff\xd8\xff",
-    # A common mislabel of JPEG that providers accept.
+    # A common mislabel of JPEG, checked as JPEG. Gemini takes the label; a
+    # provider that doesn't still refuses the request itself.
     "image/jpg": lambda d: d[:3] == b"\xff\xd8\xff",
     "image/gif": lambda d: d[:6] in (b"GIF87a", b"GIF89a"),
     "image/webp": _RIFF(b"WEBP"),

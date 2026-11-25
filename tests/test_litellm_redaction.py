@@ -537,6 +537,12 @@ class TestCallback(unittest.TestCase):
                 req = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": data}}]}]}
                 out = self._run(req, "agenerate_content")
                 self.assertEqual(out["contents"][0]["parts"][0]["inlineData"]["data"], data)
+        # Normalising doesn't loosen the decode: a length that is 1 mod 4, an
+        # '=' inside the data, and over-padding are still not base64.
+        for bad in ("iVBORw0KGgoAA", "iVBO=Rw0KGgo", "iVBORw0KGgo=AAA", "iVBORw0KGgo==="):
+            with self.subTest(bad=bad), self.assertRaises(HTTPException) as refused:
+                self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": bad}}]}]}, "agenerate_content")
+            self.assertEqual(refused.exception.status_code, 400)
         # A URL-safe payload that isn't the media it claims is still refused.
         text = b64.urlsafe_b64encode(b"on prod-eu-1, token here").decode().rstrip("=")
         with self.assertRaises(HTTPException):
@@ -606,6 +612,15 @@ class TestCallback(unittest.TestCase):
             self._run(data)
         self.assertEqual(refused.exception.status_code, 400)
         self.assertIn("refuses a request it cannot walk", str(refused.exception.detail))
+
+    def test_a_fault_in_the_hook_is_not_answered_with_400(self) -> None:
+        # Only a refused shape becomes a 400: any other exception from the
+        # walk surfaces as itself, which LiteLLM answers with a 500.
+        from unittest import mock
+
+        with mock.patch.object(type(self.hook), "redact_request", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._run({"messages": [{"role": "user", "content": "x"}]})
 
     def test_a_refusal_names_a_media_type_only_when_it_is_a_media_type_name(self) -> None:
         def part(media):
