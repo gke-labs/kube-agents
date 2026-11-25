@@ -248,7 +248,13 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			// nothing. A request with rounds left while those children
 			// run is no new round, and stays the busy ignore below.
 			if profileParent && profileRoundsUsed(parent) >= g.cfg.DelegationRoundsMax {
-				refuseRounds(noticeDelegationRoundsChildren, "child", last)
+				// Told its children will still report back only while one
+				// of them has an end to send.
+				notice := ""
+				if profileChildrenRunning(rec, parent, last) {
+					notice = noticeDelegationRoundsChildren
+				}
+				refuseRounds(notice, "child", last)
 				return
 			}
 			ignore(ruleDelegationBusy, "child", last)
@@ -1560,4 +1566,15 @@ func profileRoundsUsed(parent TaskRef) int {
 		return 1
 	}
 	return 0
+}
+
+// profileChildrenRunning reports whether a profile parent's minted children
+// still have an end to send it: for a batch, a planned child with no end
+// (batchLeft); for a single child, while that child holds the conversation,
+// which deliverChildResult hands back to the parent at the child's end.
+func profileChildrenRunning(rec *SessionRecord, parent TaskRef, child string) bool {
+	if parent.fanOut() {
+		return rec.batchLeft(parent) > 0
+	}
+	return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child
 }
