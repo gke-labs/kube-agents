@@ -71,6 +71,19 @@ AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 # directive is held to the shape the harness reads.
 PROFILE_HOOK_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "profile_hook.py"
 PROFILE_HOOK_MODULE_NAME = "bench_profile_hook"
+# The harness's throwaway delegating profile (#6789): the `delegating_profile:` key and
+# the prompt placeholder its [bench:profile name=...] addresses the profile by, loaded
+# the same way so the lint and the harness agree on both.
+DELEGATING_PROFILE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "delegating_profile.py"
+DELEGATING_PROFILE_MODULE_NAME = "bench_delegating_profile"
+# A name the placeholder stands for when the lint parses the directive: one the
+# harness could make.
+DELEGATING_PROFILE_SAMPLE_TOKEN = "0a1b2c3d"
+# Any spelling an author may have meant as the placeholder (one brace, inner spaces, any case).
+DELEGATING_PLACEHOLDER_LOOSE = re.compile(r"\{+\s*bench_delegating_profile", re.IGNORECASE)
+# The Slack lane's case list (hack/slack-lane/run.sh, AGENT_TRANSPORT=slack): a lane whose
+# transport addresses no profile, so a case there cannot use the throwaway one.
+SLACK_LANE_CASES_FILE = REPO_ROOT / "hack" / "slack-lane" / "cases.txt"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
@@ -1209,13 +1222,117 @@ def profile_hook_reader() -> Any:
     return module
 
 
+def delegating_profile_reader() -> Any:
+    """delegating_profile, loaded once, registered in sys.modules as profile_hook is."""
+    if DELEGATING_PROFILE_MODULE_NAME in sys.modules:
+        return sys.modules[DELEGATING_PROFILE_MODULE_NAME]
+    spec = importlib.util.spec_from_file_location(DELEGATING_PROFILE_MODULE_NAME, DELEGATING_PROFILE_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{DELEGATING_PROFILE_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[DELEGATING_PROFILE_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _with_sample_delegating_name(prompt: str) -> str:
+    """``prompt`` with the throwaway profile's placeholder written in as the
+    harness would, so the directive parses as it will at run time."""
+    dp = delegating_profile_reader()
+    return prompt.replace(dp.PLACEHOLDER, dp.new_name(DELEGATING_PROFILE_SAMPLE_TOKEN))
+
+
+def slack_lane_cases() -> set[str]:
+    """Case ids on the Slack lane, read as hack/slack-lane/run.sh reads them:
+    everything from a line's first `#` is a comment, then its first word."""
+    try:
+        text = SLACK_LANE_CASES_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    ids = set()
+    for line in text.splitlines():
+        words = line.split("#", 1)[0].split()
+        if words:
+            ids.add(words[0])
+    return ids
+
+
+def _delegating_profile(name: str, spec: dict[str, Any], problems: list[str]) -> None:
+    """A case on the throwaway delegating profile declares it and addresses it
+    the one way the harness makes it (delegating_profile).
+
+    The harness sees only the prompt: the placeholder as the [bench:profile]
+    directive's name= is what makes it create the profile and tear it down.
+    `delegating_profile: true` is the declaration the case tooling reads, so
+    the two go together. A literal throwaway name would address a profile no
+    run made, and the placeholder anywhere but the prompt stays literal text.
+    Only the inject transport addresses a profile, so a case on the Slack
+    lane cannot use it."""
+    dp = delegating_profile_reader()
+    hook = profile_hook_reader()
+    key = dp.KEY
+    declared = spec.get(key)
+    if key in spec and declared is not True:
+        problems.append(f"'{key}:' {declared!r} is not a bare true; the harness makes the profile for a bare true only")
+    elsewhere: list[tuple[str, str]] = []
+    _strings_outside_prompt(spec, "", elsewhere)
+    for where, value in elsewhere:
+        if DELEGATING_PLACEHOLDER_LOOSE.search(value):
+            problems.append(
+                f"{where}: carries {dp.PLACEHOLDER}, which the harness expands only in the prompt; "
+                "elsewhere it is literal text"
+            )
+    prompt = spec.get("prompt")
+    prompt = prompt if isinstance(prompt, str) else ""
+    uses = prompt.count(dp.PLACEHOLDER)
+    if DELEGATING_PLACEHOLDER_LOOSE.search(prompt.replace(dp.PLACEHOLDER, "")):
+        problems.append(f"prompt: a malformed {dp.PLACEHOLDER}; write it exactly so, as the directive's name=")
+    ask = None
+    try:
+        ask = hook.parse(_with_sample_delegating_name(prompt))
+    except ValueError:
+        pass  # _profile_directive reports it.
+    addressed = ask.name if ask is not None else ""
+    if uses and declared is not True:
+        problems.append(
+            f"prompt: addresses the throwaway delegating profile ({dp.PLACEHOLDER}) without '{key}: true'; "
+            "declare it, so the case tooling knows the run makes and deletes a profile"
+        )
+    # The raw directive must carry the placeholder as its name= field: compared
+    # after substitution, a literal sample name beside a placeholder used
+    # elsewhere would pass.
+    # The directive's body, sliced as profile_hook.parse slices it: leading
+    # whitespace dropped, and the closing ] left out.
+    text = prompt.lstrip()
+    end = text.find(hook.DIRECTIVE_END)
+    directive = text[len(hook.PROFILE_DIRECTIVE) : end] if text.startswith(hook.PROFILE_DIRECTIVE) and end >= 0 else ""
+    named_by_placeholder = f"{hook.NAME_FIELD}={dp.PLACEHOLDER}" in directive.split()
+    if declared is True and not (uses == 1 and named_by_placeholder and addressed == dp.new_name(DELEGATING_PROFILE_SAMPLE_TOKEN)):
+        problems.append(
+            f"'{key}: true' needs the prompt to open with {hook.PROFILE_DIRECTIVE} name={dp.PLACEHOLDER} ...] "
+            f"and name the placeholder nowhere else: the harness makes the profile only for that prompt"
+        )
+    if not uses and dp.looks_like_throwaway_name(addressed):
+        problems.append(
+            f"prompt: {hook.PROFILE_DIRECTIVE} name={addressed}] names a throwaway delegating profile literally, "
+            f"which no run made; address it as name={dp.PLACEHOLDER} with '{key}: true'"
+        )
+    if (uses or declared is True) and name in slack_lane_cases():
+        problems.append(
+            f"uses the throwaway delegating profile but is on the Slack lane ({SLACK_LANE_CASES_FILE.relative_to(REPO_ROOT)}): "
+            "only the inject transport addresses a profile, and the harness refuses the placeholder on any other"
+        )
+
+
 def _profile_directive(spec: dict[str, Any], problems: list[str]) -> None:
     """A prompt that opens with [bench:profile ...] parses as the harness reads
     it (profile_hook). A malformed one errors every run before the agent sees
-    the ask, which a lint catches far cheaper."""
+    the ask, which a lint catches far cheaper. The throwaway delegating
+    profile's placeholder is written in first, as the harness does."""
     prompt = spec.get("prompt")
     if not isinstance(prompt, str):
         return
+    prompt = _with_sample_delegating_name(prompt)
     hook = profile_hook_reader()
     if hook.PROFILE_DIRECTIVE in prompt and not hook.is_profile_ask(prompt):
         problems.append(f"prompt: {hook.PROFILE_DIRECTIVE} ...] must open the prompt, or it reaches the agent as text")
@@ -1676,6 +1793,7 @@ def validate_case(
         return [f"{path}: does not parse to a mapping"]
     _fleet_prompt_placeholders(spec, problems, name in FIXTURE_NOT_READY)
     _profile_directive(spec, problems)
+    _delegating_profile(name, spec, problems)
 
     # The suite. The bare line `suite: validated-capabilities` is the registration on
     # the validated-capabilities lane: hack/ci-eval-pr.sh greps for that exact line,
