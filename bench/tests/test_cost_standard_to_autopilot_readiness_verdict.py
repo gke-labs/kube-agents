@@ -103,6 +103,30 @@ def test_migration_blocked_verdict_with_both_blockers_passes():
             "Unlike the privileged hostPath DaemonSet and the hostNetwork batch Job, "
             "the stateless Deployment with CPU and memory requests can run on GKE Autopilot as-is."
         ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "1. log-collector DaemonSet: privileged and hostPath are blocked.\n"
+            "2. batch Job: hostNetwork is blocked.\n"
+            "Remove hostNetwork so the Job is allowed on Autopilot."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "1. log-collector DaemonSet: privileged and hostPath are blocked.\n"
+            "2. batch Job: hostNetwork is blocked.\n"
+            "Fix: drop hostNetwork from the Job and it can run on Autopilot."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "1. log-collector DaemonSet: privileged and hostPath are blocked.\n"
+            "2. batch Job: hostNetwork is blocked.\n"
+            "Once the Job stops using hostNetwork, it is compatible."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "1. log-collector DaemonSet: privileged and hostPath are blocked.\n"
+            "2. batch Job: hostNetwork is blocked.\n"
+            "Without hostNetwork, the batch Job is allowed on Autopilot."
+        ),
     ):
         assert _passes(report), report
 
