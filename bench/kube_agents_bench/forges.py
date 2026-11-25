@@ -46,6 +46,7 @@ import functools
 import os
 import re
 import ssl
+import stat
 import urllib.parse
 from collections.abc import Mapping
 from pathlib import Path
@@ -216,7 +217,9 @@ def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | No
     printable ASCII with no whitespace inside falls back to the variables,
     which hold the token the unit started with: such a file cannot be a
     token, and an embedded newline or a non-Latin-1 character would otherwise
-    raise out of the HTTP request's header instead of grading."""
+    raise out of the HTTP request's header instead of grading. So does a path
+    that is not a regular file: a FIFO with no writer would otherwise block
+    the read, and the check with it, for good."""
     env = _env(environ)
     token = file_token(forge, env)
     if token:
@@ -230,6 +233,9 @@ def file_token(forge: str, env: Mapping[str, str]) -> str | None:
     if forge == FORGE_GITLAB or not token_file:
         return None
     try:
+        # Checked before the open: opening a FIFO blocks until it has a writer.
+        if not stat.S_ISREG(os.stat(token_file).st_mode):
+            return None
         token = Path(token_file).read_text(encoding="utf-8").strip()
     except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
         return None
@@ -259,7 +265,7 @@ def missing_token_hint(forge: str, environ: Mapping[str, str] | None = None) -> 
     if forge != FORGE_GITLAB and token_file:
         hint += (
             f" ({GITHUB_TOKEN_FILE_ENV_VAR} names {token_file}, which was refused: "
-            "unreadable, empty, or not one line of printable ASCII)"
+            "not a regular file, unreadable, empty, or not one line of printable ASCII)"
         )
     return hint
 

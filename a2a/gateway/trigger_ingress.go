@@ -445,7 +445,22 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 		trigger = &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream, Script: s.Trigger.Script}
 	}
 	authority := g.triggerAuthority(rec, s.Trigger.Name, trigger)
-	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route, false)
+	requester := TaskRequester{Backend: triggerRequesterBackend, Subject: s.Trigger.Name}
+	now := time.Now()
+	// The run's entry on the record, written below. A run of a profile whose
+	// card says it delegates carries the profiles the delegation would
+	// accept from this entry and the width (profileTargetsParts, #6789), as
+	// a profile task started from a turn does; any other run is submitted
+	// as it was.
+	entry := TaskRef{
+		ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
+		Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
+		RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
+		// Its scope, recorded as a profile task's is: the scope its
+		// children are held to when it fans out (#6744).
+		Scope: string(route.Scope),
+	}
+	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route, false, g.profileTargetsParts(rec, entry, taskID)...)
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the task's message could not be built")
 	}
@@ -461,21 +476,12 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 
 	// Registered where the relay looks before the publish, as startTask
 	// does, so the executor's first event finds its conversation.
-	requester := TaskRequester{Backend: triggerRequesterBackend, Subject: s.Trigger.Name}
 	prevActive, prevTasks := rec.ActiveTask, rec.Tasks
-	now := time.Now()
 	rec.Delivery = &s.Delivery
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: run.CorrelationID, Ask: truncateRunes(s.Prompt, askCap),
 		SubmittedAt: now, Capability: run.Capability}
 	if !rec.hasTask(taskID) {
-		rec.Tasks = append(append([]TaskRef(nil), rec.Tasks...), TaskRef{
-			ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
-			Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
-			RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
-			// Its scope, recorded as a profile task's is: the scope its
-			// children are held to when it fans out (#6744).
-			Scope: string(route.Scope),
-		})
+		rec.Tasks = append(append([]TaskRef(nil), rec.Tasks...), entry)
 		if len(rec.Tasks) > taskHistoryCap {
 			rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 		}
