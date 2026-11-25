@@ -42,8 +42,9 @@ import (
 const userID = "worker"
 
 type options struct {
-	personaDir string
-	model      string
+	personaDir      string
+	personaRequired bool
+	model           string
 }
 
 func main() {
@@ -64,6 +65,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	fs.SetOutput(stderr)
 	var o options
 	fs.StringVar(&o.personaDir, "persona-dir", "", "the rendered persona (instructions.md, skills/<name>/SKILL.md), read once into memory")
+	fs.BoolVar(&o.personaRequired, "persona-required", false, "fail the turn when --persona-dir is missing, rather than run with no persona")
 	fs.StringVar(&o.model, "model", "", "the model name (required)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -119,7 +121,7 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	if err != nil {
 		return fmt.Errorf("tools: %w", err)
 	}
-	instructions, skillsets, err := loadPersona(ctx, o.personaDir)
+	instructions, skillsets, err := loadPersona(ctx, o.personaDir, o.personaRequired)
 	if err != nil {
 		return fmt.Errorf("persona: %w", err)
 	}

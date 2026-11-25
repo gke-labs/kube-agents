@@ -27,7 +27,10 @@ import (
 // a skill, its instructions start with the skill's directory on disk, which
 // is where the skill's scripts are run from with the shell (as on Claude
 // Code, whose skills name "the base directory the harness gives").
-func loadPersona(ctx context.Context, dir string) (string, []adktool.Toolset, error) {
+//
+// A missing dir is no persona, unless required: a pod configured for a
+// persona that finds none fails the turn rather than run without it.
+func loadPersona(ctx context.Context, dir string, required bool) (string, []adktool.Toolset, error) {
 	if dir == "" {
 		return "", nil, nil
 	}
@@ -36,9 +39,9 @@ func loadPersona(ctx context.Context, dir string) (string, []adktool.Toolset, er
 	if !filepath.IsAbs(dir) {
 		return "", nil, fmt.Errorf("the persona directory %q is not absolute", dir)
 	}
-	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) && !required {
 		// No persona rendered for this pod: the turn runs on core-agent's
-		// own prompt. Whether a pod must have one is PrepareTurn's check.
+		// own prompt.
 		return "", nil, nil
 	}
 	r, err := coreagent.Snapshot(dir)
