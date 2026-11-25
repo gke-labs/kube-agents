@@ -12,9 +12,11 @@ const (
 	coreAgentPersonaDir = "/var/lib/agent-persona"
 )
 
-// defaultPath is empty until the worker image ships the binary: a pod names
-// it with A2A_HARNESS_PATH.
-func (coreAgentBuilder) defaultPath() string { return "" }
+// coreAgentHarnessPath is where the worker image puts core-agent-harness
+// (a2a/Dockerfile.worker).
+const coreAgentHarnessPath = "/usr/local/bin/core-agent-harness"
+
+func (coreAgentBuilder) defaultPath() string { return coreAgentHarnessPath }
 
 // command takes no session or history: those are the adapter's and travel
 // in the stdin envelope.
