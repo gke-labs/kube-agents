@@ -4081,10 +4081,38 @@ class KubeAgentsHarness(AgentHarness):
                 f"AGENT_TRANSPORT={os.environ.get('AGENT_TRANSPORT', TRANSPORT_API)!r}; it runs on {TRANSPORT_INJECT!r}"
             )
         _write_eval_run(_eval_run_record(run_id, case_id, repetition))
+        # The pod's clock at the run's start, when known: the board's
+        # created_at is the pod's, and every earlier unit's cards predate it.
+        since = float(self._pod_floor) if self._pod_floor is not None else time.time() - _CARD_WAIT_CLOCK_SKEW
         try:
             return relayed_report.run(transport, relayed, inject.conversation_key(run_id, case_id, repetition))
         except relayed_report.RelayInfrastructure as exc:
             return _infra_failure(str(exc))
+        finally:
+            # The opening files the card the report comes from, and its turn
+            # runs as a follow-up, which skips the delegation wait that
+            # cleans up after a card. So, whatever the run's outcome: archive
+            # any card still running and purge every card's state, so the
+            # pod the next unit shares holds nothing of this one.
+            self._clean_cards_since(since)
+
+    def _clean_cards_since(self, since: float) -> None:
+        """Archive every card filed since ``since`` (the pod's clock) that
+        has not ended, and purge every such card's state, as the card-wait
+        path does when it gives up. A failed read leaves them for the next
+        unit's pending purges, logged."""
+        sessions = board.sessions_with_cards_since(_agent_shell, since, _EXEC_TIMEOUT)
+        if sessions is None:
+            _log.warning("relayed report: the cards filed since %s could not be read; none archived or purged", since)
+            return
+        for sid in sessions:
+            got = board.read_session_cards(_agent_shell, sid, _EXEC_TIMEOUT)
+            if got is None or not got.session_found or not got.card_ids:
+                continue
+            live = [t for t in got.card_ids if str(got.cards.get(t, {}).get("status")) not in _TERMINAL_STATUSES]
+            if live:
+                _archive_stalled_cards(live, _EXEC_TIMEOUT, floor=self._pod_floor)
+            _purge_card_state(list(got.card_ids), _EXEC_TIMEOUT, floor=self._pod_floor)
 
     def _execute_session_cap(self, prompt: str) -> AgentResult:
         """A session-cap ask (:mod:`session_cap`, #6882): fill the install's

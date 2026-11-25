@@ -544,6 +544,12 @@ def door(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubDoor, None, None]:
     # The opening's session store: it filed a card, unless a test says not.
     server.session_cards = board.SessionCards(session_found=True, card_ids=["card-1"])
     monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: server.session_cards)
+    # The cleanup after the run: the sessions that filed cards since its
+    # start, and what was archived and purged.
+    server.archived, server.purged = [], []
+    monkeypatch.setattr(harness.board, "sessions_with_cards_since", lambda *a, **k: ["a2a-opening"])
+    monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, *a, **k: server.archived.extend(ids))
+    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, *a, **k: server.purged.extend(ids))
     try:
         yield server
     finally:
@@ -756,3 +762,17 @@ def test_inject_an_unreachable_door_during_the_wait_is_infrastructure(door, monk
     assert _infra(got), got.errors
     assert "wait for the report post failed" in got.errors[0]
     assert len(door.submissions) == 1
+
+
+def test_inject_the_openings_card_is_cleaned_up_after_a_green_run(door):
+    got = _run(door)
+    assert not got.errors, got.errors
+    assert door.purged == ["card-1"]
+
+
+def test_inject_the_openings_card_is_archived_and_purged_when_no_report_comes(door):
+    door.relayed = []
+    got = _run(door)
+    assert _infra(got)
+    assert door.archived == ["card-1"] and door.purged == ["card-1"]
+
