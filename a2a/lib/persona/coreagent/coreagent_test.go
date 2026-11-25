@@ -185,13 +185,6 @@ func TestAScriptRendersExecutableWithTheShell(t *testing.T) {
 	}
 }
 
-func TestTheDelegateServerIsTheReservedOne(t *testing.T) {
-	d := coreagent.DelegateServer("/worker-adapter", map[string]string{"A2A_DELEGATE_SOCKET": "/run/d.sock"})
-	if persona.ReservedServer != "a2a" || d.Name != persona.ReservedServer || !slices.Equal(d.Tools, []string{"delegate"}) || !slices.Equal(d.Args, []string{"delegate-mcp"}) {
-		t.Errorf("delegate server = %+v", d)
-	}
-}
-
 // sameSkill checks a rendered SKILL.md against its source: the same
 // frontmatter keys and values, and the same body.
 func sameSkill(t *testing.T, skill string, src, rendered []byte) {

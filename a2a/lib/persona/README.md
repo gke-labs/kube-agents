@@ -157,7 +157,7 @@ yet.
     `metadata` values, a script whose path isn't letters, digits, `.`, `_`,
     `-` and `/`, and a script when the persona doesn't grant `shell`.
   - The server name `a2a` is reserved, for every harness, for the worker's
-    own delegate server.
+    own delegate server, which the worker adds per turn.
 
 ## An example
 
