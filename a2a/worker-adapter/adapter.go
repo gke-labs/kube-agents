@@ -882,8 +882,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	// A harness that takes its MCP servers in-process gets this turn's in its
 	// envelope, built from source here each turn so nothing an earlier turn
 	// added carries over. The delegate server joins later (#6789); nil now.
-	a.cfg.Driver = turnDriver(a.cfg.driver(), cfg.PersonaMCP, nil)
-	drv = a.cfg.driver()
+	// The turn's driver stays local: a reused pod's next turn, or a wake,
+	// starts again from the pod's.
+	drv = turnDriver(drv, cfg.PersonaMCP, nil)
 
 	if delegate {
 		// The agents this turn's requester may delegate to, as the gateway
