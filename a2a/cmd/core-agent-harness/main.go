@@ -13,6 +13,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -40,8 +42,9 @@ import (
 const userID = "worker"
 
 type options struct {
-	personaDir string
-	model      string
+	personaDir      string
+	personaRequired bool
+	model           string
 }
 
 func main() {
@@ -53,7 +56,9 @@ func main() {
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Non-dumpable before anything else: a same-UID command the turn runs
 	// can then neither read this process's memory or environ nor open its
-	// /proc/<pid>/fd, so it can't write forged event lines into stdout.
+	// /proc/<pid>/fd. That covers this end of the stdout pipe only; the
+	// adapter's end is the adapter's to protect, and its decoder accepts
+	// event lines only in the turn's order.
 	if err := childenv.Protect(); err != nil {
 		fmt.Fprintln(stderr, "core-agent-harness: protect:", err)
 		return 1
@@ -62,6 +67,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	fs.SetOutput(stderr)
 	var o options
 	fs.StringVar(&o.personaDir, "persona-dir", "", "the rendered persona (instructions.md, skills/<name>/SKILL.md), read once into memory")
+	fs.BoolVar(&o.personaRequired, "persona-required", false, "fail the turn when --persona-dir is missing, rather than run with no persona")
 	fs.StringVar(&o.model, "model", "", "the model name (required)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -71,12 +77,28 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 2
 	}
 	out := json.NewEncoder(stdout)
-	emit := func(ev coreagentwire.Event) { _ = out.Encode(ev) }
+	// Once ctx is done (the adapter's SIGTERM, for a cancel or the task's
+	// deadline) nothing more is written: no result, no history. The adapter
+	// decides a stopped task's state itself, and a result line would report
+	// the stop as this harness's failure, or as a completed turn. The
+	// stopped turn is left out of the conversation's history.
+	emit := func(ev coreagentwire.Event) {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = out.Encode(ev)
+	}
 
+	// The envelope is one line: the adapter keeps stdin open after writing
+	// it (as it does for every harness), so read to the newline, never to
+	// EOF, and no further than the cap.
 	var env coreagentwire.Envelope
-	raw, err := io.ReadAll(io.LimitReader(stdin, coreagentwire.MaxEnvelopeBytes+1))
-	if err == nil && len(raw) > coreagentwire.MaxEnvelopeBytes {
+	raw, err := bufio.NewReaderSize(io.LimitReader(stdin, coreagentwire.MaxEnvelopeBytes+1), 64<<10).ReadBytes('\n')
+	switch {
+	case len(bytes.TrimSuffix(raw, []byte("\n"))) > coreagentwire.MaxEnvelopeBytes:
 		err = fmt.Errorf("over %d bytes", coreagentwire.MaxEnvelopeBytes)
+	case err == io.EOF && len(bytes.TrimSpace(raw)) > 0:
+		err = nil // a final line without its newline
 	}
 	if err == nil {
 		err = json.Unmarshal(raw, &env)
@@ -87,6 +109,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	if err := turn(ctx, o, env, emit); err != nil {
 		emit(coreagentwire.Event{Type: coreagentwire.TypeResult, Failed: true, Error: err.Error()})
+		return 1
+	}
+	if ctx.Err() != nil {
 		return 1
 	}
 	return 0
@@ -111,7 +136,7 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	if err != nil {
 		return fmt.Errorf("tools: %w", err)
 	}
-	instructions, skillsets, err := loadPersona(ctx, o.personaDir)
+	instructions, skillsets, err := loadPersona(ctx, o.personaDir, o.personaRequired)
 	if err != nil {
 		return fmt.Errorf("persona: %w", err)
 	}
@@ -137,6 +162,12 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	}
 	if instructions != "" {
 		opts = append(opts, agent.WithExtraInstruction(instructions))
+	}
+	// The worker's own lines for the turn (a session pod's cluster access),
+	// after the persona, in the instruction layer: never in the history,
+	// which the envelope carries back on the next turn.
+	for _, line := range env.Instructions {
+		opts = append(opts, agent.WithExtraInstruction(line))
 	}
 	a, err := agent.New(llm, opts...)
 	if err != nil {

@@ -17,9 +17,11 @@ package coreagentwire
 
 import "encoding/json"
 
-// MaxEnvelopeBytes bounds one turn's Envelope. The harness refuses a larger
-// one, failing the turn: core-agent's compaction keeps a conversation's
-// history well under it.
+// MaxEnvelopeBytes bounds one turn's Envelope, its trailing newline aside.
+// The harness refuses a larger one, failing the turn. Nothing compacts the
+// history yet, so a long enough conversation reaches it (TODO(#7158):
+// compact before the turn and send only the events from the latest summary
+// on).
 const MaxEnvelopeBytes = 16 << 20
 
 // Envelope is one turn's input, a single JSON object on stdin.
@@ -37,11 +39,15 @@ type Envelope struct {
 	// MCP lists the MCP servers the turn may use, built at the start of the
 	// process and closed at its exit.
 	MCP []MCPServer `json:"mcp,omitempty"`
+	// Instructions are the worker's own system-prompt lines for the turn
+	// (a session pod's, as Claude Code gets them on --append-system-prompt),
+	// added to the agent's instruction, never to the conversation's history.
+	Instructions []string `json:"instructions,omitempty"`
 }
 
 // Policy is a turn's tool policy: the tools the model is offered and the
 // rules a call is checked against before it runs. Its contents are filled
-// from the persona grant (SEAM: tigerteam-dev-1).
+// from the persona grant.
 type Policy struct {
 	// Tools names the built-in tools the model is offered; nothing else is.
 	Tools []string `json:"tools,omitempty"`
@@ -51,8 +57,8 @@ type Policy struct {
 	Deny  []string `json:"deny,omitempty"`
 }
 
-// MCPServer is one MCP server a turn may use (SEAM: tigerteam-dev-3 for the
-// lifecycle, tigerteam-dev-1 for which tools it offers).
+// MCPServer is one MCP server a turn may use; the harness runs it for the
+// turn, and the persona grant decides which of its tools are offered.
 type MCPServer struct {
 	Name    string            `json:"name"`
 	Command string            `json:"command,omitempty"`
@@ -100,10 +106,11 @@ type Event struct {
 	Event json.RawMessage `json:"event,omitempty"`
 }
 
-// Usage is one turn's token counts.
+// Usage is one turn's token counts, summed over its model responses in
+// int64 so a long turn's total can't wrap.
 type Usage struct {
-	Input    int32 `json:"input"`
-	Output   int32 `json:"output"`
-	Cached   int32 `json:"cached,omitempty"`
-	Thoughts int32 `json:"thoughts,omitempty"`
+	Input    int64 `json:"input"`
+	Output   int64 `json:"output"`
+	Cached   int64 `json:"cached,omitempty"`
+	Thoughts int64 `json:"thoughts,omitempty"`
 }

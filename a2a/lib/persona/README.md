@@ -104,11 +104,13 @@ what the harness cannot express comes back as a warning; the `core-agent`
 adapter refuses it instead (below).
 `render.For(harness)` picks the adapter by the harness the worker is started
 with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
-`spec.harness.type`, or on a profile worker `PROFILE_HARNESS` when that is
-unset (`claude-code`, `antigravity` or `core-agent`). A session pod refuses `antigravity`
-unless `A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, until
-#6710 lands; a profile worker refuses it because it has no persona adapter
-yet.
+`spec.harness.type` (and the gateway sets on session pods from the
+PlatformAgent's `spec.harness.sessionWorker.type`), or on a profile worker
+`PROFILE_HARNESS` when that is unset (`claude-code`, `antigravity` or
+`core-agent`). A session pod refuses `antigravity` unless
+`A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, and `core-agent`
+unless `A2A_HARNESS_UNISOLATED=allow` is set, until #6710 lands. A profile
+worker refuses `antigravity`, which has no persona adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
@@ -131,7 +133,6 @@ yet.
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
-
 - **`core-agent`** (`coreagent`): renders `instructions.md` and `skills/`,
   each skill in the Agent Skills layout (`<name>/SKILL.md` and its files),
   for a directory a user other than the harness's writes before the harness
@@ -158,7 +159,7 @@ yet.
     `metadata` values, a script whose path isn't letters, digits, `.`, `_`,
     `-` and `/`, and a script when the persona doesn't grant `shell`.
   - The server name `a2a` is reserved, for every harness, for the worker's
-    own delegate server.
+    own delegate server, which the worker adds per turn.
 
 ## An example
 

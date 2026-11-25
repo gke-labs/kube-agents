@@ -70,7 +70,7 @@ func TestEveryShippedPersonaLoadsIntoCoreAgent(t *testing.T) {
 					t.Errorf("skills/%s: ADK reads the name %q", s.Name, fm.Name)
 				}
 			}
-			instructions, sets, err := loadPersona(context.Background(), dir)
+			instructions, sets, err := loadPersona(context.Background(), dir, true)
 			if err != nil {
 				t.Fatalf("loadPersona: %v", err)
 			}
@@ -212,13 +212,13 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: probe\ndescription: a probe\n---\nbody\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if instructions, sets, err := loadPersona(context.Background(), dir); err != nil || instructions != "be brief" || len(sets) != 1 {
+	if instructions, sets, err := loadPersona(context.Background(), dir, true); err != nil || instructions != "be brief" || len(sets) != 1 {
 		t.Fatalf("a plain persona: %q, %d toolsets, %v", instructions, len(sets), err)
 	}
 	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(skillDir, "leak.md")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := loadPersona(context.Background(), dir); err == nil {
+	if _, _, err := loadPersona(context.Background(), dir, true); err == nil {
 		t.Error("read a persona holding a link out of its directory")
 	}
 
@@ -226,7 +226,7 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(linked, "instructions.md")); err != nil {
 		t.Fatal(err)
 	}
-	if got, _, err := loadPersona(context.Background(), linked); err == nil {
+	if got, _, err := loadPersona(context.Background(), linked, true); err == nil {
 		t.Errorf("read instructions through a link outside the dir: %q", got)
 	}
 }
@@ -272,7 +272,7 @@ func TestTheListedScriptsAreTheGrantedOnes(t *testing.T) {
 }
 
 func TestARelativePersonaDirectoryIsRefused(t *testing.T) {
-	if _, _, err := loadPersona(context.Background(), "agent-persona"); err == nil || !strings.Contains(err.Error(), "not absolute") {
+	if _, _, err := loadPersona(context.Background(), "agent-persona", true); err == nil || !strings.Contains(err.Error(), "not absolute") {
 		t.Errorf("err = %v, want a relative directory refused", err)
 	}
 }
@@ -289,5 +289,18 @@ func TestLoadingANameThatIsntASkillFails(t *testing.T) {
 		if _, err := src.LoadInstructions(context.Background(), name); err == nil {
 			t.Errorf("LoadInstructions(%q) succeeded", name)
 		}
+	}
+}
+
+// A pod with no persona directory runs the turn with no persona.
+func TestAMissingPersonaDirIsNoPersona(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "absent")
+	instructions, toolsets, err := loadPersona(context.Background(), absent, false)
+	if err != nil || instructions != "" || len(toolsets) != 0 {
+		t.Fatalf("instructions %q, %d toolsets, err %v", instructions, len(toolsets), err)
+	}
+	// A pod configured for a persona fails the turn when it isn't there.
+	if _, _, err := loadPersona(context.Background(), absent, true); err == nil {
+		t.Error("a required persona that is missing did not fail the turn")
 	}
 }

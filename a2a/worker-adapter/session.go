@@ -81,6 +81,14 @@ func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask stri
 	for {
 		if out.launched {
 			switch {
+			case out.harnessSession != "" && keepsOnlyCompletedTurns(cfg.driver()) && out.res.State != lib.StateCompleted:
+				// This driver's conversation keeps a turn only when it
+				// completes, so a failed or stopped turn added nothing:
+				// the loop stays where it was. Before any turn has
+				// completed that means the next run starts fresh with the
+				// primer; after one, it resumes the same conversation.
+				log.Warn("the turn did not complete, and this harness keeps only completed turns; the next run starts from the conversation as it was",
+					"task", out.lastTask(cfg), "resume", resume != "")
 			case out.harnessSession != "":
 				// The primer went into a harness session that said it
 				// exists, so every later run resumes it instead.
@@ -352,4 +360,18 @@ func delegateOffForTask(origin *lib.Envelope) bool {
 		return true
 	}
 	return len(block.Via) > 0 && string(block.Via) != "null"
+}
+
+// completedTurnsOnly is implemented by a driver whose conversation keeps a
+// turn only when the turn completes (core-agent: the adapter holds its
+// history and commits a turn's events at its result). For such a driver a
+// harness session id says nothing was kept until a turn completes, so the
+// session loop doesn't drop the primer or switch to resuming before then.
+type completedTurnsOnly interface {
+	KeepsOnlyCompletedTurns()
+}
+
+func keepsOnlyCompletedTurns(d Driver) bool {
+	_, ok := d.(completedTurnsOnly)
+	return ok
 }

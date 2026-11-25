@@ -85,3 +85,27 @@ func TestAnErroringStepYieldsOneFailedResult(t *testing.T) {
 		t.Errorf("%d tool results, want 1: %+v", n, got)
 	}
 }
+
+// A final message in several text parts is the result's whole text.
+func TestTheResultJoinsTheFinalTextParts(t *testing.T) {
+	var got []coreagentwire.Event
+	m := newMapper(func(e coreagentwire.Event) { got = append(got, e) })
+	m.observe(ev(false, &genai.Part{Text: "one, "}, &genai.Part{Text: "two"}))
+	m.finish(nil)
+	if r := got[len(got)-1]; r.Text != "one, two" {
+		t.Errorf("result text %q", r.Text)
+	}
+}
+
+// A tool-only last response clears an earlier preamble: the result is the
+// model's last whole response, not text from before its tool call.
+func TestATextlessLastResponseLeavesNoPreambleAsTheResult(t *testing.T) {
+	var got []coreagentwire.Event
+	m := newMapper(func(e coreagentwire.Event) { got = append(got, e) })
+	m.observe(ev(false, &genai.Part{Text: "Let me check the pods"}))
+	m.observe(ev(false, &genai.Part{FunctionCall: &genai.FunctionCall{ID: "c1", Name: "bash"}}))
+	m.finish(nil)
+	if r := got[len(got)-1]; r.Text != "" {
+		t.Errorf("result text %q, want none: the last response had no text", r.Text)
+	}
+}

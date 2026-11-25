@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/genai"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 )
@@ -36,14 +38,15 @@ func (m *mapper) observe(ev *session.Event) {
 		return
 	}
 	if u := ev.UsageMetadata; u != nil && !ev.Partial {
-		m.usage.Input += u.PromptTokenCount
-		m.usage.Output += u.CandidatesTokenCount
-		m.usage.Cached += u.CachedContentTokenCount
-		m.usage.Thoughts += u.ThoughtsTokenCount
+		m.usage.Input += int64(u.PromptTokenCount)
+		m.usage.Output += int64(u.CandidatesTokenCount)
+		m.usage.Cached += int64(u.CachedContentTokenCount)
+		m.usage.Thoughts += int64(u.ThoughtsTokenCount)
 	}
 	if ev.Content == nil {
 		return
 	}
+	var whole []string
 	for _, p := range ev.Content.Parts {
 		switch {
 		case p.FunctionCall != nil:
@@ -76,9 +79,15 @@ func (m *mapper) observe(ev *session.Event) {
 				m.emit(coreagentwire.Event{Type: kind, Text: p.Text})
 			}
 			if kind == coreagentwire.TypeText && !ev.Partial {
-				m.final = p.Text
+				whole = append(whole, p.Text)
 			}
 		}
+	}
+	// The result is the model's last whole response: one with no text (a
+	// tool call alone, or an empty stop) clears an earlier preamble rather
+	// than leave it standing as the answer.
+	if !ev.Partial && ev.Content.Role == genai.RoleModel {
+		m.final = strings.Join(whole, "")
 	}
 	if !ev.Partial {
 		m.streamed = false
