@@ -66,7 +66,6 @@ func TestAStatusShowingBackendGetsTheBusFailurePosted(t *testing.T) {
 	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
 		return statusShowingAdapter{a}
 	})
-	waitFor(t, "the relay to bind", func() bool { return r.g.relayBound.Load() })
 	deleteTasksStream(t, r.url)
 	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/no-bus", Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "count me"}
 	waitFor(t, "the bus failure posted", postedContaining(r, noticeBusUnreachable))

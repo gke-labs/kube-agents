@@ -576,6 +576,7 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 		t.Fatalf("New: %v", err)
 	}
 	go func() { _ = g.Run(ctx) }()
+	waitFor(t, "the relay to bind", g.relayBound.Load)
 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
@@ -1596,6 +1597,7 @@ func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessio
 	}
 	ran := make(chan struct{})
 	go func() { _ = g.Run(ctx); close(ran) }()
+	waitFor(t, "the relay to bind", g.relayBound.Load)
 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel, ran: ran}, spawn
 }
