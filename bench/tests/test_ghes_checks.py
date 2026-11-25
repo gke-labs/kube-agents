@@ -311,10 +311,6 @@ def test_client_for_takes_the_api_root():
 
 # --- BENCH_FORGE_CA_FILE ----------------------------------------------------
 
-# The DER bytes of the object identifier of the curve prime256v1. A key that names its
-# curve holds them; a key that writes the curve's parameters in full does not.
-PRIME256V1_OID = bytes.fromhex("06082a8648ce3d030107")
-
 
 @pytest.fixture
 def private_ca_server(tmp_path):
@@ -356,16 +352,6 @@ def private_ca_server(tmp_path):
 
 def test_a_private_ca_is_trusted_only_when_named(private_ca_server, monkeypatch):
     url, ca = private_ca_server
-    # Only where the host's openssl is LibreSSL (macOS): it writes the curve's parameters in
-    # full, and the TLS client refuses such a key. With OpenSSL the test always runs, so a
-    # key that the client refuses fails it there.
-    libressl = "LibreSSL" in subprocess.run(["openssl", "version"], capture_output=True, text=True, check=True).stdout
-    if libressl and PRIME256V1_OID not in ssl.PEM_cert_to_DER_cert(ca.read_text()):
-        pytest.skip(
-            "this machine's openssl is LibreSSL and made the CA's key with explicit EC parameters, which "
-            "the TLS client refuses; the test shows a private CA that is trusted only when "
-            "BENCH_FORGE_CA_FILE names it"
-        )
     monkeypatch.setattr(verifiers, "_FORGE_READ_RETRY_PAUSE_SEC", 0)
     with pytest.raises(OSError, match="CERTIFICATE_VERIFY_FAILED"):
         verifiers._http_get_json(f"{url}/repos/a/b", "ghs_fake", 5)

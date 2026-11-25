@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Plant and remove the previous run of bench/tasks/fleet-audit-unchanged-finding-keeps-wording.
+"""Plant and remove the previous run of bench/tasks/fleet-audit-unchanged-finding-keeps-wording,
+of bench/tasks/fleet-audit-remediation-right-and-not-stale and of
+bench/tasks/fleet-audit-wrong-kept-remediation-gives-way.
 
 main.tf runs this in the container that runs `audit_report.py finish`, as
-`python3 - <mode> <scripts dir> <mark>`. That container holds the report store
-on its own volume.
+`python3 - <mode> <scripts dir> <mark> [<remediation>]`. That container holds
+the report store on its own volume.
 
 plant: runs the drift collector, which reads GKE metadata only, and writes a
 report-store envelope for the fleet-consistency-drift stream. The envelope holds
@@ -28,6 +30,17 @@ wording. The envelope names no issue, so the delta of the next run does not
 trust it. Exits 1 when the collector gives no candidate: then the case cannot
 go green or red for the reason it tests.
 
+<remediation> chooses what the planted authorized-networks finding proposes.
+`manual` (the default) is the marked note above. `gcloud-stale` is a marked
+`gcloud` command with a literal range, on evidence that differs from this
+run's: `finish` must not carry it, and each run of the case is then measured
+on its own words (the plant of fleet-audit-remediation-right-and-not-stale).
+`gcloud-same` is the same command on equal evidence: the plant of
+fleet-audit-wrong-kept-remediation-gives-way. `finish` keeps the planted
+title and impact, and judges the planted command by its content rules: a
+literal range where the procedure leaves the value to the owner gives way to
+this run's own remediation, when this run's own passes the rules.
+
 teardown: removes each stored envelope of the stream, `latest.json` and the
 ring entries, that holds <mark>. A kept wording then does not stay in the
 store for later runs of the stream.
@@ -35,6 +48,7 @@ store for later runs of the stream.
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -43,15 +57,46 @@ from pathlib import Path
 AUDIT = "fleet-consistency-drift"
 COLLECTOR = "fleet_drift.py"
 CREDENTIAL_PROXY_BIN = "/opt/credential-proxy/bin"
-# `finish` keeps the remediation only where both runs wrote `manual`.
+# The kind of the default plant. `finish` keeps a `manual` remediation only
+# where this run wrote `manual` too.
 MANUAL_KIND = "manual"
 # A placeholder evidence object, which `adopt_collector_evidence` replaces
 # with the collector's command and excerpt.
 PLACEHOLDER = "-"
 PLANT_ARGC = 4
+# The collector's own arguments, from the stack: on an install that declares a
+# scope the collector sweeps nothing without the scope flags, and the plant
+# then has no candidate.
+COLLECTOR_ARGS_ENV = "PLANT_COLLECTOR_ARGS"
+# The planted `gcloud` remediations, for the authorized-networks finding only.
+GCLOUD_KIND = "gcloud"
+REMEDIATION_STALE = "gcloud-stale"
+REMEDIATION_SAME = "gcloud-same"
+REMEDIATIONS = (MANUAL_KIND, REMEDIATION_STALE, REMEDIATION_SAME)
+OUTLIER_CHECK = "authorized-networks"
+# A literal range is what the drift SOP forbids in this command (section 4.5),
+# so a run that publishes this note copied it or was handed it. The range is
+# from the documentation block: no real network.
+PLANTED_COMMAND = (
+    "# {mark}\n"
+    "gcloud container clusters update {cluster} --enable-master-authorized-networks "
+    "--master-authorized-networks=203.0.113.0/24"
+)
+# Appended to the evidence of a stale plant: any difference stops the carry.
+STALE_EVIDENCE_LINE = "\nprevious run: {mark}"
 # Stamp the planted envelope one week in the past so that a reader of the store
 # sees a previous weekly run, not a run that finished seconds ago.
 PLANTED_RUN_AGE = timedelta(days=7)
+# The ring keeps only the newest envelopes, by the stamp in each file's name.
+# A ring entry named for a week ago is the first one a prune drops on a store
+# that already holds that many newer runs, and a case that reads the plant
+# after the run would then find it gone. The entry is named for a minute ago:
+# newer than every run that finished more than a minute ago, older than the
+# run under test. The name is then not the envelope's own time, which
+# report_status.py takes a ring entry's name to be: its reader answers for the
+# planted run from the ring entry and says that `latest.json` may be behind.
+# No check of the cases on this stack reads through that reader.
+PLANTED_RING_AGE = timedelta(minutes=1)
 STDERR_TAIL_CHARS = 500
 
 
@@ -78,7 +123,7 @@ def load(scripts: str):
     return audit_report
 
 
-def planted_finding(audit_report, entry: dict, candidate: dict, mark: str) -> dict:
+def planted_finding(audit_report, entry: dict, candidate: dict, mark: str, remediation: str = MANUAL_KIND) -> dict:
     check = str(candidate.get("check") or "")
     obj = str(candidate.get("object") or "")
     finding = {
@@ -97,14 +142,20 @@ def planted_finding(audit_report, entry: dict, candidate: dict, mark: str) -> di
         "remediation": {"kind": MANUAL_KIND, "note": f"{mark} note."},
         "evidence": {"command": PLACEHOLDER, "excerpt": PLACEHOLDER},
     }
+    if remediation != MANUAL_KIND and check == OUTLIER_CHECK:
+        cluster = finding["cluster"].rsplit("/", 1)[-1]
+        finding["remediation"] = {"kind": GCLOUD_KIND, "note": PLANTED_COMMAND.format(mark=mark, cluster=cluster)}
     finding["id"] = audit_report.published_id(finding)
     return finding
 
 
-def plant(audit_report, mark: str, scripts: str) -> int:
+def plant(audit_report, mark: str, scripts: str, remediation: str = MANUAL_KIND) -> int:
     collector = Path(scripts) / COLLECTOR
     run = subprocess.run(
-        [sys.executable, str(collector)], capture_output=True, text=True, check=False
+        [sys.executable, str(collector), *shlex.split(os.environ.get(COLLECTOR_ARGS_ENV, ""))],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     try:
         manifest = json.loads(run.stdout)
@@ -113,20 +164,23 @@ def plant(audit_report, mark: str, scripts: str) -> int:
         print(f"{COLLECTOR} gave no manifest (exit {run.returncode}): {tail}", file=sys.stderr)
         return 1
     findings = [
-        planted_finding(audit_report, entry, candidate, mark)
+        planted_finding(audit_report, entry, candidate, mark, remediation)
         for entry, candidate in audit_report._candidates(manifest)
     ]
     audit_report.adopt_collector_evidence(findings, manifest)
+    if remediation == REMEDIATION_STALE:
+        for finding in findings:
+            finding["evidence"]["excerpt"] += STALE_EVIDENCE_LINE.format(mark=mark)
     if not findings:
         print(f"{COLLECTOR} gave no candidate; nothing to plant.", file=sys.stderr)
         return 1
-    repo = audit_report.resolve_repo(audit_id=AUDIT)
-    now = datetime.now(timezone.utc) - PLANTED_RUN_AGE
+    repo = audit_report.resolve_repo_or_no_forge(AUDIT)
+    now = datetime.now(timezone.utc)
     envelope = audit_report.report_envelope(
         AUDIT,
         {"status": "UPDATED"},
         {"findings": findings},
-        now,
+        now - PLANTED_RUN_AGE,
         repo=repo,
         issue_number=None,
         ledger_body="",
@@ -134,7 +188,7 @@ def plant(audit_report, mark: str, scripts: str) -> int:
         resolved_ids=[],
         rendered_ids=[f["id"] for f in findings],
     )
-    audit_report.write_report(AUDIT, envelope, now)
+    audit_report.write_report(AUDIT, envelope, now - PLANTED_RING_AGE)
     stored = audit_report.reports_dir_for(AUDIT, repo) / audit_report.REPORT_LATEST_NAME
     try:
         text = stored.read_text(encoding="utf-8")
@@ -149,7 +203,7 @@ def plant(audit_report, mark: str, scripts: str) -> int:
 
 
 def teardown(audit_report, mark: str) -> int:
-    repo = audit_report.resolve_repo(audit_id=AUDIT)
+    repo = audit_report.resolve_repo_or_no_forge(AUDIT)
     directory = audit_report.reports_dir_for(AUDIT, repo)
     candidates = [directory / audit_report.REPORT_LATEST_NAME]
     candidates += sorted((directory / audit_report.REPORT_RUNS_DIR).glob("*.json"))
@@ -166,13 +220,17 @@ def teardown(audit_report, mark: str) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != PLANT_ARGC:
-        print("usage: python3 - plant|teardown <scripts dir> <mark>", file=sys.stderr)
+    if len(argv) not in (PLANT_ARGC, PLANT_ARGC + 1):
+        print("usage: python3 - plant|teardown <scripts dir> <mark> [<remediation>]", file=sys.stderr)
         return 2
-    mode, scripts, mark = argv[1:]
+    mode, scripts, mark = argv[1:PLANT_ARGC]
+    remediation = argv[PLANT_ARGC] if len(argv) > PLANT_ARGC else MANUAL_KIND
+    if remediation not in REMEDIATIONS:
+        print(f"unknown remediation {remediation!r}; one of {REMEDIATIONS}", file=sys.stderr)
+        return 2
     audit_report = load(scripts)
     if mode == "plant":
-        return plant(audit_report, mark, scripts)
+        return plant(audit_report, mark, scripts, remediation)
     if mode == "teardown":
         return teardown(audit_report, mark)
     print(f"unknown mode {mode!r}", file=sys.stderr)

@@ -132,6 +132,18 @@
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
         },
+        "delegation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "roundsMax": {
+              "description": "Delegate requests one AgentProfile task may make. Only 1 is supported until a profile task's later rounds ship.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -1831,10 +1843,6 @@
                   }
                 }
               }
-            },
-            "scopedServiceAccounts": {
-              "type": "array",
-              "maxItems": 0
             },
             "workloadIdentityFederation": {
               "type": "object",
