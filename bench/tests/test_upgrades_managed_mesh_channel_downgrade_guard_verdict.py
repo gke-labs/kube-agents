@@ -35,6 +35,11 @@ def test_blocking_verdict_with_downgrade_and_skew_terms_passes():
         "VERDICT: \u201cBLOCK-CHANNEL-DOWNGRADE\u201d\n\n"
         "The channel switch is a control-plane downgrade that causes sidecar skew.",
         "**VERDICT: BLOCK-CHANNEL-DOWNGRADE.** Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
+        'VERDICT: "BLOCK-CHANNEL-DOWNGRADE." Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.',
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u2014 Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u2013 Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE - Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u2014 not SAFE-TO-SWITCH. Switching directly from rapid to stable downgrades the control plane while sidecars remain at 1.24.",
     ):
         assert _passes(report), report
 
@@ -47,7 +52,13 @@ def test_safe_verdict_prose_only_or_missing_reasoning_fails():
         "This downgrade causes sidecar version skew.",
         "VERDICT: BLOCK-CHANNEL-DOWNGRADE\n2. **VERDICT: SAFE-TO-SWITCH**\n\n"
         "This downgrade causes Envoy NACK loops.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE\nHowever, VERDICT: SAFE-TO-SWITCH.\n\n"
+        "This downgrade causes sidecar version skew.",
         "VERDICT: BLOCK-CHANNEL-DOWNGRADE. VERDICT: SAFE-TO-SWITCH.\n\n"
+        "This downgrade causes sidecar version skew.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE; SAFE-TO-SWITCH\n\n"
+        "This downgrade causes sidecar version skew.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE. It is SAFE-TO-SWITCH.\n\n"
         "This downgrade causes sidecar version skew.",
         "VERDICT: BLOCK-CHANNEL-DOWNGRADE or SAFE-TO-SWITCH\n\n"
         "This downgrade causes sidecar version skew.",
@@ -63,7 +74,11 @@ def test_safe_verdict_prose_only_or_missing_reasoning_fails():
         "This downgrade causes sidecar version skew.",
         'VERDICT: "BLOCK-CHANNEL-DOWNGRADE"?\n\n'
         "This downgrade causes sidecar version skew.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE . ?\n\n"
+        "This downgrade causes sidecar version skew.",
         "VERDICT: BLOCK-CHANNEL-DOWNGRADE \u274c\n\n"
+        "This downgrade causes sidecar version skew.",
+        "VERDICT: BLOCK-CHANNEL-DOWNGRADE: \u274c\n\n"
         "This downgrade causes sidecar version skew.",
         "It would not be VERDICT: BLOCK-CHANNEL-DOWNGRADE if both channels served 1.24, avoiding a downgrade and sidecar skew.",
         "Do not apply this change: switching channels downgrades the control plane and causes sidecar skew and Envoy NACK loops.",

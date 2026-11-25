@@ -55,11 +55,11 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["sidecar", "nack", "xds"]
       required_patterns:
-        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade[\"'\\u201d\\u2019]?(?:$|[.:;\\u2014\\u2013-]\\s+\\S)"
+        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade[\"'\\u201d\\u2019]?(?:$|(?:[.:;][\"'\\u201d\\u2019]?|\\s*[\\u2014\\u2013]|\\s+-)\\s+[a-z0-9])"
         - "(?<!block-channel-)\\bdowngrad(?:e|es|ed|ing)\\b"
       forbidden_patterns:
-        - "(?m)(?:^|[.;]\\s*)verdict:\\s*[\"'\\u201c\\u2018]?safe-to-switch\\b"
-        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade\\b[^\\n]*(?:(?:\\b(?:or|and)\\b|/)\\s*(?:verdict:\\s*)?[\"'\\u201c\\u2018]?safe-to-switch\\b|\\bis\\s+(?:not|wrong|incorrect|false)\\b)"
+        - "(?m)(?:^|(?:[.;](?!\\d)|[,()])\\s*)(?:(?!\\b(?:not|no|never|neither|nor|avoid|reject(?:s|ed|ing)?|against)\\b|n't\\b|\\b(?:rather|instead)\\s+(?:than|of)\\b)(?:(?![.;](?!\\d)|[,()\\n]).))*\\bverdict:\\s*[\"'\\u201c\\u2018]?safe-to-switch\\b"
+        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade\\b(?:[^\\n]*\\bis\\s+(?:not|wrong|incorrect|false)\\b|(?:[^\\n]*(?:[.;](?!\\d)|[,()]))?(?:(?!\\b(?:not|no|never|neither|nor|avoid|reject(?:s|ed|ing)?|against)\\b|n't\\b|\\b(?:rather|instead)\\s+(?:than|of)\\b)(?:(?![.;](?!\\d)|[,()\\n]).))*\\bsafe-to-switch\\b)"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
