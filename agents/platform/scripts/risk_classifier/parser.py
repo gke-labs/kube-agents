@@ -179,13 +179,6 @@ def _decode_raw_utf8(raw: bytes) -> str:
     return text
 
 
-def _check_text_safety(raw: bytes) -> str:
-    """Decode UTF-8 and reject NUL, C0/C1 control chars, surrogates, and BiDi/zero-width chars."""
-    text = _decode_raw_utf8(raw)
-    _check_string_safety(text, context="manifest")
-    return text
-
-
 def _is_ident_start(ch: str) -> bool:
     return ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ch == "_"
 
@@ -926,9 +919,9 @@ def _extract_resources(
     if not api_version or not kind:
         return False, False, "", ""
 
-    if api_version.startswith("kustomize.config.k8s.io/") or api_version == "kustomize.config.k8s.io" or kind in (
-        "Kustomization",
-        "Component",
+    api_group = api_version.partition("/")[0]
+    if api_group == "kustomize.config.k8s.io" or (
+        api_group != "kustomize.toolkit.fluxcd.io" and kind in ("Kustomization", "Component")
     ):
         return True, True, "", ""
 

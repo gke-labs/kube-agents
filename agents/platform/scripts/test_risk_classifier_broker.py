@@ -193,15 +193,45 @@ class _FakeForge:
         return {"proposal": dict(prop)}
 
 
+_HERMETIC_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "Bot",
+    "GIT_AUTHOR_EMAIL": "bot@example.com",
+    "GIT_COMMITTER_NAME": "Bot",
+    "GIT_COMMITTER_EMAIL": "bot@example.com",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.bareRepository",
+    "GIT_CONFIG_VALUE_0": "explicit",
+}
+
+_SCRUBBED_BROKER_ENV_KEYS = (
+    "CREDENTIAL_PROXY_SCOPE_FILE",
+    "CREDENTIAL_PROXY_HOLD_FILE",
+    "GKE_PROJECT_ID",
+    "KUBEAGENTS_AUTOMERGE_MAX_RISK",
+    "KUBEAGENTS_AUTONOMY_LEVEL",
+)
+
+
 def _local_git_runner(argv: list[str], cwd: Path, check: bool = True, config: tuple = (), **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, check=check)
+    flags = [flag for key, value in config for flag in ("-c", f"{key}={value}")]
+    cmd = [argv[0], *flags, *argv[1:]] if flags else argv
+    return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, check=check)
 
 
 class RiskBrokerIntegrationTests(unittest.TestCase):
     """End-to-end broker tests backed by a real local bare git remote."""
 
     def setUp(self) -> None:
+        clean_env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_BROKER_ENV_KEYS}
+        clean_env.update(_HERMETIC_GIT_ENV)
+        self._env_patch = mock.patch.dict(os.environ, clean_env, clear=True)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+
         self._tmp = tempfile.TemporaryDirectory(prefix="risk-broker-test-")
+        self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
         self.remote = self.root / "remote.git"
         self.work = self.root / "work"
@@ -211,6 +241,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         self.scratch.mkdir()
 
         subprocess.run(["git", "init", "--bare", "-q", str(self.remote)], check=True)
+        subprocess.run(["git", "--git-dir=.", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=self.remote, check=True)
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.work, check=True)
         subprocess.run(["git", "config", "user.email", "bot@example.com"], cwd=self.work, check=True)
         subprocess.run(["git", "config", "user.name", "Bot"], cwd=self.work, check=True)
@@ -231,13 +262,28 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
 
         self.forge = _FakeForge(str(self.remote))
         self.clusters_list = [
-            {"name": "dev-c1", "location": "us-east4", "resourceLabels": {"environment": "dev"}},
-            {"name": "staging-c1", "location": "us-east4", "resourceLabels": {"environment": "staging"}},
-            {"name": "prod-c1", "location": "us-east4", "resourceLabels": {"environment": "prod"}},
+            {
+                "name": "dev-c1",
+                "location": "us-east4",
+                "selfLink": "https://container.googleapis.com/v1/projects/my-gcp-project/locations/us-east4/clusters/dev-c1",
+                "resourceLabels": {"environment": "dev"},
+            },
+            {
+                "name": "staging-c1",
+                "location": "us-east4",
+                "selfLink": "https://container.googleapis.com/v1/projects/my-gcp-project/locations/us-east4/clusters/staging-c1",
+                "resourceLabels": {"environment": "staging"},
+            },
+            {
+                "name": "prod-c1",
+                "location": "us-east4",
+                "selfLink": "https://container.googleapis.com/v1/projects/my-gcp-project/locations/us-east4/clusters/prod-c1",
+                "resourceLabels": {"environment": "prod"},
+            },
         ]
 
     def tearDown(self) -> None:
-        self._tmp.cleanup()
+        pass
 
     def _rev(self, ref: str) -> str:
         return subprocess.check_output(["git", "rev-parse", ref], cwd=self.work, text=True).strip()
@@ -1075,6 +1121,126 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
                 self.assertTrue(res["stale_base"])
                 self.assertFalse(res["labelled"])
                 self.assertIn("rebase", res["reason"])
+
+    def test_excluded_cluster_and_same_name_steering_refused_and_switch_off_skips_rules(self) -> None:
+        """Excluded clusters, caller project steering, and switch=off rules reads are blocked."""
+        import scope_exclude
+
+        sha = self._push_branch(
+            "platform-agent/dev-excl",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        self.forge.proposals[96] = {
+            "number": 96,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/dev-excl",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha,
+            "target": "main",
+            "labels": [],
+        }
+
+        # 1. With KUBEAGENTS_AUTOMERGE=off, `.kube-agents/automation.yaml` is NOT read,
+        #    and a base-lookup error in out_context preserves the real `risk:low` verdict.
+        broker_off = self._make_broker(switch="off")
+        with mock.patch.object(
+            broker_off, "_read_rules_from_bare", side_effect=AssertionError("automation.yaml read while off")
+        ):
+            c_off = broker_off.proposal_classify_risk({"repository": "acme/infra", "number": 96})
+            self.assertEqual(c_off["risk_level"], "low")
+            l_off = broker_off.proposal_risk_label({"repository": "acme/infra", "number": 96})
+            self.assertEqual(l_off["risk_level"], "low")
+            self.assertEqual(self.forge.proposals[96]["labels"], ["risk:low"])
+
+        with mock.patch.object(broker_off, "_default_branch_of_remote", side_effect=OSError("symref failed")):
+            broker_off.base_branch = ""
+            l_base_err = broker_off.proposal_risk_label({"repository": "acme/infra", "number": 96})
+            self.assertEqual(l_base_err["risk_level"], "low")
+            self.assertFalse(l_base_err["labelled"])
+
+        # 2. Excluded cluster in `spec.scope.exclude.clusters` is refused auto-merge labelling
+        scope_path = self.root / "scope.json"
+        scope_path.write_text(
+            json.dumps(
+                {
+                    "exclude": {
+                        "clusters": [
+                            {"projectId": "acme-proj", "location": "us-east4", "clusterName": "dev-c1"}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        excl = scope_exclude.Exclusions(path=lambda: str(scope_path))
+        self.clusters_list = [
+            {
+                "name": "dev-c1",
+                "location": "us-east4",
+                "selfLink": "https://container.googleapis.com/v1/projects/acme-proj/locations/us-east4/clusters/dev-c1",
+                "resourceLabels": {"environment": "dev"},
+            }
+        ]
+        broker_excl = vcs_broker.VcsBroker(
+            self.scratch,
+            git_runner=_local_git_runner,
+            cluster_read=self._cluster_read,
+            cluster_exclusions=excl,
+            automerge_switch=lambda: "on",
+            base_branch="main",
+        )
+        bound = vcs_broker.Binding(
+            self.forge,
+            "acme/infra",
+            lambda: mock.Mock(ensure=lambda: None, whoami=lambda: "kube-agents-bot"),
+            broker_excl._git_with(lambda: (), False),
+        )
+        broker_excl._bind = lambda payload: bound  # type: ignore[method-assign]
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            r_excl = broker_excl.proposal_risk_label({"repository": "acme/infra", "number": 96})
+            self.assertFalse(r_excl["labelled"])
+            self.assertEqual(r_excl["reason"], "the cluster's labels could not be read")
+
+        # 3. Ambiguous same-named clusters cannot be steered by caller-supplied `cluster`
+        self.clusters_list = [
+            {
+                "name": "dev-c1",
+                "location": "us-east4",
+                "selfLink": "https://container.googleapis.com/v1/projects/dev-proj/locations/us-east4/clusters/dev-c1",
+                "resourceLabels": {"environment": "dev"},
+            },
+            {
+                "name": "dev-c1",
+                "location": "us-east4",
+                "selfLink": "https://container.googleapis.com/v1/projects/prod-proj/locations/us-east4/clusters/dev-c1",
+                "resourceLabels": {"environment": "prod"},
+            },
+        ]
+        broker_ambig = self._make_broker(switch="on")
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            r_steer = broker_ambig.proposal_risk_label(
+                {"repository": "acme/infra", "number": 96, "cluster": "dev-proj/us-east4/dev-c1"}
+            )
+            self.assertFalse(r_steer["labelled"])
+            self.assertEqual(r_steer["reason"], "the cluster's labels could not be read")
+
+            # Non-string `cluster` coordinate fails closed as invalid
+            r_bad_type = broker_ambig.proposal_risk_label(
+                {"repository": "acme/infra", "number": 96, "cluster": 123}
+            )
+            self.assertFalse(r_bad_type["labelled"])
+            self.assertEqual(r_bad_type["reason"], "invalid cluster coordinate")
+
+            # Unverifiable project (missing selfLink + unset GKE_PROJECT_ID) refuses explicit `cluster`
+            self.clusters_list = [
+                {"name": "dev-c1", "location": "us-east4", "resourceLabels": {"environment": "dev"}}
+            ]
+            r_unverified = broker_ambig.proposal_risk_label(
+                {"repository": "acme/infra", "number": 96, "cluster": "evil-proj/us-east4/dev-c1"}
+            )
+            self.assertFalse(r_unverified["labelled"])
+            self.assertEqual(r_unverified["reason"], "the cluster's labels could not be read")
 
 
 if __name__ == "__main__":

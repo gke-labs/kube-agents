@@ -621,7 +621,7 @@ def _workload_pod_multiplier(kind: str, obj: dict[str, Any]) -> int:
     spec = obj.get("spec")
     if not isinstance(spec, dict):
         return 1
-    if kind in ("Deployment", "StatefulSet", "ReplicaSet"):
+    if kind in ("Deployment", "StatefulSet", "ReplicaSet", "ReplicationController"):
         rep = spec.get("replicas", 1)
         if rep is None:
             return 1
@@ -1560,16 +1560,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                 f_revert = combine_revertability(f_revert, REVERT_UNKNOWN)
                 f_disrupt = combine_disruptiveness(f_disrupt, DISRUPT_UNKNOWN)
 
-            # When `after` produced no K8s resources (e.g. `values.yaml`, `.golangci.yml`,
-            # or unparseable YAML), still scan raw `after` bytes for leaked credentials!
-            if not a_out.resources and fc.after_mode not in (_MODE_SYMLINK, _MODE_GITLINK):
-                sec_reasons = _scan_raw_blob_secrets(fc.after, norm_path, is_binary=fc.is_binary)
-                if sec_reasons:
-                    any_effective = True
-                    reasons.extend(sec_reasons)
-                    f_risk = combine_risk(f_risk, RISK_CRITICAL)
-                    f_blast = combine_blast_radius(f_blast, BLAST_HIGH)
-                    f_revert = combine_revertability(f_revert, REVERT_IRREVERSIBLE)
+            file_reason_start = len(reasons)
 
             # Check both intra-file and cross-file duplicate resource identities, then
             # ALWAYS continue evaluating all parsed resources (never skip via `elif`!).
@@ -1787,9 +1778,42 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     reasons.extend(ev.reasons)
                     resource_verdicts.append(ev.to_verdict())
 
+            # Always scan raw `after` bytes for leaked credentials so YAML `#` comments
+            # and non-resource/broken sibling documents cannot evade detection (for pure
+            # `v1/Secret` manifests whose `data`/`stringData` parser.py intentionally redacts
+            # at `RISK_HIGH`, scan `#` comment lines unless non-K8s/broken sibling docs exist).
+            raw_secret_found = False
+            if fc.after_mode not in (_MODE_SYMLINK, _MODE_GITLINK) and fc.after:
+                has_secret_res = any((r.ref.group, r.ref.kind) == ("", "Secret") for r in a_out.resources)
+                if has_secret_res and a_out.is_k8s_manifest and not a_out.error and not is_non_k8s:
+                    scan_target: bytes | None = b"\n".join(
+                        line[line.find(b"#") :] for line in fc.after.splitlines() if b"#" in line
+                    )
+                else:
+                    scan_target = fc.after
+                sec_reasons = _scan_raw_blob_secrets(scan_target, norm_path, is_binary=fc.is_binary)
+                if sec_reasons:
+                    existing_leak_msgs = [
+                        r.message for r in reasons[file_reason_start:] if r.code == "PLAINTEXT_SECRET_LEAK"
+                    ]
+                    novel_sec = [
+                        sr
+                        for sr in sec_reasons
+                        if not any(
+                            sr.message.split(" detected in ", 1)[0] in m for m in existing_leak_msgs
+                        )
+                    ]
+                    raw_secret_found = True
+                    any_effective = True
+                    f_risk = combine_risk(f_risk, RISK_CRITICAL)
+                    f_blast = combine_blast_radius(f_blast, BLAST_HIGH)
+                    f_revert = combine_revertability(f_revert, REVERT_IRREVERSIBLE)
+                    reasons.extend(novel_sec)
+
             if (
                 f_category == "manifest"
                 and f_effective_resources == 0
+                and not raw_secret_found
                 and fc.change_type != CHANGE_RENAMED
                 and fc.after_mode != _MODE_EXEC
             ):
@@ -1970,7 +1994,8 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
             )
         )
 
-    if len(clusters_touched) > 3:
+    _FLEET_CRITICAL_CLUSTER_COUNT = 3
+    if len(clusters_touched) > _FLEET_CRITICAL_CLUSTER_COUNT:
         overall_risk = combine_risk(overall_risk, RISK_CRITICAL)
         overall_blast = combine_blast_radius(overall_blast, BLAST_CRITICAL)
         reasons.append(

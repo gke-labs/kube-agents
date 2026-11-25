@@ -2013,6 +2013,149 @@ class TriageEngineHardeningTests(unittest.TestCase):
         self.assertEqual(r_doc_and_bump.risk_level, RISK_LOW)
         self.assertEqual(r_doc_and_bump.reasons[0].code, "WORKLOAD_REPLICA_BUMP")
 
+    def test_pr_review_regressions_quotas_mounts_secrets_kustomize_and_flux(self) -> None:
+        """Regression tests for PR #7274 review findings."""
+        import base64
+
+        # 1. ResourceQuota unquoted integer 0 (`pods: 0`, `count/deployments.apps: 0`) -> high & disruptive
+        rq_int_zero = (
+            "apiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: zero-pods\n  namespace: shop\n"
+            "spec:\n  hard:\n    pods: 0\n"
+        )
+        r_rq_int = classify_changes([_add("clusters/dev/rq-zero.yaml", rq_int_zero)])
+        self.assertEqual(r_rq_int.risk_level, RISK_HIGH)
+        self.assertEqual(r_rq_int.disruptiveness, DISRUPT_DISRUPTIVE)
+
+        # 2. LimitRange zero bound in `spec.limits[*].max` / `default` -> high & disruptive
+        lr_zero = (
+            "apiVersion: v1\nkind: LimitRange\nmetadata:\n  name: zero-lr\n  namespace: shop\n"
+            "spec:\n  limits:\n    - type: Container\n      max:\n        cpu: \"0\"\n"
+        )
+        r_lr_zero = classify_changes([_add("clusters/dev/lr-zero.yaml", lr_zero)])
+        self.assertEqual(r_lr_zero.risk_level, RISK_HIGH)
+        self.assertEqual(r_lr_zero.disruptiveness, DISRUPT_DISRUPTIVE)
+
+        # 3. Unhashable list/dict values in ports, volumeMounts, volumeDevices -> MALFORMED_FIELD_TYPE (no TypeError)
+        bad_after = (
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\n"
+            "spec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: web\n"
+            "  template:\n    metadata:\n      labels:\n        app: web\n"
+            "    spec:\n      containers:\n        - name: app\n          image: nginx:1.25.3\n"
+            "          ports:\n            - containerPort: [8080]\n"
+            "          volumeMounts:\n            - name: [bad]\n              mountPath: [/data]\n"
+            "          volumeDevices:\n            - name: raw\n              devicePath: [/dev/xvda]\n"
+        )
+        r_unhash = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, bad_after)])
+        self.assertEqual(r_unhash.risk_level, RISK_HIGH)
+        self.assertIn("MALFORMED_FIELD_TYPE", {x.code for x in r_unhash.reasons})
+
+        # 4. Modifying or removing `subPath` on an existing secret volumeMount -> SECRET_VOLUME_MOUNT (RISK_HIGH)
+        sec_mount_before = (
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\n"
+            "spec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: web\n"
+            "  template:\n    metadata:\n      labels:\n        app: web\n"
+            "    spec:\n      volumes:\n        - name: tls\n          secret:\n            secretName: web-tls\n"
+            "      containers:\n        - name: app\n          image: nginx:1.25.3\n"
+            "          volumeMounts:\n            - name: tls\n              mountPath: /etc/tls/ca.crt\n"
+            "              subPath: ca.crt\n              readOnly: true\n"
+        )
+        sec_mount_drop_sub = sec_mount_before.replace("              subPath: ca.crt\n", "")
+        sec_mount_swap_sub = sec_mount_before.replace("subPath: ca.crt", "subPath: tls.key")
+        for variant in (sec_mount_drop_sub, sec_mount_swap_sub):
+            rv = classify_changes([_mod("clusters/dev/web.yaml", sec_mount_before, variant)])
+            self.assertEqual(rv.risk_level, RISK_HIGH)
+            self.assertTrue(any(x.dimension == "security" for x in rv.reasons))
+            self.assertIn("SECRET_VOLUME_MOUNT", {x.code for x in rv.reasons})
+
+        # 5. Raw-blob secret scan on YAML `#` comment, sibling non-K8s doc, and Secret stringData
+        fake_ghp = "ghp_" + ("A" * 36)
+        r_comment_leak = classify_changes(
+            [_mod("clusters/dev/web.yaml", BASE_DEPLOY, f"# token: {fake_ghp}\n" + BASE_DEPLOY)]
+        )
+        self.assertEqual(r_comment_leak.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_comment_leak.revertability, REVERT_IRREVERSIBLE)
+        self.assertTrue(r_comment_leak.effective_changes)
+        self.assertIn("PLAINTEXT_SECRET_LEAK", {x.code for x in r_comment_leak.reasons})
+        self.assertNotIn("COMMENT_OR_WHITESPACE_ONLY", {x.code for x in r_comment_leak.reasons})
+
+        r_sibling_leak = classify_changes(
+            [_add("clusters/dev/mixed.yaml", BASE_CONFIGMAP + f"---\nraw_token: {fake_ghp}\n")]
+        )
+        self.assertEqual(r_sibling_leak.risk_level, RISK_CRITICAL)
+        self.assertIn("PLAINTEXT_SECRET_LEAK", {x.code for x in r_sibling_leak.reasons})
+
+        # 6. ConfigMap `binaryData` base64-encoded secret under benign key name -> critical & irreversible
+        b64_token = base64.b64encode(f"export TOKEN={fake_ghp}\n".encode()).decode("ascii")
+        cm_bin_leak = (
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: bundle\n  namespace: shop\n"
+            f"binaryData:\n  payload: {b64_token}\n"
+        )
+        r_cm_bin = classify_changes([_add("clusters/dev/cm-bin.yaml", cm_bin_leak)])
+        self.assertEqual(r_cm_bin.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_cm_bin.revertability, REVERT_IRREVERSIBLE)
+        self.assertIn("PLAINTEXT_SECRET_LEAK", {x.code for x in r_cm_bin.reasons})
+
+        # 7. ReplicationController `spec.replicas` counted in PR-wide CPU delta (> 256,000m -> critical)
+        rc_big = (
+            "apiVersion: v1\nkind: ReplicationController\nmetadata:\n  name: legacy\n  namespace: shop\n"
+            "spec:\n  replicas: 300\n  template:\n    metadata:\n      labels:\n        app: legacy\n"
+            "    spec:\n      containers:\n        - name: app\n          image: nginx:1.25.3\n"
+            "          resources:\n            requests:\n              cpu: \"1000m\"\n"
+        )
+        r_rc_big = classify_changes([_add("clusters/dev/rc.yaml", rc_big)])
+        self.assertEqual(r_rc_big.risk_level, RISK_CRITICAL)
+        self.assertIn("COMPOUND_CAPACITY_CRITICAL_CAP", {x.code for x in r_rc_big.reasons})
+
+        # 8. Kustomize `$patch: delete` does not skip kube-agents self-mod or plaintext secret scan
+        ka_patch = (
+            "apiVersion: persona.kube-agents.x-k8s.io/v1alpha1\nkind: AgentPersona\n"
+            "metadata:\n  name: p1\n  namespace: default\n$patch: delete\n"
+        )
+        r_ka_patch = classify_changes([_add("clusters/dev/ka-patch.yaml", ka_patch)])
+        self.assertEqual(r_ka_patch.risk_level, RISK_CRITICAL)
+        self.assertIn("KUBE_AGENTS_SELF_MODIFICATION", {x.code for x in r_ka_patch.reasons})
+
+        nested_del_secret = (
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n  namespace: shop\n"
+            f"data:\n  tok: {fake_ghp}\n  old:\n    $patch: delete\n"
+        )
+        r_nd_sec = classify_changes([_add("clusters/dev/cm-patch.yaml", nested_del_secret)])
+        self.assertEqual(r_nd_sec.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_nd_sec.revertability, REVERT_IRREVERSIBLE)
+        self.assertFalse(r_nd_sec.supported)
+        self.assertIn("PLAINTEXT_SECRET_LEAK", {x.code for x in r_nd_sec.reasons})
+
+        # 9. Flux Kustomization modifying `spec.path` / `spec.sourceRef` -> critical & destructive
+        flux_k1 = (
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\n"
+            "metadata:\n  name: apps\n  namespace: flux-system\n"
+            "spec:\n  path: ./clusters/dev\n  sourceRef:\n    kind: GitRepository\n    name: fleet\n"
+        )
+        flux_k2 = flux_k1.replace("./clusters/dev", "./clusters/prod")
+        r_flux = classify_changes([_mod("clusters/dev/flux-ks.yaml", flux_k1, flux_k2)])
+        self.assertEqual(r_flux.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_flux.disruptiveness, DISRUPT_DESTRUCTIVE)
+        self.assertIn("GITOPS_RECONCILER_CHANGE", {x.code for x in r_flux.reasons})
+
+        # 10. 1024-bit integer in ResourceQuota does not raise OverflowError, and Secret + Kustomization scans raw blob
+        rq_huge_int = (
+            "apiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: q\n  namespace: shop\n"
+            f"spec:\n  hard:\n    pods: 0x{'f' * 256}\n"
+        )
+        r_huge = classify_changes([_add("clusters/dev/rq-huge.yaml", rq_huge_int)])
+        self.assertIsNotNone(r_huge.risk_level)
+
+        sec_plus_kust = (
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: dummy\n  namespace: shop\nstringData:\n  k: benign\n"
+            "---\n"
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+            f"secretGenerator:\n  - name: leaked\n    literals:\n      - tok={fake_ghp}\n"
+        )
+        r_sk = classify_changes([_add("clusters/dev/sec-kust.yaml", sec_plus_kust)])
+        self.assertEqual(r_sk.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_sk.revertability, REVERT_IRREVERSIBLE)
+        self.assertIn("PLAINTEXT_SECRET_LEAK", {x.code for x in r_sk.reasons})
+
 
 if __name__ == "__main__":
     unittest.main()

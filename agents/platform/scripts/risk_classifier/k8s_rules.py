@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import math
 import posixpath
 import re
@@ -886,7 +888,10 @@ def parse_cpu_millicores(raw: Any) -> float | None:
     if isinstance(raw, bool) or raw is None:
         return None
     if isinstance(raw, (int, float)):
-        val = float(raw) * 1000.0
+        try:
+            val = float(raw) * 1000.0
+        except OverflowError:
+            return None
         return val if math.isfinite(val) and val >= 0 else None
     if not isinstance(raw, str):
         return None
@@ -904,7 +909,10 @@ def parse_memory_bytes(raw: Any) -> float | None:
     if isinstance(raw, bool) or raw is None:
         return None
     if isinstance(raw, (int, float)):
-        val = float(raw)
+        try:
+            val = float(raw)
+        except OverflowError:
+            return None
         return val if math.isfinite(val) and val >= 0 else None
     if not isinstance(raw, str):
         return None
@@ -916,6 +924,61 @@ def parse_memory_bytes(raw: Any) -> float | None:
         return None
     val = float(m.group(1)) * mult
     return val if math.isfinite(val) and val >= 0 else None
+
+
+def _is_zero_quota_value(raw: Any) -> bool:
+    """Return True if a ResourceQuota or LimitRange quantity evaluates to zero."""
+    if raw is None or isinstance(raw, bool):
+        return False
+    if isinstance(raw, (int, float)):
+        return raw == 0
+    if parse_cpu_millicores(raw) == 0.0 or parse_memory_bytes(raw) == 0.0:
+        return True
+    if isinstance(raw, str) and raw.strip() in ("0", "0.0", "+0", "-0"):
+        return True
+    return False
+
+
+def _opt_str_field(
+    ev: ResourceEval | None, obj: dict[str, Any], key: str, field_path: str
+) -> tuple[bool, str]:
+    """Extract an optional string field, flagging non-string values on `ev` if present."""
+    val = obj.get(key)
+    if val is None:
+        return True, ""
+    if isinstance(val, str):
+        return True, val
+    if ev is not None:
+        ev.add(
+            "MALFORMED_FIELD_TYPE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"expected string at {field_path}.{key}, got {type(val).__name__}",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path=f"{field_path}.{key}",
+            security=True,
+        )
+    return False, ""
+
+
+def _req_str_field(
+    ev: ResourceEval | None, obj: dict[str, Any], key: str, field_path: str
+) -> tuple[bool, str]:
+    """Extract a required string field, flagging missing/non-string values on `ev` if present."""
+    val = obj.get(key)
+    if isinstance(val, str):
+        return True, val
+    if ev is not None and val is not None:
+        ev.add(
+            "MALFORMED_FIELD_TYPE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"expected string at {field_path}.{key}, got {type(val).__name__}",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path=f"{field_path}.{key}",
+            security=True,
+        )
+    return False, ""
 
 
 def split_image_ref(image: str) -> tuple[str, str, str]:
@@ -1993,13 +2056,24 @@ def _check_pod_spec_posture(
                             security=True,
                         )
 
-            # Volume mounts (mountPropagation, new mounts of existing secret/CSI volumes) & raw block volumeDevices
-            b_vm_pairs = {
-                (vm.get("name"), vm.get("mountPath"))
-                for vm in (b_ctr.get("volumeMounts") if isinstance(b_ctr, dict) and isinstance(b_ctr.get("volumeMounts"), list) else [])
-                if isinstance(vm, dict)
-            }
-            for vm in _as_list(ev, ctr.get("volumeMounts"), f"{list_key}.{label}.volumeMounts"):
+            # Volume mounts (mountPropagation, new/widened mounts of secret/CSI volumes) & raw block volumeDevices
+            b_vm_tuples: set[tuple[str, str, str, str]] = set()
+            for vm in (
+                b_ctr.get("volumeMounts")
+                if isinstance(b_ctr, dict) and isinstance(b_ctr.get("volumeMounts"), list)
+                else []
+            ):
+                if not isinstance(vm, dict):
+                    continue
+                ok_n, bn = _req_str_field(None, vm, "name", "")
+                ok_p, bp = _req_str_field(None, vm, "mountPath", "")
+                ok_s, bs = _opt_str_field(None, vm, "subPath", "")
+                ok_e, be = _opt_str_field(None, vm, "subPathExpr", "")
+                if ok_n and ok_p and ok_s and ok_e:
+                    b_vm_tuples.add((bn, bp, bs, be))
+
+            vm_field_path = f"{list_key}.{label}.volumeMounts"
+            for vm in _as_list(ev, ctr.get("volumeMounts"), vm_field_path):
                 if not isinstance(vm, dict):
                     continue
                 mp_mode = vm.get("mountPropagation")
@@ -2010,23 +2084,29 @@ def _check_pod_spec_posture(
                         RISK_HIGH,
                         f"container {label!r} sets volumeMount mountPropagation={mp_mode!r}",
                         blast=BLAST_HIGH,
-                        field_path=f"{list_key}.{label}.volumeMounts",
+                        field_path=vm_field_path,
                         security=True,
                     )
-                vm_name = vm.get("name")
+                ok_n, vm_name = _req_str_field(ev, vm, "name", vm_field_path)
+                ok_p, vm_mp = _req_str_field(ev, vm, "mountPath", vm_field_path)
+                ok_s, vm_sp = _opt_str_field(ev, vm, "subPath", vm_field_path)
+                ok_e, vm_spe = _opt_str_field(ev, vm, "subPathExpr", vm_field_path)
                 if (
                     before_pod_spec is not None
-                    and isinstance(vm_name, str)
+                    and ok_n
                     and vm_name in secret_bearing_vnames
-                    and (vm_name, vm.get("mountPath")) not in b_vm_pairs
+                    and (
+                        not (ok_p and ok_s and ok_e)
+                        or (vm_name, vm_mp, vm_sp, vm_spe) not in b_vm_tuples
+                    )
                 ):
                     ev.add(
                         "SECRET_VOLUME_MOUNT",
                         DIM_SECURITY,
                         RISK_HIGH,
-                        f"container {label!r} adds volumeMount of secret/CSI volume {vm_name!r}",
+                        f"container {label!r} adds or modifies volumeMount of secret/CSI volume {vm_name!r}",
                         blast=BLAST_MEDIUM,
-                        field_path=f"{list_key}.{label}.volumeMounts",
+                        field_path=vm_field_path,
                         security=True,
                     )
 
@@ -3473,16 +3553,44 @@ def _check_workload_modify(
             # Identity-aware removals/replacements of ports, volumeMounts, volumeDevices, env, envFrom
             b_ports = bc.get("ports") if isinstance(bc.get("ports"), list) else []
             a_ports = ac.get("ports") if isinstance(ac.get("ports"), list) else []
-            b_port_ids = {
-                (p.get("containerPort"), str(p.get("protocol") or "TCP").upper(), str(p.get("name") or ""))
-                for p in b_ports
-                if isinstance(p, dict)
-            }
-            a_port_ids = {
-                (p.get("containerPort"), str(p.get("protocol") or "TCP").upper(), str(p.get("name") or ""))
-                for p in a_ports
-                if isinstance(p, dict)
-            }
+            b_port_ids: set[tuple[int | str, str, str]] = set()
+            for p in b_ports:
+                if not isinstance(p, dict):
+                    continue
+                cp = p.get("containerPort")
+                proto = p.get("protocol")
+                pname = p.get("name")
+                if (
+                    isinstance(cp, (int, str))
+                    and not isinstance(cp, bool)
+                    and (proto is None or isinstance(proto, str))
+                    and (pname is None or isinstance(pname, str))
+                ):
+                    b_port_ids.add((cp, (proto or "TCP").upper(), pname or ""))
+            a_port_ids: set[tuple[int | str, str, str]] = set()
+            for p in a_ports:
+                if not isinstance(p, dict):
+                    continue
+                cp = p.get("containerPort")
+                proto = p.get("protocol")
+                pname = p.get("name")
+                if (
+                    isinstance(cp, (int, str))
+                    and not isinstance(cp, bool)
+                    and (proto is None or isinstance(proto, str))
+                    and (pname is None or isinstance(pname, str))
+                ):
+                    a_port_ids.add((cp, (proto or "TCP").upper(), pname or ""))
+                else:
+                    ev.add(
+                        "MALFORMED_FIELD_TYPE",
+                        DIM_SECURITY,
+                        RISK_HIGH,
+                        f"container {cname!r} has non-scalar port fields",
+                        disrupt=DISRUPT_DISRUPTIVE,
+                        field_path=f"{c_path}.ports",
+                        security=True,
+                    )
             if len(a_ports) < len(b_ports) or (b_port_ids - a_port_ids):
                 ev.add(
                     "CONTAINER_COMPONENT_REMOVED",
@@ -3495,16 +3603,26 @@ def _check_workload_modify(
 
             b_vms = bc.get("volumeMounts") if isinstance(bc.get("volumeMounts"), list) else []
             a_vms = ac.get("volumeMounts") if isinstance(ac.get("volumeMounts"), list) else []
-            b_vm_map = {
-                (vm.get("name"), vm.get("mountPath")): vm
-                for vm in b_vms
-                if isinstance(vm, dict)
-            }
-            a_vm_map = {
-                (vm.get("name"), vm.get("mountPath")): vm
-                for vm in a_vms
-                if isinstance(vm, dict)
-            }
+            b_vm_map: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+            for vm in b_vms:
+                if not isinstance(vm, dict):
+                    continue
+                ok_n, bn = _req_str_field(None, vm, "name", "")
+                ok_p, bp = _req_str_field(None, vm, "mountPath", "")
+                ok_s, bs = _opt_str_field(None, vm, "subPath", "")
+                ok_e, be = _opt_str_field(None, vm, "subPathExpr", "")
+                if ok_n and ok_p and ok_s and ok_e:
+                    b_vm_map[(bn, bp, bs, be)] = vm
+            a_vm_map: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+            for vm in a_vms:
+                if not isinstance(vm, dict):
+                    continue
+                ok_n, an = _req_str_field(ev, vm, "name", f"{c_path}.volumeMounts")
+                ok_p, ap = _req_str_field(ev, vm, "mountPath", f"{c_path}.volumeMounts")
+                ok_s, asub = _opt_str_field(ev, vm, "subPath", f"{c_path}.volumeMounts")
+                ok_e, aexpr = _opt_str_field(ev, vm, "subPathExpr", f"{c_path}.volumeMounts")
+                if ok_n and ok_p and ok_s and ok_e:
+                    a_vm_map[(an, ap, asub, aexpr)] = vm
             if len(a_vms) < len(b_vms) or (set(b_vm_map.keys()) - set(a_vm_map.keys())):
                 ev.add(
                     "CONTAINER_COMPONENT_REMOVED",
@@ -3529,8 +3647,19 @@ def _check_workload_modify(
 
             b_vds = bc.get("volumeDevices") if isinstance(bc.get("volumeDevices"), list) else []
             a_vds = ac.get("volumeDevices") if isinstance(ac.get("volumeDevices"), list) else []
-            b_vd_ids = {(vd.get("name"), vd.get("devicePath")) for vd in b_vds if isinstance(vd, dict)}
-            a_vd_ids = {(vd.get("name"), vd.get("devicePath")) for vd in a_vds if isinstance(vd, dict)}
+            b_vd_ids: set[tuple[str, str]] = {
+                (vd["name"], vd["devicePath"])
+                for vd in b_vds
+                if isinstance(vd, dict) and isinstance(vd.get("name"), str) and isinstance(vd.get("devicePath"), str)
+            }
+            a_vd_ids: set[tuple[str, str]] = set()
+            for vd in a_vds:
+                if not isinstance(vd, dict):
+                    continue
+                ok_n, dn = _req_str_field(ev, vd, "name", f"{c_path}.volumeDevices")
+                ok_p, dp = _req_str_field(ev, vd, "devicePath", f"{c_path}.volumeDevices")
+                if ok_n and ok_p:
+                    a_vd_ids.add((dn, dp))
             if len(a_vds) < len(b_vds) or (b_vd_ids - a_vd_ids):
                 ev.add(
                     "CONTAINER_COMPONENT_REMOVED",
@@ -3900,17 +4029,6 @@ def _check_configmap(
                         field_path=f"{field_name}.{ks}",
                         security=True,
                     )
-                for _, pat_name in _scan_value_for_secrets(val):
-                    ev.add(
-                        "PLAINTEXT_SECRET_LEAK",
-                        DIM_SECURITY,
-                        RISK_CRITICAL,
-                        f"plaintext {pat_name} detected in ConfigMap {ev.ref.name!r} key {ks!r}",
-                        blast=BLAST_HIGH,
-                        revert=REVERT_IRREVERSIBLE,
-                        field_path=f"{field_name}.{ks}",
-                        security=True,
-                    )
                 if not isinstance(val, str):
                     ev.add(
                         "CONFIGMAP_NON_STRING_VALUE",
@@ -3922,6 +4040,22 @@ def _check_configmap(
                         security=True,
                     )
                 elif field_name == "binaryData":
+                    try:
+                        decoded_bin = base64.b64decode(val.encode("ascii", errors="ignore"), validate=False)
+                    except (binascii.Error, ValueError):
+                        decoded_bin = b""
+                    if decoded_bin:
+                        for _, pat_name in _scan_value_for_secrets(decoded_bin):
+                            ev.add(
+                                "PLAINTEXT_SECRET_LEAK",
+                                DIM_SECURITY,
+                                RISK_CRITICAL,
+                                f"plaintext {pat_name} detected in ConfigMap {ev.ref.name!r} binaryData.{ks}",
+                                blast=BLAST_HIGH,
+                                revert=REVERT_IRREVERSIBLE,
+                                field_path=f"binaryData.{ks}",
+                                security=True,
+                            )
                     ev.add(
                         "CONFIGMAP_BINARY_DATA",
                         DIM_BLAST_RADIUS,
@@ -4594,7 +4728,26 @@ def _check_gitops_reconciler(ev: ResourceEval, action: str, before_obj: dict[str
     root_reconciler = kind in ("RootSync", "ApplicationSet", "AppProject", "ConfigManagement")
     source_or_dest_changed = action == ACTION_MODIFY and any(
         spec.get(k) != b_spec.get(k)
-        for k in ("source", "sources", "git", "url", "oci", "helm", "destination", "project", "serviceAccountName", "kubeConfig")
+        for k in (
+            "source",
+            "sources",
+            "sourceRef",
+            "path",
+            "chart",
+            "chartRef",
+            "git",
+            "url",
+            "oci",
+            "helm",
+            "bucketName",
+            "endpoint",
+            "destination",
+            "targetNamespace",
+            "storageNamespace",
+            "project",
+            "serviceAccountName",
+            "kubeConfig",
+        )
     )
     impersonation_set = action == ACTION_ADD and bool(spec.get("kubeConfig"))
     suspended = "suspend" in spec and _is_truthy_or_nonbool(spec.get("suspend")) and b_spec.get("suspend") is not True
@@ -4988,36 +5141,6 @@ def evaluate_resource(
                 )
         return ev
 
-    # 0. Kustomize strategic-merge `$patch` directives (e.g. `$patch: delete`)
-    if action != ACTION_DELETE:
-        patches = _find_kustomize_patches(primary.obj)
-        if patches:
-            is_delete_patch = any(str(v).strip().lower() == "delete" for _, v in patches)
-            if is_delete_patch:
-                crit = is_prod or is_cluster_scoped or gk in DATA_STATEFUL_DELETE_KINDS or in_system_ns
-                ev.add(
-                    "KUSTOMIZE_DELETE_PATCH",
-                    DIM_DISRUPTIVENESS,
-                    RISK_CRITICAL if crit else RISK_HIGH,
-                    f"manifest contains Kustomize `$patch: delete` directive targeting {ref.gvk_label()} {ref.name!r}",
-                    blast=BLAST_CRITICAL if crit else BLAST_HIGH,
-                    revert=REVERT_IRREVERSIBLE if gk in DATA_STATEFUL_DELETE_KINDS else REVERT_DIFFICULT,
-                    disrupt=DISRUPT_DESTRUCTIVE,
-                    field_path=patches[0][0],
-                )
-                return _finalize()
-            ev.add(
-                "KUSTOMIZE_PATCH_DIRECTIVE",
-                DIM_BLAST_RADIUS,
-                RISK_UNKNOWN,
-                f"manifest contains unrendered Kustomize `$patch` directive on {ref.gvk_label()} {ref.name!r}",
-                blast=BLAST_UNKNOWN,
-                revert=REVERT_UNKNOWN,
-                disrupt=DISRUPT_UNKNOWN,
-                field_path=patches[0][0],
-                supported=False,
-            )
-
     # 1. Self-modification of kube-agents CRDs (including `persona.kube-agents.x-k8s.io`) -> always critical
     if is_kube_agents_group(ref.group):
         ev.add(
@@ -5032,8 +5155,8 @@ def evaluate_resource(
         )
         return _finalize()
 
-    # Universal plaintext credential scan BEFORE early returns so unknown CRDs or
-    # namespace-less manifests can never mask leaked private keys or tokens.
+    # Universal plaintext credential scan BEFORE early returns so unknown CRDs,
+    # Kustomize patches, or namespace-less manifests can never mask leaked private keys or tokens.
     if action != ACTION_DELETE:
         for secret_path, pat_name in _scan_value_for_secrets(primary.sanitized):
             ev.add(
@@ -5046,6 +5169,41 @@ def evaluate_resource(
                 field_path=secret_path,
                 security=True,
             )
+
+    # 0. Kustomize strategic-merge `$patch` directives (e.g. `$patch: delete`)
+    if action != ACTION_DELETE:
+        patches = _find_kustomize_patches(primary.obj)
+        if patches:
+            delete_patches = [p for p, v in patches if str(v).strip().lower() == "delete"]
+            if delete_patches:
+                crit = is_prod or is_cluster_scoped or gk in DATA_STATEFUL_DELETE_KINDS or in_system_ns
+                ev.add(
+                    "KUSTOMIZE_DELETE_PATCH",
+                    DIM_DISRUPTIVENESS,
+                    RISK_CRITICAL if crit else RISK_HIGH,
+                    f"manifest contains Kustomize `$patch: delete` directive targeting {ref.gvk_label()} {ref.name!r}",
+                    blast=BLAST_CRITICAL if crit else BLAST_HIGH,
+                    revert=REVERT_IRREVERSIBLE if gk in DATA_STATEFUL_DELETE_KINDS else REVERT_DIFFICULT,
+                    disrupt=DISRUPT_DESTRUCTIVE,
+                    field_path=delete_patches[0],
+                    supported=False,
+                )
+                if "$patch" in delete_patches and not (
+                    set(primary.obj.keys()) - {"apiVersion", "kind", "metadata", "$patch"}
+                ):
+                    return _finalize()
+            else:
+                ev.add(
+                    "KUSTOMIZE_PATCH_DIRECTIVE",
+                    DIM_BLAST_RADIUS,
+                    RISK_UNKNOWN,
+                    f"manifest contains unrendered Kustomize `$patch` directive on {ref.gvk_label()} {ref.name!r}",
+                    blast=BLAST_UNKNOWN,
+                    revert=REVERT_UNKNOWN,
+                    disrupt=DISRUPT_UNKNOWN,
+                    field_path=patches[0][0],
+                    supported=False,
+                )
 
     # 2. Unknown / unsupported CRD handling (never silently `low` or `medium`!)
     if not is_known_kind(ref.group, ref.kind):
@@ -5841,13 +5999,18 @@ def evaluate_resource(
         return _finalize()
     if gk in (("", "ResourceQuota"), ("", "LimitRange")):
         spec = primary.obj.get("spec") if isinstance(primary.obj.get("spec"), dict) else {}
-        hard = spec.get("hard") if isinstance(spec.get("hard"), dict) else {}
-        zero_quota = any(
-            str(hard.get(qk) or "").strip() == "0"
-            or (qk in ("requests.cpu", "limits.cpu", "cpu") and parse_cpu_millicores(hard.get(qk)) == 0.0)
-            or (qk in ("requests.memory", "limits.memory", "memory") and parse_memory_bytes(hard.get(qk)) == 0.0)
-            for qk in hard
-        )
+        if ref.kind == "ResourceQuota":
+            hard = spec.get("hard") if isinstance(spec.get("hard"), dict) else {}
+            zero_quota = any(_is_zero_quota_value(v) for v in hard.values())
+        else:
+            lim_items = spec.get("limits") if isinstance(spec.get("limits"), list) else []
+            zero_quota = any(
+                _is_zero_quota_value(v)
+                for item in lim_items
+                if isinstance(item, dict)
+                for bound_key in ("max", "default")
+                for v in (item.get(bound_key).values() if isinstance(item.get(bound_key), dict) else ())
+            )
         ev.add(
             "QUOTA_OR_LIMIT_CHANGE",
             DIM_DISRUPTIVENESS if zero_quota else DIM_BLAST_RADIUS,

@@ -83,6 +83,7 @@ import automerge_edit
 import automerge_eligibility
 import okf_guard
 import risk_classifier
+import scope_exclude
 from fix_recipes import registry as fix_recipes_registry
 from providers import (
     CliTransport,
@@ -530,13 +531,16 @@ def _extract_expected_head_sha(payload: Mapping[str, Any]) -> str:
     return validate_revision(raw, "expected_head_sha")
 
 
+_MAX_SUMMARY_REASONS = 10
+
+
 def _risk_summary_payload(risk_res: Mapping[str, Any]) -> dict[str, Any]:
     """Concise 4-axis risk classification and auto-merge summary for write responses."""
     reasons = risk_res.get("reasons")
     if not isinstance(reasons, list):
         cls_dict = risk_res.get("classification")
         reasons = cls_dict.get("reasons") if isinstance(cls_dict, Mapping) else []
-    top_reasons = list(reasons[:10]) if isinstance(reasons, list) else []
+    top_reasons = list(reasons[:_MAX_SUMMARY_REASONS]) if isinstance(reasons, list) else []
     return {
         "number": risk_res.get("number"),
         "sourceRevision": risk_res.get("sourceRevision", ""),
@@ -952,6 +956,7 @@ class VcsBroker:
         repository_role: Callable[[Forge, str], str] | None = None,
         bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
         cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
+        cluster_exclusions: scope_exclude.Exclusions | None = None,
         automerge_switch: Callable[[], str] | None = None,
         auto_label_risk: bool = False,
         on_decision_memory_check: Callable[[str], None] | None = None,
@@ -961,6 +966,9 @@ class VcsBroker:
         self.on_decision_memory_check = on_decision_memory_check
         self._allowed_commit_emails = allowed_commit_emails
         self._auto_label_risk = bool(auto_label_risk)
+        self._cluster_exclusions = (
+            cluster_exclusions if cluster_exclusions is not None else scope_exclude.Exclusions()
+        )
         # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
         # or kubectl read the broker runs on its own behalf, through the same
         # executor and cluster selection a caller's read takes. Only
@@ -3695,6 +3703,7 @@ class VcsBroker:
         proposal_override: dict[str, Any] | None = None,
         expected_head_sha: str = "",
         out_context: dict[str, Any] | None = None,
+        read_rules: bool = False,
     ) -> tuple[dict[str, Any], risk_classifier.ClassificationResult, list[str], bool]:
         """Fetch target & proposal refs into one bare scratch repo and classify in-process.
 
@@ -4064,22 +4073,41 @@ class VcsBroker:
                             break
 
             if out_context is not None and state == OPEN_PROPOSAL_STATE and target_tip:
-                if "_practice_base" not in self.__dict__:
-                    pinned = self._pinned_base(bound.forge, bound.repo)
-                    resolved_base = pinned or self._default_branch_of_remote(
-                        bare_git, bare, self._tls_refusal
+                resolved_base = ""
+                try:
+                    if "_practice_base" not in self.__dict__:
+                        pinned = self._pinned_base(bound.forge, bound.repo)
+                        resolved_base = pinned or self._default_branch_of_remote(
+                            bare_git, bare, self._tls_refusal
+                        )
+                    else:
+                        resolved_base = self._practice_base(bound)
+                    out_context["base"] = resolved_base
+                except (WorkspaceError, subprocess.SubprocessError, OSError) as exc:
+                    LOGGER.info(
+                        "risk classifier: base lookup failed repo=%s number=%s: %s",
+                        bound.repo, number, str(exc)[:300],
                     )
-                else:
-                    resolved_base = self._practice_base(bound)
-                out_context["base"] = resolved_base
+                    out_context["base"] = ""
                 if (
-                    resolved_base
+                    read_rules
+                    and resolved_base
                     and target_branch == resolved_base
                     and "_practice_rules" not in self.__dict__
                 ):
-                    out_context["rules"] = self._read_rules_from_bare(
-                        bare_git, bare, root, target_tip
-                    )
+                    try:
+                        out_context["rules"] = self._read_rules_from_bare(
+                            bare_git, bare, root, target_tip
+                        )
+                    except (WorkspaceError, subprocess.SubprocessError, OSError) as exc:
+                        LOGGER.info(
+                            "risk classifier: rules read failed repo=%s number=%s: %s",
+                            bound.repo, number, str(exc)[:300],
+                        )
+                        out_context["rules"] = automation_rules.Rules(
+                            status=automation_rules.INVALID,
+                            error=f"not read ({type(exc).__name__})",
+                        )
 
             return proposal, verdict, changed_paths, stale_base
         except WorkspaceError as exc:
@@ -4097,7 +4125,7 @@ class VcsBroker:
                 [],
                 False,
             )
-        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 -- fail closed to unknown on any unexpected classifier/git error
             LOGGER.info(
                 "risk classifier: git read failed repo=%s number=%s: %s",
                 bound.repo, number, str(exc)[:400],
@@ -4122,8 +4150,8 @@ class VcsBroker:
         """Resolve verified cluster environment from PR paths + broker cluster reads.
 
         Returns `(environment, error_reason)`. Fails closed when paths span
-        multiple clusters, sit outside `clusters/<name>/`, or cluster labels
-        cannot be uniquely verified.
+        multiple clusters, sit outside `clusters/<name>/`, touch an excluded
+        cluster, or cluster labels cannot be uniquely verified.
         """
         if not changed_paths:
             return automation_rules.UNKNOWN_ENVIRONMENT, "no changed files to bind to a cluster"
@@ -4136,44 +4164,30 @@ class VcsBroker:
         short_name = next(iter(clusters))
         assert short_name is not None
         if not _GKE_CLUSTER_SHORT_NAME.fullmatch(short_name):
-            return automation_rules.UNKNOWN_ENVIRONMENT, f"invalid cluster directory name {short_name!r}"
+            return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster directory name"
         if self._cluster_read is None:
             return automation_rules.UNKNOWN_ENVIRONMENT, "this broker has no cluster reader"
 
-        explicit = payload.get("cluster")
-        if isinstance(explicit, str) and explicit.strip():
-            target = _gke_cluster(explicit.strip())
-            if target is None:
+        explicit_target: tuple[str, str, str] | None = None
+        if "cluster" in payload and payload["cluster"] is not None:
+            explicit = payload["cluster"]
+            if not isinstance(explicit, str) or not explicit.strip():
                 return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster coordinate"
-            project, location, name = target
-            if name != short_name:
+            explicit_target = _gke_cluster(explicit.strip())
+            if explicit_target is None:
+                return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster coordinate"
+            if explicit_target[2] != short_name:
                 return (
                     automation_rules.UNKNOWN_ENVIRONMENT,
-                    f"cluster {name!r} does not match changed paths under clusters/{short_name}/",
+                    "cluster coordinate does not match changed paths",
                 )
-            code, out, err = self._cluster_read(
-                [
-                    "gcloud", "container", "clusters", "describe", name,
-                    "--location", location, "--project", project,
-                    "--format=json(resourceLabels)",
-                ],
-                "",
-            )
-            if code != 0:
-                LOGGER.info("risk label: cluster describe failed cluster=%s exit=%s: %s", explicit, code, err[:400])
-                return automation_rules.UNKNOWN_ENVIRONMENT, "the target cluster's labels could not be read"
-            try:
-                labels = (json.loads(out or "{}") or {}).get("resourceLabels") or {}
-            except (json.JSONDecodeError, AttributeError):
-                return automation_rules.UNKNOWN_ENVIRONMENT, "the target cluster's labels could not be parsed"
-            env = automation_rules.cluster_environment(labels)
-            return (env, "") if env else (automation_rules.UNKNOWN_ENVIRONMENT, "the cluster declares no environment label")
 
-        # Automatic broker-side cluster resolution by unique cluster short name
+        # Broker-side cluster resolution: never let a caller-supplied `cluster`
+        # steer `--project` or bypass uniqueness across same-named clusters.
         argv = [
             "gcloud", "container", "clusters", "list",
             f"--filter=name={short_name}",
-            "--format=json(name,location,resourceLabels)",
+            "--format=json(name,location,selfLink,resourceLabels)",
         ]
         project_id = os.environ.get("GKE_PROJECT_ID", "").strip()
         if project_id:
@@ -4181,22 +4195,54 @@ class VcsBroker:
         code, out, err = self._cluster_read(argv, "")
         if code != 0:
             LOGGER.info("risk label: cluster list failed name=%s exit=%s: %s", short_name, code, err[:400])
-            return automation_rules.UNKNOWN_ENVIRONMENT, "the target cluster's labels could not be read"
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
         try:
             items = json.loads(out or "[]")
         except json.JSONDecodeError:
-            return automation_rules.UNKNOWN_ENVIRONMENT, "the target cluster's labels could not be parsed"
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
         if not isinstance(items, list):
-            return automation_rules.UNKNOWN_ENVIRONMENT, "the target cluster's labels could not be parsed"
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
         matches = [item for item in items if isinstance(item, dict) and item.get("name") == short_name]
         if len(matches) != 1:
-            return (
-                automation_rules.UNKNOWN_ENVIRONMENT,
-                f"expected 1 cluster named {short_name!r}, found {len(matches)}",
-            )
-        labels = matches[0].get("resourceLabels") or {}
-        env = automation_rules.cluster_environment(labels)
-        return (env, "") if env else (automation_rules.UNKNOWN_ENVIRONMENT, "the cluster declares no environment label")
+            LOGGER.info("risk label: expected 1 cluster named %r, found %s", short_name, len(matches))
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+
+        match = matches[0]
+        raw_loc = match.get("location")
+        item_location = raw_loc.strip() if isinstance(raw_loc, str) else ""
+        item_project = project_id
+        raw_link = match.get("selfLink")
+        self_link = raw_link if isinstance(raw_link, str) else ""
+        m_link = re.search(r"/projects/([^/]+)/(?:locations|zones)/([^/]+)/clusters/([^/?#]+)", self_link)
+        if m_link:
+            item_project = m_link.group(1)
+            if not item_location:
+                item_location = m_link.group(2)
+
+        try:
+            if item_project and item_location:
+                self._cluster_exclusions.check(item_project, item_location, short_name, include_holds=False)
+            else:
+                self._cluster_exclusions.check_unnamed(include_holds=False)
+        except scope_exclude.ExcludedCluster as exc:
+            LOGGER.info("risk label: excluded cluster %s: %s", short_name, exc)
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+
+        if explicit_target is not None:
+            exp_proj, exp_loc, _ = explicit_target
+            if not item_project or not item_location or exp_proj != item_project or exp_loc != item_location:
+                LOGGER.info(
+                    "risk label: caller cluster coordinate %s/%s/%s disagreed with resolved %s/%s/%s",
+                    exp_proj, exp_loc, short_name, item_project, item_location, short_name,
+                )
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+
+        labels = match.get("resourceLabels") or {}
+        env = automation_rules.cluster_environment(labels) if isinstance(labels, dict) else ""
+        if not env:
+            LOGGER.info("risk label: cluster %s declares no environment label", short_name)
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster declares no environment label"
+        return env, ""
 
     def _read_rules_from_bare(
         self,
@@ -4342,8 +4388,10 @@ class VcsBroker:
         )
         if not decision.allowed:
             LOGGER.info("risk automerge refused env=%s level=%s: %s", env, verdict.risk_level, decision.reason)
+            if decision.reason.startswith(("denied by automerge.deny[", "no allow rule permits risk")):
+                return None, f"{automation_rules.RULES_FILE} does not allow this change in this cluster's environment"
             return None, decision.reason
-        return automerge_eligibility.LABEL_FOR_SWITCH[switch], decision.reason
+        return automerge_eligibility.LABEL_FOR_SWITCH[switch], f"{automation_rules.RULES_FILE} allows auto-merge"
 
     def _practice_risk_qualifies(
         self,
@@ -4428,9 +4476,14 @@ class VcsBroker:
         level = dial_level()
         ceiling = automation_rules.install_max_risk_ceiling()
 
+        wants_rules = switch in automerge_eligibility.LABELLING_SWITCH_VALUES
         git_ctx: dict[str, Any] = {}
         proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
-            bound, number, expected_head_sha=expected_sha, out_context=git_ctx
+            bound,
+            number,
+            expected_head_sha=expected_sha,
+            out_context=git_ctx if wants_rules else None,
+            read_rules=wants_rules,
         )
         want_label: str | None = None
         if switch not in automerge_eligibility.LABELLING_SWITCH_VALUES:
@@ -4477,9 +4530,14 @@ class VcsBroker:
         bound = self._bind(payload)
         switch = self._automerge_switch()
 
+        wants_rules = switch in automerge_eligibility.LABELLING_SWITCH_VALUES
         git_ctx: dict[str, Any] = {}
         proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
-            bound, number, expected_head_sha=expected_sha, out_context=git_ctx
+            bound,
+            number,
+            expected_head_sha=expected_sha,
+            out_context=git_ctx,
+            read_rules=wants_rules,
         )
         transient_mismatch = any(
             r.code in ("PROPOSAL_BRANCH_MOVED", "HEAD_SHA_MISMATCH") for r in verdict.reasons
