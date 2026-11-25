@@ -258,6 +258,7 @@ AUDITS: dict[str, AuditSpec] = {
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
             "ingress-gateway-healthcheck-mismatch",
+            "network-daemonset-missing-ccc-toleration",
             "image-pull-failing",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
@@ -1297,6 +1298,7 @@ CHECK_PHRASES = {
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
+    "network-daemonset-missing-ccc-toleration": "{object} can't start on one or more node pools",
     "image-pull-failing": "{object} cannot pull its image",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
