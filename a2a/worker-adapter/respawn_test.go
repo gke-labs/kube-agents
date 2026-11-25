@@ -16,6 +16,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // respawnScope stands the adapter in as the container's init, with the
@@ -416,7 +417,9 @@ func TestAStopBetweenProcessesRefusesEverySteer(t *testing.T) {
 // arrives during turn one is held, not written to that process; turn one's
 // process ends at its result, and a second process gets an envelope with
 // the steer as its message and turn one's conversation events as its
-// history.
+// history. The turn's MCP servers come from the persona (Config.PersonaMCP)
+// into the turn's own driver; the pod's driver carries none, so a respawn
+// that started from the pod's driver would send none.
 func TestACoreAgentSteerHeldAtTheResultRunsOnAFreshProcess(t *testing.T) {
 	dir := t.TempDir()
 	harness := stub(t, fmt.Sprintf(`
@@ -437,9 +440,8 @@ exit 0
 	session, taskID := "chat-ca-respawn", "task-ca-respawn"
 	origin := submit(t, c, session, taskID, "start")
 	cfg := adapterConfig(url, taskID, session, harness)
-	d := newCoreAgentDriver()
-	d.MCP = []coreagentwire.MCPServer{{Name: "srv", Command: "/bin/true", Tools: []string{"t"}}}
-	cfg.Driver = d
+	cfg.Driver = newCoreAgentDriver()
+	cfg.PersonaMCP = []persona.MCPServer{{Name: "srv", Command: "/bin/true", Tools: []string{"t"}}}
 	useRespawnScope(t)
 	done := runAdapter(context.Background(), cfg)
 	waitFileFor(t, filepath.Join(dir, "turn.1"), 10*time.Second)
@@ -460,6 +462,16 @@ exit 0
 	if late, err := os.ReadFile(filepath.Join(dir, "late.1")); err == nil && len(strings.TrimSpace(string(late))) > 0 {
 		t.Errorf("turn one's process was written to after its envelope: %q", late)
 	}
+	var env1 struct {
+		MCP []coreagentwire.MCPServer `json:"mcp"`
+	}
+	b1, _ := os.ReadFile(filepath.Join(dir, "envelope.1"))
+	if err := json.Unmarshal(b1, &env1); err != nil {
+		t.Fatalf("envelope 1 %q: %v", b1, err)
+	}
+	if len(env1.MCP) != 1 || env1.MCP[0].Name != "srv" {
+		t.Errorf("process 1's envelope carries MCP %+v; want the persona's server", env1.MCP)
+	}
 	var env2 struct {
 		Message string                    `json:"message"`
 		Session string                    `json:"session"`
@@ -474,7 +486,8 @@ exit 0
 		t.Errorf("process 2's message is %q; want the held steer", env2.Message)
 	}
 	// The turn's driver starts the next process, so its per-turn state
-	// (here its MCP servers) is in that envelope too.
+	// (here the persona's MCP servers) is in that envelope too; the pod's
+	// driver has none.
 	if len(env2.MCP) != 1 || env2.MCP[0].Name != "srv" {
 		t.Errorf("process 2's envelope carries MCP %+v; want the turn's server", env2.MCP)
 	}
