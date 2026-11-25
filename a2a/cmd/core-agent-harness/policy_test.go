@@ -262,6 +262,18 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 		"/var/lib/agent-persona/skills/stall/scripts/../../other/scripts/evil.py": false,
 		"/var/lib/agent-persona/skills/other/scripts/evil.py":                     false,
 		"sh -c id": false,
+		// A prefix grant is the real boundary a session pod has: a
+		// wrapper that would run a granted command (or anything) through
+		// an interpreter or launcher never matches it.
+		"bash -c 'kubectl get pods'":           false,
+		"bash -c 'kubectl get pods | sh'":      false,
+		"python3 -c 'import os; os.system(1)'": false,
+		"env kubectl get pods":                 false,
+		"xargs kubectl get pods":               false,
+		"nohup kubectl get pods":               false,
+		"timeout 5 kubectl get pods":           false,
+		"command kubectl get pods":             false,
+		"exec kubectl get pods":                false,
 	} {
 		if got := gate.CheckBash(context.Background(), cmd) == nil; got != want {
 			t.Errorf("CheckBash(%q) allowed=%v, want %v", cmd, got, want)
@@ -396,3 +408,86 @@ func TestEachGrantableBuiltinTurnsOnOnlyItsOwnSwitch(t *testing.T) {
 		}
 	}
 }
+
+// TestEachRefusedCallLogsOneLineWithoutItsArguments: every layer's refusal,
+// the plugin's and the gate's, logs one "tool refused:" line naming the
+// tool and why, and never the command or path the gate's error quotes. An
+// error that isn't a refusal logs nothing.
+func TestEachRefusedCallLogsOneLineWithoutItsArguments(t *testing.T) {
+	g, err := toolgrant.Policy{ReadFiles: true, ShellPrefixes: []string{"kubectl"}}.CoreAgent("/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Deny = append(g.Deny, "bash:kubectl delete*")
+	_, opts, plugins, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil, "/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := permissions.New(opts)
+	_, pluginErr := plugins[0].BeforeToolCallback()(nil, fakeTool("edit_file"), nil)
+	for _, c := range []struct {
+		name, tool string
+		err        error
+		want       string
+	}{
+		{"the plugin", "edit_file", pluginErr, `tool refused: "edit_file" (not in the turn's grant)`},
+		{"no allow rule", "bash", gate.CheckBash(context.Background(), "gcloud secrets-xyz list"), `tool refused: "bash" (no allow rule matches)`},
+		{"a deny rule", "bash", gate.CheckBash(context.Background(), "kubectl delete pod secret-pod"), `tool refused: "bash" (a deny rule matches)`},
+		{"a newline in a model-made name", "x\nforged", fmt.Errorf("tool 'x' not found.\nAvailable tools: a"), `tool refused: "x\nforged" (no such tool)`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.err == nil {
+				t.Fatal("no refusal to log")
+			}
+			var b strings.Builder
+			logRefusal(&b, c.tool, c.err)
+			if got := strings.TrimSuffix(b.String(), "\n"); got != c.want {
+				t.Errorf("logged %q, want %q", got, c.want)
+			}
+			for _, leak := range []string{"secret", "xyz"} {
+				if strings.Contains(b.String(), leak) {
+					t.Errorf("the line carries the call's arguments: %q", b.String())
+				}
+			}
+		})
+	}
+	var b strings.Builder
+	logRefusal(&b, "read_file", fmt.Errorf("open /scratch/missing: no such file or directory"))
+	if b.Len() != 0 {
+		t.Errorf("a tool error that isn't a refusal logged %q", b.String())
+	}
+}
+
+// TestThePluginLogsEveryToolError: the before-tool plugin carries the error
+// callback, writing to refusalLog, and leaves the error as the result.
+func TestThePluginLogsEveryToolError(t *testing.T) {
+	var b strings.Builder
+	prev := refusalLog
+	refusalLog = &b
+	defer func() { refusalLog = prev }()
+	_, _, plugins, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file"}}, nil, "/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb := plugins[0].OnToolErrorCallback()
+	if cb == nil {
+		t.Fatal("the plugin has no tool-error callback")
+	}
+	res, cbErr := cb(nil, fakeTool("bash"), map[string]any{"command": "id"}, fmt.Errorf("bash requires an allowlist entry in 'allow' mode: %q", "id"))
+	if res != nil || cbErr != nil {
+		t.Errorf("the callback replaced the error: %v, %v", res, cbErr)
+	}
+	if got := b.String(); got != "tool refused: \"bash\" (no allow rule matches)\n" {
+		t.Errorf("logged %q", got)
+	}
+}
+
+// namedTool is a tool that is only a name, for callbacks that read only
+// that.
+type namedTool string
+
+func (n namedTool) Name() string        { return string(n) }
+func (n namedTool) Description() string { return "" }
+func (n namedTool) IsLongRunning() bool { return false }
+
+func fakeTool(name string) adktool.Tool { return namedTool(name) }
