@@ -185,7 +185,7 @@ func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent, profile *age
 		return agentv1alpha1.DefaultProfileWarmReplicas
 	}
 	perTier := int(profile.Spec.Concurrency)
-	if tiers := interactiveProfileTiers([]agentv1alpha1.AgentProfile{*profile}); tiers > 1 {
+	if tiers := profileInteractiveTiers(profile); tiers > 1 {
 		perTier = (perTier + tiers - 1) / tiers
 	}
 	return max(agentv1alpha1.DefaultProfileWarmReplicas,
@@ -197,10 +197,18 @@ func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent, profile *age
 func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 	n := 0
 	for i := range profiles {
-		for _, tier := range profiles[i].AllowedTierList() {
-			if interactiveTier(&profiles[i], tier) {
-				n++
-			}
+		n += profileInteractiveTiers(&profiles[i])
+	}
+	return n
+}
+
+// profileInteractiveTiers counts one profile's interactive tiers: the warm
+// pools it needs.
+func profileInteractiveTiers(profile *agentv1alpha1.AgentProfile) int {
+	n := 0
+	for _, tier := range profile.AllowedTierList() {
+		if interactiveTier(profile, tier) {
+			n++
 		}
 	}
 	return n
@@ -224,7 +232,7 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[corev1.ResourceName]int64 {
 	var pools, warm int
 	for i := range profiles {
-		n := interactiveProfileTiers(profiles[i : i+1])
+		n := profileInteractiveTiers(&profiles[i])
 		pools += n
 		warm += n * resolveProfileWarmReplicas(agent, &profiles[i])
 	}
