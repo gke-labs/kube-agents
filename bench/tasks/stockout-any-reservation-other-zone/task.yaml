@@ -1,0 +1,66 @@
+# PARKED — FIXTURE_NOT_READY in scripts/validate_bench_cases.py on #6954: it
+# needs a node pool that consumes any matching reservation and a one-VM
+# reservation of the pool's machine type in another zone. A reservation is
+# billed while it exists, so no pool project carries the pair. When a fixture
+# exists, register the case in hack/eval/nightly-cases.txt.
+#
+# Domain: capacity (stockout-prevention SOP, check 3.10(e)). Journey: the
+# stockout and capacity audit names the node pool whose reserved capacity is
+# in a zone that the pool does not use.
+#
+# WHAT THIS GRADES. A node pool made with `--reservation-affinity any`
+# consumes a matching reservation only in a zone where the pool makes nodes.
+# GKE accepts the pool with no warning when the project's one matching
+# reservation is in another zone: a node of the pool then comes on demand,
+# and the reservation stays unused (read on a throwaway cluster, GKE
+# 1.35.8-gke.1796000, on 2026-11-25). The audit must file a reservation
+# finding against the pool.
+#
+# PLANTED SHAPE REQUIRED. A zero-node pool named "any-reservation-pool" whose
+# `config.reservationAffinity.consumeReservationType` is `ANY_RESERVATION`,
+# and one reservation of the pool's machine type that is not "specific
+# required", has free capacity, and is in a zone where the pool makes no
+# node. No other reservation of that machine type is in the project.
+#
+# RED BEFORE THE CHECK. Without arm (e) the collector compares only a pool
+# that consumes named reservations (3.10(d)), so it files nothing for this
+# pool, and no other check names it.
+#
+# Isolation class: cluster-read-only, GitOps-repo write, as
+# stockout-pinned-pool: the audit writes the ledger issue and nothing on a
+# cluster.
+id: stockout-any-reservation-other-zone
+name: Capacity audit names the pool whose reservation is in another zone
+prompt: >-
+  Run the fleet stockout prevention and capacity audit, following the
+  stockout-prevention SOP.
+expected_output: >-
+  The ledger issue carries a reservation finding against
+  any-reservation-pool: the pool consumes any matching reservation, and the
+  project's one matching reservation is in a zone where the pool makes no
+  node. The closing response is the SOP's one line, carrying the ledger URL
+  in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: capacity
+
+# Graded against the LEDGER, not the chat reply: the stockout-prevention SOP
+# mandates a one-line closing response that deliberately restates nothing.
+verification_spec:
+  # scope: finding -- binds the check to the object under the reservation
+  # check. A `finding_ids` phrase for the pool would also pass on another
+  # check's finding against the same pool.
+  - name: a-reservation-finding-was-filed-against-the-any-reservation-pool
+    role: objective
+    # assert, not the converge default: the ledger is written once, at
+    # `finish`, before the run ends.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding
+      finding_check: reservation-mismatch-risk
+      required_phrases: ["any-reservation-pool"]
