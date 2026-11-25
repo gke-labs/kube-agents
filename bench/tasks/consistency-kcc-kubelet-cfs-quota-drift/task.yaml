@@ -92,22 +92,23 @@ verification_spec:
   # kubelet disables CFS bandwidth quota enforcement / CPU throttling, leaving
   # container CPU limits unenforced so workloads can burst past their limits.
   # Uses `any_of_patterns` exclusively so every alternative requires a CPU or
-  # CFS qualifier, bounds its match within a single sentence (no `.`, `;`, `?`,
-  # `!`, or blank line crossed), and rejects negated forms (`cannot`, `can't`,
-  # `never`, `not`, `does not leave ... unenforced`).
+  # CFS qualifier, bounds its match within a single clause (no `,`, `.`, `;`,
+  # `?`, `!`, contrasting conjunction, or blank line crossed), and rejects
+  # negated forms (`cannot`, `can't`, `never`, `not`, `does not leave ...
+  # unenforced`, `does not stop/prevent/disable`).
   - name: the-answer-explains-unenforced-cpu-limits
     role: objective
     mode: assert
     check:
       type: report_contains
       any_of_patterns:
-        - '\bcpu\s+limits?\b(?:[^\n.;?!]|\.(?=\w)|\n(?!\n)){0,80}?\b(?:not|never|no\s+longer)\s+(?:be\s+|being\s+)?enforced\b'
-        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bnot\sleave\s)(?<!\bnever\sleave\s)(?<!\bnot\sleaving\s)\b(?:(?:container|workload|pod|declared|configured)\s+)?cpu\s+limits?\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t)\b)(?:[^\n.;?!]|\.(?=\w)|\n(?!\n))){0,80}?\b(?:unenforced|ignored|ineffective|unthrottled)\b'
-        - '\b(?:not|never|no\s+longer|without|stops?|disables?|disabling|prevents?|preventing)\s+(?:kubelet\s+|the\s+kubelet\s+from\s+|from\s+)?enforc(?:e|ing)\b(?:[^\n.;?!]|\.(?=\w)|\n(?!\n)){0,60}?\bcpu\s+limits?\b'
-        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?<!\bcan''t\s)(?<!\bnot\sleave\s)(?<!\bnever\sleave\s)\b(?:unenforced|ignores?|ignoring)\b(?:[^\n.;?!]|\.(?=\w)|\n(?!\n)){0,40}?\b(?:(?:container|workload|pod|declared|configured)\s+)?cpu\s+limits?\b'
-        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?<!\bcan''t\s)\b(?:disables?|disabling|without|no)\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t)\b)(?:[^\n.;?!]|\.(?=\w)|\n(?!\n))){0,50}?\b(?:cpu|cfs)\s+(?:(?:quota|limit|bandwidth)\s+)?(?:enforcement|throttling)\b'
-        - '\b(?:cpu|cfs)\s+(?:(?:quota|limit|bandwidth)\s+)?(?:enforcement|throttling)\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t)\b)(?:[^\n.;?!]|\.(?=\w)|\n(?!\n))){0,50}?\b(?:disabled|off|not\s+enforced|unenforced)\b'
-        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?<!\bcan''t\s)\b(?:exceed(?:s|ing)?|burst(?:s|ing)?\s+(?:past|beyond|above)|consum(?:e|es|ing)\s+more\s+cpu\s+than)\b(?:[^\n.;?!]|\.(?=\w)|\n(?!\n)){0,40}?\b(?:their\s+|its\s+|declared\s+|configured\s+|container\s+|pod\s+|workload\s+)?cpu\s+limits?\b'
+        - '\bcpu\s+limits?\b(?:(?!(?:\bwhereas|\bwhile|\bbut|\balthough|\bthough|\bhowever|\byet)\b)(?:[^\n,.;?!]|\.(?=\w)|\n(?!\n))){0,80}?\b(?:not|never|no\s+longer)\s+(?:be\s+|being\s+)?enforced\b'
+        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bnot\sleave\s)(?<!\bnever\sleave\s)(?<!\bnot\sleaving\s)(?<!\bcontainer\s)(?<!\bworkload\s)(?<!\bpod\s)(?<!\bdeclared\s)(?<!\bconfigured\s)(?<!\bthe\s)(?<!\btheir\s)(?<!\bits\s)\b(?:(?:container|workload|pod|declared|configured|the|their|its)\s+)*cpu\s+limits?\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t|\bwhereas|\bwhile|\bbut|\balthough|\bthough|\bhowever|\byet)\b)(?:[^\n,.;?!]|\.(?=\w)|\n(?!\n))){0,80}?\b(?:unenforced|ignored|ineffective|unthrottled)\b'
+        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?<!\bcan''t\s)\b(?:not|never|no\s+longer|without|stops?|disables?|disabling|prevents?|preventing)\s+(?:kubelet\s+|the\s+kubelet\s+from\s+|from\s+)?enforc(?:e|ing)\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t)\b)(?:[^\n,.;?!]|\.(?=\w)|\n(?!\n))){0,60}?\bcpu\s+limits?\b'
+        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?<!\bcan''t\s)(?<!\bnot\sleave\s)(?<!\bnever\sleave\s)\b(?:unenforced|ignores?|ignoring)\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t)\b)(?:[^\n,.;?!]|\.(?=\w)|\n(?!\n))){0,40}?\b(?:(?:container|workload|pod|declared|configured|the|their|its)\s+)*cpu\s+limits?\b'
+        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?<!\bcan''t\s)\b(?:disables?|disabling|without|no)\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t)\b)(?:[^\n,.;?!]|\.(?=\w)|\n(?!\n))){0,50}?\b(?:cpu|cfs)\s+(?:(?:quota|limit|bandwidth)\s+)?(?:enforcement|throttling)\b'
+        - '\b(?:cpu|cfs)\s+(?:(?:quota|limit|bandwidth)\s+)?(?:enforcement|throttling)\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t|\bwhereas|\bwhile|\bbut|\balthough|\bthough|\bhowever|\byet)\b)(?:[^\n,.;?!]|\.(?=\w)|\n(?!\n))){0,50}?\b(?:disabled|off|not\s+enforced|unenforced)\b'
+        - '(?<!\bnot\s)(?<!\bnever\s)(?<!\bcannot\s)(?<!\bcan''t\s)\b(?:exceed(?:s|ing)?|burst(?:s|ing)?\s+(?:past|beyond|above)|consum(?:e|es|ing)\s+more\s+cpu\s+than)\b(?:(?!(?:\bnot|\bnever|\bcannot|\bcan''t)\b)(?:[^\n,.;?!]|\.(?=\w)|\n(?!\n))){0,40}?\b(?:(?:their|its|declared|configured|container|pod|workload|the)\s+)*cpu\s+limits?\b'
   # A chat probe opens no ledger run, graded as an objective as in
   # drift-chat-request-runs-collector so a ledger write fails
   # VerificationCorrectness directly.
@@ -163,4 +164,4 @@ verification_spec:
             - "^(?:clusters|node-pools)$"
             - "^(?:update|upgrade|delete|resize|create|rollback|complete-upgrade)$"
       forbidden_patterns:
-        - '^(?!\s*(?:grep|rg|egrep|fgrep|echo|printf|cat|sed|awk|head|tail|less)\b).*?\bkubectl(?:\s+--?[\w-]+(?:[= ](?!-)[^\s;&|]+)?)*\s+(?:scale|patch|apply|edit|replace|set|autoscale|label|annotate|create|delete|cordon|uncordon|drain|taint|expose|run|rollout\s+(?:restart|undo|pause|resume))\b(?![^|;&\n]*\s(?:--help|-h)\b)'
+        - '(?:^|[|;&\n])(?!\s*(?:grep|rg|egrep|fgrep|echo|printf|cat|sed|awk|head|tail|less)\b)[^|;&\n]*?\bkubectl(?:\s+--?[\w-]+(?:[= ](?!-)[^\s;&|]+)?)*\s+(?:scale|patch|apply|edit|replace|set|autoscale|label|annotate|create|delete|cordon|uncordon|drain|taint|expose|run|rollout\s+(?:restart|undo|pause|resume))\b(?![^|;&\n]*\s(?:--help|-h)\b)'
