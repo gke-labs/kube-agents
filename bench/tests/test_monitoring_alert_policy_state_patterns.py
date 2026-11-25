@@ -46,6 +46,9 @@ def test_a_disabled_report_passes_whatever_its_layout(report):
         f"- {NAME}\n  - Active\n- ka-bench other: disabled\n",
         f"**{NAME}**\nEnabled: on\nNotifications: disabled\n",
         f"{NAME}\n\nEnabled\n\nother: disabled\n",
+        # A "no" that belongs to another clause does not exempt the state.
+        f"- **Display name:** {NAME}\n- **Enabled:** on (no notification channels)\n- **Other policy:** disabled\n",
+        f"{NAME}: enabled, with no notification channels (other-policy is disabled)\n",
     ],
 )
 def test_an_enabled_report_still_fails(report):
