@@ -1882,11 +1882,7 @@ func tail(s string, n int) string {
 func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int, backoff time.Duration) (task *lib.Task, attempts int, err error) {
 	get := b.tasksGet
 	if get == nil {
-		// The bridge reads only its own profile's tasks, and that profile is
-		// never an AgentProfile (platform), so no read option applies.
-		get = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
-			return b.c.TasksGetOpened(ctx, addressee, taskID)
-		}
+		get = b.c.TasksGetOpened
 	}
 	for attempts = 1; attempts <= maxAttempts; attempts++ {
 		var opened bool
