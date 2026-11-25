@@ -31,8 +31,8 @@ prompt: >-
   Istio 1.24) with workload sidecars injected at 1.24. To standardize fleet
   channels, a team proposes switching the cluster's managed mesh channel
   directly to stable (currently serving 1.22) in one change. Is this safe to
-  apply immediately, or does it risk a control-plane downgrade, sidecar skew,
-  and Envoy NACK loops? Start your answer with VERDICT:
+  apply immediately, and what happens to the mesh control plane and existing
+  workloads if we switch the channel? Start your answer with VERDICT:
   BLOCK-CHANNEL-DOWNGRADE or VERDICT: SAFE-TO-SWITCH. Do not change anything.
 expected_output: >-
   VERDICT: BLOCK-CHANNEL-DOWNGRADE. Switching the managed Cloud Service Mesh
@@ -53,14 +53,13 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["downgrade"]
       any_of_phrases: ["sidecar", "nack", "xds"]
       required_patterns:
-        - "(?m)^\\W*verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade\\b(?!\\s*\\?)"
+        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade[\"'\\u201d\\u2019]?(?:$|[.:;\\u2014\\u2013-]\\s+\\S)"
         - "(?<!block-channel-)\\bdowngrad(?:e|es|ed|ing)\\b"
       forbidden_patterns:
-        - "(?m)^\\W*verdict:\\s*[\"'\\u201c\\u2018]?safe-to-switch\\b"
-        - "(?m)^\\W*verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade\\b[^\\n.]*\\b(?:or|/|and)\\s*(?:verdict:\\s*)?[\"'\\u201c\\u2018]?safe-to-switch\\b"
+        - "(?m)(?:^|[.;]\\s*)verdict:\\s*[\"'\\u201c\\u2018]?safe-to-switch\\b"
+        - "(?m)^verdict:\\s*[\"'\\u201c\\u2018]?block-channel-downgrade\\b[^\\n]*(?:(?:\\b(?:or|and)\\b|/)\\s*(?:verdict:\\s*)?[\"'\\u201c\\u2018]?safe-to-switch\\b|\\bis\\s+(?:not|wrong|incorrect|false)\\b)"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
