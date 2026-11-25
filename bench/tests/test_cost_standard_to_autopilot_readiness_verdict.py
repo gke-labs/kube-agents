@@ -78,6 +78,21 @@ def test_migration_blocked_verdict_with_both_blockers_passes():
             "The DaemonSet (privileged, hostPath) and batch Job (hostNetwork) are not allowed on Autopilot, "
             "while the stateless web API Deployment is allowed on Autopilot as-is."
         ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The log-collector DaemonSet and the batch Job block migration because they require "
+            "securityContext.privileged: true / hostPath and hostNetwork: true, respectively."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The batch Job and the log-collector DaemonSet block migration because they require "
+            "hostNetwork: true and securityContext.privileged: true / hostPath, respectively."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "Unlike the privileged hostPath DaemonSet and the hostNetwork batch Job, "
+            "the stateless web API Deployment is allowed on Autopilot."
+        ),
     ):
         assert _passes(report), report
 
@@ -128,6 +143,21 @@ def test_migration_ready_missing_blocker_wrong_claim_or_prompt_echo_fails():
             "VERDICT: MIGRATION-BLOCKED\n"
             "The DaemonSet (privileged, hostPath) is rejected, and the batch Job with hostNetwork does not block migration."
         ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The batch Job with hostNetwork and the stateless web API Deployment are allowed on Autopilot, "
+            "whereas the privileged hostPath DaemonSet is blocked."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The privileged hostPath DaemonSet and the stateless web API Deployment are allowed on Autopilot, "
+            "whereas the batch Job with hostNetwork is blocked."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The batch Job with hostNetwork, like the stateless web API Deployment, is allowed on Autopilot, "
+            "whereas the privileged hostPath DaemonSet is blocked."
+        ),
         # Verdict line followed by the prompt itself.
         f"VERDICT: MIGRATION-BLOCKED\n{doc['prompt']}",
         (
@@ -144,6 +174,20 @@ def test_migration_ready_missing_blocker_wrong_claim_or_prompt_echo_fails():
         (
             "VERDICT: MIGRATION-BLOCKED\n"
             "The DaemonSet uses hostNetwork and the batch Job uses privileged."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "hostNetwork is used by the DaemonSet and privileged is used by the batch Job."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The log-collector DaemonSet and the batch Job block migration because they require "
+            "hostNetwork: true and securityContext.privileged: true, respectively."
+        ),
+        (
+            "VERDICT: MIGRATION-BLOCKED\n"
+            "The batch Job and the log-collector DaemonSet block migration because they require "
+            "securityContext.privileged: true and hostNetwork: true, respectively."
         ),
         # Missing the batch Job hostNetwork blocker.
         (
