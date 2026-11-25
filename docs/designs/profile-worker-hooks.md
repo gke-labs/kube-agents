@@ -13,8 +13,9 @@ owns a part that this design only names: the log line of a tool call and where i
 (telemetry and log shipping, #6674), where durable state lives (#6669), the dial and post-merge
 state (#6673), how a task posts to chat (#6668), reads across the fleet (#6667), what a profile
 reaches on the broker (#6670), delegation from a profile worker (#6789), and a plugin surface
-for agents (#1726). The designs for #6674 and #6667 are not on `main`; this design names each by
-its issue.
+for agents (#1726). A design is written for five of these parts: the broker surface (#7120), the
+state homes with the dial and post-merge state (#7123), the unattended write permit (#7130),
+telemetry and log shipping (#7250) and reads with no cluster (#7260).
 
 ## What the platform agent has today
 
@@ -136,6 +137,8 @@ For a row with "none" under Where, a "no" means that the need gets a design of i
 
 The telemetry work (#6674) decides the form of the log line for a tool call and how it ships.
 Row 2 names the source and what that source must carry. It does not add a second line format.
+The telemetry design (#7250) leaves the result of a tool call to this group; rows 2 and 3 are
+the answer.
 
 What the drivers get, because they do not have it today:
 
@@ -168,8 +171,12 @@ Limits of the record:
 ### The opened proposal
 
 The line of row 6 holds the task id, the credential's id, the repository, the number and the
-url. A profile task opens a proposal only through `proposal-create`, from a branch that the same
-task made, and that verb has one success path in the broker.
+url. Today a profile task opens a proposal only through `proposal-create`, from a branch that
+the same task made (the broker's per-task bar), and that verb has one success path in the
+broker. Row 8 of the unattended write permit design (#7130) puts a schedule bar in place of the
+per-task bar for an unattended write. A later run of a schedule can then update a proposal
+that an earlier run opened, so the task in the line of row 6 is the task that opened the
+proposal, not each task that changed it.
 
 The line does not hold three fields that the post-merge record and the ledger hold today: the
 finding's target, which the caller sets and never sends to the broker; the origin; and the chat
@@ -184,6 +191,13 @@ On the platform agent the claim proves that a `proposal-opened` line in terminal
 proposal that the broker made. For a profile task the broker writes the line itself, so nothing
 needs that proof. With row 7 at no, the token stays in the answer; the model can read it, and
 the profile role cannot use it.
+
+Open for the decider: the same line for `publish` and `proposal-update`. Row 6 as written
+covers `proposal-create` only, and the broker-surface design (#7120) has no row for a broker
+log line, so a line for the two other write verbs has no owner. The three verbs go through one
+success path of the broker's dispatch. For `publish` the line holds the branch in place of the
+number and the url. Without that line, an unattended run that updates the proposal of an
+earlier run (row 8 of #7130) leaves no broker record with the task.
 
 ### What an AgentPlugin carries
 
@@ -221,8 +235,7 @@ decides each.
 - The form and the shipping of logs and traces, and the fields that a compliance reader needs in
   them (#6674).
 - The homes of the ledger and the findings queue (#6669) and of the post-merge record (#6673).
-- The broker's relay rows and verbs, apart from row 7 (#6670). That includes a broker log line
-  for `publish` and `proposal-update`.
+- The broker's relay rows and verbs, apart from row 7 (#6670).
 - The home of the `fleet_scope` read (blocker 4, #6667; a state home, #6669, is the other
   candidate).
 - A delegate tool for a profile worker (#6789).
