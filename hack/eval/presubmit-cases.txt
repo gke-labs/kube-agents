@@ -340,11 +340,11 @@
 #   cases this file's predecessor held commented out.
 
 # harness A/B twin (never merges): the worker-harness cases
-./tasks/tse-profile-names-the-oom-kill/task.yaml
-./tasks/session-delegates-to-the-profile-asked-for/task.yaml
-./tasks/cluster-profile-names-the-oom-kill/task.yaml
+# harness A/B twin B2a: not in this stage: ./tasks/tse-profile-names-the-oom-kill/task.yaml
+# harness A/B twin B2a: not in this stage: ./tasks/session-delegates-to-the-profile-asked-for/task.yaml
+# harness A/B twin B2a: not in this stage: ./tasks/cluster-profile-names-the-oom-kill/task.yaml
 ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 ./tasks/cluster-profile-finds-the-managed-repository/task.yaml
-./tasks/session-crashloop-question-loads-a-skill/task.yaml
-./tasks/session-cluster-question-wake-answers-once/task.yaml
-./tasks/session-turn-stops-at-write-attempt/task.yaml
+# harness A/B twin B2a: not in this stage: ./tasks/session-crashloop-question-loads-a-skill/task.yaml
+# harness A/B twin B2a: not in this stage: ./tasks/session-cluster-question-wake-answers-once/task.yaml
+# harness A/B twin B2a: not in this stage: ./tasks/session-turn-stops-at-write-attempt/task.yaml

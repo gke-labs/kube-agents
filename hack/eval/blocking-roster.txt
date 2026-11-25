@@ -65,4 +65,4 @@
 # harness A/B twin: compliance-rbac-overgrant
 
 # harness A/B twin (never merges)
-session-crashloop-question-loads-a-skill
+cluster-profile-finds-the-managed-repository

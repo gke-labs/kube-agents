@@ -140,9 +140,6 @@ spec:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
     projectId: {{ required "platformAgent.harness.projectId is required" .Values.platformAgent.harness.projectId | quote }}
-    {{- /* harness A/B twin only */}}
-    sessionWorker:
-      type: core-agent
     {{- with .Values.platformAgent.harness.universeDomain }}
     {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.harness.universeDomain" "path" (list "harness") "field" "universeDomain") }}
     universeDomain: {{ . | quote }}
