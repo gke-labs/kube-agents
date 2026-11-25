@@ -28,6 +28,10 @@ type coreAgentDriver struct {
 	// today; MCP is none until the delegate server is wired).
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
+	// Instructions are the session pod's system-prompt lines, sent in each
+	// turn's envelope (WithInstructions). A profile worker has none: its
+	// persona is its instruction layer.
+	Instructions []string
 
 	conv *coreAgentConversations
 }
@@ -49,10 +53,21 @@ const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
 
+// WithInstructions is d with the worker's system-prompt lines for core-agent,
+// which reads them from each turn's envelope; any other driver is returned as
+// it is (Claude Code gets the same lines on its argv).
+func WithInstructions(d Driver, lines []string) Driver {
+	if c, ok := d.(coreAgentDriver); ok {
+		c.Instructions = append([]string(nil), lines...)
+		return c
+	}
+	return d
+}
+
 // EncodeUser is the turn's envelope: the message, the policy and MCP
 // servers, and the history of the conversation WithResume named.
 func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
-	env := coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP}
+	env := coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP, Instructions: d.Instructions}
 	if d.conv != nil {
 		d.conv.mu.Lock()
 		env.Session = d.conv.resume
@@ -108,9 +123,11 @@ type coreAgentDecoder struct {
 	model   string
 	session string
 	// inited and ended bound the turn: one init, then events, then one
-	// result. A line outside that order (a second init, an event before
-	// init or after the result) is ignored, so nothing written into the
-	// stream out of order reaches the conversation's history.
+	// result. Every line outside that order (a second init, an init after
+	// the result, any other line before init or after the result, except a
+	// failed result that ends a turn that never started) is ignored, so
+	// nothing written into the stream out of order reaches the adapter or
+	// the conversation's history.
 	inited, ended bool
 }
 
@@ -119,16 +136,24 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	if err := json.Unmarshal(line, &ln); err != nil {
 		return nil, fmt.Errorf("core-agent-harness line: %w", err)
 	}
-	switch ln.Type {
-	case coreagentwire.TypeInit:
-		if d.inited {
+	if ln.Type == coreagentwire.TypeInit {
+		if d.inited || d.ended {
 			return nil, nil
 		}
 		d.inited = true
 		d.model, d.session = ln.Model, ln.Session
 		return []Event{{Kind: EventInit, Session: ln.Session, Model: ln.Model}}, nil
+	}
+	// The one line allowed before init is a failed result: the harness
+	// writes it when the turn fails to start (the envelope, the model, a
+	// required persona), and it ends the turn.
+	startFailure := ln.Type == coreagentwire.TypeResult && ln.Failed && !d.inited
+	if (!d.inited && !startFailure) || d.ended {
+		return nil, nil
+	}
+	switch ln.Type {
 	case coreagentwire.TypeEvent:
-		if d.inited && !d.ended && d.conv != nil && d.session != "" && len(ln.Event) > 0 {
+		if d.conv != nil && d.session != "" && len(ln.Event) > 0 {
 			d.conv.mu.Lock()
 			d.conv.history[d.session] = append(d.conv.history[d.session], ln.Event)
 			d.conv.mu.Unlock()
@@ -143,14 +168,19 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	case coreagentwire.TypeToolResult:
 		return []Event{{Kind: EventToolResult, Tool: ln.Tool, Text: ln.Text, Failed: ln.Failed}}, nil
 	case coreagentwire.TypeResult:
-		if d.ended {
-			return nil, nil
-		}
 		d.ended = true
 		ev := Event{Kind: EventResult, Text: ln.Text, Telemetry: resultTelemetry{usage: lib.Usage{Model: d.model}}}
 		if ln.Usage != nil {
-			ev.Telemetry.usage.InputTokens = int64(ln.Usage.Input)
-			ev.Telemetry.usage.OutputTokens = int64(ln.Usage.Output)
+			// Each count passes lib.UsageFigure, as the other drivers'
+			// do: a bad one is that field dropped and named, and the
+			// other still reaches the bus.
+			var ok bool
+			if ev.Telemetry.usage.InputTokens, ok = lib.UsageFigure(float64(ln.Usage.Input)); !ok {
+				ev.Telemetry.dropped = append(ev.Telemetry.dropped, "usage.input")
+			}
+			if ev.Telemetry.usage.OutputTokens, ok = lib.UsageFigure(float64(ln.Usage.Output)); !ok {
+				ev.Telemetry.dropped = append(ev.Telemetry.dropped, "usage.output")
+			}
 		}
 		if ln.Failed {
 			ev.Failed, ev.Token = true, withDetail(coreAgentErrorToken, ln.Error)
