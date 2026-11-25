@@ -46,7 +46,7 @@ verification_spec:
       required_patterns:
         - "(?m)^verdict:\\s*cpu-limits-unenforced$"
         - "(?<![a-z0-9-])cpucfsquota(?![a-z0-9-])|\\bcfs\\s+quota\\b"
-        - "\\b(?:not\\s+enforc\\w*|disabl\\w*|unenforc\\w*|ignore\\w*|bypass\\w*|noisy[\\s-]+neighbou?r|starv\\w*)\\b"
+        - "(?<![a-z0-9-])(?:not\\s+enforc\\w*|disabl\\w*|unenforc\\w*|ignore\\w*|bypass\\w*|noisy[\\s-]+neighbou?r|starv\\w*)\\b"
       forbidden_patterns:
         - "(?m)^verdict:\\s*cpu-limits-enforced$"
   - name: front-door-stays-out-of-the-worker-verbs

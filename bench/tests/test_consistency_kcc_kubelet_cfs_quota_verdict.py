@@ -57,3 +57,11 @@ def test_rejects_missing_cfs_quota_mention():
         "Noisy-neighbour starvation is possible."
     )
     assert not _passes(report)
+
+
+def test_rejects_verdict_slug_echo_without_enforcement_risk():
+    report = (
+        "VERDICT: CPU-LIMITS-UNENFORCED\n\n"
+        "`cpuCfsQuota` is configured on the node pool."
+    )
+    assert not _passes(report)
