@@ -77,7 +77,7 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 	if err != nil {
 		return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("path scope: %w", err)
 	}
-	pl, err := toolPolicyPlugin(permitted, refusalLog)
+	pl, err := toolPolicyPlugin(permitted, refusalLog, shellCommands(p.Allow))
 	if err != nil {
 		return tools.BuiltinTools{}, permissions.Options{}, nil, err
 	}
@@ -96,18 +96,30 @@ const RefusalLogPrefix = coreagentwire.RefusalLogPrefix
 // permitted, and logs every refused call to log, whichever layer refused
 // it. It doesn't rewrite arguments; a call with nil arguments is checked by
 // name like any other.
-func toolPolicyPlugin(permitted map[string]bool, log io.Writer) (*plugin.Plugin, error) {
+//
+// A shell call the gate refused for want of an allow rule gets a refusal the
+// model can act on (shellRefusalHint), in place of the gate's bare one;
+// shell lists the commands the grant's shell rules name, "*" for any.
+func toolPolicyPlugin(permitted map[string]bool, log io.Writer, shell []string) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: toolPolicyPluginName,
 		// Every tool error passes through here, the plugin's own refusal
 		// included. Returning nothing leaves the error as the tool's
 		// result.
-		OnToolErrorCallback: func(_ agent.Context, t adktool.Tool, _ map[string]any, err error) (map[string]any, error) {
+		OnToolErrorCallback: func(_ agent.Context, t adktool.Tool, args map[string]any, err error) (map[string]any, error) {
 			name := ""
 			if t != nil {
 				name = t.Name()
 			}
 			logRefusal(log, name, err)
+			if name == "bash" && err != nil && strings.Contains(err.Error(), noAllowRule) {
+				command, _ := args["command"].(string)
+				if hint := shellRefusalHint(command, shell); hint != "" {
+					// Returned as the call's result, which is what the
+					// model reads; ADK words an error result the same way.
+					return map[string]any{"error": err.Error() + ". " + hint}, nil
+				}
+			}
 			return nil, nil
 		},
 		BeforeToolCallback: func(_ agent.Context, t adktool.Tool, _ map[string]any) (map[string]any, error) {
@@ -177,7 +189,7 @@ const notInGrant = "is not in this turn's grant"
 // unlogged, never to a wrong reason.
 var refusalReasons = []struct{ phrase, reason string }{
 	{notInGrant, "not in the turn's grant"},
-	{"requires an allowlist entry in 'allow' mode", "no allow rule matches"},
+	{noAllowRule, "no allow rule matches"},
 	{"denied by config policy", "a deny rule matches"},
 	{"is outside scope", "outside the workspace"},
 	{"bash refused", "the gate's command checks"},
@@ -211,4 +223,44 @@ func logRefusal(w io.Writer, tool string, err error) {
 		return
 	}
 	_, _ = fmt.Fprintf(w, "%s%s (%s)\n", RefusalLogPrefix, strconv.Quote(tool), reason)
+}
+
+// noAllowRule is core-agent's gate refusing, in allow mode, a call no allow
+// rule matches.
+const noAllowRule = "requires an allowlist entry in 'allow' mode"
+
+// shellCommands are the commands a grant's shell allow rules name ("bash:<cmd>",
+// beside "bash:<cmd> *"), sorted; "*" stands for any command.
+func shellCommands(allow []string) []string {
+	var out []string
+	for _, a := range allow {
+		cmd, ok := strings.CutPrefix(a, "bash:")
+		if !ok || (strings.HasSuffix(cmd, " *") && cmd != "*") {
+			continue
+		}
+		out = append(out, cmd)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// shellRefusalHint tells the model why a shell command no allow rule matched
+// was refused, and what to do instead: when it starts with a command the
+// grant names (or the grant names any), its shape was the problem, a pipe,
+// redirection, chain or expansion; otherwise the command itself isn't
+// granted. "" when the grant has no shell rules, as the refusal is then
+// the plugin's or a deny's business.
+func shellRefusalHint(command string, shell []string) string {
+	if len(shell) == 0 {
+		return ""
+	}
+	const shape = "The shell here runs one plain command at a time: pipes (|), redirections (>, 2>&1), chains (;, &&, ||), subshells and $ or backtick expansion are refused. Run a single command and shape its output with the command's own flags (for kubectl, -o json, -o jsonpath=... or -o custom-columns=...), then read the output yourself"
+	fields := strings.Fields(command)
+	for _, c := range shell {
+		cf := strings.Fields(c)
+		if c == "*" || (len(cf) > 0 && len(fields) >= len(cf) && slices.Equal(fields[:len(cf)], cf)) {
+			return shape
+		}
+	}
+	return "Only these commands may run here, each as one plain command: " + strings.Join(shell, ", ")
 }
