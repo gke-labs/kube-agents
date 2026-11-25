@@ -260,6 +260,11 @@ def parse(prompt: str) -> Relayed | None:
     missing = [name for name in _FIELDS if not fields.get(name)]
     if missing:
         raise ValueError(f"{DIRECTIVE} prompt is missing {', '.join(missing)}")
+    # A fact that is only emphasis marks normalizes to nothing, and no
+    # answer can carry it.
+    for fact in ("fact1", "fact2"):
+        if not _normalize(fields[fact]):
+            raise ValueError(f"{DIRECTIVE} prompt's {fact} ({fields[fact]!r}) is only emphasis marks; no answer can carry it")
     # A fact the asks already state reaches the model without the report.
     for fact in ("fact1", "fact2"):
         for ask in ("opening", "reply1", "reply2"):
@@ -268,7 +273,9 @@ def parse(prompt: str) -> Relayed | None:
     return Relayed(**fields)
 
 
-_EMPHASIS = re.compile(r"[*_`]+")
+# Emphasis marks at a token's edge only: an underscore inside an identifier
+# (``gke_proj_np-7``, ``node_pool``) is part of it, not Markdown.
+_EMPHASIS = re.compile(r"(?<!\w)[*_`]+|[*_`]+(?!\w)")
 _SPACE = re.compile(r"\s+")
 
 
@@ -277,8 +284,9 @@ def _normalize(text: str) -> str:
 
 
 def carries(answer: str, fact: str) -> bool:
-    """Whether ``answer`` states ``fact``: with case, Markdown emphasis and
-    whitespace runs aside, as ``report_contains`` matches a required phrase,
+    """Whether ``answer`` states ``fact``: with case, Markdown emphasis (at a
+    token's edge; an underscore inside a word is kept) and whitespace runs
+    aside, as ``report_contains`` matches a required phrase,
     and as a whole token: no letter, digit or underscore runs on from
     either end, so ``42`` is not in ``420`` nor ``np-quartz-7`` in
     ``np-quartz-70``."""

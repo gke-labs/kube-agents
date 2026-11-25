@@ -429,7 +429,12 @@ class _InjectFollowUp:
     """A second message on a conversation this run opened: the opening turn's
     conversation and identity triple, and the suffix its message id takes.
     ``reply_to``, when set, is the task whose relayed report the message
-    answers, sent as the POST's ``replyTo`` (:data:`inject.REPLY_TO_FIELD`)."""
+    answers, sent as the POST's ``replyTo`` (:data:`inject.REPLY_TO_FIELD`).
+
+    ``opening`` marks the conversation's first turn sent this way (a
+    relayed-report opening): it is handled as any opening -- a budget below
+    the gateway's floor refused, the queue's full backstop, its turn timing
+    written -- and skips only the directive reads and the delegation wait."""
 
     conversation: str
     run_id: str
@@ -437,6 +442,7 @@ class _InjectFollowUp:
     repetition: str
     suffix: str
     reply_to: str = ""
+    opening: bool = False
 # The three budgets both transports share, named here rather than spelled at
 # each _numeric_env call: one default per knob, or the two doors disagree
 # about how long a case may take.
@@ -3055,6 +3061,9 @@ class _InjectRelayTransport:
         self._conversation = ""
         self._root = ""
         self._replies = 0
+        # The conversation's contextId, off the first turn that reported
+        # one: the board session the run's cards are cleaned up from.
+        self.context_id = ""
 
     @staticmethod
     def _turn(result: AgentResult, conversation: str, session: str = "") -> relayed_report.RelayTurn:
@@ -3064,6 +3073,9 @@ class _InjectRelayTransport:
             task_id=str(result.metadata.get("task_id") or ""),
             session=session,
         )
+
+    def _note_context(self, result: AgentResult) -> None:
+        self.context_id = self.context_id or str(result.metadata.get("context_id") or "")
 
     @staticmethod
     def _session_pod(conversation: str, label: str) -> str:
@@ -3083,15 +3095,28 @@ class _InjectRelayTransport:
         result = self._harness._execute_inject(
             text,
             follow_up=_InjectFollowUp(
-                conversation=conversation, run_id=run_id, case_id=case_id, repetition=repetition, suffix=""
+                conversation=conversation,
+                run_id=run_id,
+                case_id=case_id,
+                repetition=repetition,
+                suffix="",
+                opening=True,
             ),
         )
+        self._note_context(result)
         if result.metadata.get("infra_failure") is not None:
             raise relayed_report.RelayUnavailable(str(result.metadata["infra_failure"]))
         if result.metadata.get("outcome") == inject.OUTCOME_NOT_ACCEPTED:
             raise relayed_report.RelayUnavailable("; ".join(result.errors) or "the door refused the opening turn")
         turn = self._turn(result, conversation)
         if not turn.task_id:
+            if result.errors:
+                # Refused before anything was sent (a budget below the
+                # gateway's floor, a non-numeric setting): the run's own
+                # error, graded as it stands, as the plain inject opening
+                # reports it.
+                turn.ended = "the opening turn errored before the door started a task"
+                return turn
             raise relayed_report.RelayUnavailable(f"the door started no task for the opening turn on {turn.conversation}")
         terminal = str(result.metadata.get("terminal_state") or "")
         outcome = str(result.metadata.get("outcome") or "")
@@ -3155,6 +3180,7 @@ class _InjectRelayTransport:
                 str(failure.metadata.get("infra_failure") or "; ".join(failure.errors) or "the reply failed")
             )
         assert result is not None
+        self._note_context(result)
         turn = self._turn(result, conversation)
         turn.session = self._session_pod(turn.conversation, f"reply {self._replies}")
         return turn
@@ -4081,38 +4107,64 @@ class KubeAgentsHarness(AgentHarness):
                 f"AGENT_TRANSPORT={os.environ.get('AGENT_TRANSPORT', TRANSPORT_API)!r}; it runs on {TRANSPORT_INJECT!r}"
             )
         _write_eval_run(_eval_run_record(run_id, case_id, repetition))
-        # The pod's clock at the run's start, when known: the board's
-        # created_at is the pod's, and every earlier unit's cards predate it.
-        since = float(self._pod_floor) if self._pod_floor is not None else time.time() - _CARD_WAIT_CLOCK_SKEW
         try:
             return relayed_report.run(transport, relayed, inject.conversation_key(run_id, case_id, repetition))
         except relayed_report.RelayInfrastructure as exc:
             return _infra_failure(str(exc))
         finally:
             # The opening files the card the report comes from, and its turn
-            # runs as a follow-up, which skips the delegation wait that
-            # cleans up after a card. So, whatever the run's outcome: archive
-            # any card still running and purge every card's state, so the
-            # pod the next unit shares holds nothing of this one.
-            self._clean_cards_since(since)
+            # skips the delegation wait that cleans up after a card. So,
+            # whatever the run's outcome: archive this conversation's cards
+            # still running and purge their state, so the pod the next unit
+            # shares holds nothing of this one. Only this conversation's
+            # session: the case can run in the eval's parallel first phase,
+            # where a sibling unit's session is filing cards on the same board.
+            self._clean_session_cards(str(getattr(transport, "context_id", "") or ""))
 
-    def _clean_cards_since(self, since: float) -> None:
-        """Archive every card filed since ``since`` (the pod's clock) that
-        has not ended, and purge every such card's state, as the card-wait
-        path does when it gives up. A failed read leaves them for the next
-        unit's pending purges, logged."""
-        sessions = board.sessions_with_cards_since(_agent_shell, since, _EXEC_TIMEOUT)
-        if sessions is None:
-            _log.warning("relayed report: the cards filed since %s could not be read; none archived or purged", since)
+    def _clean_session_cards(self, context_id: str) -> None:
+        """Archive the cards ``context_id``'s board session filed that have
+        not ended, with the cards their workers fanned out, and purge all of
+        their state, as the card-wait path does when it gives up.
+
+        Only that one session (:func:`board.api_session_id`), never every
+        session that filed cards in the run's window: sibling units share the
+        board. A contextId with no session, a read that fails, or a session
+        the store does not know cleans nothing, logged: nothing names the
+        cards, so nothing is queued for a later purge either, and any card
+        the session filed stays on the board.
+        """
+        session_id = board.api_session_id(context_id) if context_id else ""
+        if not session_id:
+            _log.warning(
+                "relayed report: no board session for contextId %r; this run's cards were not archived or purged",
+                context_id,
+            )
             return
-        for sid in sessions:
-            got = board.read_session_cards(_agent_shell, sid, _EXEC_TIMEOUT)
-            if got is None or not got.session_found or not got.card_ids:
-                continue
-            live = [t for t in got.card_ids if str(got.cards.get(t, {}).get("status")) not in _TERMINAL_STATUSES]
-            if live:
-                _archive_stalled_cards(live, _EXEC_TIMEOUT, floor=self._pod_floor)
-            _purge_card_state(list(got.card_ids), _EXEC_TIMEOUT, floor=self._pod_floor)
+        got = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+        if got is None or not got.session_found:
+            _log.warning(
+                "relayed report: the cards of session %s could not be read; none archived or purged", session_id
+            )
+            return
+        cards = list(got.card_ids)
+        if not cards:
+            return
+        live = [t for t in cards if str(got.cards.get(t, {}).get("status")) not in _TERMINAL_STATUSES]
+        if live:
+            # Their fan-out too, before anything is read for the purge.
+            _archive_stalled_cards(live, _EXEC_TIMEOUT, floor=self._pod_floor)
+        captured = worker_trajectory.capture(_agent_shell, cards, _EXEC_TIMEOUT)
+        children = _fanned_out_closure(cards, captured)
+        # A child of a card that had ended can still be running: the archive
+        # above followed only the live cards' fan-out.
+        statuses = {
+            str(c.get("task") or ""): str(c.get("status"))
+            for c in ((captured.summary.get("cards") if captured else None) or [])
+            if isinstance(c, dict)
+        }
+        if running := [t for t in children if statuses.get(t) not in _TERMINAL_STATUSES]:
+            _archive_stalled_cards(running, _EXEC_TIMEOUT, floor=self._pod_floor)
+        _purge_card_state(cards, _EXEC_TIMEOUT, children, self._pod_floor)
 
     def _execute_session_cap(self, prompt: str) -> AgentResult:
         """A session-cap ask (:mod:`session_cap`, #6882): fill the install's
@@ -5388,7 +5440,10 @@ class KubeAgentsHarness(AgentHarness):
         and identity, so nothing is minted anew, plus the message-id suffix
         the door tells the two apart by. Such a turn parses no directive,
         writes no turn timing and waits on no delegation; it returns once
-        its own task has ended.
+        its own task has ended. One marked ``opening`` (a relayed-report
+        opening) is the conversation's first turn, so it keeps the opening's
+        budget refusal, queue backstop and turn timing; it still parses no
+        directive and waits on no delegation.
 
         Mirrors ``_execute``'s retry classes. The tunnel to the inject Service
         gets the same bounded establishment retry; an exchange that never
@@ -5793,10 +5848,13 @@ class KubeAgentsHarness(AgentHarness):
             mid_turn_sent.append((sent, detail, None))
             return None
 
+        # An opening sent as a follow-up (``_InjectFollowUp.opening``) is
+        # still the conversation's opening turn.
+        opening_turn = follow_up is None or follow_up.opening
         try:
             # A follow-up is a status turn's kind of exchange: a door that
             # absorbs it as a steer answers no-task, which the caller retries.
-            exchange = _exchange(task, timeout, opening=follow_up is None, on_poll=_stop_mid_turn)
+            exchange = _exchange(task, timeout, opening=opening_turn, on_poll=_stop_mid_turn)
             opening_ended = time.monotonic()
         except inject.BudgetBelowFloor as exc:
             # Configuration, refused before the POST: the same class as a
@@ -5819,7 +5877,7 @@ class KubeAgentsHarness(AgentHarness):
 
         opening_took = opening_ended - opening_accepted[0] if opening_accepted else None
         if (
-            not follow_up
+            opening_turn
             and opening_took is not None
             and opening_took < timeout
             and exchange.outcome == inject.OUTCOME_TERMINAL

@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pytest
 from devops_bench.agents import AgentResult
 
-from kube_agents_bench import board, cases, harness, relayed_report
+from kube_agents_bench import board, cases, harness, relayed_report, worker_trajectory
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench.relayed_report import RelayTurn, ReportPost
 
@@ -543,13 +543,34 @@ def door(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubDoor, None, None]:
     monkeypatch.setattr(harness, "_session_pod_of", lambda conversation: server.pods[len(server.submissions) - 1])
     # The opening's session store: it filed a card, unless a test says not.
     server.session_cards = board.SessionCards(session_found=True, card_ids=["card-1"])
-    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: server.session_cards)
-    # The cleanup after the run: the sessions that filed cards since its
-    # start, and what was archived and purged.
-    server.archived, server.purged = [], []
-    monkeypatch.setattr(harness.board, "sessions_with_cards_since", lambda *a, **k: ["a2a-opening"])
+    # Any other session's cards, by session id: a sibling unit's on the
+    # shared board.
+    server.other_sessions = {}
+    server.session_reads = []
+
+    def _read_session_cards(shell, session_id, timeout, **kwargs):
+        server.session_reads.append(session_id)
+        if session_id in server.other_sessions:
+            return server.other_sessions[session_id]
+        return server.session_cards
+
+    monkeypatch.setattr(harness.board, "read_session_cards", _read_session_cards)
+    # The cleanup after the run: the workers' capture its fan-out is read
+    # from, and what was archived and purged (the purge's fanned-out cards
+    # apart).
+    server.capture = None
+    server.archived, server.purged, server.purged_children = [], [], []
+    monkeypatch.setattr(
+        harness.board, "sessions_with_cards_since", lambda *a, **k: pytest.fail("swept every session")
+    )
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, ids, timeout: server.capture)
     monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, *a, **k: server.archived.extend(ids))
-    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, *a, **k: server.purged.extend(ids))
+
+    def _purge(ids, timeout, fanned_out=(), floor=None):
+        server.purged.extend(ids)
+        server.purged_children.extend(fanned_out)
+
+    monkeypatch.setattr(harness, "_purge_card_state", _purge)
     try:
         yield server
     finally:
@@ -765,9 +786,16 @@ def test_inject_an_unreachable_door_during_the_wait_is_infrastructure(door, monk
 
 
 def test_inject_the_openings_card_is_cleaned_up_after_a_green_run(door):
+    # The card ran to done: purged, not archived.
+    door.session_cards = board.SessionCards(
+        session_found=True, card_ids=["card-1"], cards={"card-1": {"status": "done"}}
+    )
     got = _run(door)
     assert not got.errors, got.errors
+    assert door.archived == []
     assert door.purged == ["card-1"]
+    # Read from the conversation's own session, off the turns' contextId.
+    assert set(door.session_reads) == {board.api_session_id("ctx-a")}
 
 
 def test_inject_the_openings_card_is_archived_and_purged_when_no_report_comes(door):
@@ -776,3 +804,110 @@ def test_inject_the_openings_card_is_archived_and_purged_when_no_report_comes(do
     assert _infra(got)
     assert door.archived == ["card-1"] and door.purged == ["card-1"]
 
+
+
+def test_inject_the_cleanup_leaves_a_sibling_sessions_cards_alone(door, monkeypatch):
+    # A sibling unit in the parallel phase filed a live card on the same
+    # board in this run's window: only this conversation's session is
+    # cleaned, and the sibling's is never read.
+    door.relayed = []
+    door.other_sessions = {"a2a-sibling": board.SessionCards(session_found=True, card_ids=["sibling-card"])}
+    monkeypatch.setattr(harness.board, "sessions_with_cards_since", lambda *a, **k: ["a2a-sibling", "a2a-ctx-a"])
+    got = _run(door)
+    assert _infra(got)
+    assert "sibling-card" not in door.archived and "sibling-card" not in door.purged
+    assert "a2a-sibling" not in door.session_reads
+    assert door.archived == ["card-1"] and door.purged == ["card-1"]
+
+
+def test_inject_the_cleanup_purges_the_cards_a_worker_fanned_out(door):
+    door.session_cards = board.SessionCards(
+        session_found=True, card_ids=["card-1"], cards={"card-1": {"status": "done"}}
+    )
+    door.capture = worker_trajectory.WorkerCapture(
+        entries=[],
+        summary={
+            "cards": [
+                {"task": "card-1", "status": "done", "fanned_out": ["child-1"]},
+                {"task": "child-1", "status": "done", "fanned_out": ["grandchild-1"]},
+                {"task": "grandchild-1", "status": "running", "fanned_out": []},
+            ]
+        },
+        tokens={},
+        unbilled=[],
+    )
+    got = _run(door)
+    assert not got.errors, got.errors
+    assert door.purged == ["card-1"]
+    assert door.purged_children == ["child-1", "grandchild-1"]
+    # A fanned-out card still running under a card that ended is archived.
+    assert door.archived == ["grandchild-1"]
+
+
+@pytest.mark.parametrize("context_id", ["", "not/path-safe"])
+def test_inject_an_unresolved_session_cleans_nothing(door, monkeypatch, context_id):
+    door.relayed = []
+    door.sessions = [context_id] * 3
+    got = _run(door)
+    assert _infra(got)
+    assert door.archived == [] and door.purged == []
+    assert door.session_reads == []
+
+
+def test_inject_an_opening_budget_below_the_floor_is_refused_as_configuration(door, monkeypatch):
+    # The opening is the conversation's first turn: a budget below the
+    # gateway's floor is refused before anything is sent, as the plain
+    # inject opening refuses it, not raised to the floor.
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "0.5")
+    got = _run(door)
+    assert not _infra(got), got.errors
+    assert got.errors[0].startswith("AGENT_INJECT_TIMEOUT: "), got.errors
+    assert "below the floor" in got.errors[0]
+    assert door.submissions == []
+
+
+@pytest.mark.parametrize(
+    "name", ["AGENT_INJECT_TIMEOUT", "AGENT_INJECT_LOCAL_PORT", "AGENT_DELEGATION_TIMEOUT", "AGENT_DELEGATION_POLL_INTERVAL"]
+)
+def test_inject_a_non_numeric_setting_surfaces_its_config_error(door, monkeypatch, name):
+    monkeypatch.setenv(name, "soon")
+    got = _run(door)
+    assert not _infra(got), got.errors
+    assert got.errors[0] == f"{name} must be numeric, got 'soon'"
+    assert door.submissions == []
+
+
+def test_inject_the_opening_writes_its_turn_timing(door, monkeypatch):
+    timed: list[float] = []
+    monkeypatch.setattr(harness, "_write_turn_timing", timed.append)
+    got = _run(door)
+    assert not got.errors, got.errors
+    assert len(timed) == 1
+
+
+# --- facts that are only emphasis, and identifiers with underscores -----------
+
+
+@pytest.mark.parametrize("fact", ["***", "___", "``", "*_`"])
+def test_a_fact_made_only_of_emphasis_marks_is_an_authoring_error(fact):
+    prompt = PROMPT.replace("fact1: np-quartz-7", f"fact1: {fact}")
+    assert prompt != PROMPT
+    with pytest.raises(ValueError, match="only emphasis marks"):
+        relayed_report.parse(prompt)
+
+
+@pytest.mark.parametrize(
+    ("answer", "fact", "want"),
+    [
+        ("The pool is gke_proj_np-7.", "gke_proj_np-7", True),
+        ("The pool is **gke_proj_np-7**.", "gke_proj_np-7", True),
+        ("The pool is `gke_proj_np-7`.", "gke_proj_np-7", True),
+        ("The pool is gkeprojnp-7.", "gke_proj_np-7", False),
+        ("The nodepool is full.", "node_pool", False),
+        ("The node_pool is full.", "nodepool", False),
+        ("The pool is gke_proj_np-7.", "np-7", False),
+        ("The pool is _np-7_.", "np-7", True),
+    ],
+)
+def test_an_underscore_inside_an_identifier_is_part_of_it(answer, fact, want):
+    assert relayed_report.carries(answer, fact) is want
