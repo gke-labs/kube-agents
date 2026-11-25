@@ -38,7 +38,9 @@ no named ServiceAccount, and LABEL, then waits until the profile's card is
 published (READY_SECONDS), which is when the gateway can address it. The
 placeholder is then replaced with the name. :func:`teardown` runs in the
 harness's ``finally``, whatever the run did: on a graded run, an errored one,
-an exception, Ctrl-C, or SIGTERM (:func:`signals_raise`). It deletes the
+an exception, Ctrl-C, or SIGTERM (:func:`signals_raise`; on the main
+thread, and within the runner's grace period before its SIGKILL). A stop that
+arrives during the teardown is held until it's done, then raised. It deletes the
 profile and waits (TEARDOWN_SECONDS) until neither the profile nor any of its
 pool Deployments (``agentprofile-<name>-<tier>`` in ``<namespace>-profiles``)
 is left; one it cannot confirm makes the run an infrastructure failure.
@@ -62,7 +64,10 @@ stdin, never to disk.
 Subcommands, each exiting 1 with the reason on stderr::
 
     python -m kube_agents_bench.delegating_profile teardown --name <profile> \\
-        [--context <ctx>] [--namespace <ns>]
+        [--tier <tier> ...] [--context <ctx>] [--namespace <ns>]
+
+``teardown`` takes only a throwaway name (the prefix, then hex) and refuses
+a live profile without LABEL.
     python -m kube_agents_bench.delegating_profile sweep [--min-age <seconds>] \\
         [--context <ctx>] [--namespace <ns>]
 """
@@ -140,8 +145,14 @@ class DelegatingProfileError(Exception):
     """Setup or teardown could not do or confirm its work: infrastructure."""
 
 
+class NameTaken(DelegatingProfileError):
+    """The create found a profile already under the run's name: another run's,
+    so nothing is torn down for it."""
+
+
 class Interrupted(BaseException):
-    """SIGTERM arrived while a profile existed (:func:`signals_raise`)."""
+    """SIGTERM arrived during setup, the run or the teardown
+    (:func:`signals_raise`, :func:`signals_deferred`)."""
 
 
 Kubectl = Callable[..., subprocess.CompletedProcess]
@@ -312,6 +323,10 @@ def setup(
     # profile, and the teardown (an ignore-not-found delete) covers that too.
     try:
         created = kubectl("create", "-n", namespace, "-f", "-", stdin=json.dumps(manifest))
+        if created.returncode != 0 and "AlreadyExists" in created.stderr:
+            # Another run drew the same name: the object is theirs, so this
+            # run tears nothing down for it.
+            raise NameTaken(f"kubectl create {RESOURCE}/{name}: {created.stderr.strip()}")
         if created.returncode != 0:
             raise DelegatingProfileError(f"kubectl create {RESOURCE}/{name}: {created.stderr.strip() or 'failed'}")
         log(f"Delegating profile: created {RESOURCE}/{name} in {namespace} from {RESOURCE}/{SOURCE_PROFILE}")
@@ -327,6 +342,8 @@ def setup(
                     f"{RESOURCE}/{name}'s {READY_CONDITION} is not True after {READY_SECONDS}s"
                 )
             sleep(POLL_SECONDS)
+    except NameTaken:
+        raise
     except BaseException as exc:
         try:
             teardown(kubectl, profile, sleep=sleep, clock=clock, log=log)
@@ -381,7 +398,7 @@ def teardown(
     Raises:
         DelegatingProfileError: Something is left after TEARDOWN_SECONDS.
     """
-    with signals_ignored():
+    with signals_deferred():
         _teardown(kubectl, profile, sleep=sleep or time.sleep, clock=clock or time.monotonic, log=log)
 
 
@@ -416,20 +433,30 @@ def _teardown(
 
 
 @contextlib.contextmanager
-def signals_ignored() -> Iterator[None]:
-    """SIGTERM and SIGINT are ignored for the duration, so a second stop
-    can't abort a teardown half done (a teardown is bounded by
-    TEARDOWN_SECONDS). Only the main thread can set a handler; elsewhere this
-    does nothing."""
+def signals_deferred() -> Iterator[None]:
+    """SIGTERM and SIGINT are held for the duration, so a second stop can't
+    abort a teardown half done (a teardown is bounded by TEARDOWN_SECONDS),
+    and are raised once it's over: a held SIGTERM as :class:`Interrupted`, a
+    held SIGINT as KeyboardInterrupt, so the stop still stops the run. Only
+    the main thread can set a handler; elsewhere this does nothing."""
     if threading.current_thread() is not threading.main_thread():
         yield
         return
-    previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+    held: list[int] = []
+
+    def hold(signum: int, _frame: Any) -> None:
+        held.append(signum)
+
+    previous = {sig: signal.signal(sig, hold) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
         yield
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+    if signal.SIGINT in held:
+        raise KeyboardInterrupt
+    if held:
+        raise Interrupted(f"signal {held[0]} held during teardown")
 
 
 @contextlib.contextmanager
@@ -522,7 +549,10 @@ def main(argv: list[str] | None = None, kubectl: Kubectl | None = None) -> int:
             if found.returncode != 0:
                 raise DelegatingProfileError(f"reading {RESOURCE}/{args.name}: {found.stderr.strip() or 'failed'}")
             if found.stdout.strip():
-                labels = (json.loads(found.stdout).get("metadata") or {}).get("labels") or {}
+                try:
+                    labels = (json.loads(found.stdout).get("metadata") or {}).get("labels") or {}
+                except ValueError as exc:
+                    raise DelegatingProfileError(f"reading {RESOURCE}/{args.name}: not JSON ({exc})") from exc
                 if labels.get(LABEL) != LABEL_VALUE:
                     raise DelegatingProfileError(f"{RESOURCE}/{args.name} has no {LABEL}={LABEL_VALUE} label: this harness didn't make it")
             tiers = tuple(args.tier) or DEFAULT_TIERS

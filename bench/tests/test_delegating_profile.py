@@ -84,6 +84,8 @@ class FakeCluster:
                 return _done(rc=1, stderr="admission webhook refused")
             obj = json.loads(stdin or "{}")
             name = obj["metadata"]["name"]
+            if name in self.profiles:
+                return _done(rc=1, stderr=f'Error from server (AlreadyExists): agentprofiles "{name}" already exists')
             self.profiles[name] = obj
             self.pools[name] = {f"agentprofile-{name}-{t}" for t in obj["spec"].get("allowedTiers") or ["read"]}
             if self.create_stored_then == "timeout":
@@ -550,12 +552,34 @@ def test_sweep_tries_every_leftover_and_reports_the_failures(monkeypatch: pytest
     assert second.name not in cluster.profiles
 
 
-def test_a_second_stop_cannot_abort_a_teardown_and_the_handlers_are_put_back() -> None:
+def test_a_stop_during_teardown_is_held_then_raised_and_the_handlers_are_put_back() -> None:
     before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
-    with delegating_profile.signals_ignored():
-        signal.raise_signal(signal.SIGTERM)
-        signal.raise_signal(signal.SIGINT)
+    finished = False
+    with pytest.raises(delegating_profile.Interrupted):
+        with delegating_profile.signals_deferred():
+            signal.raise_signal(signal.SIGTERM)
+            finished = True
+    assert finished, "the held SIGTERM cut the teardown short"
     assert {sig: signal.getsignal(sig) for sig in before} == before
+    with pytest.raises(KeyboardInterrupt):
+        with delegating_profile.signals_deferred():
+            signal.raise_signal(signal.SIGINT)
+    assert {sig: signal.getsignal(sig) for sig in before} == before
+
+
+def test_a_name_another_run_holds_is_not_torn_down() -> None:
+    cluster = FakeCluster(pools_linger=0)
+    other = _made(cluster, "beef")
+    with pytest.raises(delegating_profile.NameTaken):
+        delegating_profile.setup(cluster, NS, token="beef", sleep=lambda _s: None, log=_quiet)
+    assert other.name in cluster.profiles, "another run's profile was deleted"
+
+
+def test_the_teardown_command_reports_unreadable_output() -> None:
+    def kubectl(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        return _done("not json")
+
+    assert delegating_profile.main(["teardown", "--name", "delegating-abc", "--namespace", NS], kubectl=kubectl) == 1
 
 
 def test_a_throwaway_name_is_the_prefix_then_hex_only() -> None:
