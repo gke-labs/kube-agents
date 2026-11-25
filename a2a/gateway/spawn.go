@@ -1454,10 +1454,6 @@ func delegateToolFor(rec *SessionRecord, taskID string) string {
 	return "on"
 }
 
-// envHarnessUnisolated is the worker adapter's waiver for running a harness
-// without its isolation; the spawner renders it empty on every session pod.
-const envHarnessUnisolated = "A2A_HARNESS_UNISOLATED"
-
 // withToolWithheldList is env with lib.EnvToolWithheld naming every entry
 // sourced from a Secret (secretKeyRef), for the worker to withhold from its
 // tools; env as it was when there is none.
@@ -1473,3 +1469,7 @@ func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
 	}
 	return append(env, corev1.EnvVar{Name: lib.EnvToolWithheld, Value: strings.Join(names, ",")})
 }
+
+// envHarnessUnisolated is the worker adapter's waiver for running a harness
+// without its isolation; the spawner renders it empty on every session pod.
+const envHarnessUnisolated = "A2A_HARNESS_UNISOLATED"

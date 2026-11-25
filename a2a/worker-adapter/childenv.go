@@ -30,11 +30,12 @@ import (
 // EnvToolWithheld (lib.EnvToolWithheld) is the comma-separated list of the
 // container's variables sourced from a Secret (an env entry's secretKeyRef).
 // Worker containers take no envFrom Secret, whose keys aren't known when the
-// pod is rendered. The list itself names variables, not values, and passes.
+// pod is rendered. The list names variables, not values, and is itself off the
+// allowlist, so tool children don't see it.
 const EnvToolWithheld = lib.EnvToolWithheld
 
 // toolChildAlwaysPassedPrefix passes despite its credential words (see above).
-const toolChildAlwaysPassedPrefix = "CREDENTIAL_PROXY_"
+const toolChildAlwaysPassedPrefix = "CREDENTIAL_PROXY_" // #nosec G101 -- an env var name prefix, not a credential
 
 // credentialWords are the name parts (split on "_") that mark a credential.
 var credentialWords = map[string]bool{
