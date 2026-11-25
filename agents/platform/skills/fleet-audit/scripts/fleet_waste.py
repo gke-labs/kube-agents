@@ -376,6 +376,14 @@ MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
 # bucket, so `USAGE_ALIGNMENT_S` reads a 45-second burst at the limit as 15%
 # of that limit. 60 seconds is the period the metric is sampled at; memory's
 # `ALIGN_MAX` averages nothing and keeps the wider bucket.
+#
+# The cost of the short bucket: the counter has about one sample per bucket,
+# so one bucket can take more than its share of a steady use and the next
+# one less, and the peak is the largest bucket of the window. Measured on a
+# workload held at a constant use by its limit, the peak reads up to about
+# 30% high at 60 seconds (about 5% at 300). The error has one direction: a
+# finding just under the bar can be missed and a proposed resize is larger;
+# no finding is wrong and no proposed cut is deeper.
 CPU_USAGE_ALIGNMENT_S = 60
 # Cloud Monitoring's aggregation enums, as the query string spells them.
 ALIGN_RATE = "ALIGN_RATE"
