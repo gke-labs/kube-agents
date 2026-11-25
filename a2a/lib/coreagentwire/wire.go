@@ -39,6 +39,10 @@ type Envelope struct {
 	// MCP lists the MCP servers the turn may use, built at the start of the
 	// process and closed at its exit.
 	MCP []MCPServer `json:"mcp,omitempty"`
+	// Instructions are the worker's own system-prompt lines for the turn
+	// (a session pod's, as Claude Code gets them on --append-system-prompt),
+	// added to the agent's instruction, never to the conversation's history.
+	Instructions []string `json:"instructions,omitempty"`
 }
 
 // Policy is a turn's tool policy: the tools the model is offered and the
@@ -109,12 +113,13 @@ type Event struct {
 	Event json.RawMessage `json:"event,omitempty"`
 }
 
-// Usage is one turn's token counts.
+// Usage is one turn's token counts, summed over its model responses in
+// int64 so a long turn's total can't wrap.
 type Usage struct {
-	Input    int32 `json:"input"`
-	Output   int32 `json:"output"`
-	Cached   int32 `json:"cached,omitempty"`
-	Thoughts int32 `json:"thoughts,omitempty"`
+	Input    int64 `json:"input"`
+	Output   int64 `json:"output"`
+	Cached   int64 `json:"cached,omitempty"`
+	Thoughts int64 `json:"thoughts,omitempty"`
 }
 
 // RefusalLogPrefix starts the one line the harness writes to its stderr for
