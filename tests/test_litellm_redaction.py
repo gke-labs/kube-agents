@@ -520,6 +520,28 @@ class TestCallback(unittest.TestCase):
             with self.assertRaises(HTTPException, msg=mime):
                 self._run(text, "agenerate_content")
 
+    def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
+        # Forms providers accept: the URL-safe alphabet, no padding, and the
+        # common image/jpg label. Each is kept byte for byte as it came.
+        import base64 as b64
+        png = b"\x89PNG\r\n\x1a\n" + bytes([0xFB, 0xFF, 0xFE]) * 4
+        jpeg = b"\xff\xd8\xff\xe0" + bytes([0xFB, 0xFF]) * 4
+        cases = [
+            ("image/png", b64.urlsafe_b64encode(png).decode()),
+            ("image/png", b64.b64encode(png).decode().rstrip("=")),
+            ("image/png", b64.urlsafe_b64encode(png).decode().rstrip("=")),
+            ("image/jpg", b64.b64encode(jpeg).decode()),
+        ]
+        for mime, data in cases:
+            with self.subTest(mime=mime, data=data):
+                req = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": data}}]}]}
+                out = self._run(req, "agenerate_content")
+                self.assertEqual(out["contents"][0]["parts"][0]["inlineData"]["data"], data)
+        # A URL-safe payload that isn't the media it claims is still refused.
+        text = b64.urlsafe_b64encode(b"on prod-eu-1, token here").decode().rstrip("=")
+        with self.assertRaises(HTTPException):
+            self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": text}}]}]}, "agenerate_content")
+
     # Provider-opaque fields a provider checks byte for byte: kept as they came
     # at their API positions, even when a rule matches inside them, and
     # redacted anywhere else.
@@ -689,7 +711,7 @@ class TestCallback(unittest.TestCase):
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": text_as_png}},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + text_as_png}},
             {"type": "image_url", "image_url": {"url": "data:image/png;name=on-prod-eu-1;base64," + _PNG_BASE64}},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}},  # bad padding
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo!"}},  # not base64
             {"type": "image", "source": {"type": "base64", "media_type": "video/mp4", "data": text_as_png}},
             {"type": "image", "source": {"type": "base64", "media_type": "image/heic", "data": text_as_png}},
             {"type": "input_audio", "input_audio": {"format": "ogg", "data": text_as_png}},

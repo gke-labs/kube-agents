@@ -167,6 +167,8 @@ _MPEG_AUDIO = (lambda d: d[:3] == b"ID3" or (len(d) > 1 and d[0] == 0xFF and d[1
 MEDIA_SIGNATURES = {
     "image/png": lambda d: d[:8] == b"\x89PNG\r\n\x1a\n",
     "image/jpeg": lambda d: d[:3] == b"\xff\xd8\xff",
+    # A common mislabel of JPEG that providers accept.
+    "image/jpg": lambda d: d[:3] == b"\xff\xd8\xff",
     "image/gif": lambda d: d[:6] in (b"GIF87a", b"GIF89a"),
     "image/webp": _RIFF(b"WEBP"),
     "image/heic": _FTYP,
@@ -303,8 +305,13 @@ class KubeAgentsRedactionCallback(CustomLogger):
             raise self._refuse("a payload whose media type is not a media type name")
         if not isinstance(data, str):
             raise self._refuse(f"a {media} payload that is not a string")
+        # Providers take the URL-safe alphabet and unpadded base64 too; both
+        # are normalised before the strict decode. The payload is kept as it
+        # came either way.
+        text = "".join(data.split()).replace("-", "+").replace("_", "/")
+        text += "=" * (-len(text) % 4)
         try:
-            decoded = base64.b64decode("".join(data.split()), validate=True)
+            decoded = base64.b64decode(text, validate=True)
         except (binascii.Error, ValueError):
             raise self._refuse(f"a {media} payload that is not base64") from None
         if not starts(decoded):
