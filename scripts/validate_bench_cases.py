@@ -1301,8 +1301,12 @@ def _delegating_profile(name: str, spec: dict[str, Any], problems: list[str]) ->
     # The raw directive must carry the placeholder as its name= field: compared
     # after substitution, a literal sample name beside a placeholder used
     # elsewhere would pass.
-    directive = prompt[: prompt.find(hook.DIRECTIVE_END) + 1] if prompt.startswith(hook.PROFILE_DIRECTIVE) else ""
-    named_by_placeholder = f"name={dp.PLACEHOLDER}" in directive.split()
+    # The directive's body, sliced as profile_hook.parse slices it: leading
+    # whitespace dropped, and the closing ] left out.
+    text = prompt.lstrip()
+    end = text.find(hook.DIRECTIVE_END)
+    directive = text[len(hook.PROFILE_DIRECTIVE) : end] if text.startswith(hook.PROFILE_DIRECTIVE) and end >= 0 else ""
+    named_by_placeholder = f"{hook.NAME_FIELD}={dp.PLACEHOLDER}" in directive.split()
     if declared is True and not (uses == 1 and named_by_placeholder and addressed == dp.new_name(DELEGATING_PROFILE_SAMPLE_TOKEN)):
         problems.append(
             f"'{key}: true' needs the prompt to open with {hook.PROFILE_DIRECTIVE} name={dp.PLACEHOLDER} ...] "

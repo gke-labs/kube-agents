@@ -627,3 +627,15 @@ def test_a_slack_lane_entry_with_an_inline_comment_is_still_caught(
     monkeypatch.setattr(validator, "REPO_ROOT", tmp_path)
     problems = _problems(validator, {"prompt": PROMPT, "delegating_profile": True})
     assert any("on the Slack lane" in p for p in problems)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        f"[bench:profile project=p location=l cluster=c name={delegating_profile.PLACEHOLDER}] ask",
+        f"[bench:profile name={delegating_profile.PLACEHOLDER}] ask",
+        f"  [bench:profile name={delegating_profile.PLACEHOLDER} project=p] ask",
+    ],
+)
+def test_the_placeholder_as_the_last_field_or_after_leading_space_passes(validator: Any, prompt: str) -> None:
+    assert _problems(validator, {"prompt": prompt, "delegating_profile": True}) == []
