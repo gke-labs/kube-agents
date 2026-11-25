@@ -919,7 +919,7 @@ proposal, which no caller-supplied field can prove.
 
 The broker checks what the create kept with the token, never a repository or
 number the caller sends. The claim answers 200 with `{url, number, title}` when
-the forge confirms the proposal: open, at that url, authored by this
+the forge confirms the proposal: open or already merged, at that url, authored by this
 credential, and created inside the window. It answers 404 `CLAIM_UNKNOWN` for a
 token that is unknown, already burned or expired, or whose `url` does not
 match. It answers 409 `CLAIM_NOT_CONFIRMED` when the forge check fails, 502
