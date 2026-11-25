@@ -120,7 +120,8 @@ Why: a button is one tap on a phone, and a typed reply is a guess at the expecte
 Today: `choices` in [`spec-a2a-payloads.md`](../../docs/designs/spec-a2a-payloads.md) ("Chat
 messages"); `answerChoices` and `nextStep` in `a2a/hermes-bridge/chat_choices.go` turn an answer's
 options and next step into choices; `slackChatButtonsPerRow` in `a2a/gateway/slack_chat.go` and
-`BUTTONS_PER_ROW` in `slack_presenter.py` cap a row at 5. The agent's side is the `[next: …]` line
+`BUTTONS_PER_ROW` in `slack_presenter.py` cap a row at 5; `teamsChoiceActions` in
+`a2a/gateway/teams_chat.go` draws them on a Microsoft Teams card, which lays out its own rows. The agent's side is the `[next: …]` line
 in [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 5.
 
 ## A failure is one plain line
@@ -201,5 +202,6 @@ Google Chat disagree and hides emitter bugs.
 
 Today: "The emitter composes, the renderer lays out" and "The gateway renders, it doesn't compose"
 in [`spec-a2a-payloads.md`](../../docs/designs/spec-a2a-payloads.md) ("Chat messages");
-`a2a/lib/chatmsg` validates; the header comments of `a2a/gateway/slack_chat.go` and
-`a2a/gateway/gchat_chat.go` state the same contract for each renderer.
+`a2a/lib/chatmsg` validates; the header comments of `a2a/gateway/slack_chat.go`,
+`a2a/gateway/gchat_chat.go` and `a2a/gateway/teams_chat.go` state the same contract for each
+renderer.
