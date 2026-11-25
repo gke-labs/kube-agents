@@ -220,15 +220,15 @@ base and makes a wrong route fail loudly.
 
 ### 3.2 How each caller routes
 
-| Caller                                          | Today                                                                                          | Proposed                                                                                           |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Sandbox shim, `execute()`                       | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
-| Sandbox shim, vcs, forge                        | `CREDENTIAL_PROXY_URL`                                                                         | Unchanged                                                                                          |
-| Session pods (under the cluster-view flag only) | `CREDENTIAL_PROXY_URL`, from the gateway's `A2A_CREDENTIAL_PROXY_URL` (`a2a/gateway/spawn.go`) | Also get `CREDENTIAL_PROXY_EXEC_URL`, through a new `A2A_CREDENTIAL_PROXY_EXEC_URL` on the gateway |
-| Fleet audits (agent cron jobs)                  | The model's shell, then the shim                                                               | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
-| Watches, reconcile                              | Through `sandbox_exec` and the shim                                                            | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
-| Cloud API relay callers (`ApiSession`)          | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
-| Gateway relays, watchers                        | Their own URL variables                                                                        | Unchanged                                                                                          |
+| Caller                                                   | Today                                                                                          | Proposed                                                                                           |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Sandbox shim, `execute()`                                | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
+| Sandbox shim, vcs, forge                                 | `CREDENTIAL_PROXY_URL`                                                                         | Unchanged                                                                                          |
+| Session pods (under the session pods' cluster view only) | `CREDENTIAL_PROXY_URL`, from the gateway's `A2A_CREDENTIAL_PROXY_URL` (`a2a/gateway/spawn.go`) | Also get `CREDENTIAL_PROXY_EXEC_URL`, through a new `A2A_CREDENTIAL_PROXY_EXEC_URL` on the gateway |
+| Fleet audits (agent cron jobs)                           | The model's shell, then the shim                                                               | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
+| Watches, reconcile                                       | Through `sandbox_exec` and the shim                                                            | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
+| Cloud API relay callers (`ApiSession`)                   | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
+| Gateway relays, watchers                                 | Their own URL variables                                                                        | Unchanged                                                                                          |
 
 The fallback means an exec tier that is off, or a new shim against an old operator, behaves as
 today. The shim also falls back when it cannot connect to the exec URL (no TCP connection, for
@@ -307,8 +307,7 @@ shim always takes the fallback and nothing reports it.
   kubectl's cache, so the resource watermark gate's soft mark reclaims it on an exec pod: the
   cache is renamed and removed, and the next command rebuilds it. Decided (#4536). The stateful
   broker turns gcloud's file logging off for its commands as well, and keeps its own figures.
-- A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods
-  only under the cluster-view flag (the condition the stateful broker has today), and the metrics
+- A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods only under the session pods' cluster view (the condition the stateful broker has), and the metrics
   port from GMP. The egress rules that select the broker's pod labels also need the exec tier as a
   peer: the sandbox (`shell_sandbox_manifests.go`) and session pods
   (`platformagent_a2a_manifests.go`). `/v1/exec` admits the shell, session and profile roles

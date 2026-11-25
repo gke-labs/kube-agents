@@ -17,7 +17,9 @@
 #     the agent image has no gcloud, and the broker admits this caller exactly the five
 #     argv shapes those lookups send;
 #   • probes each member with `container clusters list`, so a project the broker's
-#     identity cannot read is reported as such rather than admitted;
+#     identity cannot read is reported as such rather than admitted, and probes the
+#     management project and the explicit projects the reconcile keeps for the `clusters`
+#     map alone;
 #   • merge-patches the compact document into the ConfigMap's one data key, with the
 #     resourceVersion it read, so two runs that overlap cannot silently overwrite each other.
 #
@@ -45,10 +47,10 @@ from credential_proxy_client import EXIT_SECURITY_POLICY_BLOCKED, RETRY_DEADLINE
 SCOPE_FILE_ENV = rec.SCOPE_FILE_ENV
 CONFIGMAP_ENV = "KUBEAGENTS_RESOLVED_SCOPE_CONFIGMAP"
 NAMESPACE_ENV = "POD_NAMESPACE"
-# spec.harness.projectId. The publisher never probes it and writes no row for it (the
-# gateway admits it directly); it fills the cap's first slot, as in the reconcile. It can
-# still reach the broker as a declared selector, or by number through a Metrics Scope that
-# monitors it. The operator renders it empty when the CR has no harness block; the reconcile
+# spec.harness.projectId. The publisher writes no row for it (the gateway admits it
+# directly) and probes it only for the `clusters` map; it fills the cap's first slot, as in
+# the reconcile. It can also reach the broker as a declared selector, or by number through a
+# Metrics Scope that monitors it. The operator renders it empty when the CR has no harness block; the reconcile
 # then takes its management project from the broker's gcloud config, which this Job cannot
 # see, so the slot is reserved all the same (`build_document`). If that project is also a
 # container member it is counted twice, so the publisher may then leave out a container the
@@ -89,9 +91,11 @@ DOC_CARRIED = "carried"
 # (`fleet_scope_targets.list_scope_clusters`) and the A2A gateway's scopeClusters page for a
 # delegating profile task (spec-a2a-payloads.md, "Scope clusters"); the gateway admits targets on
 # the rows alone, never on this map. It counts toward the document's budget, and goes
-# first when the document is over it (encode_document). Member projects only: the management project and explicit projects
-# are never probed here (the broker's `scope` role runs `clusters list` only for a project an
-# earlier lookup returned), so a reader lists those itself. Keyed by project ID:
+# first when the document is over it (encode_document). It also holds the management project and
+# the explicit projects the reconcile keeps (not excluded, not over the cap), probed for this map
+# alone: the broker's `scope` role runs `clusters list` for those directly
+# (scope_policy.MANAGEMENT_PROJECT_ENV, scope.json `projects` minus `exclude.projects`), and they
+# get no row. With no management project named to the Job, it has no entry. Keyed by project ID:
 # {"at": <when the listing was read>, "clusters": [[location, name], ...]}. A probe that fails
 # keeps the previous entry, `at` included, so a reader can tell its age; it never writes an
 # empty list for a project it could not read, and a project with no entry is unread.
@@ -416,18 +420,18 @@ def _clean_clusters(value) -> dict:
     return clean
 
 
-def _clusters_map(rows: list, probes: dict, previous: dict | None, resolved_at: str) -> dict:
-    """The `clusters` map for this run's member rows.
+def _clusters_map(projects: list, probes: dict, previous: dict | None, resolved_at: str) -> dict:
+    """The `clusters` map for this run's member rows and directly listed projects, by ID.
 
-    A member this run listed gets its clusters as (location, name) pairs, sorted. One it did
-    not list (its probe failed, or its source failed and it was carried unprobed) keeps the
-    previous document's entry when there is one, and otherwise has none: never an empty list
-    standing in for a listing that did not happen. Projects that are no longer rows drop out.
+    A project this run listed (a member row's, or one listed directly) gets its clusters as
+    (location, name) pairs, sorted. One it did not list (its probe failed, or its source failed
+    and it was carried unprobed) keeps the previous document's entry when there is one, and
+    otherwise has none: never an empty list standing in for a listing that did not happen. A
+    project in neither list any more drops out.
     """
     before = (previous or {}).get(DOC_CLUSTERS) or {}
     out = {}
-    for row in rows:
-        project = row[ROW_ID]
+    for project in sorted(set(projects)):
         found, outcome = probes.get(project, (None, None))
         if found is not None and outcome == rec.OUTCOME_OK:
             out[project] = {CLUSTERS_AT: resolved_at,
@@ -474,7 +478,8 @@ def encode_document(document: dict) -> str:
         text = json.dumps(rows_only, separators=(",", ":"), ensure_ascii=False)
         if len(text.encode("utf-8")) <= MAX_DOCUMENT_BYTES:
             log(f"the resolved scope with the clusters map is over the {MAX_DOCUMENT_BYTES}-byte budget; "
-                f"publishing the rows without it, so every member's cluster list reads unread.")
+                f"publishing the rows without it, dropping {len(document[DOC_CLUSTERS])} projects' cluster "
+                "listings, so every project's cluster list reads unread.")
             return text
     log(f"the resolved scope is {len(text.encode('utf-8'))} bytes, over the {MAX_DOCUMENT_BYTES}-byte "
         f"budget; publishing {STATE_TOO_LARGE} with no rows.")
@@ -610,7 +615,7 @@ def build_document(declared: dict, management: str | None, previous: dict | None
     patterns = scope[EXCLUDE_KEY][EXCLUDE_PROJECTS_KEY]
     sources = rec._container_ids(scope) + rec._selector_ids(scope)
 
-    def place(groups: dict, earlier: dict | None = None) -> tuple[dict, dict, dict, list, list]:
+    def place(groups: dict, earlier: dict | None = None) -> tuple[dict, dict, dict, list, list, list]:
         searches = {g: r for g, r in groups.items() if rec._is_container(g)}
         selector_reports = {g: r for g, r in groups.items() if rec._is_selector(g)}
         selections = rec._selector_members(selector_reports, looked_up, deadline, patterns, SCOPE_WORKERS, budget)
@@ -623,13 +628,20 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         counted = [e for e in entries if e[ROW_OUTCOME] != rec.OUTCOME_OVER_CAP]
         members = [e for e in counted
                    if not e[ROW_ID].isdigit() and not any(via in ROW_EXCLUDED_VIAS for via in e[ROW_VIA])]
+        # The management project and the explicit projects the reconcile kept: an excluded or
+        # over-cap explicit project is not counted. Probed for the clusters map alone.
+        # Only an ID the broker's argv check reads as a project ID: a domain-scoped or padded
+        # management project would be refused every run, an audit line each time, for nothing.
+        direct = sorted(e[ROW_ID] for e in counted
+                        if not e[ROW_ID].isdigit() and scope_policy.ARGUMENT_PATTERNS[scope_policy.SHAPE_CLUSTERS_LIST].match(e[ROW_ID])
+                        and any(via in ROW_EXCLUDED_VIAS for via in e[ROW_VIA]))
         # A source can carry a counted member only when the member's row names it.
         member_ids = {e[ROW_ID] for e in members}
         carried = [{ROW_ID: e[ROW_ID], ROW_VIA: e[ROW_VIA], ROW_OUTCOME: e[ROW_OUTCOME] or rec.OUTCOME_OK,
                     **({ROW_NUMBER: e[ROW_NUMBER]} if e.get(ROW_NUMBER) else {})}
                    for e in counted if e[ROW_ID] not in member_ids
                    and any(rec._is_container(via) or rec._is_selector(via) for via in e[ROW_VIA])]
-        return searches, selector_reports, selections, members, carried
+        return searches, selector_reports, selections, members, carried, direct
 
     def probe(members: list) -> dict:
         return rec._bounded_map(rec._list_project, [e[ROW_ID] for e in members if e[ROW_OUTCOME] in LISTED_OUTCOMES],
@@ -644,7 +656,7 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         # source that answers again are recorded under the new one.
         log("the broker's scope.json changed during the run; resolving every source again")
         groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
-    searches, selector_reports, selections, members, carried = place(groups)
+    searches, selector_reports, selections, members, carried, direct = place(groups)
     probes = probe(members)
     if ((_scope_argument_wait.probe_refused or _scope_argument_wait.gave_up)
             and deadline - time.monotonic() >= SCOPE_RECOVERY_MIN_SECONDS):
@@ -658,7 +670,7 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         log(f"{reason}; resolving every source again and probing again")
         _scope_argument_wait.until = time.monotonic()
         groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
-        searches, selector_reports, selections, members, carried = place(groups, selections)
+        searches, selector_reports, selections, members, carried, direct = place(groups, selections)
         probes.update(probe([e for e in members if probes.get(e[ROW_ID], (None, rec.OUTCOME_UNREACHABLE))[1]
                              == rec.OUTCOME_UNREACHABLE]))
     rows_before = {row[ROW_ID]: row for row in (previous or {}).get(DOC_PROJECTS, [])
@@ -715,7 +727,13 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         document[DOC_NUMBERS] = numbers
     if carried:
         document[DOC_CARRIED] = carried
-    clusters = _clusters_map(rows, probes, previous, resolved_at)
+    # Last, after every member row is decided: these listings decide no row, so neither their
+    # budget nor a refusal of one (a broker without the management project's variable, or a
+    # scope.json mount behind the Job's) may cost a member its probe or start a recovery pass.
+    direct_probes = rec._bounded_map(rec._list_project, direct, deadline, "listing clusters in", SCOPE_WORKERS,
+                                     budget, consequence="its clusters entry keeps the last listing") if direct else {}
+    clusters = _clusters_map([row[ROW_ID] for row in rows] + direct, {**probes, **direct_probes}, previous,
+                             resolved_at)
     if clusters:
         document[DOC_CLUSTERS] = clusters
     if groups and all(found is None for found, _ in groups.values()):

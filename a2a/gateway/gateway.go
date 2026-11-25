@@ -1387,9 +1387,9 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
 		//
-		// Nor for a press of a Stop button, Slack's or Google Chat's: it
-		// asked the bot for nothing, and the notice, which names the
-		// presser, would land in a thread the channel reads.
+		// Nor for a press of a Stop button, Slack's, Google Chat's or
+		// Teams's: it asked the bot for nothing, and the notice, which
+		// names the presser, would land in a thread the channel reads.
 		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend) || isChatStopPress(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
@@ -1608,7 +1608,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
-		// Google Chat's Stop button names its task (gchat_stop.go): a
+		// Google Chat's Stop button and Teams's name their task
+		// (gchat_stop.go, teams_press.go): a
 		// press on a task that is not the running one is a stale button,
 		// answered on its own line, and cancels nothing. Read before the
 		// requester gate below: it cancels nothing, so anyone may heal a
@@ -1617,16 +1618,18 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	case stopping && isStopPress(msg, backend) &&
 		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
 		// Only the people who asked for work in a thread may press its Stop
-		// button, Slack's native one or the one drawn on Google Chat
-		// (stopgate.go). Anyone else's press cancels nothing; on Google
-		// Chat, in a space, the presser alone is told so. A typed `stop`
-		// keeps the rule below.
+		// button, Slack's native one or the one drawn on Google Chat or
+		// on Teams (stopgate.go). Anyone else's press cancels nothing; on
+		// Google Chat, in a space, the presser alone is told so, and on
+		// Teams the running task's line says so. A typed `stop` keeps the
+		// rule below.
 		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
 		// A task a requester has already asked to stop (Detached) is
 		// settling: its line reads "cancel sent", and a line telling the
 		// presser to type stop would be stale advice, so nothing is said.
 		if active := rec.ActiveTask; active == nil || !active.Detached {
 			g.tellRefusedPresser(rec.Key, msg, backend)
+			g.tellRefusedOnLine(rec, msg, backend)
 		}
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
@@ -1636,8 +1639,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// press was made a typed stop above, and takes that path below.
 		g.chatStopPress(ctx, rec, msg, authority)
 	case stopping && isChatTypedStop(msg, backend) && active != nil && active.StatusMsgID != "" && !g.cardStopWanted(rec, msg):
-		// A stop typed on Google Chat with a line to answer on answers as a
-		// press does, on the line, and posts nothing (chat_stop_press.go):
+		// A stop typed on Google Chat or Teams with a line to answer on answers
+		// as a press does, on the line, and posts nothing (chat_stop_press.go):
 		// the cancel, or "cancel already sent" while its terminal is
 		// pending. With the card stop armed, or no line, it takes the typed
 		// stop's path below, posts and all.

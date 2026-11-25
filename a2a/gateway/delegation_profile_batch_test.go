@@ -870,10 +870,10 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 	for _, tc := range []struct {
 		name string
 		// first makes the parent's first request end with no batch on the
-		// bus, and returns the record's child count after it.
-		first func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int
+		// bus, and returns the children on the record after it.
+		first func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) []string
 	}{
-		{"refused", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int {
+		{"refused", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) []string {
 			r.g.cfg.DelegationWidthMax = 1 // two tasks are too wide
 			if err := parent.PublishArtifact(context.Background(), two(t)); err != nil {
 				t.Fatal(err)
@@ -883,9 +883,9 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 				return ref.DelegationEnd != ""
 			})
 			r.g.cfg.DelegationWidthMax = 10
-			return 0
+			return nil
 		}},
-		{"withdrawn", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int {
+		{"withdrawn", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) []string {
 			r.g.cfg.DelegationWidthMax = 10
 			r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 			art := two(t)
@@ -910,7 +910,7 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 			r.g.beforeBatchChild = nil
 			rec, _ := r.g.reg.Get(context.Background(), conv)
 			ref, _ := rec.TaskRefFor(originID)
-			return len(ref.Children)
+			return append([]string(nil), ref.Children...)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -938,10 +938,25 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 				t.Fatal(err)
 			}
 			time.Sleep(500 * time.Millisecond)
+			// Nothing new on the record: every child after the repeat was
+			// there before it. A child a withdrawal kept (one whose cancel
+			// couldn't be sent) may leave the record later, when its own
+			// end arrives, so the count can fall; it never rises.
+			before := map[string]bool{}
+			for _, id := range kids {
+				before[id] = true
+			}
 			rec, _ := r.g.reg.Get(ctx, conv)
 			ref, _ := rec.TaskRefFor(origin.TaskID)
-			if len(ref.Children) != kids {
-				t.Fatalf("children after the repeat = %v, want the %d from before it", ref.Children, kids)
+			for _, id := range ref.Children {
+				if !before[id] {
+					t.Fatalf("children after the repeat = %v, want none beyond %v", ref.Children, kids)
+				}
+			}
+			for _, k := range rec.Tasks {
+				if k.ParentTaskID == origin.TaskID && !before[k.ID] {
+					t.Fatalf("an entry %s minted under the parent by the repeat (before: %v)", k.ID, kids)
+				}
 			}
 		})
 	}

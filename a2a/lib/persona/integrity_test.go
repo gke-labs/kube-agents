@@ -450,3 +450,39 @@ func TestFormatIntegrityManifestMatchesTheBuildRecipe(t *testing.T) {
 		t.Errorf("FormatIntegrityManifest =\n%s\nwant\n%s", got, want)
 	}
 }
+
+// WriteIntegrityManifest replaces a symlink at the manifest's path rather
+// than writing through it, and refuses a name it can't write as one line.
+func TestWriteIntegrityManifestDoesNotFollowASymlink(t *testing.T) {
+	dir := copyExample(t)
+	outside := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(outside, []byte("untouched\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, IntegrityManifestFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteIntegrityManifest(dir); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(outside); string(data) != "untouched\n" {
+		t.Errorf("the symlink's target was written: %q", data)
+	}
+	if p, err := LoadWithOptions(dir, Options{RequireIntegrity: true}); err != nil || p.Integrity != IntegrityVerified {
+		t.Errorf("after WriteIntegrityManifest: %v, %v", p, err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestWriteIntegrityManifestRefusesALineBreakInAName(t *testing.T) {
+	dir := copyExample(t)
+	writeFile(t, dir, "skills/notes/odd\nname.md", "x\n")
+	if err := WriteIntegrityManifest(dir); err == nil || !strings.Contains(err.Error(), "line break") {
+		t.Errorf("WriteIntegrityManifest = %v, want the name refused", err)
+	}
+}

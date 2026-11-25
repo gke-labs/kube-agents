@@ -504,7 +504,7 @@ func buildCredentialProxyExecTierPDB(agent *agentv1alpha1.PlatformAgent) *policy
 }
 
 // buildCredentialProxyExecTierNetworkPolicy admits the tier's callers (§3.3):
-// the sandbox, the session pods under the cluster-view flag, and the profile
+// the sandbox, the session pods under the session pods' cluster view, and the profile
 // namespace while there is a profile caller, on the credentialed port; and the
 // metrics port to Managed Prometheus and, where it is set, the operator. No
 // gateway and no agent pod: neither calls /v1/exec.

@@ -1189,7 +1189,7 @@ func TestDelegationRoundsMaxFromEnvAndTheClamp(t *testing.T) {
 	if cfg, err = FromEnv(); err != nil || cfg.DelegationRoundsMax != 3 {
 		t.Fatalf("A2A_DELEGATION_ROUNDS_MAX=3: %v, %v", cfg, err)
 	}
-	for _, bad := range []string{"junk", "1.5", "two"} {
+	for _, bad := range []string{"junk", "1.5", "two", "0", "-1"} {
 		t.Setenv("A2A_DELEGATION_ROUNDS_MAX", bad)
 		if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "A2A_DELEGATION_ROUNDS_MAX") {
 			t.Fatalf("A2A_DELEGATION_ROUNDS_MAX=%q: err %v, want one naming the variable", bad, err)
