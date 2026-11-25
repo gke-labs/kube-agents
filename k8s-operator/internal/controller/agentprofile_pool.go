@@ -165,13 +165,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 	// isolation, and pod env overrides the image's ENV, so a worker image
 	// can't set it for a type the profile names. It goes when that isolation
 	// lands (#6710).
-	if h := profile.Spec.Harness.Type; h == "core-agent" { // harness A/B twin only
-		env = append(env,
-			corev1.EnvVar{Name: "A2A_HARNESS", Value: h},
-			corev1.EnvVar{Name: "A2A_HARNESS_UNISOLATED", Value: "allow"},
-			corev1.EnvVar{Name: "A2A_HARNESS_PATH", Value: "/usr/local/bin/core-agent-harness"},
-		)
-	} else if h != "" {
+	if h := profile.Spec.Harness.Type; h != "" {
 		env = append(env,
 			corev1.EnvVar{Name: "A2A_HARNESS", Value: h},
 			corev1.EnvVar{Name: "A2A_HARNESS_UNISOLATED", Value: ""},

@@ -591,13 +591,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		if h := s.cfg.SessionHarness; h != "" && sessionHarnesses[h] {
 			c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvHarness, Value: h})
 		}
-		// harness A/B twin only: core-agent runs with the waiver and a named binary.
-		if s.cfg.SessionHarness == "core-agent" {
-			c.Env = append(c.Env, corev1.EnvVar{Name: envHarnessUnisolated, Value: "allow"},
-				corev1.EnvVar{Name: "A2A_HARNESS_PATH", Value: twinCoreAgentPath})
-		} else {
-			c.Env = append(c.Env, corev1.EnvVar{Name: envHarnessUnisolated, Value: ""})
-		}
+		c.Env = append(c.Env, corev1.EnvVar{Name: envHarnessUnisolated, Value: ""})
 	}
 	if s.cfg.SessionClusterView {
 		c := &pod.Spec.Containers[0]
@@ -1459,6 +1453,3 @@ func delegateToolFor(rec *SessionRecord, taskID string) string {
 // envHarnessUnisolated is the worker adapter's waiver for running a harness
 // without its isolation; the spawner renders it empty on every session pod.
 const envHarnessUnisolated = "A2A_HARNESS_UNISOLATED"
-
-// twinCoreAgentPath is where the harness A/B twin expects core-agent-harness in the worker image.
-const twinCoreAgentPath = "/usr/local/bin/core-agent-harness"
