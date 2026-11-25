@@ -4129,8 +4129,10 @@ class AnyReservationPoolTest(unittest.TestCase):
     def test_the_pool_shape_gke_returns(self):
         self.assertEqual(
             fs.any_reservation_pool(any_reservation_node_pool("any-pool", zones=("us-central1-c", "us-central1-a"))),
-            {"pool": "any-pool", "zones": ["us-central1-a", "us-central1-c"], "machine_type": "n2-standard-2", "accelerators": []},
+            {"pool": "any-pool", "zones": ["us-central1-a", "us-central1-c"], "machine_type": "n2-standard-2", "accelerators": [], "local_ssds": 0, "min_cpu_platform": ""},
         )
+        fitted = any_reservation_node_pool("ssd-pool", minCpuPlatform="Intel Ice Lake", localSsdCount=1, ephemeralStorageLocalSsdConfig={"localSsdCount": 2}, localNvmeSsdBlockConfig={"localSsdCount": 1})
+        self.assertEqual((fs.any_reservation_pool(fitted)["local_ssds"], fs.any_reservation_pool(fitted)["min_cpu_platform"]), (4, "Intel Ice Lake"))
         gpu = any_reservation_node_pool("gpu-pool", machine_type="g2-standard-4", accelerators=self.L4)
         self.assertEqual(fs.any_reservation_pool(gpu)["accelerators"], [("nvidia-l4", 1)])
 
@@ -4149,6 +4151,7 @@ class AnyReservationPoolTest(unittest.TestCase):
             # §3.10 does not flag non-production.
             any_reservation_node_pool("dev-pool"),
             any_reservation_node_pool("p", labels={"env": "dev"}),
+            any_reservation_node_pool("p", resourceLabels={"environment": "staging"}),
         ):
             with self.subTest(pool=pool["name"], config=pool["config"]):
                 self.assertIsNone(fs.any_reservation_pool(pool))
@@ -4162,14 +4165,35 @@ class AnyReservationPoolTest(unittest.TestCase):
         # proto3 JSON drops a zero count.
         del unused["specificReservation"]["inUseCount"]
         aggregate = {"name": "agg", "zone": "https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-b", "aggregateReservation": {}}
+        no_count = open_reservation("no-count", "us-central1-b")
+        del no_count["specificReservation"]["count"]
+        plain = {"local_ssds": 0, "min_cpu_platform": ""}
         self.assertEqual(
-            fs.reservation_shapes([gpu, unused, listed_reservation("locked", "us-central1-f"), aggregate, "junk"]),
+            fs.reservation_shapes([gpu, unused, listed_reservation("locked", "us-central1-f"), aggregate, no_count, "junk"]),
             [
-                {"name": "gpu-r", "zone": "us-central1-b", "machine_type": "g2-standard-4", "accelerators": [("nvidia-l4", 1)], "free": 3, "specific_required": False},
-                {"name": "r1", "zone": "us-central1-b", "machine_type": "n2-standard-2", "accelerators": [], "free": 1, "specific_required": False},
-                {"name": "locked", "zone": "us-central1-f", "machine_type": "n1-standard-1", "accelerators": [], "free": 1, "specific_required": True},
+                {"name": "gpu-r", "zone": "us-central1-b", "machine_type": "g2-standard-4", "accelerators": [("nvidia-l4", 1)], "free": 3, "specific_required": False, **plain},
+                {"name": "r1", "zone": "us-central1-b", "machine_type": "n2-standard-2", "accelerators": [], "free": 1, "specific_required": False, **plain},
+                {"name": "locked", "zone": "us-central1-f", "machine_type": "n1-standard-1", "accelerators": [], "free": 1, "specific_required": True, **plain},
             ],
         )
+
+    def test_the_other_fields_of_a_reservation_s_machine(self):
+        """A machine type can be a URL. Local SSDs and a minimum CPU platform
+        are a part of what a machine must match; their field names are those
+        of the Compute Engine API reference, not of a live read."""
+        fitted = open_reservation("fitted", "us-central1-b")
+        fitted["specificReservation"]["instanceProperties"] = {
+            "machineType": "https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-b/machineTypes/n2-standard-2",
+            "localSsds": [{"diskSizeGb": "375", "interface": "NVME"}, {"diskSizeGb": "375", "interface": "NVME"}],
+            "minCpuPlatform": "Intel Ice Lake",
+        }
+        # A field that the API leaves out is "not required", and a name that is no string does not stop the read.
+        bare = open_reservation("bare", "us-central1-b")
+        del bare["specificReservationRequired"]
+        bare["name"] = None
+        [first, second] = fs.reservation_shapes([fitted, bare])
+        self.assertEqual((first["machine_type"], first["local_ssds"], first["min_cpu_platform"]), ("n2-standard-2", 2, "Intel Ice Lake"))
+        self.assertEqual((second["name"], second["specific_required"]), ("", False))
 
     def test_a_matching_reservation_only_in_another_zone_is_a_major_finding(self):
         entry = self.filed(any_reservation_node_pool("any-pool"), reservations=[open_reservation("r1", "us-central1-b", count=2, in_use=1)])
@@ -4235,13 +4259,76 @@ class AnyReservationPoolTest(unittest.TestCase):
         two["specificReservation"]["instanceProperties"]["guestAccelerators"][0]["acceleratorCount"] = 2
         self.assertEqual(self.filed(pool, reservations=[two])["candidates"], [])
 
-    def test_a_project_whose_reservations_were_not_read_is_unevaluated(self):
-        entry = self.filed(any_reservation_node_pool("any-pool"), read=False, limitations="an earlier limitation")
+    def test_a_gpu_pool_does_not_match_a_reservation_with_no_accelerator(self):
+        pool = any_reservation_node_pool("gpu-pool", machine_type="g2-standard-4", accelerators=self.L4)
+        self.assertEqual(self.filed(pool, reservations=[open_reservation("r1", "us-central1-b", machine_type="g2-standard-4")])["candidates"], [])
+
+    def test_local_ssds_and_the_cpu_platform_are_a_part_of_the_match(self):
+        fitted = open_reservation("fitted", "us-central1-b")
+        fitted["specificReservation"]["instanceProperties"].update({"localSsds": [{"interface": "NVME"}], "minCpuPlatform": "Intel Ice Lake"})
+        self.assertEqual(self.filed(any_reservation_node_pool("any-pool"), reservations=[fitted])["candidates"], [])
+        same = any_reservation_node_pool("ssd-pool", minCpuPlatform="Intel Ice Lake", localSsdCount=1)
+        [candidate] = self.filed(same, reservations=[fitted])["candidates"]
+        self.assertEqual(candidate["object"], "NodePool/ssd-pool")
+
+    def test_a_full_reservation_in_the_pool_s_zone_is_the_pool_s_reservation(self):
+        """A pool whose nodes fill the reservation of its zone uses its
+        reserved capacity. Free capacity of the same shape in another zone
+        is then no finding on this pool."""
+        entry = self.filed(
+            any_reservation_node_pool("any-pool"),
+            reservations=[open_reservation("res-a", "us-central1-a", count=3, in_use=3), open_reservation("res-b", "us-central1-b", count=3, in_use=1)],
+        )
         self.assertEqual(entry["candidates"], [])
-        self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG])
-        self.assertIn("were not read in this run: any-pool", entry["checks_unevaluated"][0]["reason"])
-        self.assertEqual(entry["commands"], [])
+
+    def test_a_reservation_of_another_shape_in_the_pool_s_zone_does_not_hide_the_finding(self):
+        for why, in_zone in (
+            ("another machine type", open_reservation("other", "us-central1-a", machine_type="e2-standard-2")),
+            ("specific required", {**open_reservation("locked", "us-central1-a"), "specificReservationRequired": True}),
+        ):
+            with self.subTest(why=why):
+                entry = self.filed(any_reservation_node_pool("any-pool"), reservations=[in_zone, open_reservation("r1", "us-central1-b")])
+                [candidate] = entry["candidates"]
+                self.assertIn("matching reservation r1: 1 free in us-central1-b", candidate["excerpt"])
+                self.assertNotIn(in_zone["name"], candidate["excerpt"])
+
+    def test_each_pool_of_a_cluster_is_compared(self):
+        entry = self.filed(
+            any_reservation_node_pool("a-pool", zones=("us-central1-b",)), any_reservation_node_pool("z-pool"),
+            reservations=[open_reservation("r1", "us-central1-b")],
+        )
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["NodePool/z-pool"])
+
+    def test_only_the_reservations_of_the_cluster_s_own_project_count(self):
+        entry = {
+            "name": "acme/us-central1/c1", "project": "acme", "location": "us-central1", "outcome": "collected",
+            "commands": [{"check": self.SLUG, "command": "kubectl get computeclasses", "rc": 0}], "candidates": [],
+            fs.ANY_RESERVATION_POOLS_KEY: [{**fs.any_reservation_pool(any_reservation_node_pool("any-pool")), "command": self.POOLS_COMMAND}],
+        }
+        fs.file_any_reservation_pools(entry, {"acme": [], "other": fs.reservation_shapes([open_reservation("r1", "us-central1-b", project="other")])})
+        self.assertEqual(entry["candidates"], [])
+
+    def test_a_project_whose_reservations_were_not_read_is_unevaluated(self):
+        """The other checks' records stay, and a check that is unevaluated
+        already for the node pool arm keeps one row."""
+        entry = self.filed(
+            any_reservation_node_pool("any-pool"), any_reservation_node_pool("second-pool"), read=False,
+            limitations="an earlier limitation",
+            commands=[{"check": "single-zone-nodepool", "command": "x", "rc": 0}, {"check": self.SLUG, "command": "y", "rc": 0}],
+            checks_unevaluated=[{"check": self.SLUG, "reason": "the node pool arm's reason"}, {"check": "spot-scarcity-risk", "reason": "x"}],
+        )
+        self.assertEqual(entry["candidates"], [])
+        self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG, "spot-scarcity-risk"])
+        reason = entry["checks_unevaluated"][0]["reason"]
+        self.assertTrue(reason.startswith("the node pool arm's reason; "))
+        self.assertIn("were not read in this run: any-pool, second-pool", reason)
+        self.assertEqual([c["check"] for c in entry["commands"]], ["single-zone-nodepool"])
         self.assertTrue(entry["limitations"].startswith("an earlier limitation; reservation-mismatch-risk could not be judged: "))
+
+    def test_an_unread_project_with_no_earlier_row_gets_one_row(self):
+        entry = self.filed(any_reservation_node_pool("any-pool"), read=False)
+        self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG])
+        self.assertEqual(entry["commands"], [])
 
     def test_the_procedure_describes_the_arm(self):
         """The procedure's text for (e), held in step with the collector: the
@@ -4267,7 +4354,7 @@ class AnyReservationPoolTest(unittest.TestCase):
         self.assertEqual((pool["pool"], pool["zones"], pool["machine_type"]), ("any-pool", ["us-central1-a"], "n2-standard-2"))
         self.assertEqual(pool["command"], next(c["command"] for c in entry["commands"] if c["check"] == "single-zone-nodepool"))
 
-    def fleet(self, pool, *, reservations=()):
+    def fleet(self, pool, *, reservations=(), reservations_rc=0):
         """One project, one cluster whose listing carries `pool`."""
         listing = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": [pool]}])
 
@@ -4279,7 +4366,7 @@ class AnyReservationPoolTest(unittest.TestCase):
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
             if argv[:3] == ["gcloud", "compute", "reservations"]:
-                return run_of(0, json.dumps(list(reservations)))
+                return run_of(reservations_rc, json.dumps(list(reservations)) if not reservations_rc else "", "denied")
             if argv[:3] == ["gcloud", "compute", "regions"]:
                 return run_of(0, json.dumps({"quotas": []}))
             return run_of(0, "")
@@ -4296,6 +4383,13 @@ class AnyReservationPoolTest(unittest.TestCase):
         [candidate] = [c for c in cluster["candidates"] if c["check"] == self.SLUG]
         self.assertEqual((candidate["object"], candidate["severity"]), ("NodePool/any-pool", "major"))
         audit_report.validate_check_command(candidate["command"], cluster["name"], self.SLUG)
+
+    def test_a_failed_reservations_read_leaves_the_check_unevaluated_on_the_cluster(self):
+        """A failed read is not "no reservation": the pool was not compared."""
+        cluster = self.fleet(any_reservation_node_pool("any-pool"), reservations_rc=1)
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+        self.assertIn(self.SLUG, {e["check"] for e in cluster["checks_unevaluated"]})
+        self.assertNotIn(self.SLUG, {c["check"] for c in cluster["commands"]})
 
     def test_the_fleet_files_nothing_for_a_pool_with_a_reservation_in_its_zone(self):
         cluster = self.fleet(any_reservation_node_pool("any-pool"), reservations=[open_reservation("r1", "us-central1-a")])

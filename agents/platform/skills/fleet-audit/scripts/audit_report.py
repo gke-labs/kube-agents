@@ -3226,10 +3226,12 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # one-file pull request, for a person who knows to add the selector to it.
 #
 # The stockout collector also sets `reserved-pool` on a §3.10(d) finding, a
-# node pool whose named reservation is in none of its zones. Each fix creates
-# a reservation, which is billed from the moment it exists, or replaces the
-# pool. The SOP has that finding published as `manual`, and the marker keeps a
-# `manifest` the model wrote anyway out of the sweep.
+# node pool whose named reservation is in none of its zones, and on a §3.10(e)
+# finding, a node pool whose matching reservations are all in other zones.
+# Each fix creates a reservation, which is billed from the moment it exists,
+# or replaces the pool or changes its zones. The SOP has both findings
+# published as `manual`, and the marker keeps a `manifest` the model wrote
+# anyway out of the sweep.
 #
 # The cost collector sets `autopilot-bumped` on a sizing finding (§3.1, §3.12)
 # whose `major` grade the Autopilot bump supplied rather than its magnitude.
@@ -3271,7 +3273,7 @@ TRIAGE_REASONS = {
     "service-fronted": "stands down a controller a Service routes to",
     "new-computeclass": "needs a new ComputeClass and a workload that selects it",
     "class-status": "changes a node pool or a ComputeClass, and the audit did not read what else runs on that pool",
-    "reserved-pool": "creates a billed reservation or replaces the node pool",
+    "reserved-pool": "creates a billed reservation, or replaces the node pool or changes its zones",
     "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",

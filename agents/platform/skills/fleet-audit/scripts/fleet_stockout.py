@@ -537,9 +537,10 @@ MISSING_RESERVATION_IMPACT = (
     "pool's zones, so the pool cannot add a node; with autoscaling on, the autoscaler reports "
     "`scale.up.error.reservation.not.found`."
 )
-# The `needs_triage` marker on a §3.10(d) finding: each fix creates billed
-# capacity or replaces the node pool, so the automatic sweep opens no pull
-# request for it even if the published remediation is a manifest. Read by
+# The `needs_triage` marker on a §3.10(d) or §3.10(e) finding: each fix
+# creates billed capacity, replaces the node pool or changes its zones, so the
+# automatic sweep opens no pull request for it even if the published
+# remediation is a manifest. Read by
 # `triage_markers` in audit_report.py, as `NEW_COMPUTE_CLASS_TRIAGE` is.
 RESERVED_POOL_TRIAGE = "reserved-pool"
 # Entry keys that carry the two halves of §3.10(d) to `collect_fleet`, which
@@ -554,11 +555,25 @@ RESERVATION_ZONES_KEY = "_reservation_zones"
 POOL_ANY_RESERVATION = "ANY_RESERVATION"
 ANY_RESERVATION_SEVERITY = "major"
 ANY_RESERVATION_IMPACT = (
-    "This node pool is set to consume any matching reservation, and the project's matching reservations are only "
-    "in zones where the pool makes no node. A reservation serves only machines of its own zone, so the pool's "
-    "nodes do not use this reserved capacity: they come on demand, and in a stockout of the pool's zones they do "
-    "not come."
+    "This node pool is set to consume any matching reservation, and the reservations of this project that it can "
+    "consume are only in zones where the pool makes no node. A reservation serves only machines of its own zone, "
+    "so the pool's nodes do not use this reserved capacity. Unless a reservation that another project shares with "
+    "this project serves a zone of the pool, the nodes come on demand, and in a stockout of the pool's zones they "
+    "do not come."
 )
+# The texts of a §3.10(e) candidate and of its unevaluated reason.
+RESERVATION_MISMATCH_CHECK = "reservation-mismatch-risk"
+RESERVATION_CLAUSE_JOINER = "; "
+ANY_RESERVATION_EXCERPT = "reservationAffinity={affinity}, pool zones {zones}, machine type {machine_type}; {where}"
+ANY_RESERVATION_MATCH = "matching reservation {name}: {free} free in {zone} of project {project}"
+ANY_RESERVATION_UNREAD = (
+    "these node pools consume any matching reservation, and the reservations of the cluster's "
+    "project were not read in this run: {pools}"
+)
+RESERVATION_UNJUDGED = "{check} could not be judged: {reason}"
+# The node pool fields that count local SSDs, and the last part of a resource URL.
+POOL_LOCAL_SSD_CONFIGS = ("ephemeralStorageLocalSsdConfig", "localNvmeSsdBlockConfig")
+URL_SEPARATOR = "/"
 # Entry keys that carry the two halves of §3.10(e) to `collect_fleet`, which
 # removes them: a cluster's pools with that affinity, and what a machine must
 # match to consume each reservation of a project.
@@ -2014,14 +2029,22 @@ def _accelerators(items: object) -> list[tuple[str, int]]:
     found = []
     for item in items if isinstance(items, list) else []:
         if isinstance(item, dict) and item.get("acceleratorType"):
-            found.append((str(item["acceleratorType"]).rsplit("/", 1)[-1], _gce_int(item.get("acceleratorCount"), 0) or 0))
+            found.append((str(item["acceleratorType"]).rsplit(URL_SEPARATOR, 1)[-1], _gce_int(item.get("acceleratorCount"), 0) or 0))
     return sorted(found)
 
 
+def _pool_local_ssds(config: dict) -> int:
+    """The local SSDs of each node of a pool, over the three fields that can
+    give them. The field names are those of the GKE API reference."""
+    counts = [config.get("localSsdCount"), *((config.get(key) or {}).get("localSsdCount") for key in POOL_LOCAL_SSD_CONFIGS)]
+    return sum(_gce_int(count, 0) or 0 for count in counts)
+
+
 def any_reservation_pool(pool: dict) -> dict | None:
-    """The zones, the machine type and the accelerators of a production node
-    pool that consumes any matching reservation (§3.10(e)); None for every
-    other pool. Run inside `collect_cluster`, as `reserved_pool` is."""
+    """The zones and the machine shape (machine type, accelerators, local SSD
+    count, minimum CPU platform) of a production node pool that consumes any
+    matching reservation (§3.10(e)); None for every other pool. Run inside
+    `collect_cluster`, as `reserved_pool` is."""
     config = pool.get("config") or {}
     if (config.get("reservationAffinity") or {}).get("consumeReservationType") != POOL_ANY_RESERVATION:
         return None
@@ -2032,74 +2055,87 @@ def any_reservation_pool(pool: dict) -> dict | None:
     if is_non_production(pool.get("name", ""), {**(config.get("resourceLabels") or {}), **(config.get("labels") or {})}):
         return None
     return {
-        "pool": pool.get("name", ""),
-        "zones": sorted(zones),
-        "machine_type": machine_type,
+        "pool": str(pool.get("name") or ""),
+        "zones": sorted(str(zone) for zone in zones),
+        "machine_type": str(machine_type),
         "accelerators": _accelerators(config.get("accelerators")),
+        "local_ssds": _pool_local_ssds(config),
+        "min_cpu_platform": str(config.get("minCpuPlatform") or ""),
     }
 
 
 def reservation_shapes(reservations: list) -> list[dict]:
     """What a machine must match to consume each reservation of one project's
-    `reservations list`: the zone, the machine type and the accelerators, with
-    the free count and whether only a machine that names the reservation can
-    consume it. A reservation with no machine type of its own is left out."""
+    `reservations list`: the zone and the machine shape (machine type,
+    accelerators, local SSD count, minimum CPU platform), with the free count
+    and whether only a machine that names the reservation can consume it. A
+    reservation with no machine type of its own is left out. The local SSD and
+    CPU platform fields are those of the Compute Engine API reference."""
     from fleet_waste import _location_of  # as `check_reservation` reads the zone
 
     shapes = []
     for reservation in reservations:
         specific = (reservation.get("specificReservation") or {}) if isinstance(reservation, dict) else {}
         properties = specific.get("instanceProperties") or {}
-        count, in_use = _gce_int(specific.get("count")), _gce_int(specific.get("inUseCount"), 0)
-        if not properties.get("machineType") or count is None or in_use is None:
+        count = _gce_int(specific.get("count"))
+        if not properties.get("machineType") or count is None:
             continue
+        local_ssds = properties.get("localSsds")
         shapes.append(
             {
-                "name": reservation.get("name", ""),
-                "zone": _location_of(reservation),
-                "machine_type": str(properties["machineType"]).rsplit("/", 1)[-1],
+                "name": str(reservation.get("name") or ""),
+                "zone": str(_location_of(reservation)),
+                "machine_type": str(properties["machineType"]).rsplit(URL_SEPARATOR, 1)[-1],
                 "accelerators": _accelerators(properties.get("guestAccelerators")),
-                "free": count - in_use,
+                "local_ssds": len(local_ssds) if isinstance(local_ssds, list) else 0,
+                "min_cpu_platform": str(properties.get("minCpuPlatform") or ""),
+                # proto3 JSON drops a zero count.
+                "free": count - (_gce_int(specific.get("inUseCount"), 0) or 0),
                 "specific_required": reservation.get("specificReservationRequired") is True,
             }
         )
     return shapes
 
 
+def _same_machine(pool: dict, shape: dict) -> bool:
+    """Whether a machine of the pool can consume the reservation with no name
+    for it: each property of the machine is the same, and the reservation is
+    not "specific required"."""
+    return not shape["specific_required"] and all(
+        shape[key] == pool[key] for key in ("machine_type", "accelerators", "local_ssds", "min_cpu_platform")
+    )
+
+
 def file_any_reservation_pools(entry: dict, shapes_by_project: dict[str, list[dict]]) -> None:
     """§3.10(e) for one cluster entry: a node pool that consumes any matching
-    reservation, where the reservations of the cluster's project that it can
-    consume are all in zones in which the pool makes no node.
+    reservation, where the cluster's project has free reserved capacity that
+    a machine of the pool can consume, and no reservation for such a machine
+    is in a zone in which the pool makes nodes.
 
-    A reservation matches when a machine of the pool can consume it: the same
-    machine type and accelerators, free capacity, and not "specific required".
-    With no matching reservation in the project there is no finding: nothing
-    is reserved for such a pool. Run by `collect_fleet` beside
+    A machine of the pool can consume a reservation of the same machine shape
+    that is not "specific required" (`_same_machine`). One such reservation in
+    a zone of the pool is the pool's reservation, free or full: a pool whose
+    nodes fill it uses its reserved capacity. With none there, each one with
+    free capacity in another zone is named. With none of those either there
+    is no finding: nothing is reserved for such a pool. Only the reservations
+    that the cluster's project owns are read. Run by `collect_fleet` beside
     `file_reserved_pools`; `shapes_by_project` has the projects whose
     reservations were read."""
-    slug = "reservation-mismatch-risk"
+    slug = RESERVATION_MISMATCH_CHECK
     project = entry.get("project")
     unread: list[str] = []
     for pool in entry.pop(ANY_RESERVATION_POOLS_KEY, []):
         if project not in shapes_by_project:
             unread.append(pool["pool"])
             continue
-        matching = sorted(
-            (
-                shape
-                for shape in shapes_by_project[project]
-                if shape["machine_type"] == pool["machine_type"]
-                and shape["accelerators"] == pool["accelerators"]
-                and shape["free"] > 0
-                and not shape["specific_required"]
-            ),
-            key=lambda shape: (shape["name"], shape["zone"]),
-        )
-        if not matching or any(shape["zone"] in pool["zones"] for shape in matching):
-            # One zone of the pool that holds a matching reservation is enough.
+        same = [shape for shape in shapes_by_project[project] if _same_machine(pool, shape)]
+        if any(shape["zone"] in pool["zones"] for shape in same):
             continue
-        where = "; ".join(
-            f"matching reservation {shape['name']}: {shape['free']} free in {shape['zone']} of project {project}" for shape in matching
+        elsewhere = sorted((shape for shape in same if shape["free"] > 0), key=lambda shape: (shape["name"], shape["zone"]))
+        if not elsewhere:
+            continue
+        where = RESERVATION_CLAUSE_JOINER.join(
+            ANY_RESERVATION_MATCH.format(name=shape["name"], free=shape["free"], zone=shape["zone"], project=project) for shape in elsewhere
         )
         entry["candidates"].append(
             _emit(
@@ -2107,29 +2143,31 @@ def file_any_reservation_pools(entry: dict, shapes_by_project: dict[str, list[di
                 {
                     "object": f"NodePool/{pool['pool']}",
                     "severity": ANY_RESERVATION_SEVERITY,
-                    "excerpt": (
-                        f"reservationAffinity={POOL_ANY_RESERVATION}, pool zones {', '.join(pool['zones'])}, "
-                        f"machine type {pool['machine_type']}; {where}"
+                    "excerpt": ANY_RESERVATION_EXCERPT.format(
+                        affinity=POOL_ANY_RESERVATION, zones=", ".join(pool["zones"]), machine_type=pool["machine_type"], where=where
                     ),
                     "impact": ANY_RESERVATION_IMPACT,
                     # A fix is a new reservation, which is billed, or a change
                     # of the pool's zones: no pull request from the sweep.
                     "needs_triage": RESERVED_POOL_TRIAGE,
-                    "command": "; ".join([pool["command"], shlex.join(reservations_argv(project))]),
+                    "command": RESERVATION_CLAUSE_JOINER.join([pool["command"], shlex.join(reservations_argv(project))]),
                 },
             )
         )
     if unread:
-        # Unevaluated, as in `file_reserved_pools`.
-        reason = (
-            f"these node pools consume any matching reservation, and the reservations of the cluster's "
-            f"project were not read in this run: {', '.join(unread)}"
-        )
-        entry["checks_unevaluated"] = sorted(
-            [*entry.get("checks_unevaluated", []), {"check": slug, "reason": reason}], key=lambda e: e["check"]
-        )
+        # Unevaluated, as in `file_reserved_pools`. One row for a check: the
+        # node pool arm of this check can have written its row already.
+        reason = ANY_RESERVATION_UNREAD.format(pools=", ".join(unread))
+        unevaluated = entry.get("checks_unevaluated", [])
+        earlier = next((row for row in unevaluated if row["check"] == slug), None)
+        if earlier:
+            earlier["reason"] = RESERVATION_CLAUSE_JOINER.join([earlier["reason"], reason])
+        else:
+            entry["checks_unevaluated"] = sorted([*unevaluated, {"check": slug, "reason": reason}], key=lambda row: row["check"])
         entry["commands"] = [c for c in entry["commands"] if c["check"] != slug]
-        entry["limitations"] = "; ".join([*filter(None, [entry.get("limitations")]), f"{slug} could not be judged: {reason}"])
+        entry["limitations"] = RESERVATION_CLAUSE_JOINER.join(
+            [*filter(None, [entry.get("limitations")]), RESERVATION_UNJUDGED.format(check=slug, reason=reason)]
+        )
 
 
 # --------------------------------------------------------------------------- #

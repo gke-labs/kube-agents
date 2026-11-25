@@ -47,6 +47,12 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: capacity
 
+# The planted shape this scenario asserts on, named by ROLE. The role is not
+# in bench/tf/fleet/fixtures.json yet: the fixture issue of the PARKED line
+# plants it.
+fixtures:
+  - any-reservation-pool
+
 # Graded against the LEDGER, not the chat reply: the stockout-prevention SOP
 # mandates a one-line closing response that deliberately restates nothing.
 verification_spec:
