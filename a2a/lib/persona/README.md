@@ -145,7 +145,8 @@ adapter yet.
   - Each `mcp.yaml` server the manifest grants runs as the worker's relay to
     the credential broker, the same command and environment as for Claude
     Code, with its granted tools listed (`Output.MCPServers`); a whole-server
-    grant takes the server's `include` list.
+    grant takes the server's `include` list. The worker sends them in each
+    turn's stdin envelope.
   - Tools pass through as the manifest names them, for the harness's tool
     grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
   - A profile worker's core-agent tool grant is read from this rendering
@@ -171,7 +172,8 @@ adapter yet.
     `metadata` values, a script whose path isn't letters, digits, `.`, `_`,
     `-` and `/`, and a script when the persona doesn't grant `shell`.
   - The server name `a2a` is reserved, for every harness, for the worker's
-    own delegate server, which the worker adds per turn.
+    own delegate server, which the worker adds per turn (core-agent: once
+    #6789 lands).
 
 ## An example
 
