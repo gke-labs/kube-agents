@@ -59,7 +59,9 @@ RUN npm ci \
 
 # The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
 # kubectl at /usr/local/libexec/kubectl with a /usr/local/bin/kubectl wrapper
-# that routes through <agent>-kube-proxy when KUBE_PROXY_URL is set, and gcloud
+# (deploy/sandbox/session-kubectl.sh) that routes through <agent>-kube-proxy
+# when KUBE_PROXY_URL is set, recording a failed write attempt under a
+# read-only kube-proxy, and through the broker otherwise, and gcloud
 # on PATH as the credential broker's shim, which forwards an argv to the broker
 # and prints its refusal as `policy rule: <rule>`. The shim is Python, so
 # python3 is installed, with python3-yaml beside it: the shim parses the
@@ -127,7 +129,12 @@ COPY --chmod=0755 deploy/sandbox/session-kubectl.sh /usr/local/bin/kubectl
 # source at every brokered call (deploy/sandbox/Dockerfile says more).
 COPY --chmod=0755 deploy/shared/credential-proxy-exec.py /opt/credential-proxy/libexec/credential-proxy-exec
 COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential_proxy_client.py
-RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py \
+# The command policy, beside the client, for the kubectl wrapper's write-attempt
+# record (credential_proxy_client.record_kubectl_write_attempt). Standard
+# library only; the import below fails the build if that stops being true.
+COPY --chmod=0644 agents/platform/scripts/command_policy.py /opt/credential-proxy/libexec/command_policy.py
+RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py /opt/credential-proxy/libexec/command_policy.py \
+    && PYTHONDONTWRITEBYTECODE=1 python3 -I -c "import sys; sys.path.insert(0, '/opt/credential-proxy/libexec'); import command_policy" \
     && python3 -v /opt/credential-proxy/libexec/credential-proxy-exec --help 2>&1 \
        | grep "code object from '/opt/credential-proxy/libexec/__pycache__/credential_proxy_client\.cpython-[0-9]*\.pyc'" >/dev/null
 # The version-control skill a profile persona carries (its scripts/vcs.py, a
@@ -155,6 +162,13 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 # script row may name, root-owned and not worker-writable as script mode
 # requires. tests/test_worker_fleet_audit_scripts.py holds this list to its
 # sources, and the directory to that root.
+# The directories first, so they're 0755: a COPY --chmod creates every
+# missing directory on its destination path with the files' mode (BuildKit's
+# fsutil MkdirAll), and under buildx, which publishes the images, that left
+# /opt/kube-agents, the script root and this directory 0644, which the
+# worker's user can't enter. A directory that exists keeps its mode. mkdir
+# changes no mode test_script_root_ownership.py would have to vouch for.
+RUN mkdir -p /opt/kube-agents/scripts/fleet-audit
 COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
      agents/platform/skills/fleet-audit/scripts/report_status.py \
      agents/platform/skills/fleet-audit/scripts/manifest_delta.py \

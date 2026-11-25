@@ -615,6 +615,11 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          kubectl/gcloud shim's launcher; that folder is not
 #                          on these scripts' module path, so it is staged here
 #                          as well
+#   command_policy.py      the kubectl write classifier credential_proxy_client
+#                          imports for --record-kubectl-write-attempt (the worker
+#                          image's session kubectl wrapper runs it; nothing here
+#                          does). Shipped beside the client so the client's
+#                          imports resolve to root-owned code; pure stdlib
 #   credential_shapes.py   the token shapes the feedback gate refuses and the broker
 #                          redacts before logging: one list, imported by
 #                          feedback_broker and submit_suggestion here and by
@@ -736,6 +741,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/gitops_preflight.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/command_policy.py \
      agents/platform/scripts/credential_shapes.py \
      agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/feedback_summary.py \
@@ -866,6 +872,7 @@ COPY agents/platform/scripts/forge.py \
      agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/command_policy.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/untrusted_text.py \

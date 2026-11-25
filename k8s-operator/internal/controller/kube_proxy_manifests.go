@@ -133,6 +133,12 @@ func kubeProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	}
 }
 
+// kubeProxyMode is kube-proxy's policy mode (k8s-api-proxy's KUBE_PROXY_MODE):
+// reads, plus writes carrying a server-side dry run. The gateway gets the same
+// value (A2A_KUBE_PROXY_MODE) and passes it to session pods, whose kubectl
+// wrapper treats a failed write as refused only under a read-only mode.
+const kubeProxyMode = "read-only-dry-run"
+
 func kubeProxyURL(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("https://%s.%s.svc.cluster.local:%d",
 		kubeProxyName(agent), agent.Namespace, kubeProxyPort)
@@ -248,7 +254,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: kubeProxyMetricsPortEnv, Value: strconv.Itoa(int(kubeProxyMetricsPort))},
 		{Name: "KUBE_PROXY_TLS_CERT_FILE", Value: kubeProxyTLSMountPath + "/tls.crt"},
 		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: kubeProxyTLSMountPath + "/tls.key"},
-		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
+		{Name: "KUBE_PROXY_MODE", Value: kubeProxyMode},
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
 		{Name: memlimit.GoMemLimitEnv, Value: kubeProxyGoMemLimit()},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},

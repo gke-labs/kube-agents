@@ -497,6 +497,79 @@ class TestClone(InspectRepositoryTestCase):
                 self.assertFalse((into / "README.md").exists())
         self.assertEqual(self.calls, [])
 
+    def shared_staging(self) -> Path:
+        """The folder that every user's clone staged in before."""
+        return inspect_repository.staging_root().parent / inspect_repository.STAGING_DIR_NAME
+
+    def other_user_staging(self) -> Path:
+        return inspect_repository.staging_root().parent / f"{inspect_repository.STAGING_DIR_NAME}-{os.getuid() + 1}"
+
+    def test_the_staging_folder_is_the_caller_s_own(self):
+        root = inspect_repository.staging_root()
+        self.assertEqual(root.name, f".inspect-repository-staging-{os.getuid()}")
+        self.assertEqual(root.parent, self.shared_staging().parent)
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes in a folder whatever its mode")
+    def test_a_clone_passes_when_the_caller_cannot_write_the_shared_staging_folder(self):
+        """A root `kubectl exec` leaves the shared folder owned by root; the mode stands in for the owner."""
+        shared = self.shared_staging()
+        shared.mkdir(parents=True)
+        shared.chmod(0o555)
+        self.addCleanup(shared.chmod, 0o700)
+        into = self.tmp / "copy"
+        result = self.run_command(["clone", "--repo", "acme/public", "--into", str(into)])
+        self.assertEqual(result["written"], 3)
+        self.assertTrue((into / "cmd" / "main.go").is_file())
+        self.assertEqual(list(shared.iterdir()), [])
+        self.assertEqual(self.staging_left(), [])
+
+    def test_a_clone_removes_old_entries_of_every_staging_folder(self):
+        """The shared folder and another user's folder can hold what a killed clone left."""
+        scratch = self.shared_staging().parent
+        # A name with no user id, and one whose digit is not an ASCII digit.
+        not_staging = (scratch / ".inspect-repository-staging-backup", scratch / ".inspect-repository-staging-٣")
+        folders = (self.shared_staging(), self.other_user_staging(), *not_staging)
+        for folder in folders:
+            (folder / "clone.old12345").mkdir(parents=True)
+            (folder / "clone.old12345" / "file").write_text("x\n")
+            self.age(folder / "clone.old12345")
+        self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "copy")])
+        self.assertFalse((self.shared_staging() / "clone.old12345").exists())
+        self.assertFalse((self.other_user_staging() / "clone.old12345").exists())
+        for folder in not_staging:
+            self.assertEqual((folder / "clone.old12345" / "file").read_text(), "x\n", folder.name)
+
+    def test_a_link_with_a_staging_folder_s_name_is_not_read(self):
+        outside = self.tmp / "outside"
+        (outside / "clone.old12345").mkdir(parents=True)
+        (outside / "clone.old12345" / "keep.txt").write_text("not staging\n")
+        self.age(outside / "clone.old12345")
+        self.shared_staging().parent.mkdir(parents=True)
+        self.shared_staging().symlink_to(outside)
+        self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "copy")])
+        self.assertEqual((outside / "clone.old12345" / "keep.txt").read_text(), "not staging\n")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a folder whatever its mode")
+    def test_a_staging_folder_the_caller_cannot_read_does_not_stop_the_clone(self):
+        other = self.other_user_staging()
+        (other / "clone.old12345").mkdir(parents=True)
+        self.age(other / "clone.old12345")
+        other.chmod(0o000)
+        self.addCleanup(other.chmod, 0o700)
+        result = self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "copy")])
+        self.assertEqual(result["written"], 3)
+
+    def test_a_destination_in_another_staging_folder_is_refused(self):
+        """The sweep reads the shared folder and each user's, so a copy in one of them does not last."""
+        for folder in (self.shared_staging(), self.other_user_staging()):
+            for into in (folder, folder / "mine"):
+                with self.subTest(into=str(into)):
+                    with self.assertRaises(SystemExit) as refused:
+                        inspect_repository.dispatch(["clone", "--repo", "acme/public", "--into", str(into)])
+                    self.assertIn(f"is in {folder}, which holds only clone staging", str(refused.exception))
+                    self.assertFalse(into.exists())
+        self.assertEqual(self.calls, [])
+
     def test_a_byte_bound_refuses_the_whole_copy(self):
         into = self.tmp / "copy"
         with self.assertRaises(vcs_client.VcsError) as caught:

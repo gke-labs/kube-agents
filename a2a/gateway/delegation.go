@@ -614,16 +614,19 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			addressee, lineNote = routes[i].Profile, fmt.Sprintf(delegatedProfileLineNote, routes[i].Profile)
 		}
 		childID, ok := g.startTaskWith(ctx, rec, taskStart{
-			Text:                 e.Text,
-			Requester:            *parent.Requester,
-			Authority:            authority,
-			CorrelationID:        correlationID,
-			Role:                 taskRoleChild,
-			ParentTaskID:         taskID,
-			Depth:                parent.Depth + 1,
-			LineNote:             lineNote,
-			Route:                routes[i],
-			ProfileChain:         childProfileChain(parent, profileParent),
+			Text:          e.Text,
+			Requester:     *parent.Requester,
+			Authority:     authority,
+			CorrelationID: correlationID,
+			Role:          taskRoleChild,
+			ParentTaskID:  taskID,
+			Depth:         parent.Depth + 1,
+			LineNote:      lineNote,
+			Route:         routes[i],
+			ProfileChain:  childProfileChain(parent, profileParent),
+			// Below a scheduled run, as a single child is: the mark is what
+			// holds this child's own delegation to the unattended card check.
+			Scheduled:            profileParent && parent.belowSchedule(),
 			SteerAuthors:         parent.SteerAuthors,
 			SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 			RootTaskID:           parent.rootID(),

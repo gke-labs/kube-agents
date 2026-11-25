@@ -152,6 +152,44 @@ fixtures:
       than drifted, until then. The names are literals in the stack, the
       same on every project.
 
+  - role: long-name-replaced-pod
+    slot: a
+    available_from_day: 1
+    objects:
+      - deployment/settlement-batch-reconciliation-exporter-for-partner-feeds
+      - configmap/long-name-pod-cycle
+      - serviceaccount/long-name-pod-cycle
+      - role/long-name-pod-cycle
+      - rolebinding/long-name-pod-cycle
+    namespace: seeded-long-name
+    defect: >-
+      One Deployment whose name has 58 characters, so Kubernetes cuts the
+      names of its pods: the name and 5 generated characters, with no hash
+      between them. Its one pod is idle until 18:00 UTC, then uses its CPU
+      limit and holds 64Mi for 11 minutes, then deletes itself through the
+      API with a Role that can delete pods in this namespace only. The live
+      pod is then idle, and the pod of the day before is a replaced pod with
+      a peak above the bar of the waste audit's overrequest check. The first
+      replaced pod exists one day after the plant. The Deployment has no
+      verdict from 18:00 to about 19:11 UTC.
+
+  - role: cpu-burst-and-flat
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/cpu-flat
+      - deployment/cpu-burst
+      - configmap/cpu-cycle
+    namespace: seeded-cpu-cycle
+    defect: >-
+      Two Deployments whose real CPU use is in the manifest. cpu-flat uses
+      the CPU all the time, held by its limit at its 100m request: the
+      control. cpu-burst uses the CPU for 45 seconds at the start of each 10
+      minutes, held by its limit at its 200m request: in a bucket of 300
+      seconds the burst reads as 15% of the request, under the bar of the
+      waste audit's overrequest check, and in a bucket of 60 seconds as 37%
+      or more. No multi-day age gate: the check reads a pod after one hour.
+
   - role: guaranteed-qos-workload
     slot: a
     available_from_day: 0
@@ -390,8 +428,9 @@ fixtures:
     defect: >-
       Slot c's default pool on a 50 GB boot disk with kubeletConfig.podPidsLimit
       4096, where every other pool in the fleet runs a 20 GB disk and no
-      kubelet block, planted ahead of the boot-disk and kubelet-config drift
-      facets, which the drift SOP does not read yet. Day 1 as for drift-outlier,
+      kubelet block. The drift SOP's boot-disk facet reads the disk; the
+      kubelet block is planted ahead of the kubelet-config facet, which the SOP
+      does not read yet. Day 1 as for drift-outlier,
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.
