@@ -1806,10 +1806,8 @@ platformAgent:
     # with CREDENTIAL_PROXY_SCOPED_SA_POOL=0 on its container so the mode an
     # install is in is readable from the Deployment; `enabled: true` renders
     # the mapping into the broker's ConfigMap and sets it to 1. The key this
-    # block replaced, `scopedServiceAccounts`, is still admitted by the schema
-    # as an empty list for one release, because every earlier release record
-    # carries it empty and a retag re-applies the record; a populated one is
-    # refused by name (values.schema.json). Enabled with
+    # block replaced, `scopedServiceAccounts`, is refused by name, empty or
+    # populated (values.schema.json). Enabled with
     # an empty list is refused at `helm install`: the broker refuses to start
     # on an empty pool.
     #
