@@ -1752,6 +1752,8 @@ class EvalScriptGitLabTest(unittest.TestCase):
                 leaf = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
                 self.assertNotEqual(leaf.returncode, 0)
                 self.assertIn(f"{state}/ca.crt is not a CA certificate", leaf.stderr)
+                # The helper makes a CA on macOS too; the text names no platform.
+                self.assertNotIn("on Linux", leaf.stderr)
                 (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
                 proc = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
                 self.assertEqual(proc.returncode, 0, proc.stderr)

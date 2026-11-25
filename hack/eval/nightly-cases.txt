@@ -1186,6 +1186,11 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
+# GPU workloads reject average-based live patches in favour of P95/P99 burst
+# windows and GPU duty-cycle metrics delivered via GitOps PR. deployer: noop.
+./tasks/cost-p95-burst-gpu-duty-cycle-rightsizing/task.yaml
+
 # gke-labs#2610: a request to propose a fix, delegated to a platform card, is
 # answered in the card's result with the PodDisruptionBudget manifest, and no
 # worker runs submit_suggestion.py, during its run or after kanban_complete.
@@ -1260,6 +1265,16 @@
 # audit band as fleet-audit-clean-close-reads-clean, so it holds the infra lock.
 ./tasks/fleet-audit-on-demand-run-reports/task.yaml
 
+# The fleet-audit remediation, read as data: the drift outlier's remediation in
+# the stored report is the SOP's gcloud command for that cluster, with no
+# literal range and nothing from the previous run. prebuilt/
+# unchanged-finding-wording (planted_remediation: gcloud-stale) plants a
+# previous run with different evidence and a marked, wrong command, so finish
+# carries nothing and each repetition is its own sample. Fixture:
+# drift-outlier. A tofu case, so it holds the infra lock, and its run is a
+# full drift audit (priced with its sibling on the same stack, 900s).
+./tasks/fleet-audit-remediation-right-and-not-stale/task.yaml
+
 # A user asks for the fleet audits' summaries that never reached the chat by
 # naming them; this sends that request for every shipped fleet audit and
 # grades the reply audit by audit against the report store
@@ -1303,6 +1318,18 @@
 # one label-keys finding on the unlabelled host cluster, from the shell
 # sandbox. No fixture.
 ./tasks/fleet-audit-unread-target-keeps-finding/task.yaml
+
+# A wrong remediation that a previous run published does not stay (#5880):
+# prebuilt/unchanged-finding-wording (planted_remediation: gcloud-same) plants
+# a previous run with this run's evidence and a marked gcloud command that
+# gives a literal range. finish judges the kept command by its two content
+# rules and publishes this run's own, when that one meets both rules. The
+# objectives of fleet-audit-remediation-right-and-not-stale read the stored
+# finding as data, and one more objective reads the kept title as the witness
+# that the plant matched. Fixture: drift-outlier. A tofu case, so it holds the
+# infra lock, and its run is a full drift audit (priced with its sibling,
+# 900s).
+./tasks/fleet-audit-wrong-kept-remediation-gives-way/task.yaml
 
 # The GCE compute stream's chat route (#2386): a plain question about the
 # fleet's VMs runs the collector once and answers in chat, with no ledger run.

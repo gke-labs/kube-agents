@@ -23,7 +23,7 @@ import (
 func profileBatchParent(t *testing.T, r *rig, conv string, clusters ...string) (*lib.TaskExecution, *lib.Envelope, []*lib.Envelope) {
 	t.Helper()
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	turn := profileTurn(conv, "chat", nil)
 	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
@@ -245,7 +245,7 @@ func TestAProfileParentsBatchWithAnOutOfScopeEntryMintsNothing(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	conv := "console:tab-profile-batch-scope"
 	turn := profileTurn(conv, "chat", nil)
@@ -304,7 +304,7 @@ func TestAWithdrawnProfileBatchEndsEveryEntry(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 	ctx := context.Background()
 	conv := "console:tab-profile-batch-withdrawn"
@@ -352,6 +352,10 @@ func TestAWithdrawnProfileBatchEndsEveryEntry(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := childResultsOn(t, r, "chat", origin.TaskID); len(got) != 2 {
 		t.Fatalf("%d ends after the withdrawn child's terminal, want 2: %+v", len(got), got)
+	} // Each entry has its own end, so the parent gets no whole-request
+	// refusal on top of them (#4860).
+	if got := refusalsOn(t, r, "chat", origin.TaskID); len(got) != 0 {
+		t.Fatalf("a withdrawn batch's parent got a refusal too: %+v", got)
 	}
 }
 
@@ -414,7 +418,7 @@ func TestAWithdrawnProfileBatchLeavesAnEndedEntryAlone(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 	ctx := context.Background()
 	conv := "console:tab-profile-batch-withdrawn-ended"
@@ -500,7 +504,7 @@ func TestAProfileParentsBatchWithOneTargetsPinRefusingItsTierMintsNothing(t *tes
 	t.Parallel()
 	r := startProfileRig(t)
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.g.profiles.put("tse", &lib.AgentCard{Name: "tse", Parameters: clusterParams})
 	// Cluster c's pinned profile takes only unattended, not the read tier
 	// the parent's children are minted at.
@@ -579,7 +583,7 @@ func TestASupervisorEndForAProfileParentCancelsItsBatch(t *testing.T) {
 func TestAProfileParentThatEndsCancelsItsSingleLiveChild(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	conv := "console:tab-profile-single-parent-ends"
 	turn := profileTurn(conv, "chat", nil)
@@ -639,7 +643,7 @@ func TestABatchChildUnderAConfirmedParentCarriesItsChangeRequest(t *testing.T) {
 	for _, confirm := range []bool{true, false} {
 		r := startProfileRig(t)
 		r.g.cfg.DelegationWidthMax = 10
-		r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+		r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 		ctx := context.Background()
 		conv := fmt.Sprintf("discord:cr-batch/%v", confirm)
 		turn := profileTurn(conv, "chat", nil)
@@ -795,7 +799,7 @@ func TestAWithdrawnProfileBatchSendsAnUnsentEndAsRecorded(t *testing.T) {
 			t.Parallel()
 			r := startProfileRig(t)
 			r.g.cfg.DelegationWidthMax = 10
-			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 			r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 			ctx := context.Background()
 			conv := "console:tab-profile-batch-withdrawn-unsent-" + tc.name
@@ -866,10 +870,10 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 	for _, tc := range []struct {
 		name string
 		// first makes the parent's first request end with no batch on the
-		// bus, and returns the record's child count after it.
-		first func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int
+		// bus, and returns the children on the record after it.
+		first func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) []string
 	}{
-		{"refused", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int {
+		{"refused", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) []string {
 			r.g.cfg.DelegationWidthMax = 1 // two tasks are too wide
 			if err := parent.PublishArtifact(context.Background(), two(t)); err != nil {
 				t.Fatal(err)
@@ -879,9 +883,9 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 				return ref.DelegationEnd != ""
 			})
 			r.g.cfg.DelegationWidthMax = 10
-			return 0
+			return nil
 		}},
-		{"withdrawn", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) int {
+		{"withdrawn", func(t *testing.T, r *rig, parent *lib.TaskExecution, conv, originID string) []string {
 			r.g.cfg.DelegationWidthMax = 10
 			r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 			art := two(t)
@@ -906,13 +910,13 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 			r.g.beforeBatchChild = nil
 			rec, _ := r.g.reg.Get(context.Background(), conv)
 			ref, _ := rec.TaskRefFor(originID)
-			return len(ref.Children)
+			return append([]string(nil), ref.Children...)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			r := startProfileRig(t)
-			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 			ctx := context.Background()
 			conv := "console:tab-profile-batch-repeat-" + tc.name
 			turn := profileTurn(conv, "chat", nil)
@@ -934,10 +938,25 @@ func TestAProfileParentsRepeatRequestAfterOneThatEndedMintsNothing(t *testing.T)
 				t.Fatal(err)
 			}
 			time.Sleep(500 * time.Millisecond)
+			// Nothing new on the record: every child after the repeat was
+			// there before it. A child a withdrawal kept (one whose cancel
+			// couldn't be sent) may leave the record later, when its own
+			// end arrives, so the count can fall; it never rises.
+			before := map[string]bool{}
+			for _, id := range kids {
+				before[id] = true
+			}
 			rec, _ := r.g.reg.Get(ctx, conv)
 			ref, _ := rec.TaskRefFor(origin.TaskID)
-			if len(ref.Children) != kids {
-				t.Fatalf("children after the repeat = %v, want the %d from before it", ref.Children, kids)
+			for _, id := range ref.Children {
+				if !before[id] {
+					t.Fatalf("children after the repeat = %v, want none beyond %v", ref.Children, kids)
+				}
+			}
+			for _, k := range rec.Tasks {
+				if k.ParentTaskID == origin.TaskID && !before[k.ID] {
+					t.Fatalf("an entry %s minted under the parent by the repeat (before: %v)", k.ID, kids)
+				}
 			}
 		})
 	}
@@ -956,7 +975,7 @@ func TestAWithdrawnProfileBatchRetriesAnEndThatFailsToSend(t *testing.T) {
 		return armed.Load() == 1 && failed.Add(1) == 1
 	}
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 	ctx := context.Background()
 	conv := "console:tab-profile-batch-withdrawn-retry"

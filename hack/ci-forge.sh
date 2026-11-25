@@ -355,13 +355,13 @@ preflight_project_pieces() {
   echo "✓ Project pieces present: ${FORGE_ADDRESS_NAME}=${FORGE_IP}, ${EVAL_FORGE_HOST}. in ${FORGE_DNS_ZONE}, ${FORGE_FIREWALL_RULE}, ${FORGE_DENY_RULE}, ${FORGE_VM_SERVICE_ACCOUNT}"
 }
 
-# ─── up: certificates, from the repo's own helper, Linux only ────────────────
+# ─── up: certificates, from the repo's own helper ────────────────────────────
 make_certificates() {
   FORGE_CERT_DIR="$(mktemp -d "${FORGE_SCRATCH_DIR}/forge-certs.XXXXXX")" # 0700; make-certs.sh takes an empty directory
   bash "${SCRIPT_DIR}/ghes-proxy/make-certs.sh" "${EVAL_FORGE_HOST}" "${FORGE_CERT_DIR}" "${FORGE_CERT_DAYS}"
   # The deploy's gate would refuse this later; refuse it here, before a VM.
   if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -text -in "${FORGE_CERT_DIR}/ca.crt" 2>/dev/null)"; then
-    echo "ERROR: ${FORGE_CERT_DIR}/ca.crt is not a CA certificate; make-certs.sh needs OpenSSL (Linux), not LibreSSL (kube-agents#3682)." >&2
+    echo "ERROR: ${FORGE_CERT_DIR}/ca.crt is not a CA certificate (its basicConstraints lack CA:TRUE); make-certs.sh made it with $(openssl version 2>/dev/null) (kube-agents#3682)." >&2
     exit 1
   fi
   echo "✓ Certificates for ${EVAL_FORGE_HOST} made, valid ${FORGE_CERT_DAYS} day(s); the CA key is gone"
