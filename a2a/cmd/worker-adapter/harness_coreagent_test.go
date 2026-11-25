@@ -32,3 +32,12 @@ func TestTheCoreAgentArgvCarriesNoSession(t *testing.T) {
 		t.Errorf("argv %q", got)
 	}
 }
+
+// A pod configured for a persona passes --persona-required.
+func TestACoreAgentPodConfiguredForAPersonaRequiresIt(t *testing.T) {
+	t.Setenv(coreAgentPersonaRequiredEnv, "true")
+	argv := strings.Join((coreAgentBuilder{}).command(harnessSpec{path: coreAgentHarnessPath, model: "m"}), " ")
+	if !strings.Contains(argv, "--persona-required") {
+		t.Errorf("argv %q", argv)
+	}
+}

@@ -35,6 +35,7 @@ import (
 	"github.com/go-steer/core-agent/v3/pkg/tools"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
+	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
 // userID is the session log's user for every conversation: one worker pod
@@ -42,8 +43,9 @@ import (
 const userID = "worker"
 
 type options struct {
-	personaDir string
-	model      string
+	personaDir      string
+	personaRequired bool
+	model           string
 }
 
 func main() {
@@ -55,15 +57,19 @@ func main() {
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Non-dumpable before anything else: a same-UID command the turn runs
 	// can then neither read this process's memory or environ nor open its
-	// /proc/<pid>/fd, so it can't write forged event lines into stdout.
+	// /proc/<pid>/fd. That covers this end of the stdout pipe only; the
+	// adapter's end is the adapter's to protect, and its decoder accepts
+	// event lines only in the turn's order.
 	if err := childenv.Protect(); err != nil {
 		fmt.Fprintln(stderr, "core-agent-harness: protect:", err)
 		return 1
 	}
+	withholdFromToolChildren(os.Environ())
 	fs := flag.NewFlagSet("core-agent-harness", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var o options
 	fs.StringVar(&o.personaDir, "persona-dir", "", "the rendered persona (instructions.md, skills/<name>/SKILL.md), read once into memory")
+	fs.BoolVar(&o.personaRequired, "persona-required", false, "fail the turn when --persona-dir is missing, rather than run with no persona")
 	fs.StringVar(&o.model, "model", "", "the model name (required)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -81,7 +87,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	var env coreagentwire.Envelope
 	raw, err := bufio.NewReaderSize(io.LimitReader(stdin, coreagentwire.MaxEnvelopeBytes+1), 64<<10).ReadBytes('\n')
 	switch {
-	case len(raw) > coreagentwire.MaxEnvelopeBytes:
+	case len(bytes.TrimSuffix(raw, []byte("\n"))) > coreagentwire.MaxEnvelopeBytes:
 		err = fmt.Errorf("over %d bytes", coreagentwire.MaxEnvelopeBytes)
 	case err == io.EOF && len(bytes.TrimSpace(raw)) > 0:
 		err = nil // a final line without its newline
@@ -119,7 +125,7 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	if err != nil {
 		return fmt.Errorf("tools: %w", err)
 	}
-	instructions, skillsets, err := loadPersona(ctx, o.personaDir)
+	instructions, skillsets, err := loadPersona(ctx, o.personaDir, o.personaRequired)
 	if err != nil {
 		return fmt.Errorf("persona: %w", err)
 	}
@@ -214,4 +220,14 @@ func emitAdded(ctx context.Context, svc session.Service, id string, seeded int, 
 		i++
 	}
 	return nil
+}
+
+// withholdFromToolChildren withholds, from every process a turn starts (the
+// shell tool, an MCP stdio server), each variable in env off the worker's
+// tool-child allowlist (workeradapter.WithheldFromToolChildren): the model,
+// provider, bus and chat credentials this process carries, whatever their
+// names. This process keeps them. An MCP server still gets its own entry's
+// env on top.
+func withholdFromToolChildren(env []string) {
+	childenv.Withhold(workeradapter.WithheldFromToolChildren(env)...)
 }

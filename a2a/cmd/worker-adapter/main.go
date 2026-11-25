@@ -358,6 +358,20 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	// Chosen before anything below builds an argv or env from it.
 	activeHarness = builder
 	log.Info("harness selected", "harness", string(harness))
+	// Every harness runs its tools as the adapter's user, so the adapter is
+	// made non-dumpable before any turn: those processes then can't read its
+	// environment or memory, open its /proc fds (the harness's pipes, where a
+	// forged event line could be written), or attach to it. A harness
+	// process is unaffected: exec makes it dumpable again. Where it fails,
+	// a harness that depends on isolation (core-agent, Antigravity) is
+	// refused; Claude Code runs as it did before, with a warning.
+	if err := protectAdapter(); err != nil {
+		if harness == persona.CoreAgent || harness == persona.Antigravity {
+			log.Error("the adapter could not be made non-dumpable; refusing the harness", "harness", string(harness), "err", err)
+			return workeradapter.Config{}, false
+		}
+		log.Warn("the adapter could not be made non-dumpable", "harness", string(harness), "err", err)
+	}
 
 	originSeq, originSeqStated := originSeq(log)
 	// delegateSocket feeds Config.DelegateSocket (commented in adapter.go):
@@ -732,6 +746,9 @@ func selfPath() string {
 // the harness's stream driver and argv builder. A value the worker doesn't
 // know is an error, never a fall back to Claude Code: a typo would otherwise
 // run the wrong harness without a word.
+// protectAdapter is workeradapter.ProtectProcess, swapped in tests.
+var protectAdapter = workeradapter.ProtectProcess
+
 func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.Driver, harnessBuilder, error) {
 	h := persona.Harness(getenv(lib.EnvHarness))
 	if h == "" && getenv(lib.EnvProfileWorker) == "true" {
@@ -750,8 +767,10 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	// (#6832), and later on session pods (#6716). Elsewhere only the pod
 	// spec or the image's ENV can set it; a profile with no type gets
 	// neither variable, by design, since its image is already trusted code.
-	// core-agent likewise, until its end-of-turn sweep lands (#6710).
-	if (driver.Harness() == persona.Antigravity || driver.Harness() == persona.CoreAgent) && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
+	// core-agent needs no waiver: it runs one turn per process, behind the
+	// turn-boundary check, with the adapter non-dumpable and its tool
+	// children's environment allowlisted (#6710).
+	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
 		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
 			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
 	}

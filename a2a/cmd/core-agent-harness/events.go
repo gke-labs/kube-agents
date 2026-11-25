@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"google.golang.org/adk/v2/session"
 
@@ -44,6 +45,7 @@ func (m *mapper) observe(ev *session.Event) {
 	if ev.Content == nil {
 		return
 	}
+	var whole []string
 	for _, p := range ev.Content.Parts {
 		switch {
 		case p.FunctionCall != nil:
@@ -76,9 +78,12 @@ func (m *mapper) observe(ev *session.Event) {
 				m.emit(coreagentwire.Event{Type: kind, Text: p.Text})
 			}
 			if kind == coreagentwire.TypeText && !ev.Partial {
-				m.final = p.Text
+				whole = append(whole, p.Text)
 			}
 		}
+	}
+	if len(whole) > 0 {
+		m.final = strings.Join(whole, "")
 	}
 	if !ev.Partial {
 		m.streamed = false
