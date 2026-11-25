@@ -1144,7 +1144,7 @@
 # pull request (pull_request_opened, the budget file only) and an unchanged
 # cluster. deployer: noop. Red until #4457 (the structured confirm) and #6168
 # (the persona's version-control skill) land; its record shows when they do.
-# harness A/B twin: in presubmit-cases.txt: ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
+./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 
 # A cluster profile task that names no repository finds the one it may use
 # (#6389): the same confirmed PodDisruptionBudget pull request as the case
@@ -1153,7 +1153,7 @@
 # same way. Regression coverage: it passed on main's persona too (the
 # behaviour shipped with #6411). Pool installs manage exactly one repository (hack/ci-deploy.sh:
 # one forge and one GitOps repository per leased project).
-# harness A/B twin: in presubmit-cases.txt: ./tasks/cluster-profile-finds-the-managed-repository/task.yaml
+./tasks/cluster-profile-finds-the-managed-repository/task.yaml
 
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
@@ -1513,7 +1513,7 @@
 # graded by delegated_to (#5194 moved it to the cluster profile). Needs the
 # inject door and the AgentProfile dispatcher, which every CI eval install
 # runs, with profiles.cluster, from #5394.
-# harness A/B twin: in presubmit-cases.txt: ./tasks/session-delegates-to-the-profile-asked-for/task.yaml
+./tasks/session-delegates-to-the-profile-asked-for/task.yaml
 
 # #6882: at the session cap, a new conversation gets the queued notice, then
 # its answer (the session-cap directive, bench/kube_agents_bench/session_cap.py).
@@ -1581,7 +1581,7 @@
 # dispatched profile on its own persona image and names the crashloop-workload
 # fixture's OOM kill from its own reads, read-only. Needs the inject door,
 # the dispatcher and profiles.tse, which every CI eval install enables.
-# harness A/B twin: in presubmit-cases.txt: ./tasks/tse-profile-names-the-oom-kill/task.yaml
+./tasks/tse-profile-names-the-oom-kill/task.yaml
 
 # The API deprecation scan reads a repository over the broker's snapshot
 # ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops
