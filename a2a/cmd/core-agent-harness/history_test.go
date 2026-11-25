@@ -53,7 +53,7 @@ func (m *echoModel) GenerateContent(_ context.Context, req *llm.Request, _ bool)
 func withModel(t *testing.T, m llm.LLM) {
 	t.Helper()
 	prev := newModel
-	newModel = func(context.Context, string) (adkmodel.LLM, error) { return models.Adapt(m), nil }
+	newModel = func(context.Context, string, bool) (adkmodel.LLM, error) { return models.Adapt(m), nil }
 	t.Cleanup(func() { newModel = prev })
 }
 

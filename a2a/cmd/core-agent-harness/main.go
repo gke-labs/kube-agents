@@ -106,7 +106,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 // turn builds the agent for one turn and runs it, emitting its events.
 func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(coreagentwire.Event)) error {
-	llm, err := newModel(ctx, o.model)
+	llm, err := newModel(ctx, o.model, env.Policy.WebSearch)
 	if err != nil {
 		return fmt.Errorf("model: %w", err)
 	}

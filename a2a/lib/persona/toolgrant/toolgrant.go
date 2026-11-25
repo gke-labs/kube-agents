@@ -39,8 +39,15 @@ type Policy struct {
 	// WebSearch: search the web. Fetching an arbitrary URL is a separate
 	// grant no worker has, so URL fetch stays off.
 	WebSearch bool
+	// Shell: the shell may run any single simple command (a persona's
+	// `shell`, which Claude Code grants as an unrestricted Bash). core-agent
+	// allows it only as one command with a literal argv: no chaining,
+	// pipes, redirections, expansions or substitutions, and its own verb
+	// checks (git's read-only forms, find without -exec) hold.
+	Shell bool
 	// ShellPrefixes are the only commands the shell may run, each a binary
-	// with optional subcommands ("kubectl", "gh pr list"). Empty: no shell.
+	// with optional subcommands ("kubectl", "gh pr list"). Empty, with no
+	// Shell and no Scripts: no shell.
 	ShellPrefixes []string
 	// Scripts are persona skill scripts the shell may run, each an
 	// absolute path under ScriptRoot, run directly, never through an
@@ -147,8 +154,9 @@ type CoreAgentGrant struct {
 	// MCP maps a server to the tools it may expose (its tool allowlist).
 	MCP map[string][]string
 	// GeminiGoogleSearch is whether the grant asks for Gemini's server-side
-	// search. Nothing turns it on yet: the harness's model has every Gemini
-	// built-in off, and the session grant refuses web search.
+	// Google Search, the harness's only built-in that may be on: server-side,
+	// so not gated per call, as WebSearch is on Claude Code. URL context and
+	// code execution are never on.
 	GeminiGoogleSearch bool
 }
 
@@ -185,7 +193,7 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 		case c == classRead && p.ReadFiles, c == classWrite && p.WriteFiles:
 			g.Builtins = append(g.Builtins, name)
 			g.Allow = append(g.Allow, name+":"+inWorkspace)
-		case c == classShell && (len(p.ShellPrefixes) > 0 || len(p.Scripts) > 0):
+		case c == classShell && (p.Shell || len(p.ShellPrefixes) > 0 || len(p.Scripts) > 0):
 			g.Builtins = append(g.Builtins, name)
 		case c == classRead, c == classWrite, c == classShell:
 			// Not registered. The deny is defence in depth for the write
@@ -200,6 +208,11 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 	// simple command with a literal argv (no chaining, pipes, redirections,
 	// env prefixes or expansions); a command needs both to run with and
 	// without arguments.
+	if p.Shell {
+		// An open prefix: any command, still only as one simple literal
+		// command (above).
+		g.Allow = append(g.Allow, "bash:*")
+	}
 	for _, prefix := range p.ShellPrefixes {
 		if !shellPrefix.MatchString(prefix) {
 			return CoreAgentGrant{}, fmt.Errorf("shell prefix %q is not a binary and its subcommands", prefix)

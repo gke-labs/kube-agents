@@ -148,6 +148,16 @@ adapter yet.
     grant takes the server's `include` list.
   - Tools pass through as the manifest names them, for the harness's tool
     grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
+  - A profile worker's core-agent tool grant is read from this rendering
+    (`workeradapter.PersonaToolPolicy`) and grants what the Claude Code
+    rendering does: `read_file` the read tools, `shell` any single simple
+    command, `web_search` Gemini's server-side Google Search, and each MCP
+    server's listed tools; never writes. Two narrowings against Claude Code
+    are deliberate: reads stay inside the workspace, and the shell refuses
+    pipes, chains, redirections and expansions. Search is server-side and
+    not gated per call, as WebSearch is on Claude Code, and works only where
+    the model endpoint offers it beside function calls (Gemini 3 or later,
+    by model name).
   - Each `SKILL.md` frontmatter is written back with only the keys the
     harness reads, read as exactly one YAML document between exact `---`
     lines.
