@@ -67,7 +67,9 @@ verification_spec:
   #   a bullet) or within the four lines after it (a bullet list, or pasted
   #   `describe` output, where `documentation` sorts before `enabled`).
   # - forbidden: the policy's own line, or the two lines after it, reports
-  #   it enabled: "is enabled", "<name>: enabled", `enabled: true|yes`, or
+  #   it enabled: "is enabled", "<name>: enabled" (on the policy's own
+  #   line: read across the line break, it took the next bullet's "Enabled:"
+  #   label for a state), `enabled: true|yes`, or
   #   an enabled cell (`true`, `yes`, `enabled`, `active`, after an optional
   #   mark such as an emoji). This refuses an answer that calls the planted
   #   policy enabled and then names a neighbour, a channel or another column
@@ -86,7 +88,7 @@ verification_spec:
         - 'orbital-checkout restart storm[^\n]*(\n[^\n]*){0,3}\n[^\n]*\b(disabled|not enabled|enabled\W{0,4}(false|no)\s*(?:\||\n|$|[.,;)]))'
       forbidden_patterns:
         - 'orbital-checkout restart storm[^\n]*\b(is|was|currently|remains|stays)\s+(enabled|active|on)\b'
-        - 'orbital-checkout restart storm\W{0,4}(enabled|active)\b(?!\W{0,4}(false|no)\b)'
+        - 'orbital-checkout restart storm[^\w\n]{0,4}(enabled|active)\b(?![^\w\n]{0,4}(false|no)\b)'
         - 'orbital-checkout restart storm[^\n]*(\n[^\n]*){0,2}\benabled\W{0,4}(true|yes)\b'
         - 'orbital-checkout restart storm[^\n]*\|\s*(?:\W{0,3}\s*)?(true|yes|enabled|active)\s*(?:\||\n|$)'
   # The answer has to come from Cloud Monitoring. A worker refused the
