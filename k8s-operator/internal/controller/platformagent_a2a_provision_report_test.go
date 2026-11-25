@@ -35,10 +35,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -493,6 +495,76 @@ func TestTheMissingTopologySkewSubjectIsAnEventOnTheCR(t *testing.T) {
 	}
 	if strings.Contains(events[0], reasonTasksSubjectCapMissing) {
 		t.Errorf("the Event names the cap gap, which this report did not carry:\n%s", events[0])
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
+		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
+	}
+}
+
+func TestTheOperatorAppendsTheMissingTopologySkewSubjectThroughReconcile(t *testing.T) {
+	creds := a2aFullCreds("p", "1")
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	const (
+		updaterUser = "topics-updater"
+		updaterPW   = "pw-topics-updater"
+	)
+	conf = a2aWithStaticTrustedUser(t, conf, a2aIdentity{
+		user:    updaterUser,
+		account: a2aAccountControl,
+		publish: []string{
+			"$JS.API.STREAM.INFO." + a2aTopicsStateStream,
+			"$JS.API.STREAM.UPDATE." + a2aTopicsStateStream,
+			"_INBOX." + updaterUser + ".>",
+		},
+		subscribe: []string{"_INBOX." + updaterUser + ".>"},
+	}, updaterPW)
+
+	s, _ := a2aStartRenderedServer(t, conf)
+	ctx := context.Background()
+
+	preUpgradeSubjects := []string{
+		a2aUpgradeReadinessSubject,
+		a2aSharedBlueprintSubject,
+		a2aSharedProbeSubject,
+	}
+	_, seedJS := a2aConnectAs(t, s.ClientURL(), "seed", string(creds.Data["seed-password"]))
+	for _, cfg := range a2aSeedStreamConfigs() {
+		if cfg.Name == a2aTopicsStateStream {
+			cfg.Subjects = slices.Clone(preUpgradeSubjects)
+		}
+		if _, err := seedJS.CreateStream(ctx, cfg); err != nil {
+			t.Fatalf("seed CreateStream(%s): %v", cfg.Name, err)
+		}
+	}
+
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(8)
+	r.Recorder = rec
+	r.busTopicsStateConn = func(_ context.Context, _ *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
+		return nats.Connect(s.ClientURL(), a2aTestBusTLS(t), nats.UserInfo(updaterUser, updaterPW), nats.CustomInboxPrefix("_INBOX."+updaterUser))
+	}
+	jobName := provisionedInstall(t, ctx, cl, r, agent, `{"topics_state_subject":{"missing":1}}`)
+
+	reconcileTwice(t, ctx, r, req)
+	events := drainEvents(rec)
+	if len(events) != 1 {
+		t.Fatalf("got %d Events, want 1: %q", len(events), events)
+	}
+	for _, want := range []string{
+		corev1.EventTypeNormal, reasonTopicsStateSubjectsAppended, jobName, a2aTopologySkewSubject,
+	} {
+		if !strings.Contains(events[0], want) {
+			t.Errorf("the Event does not carry %q:\n%s", want, events[0])
+		}
+	}
+	st, err := seedJS.Stream(ctx, a2aTopicsStateStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSubjects := append(slices.Clone(preUpgradeSubjects), a2aTopologySkewSubject)
+	if !slices.Equal(st.CachedInfo().Config.Subjects, wantSubjects) {
+		t.Errorf("TOPICS-STATE subjects after Reconcile = %v, want %v", st.CachedInfo().Config.Subjects, wantSubjects)
 	}
 	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
 		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)

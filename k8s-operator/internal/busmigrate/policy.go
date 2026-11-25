@@ -1,15 +1,49 @@
 package busmigrate
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
+)
+
+const (
+	errSubjectAppendRefusedText     = "stream subject append refused"
+	subjectAppendStreamErrFmt       = "stream %s: %w"
+	subjectAppendDiffsErrFmt        = "%w: stream %s: %s"
+	subjectAppendMissingErrFmt      = "%w: %s"
+	subjectAppendNameErrFmt         = "%w: stream %s: name changed (%q -> %q)"
+	subjectAppendRePublishErrFmt    = "%w: stream %s: republish is not permitted"
+	subjectAppendSourcesErrFmt      = "%w: stream %s: sources are not permitted"
+	subjectAppendMirrorErrFmt       = "%w: stream %s: mirror is not permitted"
+	subjectAppendEmptyErrFmt        = "%w: stream %s: empty subject list is not permitted"
+	subjectAppendExistingErrFmt     = "%w: stream %s: existing subject %q is not one of %v"
+	subjectAppendDupExistingErrFmt  = "%w: stream %s: duplicate existing subject %q"
+	subjectAppendRemovedErrFmt      = "%w: stream %s: subject %q was removed"
+	subjectAppendAddedErrFmt        = "%w: stream %s: added subject %q is not one of %v"
+	subjectAppendDupAddedErrFmt     = "%w: stream %s: duplicate subject %q"
+	subjectAppendRetentionErrFmt    = "%w: stream %s: retention changed (%v -> %v)"
+	subjectAppendStorageErrFmt      = "%w: stream %s: storage changed (%v -> %v)"
+	subjectAppendMaxBytesErrFmt     = "%w: stream %s: max_bytes changed (%d -> %d)"
+	subjectAppendMaxAgeErrFmt       = "%w: stream %s: max_age changed (%s -> %s)"
+	subjectAppendDiscardErrFmt      = "%w: stream %s: discard changed (%v -> %v)"
+	subjectAppendMaxMsgsSubjErrFmt  = "%w: stream %s: max_msgs_per_subject changed (%d -> %d)"
+	subjectAppendMaxMsgsErrFmt      = "%w: stream %s: max_msgs changed (%d -> %d)"
+	subjectAppendMaxMsgSizeErrFmt   = "%w: stream %s: max_msg_size changed (%d -> %d)"
+	subjectAppendMaxConsumersErrFmt = "%w: stream %s: max_consumers changed (%d -> %d)"
+	subjectAppendReplicasErrFmt     = "%w: stream %s: num_replicas changed (%d -> %d)"
+	subjectAppendFlagsErrFmt        = "%w: stream %s: retention or access flags changed"
+	subjectAppendDuplicatesErrFmt   = "%w: stream %s: duplicate_window changed (%s -> %s)"
+	subjectAppendOutsideErrFmt      = "%w: stream %s: config changed outside subjects"
+	policyDiffSeparator             = "; "
 )
 
 // StreamPolicy is the operator's render of one provisioned stream, on the
@@ -112,6 +146,158 @@ func (p StreamPolicy) MissingSubjects(cfg nats.StreamConfig) []string {
 		}
 	}
 	return missing
+}
+
+// ErrSubjectAppendRefused is returned when a subject-only stream update
+// attempts any change other than appending missing policy subjects: a
+// removed or unrendered subject, a changed limit or retention, or a
+// RePublish, Mirror, or Source.
+var ErrSubjectAppendRefused = errors.New(errSubjectAppendRefusedText)
+
+// CheckSubjectAppend verifies that after differs from before only by
+// appending subjects from p.Subjects: no subject removed from before, no
+// duplicate or unrendered subject, no RePublish (nor Mirror or Sources),
+// and no changed limit, retention, or other config field.
+func (p StreamPolicy) CheckSubjectAppend(before, after nats.StreamConfig) error {
+	if before.Name != p.Name || after.Name != p.Name {
+		return fmt.Errorf(subjectAppendNameErrFmt, ErrSubjectAppendRefused, p.Name, before.Name, after.Name)
+	}
+	if before.RePublish != nil || after.RePublish != nil {
+		return fmt.Errorf(subjectAppendRePublishErrFmt, ErrSubjectAppendRefused, p.Name)
+	}
+	if len(before.Sources) > 0 || len(after.Sources) > 0 {
+		return fmt.Errorf(subjectAppendSourcesErrFmt, ErrSubjectAppendRefused, p.Name)
+	}
+	if before.Mirror != nil || after.Mirror != nil {
+		return fmt.Errorf(subjectAppendMirrorErrFmt, ErrSubjectAppendRefused, p.Name)
+	}
+	if len(before.Subjects) == 0 || len(after.Subjects) == 0 {
+		return fmt.Errorf(subjectAppendEmptyErrFmt, ErrSubjectAppendRefused, p.Name)
+	}
+	for i, s := range before.Subjects {
+		if !slices.Contains(p.Subjects, s) {
+			return fmt.Errorf(subjectAppendExistingErrFmt, ErrSubjectAppendRefused, p.Name, s, p.Subjects)
+		}
+		if slices.Contains(before.Subjects[:i], s) {
+			return fmt.Errorf(subjectAppendDupExistingErrFmt, ErrSubjectAppendRefused, p.Name, s)
+		}
+		if !slices.Contains(after.Subjects, s) {
+			return fmt.Errorf(subjectAppendRemovedErrFmt, ErrSubjectAppendRefused, p.Name, s)
+		}
+	}
+	for i, s := range after.Subjects {
+		if !slices.Contains(p.Subjects, s) {
+			return fmt.Errorf(subjectAppendAddedErrFmt, ErrSubjectAppendRefused, p.Name, s, p.Subjects)
+		}
+		if slices.Contains(after.Subjects[:i], s) {
+			return fmt.Errorf(subjectAppendDupAddedErrFmt, ErrSubjectAppendRefused, p.Name, s)
+		}
+	}
+	if before.Retention != after.Retention {
+		return fmt.Errorf(subjectAppendRetentionErrFmt, ErrSubjectAppendRefused, p.Name, before.Retention, after.Retention)
+	}
+	if before.Storage != after.Storage {
+		return fmt.Errorf(subjectAppendStorageErrFmt, ErrSubjectAppendRefused, p.Name, before.Storage, after.Storage)
+	}
+	if before.MaxBytes != after.MaxBytes {
+		return fmt.Errorf(subjectAppendMaxBytesErrFmt, ErrSubjectAppendRefused, p.Name, before.MaxBytes, after.MaxBytes)
+	}
+	if before.MaxAge != after.MaxAge {
+		return fmt.Errorf(subjectAppendMaxAgeErrFmt, ErrSubjectAppendRefused, p.Name, before.MaxAge, after.MaxAge)
+	}
+	if before.Discard != after.Discard {
+		return fmt.Errorf(subjectAppendDiscardErrFmt, ErrSubjectAppendRefused, p.Name, before.Discard, after.Discard)
+	}
+	if before.MaxMsgsPerSubject != after.MaxMsgsPerSubject {
+		return fmt.Errorf(subjectAppendMaxMsgsSubjErrFmt, ErrSubjectAppendRefused, p.Name, before.MaxMsgsPerSubject, after.MaxMsgsPerSubject)
+	}
+	if before.MaxMsgs != after.MaxMsgs {
+		return fmt.Errorf(subjectAppendMaxMsgsErrFmt, ErrSubjectAppendRefused, p.Name, before.MaxMsgs, after.MaxMsgs)
+	}
+	if before.MaxMsgSize != after.MaxMsgSize {
+		return fmt.Errorf(subjectAppendMaxMsgSizeErrFmt, ErrSubjectAppendRefused, p.Name, before.MaxMsgSize, after.MaxMsgSize)
+	}
+	if before.MaxConsumers != after.MaxConsumers {
+		return fmt.Errorf(subjectAppendMaxConsumersErrFmt, ErrSubjectAppendRefused, p.Name, before.MaxConsumers, after.MaxConsumers)
+	}
+	if before.Replicas != after.Replicas {
+		return fmt.Errorf(subjectAppendReplicasErrFmt, ErrSubjectAppendRefused, p.Name, before.Replicas, after.Replicas)
+	}
+	if before.AllowRollup != after.AllowRollup || before.DenyDelete != after.DenyDelete || before.DenyPurge != after.DenyPurge || before.AllowDirect != after.AllowDirect {
+		return fmt.Errorf(subjectAppendFlagsErrFmt, ErrSubjectAppendRefused, p.Name)
+	}
+	if before.Duplicates != after.Duplicates {
+		return fmt.Errorf(subjectAppendDuplicatesErrFmt, ErrSubjectAppendRefused, p.Name, before.Duplicates, after.Duplicates)
+	}
+	afterWithoutSubjects := after
+	afterWithoutSubjects.Subjects = before.Subjects
+	if !reflect.DeepEqual(before, afterWithoutSubjects) {
+		return fmt.Errorf(subjectAppendOutsideErrFmt, ErrSubjectAppendRefused, p.Name)
+	}
+	livePolicy := p
+	if before.Replicas > 0 {
+		livePolicy.Replicas = before.Replicas
+	}
+	if p.MaxConsumers != 0 && before.MaxConsumers >= p.MaxConsumers {
+		livePolicy.MaxConsumers = before.MaxConsumers
+	}
+	if diffs := livePolicy.Check(after); len(diffs) != 0 {
+		return fmt.Errorf(subjectAppendDiffsErrFmt, ErrSubjectAppendRefused, p.Name, strings.Join(diffs, policyDiffSeparator))
+	}
+	return nil
+}
+
+// AppendMissingSubjects returns before with any subjects from p.Subjects that
+// before lacks appended in policy order, plus the list of added subjects. It
+// refuses via CheckSubjectAppend if before or the resulting config differs on
+// any field other than added policy subjects.
+func (p StreamPolicy) AppendMissingSubjects(before nats.StreamConfig) (nats.StreamConfig, []string, error) {
+	if err := p.CheckSubjectAppend(before, before); err != nil {
+		return nats.StreamConfig{}, nil, err
+	}
+	var added []string
+	for _, subject := range p.Subjects {
+		if !slices.Contains(before.Subjects, subject) {
+			added = append(added, subject)
+		}
+	}
+	after := before
+	after.Subjects = append(slices.Clone(before.Subjects), added...)
+	if err := p.CheckSubjectAppend(before, after); err != nil {
+		return nats.StreamConfig{}, nil, err
+	}
+	return after, added, nil
+}
+
+// AppendMissingSubjects reads policy.Name from the bus, appends any missing
+// subjects from policy.Subjects, and updates the stream only when subjects
+// were added and CheckSubjectAppend passes before and after the update.
+func AppendMissingSubjects(ctx context.Context, nc *nats.Conn, policy StreamPolicy) ([]string, error) {
+	info, err := streamInfo(ctx, nc, policy.Name)
+	if err != nil {
+		return nil, fmt.Errorf(subjectAppendStreamErrFmt, policy.Name, err)
+	}
+	after, added, err := policy.AppendMissingSubjects(info.Config)
+	if err != nil {
+		return nil, err
+	}
+	if len(added) == 0 {
+		return nil, nil
+	}
+	if err := updateStream(ctx, nc, policy.Name, after); err != nil {
+		return nil, fmt.Errorf(subjectAppendStreamErrFmt, policy.Name, err)
+	}
+	updated, err := streamInfo(ctx, nc, policy.Name)
+	if err != nil {
+		return nil, fmt.Errorf(subjectAppendStreamErrFmt, policy.Name, err)
+	}
+	if err := policy.CheckSubjectAppend(info.Config, updated.Config); err != nil {
+		return nil, err
+	}
+	if missing := policy.MissingSubjects(updated.Config); len(missing) != 0 {
+		return nil, fmt.Errorf(subjectAppendMissingErrFmt, ErrSubjectAppendRefused, strings.Join(missing, policyDiffSeparator))
+	}
+	return added, nil
 }
 
 // withoutPolicyFields is cfg with every field a StreamPolicy decides cleared,

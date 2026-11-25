@@ -33,6 +33,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-logr/logr"
+	"github.com/nats-io/nats.go"
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -771,6 +772,11 @@ type PlatformAgentReconciler struct {
 	// busServerViews stands in for reading each bus server's /jsz
 	// (readA2ABusServerViews) in tests.
 	busServerViews func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) ([]a2aBusServerView, error)
+	// busTopicsStateConn opens the bus connection used to append missing
+	// rendered subjects to TOPICS-STATE when the provision Job reports them
+	// missing (appendTopicsStateSubjects). Nil records the finding Event
+	// without connecting.
+	busTopicsStateConn func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error)
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once

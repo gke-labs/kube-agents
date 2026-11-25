@@ -51,6 +51,8 @@ const busMigrationConvertDeadline = 15 * time.Minute
 // (busMigrationWorkloadName).
 const busMigrationNameHashLength = 10
 
+const errNoStreamPolicyFmt = "no stream policy for %s"
+
 // busMigrationLeg is the direction of a run.
 type busMigrationLeg string
 
@@ -1234,7 +1236,7 @@ func a2aStreamPolicies(agent *agentv1alpha1.PlatformAgent, replicas int) []busmi
 	return []busmigrate.StreamPolicy{
 		stream("TASKS", []string{"a2a.tasks.>"}, 3*day, a2aTasksMaxBytes, 4096, a2aTasksMaxConsumers(agent)),
 		stream("DIRECTORY", []string{"a2a.agents.>"}, 0, 1073741824, 1, 64),
-		stream(a2aTopicsStateStream, []string{"a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"}, 0, 1073741824, 8, 64),
+		stream(a2aTopicsStateStream, []string{a2aUpgradeReadinessSubject, a2aTopologySkewSubject, a2aSharedBlueprintSubject, a2aSharedProbeSubject}, 0, 1073741824, 8, 64),
 		stream("TOPICS-JOURNAL", []string{"a2a.topics.shared.annotations"}, 30*day, a2aTopicsJournalMaxBytes, -1, 64),
 		kv("runtime-state", 268435456, 0),
 		kv("session-state", 268435456, 0),
@@ -1245,6 +1247,39 @@ func a2aStreamPolicies(agent *agentv1alpha1.PlatformAgent, replicas int) []busmi
 		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1, a2aProfileDurablesAllowed),
 		stream(a2aDispatchStopStream, []string{"a2a.stop.>"}, day, 67108864, 1, 1),
 	}
+}
+
+// a2aTopicsStatePolicy is the operator's StreamPolicy for TOPICS-STATE, used
+// when appending missing rendered subjects on upgrade (busmigrate.AppendMissingSubjects).
+func a2aTopicsStatePolicy(agent *agentv1alpha1.PlatformAgent) (busmigrate.StreamPolicy, bool) {
+	for _, policy := range a2aStreamPolicies(agent, 1) {
+		if policy.Name == a2aTopicsStateStream {
+			return policy, true
+		}
+	}
+	return busmigrate.StreamPolicy{}, false
+}
+
+// appendTopicsStateSubjects appends missing rendered subjects to TOPICS-STATE
+// through busmigrate.AppendMissingSubjects, which refuses any change other
+// than added policy subjects (no removed subject, no changed limit or
+// retention, no RePublish). When no bus connection is configured, it returns
+// (nil, nil) so reportA2AProvisionFindings falls back to recording the
+// TopicsStateSubjectMissing Event.
+func (r *PlatformAgentReconciler) appendTopicsStateSubjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
+	if r.busTopicsStateConn == nil {
+		return nil, nil
+	}
+	policy, ok := a2aTopicsStatePolicy(agent)
+	if !ok {
+		return nil, fmt.Errorf(errNoStreamPolicyFmt, a2aTopicsStateStream)
+	}
+	nc, err := r.busTopicsStateConn(ctx, agent)
+	if err != nil || nc == nil {
+		return nil, err
+	}
+	defer nc.Close()
+	return busmigrate.AppendMissingSubjects(ctx, nc, policy)
 }
 
 // ensureBusRunSecret writes the run Secret once the hashing pod has
