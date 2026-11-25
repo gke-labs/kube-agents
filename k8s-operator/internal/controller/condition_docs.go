@@ -70,6 +70,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "Whether the dispatcher runs profile tasks as Jobs: unattended ones, and permit-carrying ones at any tier. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
 	},
 	{
+		Type:    sessionHarnessCondition,
+		Written: "While spec.harness.sessionWorker.type names a harness this operator doesn't render",
+		Meaning: "`status: False`, `Reason: SessionHarnessNotSupported`, with a Warning event: the CRD admitted a session harness this operator doesn't know (after a rollback, for example), so the operator doesn't pass it to the gateway and session pods run the default harness, `claude-code`. Removed once the value is supported or unset.",
+	},
+	{
 		Type:    dispatcherCeilingCondition,
 		Written: "While the profile dispatcher is switched on",
 		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 650 profiles at two tiers; the config fills first only for profiles that declare many parameters.",
@@ -88,6 +93,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Type:    a2aCalloutStalledConditionType,
 		Written: "While the auth callout Deployment's rollout is past its progress deadline",
 		Meaning: "`status: True`, `Reason: ProgressDeadlineExceeded`. The bus applies a config change without waiting for every callout replica to load the current identity map, so until the rollout finishes some connections may be placed by the previous map. Check the `<agent>-a2a-callout` Deployment's rollout (`kubectl rollout status`) and its pods' events. Removed once the rollout completes.",
+	},
+	{
+		Type:    a2aProvisionRetryingConditionType,
+		Written: "While the current A2A provision Job has failed pods and has neither completed nor failed",
+		Meaning: "`status: True`, `Reason: ProvisionJobPodsFailing`. The message names the Job, how many of its pods have failed, and the `kubectl logs` command that shows why. The Job retries up to its `backoffLimit`, which can take over an hour, before it fails and `A2AProvisionFailed` takes over. Not `Degraded`; `BusProvisioned`, `Ready` and the phase are unaffected, because the Job also re-runs on a bus that is already provisioned and a retry can clear by itself (NATS briefly unreachable). A Warning Event is recorded each time the operator sees the failed-pod count rise; it checks every 30 seconds while the Job runs, so pods that fail between two checks share one Event. Removed once the Job is replaced, or once the Job controller decides it has completed or failed, which can be a few seconds before `Complete` or `Failed` appears while its pods terminate. Written and cleared by every pass that renders the stack and reaches a status write, whichever phase it ends on; a pass that stops before then leaves it as it stands.",
 	},
 	{
 		Type:    a2aGatewayConditionType,

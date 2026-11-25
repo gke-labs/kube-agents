@@ -522,6 +522,51 @@ func TestTaskTerminalLogCoversEachTaskOfADelegationChain(t *testing.T) {
 	}
 }
 
+// A chain whose child ended and whose wake could not start (here, the
+// requester is gone from the record) ends failed toward the adapter and the
+// read route, with nothing but the root's own `completed` and the child's
+// `completed` in the log. The root logs a second line for the chain's end:
+// failed, reason wake-not-started, under a source of its own, so a search on
+// "task terminal" and state=failed finds an install that cannot start wakes
+// (#2622). The child still logs one line.
+func TestTaskTerminalLogReportsAChainsWakeNotStartedEnd(t *testing.T) {
+	t.Parallel()
+	r, spawn, obs := startObservedRig(t, doorDelegation(t))
+	conv := "a2a:agent-1001/ctx-terminal-log-no-wake"
+	origin, session, child := delegated(t, r, spawn, conv, a2aBackend)
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		for i := range rec.Tasks {
+			if rec.Tasks[i].ID == origin.TaskID {
+				rec.Tasks[i].Requester, rec.Tasks[i].Attribution = nil, nil
+			}
+		}
+	})
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	end, _ := obs.terminalFor(origin.TaskID)
+	if end.state != lib.StateFailed || reasonToken(end.text) != reasonWakeNotStarted {
+		t.Fatalf("observer's end = %+v, want failed with %s", end, reasonWakeNotStarted)
+	}
+
+	chainEnd := []string{"taskId=" + origin.TaskID, "conversation=" + conv, "addressee=" + session,
+		"state=failed", "source=" + string(terminalLogChainEnd), "reason=" + reasonWakeNotStarted}
+	waitFor(t, "the chain's end on the root's terminal lines", func() bool {
+		return len(textLogLines(r.logs, "task terminal", chainEnd...)) > 0
+	})
+	holdsAt(t, "the root's task terminal lines", 2, func() int {
+		return len(textLogLines(r.logs, "task terminal", "taskId="+origin.TaskID))
+	})
+	if got := textLogLines(r.logs, "task terminal", chainEnd...); len(got) != 1 {
+		t.Errorf("chain-end lines = %v, want one with %v", got, chainEnd)
+	}
+	if got := textLogLines(r.logs, "task terminal", "taskId="+origin.TaskID, "addressee="+session, "state=completed", "source=executor"); len(got) != 1 {
+		t.Errorf("the root's own terminal lines = %v, want one completed from the executor", got)
+	}
+	if got := textLogLines(r.logs, "task terminal", "taskId="+child.TaskID); len(got) != 1 {
+		t.Errorf("the child's terminal lines = %v, want 1", got)
+	}
+}
+
 // A session turn whose delegate request minted no child ends `completed` on
 // its hand-off line, and toward the adapter and the read route it ends failed
 // with the delegation reason (SessionRecord.handOffEnd). Its "task terminal"

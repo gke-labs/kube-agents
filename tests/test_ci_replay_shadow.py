@@ -28,6 +28,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _lift_shell import lift_constant, lift_function  # noqa: E402
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
+# The smoke build's Docker Hub mirror, as cloudbuild-ci.yaml declares it (#7033).
+_DOCKER_HUB_MIRROR = yaml.safe_load((_ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml").read_text())["substitutions"][
+    "_DOCKER_HUB_MIRROR"
+]
 _CI_ENV = _ROOT / "hack" / "ci-env.sh"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CI_EVAL = _ROOT / "hack" / "ci-eval-pr.sh"
@@ -577,7 +581,8 @@ class CloudBuildStepTest(unittest.TestCase):
         self.calls = pathlib.Path(self.tmp, "calls")
 
     def _run(self, uri):
-        script = self.script.replace("$_REPLAY_SHADOW_PROXY_URI", uri)
+        # $_DOCKER_HUB_MIRROR takes its declared default, as Cloud Build fills an unset substitution.
+        script = self.script.replace("$_REPLAY_SHADOW_PROXY_URI", uri).replace("$_DOCKER_HUB_MIRROR", _DOCKER_HUB_MIRROR)
         env = {"PATH": f"{self.tmp}:/usr/bin:/bin", "DOCKER_CALLS": str(self.calls)}
         return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
@@ -591,7 +596,8 @@ class CloudBuildStepTest(unittest.TestCase):
         proc = self._run(uri)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), [
-            f"build --platform linux/amd64 -t {uri} -f hack/replay-proxy/Dockerfile .",
+            f"build --platform linux/amd64 -t {uri} -f hack/replay-proxy/Dockerfile"
+            f" --build-arg PYTHON_IMAGE={_DOCKER_HUB_MIRROR}/library/python .",
             f"push {uri}",
         ])
 

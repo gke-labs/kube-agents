@@ -359,6 +359,30 @@ CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 570425344
 ENV_MEMORY_LIMIT_BYTES = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
 CGROUP_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
 CGROUP_NO_LIMIT = "max"
+# The kubectl cost gate (KubectlCostGate). The flat reserve above does not
+# cover cluster size: a `kubectl get pods -A -o json` on a large cluster holds
+# far more than 128 MiB. The shell sandbox charges such reads their profiled
+# peak from a per-tier table (deploy/sandbox/kubectl-admit.py and
+# kubectl-costs.json); the broker loads the same classifier and table, shipped
+# beside each other in its image (deploy/docker/Dockerfile), and charges a
+# brokered kubectl the larger of the flat reserve and the table's figure.
+KUBECTL_COST_DIR = "/usr/local/share/kube-agents"
+KUBECTL_ADMIT_PATH = f"{KUBECTL_COST_DIR}/kubectl-admit.py"
+KUBECTL_COST_TABLE_PATH = f"{KUBECTL_COST_DIR}/kubectl-costs.json"
+# The sizing tier, the column of the table charged. The operator forwards the
+# CR's spec.deployment.env value, normalised; held here to the sandbox
+# entrypoint's pattern as well, since the value names a table column.
+ENV_KUBECTL_COST_TIER = "KUBEAGENTS_KUBECTL_COST_TIER"
+DEFAULT_KUBECTL_COST_TIER = "default"
+KUBECTL_COST_TIER_RE = re.compile(r"[a-z][a-z0-9-]*\Z")
+# The refusal of a read too big ever to fit the child memory budget, the
+# broker's equivalent of kubectl-admit's exit 3. A 4xx, not the queue's 503:
+# the shim retries only 429 and a busy 503, and a retry here can never succeed.
+# Not a policy block either (403 SECURITY_POLICY_BLOCKED): nothing about the
+# command is forbidden, it is too large for this install, and the shim prints
+# `error` as the message for any other refusal.
+RULE_KUBERNETES_CAPACITY = "kubernetes.capacity"
+KUBECTL_CAPACITY_CODE = "KUBECTL_CAPACITY_EXCEEDED"
 # What the container holds, as the kernel accounts it, beside the limit above
 # (#4315): the memory series and the high-water log read these. Each is a
 # high-water mark the kernel keeps itself (the cgroup's memory.peak, a
@@ -494,7 +518,7 @@ BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 LIBC_SONAME = "libc.so.6"
 MALLOC_TRIM_SYMBOL = "malloc_trim"
 # The session role's own share of that pool. Session pods are opened by chat
-# conversations, and under the cluster-view flag all of them draw on the one
+# conversations, and under the session pods' cluster view all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
 # conversation holding slow reads could starve the shell for the slot wait.
 # Counted before the pool is asked, and refused at once rather than queued:
@@ -2558,8 +2582,8 @@ CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # backend is the Teams queue's consumer (A2A_TEAMS_BACKEND); only then does the
 # a2a-chat role reach the Teams routes (see _teams_route_roles).
 TEAMS_A2A_CALLER_ENV = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
-# The session pod the A2A gateway spawns, under the operator's
-# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
+# The session pod the A2A gateway spawns, under the session pods' cluster
+# view (the session route's default, or the operator's A2A_SESSION_CLUSTER_VIEW). Exec route only, and within it gcloud only
 # (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
 # executes model output, and the read-only posture command_policy enforces is
 # the view it gets. A demo aid until declarative profiles carry a session's
@@ -2587,7 +2611,9 @@ CALLER_ROLE_MCP = "mcp"
 CALLER_ROLE_PROFILE = "profile"
 # The scope publisher Job. The exec route only, gcloud only, and within it the
 # five lookups scope_policy names, each on an argument scope.json declares or an
-# earlier lookup returned.
+# earlier lookup returned; `clusters list` also on the management project
+# (CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT) and a declared project no
+# exclude.projects entry matches.
 # An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
 # window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
@@ -2598,6 +2624,16 @@ CALLER_ROLE_A2A_REPORTS = "a2a-reports"
 # managed repository only, so the curator can verify active and superseded
 # records from Git without holding a forge credential of its own.
 CALLER_ROLE_CURATOR = "curator"
+# The callers whose project-wide cluster listings (`gcloud container clusters
+# list`, `operations list`) drop the install's excluded clusters (#7031). The
+# platform agent's own shell keeps the full list: its upgrade-readiness watch
+# grades an excluded cluster's versions from it, as the exclusion's docs say.
+# The scope role is left out too: its lookups are the reconcile's own, matched
+# token for token (scope_policy.SHAPES), and the reconcile leaves excluded
+# clusters out by itself.
+LISTING_FILTERED_ROLES = frozenset({CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE})
+# The project segment of a relayed GKE path (v1/projects/<project>/...).
+API_RELAY_PROJECT_SEGMENT = 2
 CALLER_ROLE_TEAMS_INBOUND = "teams-inbound"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -4507,6 +4543,138 @@ class CommandSlotUnavailable(RuntimeError):
         super().__init__(message)
         self.bound = bound
         self.klass = klass
+
+
+class KubectlCapacityExceeded(Exception):
+    """A kubectl read whose charge alone exceeds the child memory budget.
+
+    Raised before the request queues: no wait can admit it. `key` is the cost
+    table's key, safe to log; the message carries the command's kind argument
+    and goes to the caller only."""
+
+    def __init__(self, message: str, key: str) -> None:
+        super().__init__(message)
+        self.key = key
+
+
+@dataclass(frozen=True)
+class KubectlCharge:
+    """What a brokered kubectl reserves for its child: `child_bytes`, never
+    under REQUEST_CHILD_MEMORY_RESERVE_BYTES, and what a refusal names."""
+
+    child_bytes: int
+    table_bytes: int
+    key: str
+    command: str
+    alternatives: str
+
+
+def kubectl_cost_tier(environ: Mapping[str, str] | None = None) -> str:
+    """The cost tier from the environment, or the default for anything that is
+    not a plain lowercase name (deploy/sandbox/entrypoint.sh's rule)."""
+    value = (os.environ if environ is None else environ).get(ENV_KUBECTL_COST_TIER, "")
+    return value if KUBECTL_COST_TIER_RE.match(value) else DEFAULT_KUBECTL_COST_TIER
+
+
+class KubectlCostGate:
+    """The sandbox's kubectl cost classifier, applied to brokered kubectl.
+
+    `charge` returns a KubectlCharge for a kubectl argv the sandbox's admission
+    charges -- a list across the cluster (`-A`, or cluster-scoped kinds),
+    without a selector, watch, `--raw`, `-f` or `--help` -- and None for every
+    other command, which keeps the flat reserve. The classifier and the table
+    are loaded once, on first use. Any failure to load either, and any error
+    while charging, is logged once and answers None: a gate fault must never
+    refuse or change a command that runs without it.
+    """
+
+    def __init__(
+        self,
+        admit_path: str = KUBECTL_ADMIT_PATH,
+        table_path: str = KUBECTL_COST_TABLE_PATH,
+        tier: str | None = None,
+    ) -> None:
+        self.admit_path = admit_path
+        self.table_path = table_path
+        self.tier = kubectl_cost_tier() if tier is None else tier
+        self._lock = threading.Lock()
+        self._loaded = False
+        self._module: Any = None
+        self._table: dict | None = None
+        self._charge_failed = False
+
+    def _load(self) -> tuple[Any, dict | None]:
+        with self._lock:
+            if not self._loaded:
+                self._loaded = True
+                try:
+                    import importlib.machinery
+                    import importlib.util
+
+                    loader = importlib.machinery.SourceFileLoader("kubectl_admit", self.admit_path)
+                    spec = importlib.util.spec_from_loader("kubectl_admit", loader)
+                    module = importlib.util.module_from_spec(spec)
+                    loader.exec_module(module)
+                    for name in ("parse", "command_key", "kinds_of", "cost", "collection", "ALTERNATIVES"):
+                        if not hasattr(module, name):
+                            raise AttributeError(f"the classifier has no {name}")
+                    with open(self.table_path, encoding="utf-8") as f:
+                        table = json.load(f)
+                    if not isinstance(table, dict) or not isinstance(table.get("tiers"), dict):
+                        raise ValueError("the cost table has no tiers")
+                    self._module, self._table = module, table
+                    LOGGER.info(
+                        "kubectl cost gate enabled tier=%s (%s)",
+                        self.tier,
+                        "listed" if self.tier in table["tiers"] else f"not in the table; charging {DEFAULT_KUBECTL_COST_TIER}",
+                    )
+                except Exception as exc:  # noqa: BLE001 -- the gate fails open to the flat reserve
+                    LOGGER.warning(
+                        "kubectl cost gate disabled: %s: %s; brokered kubectl keeps the flat %d MiB child reserve",
+                        type(exc).__name__,
+                        _sanitize_for_logging(str(exc), max_length=256),
+                        REQUEST_CHILD_MEMORY_RESERVE_BYTES // MEBIBYTE,
+                    )
+            return self._module, self._table
+
+    def charge(self, argv: Sequence[str]) -> KubectlCharge | None:
+        if not argv or argv[0] != "kubectl":
+            return None
+        module, table = self._load()
+        if module is None or table is None:
+            return None
+        try:
+            cmd = module.parse(list(argv[1:]))
+            if cmd["help"] or cmd["selector"]:
+                # A selector narrows by an amount no table knows: never
+                # refused for size, so it keeps the flat reserve.
+                return None
+            kinds = module.kinds_of(cmd)
+            if not kinds:
+                return None
+            key = module.command_key(cmd)
+            if key is None or key.rsplit(" ", 2)[1] != "cluster":
+                return None
+            table_bytes, _listed = module.cost(table, self.tier, cmd)
+            table_bytes = int(table_bytes)
+            return KubectlCharge(
+                child_bytes=max(REQUEST_CHILD_MEMORY_RESERVE_BYTES, table_bytes),
+                table_bytes=table_bytes,
+                key=key,
+                command=f"kubectl {cmd['verb']} {cmd['args'][0]}",
+                alternatives=module.ALTERNATIVES.format(kinds=cmd["args"][0], collection=module.collection(kinds)),
+            )
+        except Exception as exc:  # noqa: BLE001 -- the gate fails open to the flat reserve
+            with self._lock:
+                first = not self._charge_failed
+                self._charge_failed = True
+            if first:
+                LOGGER.warning(
+                    "kubectl cost gate could not charge a command (%s); it keeps the flat %d MiB child reserve",
+                    type(exc).__name__,
+                    REQUEST_CHILD_MEMORY_RESERVE_BYTES // MEBIBYTE,
+                )
+            return None
 
 
 class ResourcePressure(CommandSlotUnavailable):
@@ -10686,6 +10854,9 @@ class _AdmissionTicket:
     takes_slot: bool
     klass: str = CLASS_INTERACTIVE
     interactive: bool = False
+    # What its child reserves: the flat reserve, or a kubectl read's charge
+    # (KubectlCostGate), so a reserver behind it reads the budget it waits for.
+    child_bytes: int = REQUEST_CHILD_MEMORY_RESERVE_BYTES
 
 
 class CommandExecutor:
@@ -10763,6 +10934,9 @@ class CommandExecutor:
         self.watermark_gate: ResourceWatermarkGate | None = None
         # The degenerate case (§2.3) warns once per process, not once per request.
         self._budget_warned = False
+        # Charges a brokered kubectl's child its profiled peak rather than the
+        # flat reserve (KubectlCostGate); consulted only with the budget on.
+        self.kubectl_cost_gate = KubectlCostGate()
         floor = child_memory_budget_floor_bytes(max_output_bytes)
         if memory_limit_bytes is not None and memory_limit_bytes < floor:
             # Treated as absent: a budget that admits fewer than
@@ -11064,10 +11238,47 @@ class CommandExecutor:
         with self._slot_condition:
             return self._reserved_bytes
 
-    def _request_cost_bytes(self, takes_slot: bool) -> int:
-        """What one more admitted request costs the budget: its child reserve,
-        plus the broker's own output allowance if it also takes a slot."""
-        cost = REQUEST_CHILD_MEMORY_RESERVE_BYTES
+    def kubectl_charge(self, argv: Sequence[str]) -> KubectlCharge | None:
+        """The child charge for a brokered kubectl argv, or None for the flat
+        reserve: always None with the budget off, which charges nothing."""
+        if self.children_budget_bytes is None:
+            return None
+        gate = getattr(self, "kubectl_cost_gate", None)
+        return gate.charge(argv) if gate is not None else None
+
+    def refuse_if_never_fits(self, charge: KubectlCharge | None, klass: str = CLASS_INTERACTIVE) -> None:
+        """Raise KubectlCapacityExceeded for a charge larger than the whole
+        child memory budget, which no wait can admit. Asked before the request
+        queues, and asked again by `_admit`, so the degenerate admit-alone
+        branch of `_fits_budget` never takes such a read."""
+        budget = self.children_budget_bytes
+        # The whole cost admission books (the charge plus the output
+        # allowance of a slot), so a read admission could only take alone,
+        # with every other request drained, is refused here rather than left
+        # at the head of the queue.
+        if charge is None or budget is None:
+            return
+        needed = self._request_cost_bytes(True, charge.child_bytes)
+        if klass == CLASS_BACKGROUND:
+            # A background read must also leave the whole interactive reserve
+            # (`_leaves_reserve`): even a drained broker withholds it, so a
+            # read that fits only by taking it never fits.
+            reserve = max(0, self.admitted_requests() - self.class_cap(CLASS_BACKGROUND))
+            needed += self._request_cost_bytes(True) * reserve
+        if needed <= budget:
+            return
+        raise KubectlCapacityExceeded(
+            f"capacity: `{charge.command}` at this install's size is measured at about "
+            f"{charge.table_bytes // MEBIBYTE} MiB, and the credential proxy can give the commands it runs "
+            f"at most {budget // MEBIBYTE} MiB in all; the install cannot take this read. {charge.alternatives}",
+            key=charge.key,
+        )
+
+    def _request_cost_bytes(self, takes_slot: bool, child_bytes: int | None = None) -> int:
+        """What one more admitted request costs the budget: its child reserve
+        (`child_bytes`, a kubectl read's charge, else the flat reserve), plus
+        the broker's own output allowance if it also takes a slot."""
+        cost = REQUEST_CHILD_MEMORY_RESERVE_BYTES if child_bytes is None else child_bytes
         if takes_slot:
             cost += OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes
         return cost
@@ -11217,7 +11428,11 @@ class CommandExecutor:
 
     @contextlib.contextmanager
     def request_slot(
-        self, caller: socket.socket | None = None, klass: str = CLASS_INTERACTIVE, interactive: bool = False
+        self,
+        caller: socket.socket | None = None,
+        klass: str = CLASS_INTERACTIVE,
+        interactive: bool = False,
+        charge: KubectlCharge | None = None,
     ) -> Iterator[None]:
         """Hold one concurrency slot for the whole of a request.
 
@@ -11254,8 +11469,12 @@ class CommandExecutor:
         deadline a request's silent worst case would be that many deadlines
         end to end -- longer than the idle time Envoy allows the stream in
         front of the broker, which is sized against this one.
+
+        `charge`, a brokered kubectl read's (`kubectl_charge`), replaces the
+        flat child reserve with its own figure throughout the admission; one
+        larger than the whole budget raises KubectlCapacityExceeded at once.
         """
-        with self._admit(takes_slot=True, caller=caller, klass=klass, interactive=interactive):
+        with self._admit(takes_slot=True, caller=caller, klass=klass, interactive=interactive, charge=charge):
             yield
 
     @contextlib.contextmanager
@@ -11283,7 +11502,7 @@ class CommandExecutor:
         ):
             yield
 
-    def _fits_budget(self, takes_slot: bool) -> bool:
+    def _fits_budget(self, takes_slot: bool, child_bytes: int | None = None) -> bool:
         """Whether one more request fits the child memory budget right now.
 
         Called under `_slot_condition`. With the budget off, always. The
@@ -11294,14 +11513,15 @@ class CommandExecutor:
         otherwise a limit small enough to make the budget negative would
         refuse every command forever, which is worse than the OOM it exists to
         prevent (§2.3). The operator's sizing test keeps its own numbers off
-        this branch.
+        this branch. A kubectl charge (`child_bytes`) larger than the whole
+        budget never reaches it: `_admit` refuses that before it queues.
         """
         if self.children_budget_bytes is None:
             return True
         needed = (
             self._reserved_bytes
             + OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
-            + self._request_cost_bytes(takes_slot)
+            + self._request_cost_bytes(takes_slot, child_bytes)
         )
         if needed <= self.children_budget_bytes:
             return True
@@ -11319,7 +11539,9 @@ class CommandExecutor:
             return True
         return False
 
-    def _refusal_text(self, takes_slot: bool, bound: str, interactive: bool = False) -> str:
+    def _refusal_text(
+        self, takes_slot: bool, bound: str, interactive: bool = False, child_bytes: int | None = None
+    ) -> str:
         """Why a request still queued at the bound is refused, worded for the
         bound `_held_bound` named, so the text and the refusals counter agree
         by construction. Called under `_slot_condition`.
@@ -11359,10 +11581,15 @@ class CommandExecutor:
         # With nothing admitted `_fits_budget` would take its degenerate
         # branch and log; this request fits trivially then anyway.
         nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
-        if not (nothing_admitted or self._fits_budget(takes_slot)):
+        if not (nothing_admitted or self._fits_budget(takes_slot, child_bytes)):
+            needs = (
+                f" needs {child_bytes // MEBIBYTE} MiB for its kubectl and"
+                if child_bytes is not None and child_bytes > REQUEST_CHILD_MEMORY_RESERVE_BYTES
+                else ""
+            )
             return (
                 f"the credential proxy is at its child memory budget "
-                f"({self._budget_in_use_text()}) and this request "
+                f"({self._budget_in_use_text()}) and this request{needs} "
                 f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
             )
         return (
@@ -11390,7 +11617,7 @@ class CommandExecutor:
                 return False
             slots_full = self._slots_in_use >= self._effective_cap(ahead.interactive)
             class_full = self._class_holds(ahead.klass, ahead.interactive)
-            if not (slots_full or (class_full and self._fits_budget(takes_slot=True))):
+            if not (slots_full or (class_full and self._fits_budget(takes_slot=True, child_bytes=ahead.child_bytes))):
                 return False
         return False
 
@@ -11430,13 +11657,32 @@ class CommandExecutor:
         for ahead in self._slot_queue:
             if ahead is ticket:
                 return True
+            # A kubectl read charged above the flat reserve waits for its
+            # memory without holding back a flat request behind it: before
+            # the charge every request cost the same, so a request that fits
+            # never waited on one that does not. The charged read keeps its
+            # place, still bounded by the slot wait.
+            # Only while memory is what holds it: a charged read that fits and
+            # waits for a slot keeps arrival order like any other.
+            if (ahead.klass == ticket.klass and ahead.child_bytes > REQUEST_CHILD_MEMORY_RESERVE_BYTES
+                    and ticket.child_bytes <= REQUEST_CHILD_MEMORY_RESERVE_BYTES
+                    and not self._ahead_fits_memory(ahead)):
+                continue
             if ahead.klass == ticket.klass:
                 return False
             if ticket.klass == CLASS_BACKGROUND and not (interactive_full and ahead.takes_slot):
                 return False
         return False
 
-    def _leaves_reserve(self) -> bool:
+    def _ahead_fits_memory(self, ahead: _AdmissionTicket) -> bool:
+        """Whether a queued ticket's memory would be granted now: its cost fits
+        the budget and, for a background slot-taker, also leaves the
+        interactive reserve. Called under `_slot_condition`."""
+        if not self._fits_budget(ahead.takes_slot, ahead.child_bytes):
+            return False
+        return not (ahead.takes_slot and ahead.klass == CLASS_BACKGROUND) or self._leaves_reserve(ahead.child_bytes)
+
+    def _leaves_reserve(self, child_bytes: int | None = None) -> bool:
         """Whether one more background slot-taker still leaves the budget room
         for the interactive reserve (§4.2: the reserve is budget room as well
         as slots), so a background child cannot take the memory an
@@ -11444,17 +11690,19 @@ class CommandExecutor:
         reserve, so only the part of the reserve it does not use is held back.
         The reserve is the admissions the background cap withholds, so a pod
         too small to reserve two reserves what it can. Always true with the
-        budget off: the cap is then the whole reserve. Called under
+        budget off: the cap is then the whole reserve. This request is charged
+        its own child cost (`child_bytes`); the reserve it leaves is counted at
+        the flat cost, the figure the admitted count is sized in. Called under
         `_slot_condition`."""
         if self.children_budget_bytes is None:
             return True
         reserve = self.admitted_requests() - self.class_cap(CLASS_BACKGROUND)
         unused_reserve = max(0, reserve - self._slots_by_class[CLASS_INTERACTIVE])
-        cost = self._request_cost_bytes(takes_slot=True)
         needed = (
             self._reserved_bytes
             + OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
-            + cost * (1 + unused_reserve)
+            + self._request_cost_bytes(takes_slot=True, child_bytes=child_bytes)
+            + self._request_cost_bytes(takes_slot=True) * unused_reserve
         )
         return needed <= self.children_budget_bytes
 
@@ -11468,6 +11716,7 @@ class CommandExecutor:
         queued_at: float | None = None,
         klass: str = CLASS_INTERACTIVE,
         interactive: bool = False,
+        charge: KubectlCharge | None = None,
     ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One queue for both kinds, in
@@ -11491,7 +11740,16 @@ class CommandExecutor:
         `deadline`, if given, is the monotonic time the wait is refused at, in
         place of COMMAND_SLOT_WAIT_SECONDS from entry; the refusal text is the
         same here, and the one caller that passes it, a route refresher's
-        reservation after its yield, rewords it (`_refresh_under_lock`)."""
+        reservation after its yield, rewords it (`_refresh_under_lock`).
+        `charge` (`request_slot`) is a kubectl read's child cost: it is what
+        this request's fit, reserve check, booking and release all count in
+        place of the flat reserve. One larger than the whole budget raises
+        KubectlCapacityExceeded here, before the request queues."""
+        # None for the flat reserve: every helper reads None as that figure.
+        child_bytes: int | None = None
+        if charge is not None and self.children_budget_bytes is not None:
+            self.refuse_if_never_fits(charge, klass)
+            child_bytes = charge.child_bytes
         if not takes_slot and self.children_budget_bytes is None:
             previously_reserved = getattr(self._request_budget, "reserved", False)
             try:
@@ -11508,7 +11766,10 @@ class CommandExecutor:
             queued_at = time.monotonic()
         if deadline is None:
             deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-        ticket = _AdmissionTicket(takes_slot, klass, interactive)
+        ticket = _AdmissionTicket(
+            takes_slot, klass, interactive,
+            REQUEST_CHILD_MEMORY_RESERVE_BYTES if child_bytes is None else child_bytes,
+        )
         # Set if this slot-taking request ever found the slot cap full while it
         # waited. The wait log names the slot cap only then; otherwise, with the
         # budget on, what held it was the budget, directly or through the
@@ -11537,7 +11798,7 @@ class CommandExecutor:
                     f"background work, interactive work holds the other {self.class_cap(CLASS_INTERACTIVE)}, "
                     f"and this request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching one; retry shortly"
                 )
-            return self._refusal_text(takes_slot, bound, interactive)
+            return self._refusal_text(takes_slot, bound, interactive, child_bytes)
 
         with self._slot_condition:
             self._slot_queue.append(ticket)
@@ -11553,8 +11814,8 @@ class CommandExecutor:
                     )
                     slot_free = (not takes_slot) or self._slots_in_use < cap
                     class_free = (not takes_slot) or not self._class_holds(klass, interactive)
-                    reserve_free = not (takes_slot and klass == CLASS_BACKGROUND) or self._leaves_reserve()
-                    if eligible and slot_free and class_free and reserve_free and self._fits_budget(takes_slot):
+                    reserve_free = not (takes_slot and klass == CLASS_BACKGROUND) or self._leaves_reserve(child_bytes)
+                    if eligible and slot_free and class_free and reserve_free and self._fits_budget(takes_slot, child_bytes):
                         break
                     if takes_slot and self._slots_in_use >= cap:
                         saw_slots_full = True
@@ -11562,7 +11823,7 @@ class CommandExecutor:
                     # request: a slot is free and the budget fits. On a pod
                     # whose cap equals the slot cap or the budget, that bound
                     # keeps its own name.
-                    held_by_class_rule = slot_free and self._fits_budget(takes_slot)
+                    held_by_class_rule = slot_free and self._fits_budget(takes_slot, child_bytes)
                     if takes_slot and klass == CLASS_BACKGROUND and not (class_free and reserve_free) and held_by_class_rule:
                         held_by_class = True
                     if takes_slot and klass == CLASS_INTERACTIVE and not class_free and held_by_class_rule:
@@ -11582,7 +11843,9 @@ class CommandExecutor:
                     self._slots_by_class[klass] += 1
                     if interactive:
                         self._interactive_slots_in_use += 1
-                reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
+                reserved = 0
+                if self.children_budget_bytes is not None:
+                    reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if child_bytes is None else child_bytes
                 self._reserved_bytes += reserved
             finally:
                 # Admitted or leaving, the ticket comes out and the next in
@@ -11597,6 +11860,11 @@ class CommandExecutor:
                 # children at BACKGROUND_NICE.
                 self._request_budget.klass = klass
             self._request_budget.reserved = True
+            if child_bytes is not None and charge is not None:
+                # The key only: an argv can carry object and namespace names.
+                LOGGER.debug(
+                    "kubectl charged %d MiB for its child key=%s", child_bytes // MEBIBYTE, _sanitize_for_logging(charge.key, max_length=160)
+                )
             waited_seconds = time.monotonic() - queued_at
             waited_ms = int(waited_seconds * MILLISECONDS_PER_SECOND)
             # Observed on every admission: under the bound the log names when
@@ -14960,6 +15228,15 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def _mcp_listing_tool(server_name: str, message: Any) -> str | None:
+    """The gke listing tool a tools/call names (mcp_policy.GKE_LISTING_TOOLS), or None."""
+    if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    name = params.get("name") if isinstance(params, dict) else None
+    return name if name in mcp_policy.GKE_LISTING_TOOLS else None
+
+
 def mcp_relay_decision(
     principal: Principal | None, server_name: str, message: dict[str, Any] | None
 ) -> tuple[command_policy.Decision, frozenset[str] | None]:
@@ -16093,6 +16370,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         exclusions = getattr(self, "exclusions", None)
         if exclusions is not None:
             try:
+                if principal.role in LISTING_FILTERED_ROLES:
+                    # A project-wide cluster listing drops excluded clusters for
+                    # these callers (cluster_metadata_scope.scoped_listing_argv).
+                    argv = cluster_metadata_scope.scoped_listing_argv(argv, exclusions)
                 argv = cluster_metadata_scope.scoped_argv(argv, exclusions)
             except scope_exclude.ExcludedCluster as exc:
                 self._refuse_excluded_cluster(exc, request_id, audit, count)
@@ -16163,7 +16444,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     self._refuse_excluded_cluster(exc, request_id, audit, count)
                     return
         # The scope role's whole surface: five lookups, each on an argument
-        # scope.json declares or an earlier lookup returned (scope_policy).
+        # scope.json declares or an earlier lookup returned, and the clusters
+        # list also on the management project (scope_policy).
         scope_admitted = None
         if principal.role == CALLER_ROLE_SCOPE:
             scope_refusal, scope_admitted = scope_policy.check(
@@ -16171,6 +16453,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 extras=stdin is not None or cwd is not None or kubeconfig_context is not None or wants_kubeconfig,
                 scope_file=os.getenv(scope_policy.SCOPE_FILE_ENV, ""),
                 window=self.scope_window,
+                management_project=os.getenv(scope_policy.MANAGEMENT_PROJECT_ENV, "").strip(),
             )
             if scope_refusal is not None:
                 LOGGER.warning(
@@ -16322,11 +16605,25 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     self._refuse_excluded_cluster(exc, request_id, audit, count)
                     return
 
+            # A cluster-wide kubectl read's child cost from the cost table
+            # (KubectlCostGate), in place of the flat reserve; None for every
+            # other command. One the budget can never hold is refused here,
+            # before it queues for anything.
+            kubectl_charge = getattr(self.executor, "kubectl_charge", None)
+            charge = kubectl_charge(exec_argv) if kubectl_charge is not None else None
+            if not isinstance(charge, KubectlCharge):
+                # An executor stand-in's answer, or nothing: the flat reserve.
+                charge = None
+            if charge is not None:
+                self.executor.refuse_if_never_fits(charge, admission_class(principal.role))
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
             # The session or scope role's own bound is taken first, so a caller
-            # past its share never queues for the pool the shell shares.
-            with self._session_slot(principal.role), self._request_slot(admission_class(principal.role)):
+            # past its share never queues for the pool the shell shares. The
+            # charge is passed only when there is one: the route tests'
+            # stand-ins for `_request_slot` predate it.
+            charged = {"charge": charge} if charge is not None else {}
+            with self._session_slot(principal.role), self._request_slot(admission_class(principal.role), **charged):
                 result = self.executor.execute(
                     exec_argv,
                     stdin=stdin,
@@ -16424,6 +16721,27 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 extra=audit(AUDIT_STATUS_BUSY),
             )
             self._busy(exc)
+            return
+        except KubectlCapacityExceeded as exc:
+            # Logged by its cost-table key, never the argv or the message,
+            # which carry the command's own words.
+            LOGGER.info(
+                "kubectl read refused for size request_id=%s rule=%s key=%s",
+                request_id,
+                RULE_KUBERNETES_CAPACITY,
+                _sanitize_for_logging(exc.key, max_length=160),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_KUBERNETES_CAPACITY),
+            )
+            count(TOOL_STATUS_BLOCKED)
+            self._json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {
+                    "status": "refused",
+                    "code": KUBECTL_CAPACITY_CODE,
+                    "rule": RULE_KUBERNETES_CAPACITY,
+                    "error": str(exc),
+                },
+            )
             return
         except scope_exclude.ExcludedCluster as exc:
             self._refuse_excluded_cluster(exc, request_id, audit, count)
@@ -16747,7 +17065,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # check was still let through for that resource, and over the cap
                 # the upstream has served it.
                 LOGGER.info(API_RELAY_BODY_CHECKED_LOG, request_id, decision.rule_id, resource)
-        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
+        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and (
+            self.headers.get(GET_CREDENTIALS_CHECK_HEADER) or CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES
+        ):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
             segments = path.split("/")
@@ -16855,6 +17175,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             upstream = replace(upstream, body=projected)
+            relay_exclusions = getattr(self, "exclusions", None)
+            if (decision.rule_id == api_policy.GKE_CLUSTER_LIST_RULE and relay_exclusions is not None
+                    and CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES):
+                # The relay is the shell's: its listing drops excluded clusters
+                # only when the shell is among the filtered callers (#7031).
+                # The route's pattern fixes the path: v1/projects/<project>/...
+                try:
+                    upstream = replace(upstream, body=cluster_metadata_scope.filtered_cluster_list(
+                        upstream.body, path.split("/")[API_RELAY_PROJECT_SEGMENT], relay_exclusions,
+                    ))
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, lambda _status: None)
+                    return
         # `resource` has passed the route's body check, so it is logged as it is. The
         # audit mapping stays identifiers and outcomes.
         LOGGER.info(
@@ -17106,6 +17439,30 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
                 reply_body = filtered
+        listing_tool = _mcp_listing_tool(server_name, message)
+        if (
+            refused is None
+            and listing_tool is not None
+            and principal is not None
+            and principal.role in LISTING_FILTERED_ROLES
+            and upstream.status < HTTPStatus.MULTIPLE_CHOICES
+        ):
+            # A gke listing drops the install's excluded clusters for these
+            # callers (#7031); a reply the broker can't read is refused while
+            # any cluster is excluded rather than relayed whole. Unreachable
+            # today: this relay admits chat and profile, and profile workers are
+            # refused the gke server, so it applies only if chat joins the set.
+            try:
+                if self.exclusions.excluded_names_pattern() is not None:
+                    filtered = mcp_policy.filter_listing_reply(
+                        listing_tool, reply_body, self._is_excluded_cluster,
+                    )
+                    if filtered is None:
+                        refused = ("UPSTREAM_UNREADABLE", "the upstream listing reply could not be read")
+                    else:
+                        reply_body = filtered
+            except scope_exclude.ExcludedCluster:
+                refused = ("UPSTREAM_UNREADABLE", "the install's scope file can't be read, so the listing isn't relayed")
         if refused is not None:
             code, reason = refused
             LOGGER.warning(
@@ -18891,7 +19248,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         return gate.admit(self._caller_role())
 
     @contextlib.contextmanager
-    def _request_slot(self, klass: str = CLASS_INTERACTIVE) -> Iterator[None]:
+    def _request_slot(self, klass: str = CLASS_INTERACTIVE, charge: "KubectlCharge | None" = None) -> Iterator[None]:
         """This request's concurrency slot, watched on this connection, behind
         the resource watermark gate's admission. `klass` is the executor's
         admission class (`admission_class`, the role's); the gate reads the
@@ -18902,15 +19259,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         tests put in their place predate the slot, as they predate
         `resolve_git_command` above: an executor without one gets no slot
         rather than a fault, and a handler without a connection an unwatched
-        wait.
+        wait. `charge` is a brokered kubectl read's child cost (the exec
+        route's `kubectl_charge`), passed on only when there is one.
         """
         executor = getattr(self, "executor", None)
         slot: contextlib.AbstractContextManager = contextlib.nullcontext()
         if hasattr(executor, "request_slot"):
-            # The keyword only for an interactive caller: the route tests'
-            # stand-ins for `request_slot` predate it.
-            interactive = {"interactive": True} if ResourceWatermarkGate.is_interactive(self._caller_role()) else {}
-            slot = executor.request_slot(caller=getattr(self, "connection", None), klass=klass, **interactive)
+            # The keywords only for an interactive caller and a charged read:
+            # the route tests' stand-ins for `request_slot` predate them.
+            extra: dict[str, Any] = {"interactive": True} if ResourceWatermarkGate.is_interactive(self._caller_role()) else {}
+            if charge is not None:
+                extra["charge"] = charge
+            slot = executor.request_slot(caller=getattr(self, "connection", None), klass=klass, **extra)
         with self._pressure_admission(), slot:
             yield
 
@@ -18941,6 +19301,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         except scope_exclude.ExcludedCluster as exc:
             return command_policy.Decision(allowed=False, rule_id=exc.rule, message=str(exc))
         return None
+
+    def _is_excluded_cluster(self, project: str, location: str, cluster: str) -> bool:
+        """Whether the install excludes this cluster (holds aside), for a listing filter."""
+        try:
+            self.exclusions.check(project, location, cluster, include_holds=False)
+        except scope_exclude.ExcludedCluster as exc:
+            if exc.rule == scope_exclude.RULE_EXCLUDE_UNREADABLE:
+                raise
+            return True
+        return False
 
     def _refuse_excluded_cluster(
         self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,

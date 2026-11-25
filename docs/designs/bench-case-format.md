@@ -136,6 +136,16 @@ task, then its answer
 ([`bench/kube_agents_bench/session_cap.py`](../../bench/kube_agents_bench/session_cap.py)). A cap
 above `max-cap`, or one the fillers did not hold, is infrastructure; the ask's POST refused with the
 cap's own text is the graded red. Inject transport only.
+A first line of `[bench:burst-reads]`, optionally with `levels=<n>,<n>,...` (strictly ascending,
+default `1,3,6`), with a `/session` ask under it, measures concurrent sessions: for each level in
+turn the harness opens that many conversations through the inject door at once, each with the ask,
+follows every one to its terminal, cancels and fails any still running at `AGENT_INJECT_TIMEOUT`, and
+starts the next level only when this one has ended and every cancelled session has been released. It writes `harness_burst_reads`, completed when every
+conversation ended completed, with the per-level and per-conversation record (keys, task ids,
+terminal states, submit and end times) as its arguments
+([`bench/kube_agents_bench/burst_reads.py`](../../bench/kube_agents_bench/burst_reads.py)). A
+session cap below the highest level, a conversation queued or refused at submit or never started,
+and a door outage are infrastructure. Inject transport only.
 
 A first line that opens with `[bench:` and names none of these directives is infrastructure: the
 harness does not send a directive it does not know to the agent as text. A pull request is graded
@@ -231,13 +241,18 @@ a bare YAML boolean, and devops-bench ignores it.
 
 `audit_streams` is for a case whose stack starts real audit runs without grading their
 ledger, or whose agent runs a stream's collector outside a ledger run and so shares that
-stream's scratch state (`upgrade-chat-request-runs-collector`): a list of the Platform Agent
+stream's scratch state (`upgrade-chat-request-runs-collector`), or whose turn runs the
+ledger audit itself and is graded in the report store with no ledger check
+(`fleet-audit-remediation-right-and-not-stale`): a list of the Platform Agent
 job ids (`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
 lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. devops-bench ignores the key.
+run beside the case's runs and grade their ledger. What the runner does with the in-flight note
+and the ledger of a declared stream is in
+[`ci-pool-projects.md`](../ci-pool-projects.md#5-gitops-repository-and-github-token-minter).
+devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
 clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never
@@ -512,8 +527,8 @@ the run started (or, with `since_state_file`, since the `fired_at` a case's stac
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
 value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key; a key the envelope lacks reads `null`, so `precheck: null` holds a run to not having been closed by `precheck`), and, for each
-`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `shadow_report_stored`, in its own module
-(`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, on the run's shadow
+`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. Its `finding` block reads one stored finding's remediation as data, not as prose: the finding whose id contains every `id_contains` fragment must have `remediation_kind`; some line of its `remediation.note` that opens with `command_prefix` must carry `command_argument` as a whole word and every flag of `command_flags` (a flag is matched whole); no command line of the note may give a flag of `no_cidr_value` a literal IPv4 address or range; no `forbidden_text` may occur in a string of its `recommendation` or `remediation` (a number or a boolean there is not searched); each `title_contains` entry must occur in its `title` (the witness that `finish` kept a planted run's wording for this finding); and no `title_lacks` entry may occur in it (the title holds nothing of a planted run's wording; the impact is not read). `command_argument`, `command_flags` and `no_cidr_value` need `command_prefix`, and `command_prefix` needs one of them. With `planted_mark`, a store with no envelope that holds the mark is `status: "error"`: the previous run the stack planted is gone. The store's ring keeps its newest envelopes only, so a plant must name its ring entry newer than the runs already there. `shadow_report_stored`, in its own module
+(`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, without a `finding` block, on the run's shadow
 stream (`stream`, required: the AgentSchedule's name for a scheduled canary, or `<audit>-shadow` for a run
 started by hand; never a live audit's stream), read on the gateway pod, where the broker's report-store
 listener writes, with the install's own `report_query.py --include-shadow` (readers refuse a shadow

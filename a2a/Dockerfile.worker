@@ -57,7 +57,8 @@ COPY a2a/worker-harness/package.json a2a/worker-harness/package-lock.json ./
 RUN npm ci \
     && npm cache clean --force
 
-# The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
+# The temporary cluster view (on by default on the session route, or the
+# operator flag A2A_SESSION_CLUSTER_VIEW): stock
 # kubectl at /usr/local/libexec/kubectl with a /usr/local/bin/kubectl wrapper
 # (deploy/sandbox/session-kubectl.sh) that routes through <agent>-kube-proxy
 # when KUBE_PROXY_URL is set, recording a failed write attempt under a
@@ -94,6 +95,13 @@ COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexe
 # the pod can ever hold. No limit file is written, so the limit is the cgroup's memory.max.
 COPY --chmod=0644 deploy/sandbox/kubectl-admit.py /usr/local/libexec/kubectl-admit
 COPY --chmod=0644 deploy/sandbox/shell-memory-guard.py /usr/local/libexec/shell-memory-guard
+# The table's directory first, so it's 0755: a COPY --chmod creates every
+# missing directory on its destination path with the file's mode (BuildKit's
+# fsutil MkdirAll), and under buildx, which publishes the images, that left
+# /usr/local/share/kube-agents 0644. The worker's user couldn't read the table, and
+# the admission fails open on a table it can't read. A directory that exists
+# keeps its mode; the RUN after the table checks it as that user.
+RUN mkdir -p /usr/local/share/kube-agents
 COPY --chmod=0644 deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/kubectl-costs.json
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml jq git \
@@ -121,6 +129,10 @@ RUN python3 -I -B /tmp/kubectl_session_fastpath.py /usr/local/libexec/kubectl-ad
     && chmod 0644 /usr/local/share/kube-agents/kubectl-session-fastpath \
     && test -s /usr/local/share/kube-agents/kubectl-session-fastpath \
     && rm /tmp/kubectl_session_fastpath.py
+# The worker's user reads both files: the admission's table, and the wrapper's
+# fast-path figures. Root reads through any mode, so only this check sees one
+# the user can't (the 0644 directory above).
+RUN su node -s /bin/sh -c 'test -r /usr/local/share/kube-agents/kubectl-costs.json && test -r /usr/local/share/kube-agents/kubectl-session-fastpath'
 # The kubectl wrapper: deploy/sandbox/session-kubectl.sh says what it does on
 # each kind of pod.
 COPY --chmod=0755 deploy/sandbox/session-kubectl.sh /usr/local/bin/kubectl

@@ -581,6 +581,19 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		c := &pod.Spec.Containers[0]
 		c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvSessionReuse, Value: reuseValue})
 	}
+	// The harness, and the isolation waiver rendered empty on every session
+	// pod: pod env overrides the image's ENV, so a worker image can't set
+	// the waiver. The harness is added only when the install names one;
+	// unset is the worker's default, Claude Code. The waiver goes when the
+	// worker isolation lands (#6710).
+	{
+		c := &pod.Spec.Containers[0]
+		// Checked again here for a Config built without FromEnv.
+		if h := s.cfg.SessionHarness; h != "" && sessionHarnesses[h] {
+			c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvHarness, Value: h})
+		}
+		c.Env = append(c.Env, corev1.EnvVar{Name: envHarnessUnisolated, Value: ""})
+	}
 	if s.cfg.SessionClusterView {
 		c := &pod.Spec.Containers[0]
 		c.Env = append(c.Env,
@@ -1456,3 +1469,7 @@ func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
 	}
 	return append(env, corev1.EnvVar{Name: lib.EnvToolWithheld, Value: strings.Join(names, ",")})
 }
+
+// envHarnessUnisolated is the worker adapter's waiver for running a harness
+// without its isolation; the spawner renders it empty on every session pod.
+const envHarnessUnisolated = "A2A_HARNESS_UNISOLATED"

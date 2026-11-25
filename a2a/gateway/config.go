@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -70,6 +72,15 @@ const defaultDelegationDepthMax = 3
 // defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationWidthMax = 10
+
+// delegationRoundsEnv sets DelegationRoundsMax.
+const delegationRoundsEnv = "A2A_DELEGATION_ROUNDS_MAX"
+
+// delegationRoundsSupportedMax is the most rounds New lets DelegationRoundsMax
+// keep: one, until a profile parent's later rounds (a new batch after the
+// first's ends are delivered) land. A higher setting is clamped to it, with a
+// warning, rather than advertised to a worker the gateway would then refuse.
+const delegationRoundsSupportedMax = 1
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
 // accepts: ten, the fleet question's width (#5682). The children queue to
@@ -702,6 +713,17 @@ type Config struct {
 	// Namespace and WorkerImage configure the dark spawn path.
 	Namespace   string
 	WorkerImage string
+	// SessionHarness is the harness every session pod runs, passed to it as
+	// A2A_HARNESS (A2A_SESSION_HARNESS, from the PlatformAgent's
+	// spec.harness.sessionWorker.type). Empty is the worker's default,
+	// Claude Code, and adds nothing to the pod.
+	SessionHarness string
+	// SessionHarnessRefused is an A2A_SESSION_HARNESS value outside
+	// sessionHarnesses (CRD or image skew). The gateway is shared by every
+	// conversation, so it keeps serving and spawns sessions on the default
+	// harness, and main logs this at error level, rather than refusing to
+	// start and taking the whole chat surface down.
+	SessionHarnessRefused string
 
 	// SessionServiceAccount is the ServiceAccount every session pod runs
 	// as, rendered by the operator as <agent>-a2a-session and passed here
@@ -718,7 +740,8 @@ type Config struct {
 	// SessionClusterView gives spawned session pods the temporary read-only
 	// cluster view: a projected token for the credential broker's session
 	// audience, the broker's URL, and Bash in the worker. Rendered by the
-	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
+	// operator when the view is on (the session route's default, or its
+	// A2A_SESSION_CLUSTER_VIEW flag); off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
 	// New refuses the view without it. CredentialProxyExecURL is the
 	// broker's exec tier, empty while the operator renders none; the shim
@@ -861,6 +884,20 @@ type Config struct {
 	// does the depth bound, and one over 10.
 	DelegationWidthMax int
 
+	// DelegationRoundsMax bounds how many delegate requests one profile
+	// task may make (A2A_DELEGATION_ROUNDS_MAX), each minted or refused
+	// using up one; a request past it is refused under delegation.rounds.
+	// With rounds left, a request while the last round's children still run
+	// is no new round and stays a busy ignore; with none left (the default
+	// of one) it is refused like any other. A profile task's delegateTargets part
+	// advertises it when over one.
+	//
+	// Zero means 1. New clamps it to 1 to lib.DelegateRoundsCeiling, and
+	// then to delegationRoundsSupportedMax (1) with a warning, until rounds
+	// past the first are supported. FromEnv refuses a value that is not an
+	// integer.
+	DelegationRoundsMax int
+
 	// ScopeFile is the rendered spec.scope a profile task's target is
 	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
 	// routed task, so an edit reaches the gateway without a restart. A
@@ -1001,6 +1038,7 @@ func FromEnv() (*Config, error) {
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
+		SessionHarness:   os.Getenv(envSessionHarness),
 
 		SessionServiceAccount:  os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:     os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
@@ -1131,6 +1169,9 @@ func FromEnv() (*Config, error) {
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
+	}
+	if cfg.SessionHarness != "" && !sessionHarnesses[cfg.SessionHarness] {
+		cfg.SessionHarnessRefused, cfg.SessionHarness = cfg.SessionHarness, ""
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
@@ -1273,6 +1314,13 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
+	if v := strings.TrimSpace(os.Getenv(delegationRoundsEnv)); v != "" {
+		rm, err := strconv.Atoi(v)
+		if err != nil || rm < 1 {
+			return nil, fmt.Errorf("%s %q: need an integer from 1 to %d", delegationRoundsEnv, v, lib.DelegateRoundsCeiling)
+		}
+		cfg.DelegationRoundsMax = rm
+	}
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
 	ba, err := strconv.Atoi(busyAt)
 	if err != nil || ba < 1 {
@@ -1569,4 +1617,31 @@ func (c *Config) sessionResources() corev1.ResourceRequirements {
 			corev1.ResourceMemory: pick(c.SessionResources.Limits, corev1.ResourceMemory, workerMemoryLimit),
 		},
 	}
+}
+
+// envSessionHarness names the session worker's harness (Config.SessionHarness).
+const envSessionHarness = "A2A_SESSION_HARNESS"
+
+// sessionHarnesses are the harnesses the gateway spawns session pods for.
+// Antigravity joins when its worker isolation lands.
+var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
+
+// clampDelegationRounds is the DelegationRoundsMax New keeps: unset is one, a
+// value outside 1 to lib.DelegateRoundsCeiling is clamped into it, and any
+// value over delegationRoundsSupportedMax is clamped to that, with a warning
+// naming the variable, until rounds past the first are supported.
+func clampDelegationRounds(n int, log *slog.Logger) int {
+	if n == 0 {
+		return 1
+	}
+	set := n
+	n = max(1, min(n, lib.DelegateRoundsCeiling))
+	if n > delegationRoundsSupportedMax {
+		log.Warn(delegationRoundsEnv+": rounds above 1 are not supported yet; using 1", "set", set, "using", delegationRoundsSupportedMax)
+		return delegationRoundsSupportedMax
+	}
+	if n != set {
+		log.Warn(delegationRoundsEnv+": out of range; clamped", "set", set, "using", n, "max", lib.DelegateRoundsCeiling)
+	}
+	return n
 }

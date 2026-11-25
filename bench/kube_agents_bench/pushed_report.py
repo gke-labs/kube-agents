@@ -248,7 +248,7 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
     the reply's buckets with the opening's added in, bucket by bucket and
     into the nested ones, as the card-wake merge sums two turns (an inject
     record's tokens are the chain's usage as the door reported it, null
-    where it reported none, and a null bucket adds nothing).
+    where the harness holds none, and a null bucket adds nothing).
     """
     from kube_agents_bench import worker_trajectory  # devops_bench-bound, like the import below
     from kube_agents_bench.card_wake import _add_tokens  # devops_bench-bound; imported where a result exists
