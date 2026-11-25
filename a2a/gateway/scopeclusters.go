@@ -81,8 +81,8 @@ func (g *Gateway) scopeClustersPageMax() int {
 	return min(width, lib.ScopeClustersPageMax)
 }
 
-// scopeClustersInput is what buildScopeClusters reads, so the scale test can
-// time the build on its own.
+// scopeClustersInput is what buildScopeClusters reads: the declaration, the
+// resolved document and its parsed listing, and the checks it applies.
 type scopeClustersInput struct {
 	decl        *scopeDeclaration
 	doc         *resolvedScope
@@ -95,11 +95,6 @@ type scopeClustersInput struct {
 	verdict     func(t clusterTarget) error
 	holds       func(parent, child capability.Scope) bool
 }
-
-// scopeProbeToken names the location and cluster of the probe that asks
-// whether a project is in scope at all: an underscore is in no GCP location
-// or cluster name, so no exclude.clusters entry matches it.
-const scopeProbeToken = "probe_target"
 
 func buildScopeClusters(in scopeClustersInput) lib.ScopeClusters {
 	out := lib.ScopeClusters{Clusters: []lib.ScopeCluster{}}
@@ -119,7 +114,7 @@ func buildScopeClusters(in scopeClustersInput) lib.ScopeClusters {
 	projectIn := func(p string) bool {
 		v, seen := verdicts[p]
 		if !seen {
-			v = in.verdict(clusterTarget{Project: p, Location: scopeProbeToken, Cluster: scopeProbeToken}) == nil
+			v = in.verdict(clusterTarget{Project: p, Location: probeTargetToken, Cluster: probeTargetToken}) == nil
 			verdicts[p] = v
 		}
 		return v
@@ -202,7 +197,7 @@ func buildScopeClusters(in scopeClustersInput) lib.ScopeClusters {
 	}
 	slices.Sort(candidates)
 	candidates = slices.Compact(candidates)
-	probe := clusterTarget{Location: scopeProbeToken, Cluster: scopeProbeToken}
+	probe := clusterTarget{Location: probeTargetToken, Cluster: probeTargetToken}
 	for _, p := range candidates {
 		if _, listed := listing[p]; listed || !lib.ValidSubjectToken(p) || !projectIn(p) {
 			continue
