@@ -199,3 +199,50 @@ func TestAnInjectReportOverTheBusLandsOnTheTranscriptAndIsKeptByRoot(t *testing.
 		t.Fatalf("kept report under task-7 = %q (%v), want the report", got, ok)
 	}
 }
+
+// Every entry the notify route relays onto an inject conversation is marked,
+// a card's progress line as well as its settled report, and none counts as
+// the turn's own entry: a reader sets them apart, and a turn that posted
+// nothing of its own is not read as answered.
+func TestEveryRelayedEntryIsMarkedAndNotATurnEntry(t *testing.T) {
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const conv = "inject:relayed-1"
+	door.mu.Lock()
+	before := countsOf(door.conversationLocked(conv))
+	door.mu.Unlock()
+	if _, err := door.PostNotifyFrame(conv, "", "card started", "task-7", false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := door.PostNotifyFrame(conv, "", "card report", "task-7", true, false); err != nil {
+		t.Fatal(err)
+	}
+	door.mu.Lock()
+	c := door.conversationLocked(conv)
+	after := countsOf(c)
+	entries := append([]InjectEntry(nil), c.entries...)
+	door.mu.Unlock()
+	if after.entries != before.entries {
+		t.Fatalf("relayed entries counted as the turn's: %d -> %d", before.entries, after.entries)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("%d entries", len(entries))
+	}
+	for _, e := range entries {
+		if !e.Report {
+			t.Errorf("relayed entry %q not marked", e.Text)
+		}
+	}
+	// A turn's own post still counts.
+	if _, err := door.PostMessage(conv, OutMessage{Text: "the reply"}); err != nil {
+		t.Fatal(err)
+	}
+	door.mu.Lock()
+	own := countsOf(door.conversationLocked(conv))
+	door.mu.Unlock()
+	if own.entries != after.entries+1 {
+		t.Fatalf("the turn's own post not counted: %d -> %d", after.entries, own.entries)
+	}
+}

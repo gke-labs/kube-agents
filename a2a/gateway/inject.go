@@ -322,9 +322,10 @@ type InjectEntry struct {
 	Reason string `json:"reason,omitempty"`
 	// ReplyTo and Report are set on a post or edit the chat.notify route
 	// made (PostNotifyFrame) only: the root of the task the post reports on,
-	// as the console's notify frame carries it, and whether the post is a
-	// card's report, the one the gateway keeps for a reply under it. A
-	// reader finds a relayed card report by them.
+	// as the console's notify frame carries it, and Report on every such
+	// entry, a card's settled report and its progress lines alike. Report
+	// marks what was relayed onto the conversation, never a turn's own
+	// reply: a reader (the eval harness) sets these entries apart by it.
 	ReplyTo string `json:"replyTo,omitempty"`
 	Report  bool   `json:"report,omitempty"`
 	TS      string `json:"ts"`
@@ -607,6 +608,10 @@ type injectConversation struct {
 	// oldest entries have been dropped or the conversation was evicted and
 	// minted again under it.
 	nextSeq int
+	// relayed counts the entries the chat.notify route appended
+	// (PostNotifyFrame), so a turn's "answered without a task" reading
+	// counts only the turn's own entries.
+	relayed int
 	// terminals records the terminal state of every task that has ended on
 	// this conversation, so a reader that arrives after the event still
 	// learns the answer rather than waiting for one that has been and gone.
@@ -895,7 +900,12 @@ func (a *InjectAdapter) PostNotifyFrame(conversation, messageID, text, replyTo s
 	if edit {
 		kind = InjectEntryEdit
 	}
-	a.appendLocked(conv, InjectEntry{Kind: kind, Text: text, MessageID: messageID, ReplyTo: replyTo, Report: report})
+	// Every relayed entry is marked, the settled report or not (`report`
+	// says which only for what the route keeps under a reply): none is the
+	// turn's reply, and a turn's own reply carries no mark.
+	_ = report
+	a.appendLocked(conv, InjectEntry{Kind: kind, Text: text, MessageID: messageID, ReplyTo: replyTo, Report: true})
+	conv.relayed++
 	return messageID, nil
 }
 
@@ -1209,13 +1219,14 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 			a.rememberFloorLocked(oldest, injectFloor{
 				nextSeq:     evicted.nextSeq,
 				outstanding: max(0, evicted.handed-evicted.turns),
+				relayed:     evicted.relayed,
 			})
 		}
 		delete(a.conversations, oldest)
 	}
 	a.mints++
 	floor := a.floorLocked(key)
-	conv := &injectConversation{nextSeq: floor.nextSeq, handed: floor.outstanding, terminals: map[string]string{}, gen: a.mints}
+	conv := &injectConversation{nextSeq: floor.nextSeq, handed: floor.outstanding, relayed: floor.relayed, terminals: map[string]string{}, gen: a.mints}
 	a.conversations[key] = conv
 	a.order = append(a.order, key)
 	return conv
@@ -1229,6 +1240,8 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 type injectFloor struct {
 	nextSeq     int
 	outstanding int
+	// relayed is the relayed entries among the sequence's first nextSeq-1.
+	relayed int
 }
 
 // rememberFloorLocked records where an evicted conversation stopped, bounded
@@ -1315,7 +1328,7 @@ func countsOf(conv *injectConversation) injectCounts {
 		starts:           conv.started.total,
 		accepted:         conv.accepted.total,
 		publishFailed:    conv.publishFailed.total,
-		entries:          conv.nextSeq - 1,
+		entries:          conv.nextSeq - 1 - conv.relayed,
 		drops:            conv.drops,
 		turns:            conv.turns,
 		cancelsPublished: conv.cancelsPublished,
