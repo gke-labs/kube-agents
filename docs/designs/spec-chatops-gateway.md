@@ -902,7 +902,7 @@ accepted for, from the resolved scope's `clusters` map, each held to the delegat
 and the parent's scope (a profile's tiers and pins are left to the delegation), with the count, a
 reserved empty cursor, the projects in scope whose clusters are listed elsewhere (explicit and
 management projects, members not yet listed), and `unknown` with `truncated` when the document
-carries no map (dropped for its 900 KiB budget, or absent) or the scope draws no boundary. The
+isn't `ok` or carries no map (dropped for its 900 KiB budget, or absent), or when the scope draws no boundary. The
 delegate tool names the page once in its own description when an agent on the list takes a cluster. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a

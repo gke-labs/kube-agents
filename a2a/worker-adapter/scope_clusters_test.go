@@ -75,7 +75,7 @@ func TestDelegateMCPNamesTheScopeClustersPage(t *testing.T) {
 			" This task is scoped to one cluster: p/l/c." +
 				" These clusters pass the install's scope check; a profile's tiers and pins are checked when a task is delegated."},
 		{"parent scoped, out of scope", &lib.ScopeClusters{ParentScoped: true, Clusters: []lib.ScopeCluster{}},
-			" This task is scoped to one cluster, which the install's scope does not admit."},
+			" This task is scoped to one cluster, which the install's scope does not admit, or the gateway could not confirm that it does."},
 	}
 	for _, tc := range cases {
 		desc, schema := toolWithScope(t, scTargets, tc.page)

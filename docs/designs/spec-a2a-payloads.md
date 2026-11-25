@@ -933,7 +933,7 @@ can't be read, gets an empty page with a known `count` of 0.
   elsewhere.
 - `parentScoped` is set for a parent scoped to one cluster, which the delegation holds to that
   cluster: the page is that cluster when the install's scope admits it, and empty otherwise, with
-  `count` 0 or 1 and no map read.
+  `count` 0 or 1; the map isn't used.
 - `oldestListing` is the oldest `at` among the projects the counted clusters came from. A probe that
   fails keeps its previous entry and its `at`, so this is how stale the page may be. A stamp ahead
   of the gateway's clock gives no age, and `oldestListing` is then left out: clusters counted with

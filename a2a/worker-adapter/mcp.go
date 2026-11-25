@@ -237,7 +237,7 @@ const (
 	scopeClustersUnknownLead    = " Clusters this task may delegate to that have a published listing: unknown, as the gateway has no full listing; %d known."
 	scopeClustersUnboundedLead  = " Clusters this task may delegate to: unknown, as the install's scope draws no boundary; %d with a published listing are known."
 	scopeClustersParentScoped   = " This task is scoped to one cluster: %s."
-	scopeClustersParentNone     = " This task is scoped to one cluster, which the install's scope does not admit."
+	scopeClustersParentNone     = " This task is scoped to one cluster, which the install's scope does not admit, or the gateway could not confirm that it does."
 	scopeClustersPageLead       = " On this page (project/location/cluster): %s."
 	scopeClustersNotOnPage      = " Not on this page: %d."
 	scopeClustersOldest         = " Oldest cluster listing read at %s."
