@@ -70,6 +70,18 @@ const (
 	// within the agent principal's reserved a2a.topics.agent.> namespace on TOPICS-JOURNAL.
 	SubjectCuratorOutcomes = "a2a.topics.agent.platform.curator-outcomes"
 
+	// TagTrustUntrusted marks recalled records that originate from untrusted sources.
+	TagTrustUntrusted = "trust:untrusted"
+
+	// UntrustedSourceBackfill identifies records created from pull request history backfill.
+	UntrustedSourceBackfill = "backfill"
+
+	// UntrustedSourceContext identifies records loaded from context repositories.
+	UntrustedSourceContext = "context"
+
+	// UntrustedSourceExternal identifies records explicitly flagged as untrusted.
+	UntrustedSourceExternal = "external"
+
 	maxSlugLen              = 60
 	minRepoSlugSegments     = 2
 	proposalBranchPrefix    = "platform-agent/memory/"
@@ -83,6 +95,8 @@ const (
 	githubSSHHost           = "ssh.github.com"
 	repoTagPrefix           = "repo:"
 	idTagPrefix             = "id:"
+	roleTagPrefix           = "role:"
+	outcomeTagBackfill      = "outcome:backfill"
 	recordDirPerm           = 0o750
 	recordFilePerm          = 0o600
 	maxRecordFileBytes      = 4 << 20
@@ -235,6 +249,7 @@ type RecordMeta struct {
 	Date         string         `json:"date,omitempty" yaml:"date,omitempty"`
 	Repo         string         `json:"repo,omitempty" yaml:"repo,omitempty"`
 	Role         string         `json:"role,omitempty" yaml:"role,omitempty"`
+	Untrusted    bool           `json:"untrusted,omitempty" yaml:"untrusted,omitempty"`
 	Declares     []DeclareItem  `json:"declares,omitempty" yaml:"declares,omitempty"`
 	Scope        RecordScope    `json:"scope,omitempty" yaml:"scope,omitempty"`
 	Guard        *RecordGuard   `json:"guard,omitempty" yaml:"guard,omitempty"`
@@ -314,6 +329,9 @@ type MemoryQueryRequest struct {
 	Repo          string        `json:"repo,omitempty"`
 	Role          string        `json:"role,omitempty"`
 	FromLocal     bool          `json:"from_local,omitempty"`
+	BatchID       string        `json:"batch_id,omitempty"`
+	BatchIndex    int           `json:"batch_index,omitempty"`
+	BatchTotal    int           `json:"batch_total,omitempty"`
 	Records       []Record      `json:"records,omitempty"`
 	Outcome       *OutcomeEvent `json:"outcome,omitempty"`
 }
@@ -339,11 +357,12 @@ type MemoryQueryResponse struct {
 }
 
 var (
-	reRecordID      = regexp.MustCompile(`^(DEC|LES)-\d{4}-\d{3,}$`)
-	reExternalDocID = regexp.MustCompile(`(?i)\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5}|RUN-\d{1,5}|BP-\d{1,5}|TEN-\d{1,5}|MET-\d{1,5}|ESC-\d{1,5}|OBS-\d{1,5})\b`)
-	reLeadingNum    = regexp.MustCompile(`^0*(\d{1,5})(?:[-_.\s]+(.*))?$`)
-	reSlugNonAln    = regexp.MustCompile(`[^a-z0-9]+`)
-	externalDocDirs = []string{
+	reRecordID        = regexp.MustCompile(`^(DEC|LES)-\d{4}-\d{3,}$`)
+	reSafeDocRecordID = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,80}$`)
+	reExternalDocID   = regexp.MustCompile(`(?i)\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5}|RUN-\d{1,5}|BP-\d{1,5}|TEN-\d{1,5}|MET-\d{1,5}|ESC-\d{1,5}|OBS-\d{1,5})\b`)
+	reLeadingNum      = regexp.MustCompile(`^0*(\d{1,5})(?:[-_.\s]+(.*))?$`)
+	reSlugNonAln      = regexp.MustCompile(`[^a-z0-9]+`)
+	externalDocDirs   = []string{
 		"knowledge/runbook",
 		"knowledge/runbooks",
 		"knowledge/cluster-blueprint",
@@ -400,6 +419,27 @@ func (r Record) DocumentID(repoID string) string {
 	return fmt.Sprintf("%s%s:%s", DocPrefix, repoID, key)
 }
 
+// IsUntrusted reports whether this record comes from an untrusted source.
+func (r Record) IsUntrusted() bool {
+	return r.Meta.Untrusted ||
+		strings.EqualFold(strings.TrimSpace(r.Meta.Role), RoleContext) ||
+		strings.EqualFold(strings.TrimSpace(r.Meta.Evidence.Outcome), UntrustedSourceBackfill)
+}
+
+// UntrustedSource returns the untrusted source label ("context", "backfill", or "external"), or "".
+func (r Record) UntrustedSource() string {
+	if strings.EqualFold(strings.TrimSpace(r.Meta.Role), RoleContext) {
+		return UntrustedSourceContext
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Meta.Evidence.Outcome), UntrustedSourceBackfill) {
+		return UntrustedSourceBackfill
+	}
+	if r.Meta.Untrusted {
+		return UntrustedSourceExternal
+	}
+	return ""
+}
+
 // Tags returns the sorted Hindsight tag list for this record.
 func (r Record) Tags() []string {
 	seen := map[string]struct{}{
@@ -434,17 +474,23 @@ func (r Record) Tags() []string {
 	if repo := strings.TrimSpace(r.Meta.Repo); repo != "" {
 		hasRepoTag := false
 		for existing := range seen {
-			if strings.HasPrefix(existing, "repo:") {
+			if strings.HasPrefix(existing, repoTagPrefix) {
 				hasRepoTag = true
 				break
 			}
 		}
 		if !hasRepoTag {
-			seen["repo:"+repo] = struct{}{}
+			seen[repoTagPrefix+repo] = struct{}{}
 		}
 	}
 	if role := strings.TrimSpace(r.Meta.Role); role != "" {
-		seen["role:"+role] = struct{}{}
+		seen[roleTagPrefix+role] = struct{}{}
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Meta.Evidence.Outcome), UntrustedSourceBackfill) {
+		seen[outcomeTagBackfill] = struct{}{}
+	}
+	if r.IsUntrusted() {
+		seen[TagTrustUntrusted] = struct{}{}
 	}
 	out := make([]string, 0, len(seen))
 	for t := range seen {
@@ -488,8 +534,82 @@ func cloneRecord(r Record) Record {
 	return cp
 }
 
+func isValidDocRecordID(id string) bool {
+	return id != "." && id != ".." && reSafeDocRecordID.MatchString(id)
+}
+
+func clampRecordStatus(s RecordStatus, defaultStatus RecordStatus) RecordStatus {
+	switch RecordStatus(strings.ToLower(strings.TrimSpace(string(s)))) {
+	case StatusActive:
+		return StatusActive
+	case StatusProposed:
+		return StatusProposed
+	case StatusRejected:
+		return StatusRejected
+	case StatusSuperseded:
+		return StatusSuperseded
+	case StatusRetired:
+		return StatusRetired
+	default:
+		return defaultStatus
+	}
+}
+
+func fallbackRecordIDPrefix(rtype RecordType, relPath string) string {
+	switch rtype {
+	case RecordTypeLesson:
+		return "LES"
+	case RecordTypeRunbook:
+		return "RUN"
+	case RecordTypeClusterBlueprint:
+		return "BP"
+	case RecordTypeTenancyModel:
+		return "TEN"
+	case RecordTypeMetricDefinition:
+		return "MET"
+	case RecordTypeEscalation:
+		return "ESC"
+	case RecordTypeObservation:
+		return "OBS"
+	case RecordTypeDecision:
+		if strings.Contains(strings.ToLower(relPath), "rfc") {
+			return "RFC"
+		}
+		return "ADR"
+	default:
+		_, prefix := inferExternalDocTypeAndPrefix(nil, relPath)
+		return prefix
+	}
+}
+
+func sanitizeUntrustedRecordID(r Record) string {
+	cand := strings.TrimSpace(r.Meta.ID)
+	if isValidDocRecordID(cand) {
+		return cand
+	}
+	prefix := fallbackRecordIDPrefix(r.Meta.Type, r.Path)
+	if r.Path != "" {
+		stem := strings.TrimSuffix(filepath.Base(r.Path), filepath.Ext(r.Path))
+		if m := reExternalDocID.FindStringSubmatch(stem); len(m) > 1 {
+			if upper := strings.ToUpper(m[1]); isValidDocRecordID(upper) {
+				return upper
+			}
+		} else if nm := reLeadingNum.FindStringSubmatch(stem); len(nm) > 1 {
+			if n, err := strconv.Atoi(nm[1]); err == nil {
+				return fmt.Sprintf("%s-%04d", prefix, n)
+			}
+		}
+	}
+	seed := strings.TrimSpace(r.Path)
+	if seed == "" {
+		seed = r.Meta.Title + "\x00" + cand + "\x00" + r.Body
+	}
+	sum := sha256.Sum256([]byte(seed))
+	return fmt.Sprintf("%s-%s", prefix, strings.ToUpper(hex.EncodeToString(sum[:])[:6]))
+}
+
 // NormalizeRepoRecords returns a deep copy of recs stamped with repository and role metadata.
-// When role is "context", it strips machine guard assertions and downgrades blocking guards.
+// When role is "context", it marks records untrusted, strips machine assertions, and downgrades blocking guards.
 func NormalizeRepoRecords(repoID, role string, recs []Record) []Record {
 	if len(recs) == 0 {
 		return []Record{}
@@ -499,6 +619,7 @@ func NormalizeRepoRecords(repoID, role string, recs []Record) []Record {
 	if normRole != RoleManaged && normRole != RoleContext {
 		normRole = ""
 	}
+	seenIDs := make(map[string]bool, len(recs))
 	out := make([]Record, 0, len(recs))
 	for _, r := range recs {
 		cp := cloneRecord(r)
@@ -508,6 +629,25 @@ func NormalizeRepoRecords(repoID, role string, recs []Record) []Record {
 		if normRole != "" {
 			cp.Meta.Role = normRole
 		}
+		if normRole == RoleContext {
+			cp.Meta.Untrusted = true
+		}
+		rawID := strings.TrimSpace(cp.Meta.ID)
+		if normRole == RoleContext || cp.IsUntrusted() || !isValidDocRecordID(rawID) {
+			cp.Meta.ID = sanitizeUntrustedRecordID(cp)
+			if seenIDs[cp.Meta.ID] && !isValidDocRecordID(rawID) {
+				sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", cp.Path, rawID, len(out))))
+				base := cp.Meta.ID
+				if len(base) > 75 {
+					base = strings.TrimRight(base[:75], "._-")
+				}
+				cp.Meta.ID = fmt.Sprintf("%s-%s", base, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
+			}
+		} else {
+			cp.Meta.ID = rawID
+		}
+		cp.Meta.Status = clampRecordStatus(cp.Meta.Status, StatusProposed)
+		seenIDs[cp.Meta.ID] = true
 		if normRole == RoleContext {
 			for i := range cp.Meta.Declares {
 				cp.Meta.Declares[i].File = ""
@@ -940,15 +1080,20 @@ func ParseExternalDocRecord(text, relPath string) Record {
 }
 
 func parseExternalDocRecord(text, relPath string) (rec Record, explicitID bool) {
-	if parsed, err := ParseRecord(text, relPath); err == nil && len(ValidateRecord(parsed)) == 0 {
+	if parsed, err := ParseRecord(text, relPath); err == nil && len(ValidateRecord(parsed)) == 0 && isValidDocRecordID(parsed.Meta.ID) {
 		return parsed, true
 	}
 	var fm map[string]any
 	body := strings.TrimSpace(text)
-	if strings.HasPrefix(text, "---\n") {
-		if idx := strings.Index(text[4:], "\n---\n"); idx >= 0 {
-			rawFM := text[4 : 4+idx]
-			body = strings.TrimSpace(text[4+idx+5:])
+	if strings.HasPrefix(text, "---\n") || strings.HasPrefix(text, "---\r\n") {
+		rest := text[4:]
+		if strings.HasPrefix(text, "---\r\n") {
+			rest = text[5:]
+		}
+		if idx := strings.Index(rest, "\n---"); idx >= 0 {
+			rawFM := rest[:idx]
+			after := rest[idx+4:]
+			body = strings.TrimSpace(strings.TrimLeft(after, "\r\n"))
 			_ = yaml.Unmarshal([]byte(rawFM), &fm)
 		}
 	}
@@ -956,13 +1101,16 @@ func parseExternalDocRecord(text, relPath string) (rec Record, explicitID bool) 
 	rtype, prefix := inferExternalDocTypeAndPrefix(fm, relPath)
 	recID := ""
 	if fm != nil {
-		if idStr, ok := fm["id"].(string); ok && strings.TrimSpace(idStr) != "" {
-			recID = strings.TrimSpace(idStr)
-			explicitID = true
+		if idStr, ok := fm["id"].(string); ok {
+			cand := strings.TrimSpace(idStr)
+			if isValidDocRecordID(cand) {
+				recID = cand
+				explicitID = true
+			}
 		}
 	}
 	if recID == "" {
-		if m := reExternalDocID.FindStringSubmatch(stem); len(m) > 1 {
+		if m := reExternalDocID.FindStringSubmatch(stem); len(m) > 1 && isValidDocRecordID(strings.ToUpper(m[1])) {
 			recID = strings.ToUpper(m[1])
 		} else if nm := reLeadingNum.FindStringSubmatch(stem); len(nm) > 1 {
 			if n, err := strconv.Atoi(nm[1]); err == nil {
@@ -996,16 +1144,24 @@ func parseExternalDocRecord(text, relPath string) (rec Record, explicitID bool) 
 
 	status := StatusActive
 	if fm != nil {
-		if stStr, ok := fm["status"].(string); ok {
-			switch strings.ToLower(strings.TrimSpace(stStr)) {
-			case "proposed", "draft":
+		if rawStatus, hasStatus := fm["status"]; hasStatus && rawStatus != nil {
+			if stStr, ok := rawStatus.(string); ok {
+				switch strings.ToLower(strings.TrimSpace(stStr)) {
+				case "", "active", "accepted", "approved":
+					status = StatusActive
+				case "proposed", "draft":
+					status = StatusProposed
+				case "rejected":
+					status = StatusRejected
+				case "superseded", "deprecated", "obsolete":
+					status = StatusSuperseded
+				case "retired":
+					status = StatusRetired
+				default:
+					status = StatusProposed
+				}
+			} else {
 				status = StatusProposed
-			case "rejected":
-				status = StatusRejected
-			case "superseded", "deprecated", "obsolete":
-				status = StatusSuperseded
-			case "retired":
-				status = StatusRetired
 			}
 		}
 	}
@@ -1481,12 +1637,18 @@ func loadExternalDocRecordsFromRoots(repoDir string, roots []externalDocRoot) ([
 					}
 					seenFiles[absFile] = true
 					rel := filepath.ToSlash(filepath.Join(root.prefix, r.Path))
+					r.Path = rel
+					r.Meta.ID = sanitizeUntrustedRecordID(r)
+					r.Meta.Status = clampRecordStatus(r.Meta.Status, StatusProposed)
 					if seenIDs[r.Meta.ID] {
 						sum := sha256.Sum256([]byte(rel))
-						r.Meta.ID = fmt.Sprintf("%s-%s", r.Meta.ID, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
+						base := r.Meta.ID
+						if len(base) > 75 {
+							base = strings.TrimRight(base[:75], "._-")
+						}
+						r.Meta.ID = fmt.Sprintf("%s-%s", base, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
 					}
 					seenIDs[r.Meta.ID] = true
-					r.Path = rel
 					rootRecs = append(rootRecs, r)
 				}
 			}
@@ -1532,7 +1694,11 @@ func loadExternalDocRecordsFromRoots(repoDir string, roots []externalDocRoot) ([
 						continue
 					}
 					sum := sha256.Sum256([]byte(rel))
-					rec.Meta.ID = fmt.Sprintf("%s-%s", rec.Meta.ID, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
+					base := rec.Meta.ID
+					if len(base) > 75 {
+						base = strings.TrimRight(base[:75], "._-")
+					}
+					rec.Meta.ID = fmt.Sprintf("%s-%s", base, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
 				}
 				seenIDs[rec.Meta.ID] = true
 				rootRecs = append(rootRecs, rec)

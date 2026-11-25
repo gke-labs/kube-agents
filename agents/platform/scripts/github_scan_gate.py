@@ -285,9 +285,18 @@ _WRITE_ACCESS_INDETERMINATE = "indeterminate"
 DECISION_MEMORY_REPO_SCAN_ENV = "DECISION_MEMORY_REPO_SCAN"
 DECISION_MEMORY_BOOTSTRAP_SINCE_ENV = "DECISION_MEMORY_BOOTSTRAP_SINCE"
 PLATFORM_AGENT_HOME_ENV = "PLATFORM_AGENT_HOME"
+HERMES_HOME_ENV = "HERMES_HOME"
 HINDSIGHT_URL_ENV_VARS = ("DECISION_MEMORY_HINDSIGHT_URL", "HINDSIGHT_API_URL")
 DEFAULT_AGENT_HOME = "/opt/data"
 HINDSIGHT_CONFIG_REL = Path("hindsight") / "config.json"
+ROLE_MANAGED = "managed"
+ROLE_CONTEXT = "context"
+VALID_REPO_ROLES = frozenset({ROLE_MANAGED, ROLE_CONTEXT})
+BACKFILL_OUTCOME = "backfill"
+BACKFILL_RECORD_TYPE = "lesson"
+BACKFILL_GUARD_SEVERITY = "warn"
+EMIT_KIND_PROPOSED = "proposed"
+EMIT_KIND_REFUSED = "refused"
 _FALSY_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 DEFAULT_BOOTSTRAP_SINCE = "90d"
 DEFAULT_BOOTSTRAP_SINCE_DAYS = 90
@@ -2259,17 +2268,24 @@ def _resolve_hindsight_url() -> str:
         val = os.environ.get(var, "").strip()
         if val:
             return val
-    cfg_path = _agent_home_path() / HINDSIGHT_CONFIG_REL
-    if cfg_path.is_file():
-        try:
-            parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
-            if isinstance(parsed, dict):
-                for key in ("api_url", "url"):
-                    val = str(parsed.get(key) or "").strip()
-                    if val:
-                        return val
-        except (OSError, ValueError):
-            pass
+    candidate_dirs = [_agent_home_path()]
+    raw_hermes_home = os.environ.get(HERMES_HOME_ENV, "").strip()
+    if raw_hermes_home:
+        hermes_dir = Path(raw_hermes_home)
+        if hermes_dir not in candidate_dirs:
+            candidate_dirs.append(hermes_dir)
+    for base_dir in candidate_dirs:
+        cfg_path = base_dir / HINDSIGHT_CONFIG_REL
+        if cfg_path.is_file():
+            try:
+                parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    for key in ("api_url", "url"):
+                        val = str(parsed.get(key) or "").strip()
+                        if val:
+                            return val
+            except (OSError, ValueError):
+                pass
     return ""
 
 
@@ -2798,8 +2814,93 @@ def _is_backfill_situational_close(text: str | None) -> bool:
     return bool(_BACKFILL_SITUATIONAL_RE.search(str(text or "")))
 
 
+def _build_curator_index_cmd(
+    curator_bin: str,
+    repo_dir: str,
+    repo_id: str,
+    role: str,
+    hindsight_url: str = "",
+) -> list[str]:
+    """Build the `curator index` argv with explicit `--role` and fallback URL."""
+    norm_role = str(role or "").strip().lower()
+    if norm_role not in VALID_REPO_ROLES:
+        raise ValueError(f"invalid repository role for curator index: {role!r}")
+    clean_repo_id = str(repo_id or "").strip()
+    if not clean_repo_id:
+        raise ValueError("curator index requires a non-empty --repo-id")
+    cmd = [
+        curator_bin,
+        "index",
+        "--repo",
+        repo_dir,
+        "--repo-id",
+        clean_repo_id,
+        "--role",
+        norm_role,
+    ]
+    clean_hs_url = str(hindsight_url or "").strip()
+    if clean_hs_url:
+        cmd.extend(["--hindsight-url", clean_hs_url])
+    return cmd
+
+
+def _build_backfill_emit_args(
+    *,
+    kind: str,
+    repo: str,
+    pr_ref: str,
+    title: str,
+    summary: str = "",
+    reason: str = "",
+    paths: list[str] | None = None,
+) -> list[str]:
+    """Build `curator emit` flags for Step B backfill with untrusted provenance markers."""
+    clean_repo = str(repo or "").strip()
+    if not clean_repo:
+        raise ValueError("backfill curator emit requires a non-empty --repo")
+    args = [
+        "--kind",
+        kind,
+        "--type",
+        BACKFILL_RECORD_TYPE,
+        "--outcome",
+        BACKFILL_OUTCOME,
+        "--guard-severity",
+        BACKFILL_GUARD_SEVERITY,
+        "--repo",
+        clean_repo,
+        "--pr",
+        pr_ref,
+        "--title",
+        title,
+    ]
+    if summary:
+        args.extend(["--summary", summary])
+    if reason:
+        args.extend(["--reason", reason])
+    if paths:
+        args.extend(["--paths", ",".join(paths[:MAX_BACKFILL_RECORD_PATHS])])
+    return args
+
+
+def _has_flag_value(args: list[str], flag_name: str, expected: str | None = None) -> bool:
+    """Return True when `flag_name` is present in `args` with a non-empty (or `expected`) value."""
+    for idx, token in enumerate(args[:-1]):
+        if token == flag_name:
+            val = str(args[idx + 1] or "").strip()
+            return val == expected if expected is not None else bool(val)
+    return False
+
+
 def _run_curator_emit_ok(curator_bin: str, args: list[str], label: str) -> bool:
-    """Run `curator emit` and return True when it exits 0."""
+    """Run `curator emit` for Step B backfill and return True when it exits 0."""
+    if not _has_flag_value(args, "--outcome", BACKFILL_OUTCOME) or not _has_flag_value(
+        args, "--repo"
+    ):
+        sys.stderr.write(
+            f"github_scan_gate: refusing backfill curator emit for {label} without --outcome backfill and --repo\n"
+        )
+        return False
     cmd = [curator_bin, "emit", *args]
     try:
         proc = subprocess.run(
@@ -3181,26 +3282,14 @@ def _backfill_one_managed_repo(
                 summary_parts.append(f"Linked issue: {inc_citation}.")
             if body:
                 summary_parts.append(body[:BACKFILL_SUMMARY_MAX_CHARS])
-            emit_args = [
-                "--kind",
-                "proposed",
-                "--type",
-                "lesson",
-                "--outcome",
-                "backfill",
-                "--guard-severity",
-                "warn",
-                "--repo",
-                repo,
-                "--pr",
-                pr_ref,
-                "--title",
-                rec_title,
-                "--summary",
-                " ".join(summary_parts)[:BACKFILL_SUMMARY_MAX_CHARS],
-            ]
-            if live_paths:
-                emit_args.extend(["--paths", ",".join(live_paths[:MAX_BACKFILL_RECORD_PATHS])])
+            emit_args = _build_backfill_emit_args(
+                kind=EMIT_KIND_PROPOSED,
+                repo=repo,
+                pr_ref=pr_ref,
+                title=rec_title,
+                summary=" ".join(summary_parts)[:BACKFILL_SUMMARY_MAX_CHARS],
+                paths=live_paths or None,
+            )
             if dry_run:
                 sys.stderr.write(
                     f"github_scan_gate: would backfill revert lesson from {pr_ref}\n"
@@ -3253,26 +3342,14 @@ def _backfill_one_managed_repo(
                 summary_parts.append(f"Linked issue: {inc_citation}.")
             if body:
                 summary_parts.append(body[:BACKFILL_SUMMARY_MAX_CHARS])
-            emit_args = [
-                "--kind",
-                "proposed",
-                "--type",
-                "lesson",
-                "--outcome",
-                "backfill",
-                "--guard-severity",
-                "warn",
-                "--repo",
-                repo,
-                "--pr",
-                pr_ref,
-                "--title",
-                rec_title,
-                "--summary",
-                " ".join(summary_parts)[:BACKFILL_SUMMARY_MAX_CHARS],
-                "--paths",
-                ",".join(live_files[:MAX_BACKFILL_RECORD_PATHS]),
-            ]
+            emit_args = _build_backfill_emit_args(
+                kind=EMIT_KIND_PROPOSED,
+                repo=repo,
+                pr_ref=pr_ref,
+                title=rec_title,
+                summary=" ".join(summary_parts)[:BACKFILL_SUMMARY_MAX_CHARS],
+                paths=live_files,
+            )
             if dry_run:
                 sys.stderr.write(
                     f"github_scan_gate: would backfill fix lesson from {pr_ref}\n"
@@ -3379,26 +3456,14 @@ def _backfill_one_managed_repo(
                 if title
                 else f"Rejected proposal #{pr_num}"
             )
-            emit_args = [
-                "--kind",
-                "refused",
-                "--type",
-                "lesson",
-                "--outcome",
-                "backfill",
-                "--guard-severity",
-                "warn",
-                "--repo",
-                repo,
-                "--pr",
-                pr_ref,
-                "--title",
-                rec_title,
-                "--reason",
-                rej_reason,
-            ]
-            if target_paths:
-                emit_args.extend(["--paths", ",".join(target_paths[:MAX_BACKFILL_RECORD_PATHS])])
+            emit_args = _build_backfill_emit_args(
+                kind=EMIT_KIND_REFUSED,
+                repo=repo,
+                pr_ref=pr_ref,
+                title=rec_title,
+                reason=rej_reason,
+                paths=target_paths or None,
+            )
             if dry_run:
                 sys.stderr.write(
                     f"github_scan_gate: would backfill refused lesson from {pr_ref}\n"
@@ -3499,7 +3564,7 @@ def sweep_repo_memory(
         for r in managed_repos
     }
     candidates: list[dict[str, str | None]] = [
-        {"repo": r, "role": "managed", "ref": None} for r in managed_repos
+        {"repo": r, "role": ROLE_MANAGED, "ref": None} for r in managed_repos
     ]
     for spec in context_specs:
         if not isinstance(spec, dict):
@@ -3515,7 +3580,7 @@ def sweep_repo_memory(
         if canon in managed_set:
             continue
         candidates.append(
-            {"repo": c_repo, "role": "context", "ref": spec.get("ref")}
+            {"repo": c_repo, "role": ROLE_CONTEXT, "ref": spec.get("ref")}
         )
 
     if not candidates:
@@ -3612,18 +3677,13 @@ def sweep_repo_memory(
                 )
                 continue
 
-            idx_cmd = [
+            idx_cmd = _build_curator_index_cmd(
                 curator_bin,
-                "index",
-                "--repo",
                 tmpdir,
-                "--repo-id",
                 repo,
-                "--role",
                 role,
-            ]
-            if hindsight_url:
-                idx_cmd.extend(["--hindsight-url", hindsight_url])
+                hindsight_url,
+            )
             proc = subprocess.run(
                 idx_cmd,
                 capture_output=True,

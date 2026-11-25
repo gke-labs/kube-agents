@@ -788,15 +788,38 @@ func runIndex(args []string) error {
 		client, cErr := connectNATS(opCtx, "index", log)
 		if cErr == nil {
 			defer client.Close()
-			resp, nErr := memory.IndexViaNATS(opCtx, client, memory.MemoryQueryRequest{
-				Schema:    memory.MemoryQuerySchema,
-				Action:    "index",
-				Bank:      *bank,
-				Repo:      *repoID,
-				Role:      normRole,
-				FromLocal: true,
-				Records:   normalized,
-			})
+			var resp memory.MemoryQueryResponse
+			var nErr error
+			if normRole == memory.RoleManaged {
+				resp, nErr = memory.IndexViaNATS(opCtx, client, memory.MemoryQueryRequest{
+					Schema: memory.MemoryQuerySchema,
+					Action: "index",
+					Bank:   *bank,
+					Repo:   *repoID,
+					Role:   memory.RoleManaged,
+				})
+				if nErr != nil && strings.Contains(nErr.Error(), memory.ErrBrokerNotConfigured) {
+					resp, nErr = memory.IndexViaNATS(opCtx, client, memory.MemoryQueryRequest{
+						Schema:    memory.MemoryQuerySchema,
+						Action:    "index",
+						Bank:      *bank,
+						Repo:      *repoID,
+						Role:      memory.RoleManaged,
+						FromLocal: true,
+						Records:   normalized,
+					})
+				}
+			} else {
+				resp, nErr = memory.IndexViaNATS(opCtx, client, memory.MemoryQueryRequest{
+					Schema:    memory.MemoryQuerySchema,
+					Action:    "index",
+					Bank:      *bank,
+					Repo:      *repoID,
+					Role:      normRole,
+					FromLocal: true,
+					Records:   normalized,
+				})
+			}
 			if nErr == nil {
 				backend := resp.Backend
 				if backend == "" {
@@ -804,7 +827,8 @@ func runIndex(args []string) error {
 				}
 				return writeReceipt(backend, *bank, resp.Revision, resp.Upserted, resp.Deleted)
 			}
-			if !errors.Is(nErr, nats.ErrNoResponders) || *hsURL == "" {
+			canFallback := errors.Is(nErr, nats.ErrNoResponders) || errors.Is(nErr, nats.ErrMaxPayload)
+			if !canFallback || *hsURL == "" {
 				return nErr
 			}
 		} else if *hsURL == "" {
@@ -927,6 +951,7 @@ func runRecall(args []string) error {
 				MaxResults: *maxResults,
 			})
 			if qErr == nil {
+				resp.Results = memory.FrameRecallResultsForRepo(resp.Results, *repoID, nil, nil)
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
 				return enc.Encode(resp)
@@ -991,6 +1016,7 @@ func runRecall(args []string) error {
 	if *maxResults > 0 && len(results) > *maxResults {
 		results = results[:*maxResults]
 	}
+	results = memory.FrameRecallResultsForRepo(results, *repoID, byID, byDocID)
 	if results == nil {
 		results = []memory.HindsightRecallResult{}
 	}

@@ -3828,9 +3828,13 @@ class RepoMemorySweepTest(unittest.TestCase):
                 )
 
                 c_cmd, c_files = index_runs[1]
+                self.assertIn("--repo", c_cmd)
                 self.assertEqual(c_cmd[c_cmd.index("--role") + 1], "context")
                 self.assertEqual(
                     c_cmd[c_cmd.index("--repo-id") + 1], "gitlab.com/acme/standards"
+                )
+                self.assertEqual(
+                    c_cmd[c_cmd.index("--hindsight-url") + 1], "http://hindsight.local:8888"
                 )
                 self.assertEqual(
                     c_files, ["docs/runbooks/oom-triage.md", "runbooks/node-drain.md"]
@@ -4473,6 +4477,8 @@ class RepoMemorySweepTest(unittest.TestCase):
                 gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 10, tzinfo=timezone.utc))
                 self.assertEqual(len(emits), 1)
                 self.assertEqual(emits[0][emits[0].index("--kind") + 1], "refused")
+                self.assertEqual(emits[0][emits[0].index("--outcome") + 1], "backfill")
+                self.assertEqual(emits[0][emits[0].index("--repo") + 1], "acme/infra")
                 self.assertIn("#60", emits[0][emits[0].index("--pr") + 1])
 
     def test_snapshot_too_large_none_entries_fails_closed_and_multipath_toctou_retries_per_root(self):
@@ -5202,6 +5208,147 @@ class RepoMemorySweepTest(unittest.TestCase):
             repo="acme/infra",
         )
         self.assertEqual((status2, reason2), ("none", None))
+
+    def test_nats_and_hindsight_url_coexist_on_index_and_every_backfill_emit_stamps_provenance(self):
+        managed_tar = _build_tar_base64([
+            {"name": "clusters/prod/app.yaml", "data": "kind: Deployment\n"},
+            {"name": "knowledge/decisions/DEC-2026-001.md", "data": "---\nid: DEC-2026-001\n---\n"},
+        ])
+        context_tar = _build_tar_base64([
+            {"name": "docs/runbooks/oom.md", "data": "# OOM Runbook\n"},
+        ])
+        proposals = [
+            {
+                "number": 103,
+                "state": "merged",
+                "title": 'Revert "feat: lower floor"',
+                "body": "Reverts #100",
+                "author": "sre-alice",
+                "source": "revert-100",
+                "sourceRepo": "acme/gitops",
+                "mergedAt": "2026-11-23T12:00:00Z",
+                "url": "https://github.com/acme/gitops/pull/103",
+            },
+            {
+                "number": 102,
+                "state": "merged",
+                "title": "fix(prod): pin memory request",
+                "body": "Fixes #12",
+                "author": "sre-bob",
+                "source": "fix-mem",
+                "sourceRepo": "acme/gitops",
+                "mergedAt": "2026-11-22T12:00:00Z",
+                "url": "https://github.com/acme/gitops/pull/102",
+            },
+            {
+                "number": 101,
+                "state": "closed",
+                "title": "feat: disable limits",
+                "body": "",
+                "author": "contributor-dan",
+                "source": "no-limits",
+                "sourceRepo": "acme/gitops",
+                "updated": "2026-11-21T12:00:00Z",
+                "url": "https://github.com/acme/gitops/pull/101",
+            },
+        ]
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                if repo == "acme/gitops":
+                    return {"revision": "rev-m1", "archiveBase64": managed_tar}
+                return {"revision": "rev-c1", "archiveBase64": context_tar}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "proposal-closer":
+                return {"actor": "maintainer-carol", "bot": False}
+            if verb == "proposal-view":
+                pr_obj = next(p for p in proposals if p["number"] == payload["number"])
+                return {
+                    "proposal": pr_obj,
+                    "diff": "--- a/clusters/prod/app.yaml\n+++ b/clusters/prod/app.yaml\n",
+                    "comments": [
+                        {
+                            "author": "maintainer-carol",
+                            "body": "Rejected: must not disable memory limits.",
+                            "bot": False,
+                        }
+                    ],
+                }
+            return {}
+
+        seen_cmds = []
+
+        def fake_subproc(cmd, **kw):
+            seen_cmds.append(list(cmd))
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {
+                     "PLATFORM_AGENT_HOME": td,
+                     "NATS_URL": "nats://localhost:4222",
+                     "DECISION_MEMORY_HINDSIGHT_URL": "http://hindsight.local:8888",
+                 },
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+             mock.patch(
+                 "gitops_workspace.get_context_repo_specs",
+                 return_value=[{"repo": "acme/standards", "ref": "main"}],
+             ), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch("subprocess.run", side_effect=fake_subproc):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.side_effect = (
+                lambda repo, login, bot=False: login == "maintainer-carol"
+            )
+            gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+
+            # Guardrail check: `_run_curator_emit_ok` refuses calls missing `--outcome backfill` or `--repo`.
+            before_count = len(seen_cmds)
+            self.assertFalse(
+                gate._run_curator_emit_ok(
+                    "/usr/local/bin/curator",
+                    ["--kind", "proposed", "--repo", "acme/gitops"],
+                    "acme/gitops#1",
+                )
+            )
+            self.assertFalse(
+                gate._run_curator_emit_ok(
+                    "/usr/local/bin/curator",
+                    ["--kind", "proposed", "--outcome", "backfill"],
+                    "acme/gitops#1",
+                )
+            )
+            self.assertEqual(len(seen_cmds), before_count)
+
+        index_cmds = [c for c in seen_cmds if c[1] == "index"]
+        self.assertEqual(len(index_cmds), 2)
+        for cmd, expected_repo, expected_role in (
+            (index_cmds[0], "acme/gitops", "managed"),
+            (index_cmds[1], "acme/standards", "context"),
+        ):
+            self.assertIn("--repo", cmd)
+            self.assertTrue(cmd[cmd.index("--repo") + 1].strip())
+            self.assertEqual(cmd[cmd.index("--repo-id") + 1], expected_repo)
+            self.assertEqual(cmd[cmd.index("--role") + 1], expected_role)
+            self.assertEqual(cmd[cmd.index("--hindsight-url") + 1], "http://hindsight.local:8888")
+
+        emit_cmds = [c for c in seen_cmds if c[1] == "emit"]
+        self.assertEqual(len(emit_cmds), 3)
+        self.assertEqual(
+            [c[c.index("--kind") + 1] for c in emit_cmds],
+            ["proposed", "proposed", "refused"],
+        )
+        for emit_cmd in emit_cmds:
+            self.assertEqual(emit_cmd[emit_cmd.index("--outcome") + 1], "backfill")
+            self.assertEqual(emit_cmd[emit_cmd.index("--repo") + 1], "acme/gitops")
 
 
 if __name__ == "__main__":
