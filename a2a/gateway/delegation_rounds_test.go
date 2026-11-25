@@ -310,3 +310,34 @@ func TestARoundTwoRefusalIsHeldBackWhenItsPlanWasWritten(t *testing.T) {
 	r.g.tellProfileParentNoChild(ctx, rec, "chat", "task-rp", "reason: delegation-refused - rounds", 3, true)
 	waitFor(t, "the past-cap refusal", func() bool { return len(refusalsOn(t, r, "chat", "task-rp")) == 1 })
 }
+
+// An ended profile parent's orphan cancel reaches every round's live
+// children, an earlier round's (EarlierChildren) as well as the current
+// one's: dropping the earlier rounds from the walk would leave a straggler
+// of round one running after its parent ended.
+func TestAnEndedParentsOrphanCancelReachesEveryRoundsChildren(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	conv := "console:rounds-orphans"
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-rounds-orphans", Tasks: []TaskRef{
+		{ID: "p-orph", Addressee: "chat", Tier: "unattended", DelegationRound: 2, EarlierChildren: []string{"r1-orph"}, Children: []string{"r2-orph"}, Attribution: []byte(`{}`)},
+		{ID: "r1-orph", Addressee: "cluster", CorrelationID: "corr-r1-orph", Role: taskRoleChild, ParentTaskID: "p-orph", Tier: "read"},
+		{ID: "r2-orph", Addressee: "cluster", CorrelationID: "corr-r2-orph", Role: taskRoleChild, ParentTaskID: "p-orph", Tier: "read", BatchRound: 2},
+	}}
+	r.g.mu.Lock()
+	r.g.taskSessions["r1-orph"] = conv
+	r.g.taskSessions["r2-orph"] = conv
+	r.g.mu.Unlock()
+	r.g.cancelOrphanedChildren(ctx, rec, "p-orph")
+	for _, id := range []string{"r1-orph", "r2-orph"} {
+		waitFor(t, id+" cancelled", func() bool {
+			for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject("cluster", id)) {
+				if e.env.Kind == lib.KindCancel {
+					return true
+				}
+			}
+			return false
+		})
+	}
+}

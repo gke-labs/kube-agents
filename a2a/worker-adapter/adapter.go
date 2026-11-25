@@ -1152,6 +1152,19 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// when the harness is between turns or queues a mid-turn message; a
 	// driver that holds steers gets it at the running turn's result
 	// (heldDelivery).
+	// reserveAt is when the deadline reserve fires (childWaitReserve). A
+	// round may start only before it: a later one's children couldn't
+	// report before the reserve delivers.
+	reserveAt := started.Add(a.cfg.TaskDeadline - childWaitReserve(a.cfg.TaskDeadline))
+	// roundsLeft is how many more delegation rounds a dispatched task may
+	// start now: the rounds the gateway advertised less those used, and none
+	// once the reserve's time has come.
+	roundsLeft := func() int {
+		if !time.Now().Before(reserveAt) {
+			return 0
+		}
+		return max(max(a.delegateRounds, 1)-roundsUsed, 0)
+	}
 	deliver := func(why string) {
 		if wait == nil || wait.delivered {
 			return
@@ -1163,7 +1176,11 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		log.Info("delegated tasks' wait settled", "task", a.taskID, "why", why,
 			"results", len(wait.got), "asked", len(wait.asked), "refused", wait.refusal != nil)
-		text := wait.childDelivery(a.scrub)
+		left := 0
+		if why != "deadline-reserve" {
+			left = roundsLeft()
+		}
+		text := wait.childDelivery(a.scrub, left)
 		if holdSteers && pendingTurns > 0 {
 			heldDelivery = text
 			log.Info("delivery held until the turn boundary", "task", a.taskID)
@@ -1399,10 +1416,11 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			}
 			// A profile task makes at most the rounds the gateway
 			// advertised (delegateRounds; one when it advertised none),
-			// so at one a second call is refused as it always was. A
-			// call with rounds left while the last round's children run
-			// is refused too: a next round, after their delivery, isn't
-			// built yet.
+			// so at one a second call is refused as it always was. With
+			// rounds left, a call while the last round's children run is
+			// refused (their results come first), and so is one after the
+			// reserve's time (a new round's children couldn't report); a
+			// call once their results are delivered starts the next round.
 			// Once the children's results are delivered, every refusal says
 			// so: promising them as the next turn would send the model
 			// waiting for something it already has.
@@ -1417,12 +1435,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				ask.reply <- delegateReply{Message: msg}
 				continue
 			}
-			if wait != nil {
-				msg := refuseWhileWaiting
-				if wait.delivered {
-					msg = refuseAfterDelivery
-				}
-				ask.reply <- delegateReply{Message: msg}
+			// A delivery held for the turn boundary hasn't reached the model
+			// yet: the round it settled is still the one being waited on.
+			if wait != nil && (!wait.delivered || heldDelivery != "") {
+				ask.reply <- delegateReply{Message: refuseWhileWaiting}
+				continue
+			}
+			if wait != nil && roundsLeft() == 0 {
+				ask.reply <- delegateReply{Message: refuseNoTimeForRound}
 				continue
 			}
 			// Cancel and the deadline end the turn when they fire, not when

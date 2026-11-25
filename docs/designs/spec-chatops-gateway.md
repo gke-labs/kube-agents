@@ -939,7 +939,7 @@ them is refused (`delegation.rounds`), with a notice that says how many it used,
 to the round it would have been. It mints nothing, records nothing, and ends none of the wait on the earlier
 request's children. The rounds are `A2A_DELEGATION_ROUNDS_MAX`, 1 by default and 1 at most for now: the
 gateway clamps anything above 1 to 1 at startup and logs a warning naming the variable, saying rounds above 1
-are not supported yet, until a profile task's later rounds ship. The operator renders it onto the gateway
+are not supported yet. The worker takes later rounds; lifting the clamp is a later change. The operator renders it onto the gateway
 explicitly at 1, and refuses any other value it carries, in its startup log; the chart's
 `operator.delegation.roundsMax` takes only 1. At the default, the parent's second request is the one refused. The parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
@@ -981,8 +981,8 @@ artifact and doesn't end the task: no deliverable, no final status, and the harn
 The tool's reply tells the model its children's results arrive as its next turn. A result the harness writes meanwhile isn't the deliverable (a failed one still ends the task); the worker publishes a non-final `working` status
 saying how many delegated tasks it waits on. A delegate call past the rounds the submission's
 `delegateTargets` part advertises (`roundsMax`, one when absent) is refused at the tool, so at one
-a second call is refused, and a call with rounds left while the last round's children run is refused
-too, since a next round after their delivery isn't built yet. Once the results are delivered, every refusal says so instead of promising them as the next turn. The worker reads each `childResult` on
+a second call is refused. With rounds left, a call while the last round's children run is refused
+(their results come first), and so is one while a delivery is held for the turn's result, which the model hasn't seen yet, or once the deadline reserve's time has come (a new round's children couldn't report). A call after the delivery starts the next round: a new wait on that round's entries, whose result is held like the first's, and the delivery's closing line offers the rounds left, or says to answer when none is. Once the results are delivered and no round is left, every refusal says so instead of promising them as the next turn. The worker reads each `childResult` on
 the task's `.in`, deduping on `round` and `entry` when `entry` is set and on `childTaskId` otherwise
 (an absent `round` reads as one, and an older gateway's ends carry no `entry` and read as a single
 delegation's), and counts its own round's ends to the entries it asked for: an end for another round isn't counted, so it can't complete the wait or hide a missing entry. When every entry has its end, or a

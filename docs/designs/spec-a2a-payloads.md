@@ -902,7 +902,7 @@ unchanged, and a worker that predates the part ignores it.
 - `roundsMax` is how many `delegate` requests a profile task may make, the gateway's
   `A2A_DELEGATION_ROUNDS_MAX`. Only a profile task's list carries it, and only when it is over one;
   absent means one. It is at most 16 (`lib.DelegateRoundsCeiling`). The gateway holds the setting to
-  one until a profile task's later rounds ship, so no list carries it yet.
+  one until a later change lifts it (the worker already takes later rounds), so no list carries it yet.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
 

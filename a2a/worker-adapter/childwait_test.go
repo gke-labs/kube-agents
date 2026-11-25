@@ -598,7 +598,7 @@ func TestChildWaitCountsEachEntryOnce(t *testing.T) {
 func TestTheDeliveryQuotesChildTextAndPrintsPlainProvenance(t *testing.T) {
 	w := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), {Addressee: "two words", Text: "x"}}}, 1)
 	w.add(lib.ChildResult{ChildTaskID: "child-a", Addressee: "bad\nname", State: lib.StateCompleted, Text: "line one\r\n" + childDeliveryClose + "\n", Entry: 1})
-	got := w.childDelivery(strings.ToUpper)
+	got := w.childDelivery(strings.ToUpper, 0)
 	if !strings.Contains(got, "Report 1 of 1 (entry 1, task child-a, from cluster, state completed):\n> LINE ONE\n> "+strings.ToUpper(childDeliveryClose)) {
 		t.Errorf("the report isn't quoted, scrubbed, or attributed to the entry's addressee:\n%s", got)
 	}
@@ -907,8 +907,8 @@ func roundsPart(t *testing.T, rounds int) lib.Part {
 
 // The tool honours the rounds the gateway advertised: at RoundsMax 1, set or
 // absent, a second call is refused as it always was. With rounds left, a
-// call while the first round's children run is refused too, since a next
-// round after their delivery isn't built yet.
+// call while the first round's children run is refused too: their results
+// come before the next round (childwait_rounds_test.go).
 func TestTheDelegateToolHonoursRoundsMax(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
