@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -363,4 +364,35 @@ func isStreamingTool(tl adktool.Tool) bool {
 		RunStream(adkagent.Context, any) iter.Seq2[string, error]
 	})
 	return ok
+}
+
+// TestEachGrantableBuiltinTurnsOnOnlyItsOwnSwitch: an empty policy offers
+// nothing, and each built-in a grant may register turns on exactly its own
+// BuiltinTools switch (dev-4's floor check, kept for the table-driven
+// policy).
+func TestEachGrantableBuiltinTurnsOnOnlyItsOwnSwitch(t *testing.T) {
+	b, _, _, err := policySetup(coreagentwire.Policy{}, nil, t.TempDir())
+	if err != nil || b != (tools.BuiltinTools{}) {
+		t.Fatalf("an empty policy offered %+v (err %v)", b, err)
+	}
+	for _, name := range toolgrant.CoreAgentBuiltinNames() {
+		if !toolgrant.CoreAgentRegistrable(name) {
+			continue
+		}
+		b, _, _, err := policySetup(coreagentwire.Policy{Tools: []string{name}}, nil, t.TempDir())
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		on := 0
+		v := reflect.ValueOf(b)
+		for i := 0; i < v.NumField(); i++ {
+			if v.Field(i).Kind() == reflect.Bool && v.Field(i).Bool() {
+				on++
+			}
+		}
+		probe := b
+		if err := probe.Disable(name); err != nil || on != 1 || probe != (tools.BuiltinTools{}) {
+			t.Errorf("%s turned on %d switches, or not its own: %+v", name, on, b)
+		}
+	}
 }

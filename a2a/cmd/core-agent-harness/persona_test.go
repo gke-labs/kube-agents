@@ -28,7 +28,7 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(skill, "leak.md")); err != nil {
 		t.Fatal(err)
 	}
-	instructions, toolsets, err := loadPersona(context.Background(), dir)
+	instructions, toolsets, err := loadPersona(context.Background(), dir, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,20 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(linked, "instructions.md")); err != nil {
 		t.Fatal(err)
 	}
-	if got, _, err := loadPersona(context.Background(), linked); err == nil {
+	if got, _, err := loadPersona(context.Background(), linked, true); err == nil {
 		t.Errorf("read instructions through a link outside the dir: %q", got)
+	}
+}
+
+// A pod with no persona directory runs the turn with no persona.
+func TestAMissingPersonaDirIsNoPersona(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "absent")
+	instructions, toolsets, err := loadPersona(context.Background(), absent, false)
+	if err != nil || instructions != "" || len(toolsets) != 0 {
+		t.Fatalf("instructions %q, %d toolsets, err %v", instructions, len(toolsets), err)
+	}
+	// A pod configured for a persona fails the turn when it isn't there.
+	if _, _, err := loadPersona(context.Background(), absent, true); err == nil {
+		t.Error("a required persona that is missing did not fail the turn")
 	}
 }
