@@ -107,7 +107,7 @@ func startProfileRig(t *testing.T) *rig {
 	}
 	r := startRigWith(t, func(c *Config) { c.ScopeFile = scope; c.Namespace = "kubeagents-system" })
 	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
-	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams, Delegates: true,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	return r
 }
@@ -283,7 +283,7 @@ func submissionOn(t *testing.T, r *rig, profile string) *lib.Envelope {
 func TestAProfileParentDelegatesWaitsAndEndsItsChain(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	// A console conversation: the one door whose observer is told each
 	// chain's end as a terminal frame.
@@ -395,7 +395,7 @@ func TestAProfileParentDelegatesWaitsAndEndsItsChain(t *testing.T) {
 func TestAStopWhileAProfileChildRunsCancelsTheWaitingParent(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	conv := "discord:6/6"
 	r.adapter.inbox <- profileTurn(conv, "chat", nil)
@@ -629,7 +629,7 @@ func TestAChildResultIsNotDeliveredToACancelledOrEndedParent(t *testing.T) {
 func TestAProfileThatDoesntRunAtTheTierIsRefusedUpFront(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Tiers: []string{"unattended"}})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true, Tiers: []string{"unattended"}})
 	conv := "discord:12/12"
 	r.adapter.inbox <- profileTurn(conv, "chat", nil)
 	waitFor(t, "the refusal", postedContaining(r, "chat doesn't run at tier read"))
@@ -769,7 +769,7 @@ func TestAProfileParentDelegatesWithTheTargetsParameters(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := startProfileRig(t)
-			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 			ctx := context.Background()
 			conv := "console:tab-params-" + string(rune('a'+i))
 			turn := profileTurn(conv, "chat", nil)
@@ -814,7 +814,7 @@ func TestAProfileParentDelegatesWithTheTargetsParameters(t *testing.T) {
 func TestADelegationToANoTargetProfileIsHeldToItsCard(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.g.profiles.put("triage", &lib.AgentCard{Name: "triage"})
 	ctx := context.Background()
 	const conv = "console:tab-notarget-params"

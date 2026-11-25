@@ -191,7 +191,7 @@ func TestAGenericAddressThatResolvesToAProfileOnTheChainIsACycle(t *testing.T) {
 func TestAProfileParentsChildCarriesTheChainAndBothRecordTheirScopes(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	conv := "console:tab-chain"
 	turn := profileTurn(conv, "chat", nil)
@@ -229,7 +229,7 @@ func TestAProfileParentsChildCarriesTheChainAndBothRecordTheirScopes(t *testing.
 func TestAProfileParentWhoseScopeIsNotOnRecordMintsNothing(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	conv := "console:tab-noscope"
 	turn := profileTurn(conv, "chat", nil)

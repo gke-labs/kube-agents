@@ -104,6 +104,48 @@ FAKE_HERMES = textwrap.dedent('''\
             if str(job["id"]) == late:
                 job.update(enabled=False, state="paused", paused_at="2026-10-14T00:00:00+00:00")
         json.dump(store, open(os.environ["FAKE_ROSTER"], "w"))
+    if mode.startswith("trigger-after-pause:") or mode.startswith("trigger-before-pause:"):
+        # A case's stack marks this job due with Hermes' trigger_job, which lifts a pause
+        # as it sets the mark: once, either while an earlier job's pause is in flight
+        # (before this job's own), or while a later job's is (after this job's own).
+        when, fired = mode.split(":", 1)
+        store = json.load(open(os.environ["FAKE_ROSTER"]))
+        mine = next(job for job in store["jobs"] if str(job["id"]) == fired)
+        flag = os.environ["FAKE_ROSTER"] + ".triggered"
+        is_paused = mine.get("state") == "paused"
+        ready = is_paused if when == "trigger-after-pause" else not is_paused
+        if sys.argv[4] == "pause" and sys.argv[5] != fired and ready and not os.path.exists(flag):
+            open(flag, "w").close()
+            from datetime import datetime, timezone
+            mark = datetime.now(timezone.utc).isoformat()
+            mine.update(enabled=True, state="scheduled", paused_at=None, next_run_at=mark, manual_run_at=mark)
+            json.dump(store, open(os.environ["FAKE_ROSTER"], "w"))
+    if mode.startswith("claim-before-pause:") and sys.argv[4] == "pause" and sys.argv[5] != mode.split(":", 1)[1]:
+        # The tick claims a case's mark on this job while an earlier job's pause is
+        # in flight: the mark is gone from the roster and a run row is under way.
+        import sqlite3
+        from datetime import datetime, timezone
+        flag = os.environ["FAKE_ROSTER"] + ".claimed"
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            ledger = os.path.join(os.path.dirname(os.environ["FAKE_ROSTER"]), "executions.db")
+            conn = sqlite3.connect(ledger)
+            conn.execute("CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, claimed_at TEXT)")
+            conn.execute(
+                "INSERT INTO executions VALUES (?, ?, ?)",
+                (mode.split(":", 1)[1], "running", datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            conn.close()
+    if mode == "break-ledger-on-first" and sys.argv[4] == "pause":
+        # The runs' ledger stops being readable while the first pause is in flight.
+        ledger = os.path.join(os.path.dirname(os.environ["FAKE_ROSTER"]), "executions.db")
+        flag = os.environ["FAKE_ROSTER"] + ".broken"
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            if os.path.exists(ledger):
+                os.remove(ledger)
+            os.mkdir(ledger)
     if mode == "arm-on-first":
         # The oobe-first-run-audits stack arms while this pause is in flight: the pause still
         # lands, and the state file is there for every later one.
@@ -416,6 +458,78 @@ class ChainTest(unittest.TestCase):
         result, store = self.run_script()
         self.assertTrue(store[first]["enabled"])
         self.assertIn(f"{first} (oobe stage)", result.stdout)
+
+    def test_a_due_mark_set_after_the_decision_is_left_too(self):
+        # The stack's trigger_job lands while the pause of an earlier audit is in
+        # flight: the decision read this audit as idle, and its pause would drop the run.
+        # In the watch's pass and in the lease-time one alike.
+        first, second = STAGE_FIVE[:2]
+        for chain in (True, False):
+            with self.subTest(chain=chain):
+                self.write_roster(self.five())
+                self.write_stage(fired=STAGE_FIVE, done=True)
+                triggered = pathlib.Path(f"{self.roster}.triggered")
+                if triggered.exists():
+                    triggered.unlink()
+                result, store = self.run_script(mode=f"trigger-before-pause:{second}", chain=chain)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(store[second]["enabled"])
+                self.assertNotEqual(store[second].get("state"), "paused")
+                self.assertIn(f"{second} (due or under way since the decision)", result.stdout)
+                for audit in (first, *STAGE_FIVE[2:]):
+                    self.assertEqual(store[audit]["state"], "paused", audit)
+
+    def test_a_due_mark_that_lifts_a_pause_just_made_is_not_paused_away(self):
+        # The stack fires a job this pass has just paused: trigger_job lifts the
+        # pause and marks it due, the read-back finds it un-paused, and the next
+        # round would pause it again, before the tick claims the run.
+        first, second = STAGE_FIVE[:2]
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        result, store = self.run_script(mode=f"trigger-after-pause:{first}", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(store[first]["enabled"])
+        self.assertNotEqual(store[first].get("state"), "paused")
+        self.assertIn(f"{first} (due or under way since the decision)", result.stdout)
+        for audit in STAGE_FIVE[1:]:
+            self.assertEqual(store[audit]["state"], "paused", audit)
+
+    def test_a_run_the_tick_claimed_after_the_decision_is_left_too(self):
+        # The mark is gone from the roster by then: only the ledger shows the run.
+        first, second = STAGE_FIVE[:2]
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        self.write_runs([(first, "completed", PAST)])
+        result, store = self.run_script(mode=f"claim-before-pause:{second}", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(store[second]["enabled"])
+        self.assertIn(f"{second} (due or under way since the decision)", result.stdout)
+        for audit in (first, *STAGE_FIVE[2:]):
+            self.assertEqual(store[audit]["state"], "paused", audit)
+
+    def test_a_second_read_that_fails_pauses_on_the_decision_and_says_so(self):
+        # The decision read the stage as past all five. A ledger that cannot be
+        # read again is no reason to leave an audit on for the rest of the run.
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        self.write_runs([(STAGE_FIVE[0], "completed", PAST)])
+        result, store = self.run_script(mode="break-ledger-on-first", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for audit in STAGE_FIVE:
+            self.assertEqual(store[audit]["state"], "paused", audit)
+        self.assertIn("not read again before the pause of", result.stdout)
+        self.assertIn(STAGE_FIVE[1], result.stdout.split("not read again before the pause of", 1)[1])
+
+    def test_a_marker_dropped_by_a_stale_writer_is_still_paused_again(self):
+        # The read before each pause must not undo what the rounds are for: a
+        # job un-paused by a stale rewrite has no due mark, so it is paused again.
+        first = STAGE_FIVE[0]
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        result, store = self.run_script(mode=f"lose-first:{first}", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for audit in STAGE_FIVE:
+            self.assertEqual(store[audit]["state"], "paused", audit)
 
     def test_every_audit_is_paused_once_the_chain_is_done(self):
         self.write_roster(self.five())

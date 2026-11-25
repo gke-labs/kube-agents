@@ -22,9 +22,10 @@ repositories that CI pulls from.
    where the bench package is installed (`make test-bench-deps`), on a case that passes the
    others: it loads each check with the harness's parser and rejects a field that the check's
    verifier does not have. Without the
-   package, or with another checkout's, the last line of the output says that this rule did not
-   run; CI runs it. After a pull that changes `bench/pyproject.toml`, install the bench package
-   again (`docs/designs/bench-case-format.md`, "What it does not catch", says how).
+   package, with another checkout's, or with one whose installed check types or devops-bench
+   commit differ from `bench/pyproject.toml`, the last line of the output says that this rule did
+   not run; CI runs it. In the last case, install the bench package again
+   (`docs/designs/bench-case-format.md`, "What it does not catch", says how).
 3. Register the case: add its `./tasks/<name>/task.yaml` line to the sorted section at the
    foot of `hack/eval/nightly-cases.txt`, at its place in case-id order, with the `#` lines
    directly above it saying why it's there and naming anything that still blocks it. That

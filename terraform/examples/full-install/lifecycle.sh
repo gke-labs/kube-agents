@@ -2000,11 +2000,19 @@ forget_kms() {
 #                filter dead, its next write hits a closed pipe and SIGPIPE
 #                kills it mid-operation. So the filter ignores INT and TERM and
 #                ends, as it always does, when terraform closes the pipe.
+#                The ignore is set in the shell that runs this function, before
+#                it starts anything, and awk inherits it: a bash that has
+#                forked a child but not yet reached its wait dies of SIGINT,
+#                so an ignore set only in the child leaves that gap open.
+#                The calling shell stays deaf to INT and TERM afterwards, so
+#                call this only as a pipeline element, which is its own
+#                subshell.
 #   streaming    output goes out line by line, so a long helm wait does not
 #                look hung. fflush() covers gawk and BSD awk; mawk also
 #                buffers its INPUT and needs -W interactive, which no other awk
 #                accepts.
 redact_helm_release_metadata() {
+  trap '' INT TERM
   local awk_cmd=(awk) awk_version
   # A probe, not a step: an awk that rejects -W just is not mawk, so its
   # failure is the answer rather than an error. Captured whole, not piped into
@@ -2014,40 +2022,37 @@ redact_helm_release_metadata() {
   if [[ "$awk_version" == mawk* ]]; then
     awk_cmd=(awk -W interactive)
   fi
-  (
-    trap '' INT TERM
-    exec "${awk_cmd[@]}" '
-      function plain(s) { gsub(/\033\[[0-9;]*m/, "", s); sub(/\r$/, "", s); return s }
-      function indent(s) { match(s, /^ */); return RLENGTH }
-      {
-        p = plain($0)
-        if (skipping) {
-          if (indent(p) == close_col && substr(p, close_col + 1, 1) == closer) {
-            skipping = 0
-          }
-          next
+  "${awk_cmd[@]}" '
+    function plain(s) { gsub(/\033\[[0-9;]*m/, "", s); sub(/\r$/, "", s); return s }
+    function indent(s) { match(s, /^ */); return RLENGTH }
+    {
+      p = plain($0)
+      if (skipping) {
+        if (indent(p) == close_col && substr(p, close_col + 1, 1) == closer) {
+          skipping = 0
         }
-        if (p ~ /(resource|data) "/) {
-          in_helm = (p ~ /resource "helm_release"/)
-        }
-        if (in_helm && p ~ /^ *((-\/\+|\+\/-|[~+-]) +)?metadata += *[{[] *$/) {
-          close_col = index(p, "metadata") - 1
-          closer = (p ~ /\[ *$/) ? "]" : "}"
-          print substr(p, 1, close_col) "metadata = (hidden by lifecycle.sh: it repeats every chart value, credentials included)"
-          fflush()
-          skipping = 1
-          next
-        }
-        print
+        next
+      }
+      if (p ~ /(resource|data) "/) {
+        in_helm = (p ~ /resource "helm_release"/)
+      }
+      if (in_helm && p ~ /^ *((-\/\+|\+\/-|[~+-]) +)?metadata += *[{[] *$/) {
+        close_col = index(p, "metadata") - 1
+        closer = (p ~ /\[ *$/) ? "]" : "}"
+        print substr(p, 1, close_col) "metadata = (hidden by lifecycle.sh: it repeats every chart value, credentials included)"
         fflush()
+        skipping = 1
+        next
       }
-      END {
-        if (skipping) {
-          print "lifecycle.sh: a helm_release metadata block never closed; the rest of this output was hidden with it"
-        }
+      print
+      fflush()
+    }
+    END {
+      if (skipping) {
+        print "lifecycle.sh: a helm_release metadata block never closed; the rest of this output was hidden with it"
       }
-    '
-  )
+    }
+  '
 }
 
 if [[ "${KUBE_AGENTS_SOURCE_ONLY:-false}" == "true" ]]; then

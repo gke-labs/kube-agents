@@ -895,3 +895,36 @@ func capLineLen(r *rig) int {
 	defer r.g.capMu.Unlock()
 	return len(r.g.capQueue)
 }
+
+// With the warm pool on, a full cap still holds a waiter back even while an
+// unclaimed warm pod stands ready: claiming it would take a slot. When a
+// slot frees, the oldest waiter starts on that warm pod rather than a cold
+// spawn, so the line and the pool share one count (acquireCapCheck).
+func TestAWaiterAtAFullCapStartsOnTheWarmPodWhenASlotFrees(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerCap(t, RouteSession, 0, warmOn(1, 4))
+	spawn.mu.Lock()
+	spawn.liveSpawns = true
+	spawn.live = 4
+	spawn.mu.Unlock()
+	spawn.setWarm(readyWarm("chat-warm-1"))
+	conv := "discord:g1/t-warm-waiter"
+
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the waiter's notice, next in line", noticeReads(r, conv, sessionQueuedNext))
+	if claims := warmClaims(t, r); len(claims) != 0 {
+		t.Fatalf("a warm pod was claimed at a full cap: %v", claims)
+	}
+
+	spawn.mu.Lock()
+	spawn.live--
+	spawn.mu.Unlock()
+	r.g.kickCapQueue()
+	waitFor(t, "the waiter's turn started", func() bool { return started(r, conv) })
+	if got := warmClaims(t, r)["chat-warm-1"]; got != conv {
+		t.Fatalf("the warm pod's claim = %q, want the waiter %q", got, conv)
+	}
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d cold spawns; the waiter should have started on the warm pod", n)
+	}
+}

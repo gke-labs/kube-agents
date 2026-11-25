@@ -175,6 +175,7 @@ spec:
 | `queueTimeoutSeconds`                   | Optional, default 3600. How stale a queued submission may be before the dispatcher refuses to run it: at dequeue, if the message's JetStream server ingest timestamp is older than this, the dispatcher acks and publishes terminal `failed` (`reason: queue-deadline-exceeded`) instead of spawning a Job. A burst past `concurrency` cannot silently execute hours-stale diagnostics. The arbiter is the server ingest time, deliberately - the envelope's `ts` is publisher-asserted, and a freshness guard keyed to a spoofable field is not a guard.                                            |
 | `lifecycle.ttlSecondsAfterFinished`     | How long a finished Job lingers for `kubectl` inspection before GC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `concurrency`                           | Max simultaneous pods for this profile. Replaces the board-wide `max_in_progress`, per profile instead of global.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `delegates`                             | Optional, default `false`. The profile's tasks may delegate; the gateway refuses a delegation from a profile without it (`delegation.profile-not-delegating`, #6789). Rendered onto the card.                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `allowedTiers`                          | Optional, default `[read]`. The tiers this profile may run at, `read` and `unattended` (#3660, "Tiers and identity"). A task runs at its requester's tier and the dispatcher refuses one whose tier is not listed; a pinned production profile might allow only `read`. Tier is authority, so it lives on the CR, never in the persona.                                                                                                                                                                                                                                                              |
 | `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
 | `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
@@ -601,13 +602,28 @@ when the broker's 403 carries `write_refusal: true`;
 [the dispatch design](spec-profiles-dispatch.md) states which refusals those are. The
 adapter reads the file after each tool result, stops the harness as a cancel does, and
 publishes terminal `failed` with `reason: write-refused`, naming the record's rule and
-verb and nothing of the output; the chat shows the failed notice. Nothing the
+verb and nothing of the output, which the chat shows after the failed notice. Nothing the
 harness prints after the refusal is published. It is `failed`, not `rejected`, because work
 ran before the refusal; a delegating parent reads its reason, and the eval harness grades it.
 A version-control refusal (a write without the task's permit) never stops the task: the
 version-control skill's answer to it is the patch, which the task still gives. The broker
 refuses the write either way: a record that is lost leaves the task running, and every
 further write is refused too.
+
+A session pod's turn stops the same way, with the gateway's chat showing the reason. Its
+kubectl goes to `<agent>-kube-proxy`, not the broker, so no broker answer marks the refusal.
+Instead the kubectl wrapper (`deploy/sandbox/session-kubectl.sh`) records a write attempt
+when kubectl exits non-zero, the gateway has passed the pod a read-only kube-proxy mode
+(`KUBE_PROXY_MODE`, from the mode the operator gives kube-proxy), and the argv tries a
+change that mode refuses: a mutating verb, as the command policy resolves it, that is not
+a local render or, under `read-only-dry-run`, a server-side dry run. It reads the argv and
+the exit code, never kubectl's output. The adapter makes each turn's record file empty
+under the pod's scratch directory before the turn's harness starts, so one turn's record
+never stops the next. The wrapper can't tell which side refused, or whether kubectl
+reached the proxy at all, so the reason says a change was attempted and not made, and that
+writes are refused here, not that a server refused it. On a session pod the adapter counts
+only the wrapper's own rule, with a verb of one or two lowercase words, since the reason's
+verb is shown in chat and the record file is the harness's to write. A writable kube-proxy mode, or none, records nothing.
 
 **Evicted.** Node drains, spot preemptions, and GKE upgrades deliver `SIGTERM` with a
 grace period, and the adapter MUST trap it: flush the pending output buffer, publish

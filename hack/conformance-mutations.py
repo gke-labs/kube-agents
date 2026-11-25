@@ -189,6 +189,141 @@ MUTATIONS: list[Mutation] = [
         "the permit says a change was asked for -- though not which one",
     ),
     Mutation(
+        "A3-profile-reads-another-verb",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            "issue-view",\n            "publish",\n',
+         '            "issue-view",\n            "proposal-reviews",\n            "publish",\n'),
+        "test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other",
+        "give every profile one more read of a managed repository's proposals, "
+        "since a read writes nothing and the managed list still bounds it",
+    ),
+    Mutation(
+        "A3-profile-verb-set-unread",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    return narrowed is None or verb in narrowed\n',
+         '    return True\n'),
+        "test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other",
+        "drop the per-role verb narrowing as redundant with the role table, "
+        "which already says who reaches /v1/vcs/",
+    ),
+    Mutation(
+        "A3-handler-skips-the-role-table",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not self._role_permits(self.principal):\n            return None\n',
+         '        if False:\n            return None\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "stop asking the role table on every request, since each handler "
+        "checks its own caller anyway -- only the ones that were written to do",
+    ),
+    Mutation(
+        "A3-role-table-admits-any-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not needed or not principal.role or principal.role in needed:\n            return True\n',
+         '        if True:\n            return True\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "treat a role the table does not list for a route as the no-role "
+        "principal behind the socket, which reaches everything",
+    ),
+    Mutation(
+        "A3-handler-skips-the-task-gate",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if self.principal.role == CALLER_ROLE_PROFILE and not self._admit_task(self.principal):\n',
+         '        if False:\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "let a profile request through with whatever credential it sent, "
+        "leaving each route to notice that no task was bound",
+    ),
+    Mutation(
+        "A3-vcs-dispatch-skips-the-verb-set",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not vcs_verb_permitted(role, verb):\n',
+         '        if False:\n'),
+        "test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body",
+        "let the route table decide which verbs exist and drop the per-role "
+        "check ahead of it, so a profile reaches every verb the shell does",
+    ),
+    Mutation(
+        "A3-vcs-dispatch-skips-the-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            refusal = profile_vcs_refusal(principal, verb)\n',
+         '            refusal = None\n'),
+        "test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body",
+        "leave the task credential and its permit to the ownership bar "
+        "further down, which a read never reaches",
+    ),
+    Mutation(
+        "A3-profile-write-needs-no-permit-gate",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if ungated:\n        raise ValueError(\n',
+         '    if False:\n        raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "allow a profile write verb that the permit set does not name, "
+        "so a new write can ship before its gate is argued",
+    ),
+    Mutation(
+        "A3-profile-write-needs-no-ownership-bar",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if unowned:\n        raise ValueError(\n',
+         '    if False:\n        raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "allow a permit-gated profile write that the ownership set does not "
+        "name, on the argument that the permit is enough",
+    ),
+    Mutation(
+        "A3-profile-reads-unmanaged-repositories",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if unlisted:\n            raise ValueError(\n',
+         '        if False:\n            raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "let snapshot or capabilities into the profile and MCP verb sets, "
+        "since both are reads",
+    ),
+    Mutation(
+        "A3-route-roles-as-a-string",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not isinstance(roles, tuple):\n            raise TypeError(\n',
+         '        if False:\n            raise TypeError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a bare role string in ROUTE_ROLES, which a membership test "
+        "reads as a substring test",
+    ),
+    Mutation(
+        "A3-task-gate-refusal-admits",
+        "agents/platform/scripts/credential_proxy.py",
+        ('                    "message": f"The task credential was refused: {exc}.",\n                },\n            )\n            return False\n',
+         '                    "message": f"The task credential was refused: {exc}.",\n                },\n            )\n            return True\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "answer a refused task credential and carry on with the request as a "
+        "caller with no task, so a stale credential degrades instead of failing",
+    ),
+    Mutation(
+        "A3-role-verbs-as-a-string",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not isinstance(verbs, frozenset):\n            raise TypeError(\n',
+         '        if False:\n            raise TypeError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a bare verb string as a role's verb set, which a membership "
+        "test reads as a substring test",
+    ),
+    Mutation(
+        "A3-role-verbs-unknown-verb",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if unknown:\n            raise ValueError(\n',
+         '        if False:\n            raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a verb the route table does not serve in a role's verb set, "
+        "so a typo reads as policy",
+    ),
+    Mutation(
+        "A3-route-roles-unknown-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            if role not in CALLER_ROLES:\n                raise ValueError(\n',
+         '            if False:\n                raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a role name that no caller holds in ROUTE_ROLES, so a typo "
+        "closes a route to everyone without a red test",
+    ),
+    Mutation(
         "A3-report-credential-any-route",
         "agents/platform/scripts/credential_proxy.py",
         ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
@@ -1878,6 +2013,16 @@ Mutation(
         "trust the universe domain the environment names again, so a value "
         "the host's metadata server contradicts starts the broker and its "
         "credential goes to that domain's hosts",
+    ),
+    Mutation(
+        "C2-universe-domain-metadata-recheck",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        elif reported != configured:\n",
+         "        elif False and reported != configured:\n"),
+        "test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts",
+        "let a broker that started with no answer from the metadata server "
+        "keep the environment's value when the later answer contradicts it, "
+        "so its credential goes on to that domain's hosts",
     ),
     Mutation(
         "C3-policy-reads-a-file",

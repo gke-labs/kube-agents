@@ -459,6 +459,114 @@ class TestAContextLessGetCredentialsLandsAFile(ContextLessTestCase):
         self.assertEqual([self.expected_file], files)
 
 
+class PerTargetKubeconfigFolderOwnerTest(ContextLessTestCase):
+    """A get-credentials with no destination writes its file and its shell's pin only in a
+    `.kubeconfigs` that its caller owns. Root in the shell pod has the agent's home as its own
+    default: a folder that root made there was one the agent could not write its file in."""
+
+    ROOT = 0
+    ANOTHER_USER = os.geteuid() + 1
+    SHELL = "100-5"
+
+    def setUp(self):
+        super().setUp()
+        self.folder = self.home / ".kubeconfigs"
+        self.shells = self.folder / "shells"
+        self.pin = self.shells / f"{self.SHELL}.context"
+
+    @contextlib.contextmanager
+    def owned_by(self, uid, *folders):
+        """Report `uid` as the owner of `folders`. Only root can change a folder's owner, so the
+        owner is a stand-in."""
+
+        def with_the_owner(real):
+            def stand_in(path, *args, **kwargs):
+                info = real(path, *args, **kwargs)
+                if not isinstance(path, (str, os.PathLike)) or Path(path) not in folders:
+                    return info
+                fields = list(info)
+                fields[4] = uid  # index 4 of a stat result is st_uid
+                return os.stat_result(fields)
+            return stand_in
+
+        with patch.object(os, "stat", with_the_owner(os.stat)), \
+                patch.object(os, "lstat", with_the_owner(os.lstat)):
+            self.assertEqual(uid, folders[0].stat().st_uid, "the stand-in owner is in force")
+            yield
+
+    def fetch_in_a_shell(self, **environ):
+        with self.in_shell(self.SHELL):
+            return self.fetch(self.environ(**environ))
+
+    def test_no_folder_is_made_in_a_home_that_another_user_owns(self):
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            captured, stderr = self.fetch_in_a_shell()
+        self.assertEqual([], list(self.home.iterdir()))
+        self.assertEqual(0, captured["exit_code"], "gcloud succeeded")
+        self.assertIn(
+            f"could not write {self.expected_file}: {self.home} belongs to uid {self.ANOTHER_USER}", stderr
+        )
+        self.assertNotIn("export KUBECONFIG", stderr)
+
+    def test_a_refused_caller_is_told_the_explicit_way_and_not_the_context_flag(self):
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            _, stderr = self.fetch_in_a_shell()
+        self.assertIn("KUBECONFIG=<a file of your own> gcloud container clusters get-credentials", stderr)
+        self.assertIn("KUBECONFIG=<the same file> kubectl", stderr)
+        self.assertNotIn("--context", stderr)
+
+    def test_no_file_and_no_pin_land_in_a_folder_that_another_user_owns(self):
+        self.shells.mkdir(parents=True)
+        with self.owned_by(self.ANOTHER_USER, self.home, self.folder, self.shells):
+            captured, stderr = self.fetch_in_a_shell()
+        self.assertEqual([self.shells], list(self.folder.iterdir()))
+        self.assertEqual([], list(self.shells.iterdir()))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertIn(f"could not write {self.expected_file}: {self.folder} belongs to uid", stderr)
+        self.assertIn(f"could not record the shell's context in {self.pin}: {self.folder} belongs to uid", stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root is the caller, so the folder would be its own")
+    def test_no_pin_lands_below_a_folder_of_root_that_has_no_shells_folder(self):
+        # A `.kubeconfigs` that root made before this rule, in a home that the caller owns.
+        self.folder.mkdir()
+        with self.owned_by(self.ROOT, self.folder):
+            captured, stderr = self.fetch_in_a_shell()
+        self.assertEqual([], list(self.folder.iterdir()))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertIn(
+            f"could not record the shell's context in {self.pin}: {self.folder} belongs to uid {self.ROOT}", stderr
+        )
+
+    def test_after_a_refused_caller_the_owner_writes_its_file_and_its_pin(self):
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            self.fetch_in_a_shell()
+        _, stderr = self.fetch_in_a_shell()
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+        self.assertEqual(SEEDED_CONTEXT, self.pin.read_text(encoding="utf-8"))
+        self.assertIn(f"export KUBECONFIG={self.expected_file}", stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root is the caller, so the home would be its own")
+    def test_a_caller_whose_home_root_owns_still_gets_its_file_and_its_pin(self):
+        # A session pod's home can be a mount that root made for the pod's user.
+        with self.owned_by(self.ROOT, self.home):
+            _, stderr = self.fetch_in_a_shell()
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+        self.assertEqual(SEEDED_CONTEXT, self.pin.read_text(encoding="utf-8"))
+        self.assertIn(f"export KUBECONFIG={self.expected_file}", stderr)
+
+    def test_a_home_that_is_missing_is_made_under_a_folder_of_the_caller(self):
+        home = self.home / "profiles" / "cluster-a"
+        self.fetch_in_a_shell(HERMES_HOME=str(home))
+        self.assertTrue((home / ".kubeconfigs" / self.expected_file.name).is_file())
+
+    def test_an_explicit_destination_is_written_as_before_in_a_folder_of_another_user(self):
+        destination = self.home / "mine.yaml"
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            captured, _ = self.fetch_in_a_shell(KUBECONFIG=str(destination))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertEqual([destination], list(self.home.iterdir()))
+
+
 class TestKubectlContextFlagNamesTheCluster(ContextLessTestCase):
     """`--context` used to end in "context was not found" (#1968, step 37)."""
 
@@ -4836,6 +4944,65 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
         sent = self.run_shim(self.BASE + self.FULL, env={credential_proxy_client.TASK_TOKEN_FILE_ENV: str(token)})
         sent["broker"].assert_called_once()
         sent["relay"]._get_once.assert_not_called()
+
+
+class KubectlWriteAttemptRecordTest(unittest.TestCase):
+    """A session pod's kubectl write attempt, recorded by the kubectl wrapper
+    after a non-zero exit while kube-proxy is read-only (deploy/sandbox/
+    session-kubectl.sh); the worker adapter stops the turn on it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.record = self.tmp / "write-refusals"
+        self.record.write_bytes(b"")
+
+    def run_record(self, argv, code, mode="read-only-dry-run", record=True, task="task-s1"):
+        env = {credential_proxy_client.KUBE_PROXY_MODE_ENV: mode,
+               credential_proxy_client.REFUSAL_FILE_ENV: str(self.record) if record else "",
+               credential_proxy_client.REFUSAL_TASK_ENV: task}
+        with patch.dict("os.environ", env, clear=False), patch("sys.stderr", new=io.StringIO()):
+            credential_proxy_client.record_kubectl_write_attempt(list(argv), code)
+        text = self.record.read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()]
+
+    def test_a_failed_write_under_a_read_only_proxy_appends_one_record(self):
+        records = self.run_record(["kubectl", "scale", "deploy/x", "--replicas=3"], 1)
+        self.assertEqual(1, len(records), records)
+        self.assertEqual(
+            {"write_refusal": True, "rule": "kube-proxy.write-attempt", "verb": "scale", "route": "kube-proxy", "task": "task-s1"},
+            {k: v for k, v in records[0].items() if k != "time"},
+        )
+
+    def test_nothing_is_recorded_without_every_condition(self):
+        write = ["kubectl", "delete", "pod", "p"]
+        for name, kwargs in (
+            ("exit 0", {"argv": write, "code": 0}),
+            ("a read", {"argv": ["kubectl", "get", "pods"], "code": 1}),
+            ("a local render", {"argv": ["kubectl", "apply", "-f", "x", "--dry-run=client"], "code": 1}),
+            ("a server dry run the proxy allows", {"argv": ["kubectl", "apply", "-f", "x", "--dry-run=server"], "code": 1}),
+            ("a writable proxy", {"argv": write, "code": 1, "mode": "read-write"}),
+            ("no mode from the gateway", {"argv": write, "code": 1, "mode": ""}),
+            ("no record file", {"argv": write, "code": 1, "record": False}),
+        ):
+            with self.subTest(name):
+                self.assertEqual([], self.run_record(**kwargs))
+
+    def test_the_command_line_entry_reads_the_code_then_kubectls_arguments(self):
+        env = {credential_proxy_client.KUBE_PROXY_MODE_ENV: "read-only-dry-run",
+               credential_proxy_client.REFUSAL_FILE_ENV: str(self.record),
+               credential_proxy_client.REFUSAL_TASK_ENV: "task-s2"}
+        argv = ["credential-proxy-exec", "--record-kubectl-write-attempt", "1", "rollout", "restart", "deploy/x"]
+        with patch.dict("os.environ", env, clear=False), patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as done:
+            credential_proxy_client.main()
+        self.assertEqual(0, done.exception.code)
+        records = [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(["rollout restart"], [r["verb"] for r in records])
+        bad = ["credential-proxy-exec", "--record-kubectl-write-attempt", "not-a-number", "delete", "pod", "p"]
+        with patch.dict("os.environ", env, clear=False), patch.object(sys, "argv", bad), self.assertRaises(SystemExit) as done:
+            credential_proxy_client.main()
+        self.assertEqual(0, done.exception.code)
+        self.assertEqual(1, len(self.record.read_text(encoding="utf-8").splitlines()))
 
 
 class WriteRefusalRecordTest(unittest.TestCase):

@@ -37,6 +37,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -65,6 +67,9 @@ const (
 	// defaultWorkdir is the pod's scratch emptyDir. A local run falls back to
 	// the current directory, which is why this is a default and not a require.
 	defaultWorkdir = "/scratch"
+	// writeRefusalSubdir holds a session pod's per-turn write-refusal record
+	// under the workdir (sessionWriteRefusalDir).
+	writeRefusalSubdir = ".kube-agents"
 
 	// defaultModel is the profile-neutral alias LiteLLM routes; naming the
 	// concrete model belongs in the install, not here.
@@ -121,6 +126,13 @@ const (
 		"A fix you are only asked to propose is not a change: write it in your reply."
 )
 
+// warmReadyPoll paces warmReady's asks of the status endpoint, and bounds
+// each one.
+const warmReadyPoll = 250 * time.Millisecond
+
+// warmStatusHost is the loopback address the warm status endpoint binds.
+const warmStatusHost = "127.0.0.1"
+
 func main() {
 	os.Exit(run())
 }
@@ -155,6 +167,12 @@ func run() int {
 		}
 		return 0
 	}
+	// `worker-adapter warm-ready` is a warm session pod's readiness probe:
+	// exit 0 once the adapter's loopback status endpoint answers, which it
+	// does from when its task watcher's consumer exists (workeradapter.runWarm).
+	if len(os.Args) > 1 && os.Args[1] == lib.SessionWarmReadyCommand {
+		return warmReady(warmStatusURL(), lib.SessionWarmReadyWaitSeconds*time.Second)
+	}
 	// `worker-adapter mcp` forwards the session's one delegate tool call to
 	// this adapter process over a unix socket (worker-adapter/mcp.go).
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
@@ -182,6 +200,7 @@ func run() int {
 	if err := os.Chdir(workdir); err != nil {
 		log.Warn("workdir unavailable; staying put", "workdir", workdir, "err", err)
 	}
+	cfg.WriteRefusalDir = sessionWriteRefusalDir(cfg.Session, workdir)
 
 	// SIGTERM is the eviction path: context cancellation tells the adapter
 	// to flush, publish terminal failed reason worker-evicted, and exit 143 -
@@ -275,6 +294,9 @@ func resetPaths(v string) []string {
 func profileModeConfig(cfg workeradapter.Config) workeradapter.Config {
 	cfg.HarnessCommand = profileHarnessCommand()
 	cfg.HarnessCommandNoDelegate = nil
+	// The persona is a profile worker's instruction layer; the session
+	// lines are not its own.
+	cfg.Driver = workeradapter.WithInstructions(cfg.Driver, nil)
 	cfg.DelegateSocket = ""
 	return cfg
 }
@@ -290,12 +312,18 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")
 	natsURL := os.Getenv("NATS_URL")
-	// A profile worker learns each task from the dispatcher's offer, so it
-	// starts with no TASK_ID.
+	// A profile worker learns each task from the dispatcher's offer, and a
+	// warm session pod from the first task addressed to it, so neither
+	// starts with a TASK_ID.
 	profileWorker := os.Getenv(lib.EnvProfileWorker) == "true"
-	if (taskID == "" && !profileWorker) || profile == "" || natsURL == "" {
-		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker needs no TASK_ID")
+	warm := os.Getenv(lib.EnvSessionWarm) == "true"
+	if (taskID == "" && !profileWorker && !warm) || profile == "" || natsURL == "" {
+		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker or a warm session pod needs no TASK_ID")
 		return workeradapter.Config{}, false
+	}
+	warmStatusAddr := ""
+	if warm {
+		warmStatusAddr = warmStatusHostPort()
 	}
 
 	// The scope arrives resolved and already validated -- the gateway's
@@ -334,10 +362,15 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 
 	harness, driver, builder, err := selectHarness(os.Getenv)
 	if err != nil {
-		log.Error("the worker's harness is not one it can run; set "+lib.EnvHarness+" to "+string(persona.ClaudeCode)+" or leave it unset",
+		log.Error("the worker's harness is not one it can run",
 			lib.EnvHarness, os.Getenv(lib.EnvHarness), lib.EnvProfileHarness, os.Getenv(lib.EnvProfileHarness), "err", err)
 		return workeradapter.Config{}, false
 	}
+	// core-agent reads a session pod's system-prompt lines from each turn's
+	// envelope, not its argv. No delegate line: core-agent has no delegate
+	// tool yet (its MCP servers aren't wired), and a model told of a tool it
+	// doesn't have calls it. A profile worker drops these (profileModeConfig).
+	driver = workeradapter.WithInstructions(driver, sessionPrompts(os.Getenv))
 	// Chosen before anything below builds an argv or env from it.
 	activeHarness = builder
 	log.Info("harness selected", "harness", string(harness))
@@ -391,7 +424,106 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		// Literal "true" only, like EnvClusterView; a profile pod never
 		// serves a second task, and validate refuses the pair.
 		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
+		// Literal "true" only, like EnvSessionReuse; validate refuses it
+		// without reuse or beside a TASK_ID.
+		Warm:           warm,
+		WarmIdle:       envDurationOrZero(lib.EnvSessionWarmIdleSeconds),
+		WarmStatusAddr: warmStatusAddr,
 	}, true
+}
+
+// warmStatusHostPort is where a warm pod's adapter serves its status: the
+// loopback interface only.
+func warmStatusHostPort() string {
+	return net.JoinHostPort(warmStatusHost, strconv.Itoa(lib.SessionWarmStatusPort))
+}
+
+func warmStatusURL() string {
+	return "http://" + warmStatusHostPort() + lib.SessionWarmReadyPath
+}
+
+// warmReady is the warm pod's readiness probe: 0 once url answers 200,
+// waiting up to wait for it (lib.SessionWarmReadyWaitSeconds says why), 1 if
+// it never does.
+func warmReady(url string, wait time.Duration) int {
+	client := &http.Client{Timeout: warmReadyPoll}
+	deadline := time.Now().Add(wait)
+	for {
+		if resp, err := client.Get(url); err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return 0
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return 1
+		}
+		time.Sleep(warmReadyPoll)
+	}
+}
+
+// envDurationOrZero reads a positive whole number of seconds from key, or
+// zero when it is unset or not one.
+func envDurationOrZero(key string) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		fmt.Fprintf(os.Stderr, "ignoring bad %s=%q\n", key, v)
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
+// sessionWriteRefusalDir is where a session pod with the cluster view keeps
+// each turn's write-refusal record (Config.WriteRefusalDir): under the workdir,
+// the pod's scratch emptyDir, which the harness's own kubectl wrapper can
+// append to. Any other pod gets none: a profile pod's worker makes its own
+// file, and a session pod with no cluster view runs no kubectl.
+func sessionWriteRefusalDir(session, workdir string) string {
+	if session == "" || os.Getenv(lib.EnvClusterView) != "true" {
+		return ""
+	}
+	return filepath.Join(workdir, writeRefusalSubdir)
+}
+
+// sessionToolLists is a session pod's tool allowlist and denylist, whether
+// it has the cluster view, and whether that view's Bash is allowed. The view
+// is only on when Bash is actually allowed: an override that leaves it out
+// keeps Bash disallowed and gets no prompt telling the model to use it.
+func sessionToolLists(getenv func(string) string) (allowed, disallowed string, clusterView, bashView bool) {
+	allowed = getenv("A2A_ALLOWED_TOOLS")
+	disallowed = defaultDisallowedTools
+	clusterView = getenv(lib.EnvClusterView) == "true"
+	if allowed == "" {
+		allowed = defaultAllowedTools
+		if clusterView {
+			allowed = clusterViewAllowedTools
+		}
+	}
+	bashView = clusterView && allowsBash(allowed)
+	if bashView {
+		disallowed = clusterViewDisallowed
+	}
+	return allowed, disallowed, clusterView, bashView
+}
+
+// sessionPrompts is a session pod's system-prompt lines for its cluster
+// access, before the delegate line, which goes only with the delegate tool.
+// The no-cluster line keys on the view, not on Bash: a view pod whose
+// override leaves Bash out still holds the broker's URL, token file and
+// shims, so telling it they aren't there would be false. It gets neither.
+func sessionPrompts(getenv func(string) string) []string {
+	_, _, clusterView, bashView := sessionToolLists(getenv)
+	switch {
+	case bashView:
+		return []string{clusterViewPrompt}
+	case !clusterView && getenv(lib.EnvProfileExecutor) != "true":
+		return []string{noClusterPrompt}
+	}
+	return nil
 }
 
 // harnessCommand builds the harness argv: the native binary driven over the
@@ -422,22 +554,7 @@ func harnessCommand() []string {
 	// control; this list agreeing with it is what keeps the failure legible.
 	// Under A2A_CLUSTER_VIEW the egress fence has one more peer, the
 	// credential broker, and Bash is what reaches it.
-	allowed := os.Getenv("A2A_ALLOWED_TOOLS")
-	disallowed := defaultDisallowedTools
-	clusterView := os.Getenv(lib.EnvClusterView) == "true"
-	if allowed == "" {
-		allowed = defaultAllowedTools
-		if clusterView {
-			allowed = clusterViewAllowedTools
-		}
-	}
-	// The view is only on when Bash is actually allowed: an override that
-	// leaves it out keeps Bash disallowed and gets no prompt telling the
-	// model to use it.
-	bashView := clusterView && allowsBash(allowed)
-	if bashView {
-		disallowed = clusterViewDisallowed
-	}
+	allowed, disallowed, _, _ := sessionToolLists(os.Getenv)
 	// The delegate tool has its own switch, independent of
 	// A2A_ALLOWED_TOOLS: it is appended to whatever surface was resolved
 	// above, including an explicit override, because the gateway -- not
@@ -445,15 +562,7 @@ func harnessCommand() []string {
 	// A2A_DELEGATE_TOOL=off is the one way to run without it, for a stub
 	// harness in tests or an older image.
 	delegateTool := delegateToolEnabled()
-	var prompts []string
-	// The no-cluster line keys on the view, not on Bash: a view pod whose
-	// override leaves Bash out still holds the broker's URL, token file and
-	// shims, so telling it they aren't there would be false. It gets neither.
-	if bashView {
-		prompts = append(prompts, clusterViewPrompt)
-	} else if !clusterView && os.Getenv(lib.EnvProfileExecutor) != "true" {
-		prompts = append(prompts, noClusterPrompt)
-	}
+	prompts := sessionPrompts(os.Getenv)
 	if delegateTool {
 		allowed += "," + delegateToolID
 		prompts = append(prompts, delegatePrompt)
@@ -467,6 +576,7 @@ func harnessCommand() []string {
 		disallowed: disallowed,
 		prompts:    prompts,
 		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		turnBudget: harnessTurnBudget(),
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
@@ -501,11 +611,22 @@ func profileHarnessCommand() []string {
 		maxTurns = defaultMaxTurns
 	}
 	return activeHarness.command(harnessSpec{
-		path:     path,
-		model:    model,
-		maxTurns: maxTurns,
-		extra:    strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		path:       path,
+		model:      model,
+		maxTurns:   maxTurns,
+		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+		turnBudget: harnessTurnBudget(),
 	})
+}
+
+// harnessTurnBudget is harnessSpec.turnBudget from the same variables
+// Config.TaskDeadline and Config.KillGrace read. A profile worker's task
+// deadline comes from its offer and can be shorter; the adapter's own
+// deadline still bounds that task, and only the harness's clean ending is
+// lost.
+func harnessTurnBudget() time.Duration {
+	return envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds) -
+		envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds)
 }
 
 // delegateToolEnabled is the delegate tool's single switch: everything that
@@ -700,9 +821,29 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	if err != nil {
 		return "", nil, nil, err
 	}
+	// Antigravity runs without the per-task HOME locking and workspace scrub
+	// it needs (#6710), so only a pod that says it accepts that may select
+	// it: a test, or a deliberate dev run. Nothing in the operator or chart
+	// sets it to allow. Where the operator renders A2A_HARNESS, it renders
+	// this one empty beside it, so the worker image's own ENV can't set it
+	// there: on a profile worker whose profile names spec.harness.type
+	// (#6832), and later on session pods (#6716). Elsewhere only the pod
+	// spec or the image's ENV can set it; a profile with no type gets
+	// neither variable, by design, since its image is already trusted code.
+	// core-agent likewise, until its end-of-turn sweep lands (#6710).
+	if (driver.Harness() == persona.Antigravity || driver.Harness() == persona.CoreAgent) && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
+		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
+			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
+	}
 	builder, err := builderFor(driver.Harness())
 	if err != nil {
 		return "", nil, nil, err
+	}
+	// A harness with no default path in the image needs one named, unless a
+	// test replaces the whole argv. Refused here, at startup, rather than at
+	// the first task's exec.
+	if builder.defaultPath() == "" && getenv("A2A_HARNESS_PATH") == "" && getenv("A2A_HARNESS_CMD") == "" {
+		return "", nil, nil, fmt.Errorf("harness %q has no default path in this image; set A2A_HARNESS_PATH", driver.Harness())
 	}
 	return driver.Harness(), driver, builder, nil
 }
@@ -714,6 +855,10 @@ func builderFor(h persona.Harness) (harnessBuilder, error) {
 	switch h {
 	case persona.ClaudeCode:
 		return claudeBuilder{}, nil
+	case persona.Antigravity:
+		return agyBuilder{}, nil
+	case persona.CoreAgent:
+		return coreAgentBuilder{}, nil
 	}
 	return nil, fmt.Errorf("harness %q has no argv builder", h)
 }

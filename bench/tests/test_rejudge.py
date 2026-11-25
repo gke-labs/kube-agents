@@ -248,3 +248,21 @@ def test_a_later_success_clears_the_earlier_error():
     rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": _scored(0.7)})
     assert rejudge.JUDGE_ERRORS_KEY not in record
     assert record["scores"]["OutcomeValidity"]["score"] == 0.7
+
+
+def test_a_cancelled_run_skips_rejudge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    marker = tmp_path / "cancelled"
+    marker.touch()
+    monkeypatch.setenv("KUBE_AGENTS_CANCEL_MARKER", str(marker))
+    record = _record()
+    assert rejudge.missing_metrics(record, GATED) == []
+    assert rejudge.rejudge_record(record, GATED, _no_judge) == []
+
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps([record]), encoding="utf-8")
+    assert rejudge.rejudge_file(path, GATED, _no_judge) == []
+    assert "cancelled run marker found" in capsys.readouterr().err
+
+    assert rejudge.main([str(path)]) == 0
+    assert "cancelled run marker found" in capsys.readouterr().err
+
