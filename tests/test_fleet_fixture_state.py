@@ -184,6 +184,14 @@ _WRAPPED_SERIAL = (
     "2026-10-17T02:48:17.439738+00:00 startup-fail-seeded mwlid_extension[723]: "
     "MWLID credential refresh is not enabled, skipping run\n"
 )
+# The serial-flood VM's console after its flood pass: one pass writes about
+# twice the 1 MiB buffer in counted filler lines, so only the filler remains
+# and the boot's failure lines are out. The tail of a real pass.
+_FLOODED_SERIAL = (
+    "eval fixture: serial-flood filler 40958 of 40960\n"
+    "eval fixture: serial-flood filler 40959 of 40960\n"
+    "eval fixture: serial-flood filler 40960 of 40960\n"
+)
 
 _STUB_GCLOUD = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -357,6 +365,47 @@ def _writer_cronjob(*, suspend: bool = False, schedule: str = "*/10 * * * *") ->
     }
 
 
+# The three finished Jobs of the generated-name-job-family role (defects-a.tf).
+_FAMILY_JOBS = (
+    "job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39",
+    "job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041",
+    "job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2",
+)
+
+
+def _family_job(*, finished_hours_ago: float = 24 * 30) -> dict:
+    """One finished Job of the generated-name family: it succeeded, and it has no TTL and no owner."""
+    return {
+        "metadata": {"labels": {"app.kubernetes.io/part-of": "reindex"}},
+        "spec": {},
+        "status": {"succeeded": 1, "completionTime": _created(finished_hours_ago)},
+    }
+
+
+# The long-named Deployment of the long-name-replaced-pod role (defects-a.tf).
+_LONG_NAME_DEPLOYMENT = "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds"
+_LONG_NAME_ROLE = "role/long-name-pod-cycle"
+# The two Deployments of the cpu-burst-and-flat role, each with its mode and its CPU size.
+_CPU_CYCLE = (("deployment/cpu-flat", "flat", "100m"), ("deployment/cpu-burst", "burst", "200m"))
+
+
+def _long_name_deployment() -> dict:
+    """The long-named Deployment between two replacements: one ready pod."""
+    container = {"resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "200m", "memory": "256Mi"}}}
+    return {
+        "spec": {"replicas": 1, "template": {"spec": {"serviceAccountName": "long-name-pod-cycle", "containers": [container]}}},
+        "status": {"replicas": 1, "readyReplicas": 1},
+    }
+
+
+def _cpu_cycle_deployment(mode: str, cpu: str) -> dict:
+    container = {
+        "resources": {"requests": {"cpu": cpu, "memory": "64Mi"}, "limits": {"cpu": cpu, "memory": "128Mi"}},
+        "env": [{"name": "CPU_MODE", "value": mode}],
+    }
+    return {"spec": {"replicas": 1, "template": {"spec": {"containers": [container]}}}, "status": {"replicas": 1, "readyReplicas": 1}}
+
+
 def _future(days: int = 30) -> str:
     return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -423,17 +472,18 @@ def _peer(*, block: dict | None = _OPEN_BLOCK, created: str | None = None) -> di
     return doc
 
 
-def _cluster_c(*, disk: int = 50, cfs_quota: bool | None = False, created: str | None = None) -> dict:
+def _cluster_c(*, disk: int = 50, pids_limit: str | None = "4096", created: str | None = None) -> dict:
     """Slot c's cluster document: no authorized-networks block, and the
     default pool bench/tf/fleet/main.tf plants as the pool-level outlier, a
-    50 GB disk with cpuCfsQuota false. `cfs_quota=None` leaves the pool with
-    no kubeletConfig at all, as every peer pool reads."""
+    50 GB disk with podPidsLimit 4096 (a string, as gcloud prints an int64).
+    `pids_limit=None` leaves the pool with no kubeletConfig at all, as every
+    peer pool reads."""
     # Since the ComputeClass fixtures (defects-c.tf): the pool carries the
     # class label and the NodeLocal DNSCache add-on is off (GKE omits the
     # false boolean, so the block is empty).
     config: dict = {"diskSizeGb": disk, "labels": {"cloud.google.com/compute-class": "general-ccc"}}
-    if cfs_quota is not None:
-        config["kubeletConfig"] = {"cpuCfsQuota": cfs_quota}
+    if pids_limit is not None:
+        config["kubeletConfig"] = {"podPidsLimit": pids_limit}
     return {
         "currentMasterVersion": "1.34.1-gke.1",
         "createTime": created or _created(),
@@ -494,6 +544,10 @@ def _healthy_world() -> dict:
             "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
             "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
             "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            **{subject: _family_job() for subject in _FAMILY_JOBS},
+            _LONG_NAME_DEPLOYMENT: _long_name_deployment(),
+            _LONG_NAME_ROLE: {"rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["delete"]}]},
+            **{subject: _cpu_cycle_deployment(mode, cpu) for subject, mode, cpu in _CPU_CYCLE},
             "deployment/ledger-writer": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "10m", "memory": "32Mi"}}}]}}}},
             "poddisruptionbudget?": {"items": []},
             "networkpolicy?": {"items": []},
@@ -668,6 +722,7 @@ def _healthy_world() -> dict:
             "instances": [
                 {"name": "startup-fail-seeded", "status": "RUNNING", "zone": "https://www.googleapis.com/compute/v1/projects/kube-agents-evals/zones/us-central1-a", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
                 {"name": "world-open-seeded", "status": "RUNNING", "networkInterfaces": [{"accessConfigs": [{"type": "ONE_TO_ONE_NAT", "natIP": "203.0.113.7"}]}]},
+                {"name": "serial-flood-seeded", "status": "RUNNING", "zone": "https://www.googleapis.com/compute/v1/projects/kube-agents-evals/zones/us-central1-a", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
             ],
             "firewall-rules": [
                 {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
@@ -686,8 +741,9 @@ def _healthy_world() -> dict:
             "disks": [],
         },
         # Each instance's serial port 1 output, by name. The startup-fail VM's
-        # holds the boot that ran its script.
-        "serial": {"startup-fail-seeded": _FRESH_SERIAL},
+        # holds the boot that ran its script; the serial-flood VM's holds only
+        # its flood filler, the boot already rotated out.
+        "serial": {"startup-fail-seeded": _FRESH_SERIAL, "serial-flood-seeded": _FLOODED_SERIAL},
         "describe": {
             "seeded-a": _peer(),
             "seeded-b": _cluster_b(),
@@ -1290,7 +1346,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script_process(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 55 role(s) in their designed state, 0 drifted, 0 not checked, 0 not yet ready (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 59 role(s) in their designed state, 0 drifted, 0 not checked, 0 not yet ready (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -1320,7 +1376,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "55 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "59 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -1352,7 +1408,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script_process(world)
         assert done.returncode == 0, done.stderr
-        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "58 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -1378,7 +1434,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "55 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "59 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -1402,7 +1458,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "55 role(s) in their designed state" in done.stderr, done.stderr
+        assert "59 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -1416,7 +1472,7 @@ class PassTest(_Harness):
     def test_the_default_pool_needs_room_for_the_next_fixture(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "55 role(s) in their designed state" in done.stderr, done.stderr
+        assert "59 role(s) in their designed state" in done.stderr, done.stderr
         # The pods are read once, across every namespace, not once per node.
         assert self.log.read_text().count("get pod -A") == 1, self.log.read_text()
         # 2026-10-20's shape on kube-agents-evals-11: 940m nodes, the busier one 4m from full.
@@ -1432,7 +1488,7 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["kubectl"]["pod?"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "58 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
         assert "default-pool-headroom" in done.stderr and "kubectl get pod -A failed" in done.stderr, done.stderr
         assert "default-pool-headroom" not in self.drift_files()
 
@@ -1445,7 +1501,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "55 role(s) in their designed state" in done.stderr, done.stderr
+        assert "59 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -1477,7 +1533,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "55 role(s) in their designed state" in done.stderr, done.stderr
+        assert "59 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -1684,7 +1740,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "55 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "59 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
@@ -1741,12 +1797,12 @@ class PassTest(_Harness):
     def test_a_default_pool_matching_its_peers_is_drift(self):
         # The pool-level outlier is a separate role from drift-outlier: a
         # default pool back at the peers' 20 GB, or with the kubelet key
-        # unset or at its default, drifts drift-pool-outlier alone, so the
+        # unset or at another value, drifts drift-pool-outlier alone, so the
         # case that lists drift-outlier is excused nothing by it.
         for doc, observed in (
             (_cluster_c(disk=20), "nodePools[?(@.name=='default-pool')].config.diskSizeGb eq 50: observed 20"),
-            (_cluster_c(cfs_quota=None), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.cpuCfsQuota eq false: observed nothing"),
-            (_cluster_c(cfs_quota=True), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.cpuCfsQuota eq false: observed true"),
+            (_cluster_c(pids_limit=None), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit eq 4096: observed nothing"),
+            (_cluster_c(pids_limit="1024"), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit eq 4096: observed \"1024\""),
         ):
             with self.subTest(observed=observed):
                 world = _healthy_world()
@@ -1889,7 +1945,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "43 role(s) in their designed state, 0 drifted, 12 not checked" in done.stderr
+        assert "47 role(s) in their designed state, 0 drifted, 12 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -1934,7 +1990,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "55 role(s) in their designed state" in done.stderr
+        assert "59 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -2083,6 +2139,34 @@ class ProjectScopedRoleTest(_Harness):
         assert "fixture role 'startup-fail-vm' could not be checked" in done.stderr
         assert "compute.instances.getSerialPortOutput" in done.stderr
 
+    def test_the_serial_flood_vms_console_is_read_for_the_filler(self):
+        done = self.run_script(_healthy_world())
+        assert self.drift_files() == {}, done.stderr
+        assert (
+            "gcloud compute instances get-serial-port-output serial-flood-seeded --zone=us-central1-a --port=1 --project=kube-agents-evals"
+            in self.log.read_text()
+        )
+
+    def test_a_serial_flood_console_still_showing_its_boot_is_drift(self):
+        """The rotated console is this fixture's designed state: a buffer
+        that still reads as a fresh boot means the flood never ran, and the
+        audit would file a plain startup failure instead of the
+        rotated-console note the case grades."""
+        world = _healthy_world()
+        world["serial"]["serial-flood-seeded"] = _FRESH_SERIAL.replace("startup-fail-seeded", "serial-flood-seeded")
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"rotated-console-vm"}, done.stderr
+        body = self.drift_files()["rotated-console-vm"]
+        assert 'instance/serial-flood-* serial_contains "eval fixture: serial-flood filler"' in body, body
+        assert "not in the serial port 1 output of serial-flood-seeded (us-central1-a," in body, body
+
+    def test_a_stopped_serial_flood_vm_is_drift(self):
+        world = _healthy_world()
+        world["compute"]["instances"][2]["status"] = "TERMINATED"
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"rotated-console-vm"}, done.stderr
+        assert 'instance/serial-flood-* status any_eq "RUNNING": observed "TERMINATED"' in self.drift_files()["rotated-console-vm"]
+
     def test_serial_contains_is_for_a_project_instance_subject_only(self):
         for role, change in (
             ("world-open-ingress", {"subject": "firewall/world-open-2379-*"}),
@@ -2126,7 +2210,7 @@ class ProjectScopedRoleTest(_Harness):
         world["compute"]["instances"] = "UNREACHABLE"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "53 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
+        assert "56 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
         assert "fixture role 'startup-fail-vm' could not be checked" in done.stderr
 
     def test_the_peered_networks_are_read_in_the_project(self):
@@ -2228,7 +2312,7 @@ class ReservationSubjectTest(_Harness):
         world["compute"]["reservations"] = "PARTIAL"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "58 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert "fixture role 'missing-reservation-pool' could not be checked" in done.stderr
         # The reason is each item under gcloud's first warning, not its last line.
         assert "compute reservations list was partial: Internal error in zone us-central1-a; Internal error in zone us-central1-b" in done.stderr
@@ -2239,7 +2323,7 @@ class ReservationSubjectTest(_Harness):
         world["compute"]["reservations"] = "UNREACHABLE"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "58 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert "fixture role 'missing-reservation-pool' could not be checked" in done.stderr
 
     def test_no_other_project_subject_is_for_a_cluster_role(self):
@@ -2453,7 +2537,7 @@ class OrphanSnapshotRoleTest(_Harness):
         done = self.run_script(world, "--report", str(report))
         assert done.returncode == 0, done.stderr
         assert self.drift_files() == {}, done.stderr
-        assert "54 role(s) in their designed state, 0 drifted, 0 not checked, 1 not yet ready" in done.stderr, done.stderr
+        assert "58 role(s) in their designed state, 0 drifted, 0 not checked, 1 not yet ready" in done.stderr, done.stderr
         assert "NOTE: fixture role 'declared-orphan-snapshot' is planted in kube-agents-evals but not yet ready" in done.stderr, done.stderr
         assert "WARNING" not in done.stderr
         doc = json.loads(report.read_text())
@@ -2463,7 +2547,7 @@ class OrphanSnapshotRoleTest(_Harness):
         assert len(entry["detail"]) == 1 and entry["detail"][0].startswith("snapshot/declared-orphan-snap-* creationTimestamp ready_after_hours 2184: observed"), entry
         assert f"ready at {ready_at}" in entry["detail"][0], entry
         assert doc["roles"]["orphan-snapshot"]["state"] == "converged"
-        assert doc["summary"] == {"converged": 54, "drifted": 0, "unchecked": 0, "not_ready": 1}
+        assert doc["summary"] == {"converged": 58, "drifted": 0, "unchecked": 0, "not_ready": 1}
 
     def test_the_gate_does_not_hold_the_wait(self):
         # One read of the prefix under a 60-second wait at a 1-second interval
@@ -2574,7 +2658,7 @@ class OrphanSnapshotRoleTest(_Harness):
         world["compute"]["disks"] = "UNREACHABLE"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "53 role(s) in their designed state, 0 drifted, 2 not checked, 0 not yet ready" in done.stderr, done.stderr
+        assert "57 role(s) in their designed state, 0 drifted, 2 not checked, 0 not yet ready" in done.stderr, done.stderr
         assert "fixture role 'declared-orphan-snapshot' could not be checked" in done.stderr
         assert "compute.disks.list" in done.stderr
 
@@ -2606,6 +2690,236 @@ class OrphanSnapshotRoleTest(_Harness):
         assert "not one RFC 3339 timestamp" in ffs.evaluate(entry, [{"creationTimestamp": "soon"}])
         assert "not one RFC 3339 timestamp" in ffs.evaluate(entry, [])
 
+
+
+class FinishedJobFamilyRoleTest(_Harness):
+    """generated-name-job-family: three finished Jobs named `reindex-<uuid>` on
+    slot a, with no TTL and no owner. The cost audit's 3.9 files a finished Job
+    7 days after it finished, so each Job has a `ready_after_hours` gate on its
+    `status.completionTime`: a cluster role that is NOT READY, never drifted,
+    for its first 168 hours."""
+
+    ROLE = "generated-name-job-family"
+
+    def test_three_jobs_that_finished_long_ago_converge(self):
+        done = self.run_script(_healthy_world())
+        assert done.returncode == 0, done.stderr
+        assert self.drift_files() == {}, done.stderr
+        assert "0 drifted, 0 not checked, 0 not yet ready" in done.stderr, done.stderr
+        log = self.log.read_text()
+        for subject in _FAMILY_JOBS:
+            assert f"get {subject.replace('/', ' ')} -n seeded-family -o json" in log, log
+
+    def test_a_job_that_finished_a_day_ago_is_not_ready_not_drifted(self):
+        world = _healthy_world()
+        finished = (datetime.now(timezone.utc) - timedelta(hours=24)).replace(microsecond=0)
+        world["kubectl"][_FAMILY_JOBS[0]]["status"]["completionTime"] = finished.isoformat()
+        report = self.tmp / "report.json"
+        done = self.run_script(world, "--report", str(report))
+        assert done.returncode == 0, done.stderr
+        assert self.drift_files() == {}, done.stderr
+        assert "0 drifted, 0 not checked, 1 not yet ready" in done.stderr, done.stderr
+        assert f"NOTE: fixture role '{self.ROLE}' is planted in kube-agents-evals but not yet ready" in done.stderr, done.stderr
+        entry = json.loads(report.read_text())["roles"][self.ROLE]
+        assert entry["state"] == "not_ready", entry
+        assert len(entry["detail"]) == 1 and entry["detail"][0].startswith(f"{_FAMILY_JOBS[0]} status.completionTime ready_after_hours 168: observed"), entry
+        assert f"ready at {(finished + timedelta(hours=168)).isoformat()}" in entry["detail"][0], entry
+
+    def test_the_gate_is_the_cost_audits_own_threshold(self):
+        # The gate is the hour at which check 3.9 starts to file the Job: an
+        # hour younger is no finding, that old is one. Asked of the collector
+        # itself, so a moved threshold or a different timestamp fails this
+        # test and does not leave the role ready on the wrong day.
+        scripts = _REPO / "agents" / "platform" / "skills" / "fleet-audit" / "scripts"
+        spec = importlib.util.spec_from_file_location("fleet_waste", scripts / "fleet_waste.py")
+        collector = importlib.util.module_from_spec(spec)
+        # The collector imports the modules beside it by name. The two patches
+        # put its folder on the path for the import only, and take the modules
+        # that it loaded out of sys.modules again.
+        with mock.patch.object(sys, "path", [str(scripts), *sys.path]), mock.patch.dict(sys.modules):
+            spec.loader.exec_module(collector)
+        now = datetime.now(timezone.utc)
+        name = _FAMILY_JOBS[0].split("/", 1)[1]
+
+        def filed(hours: float) -> bool:
+            job = {"metadata": {"name": name, "namespace": "seeded-family"}, "spec": {}, "status": {"succeeded": 1, "completionTime": (now - timedelta(hours=hours)).isoformat()}}
+            hits = collector.check_terminal_pods({"pods": [], "jobs": [job], "cronjobs": []}, now=now)
+            return any(hit["object"] == f"Job/{name}" for hit in hits)
+
+        entries = [e for e in self.catalog["roles"][self.ROLE]["state"] if e["op"] == "ready_after_hours"]
+        assert sorted(e["subject"] for e in entries) == sorted(_FAMILY_JOBS), entries
+        for entry in entries:
+            assert entry["path"] == "status.completionTime", entry
+            assert not filed(entry["value"] - 1) and filed(entry["value"]), entry
+
+    def test_the_script_holds_the_gate_within_an_hour(self):
+        # An hour before the gate one Job keeps the role not ready; an hour
+        # after it the role is in its designed state.
+        for hours, summary in ((167, "0 drifted, 0 not checked, 1 not yet ready"), (169, "0 drifted, 0 not checked, 0 not yet ready")):
+            with self.subTest(hours=hours):
+                world = _healthy_world()
+                world["kubectl"][_FAMILY_JOBS[2]]["status"]["completionTime"] = _created(hours)
+                done = self.run_script(world)
+                assert done.returncode == 0, done.stderr
+                assert self.drift_files() == {}, done.stderr
+                assert summary in done.stderr, done.stderr
+
+    def test_each_job_is_drift_with_a_ttl_an_owner_or_no_family_label(self):
+        # Check 3.9 files no Job that has a TTL (and the TTL controller deletes
+        # it) and no Job that a CronJob owns; the family has no owner at all,
+        # and the label is the mark of its parent. Each Job has each assertion.
+        def with_ttl(job):
+            job["spec"]["ttlSecondsAfterFinished"] = 3600
+
+        def with_owner(job):
+            job["metadata"]["ownerReferences"] = [{"kind": "CronJob", "name": "reindex"}]
+
+        def without_label(job):
+            job["metadata"]["labels"] = {}
+
+        for defect, line in (
+            (with_ttl, "spec.ttlSecondsAfterFinished absent: observed 3600"),
+            (with_owner, "metadata.ownerReferences absent: observed"),
+            (without_label, 'metadata.labels["app.kubernetes.io/part-of"] eq "reindex": observed nothing'),
+        ):
+            for subject in _FAMILY_JOBS:
+                with self.subTest(defect=defect.__name__, subject=subject):
+                    world = _healthy_world()
+                    defect(world["kubectl"][subject])
+                    done = self.run_script(world)
+                    assert set(self.drift_files()) == {self.ROLE}, done.stderr
+                    assert f"{subject} {line}" in self.drift_files()[self.ROLE], self.drift_files()[self.ROLE]
+
+    def test_each_job_that_did_not_succeed_is_drift(self):
+        for subject in _FAMILY_JOBS:
+            with self.subTest(subject=subject):
+                world = _healthy_world()
+                world["kubectl"][subject]["status"] = {"failed": 1, "conditions": [{"type": "Failed", "status": "True"}]}
+                done = self.run_script(world)
+                assert set(self.drift_files()) == {self.ROLE}, done.stderr
+                assert f"{subject} status.succeeded eq 1: observed nothing" in self.drift_files()[self.ROLE], self.drift_files()[self.ROLE]
+
+    def test_a_job_that_did_not_succeed_is_drift_also_when_it_is_young(self):
+        world = _healthy_world()
+        world["kubectl"][_FAMILY_JOBS[0]]["status"] = {"failed": 1, "conditions": [{"type": "Failed", "status": "True"}]}
+        world["kubectl"][_FAMILY_JOBS[1]]["status"]["completionTime"] = _created(2)
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {self.ROLE}, done.stderr
+        body = self.drift_files()[self.ROLE]
+        assert f"{_FAMILY_JOBS[0]} status.succeeded eq 1: observed nothing" in body, body
+        assert f"{_FAMILY_JOBS[0]} status.completionTime ready_after_hours 168: observed nothing, not one RFC 3339 timestamp" in body, body
+        assert f"not ready: {_FAMILY_JOBS[1]} status.completionTime ready_after_hours 168" in body, body
+
+
+class CostWorkloadRolesTest(_Harness):
+    """long-name-replaced-pod and cpu-burst-and-flat: Deployments on slot a
+    whose shape the waste audit's overrequest check reads. The long-named
+    Deployment replaces its one pod each day. Its role still asserts a ready
+    pod: a pod that never runs must not read as healthy, and a scan in the
+    seconds of the replacement is one drifted scan that the next one clears."""
+
+    LONG_NAME = "long-name-replaced-pod"
+    CPU = "cpu-burst-and-flat"
+
+    def test_a_pod_that_the_controller_holds_and_that_never_runs_is_drift(self):
+        # A pull that fails or a script that does not start: the controller
+        # counts the pod, and it is never ready. Without the readiness
+        # assertion this reads as healthy, the audit has no pod to read, and
+        # each case passes on each build.
+        world = _healthy_world()
+        world["kubectl"][_LONG_NAME_DEPLOYMENT]["status"] = {"replicas": 1, "unavailableReplicas": 1}
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {self.LONG_NAME}, done.stderr
+        assert f"{_LONG_NAME_DEPLOYMENT} status.readyReplicas eq 1: observed nothing" in self.drift_files()[self.LONG_NAME], self.drift_files()[self.LONG_NAME]
+
+    def test_the_long_named_deployment_is_drift_out_of_its_shape(self):
+        def no_pod(world):
+            world[_LONG_NAME_DEPLOYMENT]["status"] = {}
+
+        def two_replicas(world):
+            world[_LONG_NAME_DEPLOYMENT]["spec"]["replicas"] = 2
+
+        def other_account(world):
+            world[_LONG_NAME_DEPLOYMENT]["spec"]["template"]["spec"]["serviceAccountName"] = "default"
+
+        def smaller_cpu_request(world):
+            world[_LONG_NAME_DEPLOYMENT]["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["cpu"] = "50m"
+
+        def smaller_memory_request(world):
+            world[_LONG_NAME_DEPLOYMENT]["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["memory"] = "64Mi"
+
+        def lower_cpu_limit(world):
+            world[_LONG_NAME_DEPLOYMENT]["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["cpu"] = "10m"
+
+        def no_delete_verb(world):
+            world[_LONG_NAME_ROLE]["rules"][0]["verbs"] = ["get"]
+
+        def a_second_verb(world):
+            world[_LONG_NAME_ROLE]["rules"][0]["verbs"] = ["delete", "list"]
+
+        def another_resource(world):
+            world[_LONG_NAME_ROLE]["rules"][0]["resources"] = ["configmaps"]
+
+        def a_second_resource(world):
+            world[_LONG_NAME_ROLE]["rules"][0]["resources"] = ["pods", "secrets"]
+
+        for defect, line in (
+            (no_pod, f"{_LONG_NAME_DEPLOYMENT} status.readyReplicas eq 1: observed nothing"),
+            (two_replicas, f"{_LONG_NAME_DEPLOYMENT} spec.replicas eq 1: observed 2"),
+            (other_account, f'{_LONG_NAME_DEPLOYMENT} spec.template.spec.serviceAccountName eq "long-name-pod-cycle": observed "default"'),
+            (smaller_cpu_request, f'{_LONG_NAME_DEPLOYMENT} spec.template.spec.containers[0].resources.requests.cpu eq "100m": observed "50m"'),
+            (smaller_memory_request, f'{_LONG_NAME_DEPLOYMENT} spec.template.spec.containers[0].resources.requests.memory eq "128Mi": observed "64Mi"'),
+            (lower_cpu_limit, f'{_LONG_NAME_DEPLOYMENT} spec.template.spec.containers[0].resources.limits.cpu eq "200m": observed "10m"'),
+            (no_delete_verb, f'{_LONG_NAME_ROLE} rules[0].verbs[*] eq "delete": observed "get"'),
+            (a_second_verb, f'{_LONG_NAME_ROLE} rules[0].verbs[*] eq "delete": observed ["delete", "list"]'),
+            (another_resource, f'{_LONG_NAME_ROLE} rules[0].resources[*] eq "pods": observed "configmaps"'),
+            (a_second_resource, f'{_LONG_NAME_ROLE} rules[0].resources[*] eq "pods": observed ["pods", "secrets"]'),
+        ):
+            with self.subTest(defect=defect.__name__):
+                world = _healthy_world()
+                defect(world["kubectl"])
+                done = self.run_script(world)
+                assert set(self.drift_files()) == {self.LONG_NAME}, done.stderr
+                assert line in self.drift_files()[self.LONG_NAME], self.drift_files()[self.LONG_NAME]
+
+    def test_each_cpu_deployment_is_drift_out_of_its_shape(self):
+        def container(world, subject):
+            return world[subject]["spec"]["template"]["spec"]["containers"][0]
+
+        def not_ready(world, subject):
+            world[subject]["status"] = {"replicas": 1, "unavailableReplicas": 1}
+
+        def no_cpu_limit(world, subject):
+            del container(world, subject)["resources"]["limits"]["cpu"]
+
+        def guaranteed(world, subject):
+            container(world, subject)["resources"]["limits"]["memory"] = "64Mi"
+
+        def larger_memory_request(world, subject):
+            container(world, subject)["resources"]["requests"]["memory"] = "128Mi"
+
+        def other_mode(world, subject):
+            container(world, subject)["env"][0]["value"] = "sometimes"
+
+        for subject, mode, cpu in _CPU_CYCLE:
+            for defect, line in (
+                (not_ready, f"{subject} status.readyReplicas eq 1: observed nothing"),
+                (no_cpu_limit, f'{subject} spec.template.spec.containers[0].resources.limits.cpu eq "{cpu}": observed nothing'),
+                (guaranteed, f'{subject} spec.template.spec.containers[0].resources.limits.memory eq "128Mi": observed "64Mi"'),
+                (larger_memory_request, f'{subject} spec.template.spec.containers[0].resources.requests.memory eq "64Mi": observed "128Mi"'),
+                (other_mode, f"{subject} spec.template.spec.containers[0].env[?(@.name=='CPU_MODE')].value eq \"{mode}\": observed \"sometimes\""),
+            ):
+                with self.subTest(subject=subject, defect=defect.__name__):
+                    world = _healthy_world()
+                    defect(world["kubectl"], subject)
+                    done = self.run_script(world)
+                    assert set(self.drift_files()) == {self.CPU}, done.stderr
+                    assert line in self.drift_files()[self.CPU], self.drift_files()[self.CPU]
+
+    def test_the_two_cpu_deployments_do_not_have_each_others_request(self):
+        entries = self.catalog["roles"][self.CPU]["state"]
+        requests = {e["subject"]: e["value"] for e in entries if e["path"].endswith("requests.cpu")}
+        assert requests == {subject: cpu for subject, _, cpu in _CPU_CYCLE}, requests
 
 
 class ReportTest(_Harness):
@@ -2645,6 +2959,9 @@ class ReportTest(_Harness):
                 "declared-no-pdb-workload": "converged",
                 "declared-overrequest-workload": "converged",
                 "generated-name-family": "converged",
+                "generated-name-job-family": "converged",
+                "long-name-replaced-pod": "converged",
+                "cpu-burst-and-flat": "converged",
                 "guaranteed-qos-workload": "converged",
                 "declared-token-workload": "converged",
                 "default-pool-headroom": "converged",
@@ -2675,6 +2992,7 @@ class ReportTest(_Harness):
                 "stale-client-skew": "converged",
                 "stalled-controller": "converged",
                 "startup-fail-vm": "converged",
+                "rotated-console-vm": "converged",
                 "declared-orphan-snapshot": "converged",
                 "orphan-snapshot": "converged",
                 "version-laggard": "converged",
@@ -2691,7 +3009,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 49, "drifted": 1, "unchecked": 4, "not_ready": 0})
+        self.assertEqual(doc["summary"], {"converged": 53, "drifted": 1, "unchecked": 4, "not_ready": 0})
         self.assertEqual(doc["roles"]["startup-fail-vm"]["cluster_slot"], None)
         self.assertIn("1 drifted, 4 not checked", done.stderr)
 

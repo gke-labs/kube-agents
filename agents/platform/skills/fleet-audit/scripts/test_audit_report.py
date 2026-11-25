@@ -265,6 +265,8 @@ NUMBER_WORDS = {
             "twenty-four",
             "twenty-five",
             "twenty-six",
+            "twenty-seven",
+            "twenty-eight",
         )
     )
 }
@@ -3783,7 +3785,7 @@ class TestAuditCatalogue(unittest.TestCase):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("eleven §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("twelve §4 facets marked _Standard cohorts only_", text)
         self.assertIn("reads as complete at eight of eight", text)
         self.assertIn("logging-components", text)
         self.assertIn("monitoring-components", text)
@@ -3825,6 +3827,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "managed-prometheus",
                 "logging-components",
                 "monitoring-components",
+                "boot-disk",
             ],
         }
         for audit_id, checks in expected_na_checks.items():
@@ -17347,6 +17350,18 @@ class TestFindExistingIssue(HarnessTestCase):
             result = audit_report.find_existing_issue("acme/fleet", AUDIT)
         self.err = err.getvalue()
         return result
+
+    def test_a_ledger_body_that_is_not_a_text_is_a_body_that_did_not_arrive(self):
+        """The broker's GitHub translation gives None for a body that is not a text. The read
+        gives None for it too, which is "the body did not arrive": a run leaves that ledger's
+        body alone. The empty text is a real empty body, which a run can write over."""
+        url = "https://github.com/acme/fleet/issues/42"
+        for body in (None, [["nested"]], {"a": 1}, 7):
+            with self.subTest(body=body):
+                self.harness.replies = {"issue-list": issues_view([{"number": 42, "url": url, "body": body}])}
+                self.assertIsNone(self.find()[2])
+        self.harness.replies = {"issue-list": issues_view([{"number": 42, "url": url, "body": ""}])}
+        self.assertEqual("", self.find()[2])
 
     def test_the_highest_number_wins_so_the_choice_converges(self):
         # Duplicates exist because some run created one — and that run wrote
@@ -32018,27 +32033,46 @@ class TestReportStore(HarnessTestCase):
     def test_a_root_run_hands_what_it_creates_to_the_stores_owner(self):
         """Mode cannot let uid 1000 write into a root-owned directory; root
         hands every directory and file it creates to the nearest existing
-        directory's owner, so the next scheduled run can write."""
+        directory's owner, so the next scheduled run can write. Always
+        through a descriptor: a chown by name could follow a swapped link."""
         self.reports_dir.parent.mkdir(parents=True, exist_ok=True)
         owner = self.reports_dir.parent.stat()
         chowned = []
         with (
             patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(audit_report.os, "chown", side_effect=AssertionError("chown by name")),
             patch.object(
-                audit_report.os, "chown", side_effect=lambda path, uid, gid: chowned.append(
-                    (Path(path), uid, gid)
+                audit_report.os, "fchown", side_effect=lambda fd, uid, gid: chowned.append(
+                    (os.fstat(fd).st_ino, stat.S_ISDIR(os.fstat(fd).st_mode), uid, gid)
                 )
             ),
         ):
             audit_report.write_report(AUDIT, self.envelope(), NOW)
-        self.assertEqual({(uid, gid) for _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
+        self.assertEqual({(uid, gid) for _, _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
         directory = self.store_dir()
-        paths = {path for path, _, _ in chowned}
+        inodes = {ino for ino, _, _, _ in chowned}
         for created in (self.reports_dir, directory, directory / "runs"):
             with self.subTest(created=created):
-                self.assertIn(created, paths)
+                self.assertIn(created.stat().st_ino, inodes)
         # One temp file per write: the ring entry and latest.json.
-        self.assertEqual(len([path for path in paths if path.suffix == ".tmp"]), 2)
+        self.assertEqual(len([1 for _, is_dir, _, _ in chowned if not is_dir]), 2)
+
+    def test_a_new_directory_swapped_for_a_link_is_left_alone(self):
+        """The store's directories are its owner's, so a directory root just
+        made can be swapped for a link before its mode and owner are set;
+        neither may land on what the link points at."""
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "elsewhere"
+        target.mkdir(mode=0o700)
+        link = Path(self.enterContext(tempfile.TemporaryDirectory())) / "swapped"
+        link.symlink_to(target)
+        with (
+            patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(audit_report.os, "fchown") as fchown,
+            self.assertRaises(OSError),
+        ):
+            audit_report._settle_new_dir(link, link.parent.stat())
+        fchown.assert_not_called()
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
 
     def test_another_uids_store_is_named_when_it_is_denied(self):
         """What a root hand-run from before the handover left behind: the
@@ -35160,6 +35194,299 @@ GITHUB_LIKE = {
 GITLAB_LIKE = {**GITHUB_LIKE, "forge": "gitlab"}
 
 
+class TestShadowRun(BaseTestCase):
+    """A shadow run (#5623): the report goes to the store's shadow stream and nowhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        # Any git or forge call is recorded: a shadow run makes none, even with
+        # a repository registered.
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        no_remote = type(sys)("github_token_refresh")
+        no_remote.get_current_git_repo = lambda cwd=None: None
+        for patcher in (
+            patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]),
+            patch("gitops_workspace._read_state_text", lambda key: "acme/gitops"),
+            patch("gitops_workspace.get_context_github_repo_entries", return_value=[]),
+            patch.dict(sys.modules, {"github_token_refresh": no_remote}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # The real in-flight claim: the recorded mode is trusted only for the
+        # run now in flight (`run_is_shadow`).
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        # The declared-intent search reads each owed repository completely, so
+        # a run's delta isn't held over a search gap the stub clone would leave.
+        self.patch_attr(
+            "discover_declarations",
+            lambda audit_id, repo, root, entries: ([], [f"{entry['repo']}@0123abc" for entry in entries], []),
+        )
+        for name in ("open_chat_report", "append_chat_report", "save_chat_verdict"):
+            stub = mock.MagicMock(name=name)
+            self.patch_attr(name, stub)
+            setattr(self, name, stub)
+        self.env = {audit_report.SHADOW_TASK_ENV: "true"}
+        patcher = patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(audit_report.SHADOW_TRIGGER_STREAM_ENV, None)
+
+    def only_search_clones(self):
+        """Every recorded call that isn't the declared-intent search's read-only clone."""
+        return [
+            call for call in self.recorder.calls
+            if not (any(str(arg).endswith("inspect_repository.py") for arg in call) and "clone" in call)
+        ]
+
+    def shadow_store(self, stream=None, repo="acme/gitops"):
+        # Under the install's own key, which the broker requires of a profile's write.
+        return Path(audit_report.reports_dir_for(stream or AUDIT + audit_report.SHADOW_STREAM_SUFFIX, repo))
+
+    def start(self, *extra):
+        code = self.run_main(["start", "--audit", AUDIT, *extra])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def finish(self, doc, scheduled=True, extra=(audit_report.STORE_ONLY_FLAG,)):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, *extra]
+            + (["--scheduled"] if scheduled else [])
+        )
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def test_it_writes_the_shadow_stream_alone_and_asks_nothing_of_forge_or_chat(self):
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+        self.assertEqual(out[audit_report.SHADOW_STREAM_KEY], AUDIT + audit_report.SHADOW_STREAM_SUFFIX)
+        latest = json.loads((self.shadow_store() / "latest.json").read_text())
+        self.assertTrue(latest[audit_report.SHADOW_KEY])
+        self.assertEqual(latest["audit_id"], AUDIT)
+        self.assertIn("summary", out)
+        self.assertEqual(latest[audit_report.SHADOW_SUMMARY_KEY].splitlines()[0], out["summary"].splitlines()[0])
+        # The live stream is untouched: no store, no chat, no forge write
+        # (the declared-intent search, stubbed here, is the one read).
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.only_search_clones(), [])
+        self.open_chat_report.assert_not_called()
+        self.append_chat_report.assert_not_called()
+        self.save_chat_verdict.assert_not_called()
+
+    def test_its_delta_is_against_its_own_previous_run(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+        self.finish(doc)
+        unchanged = self.finish(doc)
+        self.assertEqual((unchanged["new"], unchanged["resolved"]), (0, 0))
+        fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
+        self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+
+    def test_the_schedule_the_runtime_names_is_the_stream(self):
+        with patch.dict(os.environ, {audit_report.SHADOW_TRIGGER_STREAM_ENV: "compliance-audit-canary"}):
+            out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertEqual(out[audit_report.SHADOW_STREAM_KEY], "compliance-audit-canary")
+        self.assertTrue((self.shadow_store("compliance-audit-canary") / "latest.json").exists())
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_a_schedule_name_that_is_a_live_stream_or_ill_formed_is_refused(self):
+        for bad in (AUDIT, "Not_A_Label"):
+            with self.subTest(bad=bad), patch.dict(os.environ, {audit_report.SHADOW_TRIGGER_STREAM_ENV: bad}):
+                code = self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG])
+                self.assertNotEqual(code, 0)
+                self.assertIn(audit_report.SHADOW_TRIGGER_STREAM_ENV, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_the_runtime_and_the_flag_must_agree(self):
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        # A shadow task that leaves the flag out is refused, on start and finish.
+        self.assertNotEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        # A live task that passes it is refused.
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "false"}):
+            self.assertNotEqual(self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG]), 0)
+        # The flag with --dry-run is refused.
+        self.assertNotEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run", audit_report.STORE_ONLY_FLAG]),
+            0,
+        )
+        # --repo means nothing to a shadow run.
+        self.assertNotEqual(self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG, "--repo", "acme/gitops"]), 0)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_a_dry_run_preview_passes_in_a_shadow_task(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run"]), 0, self.err)
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_with_no_repository_registered_it_writes_under_no_forge(self):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch(
+            "gitops_workspace._read_state_text", lambda key: ""
+        ):
+            self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue((self.shadow_store(repo=audit_report.NO_FORGE_REPO) / "latest.json").exists())
+
+    def test_a_run_started_as_a_shadow_run_ends_as_one_with_no_runtime_word(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        # `finish` without the flag would publish live: refused.
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        # And from `_finish` directly, as precheck's close calls it.
+        close = argparse.Namespace(audit=AUDIT, findings_file=path, repo=None, dry_run=False, scheduled=True)
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report._finish(close, AUDIT)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_a_live_record_doesnt_refuse_a_store_only_finish(self):
+        # Store-only writes nothing live, so a live run's record doesn't refuse it.
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.record_run(audit=AUDIT)
+        self.assertFalse(audit_report.run_is_shadow(AUDIT))
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+
+    def test_the_runtime_word_fails_closed(self):
+        for value, want in (("true", True), ("1", True), ("yes", True), ("TRUE", True), ("false", False), ("0", False), ("", None)):
+            with self.subTest(value=value), patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: value}):
+                self.assertIs(audit_report.task_is_shadow(), want)
+
+    def test_a_shadow_runs_record_still_blocks_a_live_publish_after_its_note_is_gone(self):
+        # A shadow finish that died released its in-flight note; the retry
+        # without the flag must not publish live. Only a new `start` replaces the record.
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        audit_report.release_in_flight(AUDIT)
+        self.assertTrue(audit_report.run_is_shadow(AUDIT))
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_remediate_refuses_in_a_run_started_as_a_shadow_run(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        code = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", "x"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("shadow run", self.err)
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_a_shadow_start_doesnt_honour_a_pin_on_the_gitops_repository(self):
+        # As a live run reads the GitOps repository at its default branch,
+        # whatever `ref` a context entry naming it carries, so does a shadow
+        # run, under any spelling of the entry.
+        for pinned in ({"repo": "ACME/GitOps", "ref": "curated", audit_report.REFUSED_REF_KEY: None},
+                       {"repo": "acme/gitops", "ref": None, audit_report.REFUSED_REF_KEY: "bad ref"}):
+            with self.subTest(pinned=pinned):
+                seen = []
+
+                def capture(audit_id, repo, root, entries):
+                    seen.append(list(entries))
+                    return [], [], []
+
+                with patch.object(audit_report, "context_repo_entries", return_value=[pinned]), patch.object(
+                    audit_report, "discover_declarations", side_effect=capture
+                ):
+                    self.start(audit_report.STORE_ONLY_FLAG)
+                audit_report.release_in_flight(AUDIT)  # the next subtest's start
+                gitops = [e for e in seen[-1] if e["repo"].lower() == "acme/gitops"]
+                self.assertEqual(gitops, [{"repo": "acme/gitops", "ref": None, audit_report.REFUSED_REF_KEY: None}])
+
+    def test_an_explicit_live_runtime_outranks_a_leftover_shadow_record(self):
+        # A run record a shadow run left blocks a live publish only while the
+        # runtime is silent: a task the runtime marks live is live.
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        self.assertTrue(audit_report.run_shadow(AUDIT))
+        os.environ[audit_report.SHADOW_TASK_ENV] = "false"
+        self.assertFalse(audit_report.run_shadow(AUDIT))
+        args = argparse.Namespace(store_only=False)
+        audit_report.refuse_remediate_in_shadow(args, AUDIT)  # raises nothing
+        os.environ[audit_report.SHADOW_TASK_ENV] = "true"
+        self.assertTrue(audit_report.run_shadow(AUDIT))
+
+    def test_a_shadow_starts_next_steps_finish_with_the_flag(self):
+        out = self.start(audit_report.STORE_ONLY_FLAG)
+        finish_step = out[audit_report.NEXT_STEPS_KEY][-1]
+        self.assertIn(" finish ", finish_step)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, finish_step)
+        self.assertNotIn(audit_report.STORE_ONLY_FLAG, audit_report.next_steps(AUDIT, "/tmp/f.json")[-1])
+
+    def test_an_unreadable_repository_list_fails_the_run_instead_of_writing_under_no_forge(self):
+        with patch("gitops_workspace.get_managed_repos", side_effect=RuntimeError("ConfigMap unreadable")), patch(
+            "gitops_workspace._read_state_text", side_effect=RuntimeError("ConfigMap unreadable")
+        ):
+            code = self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG])
+        self.assertNotEqual(code, 0)
+        self.assertFalse(self.shadow_store(repo=audit_report.NO_FORGE_REPO).exists())
+
+    def test_several_repositories_with_none_chosen_write_under_no_forge(self):
+        with patch.object(audit_report, "resolve_repo_or_no_forge", side_effect=audit_report.NoGitOpsRepo("several")):
+            self.assertEqual(audit_report.shadow_store_repo(AUDIT), audit_report.NO_FORGE_REPO)
+
+    def test_a_shadow_start_owes_the_gitops_repositorys_declared_intent_search(self):
+        out = self.start(audit_report.STORE_ONLY_FLAG)
+        self.assertIn("acme/gitops", out[audit_report.DECLARED_INTENT_REPOS_KEY])
+
+    def test_a_shadow_finish_reads_no_earlier_finish_from_the_live_chat_record(self):
+        with patch.object(audit_report, "earlier_finish", return_value={"news": True}) as earlier:
+            out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        earlier.assert_not_called()
+        self.assertNotIn(audit_report.REFINISH_KEY, out)
+
+    def test_a_shadow_preview_carries_wording_from_the_shadow_stream(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        with patch.object(audit_report, "previous_run_document", return_value=None) as previous:
+            self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run"]), 0, self.err)
+        previous.assert_called_once_with(AUDIT + audit_report.SHADOW_STREAM_SUFFIX, "acme/gitops")
+
+    def test_a_flag_without_the_runtime_is_a_shadow_run_started_by_hand(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+        self.assertTrue((self.shadow_store() / "latest.json").exists())
+
+    def test_remediate_refuses(self):
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        args = ["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", "x", "--dry-run"]
+        self.assertNotEqual(self.run_main(args), 0)
+        self.assertIn("shadow run", self.err)
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.assertNotEqual(self.run_main(args + [audit_report.STORE_ONLY_FLAG]), 0)
+        self.assertIn("shadow run", self.err)
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_a_store_write_that_fails_fails_the_run(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        with patch.object(audit_report, "write_report", return_value=False):
+            code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, audit_report.STORE_ONLY_FLAG])
+        self.assertNotEqual(code, 0)
+        self.assertIn("shadow run", self.err)
+
+
 class TestForgeWithoutIssuesOrLabels(HarnessTestCase):
     """A forge with proposals and no issue tracker and no labels: Bitbucket's shape.
 
@@ -36036,6 +36363,29 @@ class TestPlainChatLines(unittest.TestCase):
         self.assertEqual(
             audit_report.summary_row(finding),
             "`major` host/seeded-networking: backend-api-svc routes or health-checks a port no pod exposes",
+        )
+
+    def test_network_daemonset_missing_toleration_is_rostered_and_phrased(self):
+        self.assertIn(
+            "network-daemonset-missing-ccc-toleration",
+            audit_report.AUDITS["obtainability-audit"].checks,
+        )
+        finding = make_finding(
+            check="network-daemonset-missing-ccc-toleration",
+            severity="major",
+            cluster="proj/us-central1-a/seeded-a",
+            namespace="seeded-shapes",
+            obj="DaemonSet/cni-shaped-agent",
+        )
+        self.assertEqual(
+            audit_report.summary_row(finding),
+            "`major` seeded-a/seeded-shapes: cni-shaped-agent can't start on one or more node pools",
+        )
+        # The one obtainability check that files in a system namespace.
+        finding["namespace"], finding["object"] = "kube-system", "DaemonSet/ip-masq-agent"
+        self.assertEqual(
+            audit_report.summary_row(finding),
+            "`major` seeded-a/kube-system: ip-masq-agent can't start on one or more node pools",
         )
 
     def test_a_cluster_setting_on_an_object_names_it_in_brackets(self):
@@ -38204,6 +38554,46 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
     def searched_this_run(self):
         """The record `start` leaves on an install whose harness search read the GitOps repository."""
         audit_report.write_run_record(AUDIT, "acme/fleet", [], searched=["acme/fleet@abc123"])
+
+    def test_a_shadow_task_closes_nothing_from_the_live_stream(self):
+        # The same unchanged run as below, but the task is a shadow run: the
+        # stored document is the live stream's, so precheck closes nothing and
+        # the live store is left as the live run wrote it.
+        a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
+        body = published_body(make_doc(findings=[a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        candidate = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a", "severity": "major", "excerpt": "e"}
+        rc = self.run_finish(make_doc(findings=[a]), ["--manifest-file", self.manifest_file("day1", [candidate])])
+        self.assertEqual(rc, 0, self.err)
+        before = (self.store_dir() / "latest.json").read_text(encoding="utf-8")
+
+        self.searched_this_run()
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "true"}):
+            rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertIs(out[audit_report.PRECHECK_CLOSED_KEY], False)
+        self.assertIn(audit_report.PRECHECK_SHADOW_REASON, out[audit_report.PRECHECK_REASON_KEY])
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), before)
+
+    def test_finish_refuses_a_live_publish_in_a_shadow_task_from_any_caller(self):
+        # The gate is in `_finish`, which precheck's close calls directly.
+        close = argparse.Namespace(audit=AUDIT, findings_file="unused.json", repo=None, dry_run=False, scheduled=True)
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "true"}):
+            with self.assertRaises(audit_report.ValidationError) as raised:
+                audit_report._finish(close, AUDIT)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, str(raised.exception))
 
     def test_an_unchanged_scheduled_run_closes_with_the_ledger_untouched(self):
         a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)

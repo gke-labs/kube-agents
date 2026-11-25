@@ -24,13 +24,10 @@ const (
 	ruleDelegationBusy          = "delegation.busy"
 	ruleDelegationDepth         = "delegation.depth"
 	ruleDelegationWidth         = "delegation.width"
-	// ruleDelegationProfileBatch ignores a batch from a profile task, which
-	// waits open for one child result and has no way yet to take several.
-	ruleDelegationProfileBatch = "delegation.profile-batch"
-	ruleDelegationNoRequester  = "delegation.no-requester"
-	ruleDelegationStale        = "delegation.stale"
-	ruleDelegationMalformed    = "delegation.malformed"
-	ruleDelegationDoorUnlisted = "delegation.door-unlisted"
+	ruleDelegationNoRequester   = "delegation.no-requester"
+	ruleDelegationStale         = "delegation.stale"
+	ruleDelegationMalformed     = "delegation.malformed"
+	ruleDelegationDoorUnlisted  = "delegation.door-unlisted"
 	// ruleDelegationChildSteer refuses a steer into a delegated child from
 	// an author the target's list refuses (gke-labs#2531 item 5).
 	ruleDelegationChildSteer = "delegation.child-steer"
@@ -48,9 +45,10 @@ const (
 	// ruleDelegationParentChainMismatch refuses when an ancestor the record
 	// still holds contradicts the parent's carried chain.
 	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
-	// ruleDelegationUnattendedParent refuses a child of an unattended task:
-	// the child's grant would not carry the parent's trigger binding.
-	ruleDelegationUnattendedParent = "delegation.unattended-parent"
+	// ruleDelegationUnattendedChild refuses a scheduled run's child whose
+	// profile's card doesn't list the unattended tier: its owner hasn't
+	// agreed to runs nobody is watching, even read-only ones (#6744).
+	ruleDelegationUnattendedChild = "delegation.unattended-child"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root
@@ -75,7 +73,6 @@ const (
 	whyRequestMalformed = "the request was malformed"
 	whyNoChild          = "the request minted no child"
 	whyRequestUnread    = "the delegate request could not be read from the stream"
-	whyProfileBatch     = "a profile task can't hand out a batch yet"
 	// whyBatchPlanUnwritten: the batch's plan could not be written to the
 	// record before its first child, so none was minted (mintBatch).
 	whyBatchPlanUnwritten = "the batch could not be recorded before its tasks were started"
@@ -208,6 +205,17 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// children already on the bus, so a batch is whole or not run. minting
 	// is set once the request reaches mintBatch, which then finishes the
 	// batch or withdraws it itself.
+	// A profile parent stays open after its request, so it can ask again
+	// after one that ended with no batch on the bus (refused, or withdrawn
+	// with nothing kept). That request is its one, too: minting it would
+	// send none of its ends, since the parent's mark (DelegationEnd) holds
+	// them back (profileBatchChildEnded), and a batch minted beside one a
+	// withdrawal kept would mix with it. The worker makes one delegate call
+	// per task, so nothing waits on a repeat.
+	if profileParent && parent.DelegationEnd != "" {
+		ignore(ruleDelegationBusy, "delegationEnd", parent.DelegationEnd)
+		return
+	}
 	resuming, minting := false, false
 	if len(parent.Children) > 0 {
 		if parent.batchComplete() || parent.DelegationEnd != "" {
@@ -235,13 +243,6 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	if rec.ActiveTask.Detached || parent.Canceled {
 		ignore(ruleDelegationStale, "stopped", true)
 		noChild(notStartedEnd(whyTurnStopped))
-		return
-	}
-	// A profile task waits open for its child's result, and nothing yet
-	// lets it take several, so a batch from one is not served.
-	if parsed && req.IsBatch() && profileParent {
-		ignore(ruleDelegationProfileBatch, "tasks", len(req.Tasks))
-		noChild(notStartedEnd(whyProfileBatch))
 		return
 	}
 	// A batch wider than this gateway's setting is refused whole, naming
@@ -296,8 +297,9 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// platform.
 	check := func(e lib.DelegateTask) (*profileRoute, bool) {
 		// Anything but platform is an AgentProfile: resolved, its target checked
-		// against the scope, and minted at the parent's tier, which for a
-		// session parent is its requester's (profileRouteFor).
+		// against the scope, and minted at the parent's tier (read when the
+		// parent is unattended, #6744), which for a session parent is its
+		// requester's (profileRouteFor).
 		var route *profileRoute
 		var err error
 		addressee := strings.TrimSpace(e.Addressee)
@@ -314,6 +316,14 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		}
 		if addressee != targetPlatform {
 			tier := capability.Tier(parent.Tier)
+			if profileParent && tier == capability.TierUnattended {
+				// A child of an unattended task (#6744) is minted at the read
+				// tier, as a fresh root on the parent's scope (the chain checks
+				// below hold it there), and carries no trigger: an unattended
+				// grant is bound to its trigger, and only the parent writes
+				// under it. A child can read for its parent, never write.
+				tier = capability.TierRead
+			}
 			if !profileParent {
 				authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
 				if tier, err = g.tierFor(authors, unknown); err != nil {
@@ -324,6 +334,28 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			if route, err = g.profileRouteFor(addressee, e.Parameters, tier, lib.SubmitKindChild); err != nil {
 				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
 				return nil, false
+			}
+			if profileParent && parent.belowSchedule() {
+				// The child runs at read, but for a schedule, with nobody
+				// watching: only a profile whose card lists unattended takes
+				// it, as only such a profile takes the trigger itself. So
+				// does a grandchild: the mark rides the chain.
+				if card, ok := g.profiles.lookup(route.Profile); !ok || !cardAllowsTier(card, capability.TierUnattended) {
+					refuse(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+fmt.Sprintf(noticeUnattendedChild, route.Profile), "child", route.Profile)
+					return nil, false
+				}
+				// And a profile pinned to the child's target must list it
+				// too, as a trigger submitted there directly is held to
+				// (profileRouteFor's checkPinnedTiers at unattended).
+				// resolveProfile already succeeded for this address above.
+				_, target, rerr := resolveProfile(g.profiles, addressee, e.Parameters)
+				if rerr == nil {
+					rerr = g.checkPinnedTiers(route.Profile, target, capability.TierUnattended)
+				}
+				if rerr != nil {
+					refuse(ruleDelegationUnattendedChild, refusalNotice(noticeDelegationRefusedFor, rerr), "child", route.Profile)
+					return nil, false
+				}
 			}
 			if profileParent {
 				if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {
@@ -398,7 +430,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	if len(routes) > 1 {
 		minting = true
-		g.mintBatch(ctx, rec, taskID, parent, req.Tasks, routes, authority, noChild, log)
+		g.mintBatch(ctx, rec, taskID, parent, profileParent, req.Tasks, routes, authority, noChild, log)
 		return
 	}
 	route := routes[0]
@@ -429,6 +461,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		LineNote:             lineNote,
 		Route:                route,
 		ProfileChain:         childProfileChain(parent, profileParent),
+		Scheduled:            profileParent && parent.belowSchedule(),
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),
@@ -475,7 +508,7 @@ const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delega
 // a cancel and dropped, and the parent records that its request minted no
 // child, so the record is as it was before the request. A child whose cancel
 // couldn't be published stays on the record, canceled, linked and indexed.
-func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, tasks []lib.DelegateTask,
+func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, profileParent bool, tasks []lib.DelegateTask,
 	routes []*profileRoute, authority Authority, noChild func(string), log *slog.Logger) {
 	correlationID := rec.ActiveTask.CorrelationID
 	// The plan goes on the parent before any child is published, in its own
@@ -513,29 +546,41 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			addressee, lineNote = routes[i].Profile, fmt.Sprintf(delegatedProfileLineNote, routes[i].Profile)
 		}
 		childID, ok := g.startTaskWith(ctx, rec, taskStart{
-			Text:                 e.Text,
-			Requester:            *parent.Requester,
-			Authority:            authority,
-			CorrelationID:        correlationID,
-			Role:                 taskRoleChild,
-			ParentTaskID:         taskID,
-			Depth:                parent.Depth + 1,
-			LineNote:             lineNote,
-			Route:                routes[i],
+			Text:          e.Text,
+			Requester:     *parent.Requester,
+			Authority:     authority,
+			CorrelationID: correlationID,
+			Role:          taskRoleChild,
+			ParentTaskID:  taskID,
+			Depth:         parent.Depth + 1,
+			LineNote:      lineNote,
+			Route:         routes[i],
+			ProfileChain:  childProfileChain(parent, profileParent),
+			// Below a scheduled run, as a single child is: the mark is what
+			// holds this child's own delegation to the unattended card check.
+			Scheduled:            profileParent && parent.belowSchedule(),
 			SteerAuthors:         parent.SteerAuthors,
 			SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 			RootTaskID:           parent.rootID(),
-			LinkParent:           true,
-			Addressee:            addressee,
-			KeepActive:           true,
-			BatchIndex:           i + 1,
-			Target:               batchTarget(batchParams(e, routes[i])),
+			// The parent's entry, as for a single child: a child can't
+			// raise it.
+			ChangeRequested: parent.ChangeRequested,
+			LinkParent:      true,
+			Addressee:       addressee,
+			KeepActive:      true,
+			BatchIndex:      i + 1,
+			Target:          batchTarget(batchParams(e, routes[i])),
 		})
 		if !ok {
 			// The parent records that its request ran nothing, whether or
 			// not a child whose cancel failed stays on the record: a
 			// withdrawn batch wakes nothing (batchChildEnded).
+			// The entries' ends go out before noChild writes the record,
+			// which marks the batch withdrawn: after that write nothing
+			// would send them.
+			ended := rec.endedBatchEntries(taskID)
 			g.withdrawBatch(ctx, rec, taskID, minted, authority)
+			g.endWithdrawnProfileBatch(ctx, rec, taskID, len(tasks), whyChildOffBus, ended)
 			noChild(notStartedEnd(whyChildOffBus))
 			log.Warn("delegation batch withdrawn: a child could not be started", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
 			return
@@ -637,8 +682,10 @@ func (g *Gateway) withdrawCutShortBatch(ctx context.Context, rec *SessionRecord,
 	if authority.Via == nil {
 		authority.Via = &AuthorityVia{TaskID: taskID, Session: parent.Addressee}
 	}
+	ended := rec.endedBatchEntries(taskID)
 	kept := g.withdrawBatch(ctx, rec, taskID, parent.Children, authority)
 	rec.markDelegationEnd(taskID, notStartedEnd(whyBatchCutShort))
+	g.endWithdrawnProfileBatch(ctx, rec, taskID, parent.BatchSize, whyBatchCutShort, ended)
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed after a cut-short batch was withdrawn", "conversation", rec.Key, "err", err)
 	}
@@ -928,7 +975,7 @@ func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
 // a wake used to loop to the depth bound with nothing answered.
 const (
 	wakeReplyGuide     = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
-	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it, in the format their question asked for if it gave one. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
 )
 
 // wakeReplyGuideMax is the longer of the two guides, which the result

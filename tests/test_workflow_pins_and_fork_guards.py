@@ -84,6 +84,14 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 WORKFLOW_GLOBS = ("*.yml", "*.yaml")
+# The CodeQL analysis job and the condition it has to keep: it runs for every
+# event but a pull request run that GitHub resolved to the base branch.
+CODEQL_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "codeql.yml"
+CODEQL_ANALYZE_JOB = "analyze"
+CODEQL_ANALYZE_CONDITION = (
+    "github.repository == 'gke-labs/kube-agents' && "
+    "(github.event_name != 'pull_request' || startsWith(github.ref, 'refs/pull/'))"
+)
 
 _REPO = "gke-labs/kube-agents"
 _GUARD = f"github.repository == '{_REPO}'"
@@ -1266,6 +1274,16 @@ class RealTreeTests(unittest.TestCase):
 
     def test_buildkitd_config_mirrors_docker_hub(self) -> None:
         self.assertEqual(check_buildkitd_config(_BUILDKITD_CONFIG_FILE), [])
+
+
+
+class CodeQLAnalyzeConditionTest(unittest.TestCase):
+    def test_the_analysis_job_keeps_its_condition(self) -> None:
+        # Without its first operand the second clause skips every push and
+        # schedule run, and a skipped job is not red: scanning of main would
+        # stop with nothing to show it.
+        job = yaml.safe_load(CODEQL_WORKFLOW.read_text())["jobs"][CODEQL_ANALYZE_JOB]
+        self.assertEqual(" ".join(job["if"].split()), CODEQL_ANALYZE_CONDITION)
 
 
 if __name__ == "__main__":

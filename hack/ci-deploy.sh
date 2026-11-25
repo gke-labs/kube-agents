@@ -404,6 +404,10 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 readonly PROFILES_NAMESPACE_SUFFIX="-profiles"
 readonly NAMESPACE_DELETION_JSONPATH='{.metadata.deletionTimestamp}'
 readonly PROFILES_NAMESPACE_DELETE_TIMEOUT="120s"
+# What the guard prints when that wait fails: each condition of the namespace
+# on a line. They name the kinds of objects that remain, with a count, and the
+# finalizers that hold it.
+readonly NAMESPACE_CONDITIONS_JSONPATH='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
 # The NATS StatefulSet the operator renders, and the claims its
 # volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
 # (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
@@ -746,6 +750,7 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
+readonly A2A_TEAMS_INBOUND_IMAGE_ENV_VAR="A2A_TEAMS_INBOUND_IMAGE"
 readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
@@ -762,6 +767,7 @@ readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
+readonly A2A_TEAMS_INBOUND_IMAGE_NAME="a2a-teams-inbound"
 readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
 # The cluster AgentProfile's persona image (a2a/Dockerfile.persona-cluster,
 # context agents/cluster/persona), built beside the A2A images so the lane runs
@@ -770,6 +776,9 @@ readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
 # The tse AgentProfile's persona image (a2a/Dockerfile.persona-tse, context
 # agents/tse/persona), built the same way (#3842).
 readonly PERSONA_TSE_IMAGE_NAME="persona-tse"
+# The fleet-audit AgentProfile's persona image (a2a/Dockerfile.persona-fleet-audit,
+# context agents/fleet-audit/persona), built the same way (#5623).
+readonly PERSONA_FLEET_AUDIT_IMAGE_NAME="persona-fleet-audit"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -814,6 +823,13 @@ readonly BUILD_FAILED_STATUSES="FAILURE INTERNAL_ERROR TIMEOUT CANCELLED EXPIRED
 # What a build id looks like (a UUID), so a submit whose stdout is not one is
 # refused before it is polled.
 readonly BUILD_ID_RE='^[0-9a-fA-F-]+$'
+# A build that ended failed on BuildKit's "flightcontrol: exceeded retry
+# timeout" is a Cloud Build builder flake, not the source: the same commit
+# builds on a second submit (#3911). That fixed string, and only it, earns one
+# resubmit; .github/scripts/cloud_build_submit.sh does the same for main's
+# publish and says why. Submits allowed in total: the first, plus one retry.
+readonly BUILD_FLIGHTCONTROL_ERROR="flightcontrol: exceeded retry timeout"
+readonly BUILD_MAX_ATTEMPTS=2
 
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 # Required on every provider: the judge reads it (JUDGE_API_KEY in
@@ -1712,9 +1728,11 @@ fi
 # session run sizes its session cap: fair (the default) gives it one session
 # per parallel conversation plus FRONT_DOOR_SESSION_HEADROOM, so the cap's
 # eviction (the gateway evicts the longest-idle pod at the cap, or refuses;
-# nothing queues) doesn't land on a multi-turn case between its turns; shipped
-# leaves the cap at the install default, what a customer install gets, and an
-# eviction or refusal there is a finding about that default.
+# with the session-cap queue (#6882), a turn waits in line instead, for up to
+# five minutes, before the refusal) doesn't land on a multi-turn case between
+# its turns; shipped leaves the cap at the install default, what a customer
+# install gets, and an eviction, a wait or a refusal there is a finding about
+# that default.
 EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
@@ -1960,11 +1978,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying ${DEPLOY_SOURCE} to Names
 # ─── 3. Cluster Auth ──────────────────────────────────────────────────────────
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG
+get_cluster_credentials "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
@@ -1996,10 +2010,12 @@ A2A_CALLOUT_URI="${A2A_IMAGE_PREFIX}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
 A2A_WORKER_URI="${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
 A2A_VERIFIER_URI="${A2A_IMAGE_PREFIX}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
 A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
+A2A_TEAMS_INBOUND_URI="${A2A_IMAGE_PREFIX}/${A2A_TEAMS_INBOUND_IMAGE_NAME}:${TAG}"
 A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
 A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
 PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
 PERSONA_TSE_URI="${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}:${TAG}"
+PERSONA_FLEET_AUDIT_URI="${A2A_IMAGE_PREFIX}/${PERSONA_FLEET_AUDIT_IMAGE_NAME}:${TAG}"
 A2A_OPERATOR_ENV_ARGS=(
   --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
   --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -2047,12 +2063,20 @@ A2A_OPERATOR_ENV_ARGS=(
   --set-string "profiles.tse.persona.image.tag=${TAG}"
   --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
   --set-string "profiles.tse.harness.image.tag=${TAG}"
+  --set-string "profiles.fleetAudit.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_FLEET_AUDIT_IMAGE_NAME}"
+  --set-string "profiles.fleetAudit.persona.image.tag=${TAG}"
+  --set-string "profiles.fleetAudit.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+  --set-string "profiles.fleetAudit.harness.image.tag=${TAG}"
   # The A2A door, for the card-wait stopped ask (above).
   --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
   --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
   # The bus's debug logging, for #5708 (above).
   --set-string "operator.extraEnv[12].name=${A2A_NATS_DEBUG_ENV_VAR}"
   --set-string "operator.extraEnv[12].value=${A2A_NATS_DEBUG_ON}"
+  # The Teams inbound receiver's image, from this build, so an eval that
+  # enables spec.integration.teams.inbound pulls the candidate (#1034).
+  --set-string "operator.extraEnv[13].name=${A2A_TEAMS_INBOUND_IMAGE_ENV_VAR}"
+  --set-string "operator.extraEnv[13].value=${A2A_TEAMS_INBOUND_URI}"
 )
 
 # Skipped whole on the release-candidate path: the candidate's images are what
@@ -2062,11 +2086,11 @@ A2A_OPERATOR_ENV_ARGS=(
 # a rebuild would not be grading the thing the release ships.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
-  echo "the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+  echo "the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster, tse and fleet-audit personas and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
 else
   STEP_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, sandbox, operator) ==="
-  # One submit, not four. The two agent images share the agent-base chain, so
+  # One build, not four. The two agent images share the agent-base chain, so
   # building them as consecutive steps on one worker lets the second reuse the
   # first's layers instead of rebuilding that chain on a cold daemon; the sandbox
   # and operator builds run alongside them. See the header of cloudbuild-ci.yaml,
@@ -2089,8 +2113,8 @@ else
   # The web console, built on every lane for the same reason: the deploy
   # installs it on every lane, at the reference section 2a gave the chart.
   WEB_CONSOLE_BUILD_SUBSTITUTIONS=",_WEB_CONSOLE_URI=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}:${TAG}"
-  A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI}"
-  echo "also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar"
+  A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_TEAMS_INBOUND_URI=${A2A_TEAMS_INBOUND_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI},_PERSONA_FLEET_AUDIT_URI=${PERSONA_FLEET_AUDIT_URI}"
+  echo "also building the A2A gateway, auth callout, worker, verifier, dispatcher, console and Teams inbound receiver images, the cluster, tse and fleet-audit personas and the Hermes bridge sidecar"
   REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
   if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
     REPLAY_SHADOW_BUILD_SUBSTITUTIONS=",_REPLAY_SHADOW_PROXY_URI=${REPLAY_SHADOW_PROXY_URI}"
@@ -2112,72 +2136,99 @@ else
       "$@"
     fi
   }
-  CLOUD_BUILD_ID=""
-  CLOUD_BUILD_LOG_URL=""
-  CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS}${WEB_CONSOLE_BUILD_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
-    --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
-    echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
-    exit 1
-  }
-  IFS=$'\t' read -r CLOUD_BUILD_ID CLOUD_BUILD_LOG_URL <<<"${CLOUD_BUILD_SUBMIT_OUT}"
-  if ! [[ "${CLOUD_BUILD_ID}" =~ ${BUILD_ID_RE} ]]; then
-    echo "ERROR: gcloud builds submit printed no build id: ${CLOUD_BUILD_SUBMIT_OUT}" >&2
-    exit 1
-  fi
-  echo "Cloud Build ${CLOUD_BUILD_ID} submitted: ${CLOUD_BUILD_LOG_URL:-no log URL returned}"
-  echo "Polling its status every ${BUILD_POLL_INTERVAL_SECONDS}s, for at most ${BUILD_WAIT_CAP_SECONDS}s"
-  CLOUD_BUILD_DEADLINE=$((SECONDS + BUILD_WAIT_CAP_SECONDS))
-  CLOUD_BUILD_STATUS=""
-  CLOUD_BUILD_OUTCOME=""
-  CLOUD_BUILD_DESCRIBE_ERR="$(mktemp)"
-  CLOUD_BUILD_DESCRIBE_ERRORS=0
+  # A retry gets its own BUILD_WAIT_CAP_SECONDS: the cap bounds one build
+  # (cloudbuild-ci.yaml's timeout plus queueing), and a shared one could cut off
+  # a healthy resubmit of a build that failed late. The job's own timeout still
+  # bounds the pair.
+  CLOUD_BUILD_ATTEMPT=1
   while :; do
-    if CLOUD_BUILD_STATUS="$(with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds describe "${CLOUD_BUILD_ID}" \
-      --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} --format="value(status)" 2>"${CLOUD_BUILD_DESCRIBE_ERR}")"; then
-      CLOUD_BUILD_DESCRIBE_ERRORS=0
-    else
-      CLOUD_BUILD_DESCRIBE_RC=$?
-      CLOUD_BUILD_DESCRIBE_ERRORS=$((CLOUD_BUILD_DESCRIBE_ERRORS + 1))
-      echo "WARNING: gcloud builds describe ${CLOUD_BUILD_ID} exited ${CLOUD_BUILD_DESCRIBE_RC} ($(tr '\n' ' ' <"${CLOUD_BUILD_DESCRIBE_ERR}")); polling again (${CLOUD_BUILD_DESCRIBE_ERRORS}/${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS} in a row)"
-      CLOUD_BUILD_STATUS=""
-      if [ "${CLOUD_BUILD_DESCRIBE_ERRORS}" -ge "${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS}" ]; then
-        CLOUD_BUILD_OUTCOME="could not be described ${CLOUD_BUILD_DESCRIBE_ERRORS} times in a row"
+    CLOUD_BUILD_ID=""
+    CLOUD_BUILD_LOG_URL=""
+    CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
+      --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS}${WEB_CONSOLE_BUILD_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
+      --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
+      echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
+      exit 1
+    }
+    IFS=$'\t' read -r CLOUD_BUILD_ID CLOUD_BUILD_LOG_URL <<<"${CLOUD_BUILD_SUBMIT_OUT}"
+    if ! [[ "${CLOUD_BUILD_ID}" =~ ${BUILD_ID_RE} ]]; then
+      echo "ERROR: gcloud builds submit printed no build id: ${CLOUD_BUILD_SUBMIT_OUT}" >&2
+      exit 1
+    fi
+    echo "Cloud Build ${CLOUD_BUILD_ID} submitted: ${CLOUD_BUILD_LOG_URL:-no log URL returned}"
+    echo "Polling its status every ${BUILD_POLL_INTERVAL_SECONDS}s, for at most ${BUILD_WAIT_CAP_SECONDS}s"
+    CLOUD_BUILD_DEADLINE=$((SECONDS + BUILD_WAIT_CAP_SECONDS))
+    CLOUD_BUILD_STATUS=""
+    CLOUD_BUILD_OUTCOME=""
+    CLOUD_BUILD_DESCRIBE_ERR="$(mktemp)"
+    CLOUD_BUILD_DESCRIBE_ERRORS=0
+    while :; do
+      if CLOUD_BUILD_STATUS="$(with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds describe "${CLOUD_BUILD_ID}" \
+        --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} --format="value(status)" 2>"${CLOUD_BUILD_DESCRIBE_ERR}")"; then
+        CLOUD_BUILD_DESCRIBE_ERRORS=0
+      else
+        CLOUD_BUILD_DESCRIBE_RC=$?
+        CLOUD_BUILD_DESCRIBE_ERRORS=$((CLOUD_BUILD_DESCRIBE_ERRORS + 1))
+        echo "WARNING: gcloud builds describe ${CLOUD_BUILD_ID} exited ${CLOUD_BUILD_DESCRIBE_RC} ($(tr '\n' ' ' <"${CLOUD_BUILD_DESCRIBE_ERR}")); polling again (${CLOUD_BUILD_DESCRIBE_ERRORS}/${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS} in a row)"
+        CLOUD_BUILD_STATUS=""
+        if [ "${CLOUD_BUILD_DESCRIBE_ERRORS}" -ge "${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS}" ]; then
+          CLOUD_BUILD_OUTCOME="could not be described ${CLOUD_BUILD_DESCRIBE_ERRORS} times in a row"
+          break
+        fi
+      fi
+      if [ "${CLOUD_BUILD_STATUS}" = "${BUILD_SUCCESS_STATUS}" ]; then
+        CLOUD_BUILD_OUTCOME="${BUILD_SUCCESS_STATUS}"
         break
       fi
+      case " ${BUILD_FAILED_STATUSES} " in
+        *" ${CLOUD_BUILD_STATUS} "*)
+          CLOUD_BUILD_OUTCOME="ended ${CLOUD_BUILD_STATUS}"
+          break ;;
+      esac
+      if [ "${SECONDS}" -ge "${CLOUD_BUILD_DEADLINE}" ]; then
+        CLOUD_BUILD_OUTCOME="did not reach a terminal state within the ${BUILD_WAIT_CAP_SECONDS}s cap (last status: ${CLOUD_BUILD_STATUS:-unknown})"
+        break
+      fi
+      sleep "${BUILD_POLL_INTERVAL_SECONDS}"
+    done
+    rm -f "${CLOUD_BUILD_DESCRIBE_ERR}"
+    if [ "${CLOUD_BUILD_OUTCOME}" != "${BUILD_SUCCESS_STATUS}" ]; then
+      echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} ${CLOUD_BUILD_OUTCOME}; its log follows (${CLOUD_BUILD_LOG_URL:-no log URL})" >&2
+      # A build this loop gave up on (the cap, or describe failing) may still be
+      # running; cancel it so it stops pushing into a project this run is about
+      # to hand back. A build that ended on its own needs nothing.
+      case "${CLOUD_BUILD_OUTCOME}" in
+        ended\ *) ;;
+        *) with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds cancel "${CLOUD_BUILD_ID}" \
+             --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} >/dev/null \
+             || echo "WARNING: gcloud builds cancel ${CLOUD_BUILD_ID} exited $?; it runs until its own timeout" >&2 ;;
+      esac
+      # Kept as well as printed, for the flightcontrol check below.
+      CLOUD_BUILD_LOG="$(mktemp)"
+      with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds log "${CLOUD_BUILD_ID}" \
+        --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} | tee "${CLOUD_BUILD_LOG}" \
+        || echo "WARNING: gcloud builds log ${CLOUD_BUILD_ID} exited $?; read it at ${CLOUD_BUILD_LOG_URL:-the Cloud Build console}" >&2
+      # Only a build that ended FAILURE is resubmitted. One the loop gave up on
+      # (the cap, or describe failing) is not a flightcontrol flake, and one
+      # that timed out, was cancelled or expired ended for another reason even
+      # when the line is in its log.
+      case "${CLOUD_BUILD_OUTCOME}" in
+        "ended FAILURE")
+          if [ "${CLOUD_BUILD_ATTEMPT}" -lt "${BUILD_MAX_ATTEMPTS}" ] && grep -qF "${BUILD_FLIGHTCONTROL_ERROR}" "${CLOUD_BUILD_LOG}"; then
+            echo "WARNING: Cloud Build ${CLOUD_BUILD_ID} died on '${BUILD_FLIGHTCONTROL_ERROR}', a builder flake (#3911) (attempt ${CLOUD_BUILD_ATTEMPT} of ${BUILD_MAX_ATTEMPTS}); submitting it again" >&2
+            rm -f "${CLOUD_BUILD_LOG}"
+            CLOUD_BUILD_ATTEMPT=$((CLOUD_BUILD_ATTEMPT + 1))
+            continue
+          fi
+          if [ "${CLOUD_BUILD_ATTEMPT}" -ge "${BUILD_MAX_ATTEMPTS}" ] && grep -qF "${BUILD_FLIGHTCONTROL_ERROR}" "${CLOUD_BUILD_LOG}"; then
+            echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} died on '${BUILD_FLIGHTCONTROL_ERROR}' again, on the one resubmit it gets (#3911)" >&2
+          fi ;;
+      esac
+      rm -f "${CLOUD_BUILD_LOG}"
+      exit 1
     fi
-    if [ "${CLOUD_BUILD_STATUS}" = "${BUILD_SUCCESS_STATUS}" ]; then
-      CLOUD_BUILD_OUTCOME="${BUILD_SUCCESS_STATUS}"
-      break
-    fi
-    case " ${BUILD_FAILED_STATUSES} " in
-      *" ${CLOUD_BUILD_STATUS} "*)
-        CLOUD_BUILD_OUTCOME="ended ${CLOUD_BUILD_STATUS}"
-        break ;;
-    esac
-    if [ "${SECONDS}" -ge "${CLOUD_BUILD_DEADLINE}" ]; then
-      CLOUD_BUILD_OUTCOME="did not reach a terminal state within the ${BUILD_WAIT_CAP_SECONDS}s cap (last status: ${CLOUD_BUILD_STATUS:-unknown})"
-      break
-    fi
-    sleep "${BUILD_POLL_INTERVAL_SECONDS}"
+    break
   done
-  rm -f "${CLOUD_BUILD_DESCRIBE_ERR}"
-  if [ "${CLOUD_BUILD_OUTCOME}" != "${BUILD_SUCCESS_STATUS}" ]; then
-    echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} ${CLOUD_BUILD_OUTCOME}; its log follows (${CLOUD_BUILD_LOG_URL:-no log URL})" >&2
-    # A build this loop gave up on (the cap, or describe failing) may still be
-    # running; cancel it so it stops pushing into a project this run is about
-    # to hand back. A build that ended on its own needs nothing.
-    case "${CLOUD_BUILD_OUTCOME}" in
-      ended\ *) ;;
-      *) with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds cancel "${CLOUD_BUILD_ID}" \
-           --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} >/dev/null \
-           || echo "WARNING: gcloud builds cancel ${CLOUD_BUILD_ID} exited $?; it runs until its own timeout" >&2 ;;
-    esac
-    with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds log "${CLOUD_BUILD_ID}" \
-      --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} \
-      || echo "WARNING: gcloud builds log ${CLOUD_BUILD_ID} exited $?; read it at ${CLOUD_BUILD_LOG_URL:-the Cloud Build console}" >&2
-    exit 1
-  fi
   echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 fi
 
@@ -2422,6 +2473,9 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     echo "The profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} is Terminating (since ${PROFILES_NAMESPACE_DELETING}); waiting up to ${PROFILES_NAMESPACE_DELETE_TIMEOUT} for it to go before install attempt ${attempt}."
     if ! kubectl wait --for=delete "namespace/${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --timeout="${PROFILES_NAMESPACE_DELETE_TIMEOUT}"; then
       echo "ERROR: the wait for the profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} to go failed (limit ${PROFILES_NAMESPACE_DELETE_TIMEOUT}; kubectl's line is above); install attempt ${attempt} would fail on it (#6602)." >&2
+      echo "The namespace's conditions:" >&2
+      kubectl get namespace "${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --ignore-not-found \
+        -o jsonpath="${NAMESPACE_CONDITIONS_JSONPATH}" >&2 || true
       rm -f "${HELM_INSTALL_OUT}"
       exit 1
     fi
@@ -3222,6 +3276,50 @@ echo "Front door: ${EVAL_FRONT_DOOR} (EVAL_FRONT_DOOR; session sizing ${EVAL_FRO
 # it later), and the compare reads a missing file as platform.
 mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
 echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+
+# verify_front_door checks the route the install resolved against the one the
+# switch asked for (#6942), so the record says which front door the run
+# graded rather than which it asked for. Today the operator's route is the
+# spec's (resolveA2ADefaultRoute), so a mismatch means the chart or the CR
+# lost the setting; once the operator's route can fall back from an explicit
+# `session` (the session cap's guards in #6487), it also catches a run that
+# asked for session and would grade platform. It reads the
+# A2A_DEFAULT_ADDRESSEE the operator rendered on the gateway's pod template,
+# retrying a read that fails as the bridge's template read does, rewrites
+# front-door.txt with both routes, and fails the deploy on a mismatch or a
+# route it can't read.
+verify_front_door() {
+  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved="" out errfile attempt
+  # kubectl's stderr goes to its own file, never into the value parsed: a read
+  # that succeeds with a warning on stderr still yields the route. An empty
+  # read is retried as a failed one is.
+  errfile="$(mktemp)"
+  for ((attempt = 1; attempt <= BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
+    if out="$(kubectl get "${gateway}" -n "${NAMESPACE}" \
+      -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>"${errfile}")"; then
+      resolved="$(awk 'NF { print; exit }' <<<"${out}")"
+      if [ -n "${resolved}" ]; then
+        break
+      fi
+      echo "front door: ${gateway} has no A2A_DEFAULT_ADDRESSEE yet (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS})" >&2
+    else
+      echo "front door: reading ${gateway} failed (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS}): $(cat "${errfile}")" >&2
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  rm -f "${errfile}"
+  printf 'requested=%s\nresolved=%s\n' "${EVAL_FRONT_DOOR}" "${resolved:-unknown}" \
+    >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+  if [ -z "${resolved}" ]; then
+    echo "ERROR: front door: could not read A2A_DEFAULT_ADDRESSEE on ${gateway}, so the route this install resolved is unknown; EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}." >&2
+    return 1
+  fi
+  if [ "${resolved}" != "${EVAL_FRONT_DOOR}" ]; then
+    echo "ERROR: front door: EVAL_FRONT_DOOR asked for ${EVAL_FRONT_DOOR}, but the install resolved ${resolved} (A2A_DEFAULT_ADDRESSEE on ${gateway}); the run would grade the ${resolved} route. Check spec.harness.tuning.defaultRoute on the PlatformAgent, and the operator's conditions for a route it held back." >&2
+    return 1
+  fi
+  echo "✓ front door: the install resolved ${resolved}, as EVAL_FRONT_DOOR asked"
+}
 if [ -z "${MODE_NEXT_MAX_SESSIONS}" ]; then
   echo "spec.harness.tuning.maxSessions: not set (EVAL_FRONT_DOOR_SESSIONS=shipped); the install default applies, and the provision sizes TASKS for it"
 elif [ "${EVAL_FRONT_DOOR}" = "session" ]; then
@@ -3328,6 +3426,13 @@ gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
 # has rolled for the bridge by now, and the CR stays out of Degraded with
 # the console on.
 gate_web_console
+
+# The route the install resolved, against the one asked for (#6942): after the
+# gates, so the gateway's rendered env is the one the eval will run against.
+if ! verify_front_door; then
+  report_cr_status "front-door-mismatch"
+  exit 1
+fi
 
 # What the run has to show for itself, for the artifact log: the CR status,
 # the A2A stack, the ungated gateway, and the entrypoint's

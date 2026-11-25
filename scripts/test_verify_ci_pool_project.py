@@ -536,8 +536,16 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertEqual(
             checker.LEASE_SILENT_FINDINGS,
             frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API})
-            | checker.FORGE_FINDINGS,
+            | checker.FORGE_FINDINGS
+            | {checker.FINDING_CONFIG_MANAGEMENT_API, checker.FINDING_FLEET_RECONCILER_GKEHUB},
         )
+        # The seeded fleet's Config Sync needs the API and the reconciler's
+        # gkehub grant; only the reconcile reads them, so a leased run passes
+        # without them. The ids are the ones the API and IAM checks emit.
+        self.assertEqual(checker.FINDING_CONFIG_MANAGEMENT_API, "apis/anthosconfigmanagement.googleapis.com")
+        self.assertIn("anthosconfigmanagement.googleapis.com", checker.REQUIRED_APIS)
+        self.assertEqual(checker.FINDING_FLEET_RECONCILER_GKEHUB, "iam/fleet-reconciler/missing/roles/gkehub.editor")
+        self.assertIn("roles/gkehub.editor", checker.FLEET_RECONCILER_ROLES)
         # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
         # public lanes read none of them, so a leased run passes with any of them.
         # The Gemini key findings red runs (GeminiApiKeyCheckTest).
@@ -4283,11 +4291,67 @@ class IamGrantsTest(unittest.TestCase):
 
     def test_both_build_identities_granted_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok(self._both_build_identities())]
+            run.side_effect = [_ok(self._both_build_identities()), _ok(self._both_build_identities())]
             result = checker.check_warm_cache_readers("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
-        self.assertEqual(result.message, "Cloud Build and Compute SAs hold reader on the warm cache repository")
+        self.assertEqual(result.message, "Cloud Build and Compute SAs hold reader on the warm cache and candidate image repositories")
         self.assertTrue(result.read)
+        # One read per repository, each named: the warm cache, then the candidates.
+        self.assertEqual([call.args[0][4] for call in run.call_args_list], ["kube-agents", "kube-agents-candidates"])
+
+    def test_a_missing_candidate_image_reader_is_its_own_finding(self):
+        """Reader on the warm cache says nothing about the candidate images:
+        each repository's policy is its own, and the repair names the one
+        that is short."""
+        project_number = "123456"
+        compute_only = self._reader_policy([f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._both_build_identities()), _ok(compute_only)]
+            result = checker.check_warm_cache_readers("kube-agents-evals-3", project_number)
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], ["warm_cache/candidates-reader/cloudbuild"])
+        self.assertIn("add-iam-policy-binding kube-agents-candidates ", result.findings[0].repair)
+
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._both_build_identities()), _ok(self._reader_policy([]))]
+            result = checker.check_warm_cache_readers("kube-agents-evals-3", project_number)
+        self.assertEqual(
+            [f.id for f in result.findings],
+            ["warm_cache/candidates-reader/cloudbuild", "warm_cache/candidates-reader/compute"],
+        )
+
+    def test_the_repositories_checked_are_the_ones_the_provisioner_grants(self):
+        """The list is written twice, here and in scripts/provision_ci_pool_project.sh:
+        a repository on one side only is a grant nothing verifies, or a check
+        that fails every project the script provisions. Pinned as the literal
+        pair too, so the two cannot drift together."""
+        provisioner = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text(encoding="utf-8")
+        granted = re.search(r"^readonly PROW_READ_REPOSITORIES=\(([^)]*)\)$", provisioner, re.M)
+        self.assertIsNotNone(granted, "could not find PROW_READ_REPOSITORIES in scripts/provision_ci_pool_project.sh")
+        checked = [repository for repository, _, _ in checker.PROW_READ_REPOSITORIES]
+        self.assertEqual(["kube-agents", "kube-agents-candidates"], checked)
+        self.assertEqual(checked, granted.group(1).split())
+        # The grant loop is the one that walks the list.
+        self.assertIn('for repository in "${PROW_READ_REPOSITORIES[@]}"; do', provisioner)
+        self.assertIn('gcloud artifacts repositories add-iam-policy-binding "${repository}"', provisioner)
+
+    def test_one_unreadable_repository_leaves_the_other_checked(self):
+        """A refused read of one policy is not a missing grant, and it does not
+        hide what the other policy showed."""
+        denied = _fail("ERROR: PERMISSION_DENIED: Permission 'artifactregistry.repositories.getIamPolicy' denied on resource")
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._both_build_identities()), denied]
+            result = checker.check_warm_cache_readers("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(result.read)
+        self.assertEqual(result.message, "Reader held on the repository whose policy was read; the other could not be read")
+        self.assertEqual(len([w for w in result.warnings if isinstance(w, checker.Unread)]), 1)
+        self.assertIn("kube-agents-candidates", str(result.warnings[0]))
+
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [denied, _ok(self._reader_policy([]))]
+            result = checker.check_warm_cache_readers("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed, "the policy that was read shows both grants missing")
 
     def test_the_one_read_that_happened_keeps_the_check_read(self):
         # Four reads, any one of which is a read: the platform GSA, project
@@ -4322,8 +4386,8 @@ class IamGrantsTest(unittest.TestCase):
         return result
 
     def test_the_warm_cache_read_is_its_own_check_and_not_the_scans(self):
-        # The IAM check as the bot must read in full: the one read outside the
-        # project lives here, outside POOL_STATE_CHECKS, so a healthy `iam`
+        # The IAM check as the bot must read in full: the reads outside the
+        # project live here, outside POOL_STATE_CHECKS, so a healthy `iam`
         # carries no warning and rule 6's exit can see a repair.
         self.assertIn(checker.CHECK_WARM_CACHE, checker.CHECK_IDS)
         self.assertNotIn(checker.CHECK_WARM_CACHE, checker.POOL_STATE_CHECKS)
@@ -4346,6 +4410,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._reader_policy([f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"])),
+                _ok(self._both_build_identities()),
             ]
             result = checker.check_warm_cache_readers("kube-agents-evals-2", project_number)
         self.assertFalse(result.passed)
@@ -4496,17 +4561,19 @@ class IamGrantsTest(unittest.TestCase):
             result.message,
         )
 
-        # The one read outside the project, denied: unread, not missing,
+        # The reads outside the project, denied: unread, not missing,
         # and now a check of its own rather than a warning on the IAM check.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
+                _fail("ERROR: PERMISSION_DENIED: Permission 'artifactregistry.repositories.getIamPolicy' "
+                      "denied on resource"),
                 _fail("ERROR: PERMISSION_DENIED: Permission 'artifactregistry.repositories.getIamPolicy' "
                       "denied on resource"),
             ]
             result = checker.check_warm_cache_readers("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
         self.assertFalse(result.read)
-        self.assertEqual(result.message, "Not checked: the warm cache repository's policy could not be read")
+        self.assertEqual(result.message, "Not checked: the Prow project's repository policies could not be read")
         self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
 
     def test_gsa_policy_failing_for_another_reason_still_fails(self):
@@ -4934,6 +5001,11 @@ FLEET_RESOURCE_ROLES = {
     # orphan_snapshot.py's probe, whose reads are `gcloud compute snapshots
     # describe` and `disks list`: compute.storageAdmin's, held already.
     "external": {"roles/container.admin", "roles/compute.storageAdmin"},
+    # seeded-a's fleet membership and its Config Sync (config-sync.tf). The
+    # membership's create also reads the cluster, which container.admin covers.
+    "google_gke_hub_membership": {"roles/gkehub.editor", "roles/container.admin"},
+    "google_gke_hub_feature": {"roles/gkehub.editor"},
+    "google_gke_hub_feature_membership": {"roles/gkehub.editor"},
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
@@ -5001,8 +5073,7 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # config_connector.py and orphan_snapshot.py the ones the terraform_data
     # local-execs run, not something tofu loads; their calls are accounted for
     # on the external and terraform_data types above.
-    # config_sync.py is a writer of the same kind that no resource runs yet.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py", "config_sync.py"}
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.

@@ -138,6 +138,7 @@ spec:
     image: <registry>/kube-agents/agent-worker:2026.08 # headless-contract runner + adapter
     model: model-default # via LiteLLM, as today
     maxTurns: 250
+    # type: claude-code # optional; absent is claude-code
   tools: # each mounted read-only at /opt/tools/<name>, bin/ on PATH
     - name: helm
       image: <registry>/kube-agents/tools-helm:3.17 # /files/bin/helm
@@ -162,8 +163,9 @@ spec:
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `description`                           | The routing blurb - today's `CAPABILITIES.md` first line. Rendered into the A2A agent card.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `persona.image`                         | OCI artifact holding the persona (the neutral layout of #3656: `persona.yaml`, `instructions.md`, `skills/`, `mcp.yaml`) under the image's `/files` directory, mounted read-only at `/persona`. Image volume (with `subPath: files`), the `AgentPlugin` mechanism, including its fallback: where image volumes are unavailable (GKE Autopilot, Kubernetes below 1.35) an init container copies `/files` into an emptyDir, so the image must also ship `/bin/sh`. One image works in both modes. Rendered by `k8s-operator/internal/profilepod`. (Decided 8/24: OCI-only, no `configMapRef` variant.) |
-| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below). The harness is a container image choice, nothing more.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `harness.model`, `maxTurns`             | Model routing and the turn budget, as in profile config today.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `harness.type`                          | Optional: the harness the worker image runs, passed to the worker as `A2A_HARNESS` only when set. Absent is `claude-code`, the only value accepted today. Pod configuration only: not on the card, and no bus subject or permission depends on it. A type the operator doesn't render refuses the profile (`IdentityReady` False, `HarnessNotSupported`).                                                                                                                                                                                                                                            |
 | `tools`                                 | Optional list of `{name, image, imagePullPolicy}` (name at most 24 characters): OCI images of command-line tools, each with its payload under `/files` mounted read-only at `/opt/tools/<name>` (same mechanism and fallback as `persona.image`), and `/opt/tools/<name>/bin` put on `PATH` in list order, so one tools image serves every harness. A tools image holds no credentials; a tool that needs them gets them from the broker, per task. Rendered by `k8s-operator/internal/profilepod`.                                                                                                  |
 | `bus.publishTopics` / `subscribeTopics` | Topic grants beyond the task subjects every executor gets. The operator renders these into the auth callout's identity-to-permissions map; the deny-by-default posture is the deployment spec's.                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `identity.serviceAccountName`           | The KSA the pod runs as. Optional. Absent means the operator creates a KSA with **zero** RBAC bindings, which is the default posture - the token exists to authenticate to NATS, not to talk to the API server.                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -590,6 +592,37 @@ GC - replay is not tied to the pod's existence.
   a Kubernetes verb with Kubernetes RBAC, not an API the harness may or may not
   implement. The janitor (below) writes the terminal event on the dead task's behalf.
   `activeDeadlineSeconds` is the same path triggered by the clock.
+
+**Stopped at a write refusal.** A profile task's adapter stops the harness at the first
+definitive write refusal the credential broker made, as the in-pod broker client recorded
+it, and never on a tool's output. The client appends a record to the task's
+`write-refusals` file (on the task token's tmpfs, named in `CREDENTIAL_PROXY_REFUSAL_FILE`)
+when the broker's 403 carries `write_refusal: true`;
+[the dispatch design](spec-profiles-dispatch.md) states which refusals those are. The
+adapter reads the file after each tool result, stops the harness as a cancel does, and
+publishes terminal `failed` with `reason: write-refused`, naming the record's rule and
+verb and nothing of the output, which the chat shows after the failed notice. Nothing the
+harness prints after the refusal is published. It is `failed`, not `rejected`, because work
+ran before the refusal; a delegating parent reads its reason, and the eval harness grades it.
+A version-control refusal (a write without the task's permit) never stops the task: the
+version-control skill's answer to it is the patch, which the task still gives. The broker
+refuses the write either way: a record that is lost leaves the task running, and every
+further write is refused too.
+
+A session pod's turn stops the same way, with the gateway's chat showing the reason. Its
+kubectl goes to `<agent>-kube-proxy`, not the broker, so no broker answer marks the refusal.
+Instead the kubectl wrapper (`deploy/sandbox/session-kubectl.sh`) records a write attempt
+when kubectl exits non-zero, the gateway has passed the pod a read-only kube-proxy mode
+(`KUBE_PROXY_MODE`, from the mode the operator gives kube-proxy), and the argv tries a
+change that mode refuses: a mutating verb, as the command policy resolves it, that is not
+a local render or, under `read-only-dry-run`, a server-side dry run. It reads the argv and
+the exit code, never kubectl's output. The adapter makes each turn's record file empty
+under the pod's scratch directory before the turn's harness starts, so one turn's record
+never stops the next. The wrapper can't tell which side refused, or whether kubectl
+reached the proxy at all, so the reason says a change was attempted and not made, and that
+writes are refused here, not that a server refused it. On a session pod the adapter counts
+only the wrapper's own rule, with a verb of one or two lowercase words, since the reason's
+verb is shown in chat and the record file is the harness's to write. A writable kube-proxy mode, or none, records nothing.
 
 **Evicted.** Node drains, spot preemptions, and GKE upgrades deliver `SIGTERM` with a
 grace period, and the adapter MUST trap it: flush the pending output buffer, publish

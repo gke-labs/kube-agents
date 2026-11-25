@@ -24,9 +24,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	container "google.golang.org/api/container/v1"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
 
 // realMainStopAfter bounds a test that runs realMain until a log line.
@@ -233,9 +238,14 @@ func TestRealMain_HoldsTheInformersUntilTheGatewayWaitEnds(t *testing.T) {
 		t.Fatalf("realMain: %v", err)
 	}
 	// Registered at 0 during the wait: an absent series would read as no
-	// watcher at all to an absent() alert and to status.usage.
-	if body := <-scraped; !strings.Contains(body, `k8s_event_watcher_cluster_up{cluster="x",location="",project=""} 0`) {
+	// watcher at all to an absent() alert and to status.usage, and
+	// watch_set_ready is already 1 because buildWatchSet finished.
+	body := <-scraped
+	if !strings.Contains(body, `k8s_event_watcher_cluster_up{cluster="x",location="",project=""} 0`) {
 		t.Errorf("cluster_up is not published at 0 during the gateway wait; /metrics:\n%s", body)
+	}
+	if !strings.Contains(body, watchSetReadyMetric+" 1") {
+		t.Errorf("watch_set_ready is not 1 during the gateway wait; /metrics:\n%s", body)
 	}
 	got := logs.String()
 	alert := strings.Index(got, "did not answer within")
@@ -292,5 +302,107 @@ func TestRealMain_DryRunDoesNotWaitForTheGateway(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Errorf("--dry-run took %s to start its informer", elapsed)
+	}
+}
+
+// A /metrics scrape during buildWatchSet must see watch_set_ready=0 with no
+// cluster_up series so the poller holds existing fleet gauges; once
+// buildWatchSet finishes (even with no --gateway-url), cluster_up=0 is
+// published for every initial cluster before watch_set_ready becomes 1.
+func TestRealMain_WatchSetReadyTracksBuildWatchSet(t *testing.T) {
+	logs := captureLog(t)
+	stubGKE(t)
+	origDescribe := discovery.Describe
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	discovery.Describe = func(ctx context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
+		enterOnce.Do(func() { close(entered) })
+		<-release
+		return origDescribe(ctx, id)
+	}
+
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM)
+	t.Cleanup(func() { signal.Stop(sigs) })
+
+	var releaseOnce, termOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	sendSIGTERM := func() { termOnce.Do(func() { _ = syscall.Kill(os.Getpid(), syscall.SIGTERM) }) }
+	var mainErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mainErr = realMain([]string{
+			"--dry-run", "--profiles-dir", dir, "--metrics-addr", "127.0.0.1:0",
+		})
+	}()
+	t.Cleanup(func() {
+		closeRelease()
+		select {
+		case <-done:
+			// Already exited; avoid sending an extra SIGTERM that can race with signal.Stop.
+		default:
+			sendSIGTERM()
+			<-done
+		}
+	})
+
+	<-entered
+	const metricsLogPrefix = "/metrics listening on "
+	waitForLog(logs, metricsLogPrefix)
+	logSnapshot := logs.String()
+	_, after, ok := strings.Cut(logSnapshot, metricsLogPrefix)
+	if !ok {
+		t.Fatalf("metrics listener did not log %q:\n%s", metricsLogPrefix, logSnapshot)
+	}
+	metricsAddr := strings.Fields(after)[0]
+	resp, err := http.Get("http://" + metricsAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics during buildWatchSet: %v", err)
+	}
+	earlyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read /metrics during buildWatchSet: %v", err)
+	}
+	early := string(earlyBytes)
+	if !strings.Contains(early, watchSetReadyMetric+" 0") {
+		t.Errorf("watch_set_ready is not 0 during buildWatchSet; /metrics:\n%s", early)
+	}
+	if strings.Contains(early, "k8s_event_watcher_cluster_up{") {
+		t.Errorf("cluster_up was already published during buildWatchSet; /metrics:\n%s", early)
+	}
+
+	closeRelease()
+	waitForLog(logs, "watching 1 cluster(s)")
+	resp, err = http.Get("http://" + metricsAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics after buildWatchSet: %v", err)
+	}
+	readyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read /metrics after buildWatchSet: %v", err)
+	}
+	ready := string(readyBytes)
+	if !strings.Contains(ready, watchSetReadyMetric+" 1") {
+		t.Errorf("watch_set_ready is not 1 after buildWatchSet; /metrics:\n%s", ready)
+	}
+	if !strings.Contains(ready, `k8s_event_watcher_cluster_up{cluster="prod",location="us-central1",project="projA"}`) {
+		t.Errorf("cluster_up was not published before watch_set_ready=1; /metrics:\n%s", ready)
+	}
+
+	sendSIGTERM()
+	select {
+	case <-done:
+		if mainErr != nil {
+			t.Fatalf("realMain: %v", mainErr)
+		}
+	case <-time.After(realMainStopAfter):
+		t.Fatal("realMain did not exit after SIGTERM")
 	}
 }

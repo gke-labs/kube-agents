@@ -19,6 +19,7 @@ import (
 	"time"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -282,7 +283,7 @@ func (k *kanbanTracker) ensureMapsLocked() {
 func cardStep(c kanbanCardRow, settled, total int, parentTaskID string) stepmsg.Step {
 	// The title is model-written too (the coordinator names the card when it
 	// files it), so it passes the scrubber as a net, like an argument value.
-	title := scrubInlineSecrets(strings.TrimSpace(c.Title))
+	title := answerscrub.ScrubInline(strings.TrimSpace(c.Title))
 	shortTitle := shortCardClusterOrTitle(title)
 	if shortTitle == "" {
 		shortTitle = c.ID
@@ -697,11 +698,11 @@ func cardAnswerText(c kanbanCardRow) string {
 		if text == "" {
 			text = strings.TrimSpace(formatKanbanCardOutput(c))
 		}
-		if out := oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap); out != "" {
+		if out := oneLinePreview(answerscrub.ScrubInline(text), debugErrorTextCap); out != "" {
 			return out
 		}
 	}
-	title := shortCardClusterOrTitle(scrubInlineSecrets(strings.TrimSpace(c.Title)))
+	title := shortCardClusterOrTitle(answerscrub.ScrubInline(strings.TrimSpace(c.Title)))
 	if title == "" {
 		return fmt.Sprintf("Kanban card `%s` finished with status `%s`.", c.ID, st)
 	}

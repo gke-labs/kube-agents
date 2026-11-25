@@ -22,20 +22,25 @@ The tier is the largest row any metric lands in. The thresholds are modeled: the
 column is where the measured fleet sat, and the `medium` band is where the defaults start to
 need the raises below.
 
-| Metric                                                              | `small` (default) | `medium`         | `fleet`                     |
-| ------------------------------------------------------------------- | ----------------- | ---------------- | --------------------------- |
-| Registered clusters                                                 | under 10          | 10 to 24         | 25 or more (to 2,500)       |
-| Fleet nodes                                                         | under 1,000       | 1,000 to 14,999  | 15,000 or more (to 250,000) |
-| Fleet controllers (Deployments, StatefulSets, DaemonSets, CronJobs) | under 500         | 500 to 2,999     | 3,000 or more               |
-| Fleet pods                                                          | under 5,000       | 5,000 to 29,999  | 30,000 or more              |
-| Pods in the largest single cluster                                  | under 2,500       | 2,500 to 7,499   | 7,500 or more               |
-| Objects in the host cluster                                         | under 15,000      | 15,000 to 49,999 | 50,000 or more              |
+| Metric                                                              | `small` (chart default) | `medium`         | `fleet`                     |
+| ------------------------------------------------------------------- | ----------------------- | ---------------- | --------------------------- |
+| Registered clusters                                                 | under 10                | 10 to 24         | 25 or more (to 2,500)       |
+| Fleet nodes                                                         | under 1,000             | 1,000 to 14,999  | 15,000 or more (to 250,000) |
+| Fleet controllers (Deployments, StatefulSets, DaemonSets, CronJobs) | under 500               | 500 to 2,999     | 3,000 or more               |
+| Fleet pods                                                          | under 5,000             | 5,000 to 29,999  | 30,000 or more              |
+| Pods in the largest single cluster                                  | under 2,500             | 2,500 to 7,499   | 7,500 or more               |
+| Objects in the host cluster                                         | under 15,000            | 15,000 to 49,999 | 50,000 or more              |
+
+(`charts/kube-agents/values.yaml` defaults an omitted `sizingProfile` to `small`; `install.sh` and `upgrade.sh` default `PLATFORM_AGENT_SIZING_PROFILE`, and Terraform defaults `platform_agent_sizing_profile`, to `auto`, which begins at `small` below 10 clusters and steps up automatically at the 10- and 25-cluster thresholds above.)
 
 The host-cluster row is the one that sizes the operator. The manager caches every Deployment,
-StatefulSet, Service and PersistentVolumeClaim in the cluster it runs in, so a shared host
-cluster with thousands of them needs the operator memory raise even at a small fleet. The other
-rows size the credential proxy, the event watcher and the data volumes, which grow with what the
-agent reads.
+StatefulSet, Service, ConfigMap, ServiceAccount, PersistentVolumeClaim, NetworkPolicy,
+PodDisruptionBudget and RBAC object in the cluster it runs in. Those informers take about 3.7 MiB
+of live heap per 1,000 objects across a balanced mix, and 7.9 to 8.5 MiB per 1,000 StatefulSets or
+Deployments; see [Manager cache and memory sizing](/kube-agents/operator/#manager-cache-and-memory-sizing).
+A shared host cluster with tens of thousands of them therefore needs the operator memory raise even
+at a small fleet. The other rows size the credential proxy, the event watcher and the data volumes,
+which grow with what the agent reads.
 
 ## What each pod needs
 
@@ -101,7 +106,19 @@ sandbox's memory limit: at the default 2 GiB, 13 kubectl reads run at once and 1
 The shell's kubectl admission refuses such a read before it starts, with a reason that names a
 narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet
 whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
-[`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
+the chart value `platformAgent.deployment.env`; [Applying it](#applying-it) shows the `install.env` line that carries such an entry. A hand edit of the CR's [`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment) can be lost at the next chart apply.
+
+The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
+
+The operator passes the tier to the shell sandbox and, under the session cluster view, to the
+session Pods the A2A gateway starts. On the `default` tier at the default session memory limit
+(2 GiB), their kubectl runs with no admission. On the `fleet` tier at that limit, a session Pod
+runs the admission against its own memory limit. It refuses a cluster-wide list that the fleet
+figures charge above what one read may take there, such as `kubectl get pods -A`, whatever the
+cluster's real size, as the shell does. Raise the session Pods' limit with
+[`harness.tuning.sessionResources.limits.memory`](/kube-agents/operator/platformagent-fields/#spec),
+or read per namespace or with a selector. A session Pod never refuses a read for being busy; it
+waits, then runs.
 
 Two more stacks add to the total:
 
@@ -155,9 +172,15 @@ resize both: `sizing_profile = "fleet"` renders the table's machine types and bo
 an explicit input such as `gvisor_machine_type = "n2-standard-8"` wins over the profile. The
 default pool keeps `standard_node_count` nodes per zone and does not autoscale.
 
-The installer writes none of these inputs, so set them as `TF_VAR_` lines in `install.env` and
+`install.sh` writes none of the explicit `standard_*` or `gvisor_*` inputs. On a fresh
+Standard install with 25 or more visible clusters and `auto` or `fleet` runtime sizing, it sets or
+offers `TF_VAR_sizing_profile=fleet` when `TF_VAR_sizing_profile` and `TF_VAR_standard_machine_type`
+are unset. It also keeps an exported `TF_VAR_sizing_profile`. Set other explicit inputs as
+`TF_VAR_` lines in `install.env` and
 keep the lines there for every later run. A lost profile line resolves the small profile, and a
-lost explicit line the profile's shape. The composition's `lifecycle.sh` refuses an apply that
+lost explicit line the profile's shape.
+
+The composition's `lifecycle.sh` refuses an apply that
 would resize a pool unless a sizing input asks for it: the pool's own input, or a changed profile
 for an attribute the profile decided at the last apply. A changed profile asks nothing about an
 attribute an explicit line set, so that line stays beside it. A machine type changed outside Terraform shows as drift on the next plan, so change it
@@ -233,7 +256,9 @@ sets what the chart exposes for the `fleet` tier, each key with its reason and i
 caveat beside it:
 
 - `operator.resources`: 1 GiB memory, request and limit alike, for a host cluster at or past
-  50,000 objects. The chart's floor on the limit is 512 MiB.
+  50,000 watched objects (or 180 MiB of cached live heap under the per-kind formula in
+  [Manager cache and memory sizing](/kube-agents/operator/#manager-cache-and-memory-sizing)). The
+  chart's floor on the limit is 512 MiB.
 - `platformAgent.storage.size: 100Gi`: both data claims. A claim cannot shrink, and each GiB
   counts twice against a namespace `requests.storage` quota. For a fleet of more than about 230
   clusters, also set `platformAgent.storage.expectedClusterProfiles`
@@ -254,7 +279,8 @@ caveat beside it:
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
-the shell sandbox, where the audits run, and passes every name it does not reserve to the
+the shell sandbox, where the audits run, sends `KUBEAGENTS_KUBECTL_COST_TIER` to the A2A gateway for
+its session Pods too, and passes every name it does not reserve to the
 credential proxy and `agent-api-auth` containers. The name in the example reaches the container
 that reads it.
 
@@ -283,31 +309,43 @@ helm upgrade kube-agents ./charts/kube-agents -n kubeagents-system \
   -f charts/kube-agents/examples/values-fleet.yaml
 ```
 
-An install made with `install.sh` re-renders the chart from `install.env` on a full
-[upgrade](/kube-agents/install/upgrade/), so a value passed only by hand is rendered away on the
-next run. Put the data volume size in `PLATFORM_AGENT_STORAGE_SIZE=100Gi` and the rest in the
-file's `TF_VAR_extra_helm_values` line, which the
-[quickstart](/kube-agents/install/quickstart-gke/#operator-settings) describes. The file holds one
+An install made with `install.sh` and `upgrade.sh` defaults `PLATFORM_AGENT_SIZING_PROFILE` to
+`auto` (`spec.deployment.sizingProfile: auto`), which promotes runtime pod sizes at 10 and 25
+clusters when namespace quota allows. Both `install.sh` and `upgrade.sh` (`--plan`, `full`,
+`harness`, and `operator`, though `--upgrade-mode=operator` refuses `--sizing-profile` and leaves
+chart values unchanged) scan visible clusters in scope and print host and storage guidance
+before applying. On a fresh Standard install with 25 or more clusters and `auto` or `fleet`
+runtime sizing, `install.sh` sets or offers `TF_VAR_sizing_profile=fleet` when
+`TF_VAR_sizing_profile` and `TF_VAR_standard_machine_type` are unset. On an existing cluster, add
+large nodes deliberately
+because resizing a managed Standard pool replaces its nodes.
+
+A hand-edited value passed only by `helm upgrade` is overwritten on the next full run of
+[upgrade](/kube-agents/install/upgrade/), so keep explicit overrides in `install.env`. Put
+the profile and volume size in `install.env` and the remaining overrides in `TF_VAR_extra_helm_values`,
+which the [quickstart](/kube-agents/install/quickstart-gke/#operator-settings) describes. (`sizingProfile: fleet` sets the `credentialProxy`, `agentAPIAuth`, and `shellSandbox` presets; leave those blocks out of `TF_VAR_extra_helm_values` unless intentionally pinning a different limit.) The file holds one
 such line and a second `platformAgent` key replaces the first, so merge these keys into a line
 that already has one rather than pasting over it:
 
 ```bash
+PLATFORM_AGENT_SIZING_PROFILE=fleet
 PLATFORM_AGENT_STORAGE_SIZE=100Gi
-TF_VAR_extra_helm_values='{operator={resources={requests={cpu="250m",memory="1Gi"},limits={cpu="500m",memory="1Gi"}}},platformAgent={harness={tuning={maxInProgress=3}},deployment={env=[{name="KUBEAGENTS_AUDIT_AUTO_PROMOTE",value="false"}],credentialProxy={resources={requests={cpu="4",memory="8Gi"},limits={cpu="8",memory="8Gi"}}},agentAPIAuth={resources={requests={cpu="500m",memory="2Gi"},limits={memory="4Gi"}}}}}}'
+TF_VAR_extra_helm_values='{operator={resources={requests={cpu="250m",memory="1Gi"},limits={cpu="500m",memory="1Gi"}}},platformAgent={harness={tuning={maxInProgress=3}},deployment={env=[{name="KUBEAGENTS_AUDIT_AUTO_PROMOTE",value="false"}]}}}'
 ```
 
 Read the result on the CR and the pods:
 
 ```bash
 kubectl get platformagent platform-agent -n kubeagents-system \
-  -o jsonpath='{.spec.storage}{"\n"}{.spec.deployment.credentialProxy}{"\n"}{.status.conditions}{"\n"}'
+  -o jsonpath='{.spec.storage}{"\n"}{.spec.deployment.sizingProfile}{"\n"}{.spec.deployment.credentialProxy}{"\n"}{.status.effectiveSizingTier}{"\n"}{.status.conditions}{"\n"}'
 kubectl get pods -n kubeagents-system -o custom-columns='NAME:.metadata.name,REQ:.spec.containers[*].resources.requests,LIM:.spec.containers[*].resources.limits'
 ```
 
 A `Degraded` condition with reason `InvalidCredentialProxyResources` or
 `InvalidAgentAPIAuthResources` means the operator refused an override and rendered that
-container at its defaults. `InvalidKanbanAdmission` means the resolved `memoryBudgetMiB`
-is below `workerRssCapMiB`, so a single worker's RSS cap exceeds the pod's admission budget.
-`DataVolumeNotExpanded` means the StorageClass does not expand claims
-online. On Autopilot the pod's limits read equal to its requests where bursting is off,
+container at the sizing profile's row. `InvalidKanbanAdmission` means the resolved
+`memoryBudgetMiB` is below `workerRssCapMiB`, so a single worker's RSS cap exceeds
+the pod's admission budget. `DataVolumeNotExpanded` means the StorageClass does
+not expand claims online. On Autopilot the pod's limits read equal to its requests
+where bursting is off,
 which is the cluster rewriting the manifest rather than the chart dropping a key.

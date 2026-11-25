@@ -1101,6 +1101,20 @@ agree. When it cannot read them, or fails in any other way, it runs the command 
 that cannot take the lock waits for it in the kernel for up to 5 s, once, and is then refused: in a fan-out of 60 commands on two CPUs, the commands that ran unslotted after a lock
 timeout outgrew the shell.
 
+A2A session Pods under the cluster view run kubectl against the kube-proxy too, in a container
+limited to `A2A_SESSION_MEMORY_LIMIT` (2 GiB by default) with no guard running. The worker image's
+wrapper runs kubectl directly, with no admission, when the tier's largest read fits the Pod's memory
+limit (every default install), or for a command the admission never charges. Otherwise it execs
+the same admission, with three settings from its environment: its state in a directory the session
+user owns (`KUBECTL_ADMIT_RUN_DIR`), the guard loaded only as a library for its memory figure and
+watermark (`KUBECTL_ADMIT_GUARD_PATH`), and `KUBECTL_ADMIT_ON_BUSY=run`. With `run`, a command the
+Pod finds busy waits up to the admission's wait (`ADMIT_WAIT_SECONDS`), then runs anyway,
+unslotted, and the event log records it as `ran-busy`; it is never refused for being busy. Only a
+read larger than the Pod could ever hold is refused, with exit 3. The sandbox's wrapper unsets
+these three settings, so a sandbox session cannot use them. The tier comes from `KUBEAGENTS_KUBECTL_COST_TIER`,
+which the operator passes to the gateway and the gateway to each session Pod, both checking it is a
+plain lowercase word.
+
 ### Running the sandbox under gVisor
 
 `harness.experimental.shellSandbox.runtimeClassName` puts the sandbox pod on a sandboxed
@@ -2789,8 +2803,7 @@ unidentified caller gets an undifferentiated `401` rather than a reason. `CREDEN
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
 the same listener, on every install the A2A gateway's, the A2A MCP server's own
-ServiceAccount unless `A2A_MCP_DOOR=false` (and while this `PlatformAgent` controls it), under
-the operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
+ServiceAccount unless `A2A_MCP_DOOR=false` (and while this `PlatformAgent` controls it), under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it) the session pods', and, with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
@@ -2813,7 +2826,7 @@ design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that calle
 apart from the legacy chat one. It is bound to its caller as the session role is, below:
 `CREDENTIAL_PROXY_A2A_CHAT_CALLERS` names the A2A gateway's own ServiceAccount, which may present
 only the a2a-chat audience, or the a2a-reports audience when `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names it too, and no other caller may present that audience; with the list empty,
-as from an operator that doesn't render it, the audience alone decides. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+as from an operator that doesn't render it, the audience alone decides. Under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it) there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
 (the `profile` and `scope` roles, below, reach it too), and

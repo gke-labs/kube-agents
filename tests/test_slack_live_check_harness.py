@@ -66,6 +66,10 @@ NOT_STARTED_NOTICES = (
     "an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
     "⚠️ not started: can't count the running session workers right now — try again in a moment",
     "⚠️ not started: other conversations were starting session workers and this one waited too long — try again in a moment",
+    "🚦 not started: the gateway stopped while this waited for a session worker — send it again",
+    "🚦 not started: every session worker stayed busy while this waited, so I took it out of the line — send it again later, "
+    "or `stop` a conversation you started to free one",
+    "🚦 not started: this conversation is already waiting for a session worker with 8 messages behind it — send this one once it starts",
     "⚠️ not started: could not mint this task's capability",
     "⚠️ not started: could not close the previous task on the bus; try again in a moment",
     "⚠️ not started: a task is still running here; stop it or wait for it before asking an agent profile",

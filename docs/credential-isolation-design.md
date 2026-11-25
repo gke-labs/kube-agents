@@ -132,7 +132,9 @@ are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
 kubectl cost table the shell's admission charges, which the operator passes only as a short
-lowercase word, before either reaches that Pod. The three
+lowercase word, before either reaches that Pod. The tier also goes, normalised the same way, to
+the A2A gateway, which sets it on the session Pods it starts under the cluster view, since their
+kubectl runs the same admission. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
@@ -257,12 +259,12 @@ caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-pr
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
 broker's watcher routes), `kubeagents-credential-proxy-a2a-reports` for the A2A gateway's
-audit-report reader on every install and, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
-for the A2A gateway) as a bearer header, and the
+audit-report reader on every install, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
+for the A2A gateway, and, when the Teams inbound receiver is enabled, `kubeagents-credential-proxy-teams-inbound`
+for that receiver, which reaches one route by one method) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
-install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
-pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it), the session pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience
 `kubeagents-credential-proxy-profile`; see
@@ -831,8 +833,8 @@ argv, and a profile task's call go to the broker as above. The read carries the
 `X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
 cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
 `get-credentials`, which refuses that cluster itself. The header only narrows:
-without it the read is unchanged, so other control-plane reads of an excluded
-cluster stay allowed.
+without it the read is unchanged, so the reconcile's existence check of an
+excluded cluster stays allowed.
 
 Consequences:
 
@@ -914,7 +916,10 @@ Consequences:
   back and lands it at
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
-  cluster from later commands.
+  cluster from later commands. It writes the file and the pin only when its
+  caller owns `.kubeconfigs`; another caller gets neither, and is told to name
+  a file of its own
+  ([`kube-proxy.md`](designs/kube-proxy.md#4-sandbox-kubectl-and-kubeconfig-setup)).
 - A `kubectl` read that names no cluster that way and comes back empty or with
   a server NotFound says where it looked. For `get`, `describe`, `events`,
   `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr

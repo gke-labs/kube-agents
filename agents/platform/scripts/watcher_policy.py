@@ -116,6 +116,7 @@ PUBSUB_BODIES: dict[str, dict[str, type]] = {
     ":acknowledge": {"ackIds": list},
     ":modifyAckDeadline": {"ackIds": list, "ackDeadlineSeconds": int},
 }
+PUBSUB_VERB_METHOD_MESSAGE = "That Pub/Sub call is made with POST."
 _TARGET = re.compile(rf"(?P<project>{PROJECT_REF})/(?P<location>{LOCATION})/(?P<cluster>{CLUSTER})")
 
 # A Kubernetes path segment for a namespace, group, version or resource plural:
@@ -427,7 +428,9 @@ def _evaluate_subscription_call(
         if method != METHOD_GET:
             return _refuse(rules.method, "A subscription is read with GET.")
         return Decision(allowed=True, rule_id=rules.allowed_prefix + "-get", message="")
-    if method != METHOD_POST or not _body_fits(body, PUBSUB_BODIES[verb]):
+    if method != METHOD_POST:
+        return _refuse(rules.method, PUBSUB_VERB_METHOD_MESSAGE)
+    if not _body_fits(body, PUBSUB_BODIES[verb]):
         return _refuse(rules.body, "That Pub/Sub call carries a body this relay does not forward.")
     return Decision(allowed=True, rule_id=rules.allowed_prefix + verb.replace(":", "-"), message="")
 

@@ -41,7 +41,7 @@ from typing import Any
 import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
-from kube_agents_bench import pushed_report, scope_exclude, stop_hook, worker_trajectory
+from kube_agents_bench import burst_reads, idle_reply, pushed_report, scope_exclude, scope_hold, session_cap, stop_hook, worker_trajectory
 from kube_agents_bench.lane import REQUESTED_KEY as _REQUESTED_KEY
 from kube_agents_bench.lane import LaneSafeguardsError as _LaneSafeguardsError
 from kube_agents_bench.lane import declared_pull_requests as _lane_declared_pull_requests
@@ -73,7 +73,7 @@ __all__ = [
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
-#   ``scope_exclude.py``), ``writes_alone`` and ``requested_pull_requests``
+#   ``scope_exclude.py``), ``scope_hold`` (read by ``scope_hold.py``), ``writes_alone`` and ``requested_pull_requests``
 #   (read by ``lane.py`` and by ``load_case``), ``suite``
 #   (``validated-capabilities``: the case runs on the validated-capabilities lane only; the
 #   lane and scripts/validate_bench_cases.py read the bare line from the task
@@ -90,7 +90,7 @@ DEVOPS_BENCH_CASE_KEYS = (
 REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
-        "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
+        "audit_streams", scope_exclude.KEY, scope_hold.KEY, "task_version", "writes_alone", "suite",
         "suite_part",
         _REQUESTED_KEY,
     }
@@ -144,7 +144,7 @@ TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
 WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worker_budget", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
 # Entries the harness writes on the trajectory itself (``stop_hook.py``,
-# ``pushed_report.py``, ``worker_trajectory.py``), not calls read off the door's trace, so a lossy
+# ``pushed_report.py``, ``idle_reply.py``, ``worker_trajectory.py``, ``burst_reads.py``), not calls read off the door's trace, so a lossy
 # trace says nothing about them: a ``tool_called`` leaf naming only these is
 # graded on every record.
 HARNESS_WRITTEN_ENTRIES = frozenset(
@@ -153,6 +153,9 @@ HARNESS_WRITTEN_ENTRIES = frozenset(
         stop_hook.CARDS_STOPPED_ENTRY,
         stop_hook.CANCEL_REPORTED_ENTRY,
         pushed_report.PLANT_ENTRY,
+        idle_reply.WAIT_ENTRY,
+        session_cap.QUEUED_ENTRY,
+        burst_reads.ENTRY,
         worker_trajectory.GAP_ENTRY,
         worker_trajectory.NO_WORKER_CALLS_ENTRY,
     }

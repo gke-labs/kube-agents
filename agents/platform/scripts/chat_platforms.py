@@ -82,23 +82,20 @@ MANAGED_CONFIG_PATH = os.path.join(
 CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yaml")
 
 # Per-platform environment signals, tried when config.yaml does not settle it. The
-# relay URL leads each list: the operator sets it on this container exactly when the
-# matching `spec.integration.<platform>.enabled` is true and this pod is the platform's
-# consumer, so it answers the question being asked rather than approximating it
-# (platformagent_manifests.go, the `integration.GoogleChat` / `integration.Slack` blocks
-# in buildPodTemplateSpec). Google Chat is the A2A gateway's, so the variable is not
-# set here and this list does not count it; the platforms
+# relay URL leads each list: it says that this pod is the platform's consumer. The
+# operator renders neither relay URL now: Google Chat and Slack are the A2A gateway's
+# (platformagent_manifests.go, buildPodTemplateSpec and renderManagedEnv), so on an
+# operator install no relay URL is set here; the platforms
 # `chat_notify.routed_platforms()` names, from the two notify variables and the
 # projected home-channel file, are counted through the gateway's notify route.
 #
-# In a deployed pod the relay URL is not merely first, it is the only one of these
-# that arrives. A bot token is a credential, so it lives in the credential-proxy
-# container and never reaches this one — asking for it is a question whose answer on a
-# pod is always "no", which is the specific defect #742 records and #855 fixed in the
-# session server's copy. And `*_HOME_CHANNEL` is stripped from every `no_agent` cron
-# script's environment by Hermes' provider-env blocklist, which is why
-# `profile_cron_tick.home_target_env` exists to re-read it from disk; the caller here
-# is one of those children, so it never sees those either.
+# In a deployed pod none of these reaches this caller. A bot token is a credential, so
+# it lives in the credential-proxy container and never reaches this one — asking for
+# it is a question whose answer on a pod is always "no", which is the specific defect
+# #742 records and #855 fixed in the session server's copy. And `*_HOME_CHANNEL` is
+# stripped from every `no_agent` cron script's environment by Hermes' provider-env
+# blocklist, which is why `profile_cron_tick.home_target_env` exists to re-read it
+# from disk; the caller here is one of those children, so it never sees those either.
 #
 # They are listed anyway, after the relay URLs, because this module is not only for
 # that caller: on a bare `docker run` off the image no operator has rendered a relay

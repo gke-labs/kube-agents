@@ -15,8 +15,9 @@
 # as eight periodics on eight projects: the main part in
 # five shards (#3384, #4238) across ci-kube-agents-eval-nightly with
 # EVAL_NIGHTLY_PART=main-a and ci-kube-agents-eval-nightly-main-b to -main-e
-# with main-b to main-e, the stack-bearing cases placed by nightly-main-b.txt
-# to nightly-main-e.txt; and the writers part, the cases
+# with main-b to main-e, the stack-bearing cases that take the infra lock
+# placed by nightly-main-b.txt to nightly-main-e.txt; and the writers part,
+# the cases
 # that request a pull request, the stopped asks and the writes_alone cases,
 # in thirds across ci-kube-agents-eval-nightly-writers with
 # EVAL_NIGHTLY_PART=writers-a and -writers-b and -writers-c with writers-b
@@ -1145,6 +1146,15 @@
 # (the persona's version-control skill) land; its record shows when they do.
 ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 
+# A cluster profile task that names no repository finds the one it may use
+# (#6389): the same confirmed PodDisruptionBudget pull request as the case
+# above with the repository left unnamed, so the persona asks `identity` with
+# no repository and uses the install's one managed repository. Graded the
+# same way. Regression coverage: it passed on main's persona too (the
+# behaviour shipped with #6411). Pool installs manage exactly one repository (hack/ci-deploy.sh:
+# one forge and one GitOps repository per leased project).
+./tasks/cluster-profile-finds-the-managed-repository/task.yaml
+
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
 # verdict lines: the cause is the missing class and not a stockout, and the
@@ -1169,6 +1179,12 @@
 # Enters again once a lane grades that route and the record holds (#3598).
 # The domain's roster seat is consistency-drift-outlier since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
+
+# #2800: the drift audit's boot-disk facet, voted by node pool. seeded-c's
+# default-pool runs a 50 GB boot disk where the stack's other pools run 20 GB;
+# graded on the ledger's boot-disk finding and the pool it names. The same
+# full audit and band as consistency-drift-outlier.
+./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
 # gke-labs#2610: a request to propose a fix, delegated to a platform card, is
 # answered in the card's result with the PodDisruptionBudget manifest, and no
@@ -1251,6 +1267,22 @@
 # and safeguards. deployer: noop, read-only, no fixture; three units at the
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
+
+# A scheduled audit run, started the way the schedule starts it and not by a
+# request, stores the finding of a planted defect. Every other case that
+# grades a finding asks for the audit in its prompt, which is an on-demand
+# run. prebuilt/audit-chat-report moves the compliance-audit stream's stored
+# report and digest record aside, fires the stream's real cron job and waits
+# for it, so the turn is a one-line answer and the grade reads the store with
+# the stack's fire time as its clock. Fixture: rbac-overgrant. A tofu case
+# off the infra lock (hack/ci-eval-pr.sh, infra_lock_exempt): its stack
+# carries one full compliance audit and waits for it for up to 3000s, past
+# the longest hold the lock plans for, and the stream lock keeps it apart
+# from the other compliance-audit cases. Priced with
+# compliance-rbac-overgrant's 1000s plus the fire and the wait; the fired
+# run took 11 to 13 minutes on two dev installs and is unmeasured on a lane.
+# Placed by its name, as a case without a stack is.
+./tasks/fleet-audit-scheduled-run-files-the-finding/task.yaml
 
 # A scheduled audit over a fleet that did not change since the last scheduled
 # run is closed by `audit_report.py precheck` from that run's stored findings
@@ -1389,6 +1421,15 @@
 # projects. Nightly from the merge that removes its FIXTURE_NOT_READY entry.
 ./tasks/networking-world-open-ingress/task.yaml
 
+# The obtainability stream's `image-pull-failing` check (3.28), nightly from
+# the start: a per-run plant (`prebuilt/image-pull-failing`) of two Deployments
+# whose image pull the registry refuses, one through the node identity and one
+# through a named pull secret, graded on one finding of the check on each
+# reaching the ledger. The stack waits eleven minutes after the plant, since
+# the check names a pull only once it has failed for ten; priced at the 900s
+# audit band plus that wait. Not on the scored suite for the same wait.
+./tasks/obtainability-image-pull-failing/task.yaml
+
 # The obtainability audit's sweep opens a pull request for a major finding
 # with a declared workload: checkout-gateway's no-pdb fix, beside the
 # clusters/seeded-a/seeded-reliability/checkout-gateway.yaml declaration
@@ -1435,13 +1476,6 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
-# post-merge-verified-fixed: the post-merge check's verify-after-merge loop
-# (#6343 case 1), the eval record for #6311. A writer: the check merges the
-# agent's no-pdb fix, applies it and drives the cron's ticks (post_merge.py).
-# Cost: each repetition holds a serial writers slot for the agent's turn plus
-# up to 15 minutes of ticks, about 45 minutes a night across three.
-./tasks/post-merge-verified-fixed/task.yaml
-
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
 # into the platform charts context repository, names the chart template
@@ -1462,6 +1496,13 @@
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
 
+# A question about the agent's own cluster while spec.hold holds it: the
+# answer reports the hold and its reason and lists no pod. The runner holds the
+# host cluster for this case's repetitions alone, after every other unit, and
+# restores the hold after them (scope_hold); deployer: noop, read-only, no
+# seeded fleet.
+./tasks/scope-held-cluster-is-reported/task.yaml
+
 # #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
 # stack plants two namespaces exporting one host everywhere and two exporting
 # another to themselves only, on the host cluster, installing a minimal
@@ -1473,6 +1514,21 @@
 # inject door and the AgentProfile dispatcher, which every CI eval install
 # runs, with profiles.cluster, from #5394.
 ./tasks/session-delegates-to-the-profile-asked-for/task.yaml
+
+# #6882: at the session cap, a new conversation gets the queued notice, then
+# its answer (the session-cap directive, bench/kube_agents_bench/session_cap.py).
+# It needs a session cap of at most 2, which the nightly install does not
+# have, so here it reports infrastructure naming the cap; its evidence runs
+# come from twins that set the cap to 2. deployer: noop, read-only.
+./tasks/session-front-door-cap-busy-notice/task.yaml
+
+# #6816: a chat turn that tries a direct cluster write stops at that first
+# attempt and says the change was not made. Through the session front door the
+# kubectl wrapper's write-attempt record ends the turn; through the platform
+# front door the Hermes halt does, so either wording passes. Red on main in
+# session mode, where the turn ran on. deployer: noop, read-only: the write is
+# refused either way.
+./tasks/session-turn-stops-at-write-attempt/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
@@ -1656,6 +1712,20 @@
 # per seeded cluster (the three slot roles beside the planted one tell a
 # missed cluster from an absent one). Nightly from its first merge.
 ./tasks/upgrades-readiness-changed-defaults/task.yaml
+
+# The explicit question behind the readiness report's `answered` list: which
+# fail-closed admission webhooks the readiness check tested, and whether each
+# one's backend answered. The fleet-upgrade-verification report names a webhook
+# with an unreachable backend in its table and one whose backend answered in
+# its JSON, so the names come from the run; the route check, the same as
+# upgrades-fleet-readiness-failclosed-webhook's, fails a hand survey of webhook
+# configurations. The case grades the planted gate's line as "backend: missing"
+# (seeded-b, role readiness-failclosed-webhook) and requires one webhook line
+# with "backend: ready"; it names no live webhook, because the fleet plants
+# none and GKE's own give one on a seeded cluster. Read-only chat prompt;
+# deployer: noop, no lock. Nightly from its first merge; a presubmit seat is a
+# later pull request that cites its record.
+./tasks/upgrades-readiness-checked-webhooks-named/task.yaml
 
 # Catalogue entry 10 through the readiness report's client-addon-skew rule:
 # stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0

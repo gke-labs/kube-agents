@@ -249,6 +249,7 @@ func TestABatchIsRefusedWhileAnEarlierChildIsLive(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, targetPlatform, "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	waitParentTerminalRelayed(t, r, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "child detached", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
@@ -449,44 +450,6 @@ func TestOnlyTheSecondEntryFailingRefusesTheBatch(t *testing.T) {
 				t.Fatalf("a refused batch submitted %d triage children", len(envs))
 			}
 		})
-	}
-}
-
-// TestAProfileParentsBatchIsIgnored: a profile task waits open for its child,
-// and nothing yet lets it take several child results, so a batch from one is
-// ignored under its own rule (delegation.profile-batch), with nothing
-// minted. This rig captures no log, so the record's end is the observation.
-func TestAProfileParentsBatchIsIgnored(t *testing.T) {
-	r := startProfileRig(t)
-	r.g.cfg.DelegationWidthMax = 3
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
-	ctx := context.Background()
-	conv := "console:tab-profile-batch"
-	turn := profileTurn(conv, "chat", nil)
-	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
-	r.adapter.inbox <- turn
-	origin := submissionOn(t, r, "chat")
-	parent := r.execFor(t, origin, "chat")
-	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
-		t.Fatal(err)
-	}
-	art := delegateBatchArtifact(t,
-		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
-		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
-	if err := parent.PublishArtifact(ctx, art); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "the request recorded as minting nothing", func() bool {
-		rec, _ := r.g.reg.Get(ctx, conv)
-		ref, ok := rec.TaskRefFor(origin.TaskID)
-		return ok && strings.Contains(ref.DelegationEnd, whyProfileBatch)
-	})
-	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>"); len(envs) != 0 {
-		t.Fatalf("a profile parent's batch submitted %d children", len(envs))
-	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if pref, _ := rec.TaskRefFor(origin.TaskID); len(pref.Children) != 0 {
-		t.Fatalf("parent children = %v", pref.Children)
 	}
 }
 

@@ -152,8 +152,8 @@ CHECK_CODEBASE_MAPPING = "codebase_mapping"
 CHECK_PROJECT_AND_APIS = "project_and_apis"
 CHECK_IAM = "iam"
 CHECK_ARTIFACT_REGISTRY = "artifact_registry"
-# The one read outside the project: this project's build identities' reader
-# grant on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT. Its own
+# The reads outside the project: this project's build identities' reader
+# grants on PROW_READ_REPOSITORIES in WARM_CACHE_REPOSITORY_PROJECT. Its own
 # check so that a caller holding nothing there -- every caller but the Prow
 # runner -- gets an unread check rather than an IAM check with a warning.
 CHECK_WARM_CACHE = "warm_cache"
@@ -256,7 +256,7 @@ GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAUL
 # gitops_workload_manifest, the ledger App's key for ledger_read_credential), not the minter's signing half
 # (token_minter; the scan runs token_minter_kms), not the mapping (that is
 # about the checkout, not the project), and not the warm-cache check, whose
-# read is in another project the bot holds nothing on. The Gemini key check
+# reads are in another project the bot holds nothing on. The Gemini key check
 # is in: securityReviewer carries its reads (GCLOUD_SURFACE_READ_ROLES). The
 # GitOps default-branch read is in: one metadata call the job makes with whatever GitHub credential it
 # carries (GITOPS_READ_TOKEN_ENV), and records as not checked when it carries
@@ -308,9 +308,20 @@ REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinte
 # The one version state `kms keys versions enable` takes; a scheduled or done
 # destruction and a failed or pending import need the rotation repair.
 KMS_VERSION_DISABLED = "DISABLED"
-# hack/ci-deploy.sh's warm cache image lives in the Prow project's `us` repository.
+# Where the repositories of PROW_READ_REPOSITORIES are: the Prow project, at `us`.
 WARM_CACHE_REPOSITORY_PROJECT = "kube-agents-prow"
 WARM_CACHE_REPOSITORY_LOCATION = "us"
+# The repositories there a pool project's Cloud Build and Compute SAs read, each
+# with what it holds (for the messages) and the finding-id segment its missing
+# grants report under: the warm cache, and the repository for per-commit
+# candidate images. scripts/provision_ci_pool_project.sh grants reader on both
+# (its PROW_READ_REPOSITORIES, held equal by scripts/test_verify_ci_pool_project.py).
+WARM_CACHE_REPOSITORY = "kube-agents"
+CANDIDATE_IMAGES_REPOSITORY = "kube-agents-candidates"
+PROW_READ_REPOSITORIES = (
+    (WARM_CACHE_REPOSITORY, "the warm cache image", "reader"),
+    (CANDIDATE_IMAGES_REPOSITORY, "the per-commit candidate images", "candidates-reader"),
+)
 
 # The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
 # the only place the counts appear, and the script exits 0 whether it wrote
@@ -339,7 +350,8 @@ _FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
 # carried into this check's advice rather than read as an unread role.
 FLEET_STATE_UNASSERTED_MARK = "was not asserted"
 # The fourth count: a role that is not yet ready is planted and in shape, and
-# its audit's age gate (the orphaned-snapshot roles' 91 days) has not passed;
+# its audit's age gate (the orphaned-snapshot roles' 91 days, the finished-Job
+# family's 7) has not passed;
 # it fails nothing here.
 _FLEET_STATE_SUMMARY = re.compile(
     r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
@@ -402,6 +414,9 @@ REQUIRED_APIS = {
     # project's RolloutSequences through the GKE Hub API; the composition
     # enables it for the same reason.
     "gkehub.googleapis.com",
+    # The seeded fleet's Config Sync on seeded-a (bench/tf/fleet/config-sync.tf),
+    # a fleet feature that needs the Config Management API.
+    "anthosconfigmanagement.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
     # The eval nightlies' Gemini Developer API key (check_gemini_api_key): the
@@ -526,6 +541,14 @@ FORGE_FINDINGS = frozenset(
 # position as the pieces: nothing on the public lanes resolves eval.internal.
 FINDING_DNS_API = "apis/dns.googleapis.com"
 LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | FORGE_FINDINGS | {FINDING_DNS_API}
+# The seeded fleet's Config Sync (bench/tf/fleet/config-sync.tf) needs these on
+# a project listed in post_merge_sync_projects, and only the reconcile reads
+# them: a leased run uses neither the Config Management API nor the
+# reconciler's gkehub grant, so a project missing them is not the pool's
+# reason for a red, and the health bot's pool-drift advice must not say it is.
+FINDING_CONFIG_MANAGEMENT_API = "apis/anthosconfigmanagement.googleapis.com"
+FINDING_FLEET_RECONCILER_GKEHUB = "iam/fleet-reconciler/missing/roles/gkehub.editor"
+LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | {FINDING_CONFIG_MANAGEMENT_API, FINDING_FLEET_RECONCILER_GKEHUB}
 
 # ─── The eval nightlies' Gemini Developer API key ────────────────────────────
 # scripts/provision_ci_pool_gemini_key.sh mints the key and keeps its string as
@@ -978,7 +1001,7 @@ CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow
 # (scripts/eval_dashboard/pool_state.py, which runs POOL_STATE_CHECKS as the
 # bot). Together they cover every read those checks make, and none writes;
 # securityReviewer alone lacks projects.get and the three describes (role
-# definitions read 2026-09-25). The one cross-project read is CHECK_WARM_CACHE,
+# definitions read 2026-09-25). The cross-project reads are CHECK_WARM_CACHE's,
 # which the scan does not run. Granted by bench/tf/fleet
 # (`pool_state_readers`), kept equal by test, checked below.
 POOL_STATE_READER_ROLES = {
@@ -1104,6 +1127,9 @@ FLEET_RECONCILER_ROLES = {
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
+    # gkehub.editor: the stack registers seeded-a to the fleet and turns on Config
+    # Sync for it (config-sync.tf): gkehub.memberships.* and gkehub.features.*.
+    "roles/gkehub.editor",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/resourcemanager.projectIamAdmin",
@@ -2180,72 +2206,76 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
 
 
 def check_warm_cache_readers(project_id: str, project_number: str) -> CheckResult:
-    """Verify this project's Cloud Build and Compute SAs hold reader on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT."""
+    """Verify this project's Cloud Build and Compute SAs hold reader on each of PROW_READ_REPOSITORIES in WARM_CACHE_REPOSITORY_PROJECT."""
     details: List[str] = []
     warnings: List[str] = []
     findings: List[Finding] = []
     passed = True
-    prow_checked = False
-    # The warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE to lives in the
-    # `us` multi-region repository of kube-agents-prow, not in us-central1.
-    rc, out, err = run_cmd([
-        "gcloud", "artifacts", "repositories", "get-iam-policy",
-        "kube-agents",
-        f"--project={WARM_CACHE_REPOSITORY_PROJECT}",
-        f"--location={WARM_CACHE_REPOSITORY_LOCATION}",
-        "--format=json",
-    ])
-    if rc != 0:
-        # A cross-project read. The pool project can be perfectly configured
-        # while the caller simply holds nothing on kube-agents-prow, which is
-        # the common case for anyone who is not the Prow service account.
-        if not _record_unreadable(
-            err,
-            f"Failed reading IAM policy for kube-agents-prow repository: {err.strip()}",
-            "Could not read the IAM policy on kube-agents-prow's kube-agents repository, so this "
-            "project's Cloud Build and Compute SAs were not checked for reader on the warm cache image",
-            details,
-            warnings,
-        ):
-            passed = False
-    else:
-        prow_checked = True
+    repositories_read = 0
+    cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
+    compute_sa = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
+    # Both live in the `us` multi-region location of kube-agents-prow, not in
+    # us-central1: the warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE
+    # to, and the candidate images.
+    for repository, holds, finding_segment in PROW_READ_REPOSITORIES:
+        rc, out, err = run_cmd([
+            "gcloud", "artifacts", "repositories", "get-iam-policy",
+            repository,
+            f"--project={WARM_CACHE_REPOSITORY_PROJECT}",
+            f"--location={WARM_CACHE_REPOSITORY_LOCATION}",
+            "--format=json",
+        ])
+        if rc != 0:
+            # A cross-project read. The pool project can be perfectly configured
+            # while the caller simply holds nothing on kube-agents-prow, which is
+            # the common case for anyone who is not the Prow service account.
+            if not _record_unreadable(
+                err,
+                f"Failed reading IAM policy for kube-agents-prow repository {repository}: {err.strip()}",
+                f"Could not read the IAM policy on kube-agents-prow's {repository} repository, so this "
+                f"project's Cloud Build and Compute SAs were not checked for reader on {holds}",
+                details,
+                warnings,
+            ):
+                passed = False
+            continue
+        repositories_read += 1
         try:
             policy = _load_json(out)
-            cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
-            compute_sa = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
             readers = set()
             for b in policy.get("bindings", []):
                 if b.get("role") == "roles/artifactregistry.reader":
                     readers.update(b.get("members", []))
-            warm_cache_grant = (
-                f"gcloud artifacts repositories add-iam-policy-binding kube-agents --project={WARM_CACHE_REPOSITORY_PROJECT} "
+            grant = (
+                f"gcloud artifacts repositories add-iam-policy-binding {repository} --project={WARM_CACHE_REPOSITORY_PROJECT} "
                 f'--location={WARM_CACHE_REPOSITORY_LOCATION} --member="{{member}}" --role=roles/artifactregistry.reader'
             )
             if cb_sa not in readers:
                 passed = False
                 _drift(
-                    details, findings, "warm_cache/reader/cloudbuild",
-                    f"Cloud Build SA ({cb_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
-                    warm_cache_grant.format(member=cb_sa),
+                    details, findings, f"warm_cache/{finding_segment}/cloudbuild",
+                    f"Cloud Build SA ({cb_sa}) missing roles/artifactregistry.reader on kube-agents-prow's {repository} repository",
+                    grant.format(member=cb_sa),
                 )
             if compute_sa not in readers:
                 passed = False
                 _drift(
-                    details, findings, "warm_cache/reader/compute",
-                    f"Compute SA ({compute_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
-                    warm_cache_grant.format(member=compute_sa),
+                    details, findings, f"warm_cache/{finding_segment}/compute",
+                    f"Compute SA ({compute_sa}) missing roles/artifactregistry.reader on kube-agents-prow's {repository} repository",
+                    grant.format(member=compute_sa),
                 )
         except Exception as exc:
             passed = False
-            details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
+            details.append(f"Failed parsing kube-agents-prow AR policy for {repository}: {exc}")
 
     if not passed:
-        message = "Warm cache reader grants missing"
-    elif not prow_checked:
-        message = "Not checked: the warm cache repository's policy could not be read"
+        message = "Warm cache or candidate image reader grants missing"
+    elif repositories_read == 0:
+        message = "Not checked: the Prow project's repository policies could not be read"
+    elif repositories_read < len(PROW_READ_REPOSITORIES):
+        message = "Reader held on the repository whose policy was read; the other could not be read"
     else:
-        message = "Cloud Build and Compute SAs hold reader on the warm cache repository"
+        message = "Cloud Build and Compute SAs hold reader on the warm cache and candidate image repositories"
     return CheckResult(
         "Warm Cache Readers",
         passed,
@@ -2253,7 +2283,7 @@ def check_warm_cache_readers(project_id: str, project_number: str) -> CheckResul
         details=details,
         warnings=warnings,
         findings=findings,
-        read=prow_checked,
+        read=repositories_read > 0,
     )
 
 

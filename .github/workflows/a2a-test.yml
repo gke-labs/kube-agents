@@ -77,6 +77,15 @@ on:
       - "agents/platform/scripts/workload_triage.py"
       - "agents/platform/skills/version-control/scripts/vcs.py"
       - "agents/platform/scripts/mcp_policy.py"
+      # The fleet-audit persona's tests read the persona and the platform
+      # reference it copies (fleetAuditVendored in a2a/lib/persona/claudecode).
+      - "agents/fleet-audit/persona/**"
+      # cmd/persona's shipped-manifest tests glob every agents/*/persona
+      # directory and read the persona image build steps in the publish
+      # workflow, so a new persona or a changed build context runs them.
+      - "agents/*/persona/**"
+      - ".github/workflows/docker-publish-ghcr.yml"
+      - "agents/platform/skills/fleet-audit/references/findings-document.md"
       # hermes-bridge's incident_test.go reads the incident_context hook to
       # keep the bridge's copy of its frame and token list in step; an edit
       # to the hook alone has to run that test.
@@ -150,6 +159,10 @@ jobs:
               - "agents/platform/scripts/workload_triage.py"
               - "agents/platform/skills/version-control/scripts/vcs.py"
               - "agents/platform/scripts/mcp_policy.py"
+              - "agents/fleet-audit/persona/**"
+              - "agents/*/persona/**"
+              - ".github/workflows/docker-publish-ghcr.yml"
+              - "agents/platform/skills/fleet-audit/references/findings-document.md"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
               - "tests/conformance/chat-ux/**"

@@ -77,11 +77,12 @@ method it was initialised with, and the passwordless DSN will be rejected. Movin
 an existing install onto this manifest means deleting
 `data-hindsight-postgresql-0`, which discards every stored memory.
 
-**LiteLLM takes no key either.** The gateway runs without a master key — the
-agents authenticate to it with the literal string `none`
+**Hindsight sends LiteLLM a placeholder, not a key.** The agents send the literal
+string `none`
 ([`deploy/shared/defaults/config.yaml`](../../../../deploy/shared/defaults/config.yaml)) and
 Hindsight does the same. The value is a placeholder the OpenAI-compatible client
-insists on, not a credential. The real provider keys (Gemini, Anthropic, OpenAI)
+insists on, not a credential; the gateway's caller-auth hook admits it as the
+`keyless` class ([`litellm_caller_auth.py`](../litellm/base/litellm_caller_auth.py)). The real provider keys (Gemini, Anthropic, OpenAI)
 live in LiteLLM's own secret and never reach this pod.
 
 ## What the agent connects to

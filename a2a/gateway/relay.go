@@ -133,6 +133,10 @@ var reasonSentences = map[string]string{
 	// The worker adapter passes the harness's own result subtype through as the token.
 	"error_max_turns":        "the agent used up its turns before it answered; ask again with a smaller task",
 	"error_during_execution": "the agent hit an error while it worked and produced no answer",
+	// The Antigravity CLI's own two (#6709): a tool call it could not get
+	// approval for was skipped, and its --print-timeout cut the turn short.
+	"permission-denied": "the agent needed a tool it isn't allowed to use here, so it stopped without finishing",
+	"print-timeout":     "the agent ran out of time before it answered; ask again with a smaller task",
 	// A delegation the gateway could not carry through.
 	"delegation-refused": "the agent could not hand this to another agent",
 	"wake-not-started":   "the agent could not pick the delegated work back up",
@@ -142,7 +146,7 @@ var reasonSentences = map[string]string{
 
 // reasonDetailShown names the tokens whose detail is written for the
 // person: the verifier's rule (capability.Reason), the dispatcher's
-// admission wording, a delegation's own why. That detail is shown, cut
+// admission wording, a delegation's own why, a write refusal's verb. That detail is shown, cut
 // before any session id (reasonSessionMarker).
 var reasonDetailShown = map[string]bool{
 	"capability-refused":     true,
@@ -150,6 +154,9 @@ var reasonDetailShown = map[string]bool{
 	"parameters-invalid":     true,
 	"queue-timeout":          true,
 	"delegation-not-started": true,
+	// A task stopped at its first write refusal (worker-adapter
+	// writeRefusedReason): the refused verb, and that the change was not made.
+	"write-refused": true,
 }
 
 // KV access rides withRetry with these shapes: enough to ride out a
@@ -368,6 +375,15 @@ func firstDeliveryLevel(item relayItem) slog.Level {
 	return slog.LevelDebug
 }
 
+// storedAt is when the stream stored the item's message, zero when it has no
+// delivery or the server sent no metadata.
+func (item relayItem) storedAt() time.Time {
+	if item.d == nil {
+		return time.Time{}
+	}
+	return item.d.Received()
+}
+
 // sequence is the item's stream sequence, 0 when it has none.
 func (item relayItem) sequence() uint64 {
 	if item.d == nil {
@@ -552,6 +568,18 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			addressee, _, _, _ := lib.ParseTaskSubject(item.subject)
 			g.log.Warn("relay: event dropped; it came on another addressee's subject",
 				"session", sessionKey, "taskId", item.env.TaskID, "subjectAddressee", addressee, "taskAddressee", taskAddressee(rec, item.env.TaskID))
+			g.settle(item)
+			continue
+		}
+		if !g.client.AcceptSupervisorEvent(item.subject, item.storedAt(), g.taskIsProfile(rec, item.env.TaskID, taskAddressee(rec, item.env.TaskID))) {
+			// A five-token supervisor message on a profile task, stored
+			// after the install's cutoff (#5301): the dispatcher writes a
+			// profile task's terminal on the six-token form by then, so
+			// this one is not the task's. Settled, never rendered and
+			// never a wake; the client counts it.
+			g.log.Warn("relay: five-token supervisor event on a profile task, stored after the cutoff, dropped",
+				"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
+				"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
 			g.settle(item)
 			continue
 		}
@@ -971,6 +999,12 @@ func reasonInPlainWords(reason string) (string, bool) {
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
 	ref, _ := rec.TaskRefFor(taskID)
+	// A profile task's own terminal, the executor's or the supervisor's,
+	// ends its wait: its live children, a batch or a single child holding
+	// the conversation, are cancelled now. Nothing else here triggers it.
+	if !ref.Canceled {
+		g.cancelOrphanedChildren(ctx, rec, taskID)
+	}
 	// A task the gateway canceled posts nothing at its end: no turn answer,
 	// result, notice or steer shortfall (applyCanceledEvent). Its line is
 	// still closed below, once, and its end logged and observed. A task with
@@ -1037,7 +1071,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
 		addressee := rec.AddresseeFor(taskID)
-		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
+		if task, err := g.replayForTerminal(ctx, addressee, taskID, g.taskIsProfile(rec, taskID, addressee)); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
 				replayedResult = art.Parts
@@ -1236,14 +1270,17 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
-		if !active.Detached && rec.fanOutPending(taskID) {
+		if !active.Detached && rec.fanOutPending(taskID) && !rec.profileTask(taskID) {
 			// A turn whose batch is still running keeps the conversation
 			// until the last child ends (wakeBatch releases it): a stop
 			// reaches it, a steer is refused and a status lists the
-			// children. Its line is closed above.
+			// children. Its line is closed above. A profile parent's
+			// terminal is its real end, not a hand-off: it waited open for
+			// its children and stopped waiting, so it lets go here as any
+			// task does, and its children are cancelled (cancelOrphanedChildren).
 			active.StatusMsgID = ""
 		} else {
-			rec.ActiveTask = nil
+			g.releaseEndedTask(ctx, rec, active)
 		}
 		// An executor's end of a live task is activity. The Slack adapter's
 		// session-thread rule (hasSession, through LastTaskActivity) counts
@@ -1477,14 +1514,15 @@ func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID 
 	}
 }
 
-// replayForTerminal is relayTerminal's read of the task's stream.
-func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+// replayForTerminal is relayTerminal's read of the task's stream. profile is
+// taskIsProfile's answer for the task.
+func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string, profile bool) (*lib.Task, error) {
 	if g.terminalReplayHook != nil {
 		if err := g.terminalReplayHook(taskID); err != nil {
 			return nil, err
 		}
 	}
-	return g.client.TasksGet(ctx, addressee, taskID)
+	return g.client.TasksGet(ctx, addressee, taskID, lib.ProfileTaskIf(profile))
 }
 
 // runReasonToken is the token a scheduled run's record carries for a

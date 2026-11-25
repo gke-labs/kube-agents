@@ -16,8 +16,8 @@ produced here, deterministically.
 
 Two-command lifecycle, plus three on-demand commands:
 
-    audit_report.py start     --audit <audit-id>
-    audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
+    audit_report.py start     --audit <audit-id> [--store-only]
+    audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run | --store-only]
                           [--scheduled]
                           [--manifest-file <path> | --no-collector-manifest <why>]
                           [--decline-fix <id> <why> ...]
@@ -25,6 +25,10 @@ Two-command lifecycle, plus three on-demand commands:
                           --finding <id> [--finding <id>...] [--dry-run]
     audit_report.py fetch     --audit <audit-id> --path <repo-path> [--path ...]
     audit_report.py list      --audit <audit-id> [--prefix <repo-path>]
+
+A shadow run (`--store-only`, which the runtime's PROFILE_TASK_DRY_RUN=true
+requires) keeps its report in the report store's shadow stream and does
+nothing else: see `shadow_mode` and `shadow_stream`.
 
 There are two ways a fix reaches GitHub, and which one runs depends on whether
 a broker is configured.
@@ -258,6 +262,8 @@ AUDITS: dict[str, AuditSpec] = {
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
             "ingress-gateway-healthcheck-mismatch",
+            "network-daemonset-missing-ccc-toleration",
+            "image-pull-failing",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -367,9 +373,11 @@ AUDITS: dict[str, AuditSpec] = {
             "label-keys",
             "image-type",
             "database-encryption",
-            # §4.14, the one check that runs outside a cohort. Last because
-            # the roster is the SOP's `####` heading order.
+            # §4.14, the one check that runs outside a cohort.
             "no-environment-label",
+            # §4.15, voted by node pool. The roster is the SOP's `####`
+            # heading order.
+            "boot-disk",
         ),
         # §3 step 6's split-cluster guard: a cluster that is an outlier on six
         # or more facets is a different kind of cluster, not a drifting one, so
@@ -405,6 +413,7 @@ AUDITS: dict[str, AuditSpec] = {
             "reservation-mismatch-risk",
             "autoscaler-out-of-resources",
             "dangling-compute-class",
+            "ccc-unbacked-manual-fallback",
         ),
         # §4's manifest note: the `project/<id>` entry carries the two
         # project-scoped checks. `reservation-mismatch-risk` sits under both
@@ -425,6 +434,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "reservation-mismatch-risk",
                     "autoscaler-out-of-resources",
                     "dangling-compute-class",
+                    "ccc-unbacked-manual-fallback",
                 ),
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
@@ -437,7 +447,7 @@ AUDITS: dict[str, AuditSpec] = {
         # finding; the join tells the arms apart by the collector's excerpt
         # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
         # validator cannot, and the SOP's step carries that distinction. The
-        # other eleven are capacity faults no
+        # other twelve are capacity faults no
         # declaration excuses: a quota near its limit, a ComputeClass with no
         # fallback, a Spot shape that gets preempted, an autoscaler that
         # already failed to add a node.
@@ -1292,6 +1302,8 @@ CHECK_PHRASES = {
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
+    "network-daemonset-missing-ccc-toleration": "{object} can't start on one or more node pools",
+    "image-pull-failing": "{object} cannot pull its image",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -1327,6 +1339,7 @@ CHECK_PHRASES = {
     "label-keys": "labels differ from its peers",
     "image-type": "node image type differs from its peers",
     "database-encryption": "secrets encryption differs from its peers",
+    "boot-disk": "{object} node pool has a different boot disk from its peers",
     "no-environment-label": "has no environment label",
     "uncohorted": "differs from its peers on too many settings to compare",
     # AI Workload Security Audit
@@ -1349,6 +1362,7 @@ CHECK_PHRASES = {
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
+    "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists machine options that it cannot use",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -3191,7 +3205,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Twelve markers. A cost collector sets `service-fronted` on an idle
+# Thirteen markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -3242,6 +3256,11 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # other three are set by `collect.py` for the same reason, on §2.7,
 # §3.16 and §3.19; `collect.py`'s `TRIAGE_BY_SLUG` says what each fix risks.
 #
+# The stockout collector sets `manual-pool-fallback` on every §3.13 finding:
+# the fix adds a node pool for each rule that has none, or lets GKE create
+# node pools for the class, and the collector cannot tell which the owners
+# want.
+#
 # The text beside each marker is what the ledger prints after the finding's
 # title in the "fix needs a decision" block, so a reader sees why the sweep
 # passed over that one without opening it. Keep it a clause about the fix.
@@ -3258,6 +3277,8 @@ TRIAGE_REASONS = {
     "service-selector": "rewrites or deletes a Service on a judgement about its backend",
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
     "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
+    "manual-pool-fallback": "creates node pools or turns on automatic node pool creation, and which of the two is the owners' call",
+    "image-pull": "follows from why the pull fails, which the alert's triage establishes and this audit does not",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
@@ -3813,6 +3834,174 @@ def validate_audit_id(audit_id: str) -> str:
     return audit_id
 
 
+# Shadow runs (#5623): a run beside the job it may replace, which writes its
+# report to the report store and nothing else: no ledger, no forge or git
+# write, no remediation, no chat. The task decides it, not the model's command
+# line: the worker exports a task's parameters as PROFILE_TASK_<NAME>, so a
+# task whose `dry_run` parameter is true (the fleet-audit profile declares it,
+# #6807, and a canary's AgentSchedule sets it) has SHADOW_TASK_ENV set.
+# `--store-only` on `start` and `finish` must agree with it (`shadow_mode`),
+# and `start` records the mode, so a run started as a shadow run ends as one
+# even with no runtime word (`run_is_shadow`). A run with neither is live.
+STORE_ONLY_FLAG = "--store-only"
+SHADOW_TASK_ENV = "PROFILE_TASK_DRY_RUN"
+# The schedule a dispatched task came from. The worker adapter exports it
+# when the task carries a trigger (#6959); a task with none, or a run
+# started by hand, leaves it unset and takes the fallback stream. It is outside the
+# PROFILE_TASK_ prefix the task's parameters use, so no parameter can set it.
+# It names the shadow stream (`shadow_stream`), which the broker requires to
+# be the trigger's stream for a profile's write.
+SHADOW_TRIGGER_STREAM_ENV = "PROFILE_TRIGGER_STREAM"
+# A shadow run with no schedule identity (one started by hand) writes to
+# `<audit>` plus this.
+SHADOW_STREAM_SUFFIX = "-shadow"
+# The report store's stream-name shape (audit_report_store.AUDIT_ID_RE).
+SHADOW_STREAM_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+# The envelope keys a shadow run adds: that it is one, the stream it went to,
+# and the summary a live run would have sent to chat, kept instead of posted.
+SHADOW_KEY = "shadow"
+SHADOW_STREAM_KEY = "shadow_stream"
+SHADOW_SUMMARY_KEY = "shadow_summary"
+# The run record's mark that `start` began a shadow run.
+RUN_RECORD_SHADOW_KEY = "shadow"
+# What reads as "not a shadow run" in SHADOW_TASK_ENV; anything else set reads
+# as one, so a spelling the runtime didn't mean as false can't publish live.
+SHADOW_TASK_FALSE = frozenset({"false", "0", "no", "off"})
+# Why `precheck` closes nothing in a shadow run.
+PRECHECK_SHADOW_REASON = "a shadow run closes nothing from the live stream's stored document"
+
+
+def task_is_shadow() -> bool | None:
+    """What the runtime says: True or False when SHADOW_TASK_ENV is set, None when it isn't.
+
+    Fails closed: only an explicit false (SHADOW_TASK_FALSE) is live.
+    """
+    raw = os.environ.get(SHADOW_TASK_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() not in SHADOW_TASK_FALSE
+
+
+def run_is_shadow(audit_id: str) -> bool:
+    """Whether this stream's last `start` was a shadow run's; read to block a live publish, so it fails closed.
+
+    True while the stream's run record says shadow, whether or not that run is
+    still in flight: a shadow `finish` that died releases its in-flight note,
+    and its retry must not publish live by leaving the flag out. The record
+    goes when the next `start` replaces it, so a live run begins with a live
+    `start`. A live record never refuses `--store-only`: a shadow publish
+    writes nothing live (`shadow_mode`).
+    """
+    try:
+        record = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and record.get("audit") == audit_id and record.get(RUN_RECORD_SHADOW_KEY) is True
+
+
+def run_shadow(audit_id: str) -> bool:
+    """Whether this run is a shadow run: the runtime's word when it gives one, else this stream's last `start`.
+
+    An explicit runtime word wins both ways, as in `shadow_mode`: a task the
+    runtime marks live is live whatever record a shadow run left, and one it
+    marks shadow is shadow. Only a silent runtime (a run started by hand)
+    reads the record (`run_is_shadow`), which fails closed.
+    """
+    runtime = task_is_shadow()
+    if runtime is not None:
+        return runtime
+    return run_is_shadow(audit_id)
+
+
+def shadow_store_repo(audit_id: str) -> str:
+    """The store key a shadow run writes its stream under: the install's own.
+
+    The broker lets a profile write only to the key `finish` publishes to
+    (credential_proxy.report_write_permitted), so a shadow run uses the same
+    rule, read from the registered repositories with no forge call:
+    `NO_FORGE_REPO` with none, the one repository, or the gitops-role one;
+    several with none chosen is `NO_FORGE_REPO`, as the broker answers.
+    A list that can't be read raises: the run can't know where it may write.
+    """
+    try:
+        return resolve_repo_or_no_forge(audit_id)
+    except NoGitOpsRepo:
+        # Several repositories and none chosen: the broker's answer is
+        # no_forge too. Anything else (a list that can't be read or used)
+        # raises: the run can't know where it may write.
+        return NO_FORGE_REPO
+
+
+def shadow_mode(args: argparse.Namespace, command: str) -> bool:
+    """Whether this `start` or `finish` is a shadow run; ValidationError when the flag and the runtime disagree.
+
+    The runtime decides (`task_is_shadow`). A task that is a shadow run must
+    say `--store-only` on the publishing calls, so no step can write a live
+    ledger by leaving the flag out; a `finish --dry-run` preview writes
+    nothing and passes. A task the runtime says is live refuses
+    `--store-only`. With no runtime word (a run started by hand) the flag
+    decides, and `--store-only` with `--dry-run` is refused: a preview of a
+    shadow run is the dry run itself.
+    """
+    flag = bool(getattr(args, "store_only", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    runtime = task_is_shadow()
+    # With the runtime silent, a `finish` after a shadow `start` is a shadow
+    # run's (`run_is_shadow`, fail-closed); a live record decides nothing.
+    if runtime is None and command == "finish" and run_is_shadow(validate_audit_id(args.audit)):
+        runtime = True
+    if flag and dry_run:
+        raise ValidationError(
+            f"{STORE_ONLY_FLAG} and --dry-run: pass one. --dry-run writes nothing; "
+            f"{STORE_ONLY_FLAG} writes the report to the store and nothing else."
+        )
+    if runtime is True and not flag and not dry_run:
+        raise ValidationError(
+            f"this is a shadow run ({SHADOW_TASK_ENV}, or this run's `start`): `{command}` must pass "
+            f"{STORE_ONLY_FLAG}, which writes the report to the store and nothing else."
+        )
+    if runtime is False and flag:
+        raise ValidationError(
+            f"{STORE_ONLY_FLAG}: this task is live ({SHADOW_TASK_ENV} is false), so it "
+            "publishes as a live run; leave the flag out."
+        )
+    return flag
+
+
+def shadow_stream(audit_id: str) -> str:
+    """The report-store stream a shadow run of `audit_id` writes to.
+
+    The schedule's own name when the runtime gives one
+    (SHADOW_TRIGGER_STREAM_ENV), so two canaries of one audit keep separate
+    baselines; it must be a store stream name and must not be a real audit's
+    stream. Otherwise `<audit>-shadow`. Never a command-line argument: the
+    model doesn't choose where its run's report goes.
+    """
+    raw = (os.environ.get(SHADOW_TRIGGER_STREAM_ENV) or "").strip()
+    if not raw:
+        return audit_id + SHADOW_STREAM_SUFFIX
+    if not SHADOW_STREAM_RE.match(raw):
+        raise ValidationError(
+            f"{SHADOW_TRIGGER_STREAM_ENV}={raw!r} is not a report-store stream name "
+            "(a DNS-1123 label); the shadow run has nowhere to write."
+        )
+    if raw in AUDITS:
+        raise ValidationError(
+            f"{SHADOW_TRIGGER_STREAM_ENV}={raw!r} is a live audit's stream; a shadow "
+            "run never writes there."
+        )
+    return raw
+
+
+def refuse_remediate_in_shadow(args: argparse.Namespace, audit_id: str) -> None:
+    """`remediate` drafts nothing in a shadow run: ValidationError when the flag, the runtime or this run's `start` says it is one."""
+    if getattr(args, "store_only", False) or run_shadow(audit_id):
+        raise ValidationError(
+            f"remediate: this is a shadow run ({STORE_ONLY_FLAG}, {SHADOW_TASK_ENV}, or this run's `start`), "
+            "which writes its report to the store and nothing else; it opens no remediation."
+        )
+
+
 def audit_name(audit_id: str) -> str:
     return AUDITS[audit_id].title
 
@@ -4047,14 +4236,20 @@ def skill_path(*parts: str) -> str:
     return "/".join([gitops_workspace.agent_home(), PLATFORM_PROFILE_SUBDIR, SKILL_SUBDIR, *parts])
 
 
-def next_steps(audit_id: str, findings_path: str) -> list[str]:
-    """What `start` tells the worker to do after it, each step with the file it needs."""
+def next_steps(audit_id: str, findings_path: str, store_only: bool = False) -> list[str]:
+    """What `start` tells the worker to do after it, each step with the file it needs.
+
+    A shadow run's `finish` must pass --store-only (`shadow_mode`), so its
+    command carries it.
+    """
     finish = (
         f"{skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} finish --audit {audit_id} "
         f"--findings-file {findings_path}"
     )
     if audit_id in COLLECTOR_AUDITS:
         finish += f" --manifest-file {manifest_path_for(audit_id)}"
+    if store_only:
+        finish += " --store-only"
     return [
         f"Read the SOP at {sop_path(audit_id)} in full, then run every check in `checks` "
         "the way it says, recording each check and its command in checks_run as it completes.",
@@ -4797,17 +4992,22 @@ def report_envelope(
     }
 
 
-def _adopt_owner(path: Path, owner: os.stat_result) -> None:
-    """Give `path` to `owner`'s uid and gid when this run is root.
+def _adopt_owner(descriptor: int, owner: os.stat_result) -> None:
+    """Give the open file or directory `descriptor` to `owner`'s uid and gid
+    when this run is root.
 
     Mode alone cannot fix a root hand-run: uid 1000 can read a root-owned 0755
     directory but cannot create the temp file or rename over `latest.json` in
     it, so every later run would lose its memory and fail its write. Root is
     the one writer that can hand what it creates to the store's owner, and
     any other uid creates what it owns.
+
+    Through a descriptor, never a name: the store's directories are the store
+    owner's, so an entry root just made can be swapped for a link before the
+    chown, and a chown by name would follow it to the link's target.
     """
     if os.geteuid() == ROOT_UID:
-        os.chown(path, owner.st_uid, owner.st_gid)
+        os.fchown(descriptor, owner.st_uid, owner.st_gid)
 
 
 def _make_store_dirs(path: Path) -> None:
@@ -4825,8 +5025,18 @@ def _make_store_dirs(path: Path) -> None:
         except FileExistsError:
             # A rival run made it, and chose its ownership then.
             continue
-        os.chmod(directory, REPORT_DIR_MODE)
-        _adopt_owner(directory, owner)
+        _settle_new_dir(directory, owner)
+
+
+def _settle_new_dir(directory: Path, owner: os.stat_result) -> None:
+    """Set a just-made directory's mode and owner through a no-follow open of
+    it, so neither lands on a link swapped in since the mkdir."""
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(descriptor, REPORT_DIR_MODE)
+        _adopt_owner(descriptor, owner)
+    finally:
+        os.close(descriptor)
 
 
 def _ownership_note(exc: BaseException) -> str:
@@ -4862,9 +5072,11 @@ def _atomic_write(path: Path, text: str) -> None:
     )
     try:
         with handle:
+            # Mode and owner through the open descriptor, not the name, which
+            # can be swapped for a link before the rename.
+            os.fchmod(handle.fileno(), REPORT_FILE_MODE)
+            _adopt_owner(handle.fileno(), path.parent.stat())
             handle.write(text)
-        os.chmod(handle.name, REPORT_FILE_MODE)
-        _adopt_owner(Path(handle.name), path.parent.stat())
         os.replace(handle.name, path)
     except BaseException:
         # Anything that leaves the temp file behind leaves it in the store,
@@ -18770,6 +18982,7 @@ def write_run_record(
     searched: list[str] | None = None,
     sources: list[dict] | None = None,
     decision: LedgerDecision | None = None,
+    shadow: bool = False,
 ) -> str:
     """Record which repositories this run's declared-intent step must search.
 
@@ -18803,6 +19016,7 @@ def write_run_record(
                 RUN_RECORD_SEARCHED_KEY: list(searched or []),
                 RUN_RECORD_SOURCES_KEY: list(sources or []),
                 RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
+                **({RUN_RECORD_SHADOW_KEY: True} if shadow else {}),
                 **(
                     {
                         RUN_RECORD_UNREACHABLE_KEY: {"repo": unreachable[0], "reason": unreachable[1]},
@@ -22534,9 +22748,12 @@ def _open_store_ledger(repo: str, audit_id: str) -> tuple[Path, list[dict[str, s
 
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    shadow = shadow_mode(args, "start")
+    if shadow and getattr(args, "repo", None):
+        raise ValidationError(f"--repo: a shadow run ({STORE_ONLY_FLAG}) publishes to no repository.")
     claim_in_flight(audit_id)
     try:
-        _start(args, audit_id)
+        _start(args, audit_id, shadow=shadow)
     except BaseException:
         # A `start` that raised left no run in flight, so the retry must not
         # be refused for its own failure. The refusal above sits outside this
@@ -22546,7 +22763,7 @@ def handle_start(args: argparse.Namespace) -> None:
         raise
 
 
-def _start(args: argparse.Namespace, audit_id: str) -> None:
+def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> None:
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
@@ -22563,12 +22780,21 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
             stale.unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
-    decision = resolve_reachable_repo(audit_id, opt_repo)
+    if shadow:
+        # A shadow run writes nothing to the forge and keeps no chat report: it
+        # runs the checks as an install with no forge does. The declared-intent
+        # search below still reads the context repositories, as a live run's
+        # does, so the two runs' findings compare.
+        decision = LedgerDecision(NO_FORGE_REPO, LEDGER_STORE, False, None)
+        log(f"SHADOW RUN: this run's report goes to the report store alone ({shadow_stream(audit_id)}).")
+    else:
+        decision = resolve_reachable_repo(audit_id, opt_repo)
     repo, unreachable = decision.publish_repo, decision.unreachable
     # The relay posts what this file holds instead of the run's final message,
     # so a run that dies before its `finish` must not leave the previous run's
     # report there.
-    open_chat_report(audit_id, repo, datetime.now(timezone.utc))
+    if not shadow:
+        open_chat_report(audit_id, repo, datetime.now(timezone.utc))
     no_forge = repo == NO_FORGE_REPO
     if no_forge:
         # The checks still run; only the ledger and the fixes have nowhere to go.
@@ -22598,6 +22824,22 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     # not get this far leaves no record at all, and `finish` withholds rather
     # than measuring the document against yesterday's list.
     context_entries = context_repo_entries()
+    if shadow:
+        # A live run's search starts from the install's GitOps repository; a
+        # shadow run has no ledger repository, so that repository joins the
+        # search as a context repository (read, never written), and the two
+        # runs owe the same declared-intent search.
+        # As in a live run, a `ref` or a refused `ref` on a context entry
+        # naming that repository isn't honoured: the run reads its default
+        # branch. So any entry naming it, in any spelling, gives way to one
+        # with no pin (the search keys its pins on the lowercased slug).
+        gitops = shadow_store_repo(audit_id)
+        if gitops != NO_FORGE_REPO:
+            key = gitops.strip().lower()
+            context_entries = [
+                {"repo": gitops, "ref": None, REFUSED_REF_KEY: None},
+                *[entry for entry in context_entries if entry["repo"].strip().lower() != key],
+            ]
     context = [entry["repo"] for entry in context_entries]
     # The harness's half of the declared-intent step, before the record is
     # written so the record carries what it read: every repository the step
@@ -22610,7 +22852,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     )
     declarations_path = write_declarations(audit_id, repo, declarations)
     write_run_record(
-        audit_id, repo, context, searched=searched, sources=sources, decision=decision
+        audit_id, repo, context, searched=searched, sources=sources, decision=decision, shadow=shadow
     )
 
     print(
@@ -22732,7 +22974,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                     "reasons. A check you could have run and did not is not one "
                     "of those; it is a limitations note and a real gap."
                 ),
-                NEXT_STEPS_KEY: next_steps(audit_id, findings_path),
+                NEXT_STEPS_KEY: next_steps(audit_id, findings_path, store_only=shadow),
             }
         )
     )
@@ -23571,6 +23813,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     findings a run on its own, but a human who asked for one by name gets it.
     """
     audit_id = validate_audit_id(args.audit)
+    refuse_remediate_in_shadow(args, audit_id)
     data = load_findings(args.findings_file, audit_id)
     opt_repo = getattr(args, "repo", None)
     # The same withhold `finish` applies, against the same record. A direct
@@ -24012,7 +24255,7 @@ def _previous_store_envelope(
     return None, False
 
 
-def previous_no_forge_record(audit_id: str) -> dict | None:
+def previous_no_forge_record(audit_id: str, store_repo: str = NO_FORGE_REPO) -> dict | None:
     """The envelope the previous run with no forge stored; None when unknowable.
 
     `{}` when the store holds no envelope for this key at all: the run is
@@ -24024,7 +24267,7 @@ def previous_no_forge_record(audit_id: str) -> dict | None:
     (`NOT_RECHECKED_KEY`) are in it.
     """
     envelope, known = _previous_store_envelope(
-        audit_id, NO_FORGE_REPO, NO_FORGE_STATUS, "a run with no forge"
+        audit_id, store_repo, NO_FORGE_STATUS, "a run with no forge"
     )
     if not known:
         return None
@@ -24412,6 +24655,8 @@ def _finish_without_forge(
     scheduled: bool = False,
     unreachable: tuple[str, str] | None = None,
     probe: str = REACHABILITY_PROBE_VERB,
+    shadow_to: str | None = None,
+    shadow_repo: str | None = None,
 ) -> dict | None:
     """Keep a run on an install with no forge in the report store, and print its line.
 
@@ -24442,7 +24687,16 @@ def _finish_without_forge(
     the not-re-checked entries stay in the record that run reads. A document
     `finish` would refuse is refused the same way, since validation runs
     before this.
+
+    `shadow_to` is a shadow run's stream (`shadow_stream`) and `shadow_repo`
+    the install's store key (`shadow_store_repo`): the delta and the
+    baselines come from that stream's previous record under that key, and the
+    envelope goes there, marked `shadow` with the summary a live run would post, and
+    nothing goes to chat. The store is a shadow run's only output, so a write
+    that fails raises instead of returning None.
     """
+    shadow = shadow_to is not None
+    stream = shadow_to or audit_id
     findings = list(data["findings"])
     declared = [entry for entry in data.get("declared") or [] if isinstance(entry, dict)]
     gaps = coverage_gaps(data) + ([waiver_gap(waiver)] if waiver else [])
@@ -24460,14 +24714,20 @@ def _finish_without_forge(
     # includes the not-re-checked entries: with no record, none are kept. It also
     # reads no scheduled baseline, so a scheduled diverted run says that the
     # change since the last scheduled run is unknown.
-    record = None if unreachable is not None else previous_no_forge_record(audit_id)
+    record = (
+        None
+        if unreachable is not None
+        else previous_no_forge_record(stream, store_repo=shadow_repo or NO_FORGE_REPO)
+    )
     previous_ids = (
         None if record is None else [str(fid) for fid in record.get("current_ids") or []]
     )
     marker = diverted_marker(unreachable)
-    store_repo = unreachable[0] if unreachable and unreachable[0] else NO_FORGE_REPO
+    store_repo = shadow_repo or (unreachable[0] if unreachable and unreachable[0] else NO_FORGE_REPO)
     delta_known = previous_ids is not None
-    earlier = earlier_finish(audit_id, NO_FORGE_REPO, now)
+    # The chat record is the live stream's, keyed by the audit; a shadow run
+    # keeps none, so it has no earlier finish of its own to read there.
+    earlier = None if shadow else earlier_finish(audit_id, NO_FORGE_REPO, now)
     # A posture `finish` withheld is in the document, only not published,
     # which is how the ledger branch's `held_exclude` reads it too.
     held = sorted(
@@ -24575,14 +24835,15 @@ def _finish_without_forge(
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
-    save_chat_verdict(
-        audit_id,
-        NO_FORGE_REPO,
-        payload["silent_ok"],
-        [],
-        now,
-        news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
-    )
+    if not shadow:
+        save_chat_verdict(
+            audit_id,
+            NO_FORGE_REPO,
+            payload["silent_ok"],
+            [],
+            now,
+            news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
+        )
     envelope = report_envelope(
         audit_id,
         payload,
@@ -24603,9 +24864,33 @@ def _finish_without_forge(
         started_at=run_started,
     )
     envelope.update(marker)
+    if shadow:
+        # What a live run would have sent to chat, kept rather than posted, so
+        # the shadow can be compared with the job it may replace.
+        envelope[SHADOW_KEY] = True
+        envelope[SHADOW_STREAM_KEY] = stream
+        envelope[SHADOW_SUMMARY_KEY] = render_no_forge_summary(
+            audit_id,
+            data,
+            gaps,
+            new_ids,
+            resolved_ids,
+            delta_known,
+            held,
+            unreachable_note(unreachable, stored=True, probe=probe),
+            len(unpublished),
+            since_scheduled=since_scheduled_line(payload, delta_known),
+            unread=unread,
+            stored=True,
+        )
     # A diverted run wrote nothing to the ledger, so when its write fails the
     # stored record of the last published run is still correct.
-    stored = write_report(audit_id, envelope, now, ledger_unchanged=unreachable is not None)
+    stored = write_report(stream, envelope, now, ledger_unchanged=unreachable is not None)
+    if shadow and not stored:
+        raise RuntimeError(
+            f"the report store did not keep this shadow run's report ({stream}); the "
+            "store is its only output, so the run fails."
+        )
     # The store is the only record on this install, so the note says whether
     # it holds this run rather than promising it.
     note = unreachable_note(unreachable, stored=stored, probe=probe)
@@ -24630,9 +24915,14 @@ def _finish_without_forge(
         unread=unread,
         stored=stored,
     )
-    append_chat_report(
-        audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
-    )
+    if shadow:
+        payload[SHADOW_KEY] = True
+        payload[SHADOW_STREAM_KEY] = stream
+        payload["silent_ok"] = True
+    else:
+        append_chat_report(
+            audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
+        )
     print(json.dumps(payload))
     return envelope if stored else None
 
@@ -25375,6 +25665,8 @@ def _finish_store_ledger(
 
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    if shadow_mode(args, "finish") and getattr(args, "repo", None):
+        raise ValidationError(f"--repo: a shadow run ({STORE_ONLY_FLAG}) publishes to no repository.")
     if getattr(args, "dry_run", False):
         # A preview taken mid-run: the run is still in flight and keeps its note.
         _finish(args, audit_id)
@@ -25405,6 +25697,9 @@ def handle_finish(args: argparse.Namespace) -> None:
         release_in_flight(audit_id)
         raise
     release_in_flight(audit_id)
+    if getattr(args, "store_only", False):
+        # The gate's record is the live stream's; a shadow run leaves it alone.
+        return
     _record_scheduled_digest(args, audit_id, stored)
 
 
@@ -25790,6 +26085,10 @@ def handle_precheck(args: argparse.Namespace) -> None:
         line[PRECHECK_REASON_KEY] = PRECHECK_NOT_SCHEDULED_REASON
     elif run_llm:
         line[PRECHECK_REASON_KEY] = reasons.get(verdict, verdict)
+    elif run_shadow(audit_id):
+        # The stored document is the live stream's; a shadow run publishes
+        # only through its own `finish --store-only`.
+        line[PRECHECK_REASON_KEY] = PRECHECK_SHADOW_REASON + PRECHECK_CONTINUES_SUFFIX
     else:
         document, source = stored_scheduled_document(
             audit_id, getattr(args, "repo", None), delta.read_record(audit_id, SCRATCH_DIR)
@@ -25871,6 +26170,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
     # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
+    # The shadow gate, here and not only in `handle_finish`: `precheck`'s
+    # close calls this directly, and a shadow task must not publish live by
+    # any path.
+    if run_shadow(audit_id) and not args.dry_run and not getattr(args, "store_only", False):
+        raise ValidationError(
+            f"this task is a shadow run ({SHADOW_TASK_ENV}=true): it publishes only with "
+            f"{STORE_ONLY_FLAG}, which keeps the report in the store and nothing else."
+        )
     set_sweep_waived(getattr(args, "no_promote", False))
     # Read before the checks below tie this run to its `start`: a later
     # `start` can rewrite the run record while this run publishes.
@@ -25972,7 +26279,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # when `--repo` was given.
     unreachable: tuple[str, str] | None = None
     decision: LedgerDecision | None = None
-    if args.dry_run:
+    store_only = bool(getattr(args, "store_only", False))
+    if args.dry_run or store_only:
+        # A shadow run, like a dry run, asks the forge nothing.
         repo_hint = opt_repo
     else:
         decision = finish_target(audit_id, opt_repo)
@@ -25987,7 +26296,17 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # issue, and a dry run does not ask the forge for it. `_dry_run_repo`
     # gives the real run its resolved repository, and a dry run the same
     # repository on a best-effort basis.
-    previous_document = previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
+    # A shadow run reads its own stream under the install's key, so its
+    # wording never comes from the live stream's record or a forge lookup.
+    # The preview of a shadow run (`--dry-run` in a shadow task) reads what
+    # the shadow run will, so the two publish the same words.
+    is_shadow = store_only or run_shadow(audit_id)
+    shadow_repo = shadow_store_repo(audit_id) if is_shadow else None
+    previous_document = (
+        previous_run_document(shadow_stream(audit_id), shadow_repo)
+        if is_shadow
+        else previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
+    )
     for fid in carry_unchanged_findings(data["findings"], previous_document):
         log(f"{fid}: unchanged since the previous run; its wording is carried forward.")
     # After the carry: an impact sentence that tells which arm of a check
@@ -26055,6 +26374,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver, record=record
         )
         return
+
+    if store_only:
+        return _finish_without_forge(
+            audit_id,
+            data,
+            now,
+            run_started=run_started,
+            manifest=manifest,
+            waiver=waiver,
+            timers=timer_payload,
+            scheduled=scheduled,
+            shadow_to=shadow_stream(audit_id),
+            shadow_repo=shadow_repo,
+        )
 
     repo = repo_hint
     if repo == NO_FORGE_REPO:
@@ -27844,6 +28177,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo",
         help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
     )
+    start_parser.add_argument(
+        STORE_ONLY_FLAG,
+        dest="store_only",
+        action="store_true",
+        help=(
+            "A shadow run: no forge, ledger or chat; finish keeps the report in the "
+            f"store alone. Required when {SHADOW_TASK_ENV}=true, refused when it is false."
+        ),
+    )
 
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
@@ -27861,6 +28203,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate and render to stdout; perform zero git or forge side effects.",
+    )
+    finish_parser.add_argument(
+        STORE_ONLY_FLAG,
+        dest="store_only",
+        action="store_true",
+        help=(
+            "A shadow run: write the report to the report store (the shadow stream) "
+            "and nothing else: no ledger, no forge or git write, no remediation, no "
+            f"chat. Required when {SHADOW_TASK_ENV}=true, refused when it is false. "
+            "A store write that fails fails the run."
+        ),
     )
     finish_parser.add_argument(
         "--scheduled",
@@ -28066,6 +28419,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Render the pull-request bodies to stdout; zero git or forge side effects.",
+    )
+    remediate_parser.add_argument(
+        STORE_ONLY_FLAG,
+        dest="store_only",
+        action="store_true",
+        help="Refused: a shadow run opens no remediation.",
     )
     remediate_parser.add_argument(
         "--manifest-file",

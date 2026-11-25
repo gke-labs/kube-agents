@@ -61,7 +61,12 @@ started late holds only the waves that fit (`batch_size`), and none starts
 with less than one wave left. Clusters after that point are not reached this
 run. Every cluster in a call is stamped in `cluster_runs` however the call
 ended; the least recently stamped go first, and clusters stamped together are
-shuffled by the run's date so batch membership changes from run to run.
+shuffled by the run's date so batch membership changes from run to run. On a
+tick that swept at least one target, `cluster_runs` entries for clusters outside
+the current sweep's targets (`LEEWAY_WATCH_CLUSTERS` or the target projects)
+whose timestamp is unparseable or older than twice the refresh window
+(`2 * LEEWAY_WATCH_REFRESH_DAYS`) are dropped so clusters removed from
+`LEEWAY_WATCH_CLUSTERS` or from projects that leave the scope do not accumulate.
 Projects go least recently swept first (`project_runs`). A project whose turn
 starts with a full call's time is stamped then, so it rotates behind the
 others whatever the turn produces. Its turn ends at its first sandbox timeout,
@@ -85,7 +90,8 @@ Only ok rows count as read. A target only the budget kept from being read in
 full is not a failure: it posts nothing and is listed under the report's "Not
 Reached This Run". The partial-scan line posts when a target fails that has
 no open episode, naming the targets that failed this run (up to
-MAX_NAMES_IN_LINE, then "+N more"). An episode remembers the clusters that
+MAX_NAMES_IN_LINE, then "+N more"), while the per-target detail is logged to
+`logs/leeway_watch.log`. An episode remembers the clusters that
 failed (in a call that raised or timed out, or as an error row) and, with
 WHOLE_TARGET_MARKER, whether the target failed as a whole (its list could not
 be read, or an error row matched none of its clusters). It closes once each
@@ -97,15 +103,16 @@ signature of error kinds is read in the first run after the upgrade and then
 removed, without a line: a target failing in that run with a kind it holds
 opens its episode silently, and one failing with another kind posts.
 
-When no call returned a report the tick fails with one fixed sentence that
-names no target and no count, only whether the reads timed out, failed, or
-both. While the tick keeps failing it keeps the kinds the last line named, so
-the rotation does not change the line and it posts once while the condition
-lasts. A run of one project whose list failed, or whose one call held every
-cluster, keeps that project's entry instead (`RuntimeError: p1: <entry>`);
-under LEEWAY_WATCH_CLUSTERS, a run of one call that held every cluster keeps
-that call's own exception and message (`RuntimeError: leeway exited 1 without
-a report: <stderr>`).
+When a tick fails, it posts one plain line saying what did not happen, why,
+and whether it tries again tomorrow (or at its next scheduled run) or needs
+an admin, while the raw detail goes to `logs/leeway_watch.log`. `last-failure.txt`
+is keyed on the plain reason (taking an older marker's no-report sentence as
+its reason). When no call returned a report, the reason says only whether the
+reads timed out, failed, or both; while the tick keeps failing it keeps the
+kinds the last line named, so the rotation does not change the line and it
+posts once while the condition lasts. Exit code is 0 on every path, a ledger
+or report that cannot be written included, so the scheduler never replaces the
+tick's failure line with its own retry promise.
 
 Threshold filtering and environment knobs. Before ledger gating,
 `filter_report_findings` drops `unknown`-cause topology findings at their
@@ -121,8 +128,11 @@ findings), `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and
 CR's `spec.deployment.env`, which the operator's allowlist carries.
 `LEEWAY_WATCH_CLUSTERS`, `LEEWAY_WATCH_PROJECTS`, and `LEEWAY_WATCH_HOME` are
 not carried; they are overrides for runs started by hand in the pod. Pass
-`--dry-run` when probing narrower or wider thresholds by hand, so `ledger.json`
-and `reports/latest.*` are not mutated.
+`--dry-run` when probing narrower or wider thresholds by hand: it previews the
+exact `due_message` and `resolved_message` blocks a scheduled run would post,
+prefixed with `dry run (nothing posted):` (and prints a failing tick's raw
+detail to stderr), without mutating `ledger.json`, `reports/latest.*`,
+`last-failure.txt`, or `logs/leeway_watch.log`.
 
 State ledger, blackboard topic, and 7-day reminder gate. Under
 `<profile home>/leeway/`:
@@ -144,9 +154,10 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   change only when a finding comes due, and otherwise keep the previous report
   until a run reads every project in full. When
   `NATS_URL` is set, the JSON report is also published to the A2A blackboard
-  topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
-  once in chat on failure and retrying on a later tick that reads every target
-  in full without failing. A report too large for one bus message
+  topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), logging
+  any `a2a` error and remediation commands to `logs/leeway_watch.log` and
+  retrying silently on a later tick that reads every target in full without
+  failing. A report too large for one bus message
   (`TOPIC_ARTIFACT_BUDGET_BYTES`: the NATS limit less the envelope reserve and
   encoding slack) is published capped (`cap_topic_report`): the fleet's most
   severe findings in order, up to the first that does not fit, each kept in its
@@ -172,7 +183,7 @@ open; the report's path on the pod is not in it. Findings on clusters
 whose scan succeeded (`status == "ok"`) and that are no longer present are
 retired from `ledger.json` under their own headline in the same post, counting
 the cleared problems, then up to three of them by name. Lines about the scan
-itself (a partial scan, a recovery, a failed publish) follow both. A finding on a cluster its
+itself (a partial scan, a recovery) follow both in plain text. A finding on a cluster its
 project's cluster list no longer names retires once that list was read.
 Clusters whose scan failed (`status == "error"`), that were not reached, or
 whose project could not be scanned retain their existing ledger entries so a
@@ -197,9 +208,11 @@ from pathlib import Path
 from typing import Any, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cron_schedule  # noqa: E402
 import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
+import script_log  # noqa: E402
 
 # Where the job keeps its ledger and reports, under the agent home.
 HOME_ENV = "HERMES_HOME"
@@ -226,6 +239,8 @@ REFRESH_DAYS_ENV = "LEEWAY_WATCH_REFRESH_DAYS"
 REFRESH_DAYS_DEFAULT = 7
 REFRESH_DAYS_MAX = 365
 REFRESH_SLACK_SECONDS = 10 * 60
+# Age-based retention multiplier for `cluster_runs` rotation stamps (`2 * refresh_days()`).
+CLUSTER_RUNS_RETENTION_MULTIPLIER = 2
 
 # Alert filtering thresholds (optional environment overrides).
 MIN_SEVERITY_ENV = "LEEWAY_WATCH_MIN_SEVERITY"
@@ -350,6 +365,8 @@ CAUSE_MAX_CHARS = 160
 CAUSE_ELLIPSIS = "…"
 # How LEEWAY_WATCH_CLUSTERS is named when it takes more than one call.
 EXPLICIT_TARGET_LABEL = "the configured clusters"
+# How an unresolved declared scope (`fleet_scope_targets.UNRESOLVED_SCOPE_ROW`) is named in chat.
+UNRESOLVED_SCOPE_TARGET_LABEL = "the declared scope's member projects"
 # A project the resolved scope names but holds no cluster list for (spec.mode: next).
 UNREAD_PROJECT_DETAIL = "{target} was not swept: {reason}"
 
@@ -546,7 +563,37 @@ FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 
 # Output lines (stdout is `deliver: "chat"`).
 LINE_PREFIX = "leeway"
-RECOVERED_LINE = "{prefix} watch: the tick runs again"
+RECOVERED_LINE = "**The topology skew check is running again.**"
+FAILED_TICK_LINE = "**The topology skew check didn't run today.** {reason}. {next}"
+FAILED_WRITE_LINE = "**The topology skew check didn't finish today.** {reason}. {next}"
+FAILED_NEXT_DAILY = "It will try again tomorrow."
+FAILED_NEXT_UNKNOWN = "It will try again at its next scheduled run."
+FAILED_NEEDS_ADMIN = "An admin needs to fix this before it can run; the details are in the agent's log."
+WATCH_JOB_ID = "leeway-watch"
+WATCH_LOG_FILE = "leeway_watch.log"
+FAILED_REASON_SCOPE_UNREADABLE = "It couldn't read the install's scope"
+FAILED_REASON_WRITE = "It couldn't save its report"
+FAILED_REASON_TIMED_OUT = "Reading the clusters took too long"
+FAILED_REASON_MIXED = "Some cluster reads timed out and others failed"
+FAILED_REASON_NO_PROJECT = "It has no GCP project to read"
+FAILED_REASON_LEDGER = "Its record of earlier runs can't be read"
+FAILED_REASON_ERROR = "Reading the clusters failed"
+FAILED_REASONS_NEED_ADMIN = frozenset(
+    {
+        FAILED_REASON_SCOPE_UNREADABLE,
+        FAILED_REASON_WRITE,
+        FAILED_REASON_NO_PROJECT,
+        FAILED_REASON_LEDGER,
+    }
+)
+# Legacy `last-failure.txt` markers from before plain-text reasons held the raw
+# `NO_REPORT_DETAIL` sentence; normalize them so the first tick after upgrade
+# suppresses a duplicate post when the underlying no-report failure continues.
+LEGACY_NO_REPORT_REASONS: dict[str, str] = {
+    NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE): FAILED_REASON_TIMED_OUT,
+    NO_REPORT_DETAIL.format(cause=NO_REPORT_FAILED_CAUSE): FAILED_REASON_ERROR,
+    NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE): FAILED_REASON_MIXED,
+}
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
@@ -555,6 +602,7 @@ FAILED_WHAT_WRITE = "writing the ledger or the report"
 # "and N more". Names and items are cut so the message stays bounded however
 # many findings or however long a workload name.
 CHAT_HEADLINE = "**{text}**"
+CHAT_HEADLINE_PLACEHOLDER = "{text}"
 CHAT_ITEM = "- {text}"
 CHAT_MORE_ITEM = "- and {count} more"
 CHAT_LINE_SEPARATOR = "\n"
@@ -638,40 +686,43 @@ ZONE_CAUSE_PHRASES: dict[str, str] = {
     "domain_outage": "it takes no new pods because its nodes are not ready",
     "consolidation": "it has no nodes left",
 }
-TOPIC_PUBLISH_FAILED_LINE = (
+TOPIC_PUBLISH_FAILED_LOG = (
     "{prefix} watch: publishing to blackboard topic {topic} failed ({detail}); "
     "on upgraded installs, check `kubectl describe platformagent` for TopicsStateSubjectMissing "
     "and append {subject} with `nats stream edit TOPICS-STATE`"
 )
-TOPIC_PUBLISH_CLEARED_LINE = "{prefix} watch: publishing to blackboard topic {topic} succeeded again"
 PARTIAL_LINE = (
+    "**The topology skew check couldn't read {targets}.** "
+    "Existing findings there are kept until the next clean read."
+)
+PARTIAL_LOG = (
     "{prefix} watch: the fleet scan was partial ({errors} error(s)): {reasons}; "
     "findings on unreadable clusters are retained until read again"
 )
-PARTIAL_CLEARED_LINE = "{prefix} watch: every target that failed reads cleanly again"
+PARTIAL_CLEARED_LINE = "**The topology skew check read every project cleanly again.**"
 REPORT_NOT_REACHED_HEADING = "## Not Reached This Run"
 REPORT_NOT_REACHED_INTRO = (
     "The run's time ran out before these were read. Their unread clusters go first on their next turn, "
     "and their findings are kept until they are read."
 )
-DRY_RUN_WOULD_REPORT = "dry run: would report {count} finding(s) ({reasons}) across {clusters}: {names}"
-DRY_RUN_WOULD_RETIRE = "dry run: would retire {count} resolved finding(s) ({names})"
+DRY_RUN_PREFIX = "dry run (nothing posted):\n"
 DRY_RUN_NOTHING_DUE = "dry run: nothing due; active findings: {count}"
-DUE_SUBJECT_NAMESPACED = "{kind}/{namespace}/{name}"
-DUE_SUBJECT_CLUSTER = "{kind}/{name}"
-DUE_SUMMARY_WITH_SHARE = "{subject} [{cause}, {pct}%]"
-DUE_SUMMARY_NO_SHARE = "{subject} [{cause}]"
-DUE_CLUSTER_PREFIX = "{cluster}:{summary}"
-REASON_COUNT_FORMAT = "{count} {reason}"
 LIST_SEPARATOR = ", "
 MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
-WRITE_FAILED_EXIT = 2
 DATE_FORMAT = "%Y-%m-%d"
 
 
 class SandboxTimedOut(RuntimeError):
     """The sandbox run hit the client-side timeout."""
+
+
+class NoProject(RuntimeError):
+    """No source names a GCP project (`NO_PROJECT_DETAIL`)."""
+
+
+class LedgerUnusable(RuntimeError):
+    """The ledger could not be read or parsed; it is refused rather than overwritten."""
 
 
 class NoReportReturned(RuntimeError):
@@ -833,10 +884,10 @@ def projects(scope: fleet_scope_targets.ScopeTargets | None = None) -> list[str]
     try:
         completed = sandbox_exec.run(list(CONFIG_PROJECT_ARGV), timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS, check=False)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=PROJECT_LOOKUP_TIMEOUT_SECONDS)) from None
+        raise SandboxTimedOut(TIMED_OUT_DETAIL.format(seconds=PROJECT_LOOKUP_TIMEOUT_SECONDS)) from None
     configured = (completed.stdout or "").strip()
     if not configured:
-        raise RuntimeError(NO_PROJECT_DETAIL)
+        raise NoProject(NO_PROJECT_DETAIL)
     return [configured]
 
 
@@ -1423,10 +1474,20 @@ def topic_summary(message: str) -> str:
     """A chat message's headline as plain text: the summary other agents read
     on the blackboard topic, which carries the report itself as data."""
     headline = message.split(CHAT_LINE_SEPARATOR, 1)[0]
-    bold_open, bold_close = CHAT_HEADLINE.split("{text}")
+    bold_open, bold_close = CHAT_HEADLINE.split(CHAT_HEADLINE_PLACEHOLDER)
     if headline.startswith(bold_open) and headline.endswith(bold_close):
         headline = headline[len(bold_open) : len(headline) - len(bold_close)]
     return headline
+
+
+def plain_status_line(line: str) -> str:
+    """Strip the bold headline markers from a status line that follows an earlier line in the post."""
+    bold_open, bold_close = CHAT_HEADLINE.split(CHAT_HEADLINE_PLACEHOLDER)
+    if line.startswith(bold_open):
+        end = line.find(bold_close, len(bold_open))
+        if end != -1:
+            return line[len(bold_open) : end] + line[end + len(bold_close) :]
+    return line
 
 
 def chat_message(headline: str, items: list[str], tail: str = "") -> str:
@@ -1468,27 +1529,6 @@ def due_message(due_items: list[dict[str, Any]], due_reasons: list[str], next_da
     return chat_message(headline, items, DUE_FOLLOW_UP.format(next_date=next_date))
 
 
-def due_finding_summary(item: dict[str, Any], *, include_cluster: bool) -> str:
-    """Concise workload summary (`Kind/ns/name [cause, share%]`) for due chat alerts."""
-    ns = str(item.get(NAMESPACE_FIELD) or "")
-    s_kind = str(item.get(SUBJECT_KIND_FIELD) or DEFAULT_SUBJECT_KIND_CLUSTER)
-    s_name = str(item.get(SUBJECT_NAME_FIELD) or DEFAULT_UNKNOWN)
-    if ns and ns != CLUSTER_WIDE_NAMESPACE:
-        subject = DUE_SUBJECT_NAMESPACED.format(kind=s_kind, namespace=ns, name=s_name)
-    else:
-        subject = DUE_SUBJECT_CLUSTER.format(kind=s_kind, name=s_name)
-    cause = str(item.get(SUSPECTED_CAUSE_FIELD) or DEFAULT_UNKNOWN)
-    if str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE:
-        summary = DUE_SUMMARY_NO_SHARE.format(subject=subject, cause=cause)
-    else:
-        pct = round(_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT) * PERCENT_SCALE)
-        summary = DUE_SUMMARY_WITH_SHARE.format(subject=subject, cause=cause, pct=pct)
-    if include_cluster:
-        cluster_short = str(item.get(CLUSTER_FIELD) or "").rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1]
-        return DUE_CLUSTER_PREFIX.format(cluster=cluster_short, summary=summary)
-    return summary
-
-
 def format_name_list(names: list[str], limit: int = MAX_NAMES_IN_LINE) -> str:
     if len(names) <= limit:
         return ", ".join(names)
@@ -1510,13 +1550,13 @@ def load_ledger(home: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return empty_ledger()
     except OSError as exc:
-        raise RuntimeError(f"ledger at {path} could not be read ({exc}); refusing to overwrite it") from exc
+        raise LedgerUnusable(f"ledger at {path} could not be read ({exc}); refusing to overwrite it") from exc
     try:
         data = json.loads(raw)
     except ValueError as exc:
-        raise RuntimeError(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
+        raise LedgerUnusable(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
     if not isinstance(data, dict) or (FINDINGS_KEY in data and not isinstance(data.get(FINDINGS_KEY), dict)):
-        raise RuntimeError(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
+        raise LedgerUnusable(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
     data.setdefault(FINDINGS_KEY, {})
     data[LEDGER_SCHEMA_KEY] = LEDGER_SCHEMA_VERSION
     return data
@@ -1889,62 +1929,126 @@ def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, 
 
 
 def record_topic_publish_result(
-    published: bool,
     err_detail: str | None,
     announced: dict[str, Any],
-    lines: list[str],
 ) -> None:
-    """Announce blackboard topic publish failure or recovery once via the ledger's announced map."""
+    """Record blackboard topic publish failure in the ledger's announced map for retry and log details."""
     if err_detail is not None:
-        if announced.get(ANNOUNCED_TOPIC_PUBLISH_KEY) != ERROR_KIND_TOPIC_PUBLISH:
-            lines.append(
-                TOPIC_PUBLISH_FAILED_LINE.format(
+        script_log.append(
+            WATCH_LOG_FILE,
+            [
+                TOPIC_PUBLISH_FAILED_LOG.format(
                     prefix=LINE_PREFIX,
                     topic=A2A_TOPIC_NAME,
                     detail=err_detail,
                     subject=A2A_TOPIC_SUBJECT,
                 )
-            )
+            ],
+        )
         announced[ANNOUNCED_TOPIC_PUBLISH_KEY] = ERROR_KIND_TOPIC_PUBLISH
     elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced:
         del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
-        if published:
-            lines.append(TOPIC_PUBLISH_CLEARED_LINE.format(prefix=LINE_PREFIX, topic=A2A_TOPIC_NAME))
 
 
 # --- failure marker ----------------------------------------------------------
 
 
+def no_report_kinds(kinds: frozenset[str] | set[str], previous: str = "") -> tuple[bool, bool]:
+    """Return `(timed_out, failed)` for a no-report sweep, merging `kinds` with `previous`."""
+    mixed = NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE)
+    timed_out = ERROR_KIND_TIMEOUT in kinds or previous in (
+        mixed,
+        NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE),
+        FAILED_REASON_MIXED,
+        FAILED_REASON_TIMED_OUT,
+    )
+    failed = bool(kinds - {ERROR_KIND_TIMEOUT}) or previous in (
+        mixed,
+        NO_REPORT_DETAIL.format(cause=NO_REPORT_FAILED_CAUSE),
+        FAILED_REASON_MIXED,
+        FAILED_REASON_ERROR,
+    )
+    return timed_out, failed
+
+
 def failure_detail(exc: Exception, previous: str = "") -> str:
-    """A tick failure's detail: the exception's class and message, or the
-    plain sentence alone when no call returned a report, naming the kinds the
-    `previous` detail named as well."""
+    """A tick failure's detail for the agent's log: the exception's class and
+    message, or the plain sentence alone when no call returned a report, naming
+    the kinds the `previous` marker named as well."""
     if isinstance(exc, NoReportReturned):
         return no_report_detail(exc.kinds, previous)
     return f"{type(exc).__name__}: {exc}"
 
 
+def failure_reason(exc: Exception, previous: str = "") -> str:
+    """Why a tick failed, in the channel's words: the kind of failure, never its text."""
+    if isinstance(exc, WriteFailed):
+        return FAILED_REASON_WRITE
+    if isinstance(exc, fleet_scope_targets.ScopeRenderUnreadable):
+        return FAILED_REASON_SCOPE_UNREADABLE
+    if isinstance(exc, NoProject):
+        return FAILED_REASON_NO_PROJECT
+    if isinstance(exc, LedgerUnusable):
+        return FAILED_REASON_LEDGER
+    if isinstance(exc, SandboxTimedOut):
+        return FAILED_REASON_TIMED_OUT
+    if isinstance(exc, NoReportReturned):
+        timed_out, failed = no_report_kinds(exc.kinds, previous)
+        if timed_out and failed:
+            return FAILED_REASON_MIXED
+        return FAILED_REASON_TIMED_OUT if timed_out else FAILED_REASON_ERROR
+    return FAILED_REASON_ERROR
+
+
+def needs_admin(reason: str) -> bool:
+    """Whether a person has to act before the tick can succeed."""
+    return reason in FAILED_REASONS_NEED_ADMIN
+
+
+def next_attempt(admin: bool) -> str:
+    """What happens after a failure, in the channel's words: a person acts, or
+    the watch tries again tomorrow for a daily roster entry, else at its next run."""
+    if admin:
+        return FAILED_NEEDS_ADMIN
+    return FAILED_NEXT_DAILY if cron_schedule.job_runs_daily(profile_home(), WATCH_JOB_ID) else FAILED_NEXT_UNKNOWN
+
+
 def previous_tick_failure(home: Path) -> str:
-    """The detail the failure marker holds; empty when the last tick ran."""
+    """The reason (or legacy detail) the failure marker holds; empty when the last tick ran."""
     try:
-        return (home / FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip()
+        raw = (home / FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+    return LEGACY_NO_REPORT_REASONS.get(raw, raw)
 
 
-def record_tick_failure(home: Path, detail: str, *, dry_run: bool) -> list[str]:
-    line = FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail)
+def record_tick_failure(home: Path, exc: Exception, *, dry_run: bool) -> list[str]:
+    write = isinstance(exc, WriteFailed)
+    previous = previous_tick_failure(home)
+    detail = str(exc) if write else failure_detail(exc, previous)
+    reason = failure_reason(exc, previous)
+    log_line = FAILED_LINE.format(
+        prefix=LINE_PREFIX,
+        what=FAILED_WHAT_WRITE if write else FAILED_WHAT_TICK,
+        detail=detail,
+    )
+    chat_line = (FAILED_WRITE_LINE if write else FAILED_TICK_LINE).format(
+        reason=reason,
+        next=next_attempt(needs_admin(reason)),
+    )
     if dry_run:
-        return [line]
+        print(log_line, file=sys.stderr)
+        return [chat_line]
+    script_log.append(WATCH_LOG_FILE, [log_line])
     marker = home / FAILURE_MARKER_FILE_NAME
     try:
-        if marker.is_file() and marker.read_text(encoding="utf-8").strip() == detail:
+        if previous == reason:
             return []
         home.mkdir(parents=True, exist_ok=True)
-        marker.write_text(detail + "\n", encoding="utf-8")
+        marker.write_text(reason + "\n", encoding="utf-8")
     except OSError:
         pass
-    return [line]
+    return [chat_line]
 
 
 def clear_tick_failure(home: Path, *, dry_run: bool) -> list[str]:
@@ -1955,7 +2059,7 @@ def clear_tick_failure(home: Path, *, dry_run: bool) -> list[str]:
         marker.unlink()
     except OSError:
         return []
-    return [RECOVERED_LINE.format(prefix=LINE_PREFIX)]
+    return [RECOVERED_LINE]
 
 
 # --- main tick ---------------------------------------------------------------
@@ -2214,16 +2318,10 @@ def sweep_in_batches(
 def no_report_detail(kinds: frozenset[str] | set[str], previous: str = "") -> str:
     """The no-report sentence for the kinds of failure a run met: timeouts,
     other failures, or both, together with those the `previous` no-report
-    sentence named. It names no target and no count."""
-    mixed = NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE)
-    timed_out = ERROR_KIND_TIMEOUT in kinds or previous in (
-        mixed, NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE)
-    )
-    failed = bool(kinds - {ERROR_KIND_TIMEOUT}) or previous in (
-        mixed, NO_REPORT_DETAIL.format(cause=NO_REPORT_FAILED_CAUSE)
-    )
+    sentence or plain reason named. It names no target and no count."""
+    timed_out, failed = no_report_kinds(kinds, previous)
     if timed_out and failed:
-        return mixed
+        return NO_REPORT_DETAIL.format(cause=NO_REPORT_MIXED_CAUSE)
     return NO_REPORT_DETAIL.format(cause=NO_REPORT_TIMED_OUT_CAUSE if timed_out else NO_REPORT_FAILED_CAUSE)
 
 
@@ -2239,6 +2337,28 @@ def forget_unlisted_clusters(cluster_runs: dict[str, Any], project: str, triples
     listed = set(triples)
     for stale in [t for t in cluster_runs if t.startswith(prefix) and t not in listed]:
         del cluster_runs[stale]
+
+
+def prune_stale_cluster_runs(
+    cluster_runs: dict[str, Any],
+    now: datetime,
+    *,
+    active_clusters: set[str] | None = None,
+    active_projects: set[str] | None = None,
+) -> None:
+    """Drop `cluster_runs` stamps for out-of-scope clusters that are unparseable
+    or older than `CLUSTER_RUNS_RETENTION_MULTIPLIER * refresh_days()`."""
+    cutoff = now - timedelta(days=CLUSTER_RUNS_RETENTION_MULTIPLIER * refresh_days())
+    kept_clusters = active_clusters or set()
+    kept_prefixes = tuple(p + CLUSTER_KEY_SEPARATOR for p in (active_projects or ()))
+    for cluster in [
+        c
+        for c, raw in cluster_runs.items()
+        if c not in kept_clusters
+        and not c.startswith(kept_prefixes)
+        and ((stamped := parse_iso(raw)) is None or stamped < cutoff)
+    ]:
+        del cluster_runs[cluster]
 
 
 def sweep_fleet(
@@ -2292,6 +2412,7 @@ def sweep_fleet(
         if swept.detail is not None and swept.kind is not None:
             scan_errors[EXPLICIT_TARGET_LABEL] = swept.detail
             error_kinds[EXPLICIT_TARGET_LABEL] = swept.kind
+        prune_stale_cluster_runs(cluster_runs, now, active_clusters=requested_clusters)
         return (
             merge_reports(reports, now),
             project_runs,
@@ -2383,14 +2504,25 @@ def sweep_fleet(
     if not reports and failures:
         # No call returned: fail the tick. A run of one target whose cluster
         # list failed, or whose one call held every cluster, keeps that
-        # target's entry, as before batching. Any
+        # target's entry in the log, as before batching. Any
         # other names no target and no count, since the rotation changes
         # which targets fail, how far each got and why, and the line must
         # repeat word for word while the condition lasts; it names only the
         # kinds of failure.
         if len(scan_errors) == 1 and calls == whole_calls <= 1:
-            raise RuntimeError(format_name_list([f"{k}: {v}" for k, v in sorted(failures.items())]))
+            detail = format_name_list([f"{k}: {v}" for k, v in sorted(failures.items())])
+            if failure_kinds == {ERROR_KIND_TIMEOUT}:
+                raise SandboxTimedOut(detail)
+            raise RuntimeError(detail)
         raise NoReportReturned(failure_kinds)
+
+    if target_reads:
+        prune_stale_cluster_runs(
+            cluster_runs,
+            now,
+            active_clusters=requested_clusters,
+            active_projects=set(target_projects),
+        )
 
     return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, requested_clusters
 
@@ -2487,7 +2619,15 @@ def announce_failed_targets(
     if new:
         named = new + sorted(set(failures) - set(new))
         reasons = format_name_list([f"{target}: {failures[target]}" for target in named])
-        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(failures), reasons=reasons))
+        script_log.append(
+            WATCH_LOG_FILE,
+            [PARTIAL_LOG.format(prefix=LINE_PREFIX, errors=len(failures), reasons=reasons)],
+        )
+        display_targets = [
+            UNRESOLVED_SCOPE_TARGET_LABEL if target == fleet_scope_targets.UNRESOLVED_SCOPE_ROW else target
+            for target in named
+        ]
+        lines.append(PARTIAL_LINE.format(targets=format_name_list(display_targets)))
     still_open: dict[str, set[str]] = {}
     closed = False
     for target in sorted(set(episodes) | set(failures)):
@@ -2513,7 +2653,7 @@ def announce_failed_targets(
         else:
             closed = True
     if closed and not still_open:
-        lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
+        lines.append(PARTIAL_CLEARED_LINE)
     if still_open:
         announced[ANNOUNCED_FAILED_TARGETS_KEY] = {
             target: None if clusters == {WHOLE_TARGET_MARKER} else sorted(clusters)
@@ -2553,14 +2693,11 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             ledger, moment, deadline, cluster_runs, project_runs, target_reads
         )
     except Exception as exc:  # noqa: BLE001
-        detail = failure_detail(exc, previous_tick_failure(home))
         if ledger is not None and not dry_run:
             save_stamps(home, ledger, project_runs, cluster_runs)
-        for line in record_tick_failure(home, detail, dry_run=dry_run):
+        for line in record_tick_failure(home, exc, dry_run=dry_run):
             print(line)
         return 0
-
-    lines: list[str] = []
 
     raw_findings, ok_clusters, cluster_errors = extract_findings(report)
     report = filter_report_findings(report)
@@ -2578,16 +2715,6 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         COVERAGE_NOT_REACHED_FIELD: dict(sorted(not_reached.items())),
         COVERAGE_SCAN_ERRORS_FIELD: dict(sorted(all_errors.items())),
     }
-    announced = dict(ledger.get(ANNOUNCED_KEY) or {})
-    lines.extend(
-        announce_failed_targets(
-            announced,
-            all_errors,
-            target_reads,
-            set(scan_errors) | set(target_reads),
-            error_kinds,
-        )
-    )
 
     prior_findings: dict[str, Any] = dict(ledger.get(FINDINGS_KEY) or {})
     next_findings: dict[str, Any] = {}
@@ -2672,34 +2799,30 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             next_findings[key] = prior
 
     if dry_run:
-        if retired_labels:
-            print(
-                DRY_RUN_WOULD_RETIRE.format(
-                    count=len(retired_labels),
-                    names=format_name_list(retired_labels),
-                )
-            )
         if due_reasons:
             due_items = [active_findings[k] for k in sorted(due_reasons)]
-            due_clusters = sorted({item[CLUSTER_FIELD] for item in due_items})
-            multi_cluster = len(due_clusters) > 1
-            reasons_counts: dict[str, int] = {}
-            for r in due_reasons.values():
-                reasons_counts[r] = reasons_counts.get(r, 0) + 1
-            reasons_str = LIST_SEPARATOR.join(
-                REASON_COUNT_FORMAT.format(count=c, reason=r) for r, c in sorted(reasons_counts.items())
-            )
+            next_date = (moment + timedelta(days=days)).strftime(DATE_FORMAT)
             print(
-                DRY_RUN_WOULD_REPORT.format(
-                    count=len(due_reasons),
-                    reasons=reasons_str,
-                    clusters=format_name_list(due_clusters),
-                    names=format_name_list([due_finding_summary(i, include_cluster=multi_cluster) for i in due_items]),
-                )
+                DRY_RUN_PREFIX
+                + due_message(due_items, [due_reasons[k] for k in sorted(due_reasons)], next_date)
             )
+        if retired_labels:
+            print(DRY_RUN_PREFIX + resolved_message(retired_labels))
         if not retired_labels and not due_reasons:
             print(DRY_RUN_NOTHING_DUE.format(count=len(active_findings)))
         return 0
+
+    lines: list[str] = []
+    announced = dict(ledger.get(ANNOUNCED_KEY) or {})
+    lines.extend(
+        announce_failed_targets(
+            announced,
+            all_errors,
+            target_reads,
+            set(scan_errors) | set(target_reads),
+            error_kinds,
+        )
+    )
 
     current_thresholds: list[int | float] = [
         min_severity_rank(),
@@ -2738,10 +2861,10 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             due_items = [active_findings[k] for k in sorted(due_reasons)]
             next_date = (moment + timedelta(days=days)).strftime(DATE_FORMAT)
             report_line = due_message(due_items, [due_reasons[k] for k in sorted(due_reasons)], next_date)
-            published, err_detail = publish_blackboard_topic(
+            _, err_detail = publish_blackboard_topic(
                 topic_summary(report_line), md_path.with_suffix(REPORT_JSON_SUFFIX)
             )
-            record_topic_publish_result(published, err_detail, announced, lines)
+            record_topic_publish_result(err_detail, announced)
         elif retired_labels and scan_errors:
             # A finding retired on a readable cluster during a partial scan (a
             # failure, or clusters not reached) makes `latest.json` stale; defer
@@ -2760,15 +2883,15 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             summary_line = (
                 topic_summary(retired_line) if retired_line else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
             )
-            published, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
-            record_topic_publish_result(published, err_detail, announced, lines)
+            _, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
+            record_topic_publish_result(err_detail, announced)
         elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not scan_errors:
             latest_json = home / REPORTS_DIR_NAME / LATEST_JSON_LINK_NAME
             if latest_json.is_file():
-                published, err_detail = publish_blackboard_topic(
+                _, err_detail = publish_blackboard_topic(
                     A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX), latest_json
                 )
-                record_topic_publish_result(published, err_detail, announced, lines)
+                record_topic_publish_result(err_detail, announced)
             else:
                 del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
 
@@ -2786,10 +2909,16 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             updated_ledger[ANNOUNCED_KEY] = announced
         save_ledger(home, updated_ledger)
         messages = [message for message in (report_line, retired_line) if message]
-        lines = messages + clear_tick_failure(home, dry_run=dry_run) + lines
+        status_lines = clear_tick_failure(home, dry_run=dry_run) + lines
+        if messages:
+            status_lines = [plain_status_line(line) for line in status_lines]
+        elif len(status_lines) > 1:
+            status_lines = [status_lines[0], *(plain_status_line(line) for line in status_lines[1:])]
+        lines = messages + status_lines
     except WriteFailed as exc:
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=str(exc)))
-        return WRITE_FAILED_EXIT
+        for line in record_tick_failure(home, exc, dry_run=dry_run):
+            print(line)
+        return 0
 
     for line in lines:
         print(line)
@@ -2806,12 +2935,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return tick(dry_run=args.dry_run)
-    except WriteFailed as exc:
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=str(exc)))
-        return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001
-        detail = failure_detail(exc)
-        for line in record_tick_failure(watch_home(), detail, dry_run=args.dry_run):
+        for line in record_tick_failure(watch_home(), exc, dry_run=args.dry_run):
             print(line)
         return 0
 

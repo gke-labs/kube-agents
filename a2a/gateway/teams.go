@@ -152,10 +152,19 @@ var errTeamsNoOpenDirect = errors.New("teams: opening a direct conversation is n
 
 // teamsActivity is the part of a Bot Framework activity the adapter reads.
 type teamsActivity struct {
-	Type         string `json:"type"`
-	ID           string `json:"id"`
-	Text         string `json:"text"`
-	ServiceURL   string `json:"serviceUrl"`
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	// Timestamp is read for the ingress lag alone and kept raw, so a
+	// timestamp of an unexpected JSON type cannot fail the decode and drop
+	// the turn.
+	Timestamp  json.RawMessage `json:"timestamp"`
+	Text       string          `json:"text"`
+	ServiceURL string          `json:"serviceUrl"`
+	// ReplyToID and Value are a card press's: the message whose card was
+	// pressed, and the pressed action's data (teams_press.go). Value is kept
+	// raw, since a message may carry one of any shape.
+	ReplyToID    string          `json:"replyToId"`
+	Value        json.RawMessage `json:"value"`
 	Conversation struct {
 		ID               string `json:"id"`
 		ConversationType string `json:"conversationType"`
@@ -217,6 +226,9 @@ type TeamsAdapter struct {
 	allowAll bool
 	client   *http.Client
 	log      *slog.Logger
+	// metrics counts each pull by outcome, times each passthrough call and
+	// observes each turn's ingress lag (SetMetrics; nil counts nothing).
+	metrics *Metrics
 
 	mu sync.Mutex
 	// seen dedupes inbound activities by id, with seenOrder its eviction
@@ -257,6 +269,13 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		allowed:       map[string]bool{},
 		countInterval: teamsEventCountInterval,
 	}, nil
+}
+
+// SetMetrics gives the adapter the gateway's counters, so each pull of the
+// broker's Teams queue, each Bot Framework call through the passthrough and
+// each turn's ingress lag is counted beside the other backends'.
+func (a *TeamsAdapter) SetMetrics(m *Metrics) {
+	a.metrics = m
 }
 
 // SetAllowedUsers hands the adapter the install's allowed-users list and the
@@ -357,22 +376,21 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 	if strings.TrimSpace(act.From.AadObjectID) == "" && strings.TrimSpace(act.From.ID) == "" {
 		return InboundMessage{}, "sender has no id"
 	}
-	text := teamsStripBotMentions(act)
-	if text == "" {
-		return InboundMessage{}, "empty ask (bare mention)"
-	}
 	kind := sessionKindGroup
 	if strings.EqualFold(act.Conversation.ConversationType, teamsConversationPerson) {
 		kind = sessionKindDM
 	}
-
-	a.mu.Lock()
-	if act.ServiceURL != "" {
-		a.rememberServiceURLLocked(conversation, act.ServiceURL)
+	// A press of a button the adapter drew arrives as a message whose value
+	// is the button's data and whose text is empty (teams_press.go).
+	if press := teamsCardPress(act.Value); press.Action != "" {
+		return a.classifyPress(act, press, conversation, kind)
 	}
-	author := a.authorForLocked(act.From.AadObjectID, act.From.ID)
-	dup := act.ID != "" && a.seenLocked(act.ID)
-	a.mu.Unlock()
+	text := teamsStripBotMentions(act)
+	if text == "" {
+		return InboundMessage{}, "empty ask (bare mention)"
+	}
+
+	author, dup := a.admit(act, conversation)
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + act.ID
 	}
@@ -383,6 +401,20 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 		MessageID:    act.ID,
 		Text:         text,
 	}, ""
+}
+
+// admit records what an activity that passed classify's checks teaches the
+// adapter, and answers who sent it and whether it is a redelivery: the
+// conversation's service URL is remembered, the sender is named as the
+// allowlist names them (authorForLocked), and the activity's id is marked
+// seen. A typed message and a press share it, so the two cannot drift.
+func (a *TeamsAdapter) admit(act *teamsActivity, conversation string) (author string, dup bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if act.ServiceURL != "" {
+		a.rememberServiceURLLocked(conversation, act.ServiceURL)
+	}
+	return a.authorForLocked(act.From.AadObjectID, act.From.ID), act.ID != "" && a.seenLocked(act.ID)
 }
 
 // seenLocked records an activity id and reports whether it was already
@@ -456,6 +488,7 @@ func (a *TeamsAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				return ctx.Err()
 			}
 			failedPulls++
+			a.metrics.teamsPull(teamsPullFailed)
 			a.log.Warn("teams event pull failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -466,6 +499,7 @@ func (a *TeamsAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 		}
 		if env == nil {
 			emptyPulls++
+			a.metrics.teamsPull(teamsPullEmpty)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -473,7 +507,11 @@ func (a *TeamsAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			}
 			continue
 		}
+		// The receipt time, before the ack's round trip, so the ingress lag
+		// holds only what happened before the gateway had the activity.
+		arrived := time.Now()
 		received++
+		a.metrics.teamsPull(teamsPullEvents)
 		var act teamsActivity
 		decodeErr := json.Unmarshal(env.Event, &act)
 		a.ack(env.Receipt)
@@ -486,6 +524,7 @@ func (a *TeamsAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			a.log.Info("teams activity is not a turn; acked", "activity", act.ID, "reason", reason)
 			continue
 		}
+		a.metrics.teamsIngress(arrived, teamsTimestampText(act.Timestamp))
 		handler(msg)
 	}
 }
@@ -547,36 +586,59 @@ func (a *TeamsAdapter) authorize(req *http.Request) error {
 
 // relayPost is one authenticated POST to the relay under ctx.
 func (a *TeamsAdapter) relayPost(ctx context.Context, path string, payload []byte) ([]byte, error) {
+	body, _, err := a.relayPostStatus(ctx, path, payload)
+	return body, err
+}
+
+// relayPostStatus is relayPost with the relay's own HTTP status beside the
+// answer, 0 for a call that got no response, for the passthrough's timing.
+func (a *TeamsAdapter) relayPostStatus(ctx context.Context, path string, payload []byte) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("teams: building relay request: %w", err)
+		return nil, 0, fmt.Errorf("teams: building relay request: %w", err)
 	}
 	if err := a.authorize(req); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("teams: relay request: %w", err)
+		return nil, 0, fmt.Errorf("teams: relay request: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, teamsRelayBodyMaxBytes))
 	if err != nil {
-		return nil, fmt.Errorf("teams: reading relay response: %w", err)
+		return nil, 0, fmt.Errorf("teams: reading relay response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, teamsRelayError(fmt.Sprintf("teams: relay %s answered %d", path, resp.StatusCode), body)
+		return nil, resp.StatusCode, teamsRelayError(fmt.Sprintf("teams: relay %s answered %d", path, resp.StatusCode), body)
 	}
-	return body, nil
+	return body, resp.StatusCode, nil
+}
+
+// apiPost is one Bot Framework call through the broker's passthrough, timed
+// and counted under the operation httpMethod and endpoint spell
+// (teamsAPIMethodLabel) and the outcome the broker's answer carried.
+func (a *TeamsAdapter) apiPost(ctx context.Context, httpMethod, endpoint string, payload []byte) ([]byte, error) {
+	start := time.Now()
+	body, relayStatus, err := a.relayPostStatus(ctx, teamsRelayAPIPath, payload)
+	a.metrics.teamsAPICall(teamsAPIMethodLabel(httpMethod, endpoint), relayStatus, teamsCarriedStatus(err), time.Since(start))
+	return body, err
 }
 
 // teamsRelayError carries the broker's answer forward: its `error` and
 // `detail` (the detail quotes Microsoft's refusal when there was one), so a
-// 502 names invalid_client or a roster refusal rather than nothing.
+// 502 names invalid_client or a roster refusal rather than nothing. When the
+// body carries Microsoft's own status (teams.status, the broker's record of
+// an upstream refusal), the error is a teamsUpstreamError around that text,
+// so the passthrough's timing can tell a 429 from the broker being down.
 func teamsRelayError(prefix string, body []byte) error {
 	var parsed struct {
 		Error  string `json:"error"`
 		Detail string `json:"detail"`
+		Teams  struct {
+			Status int `json:"status"`
+		} `json:"teams"`
 	}
 	if len(body) == 0 || json.Unmarshal(body, &parsed) != nil {
 		return errors.New(prefix)
@@ -587,10 +649,14 @@ func teamsRelayError(prefix string, body []byte) error {
 			parts = append(parts, v)
 		}
 	}
-	if len(parts) == 0 {
-		return errors.New(prefix)
+	err := errors.New(prefix)
+	if len(parts) > 0 {
+		err = fmt.Errorf("%s: %s", prefix, strings.Join(parts, " "))
 	}
-	return fmt.Errorf("%s: %s", prefix, strings.Join(parts, " "))
+	if parsed.Teams.Status != 0 {
+		return &teamsUpstreamError{Status: parsed.Teams.Status, Err: err}
+	}
+	return err
 }
 
 // Post writes text to a conversation as one activity and returns its id
@@ -599,20 +665,27 @@ func teamsRelayError(prefix string, body []byte) error {
 // PieceSize, teamsPieceBytes here), so one call is one piece, and the
 // adapter only fits it under the activity budget (teamsFitActivity).
 func (a *TeamsAdapter) Post(conversation, text string) (string, error) {
+	return a.post(conversation, text, nil)
+}
+
+// post is Post with the card's buttons: actions, when there are any, are
+// drawn under the text on the card, and dropped with it when the activity
+// goes out as plain text (teamsFitActivityWith).
+func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any) (string, error) {
 	convID := teamsConversationFromID(conversation)
 	if convID == "" {
 		return "", fmt.Errorf("teams: malformed conversation id %q", conversation)
 	}
 	serviceURL := a.serviceURLFor(convID)
 	endpoint := teamsConversationsPath + convID + teamsActivitiesSuffix
-	activity := teamsFitActivity(text, a.adaptiveCards, teamsMaxActivityBytes)
+	activity := teamsFitActivityWith(text, a.adaptiveCards, teamsMaxActivityBytes, actions)
 	payload, err := json.Marshal(map[string]any{
 		"serviceUrl": serviceURL, "endpoint": endpoint, "method": http.MethodPost, "payload": activity,
 	})
 	if err != nil {
 		return "", fmt.Errorf("teams: encoding activity: %w", err)
 	}
-	raw, err := a.relayPost(context.Background(), teamsRelayAPIPath, payload)
+	raw, err := a.apiPost(context.Background(), http.MethodPost, endpoint, payload)
 	if err != nil {
 		return "", err
 	}
@@ -718,6 +791,12 @@ func teamsThreadInHome(thread, home string) bool {
 // passthrough, which admits that one PUT path. The rolling status line
 // edits its message with it as artifacts arrive.
 func (a *TeamsAdapter) Edit(conversation, messageID, text string) error {
+	return a.edit(conversation, messageID, text, nil)
+}
+
+// edit is Edit with the card's buttons (post): an update replaces the whole
+// card, so an edit that names no actions removes the ones the message had.
+func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[string]any) error {
 	convID := teamsConversationFromID(conversation)
 	if convID == "" {
 		return fmt.Errorf("teams: malformed conversation id %q", conversation)
@@ -725,7 +804,7 @@ func (a *TeamsAdapter) Edit(conversation, messageID, text string) error {
 	if strings.TrimSpace(messageID) == "" {
 		return fmt.Errorf("teams: edit names no activity")
 	}
-	activity := teamsFitActivity(text, a.adaptiveCards, teamsMaxActivityBytes)
+	activity := teamsFitActivityWith(text, a.adaptiveCards, teamsMaxActivityBytes, actions)
 	activity["id"] = messageID
 	// No summary on an update: Teams renders an updated activity that carries
 	// one as that text, in a plain bubble, and drops the card (seen on every
@@ -733,26 +812,35 @@ func (a *TeamsAdapter) Edit(conversation, messageID, text string) error {
 	// kept its frame, with it lost it). The preview the summary feeds is the
 	// chat list's, which the original post already set.
 	delete(activity, "summary")
+	endpoint := teamsConversationsPath + convID + teamsActivitiesSuffix + "/" + messageID
 	payload, err := json.Marshal(map[string]any{
 		"serviceUrl": a.serviceURLFor(convID),
-		"endpoint":   teamsConversationsPath + convID + teamsActivitiesSuffix + "/" + messageID,
+		"endpoint":   endpoint,
 		"method":     http.MethodPut,
 		"payload":    activity,
 	})
 	if err != nil {
 		return fmt.Errorf("teams: encoding activity update: %w", err)
 	}
-	_, err = a.relayPost(context.Background(), teamsRelayAPIPath, payload)
+	_, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload)
 	return err
 }
 
 // PostMessage and EditMessage post text only: a chat message falls back to
-// its text (ErrTextOnly), rendered as an Adaptive Card by Post.
+// its text (ErrTextOnly), rendered as an Adaptive Card by Post. A running
+// task's line (m.Stop) carries the Stop button on that card
+// (teams_press.go); an edit that names no task removes it.
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil && m.Stop != "" {
+		return a.post(conversation, m.Text, teamsStopActions(m.Stop))
+	}
 	return postTextOnly(a.Post, conversation, m)
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	if m.Chat == nil && m.Stop != "" {
+		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
+	}
 	return editTextOnly(a.Edit, conversation, messageID, m)
 }
 
@@ -804,12 +892,19 @@ func (a *TeamsAdapter) RemoveReaction(string, string, string) error { return nil
 // line, so short lines inflate it), then the longest prefix that fits with
 // teamsTruncationMarker.
 func teamsFitActivity(text string, cards bool, cap int) map[string]any {
+	return teamsFitActivityWith(text, cards, cap, nil)
+}
+
+// teamsFitActivityWith is teamsFitActivity for a card that carries buttons:
+// actions ride the card alone, so the plain-text forms drop them, and a
+// reader of such a message stops a task by typing the word.
+func teamsFitActivityWith(text string, cards bool, cap int, actions []map[string]any) map[string]any {
 	size := func(m map[string]any) int {
 		b, _ := json.Marshal(m)
 		return len(b)
 	}
 	if cards {
-		if card := teamsCardActivity(text); size(card) <= cap {
+		if card := teamsCardActivityWith(text, actions); size(card) <= cap {
 			return card
 		}
 	}
@@ -839,12 +934,22 @@ func teamsTextActivity(text string) map[string]any {
 // the plain summary chat lists and notifications preview (without one Teams
 // shows "Card - access it on cards.unsupported").
 func teamsCardActivity(text string) map[string]any {
+	return teamsCardActivityWith(text, nil)
+}
+
+// teamsCardActivityWith is teamsCardActivity with the card's buttons, under
+// the card's own actions key; none leaves the card as it was.
+func teamsCardActivityWith(text string, actions []map[string]any) map[string]any {
+	card := teamsMarkdownToCard(text)
+	if len(actions) > 0 {
+		card[teamsCardActionsKey] = actions
+	}
 	return map[string]any{
 		"type":    teamsActivityMessage,
 		"summary": teamsActivitySummary(text),
 		"attachments": []map[string]any{{
 			"contentType": teamsCardContentType,
-			"content":     teamsMarkdownToCard(text),
+			"content":     card,
 		}},
 	}
 }

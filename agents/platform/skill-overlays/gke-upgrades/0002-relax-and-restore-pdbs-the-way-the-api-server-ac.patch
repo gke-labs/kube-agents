@@ -3,7 +3,6 @@ Subject: Relax and restore PDBs the way the API server accepts
 Why: the runbook template relaxes a blocking PDB by merging maxUnavailable into it, which the API server rejects on a PDB that sets minAvailable, and restores it by re-applying a dump the API server answers with a 409 conflict. The patch clears minAvailable in the relax step, restores the PDB as a numbered, verified step, and aligns SKILL.md's rule and troubleshooting.md §1 with it.
 Local-Issue: none (#2353)
 Eval-Case: none (came with the migration to overlays, a byte-identical move)
-Upstream-Issue: none filed yet
 Retire-When: upstream's runbook relaxes and restores PDBs the way the API server accepts
 
 diff --git a/SKILL.md b/SKILL.md

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -157,6 +159,15 @@ const (
 // spec.telemetry.peopleSeen=false.
 const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+
+// envKubectlCostTier is the variable the kubectl admission
+// (deploy/sandbox/kubectl-admit.py) reads its sizing tier from when no tier
+// file names one: the shell sandbox's name for it, on the session pod.
+const envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
+
+// defaultKubectlCostTier is the tier the admission charges when none is
+// named; spawn names it rather than leave the variable unset.
+const defaultKubectlCostTier = "default"
 
 // The A2A door's Microsoft Entra sign-in class (a2adoor_entra.go), set by
 // hand on the gateway as the Google class's variables are.
@@ -692,6 +703,17 @@ type Config struct {
 	// Namespace and WorkerImage configure the dark spawn path.
 	Namespace   string
 	WorkerImage string
+	// SessionHarness is the harness every session pod runs, passed to it as
+	// A2A_HARNESS (A2A_SESSION_HARNESS, from the PlatformAgent's
+	// spec.harness.sessionWorker.type). Empty is the worker's default,
+	// Claude Code, and adds nothing to the pod.
+	SessionHarness string
+	// SessionHarnessRefused is an A2A_SESSION_HARNESS value outside
+	// sessionHarnesses (CRD or image skew). The gateway is shared by every
+	// conversation, so it keeps serving and spawns sessions on the default
+	// harness, and main logs this at error level, rather than refusing to
+	// start and taking the whole chat surface down.
+	SessionHarnessRefused string
 
 	// SessionServiceAccount is the ServiceAccount every session pod runs
 	// as, rendered by the operator as <agent>-a2a-session and passed here
@@ -708,19 +730,32 @@ type Config struct {
 	// SessionClusterView gives spawned session pods the temporary read-only
 	// cluster view: a projected token for the credential broker's session
 	// audience, the broker's URL, and Bash in the worker. Rendered by the
-	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
+	// operator when the view is on (the session route's default, or its
+	// A2A_SESSION_CLUSTER_VIEW flag); off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
 	// New refuses the view without it. CredentialProxyExecURL is the
 	// broker's exec tier, empty while the operator renders none; the shim
 	// sends its commands there and falls back to CredentialProxyURL.
+	// KubectlCostTier is the sizing tier whose column of the kubectl cost
+	// table (deploy/sandbox/kubectl-costs.json) the session pod's kubectl
+	// admission charges; spawn passes it on as KUBEAGENTS_KUBECTL_COST_TIER
+	// beside KUBE_PROXY_URL. The operator forwards it normalised, as for the
+	// shell sandbox; anything but a plain lowercase name is dropped here too,
+	// and empty passes the admission's default tier by name.
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
 	KubeProxyURL           string
 	KubeProxyCAConfigMap   string
 	KubeProxyHostContext   string
-	UniverseDomain         string
-	ImagePullRefs          []string
+	// KubeProxyMode is the policy mode the operator gives kube-proxy
+	// (A2A_KUBE_PROXY_MODE). Session pods get it as KUBE_PROXY_MODE, and
+	// their kubectl wrapper records a failed write attempt only under a
+	// read-only mode. Empty records nothing.
+	KubeProxyMode   string
+	KubectlCostTier string
+	UniverseDomain  string
+	ImagePullRefs   []string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -979,6 +1014,7 @@ func FromEnv() (*Config, error) {
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
+		SessionHarness:   os.Getenv(envSessionHarness),
 
 		SessionServiceAccount:  os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:     os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
@@ -988,6 +1024,8 @@ func FromEnv() (*Config, error) {
 		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
 		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
 		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
+		KubeProxyMode:          os.Getenv("A2A_KUBE_PROXY_MODE"),
+		KubectlCostTier:        kubectlCostTier(os.Getenv("A2A_KUBECTL_COST_TIER")),
 		UniverseDomain:         strings.TrimSpace(os.Getenv(envGoogleCloudUniverseDomain)),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
@@ -1107,6 +1145,9 @@ func FromEnv() (*Config, error) {
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
+	}
+	if cfg.SessionHarness != "" && !sessionHarnesses[cfg.SessionHarness] {
+		cfg.SessionHarnessRefused, cfg.SessionHarness = cfg.SessionHarness, ""
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
@@ -1433,6 +1474,19 @@ func pyStrip(s string) string {
 	})
 }
 
+// kubectlCostTierPattern is the tier name the operator forwards (its own
+// kubectlCostTierPattern) and the sandbox entrypoint accepts.
+var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+
+// kubectlCostTier is a forwarded tier name if it is a plain lowercase one,
+// else empty: the session pod's admission then charges its default tier.
+func kubectlCostTier(raw string) string {
+	if tier := strings.TrimSpace(raw); kubectlCostTierPattern.MatchString(tier) {
+		return tier
+	}
+	return ""
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -1533,3 +1587,10 @@ func (c *Config) sessionResources() corev1.ResourceRequirements {
 		},
 	}
 }
+
+// envSessionHarness names the session worker's harness (Config.SessionHarness).
+const envSessionHarness = "A2A_SESSION_HARNESS"
+
+// sessionHarnesses are the harnesses the gateway spawns session pods for.
+// Antigravity joins when its worker isolation lands.
+var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
