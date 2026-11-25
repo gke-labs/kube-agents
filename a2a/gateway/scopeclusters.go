@@ -187,10 +187,10 @@ func buildScopeClusters(in scopeClustersInput) lib.ScopeClusters {
 		return out
 	}
 
-	// The projects in scope whose clusters the map doesn't carry: the
-	// explicit ones and the management project, which the publisher never
-	// probes, and a member row no probe has listed yet. Without a map,
-	// every project in scope is one.
+	// The projects in scope whose clusters the map doesn't carry: a member
+	// row no probe has listed yet and, from a publisher before #7107, the
+	// explicit ones and the management project, which it never probed (from
+	// #7107 it lists those too). Without a map, every project in scope is one.
 	candidates := slices.Clone(in.decl.Projects)
 	if in.management != "" {
 		candidates = append(candidates, in.management)

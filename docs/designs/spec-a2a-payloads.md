@@ -925,8 +925,9 @@ can't be read, gets an empty page with a known `count` of 0.
   publisher's time format, a pair that isn't two strings) is left out, and its project reads as one
   no probe has listed.
 - `unlistedProjects` names the projects in scope whose clusters no map entry carries, "listed
-  elsewhere": an explicitly declared project and the management project, which the publisher never
-  probes, and a member no probe has listed yet. Without a map every project in scope is one. At most
+  elsewhere": a member no probe has listed yet, and, from a publisher that predates #7107, an
+  explicitly declared project and the management project, which it never probes (from #7107 the
+  publisher lists those in the map too). Without a map every project in scope is one. At most
   16 are named, sorted; `unlistedCount` is the total. A delegation to one is checked as it arrives.
 - `unbounded` is set when the install's scope declares no boundary, so any project not excluded is
   in scope and no list can be complete: `unknown` is set too, and no project is named as listed
