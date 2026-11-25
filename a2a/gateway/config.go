@@ -741,7 +741,8 @@ type Config struct {
 	// SessionClusterView gives spawned session pods the temporary read-only
 	// cluster view: a projected token for the credential broker's session
 	// audience, the broker's URL, and Bash in the worker. Rendered by the
-	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
+	// operator when the view is on (the session route's default, or its
+	// A2A_SESSION_CLUSTER_VIEW flag); off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
 	// New refuses the view without it. CredentialProxyExecURL is the
 	// broker's exec tier, empty while the operator renders none; the shim
