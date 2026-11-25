@@ -15,10 +15,15 @@
 package gateway
 
 import (
+	"regexp"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/dispatch"
 )
+
+// reasonTokenPattern is the shape a reason token keeps: up to 64 letters,
+// digits, dots, underscores and hyphens, lowercase-hyphen by convention.
+var reasonTokenPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 // TestEveryDispatchRefusalReadsAsOnePlainLine holds the relay to the
 // dispatcher's terminal reasons: each one reads in chat as a sentence of its
@@ -41,9 +46,14 @@ func TestEveryDispatchRefusalReadsAsOnePlainLine(t *testing.T) {
 		dispatch.ReasonOutsideParentScope,
 		// A tier-ended cancel says why in its own sentence (#5850).
 		dispatch.ReasonTierEnded,
+		// A task settled with no terminal on a latched install (#5301).
+		dispatch.ReasonTerminalUnpublished,
 		// dispatch.ReasonStopped is left out: it ends the task canceled, and
 		// the room reads a stopped task as its own notice (noticeCanceled).
 	} {
+		if !reasonTokenPattern.MatchString(reason) {
+			t.Errorf("dispatch reason %q does not fit %s", reason, reasonTokenPattern)
+		}
 		_, sentence := reasonSentences[reason]
 		if !sentence && !reasonDetailShown[reason] {
 			t.Errorf("dispatch reason %q has no line in reasonSentences or reasonDetailShown", reason)

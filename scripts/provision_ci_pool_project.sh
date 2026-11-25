@@ -770,6 +770,13 @@ echo "  except that until the Prow job mounts this App's key the eval reads thro
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
 
+# ─── Step 1.4b: The post-merge sync's repository side ─────────────────────────
+echo -e "\n==> [Step 1.4b] Seeding the post-merge fixture and its read-only deploy key..."
+# The declaration, the budget and the deploy key's secret (docs/ci-pool-projects.md
+# 5.13). A step of its own, after the GitOps repository exists and before Step
+# 2.2's fleet apply, which reads the secret on a project the fleet lists.
+"${SCRIPT_DIR}/provision_ci_pool_post_merge_sync.sh" "${PROJECT_ID}" "${GITOPS_REPO}"
+
 # ─── Step 1.5: The self-managed forges' pieces ────────────────────────────────
 echo -e "\n==> [Step 1.5] Reserving the self-managed forges' zone, addresses, firewall rule and VM identity..."
 # The rows' hosts, from the one table (forge_profile in hack/ci-deploy.sh).
