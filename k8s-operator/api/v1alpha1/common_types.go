@@ -537,6 +537,11 @@ type HarnessSpec struct {
 	// +optional
 	UniverseDomain string `json:"universeDomain,omitempty"`
 
+	// SessionWorker configures the session pods the gateway spawns for
+	// conversations.
+	// +optional
+	SessionWorker *SessionWorkerSpec `json:"sessionWorker,omitempty"`
+
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
 	Hermes *HermesSpec `json:"hermes,omitempty"`
@@ -3982,4 +3987,18 @@ type ManagedRepoEntry struct {
 	// docs/designs/version-control-support.md §6.
 	Type string `json:"type"`
 	URL  string `json:"url"`
+}
+
+// SessionWorkerSpec configures the session pods the A2A gateway spawns.
+type SessionWorkerSpec struct {
+	// Type is the harness the session worker image runs. Absent is
+	// claude-code. The operator passes it to the gateway as
+	// A2A_SESSION_HARNESS, only when it is set, and the gateway passes it
+	// to each session pod as A2A_HARNESS, which the worker adapter's
+	// harness selector reads. It is pod configuration only: no route, bus
+	// subject or permission depends on it. claude-code is the only value
+	// accepted today.
+	// +kubebuilder:validation:Enum=claude-code
+	// +optional
+	Type string `json:"type,omitempty"`
 }

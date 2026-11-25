@@ -879,6 +879,15 @@ whether its card declares them or not.
 The session manager is the demo's chatops code generalized from one-shot workers to
 long-lived sessions. Four operations:
 
+The session pod's harness follows the PlatformAgent's `spec.harness.sessionWorker.type`. The
+operator renders a value it supports on the gateway as `A2A_SESSION_HARNESS`, and the gateway passes it
+to each session pod as `A2A_HARNESS`; unset adds nothing and the worker runs Claude Code. A value
+the operator or the gateway doesn't know falls back to that default rather than stopping the shared
+gateway: the operator writes the `SessionHarness` condition and a Warning event, and the gateway logs an
+error at start. Every session
+pod also carries `A2A_HARNESS_UNISOLATED` set empty, so a worker image's own environment can't turn
+on the worker's isolation waiver.
+
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 150m/320Mi requests by default, set by
 `spec.harness.tuning.sessionResources` (#2371); egress
