@@ -34,7 +34,7 @@ import (
 const EnvToolWithheld = lib.EnvToolWithheld
 
 // toolChildAlwaysPassedPrefix passes despite its credential words (see above).
-const toolChildAlwaysPassedPrefix = "CREDENTIAL_PROXY_"
+const toolChildAlwaysPassedPrefix = "CREDENTIAL_PROXY_" // #nosec G101 -- an env var name prefix, not a credential
 
 // credentialWords are the name parts (split on "_") that mark a credential.
 var credentialWords = map[string]bool{
