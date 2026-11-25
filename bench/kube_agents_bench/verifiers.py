@@ -3719,6 +3719,12 @@ _NO_CHILD_ADDRESSEES_REASON = (
     "field, so this check could not be evaluated"
 )
 
+_NO_CHILD_COUNT_REASON = (
+    "the run did not report how many children its chain delegated: the record came "
+    "through a transport other than the inject door, or a door older than its "
+    "childCount field, so min_children/max_children could not be evaluated"
+)
+
 
 @VERIFIERS.register("delegated_to")
 class DelegatedToVerifier(BaseVerifier):
@@ -3734,16 +3740,27 @@ class DelegatedToVerifier(BaseVerifier):
     ``required_addressees``: Python regular expressions, each of which must
     ``re.fullmatch`` at least one addressee.
     ``forbidden_addressees``: Python regular expressions, none of which may
-    ``re.fullmatch`` any addressee. At least one of the two lists is set.
+    ``re.fullmatch`` any addressee.
+    ``min_children`` / ``max_children``: bounds, inclusive, on how many child
+    tasks the chain minted (``childCount``, kept as
+    ``TranscriptSnapshot.child_count``). That counts every delegation, so a
+    chain that delegated to ``platform`` three times counts 3 where the
+    addressees name ``platform`` once; ``min_children: 1`` with
+    ``max_children: 1`` asserts exactly one delegation. Non-negative, and
+    ``min_children`` is no greater than ``max_children``.
+    At least one of the four is set.
 
     Fails closed: a run that could not say (the api transport, which no CI
     lane uses, or a door older than the field) is ``status="error"``, never
-    a pass or a fail.
+    a pass or a fail. The addressees are needed on every run; the count only
+    when a bound is set.
     """
 
     type: Literal["delegated_to"]
     required_addressees: list[str] = Field(default_factory=list)
     forbidden_addressees: list[str] = Field(default_factory=list)
+    min_children: int | None = Field(default=None, ge=0)
+    max_children: int | None = Field(default=None, ge=0)
 
     @field_validator("required_addressees", "forbidden_addressees")
     @classmethod
@@ -3754,9 +3771,29 @@ class DelegatedToVerifier(BaseVerifier):
         return patterns
 
     @model_validator(mode="after")
-    def _one_list_set(self) -> "DelegatedToVerifier":
-        if not self.required_addressees and not self.forbidden_addressees:
-            raise ValueError("delegated_to needs required_addressees, forbidden_addressees, or both")
+    def _one_check_set(self) -> "DelegatedToVerifier":
+        if (
+            not self.required_addressees
+            and not self.forbidden_addressees
+            and self.min_children is None
+            and self.max_children is None
+        ):
+            raise ValueError(
+                "delegated_to needs at least one of required_addressees, forbidden_addressees, "
+                "min_children, max_children"
+            )
+        if (
+            self.min_children == 0
+            and self.max_children is None
+            and not self.required_addressees
+            and not self.forbidden_addressees
+        ):
+            # Every count is at least 0, so this alone could never fail.
+            raise ValueError("delegated_to min_children: 0 alone checks nothing; set a bound that can fail")
+        if self.min_children is not None and self.max_children is not None and self.min_children > self.max_children:
+            raise ValueError(
+                f"delegated_to min_children ({self.min_children}) is greater than max_children ({self.max_children})"
+            )
         return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
@@ -3776,16 +3813,33 @@ class DelegatedToVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_CHILD_ADDRESSEES_REASON,
             )
+        counted = self.min_children is not None or self.max_children is not None
+        if counted and snap.child_count is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_CHILD_COUNT_REASON,
+            )
         addressees = list(snap.child_addressees)
         missing = [p for p in self.required_addressees if not any(re.fullmatch(p, a) for a in addressees)]
         forbidden = [a for a in addressees if any(re.fullmatch(p, a) for p in self.forbidden_addressees)]
+        count = snap.child_count
+        too_few = count is not None and self.min_children is not None and count < self.min_children
+        too_many = count is not None and self.max_children is not None and count > self.max_children
         seen = addressees or "nobody"
-        if missing or forbidden:
+        if counted:
+            seen = f"{seen} in {count} child task(s)"
+        if missing or forbidden or too_few or too_many:
             parts = []
             if missing:
                 parts.append(f"no delegation went to an addressee matching {missing}")
             if forbidden:
                 parts.append(f"the chain delegated to forbidden addressee(s) {forbidden}")
+            if too_few:
+                parts.append(f"the chain minted {count} child task(s), fewer than min_children {self.min_children}")
+            if too_many:
+                parts.append(f"the chain minted {count} child task(s), more than max_children {self.max_children}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,

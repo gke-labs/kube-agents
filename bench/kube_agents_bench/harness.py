@@ -3110,6 +3110,8 @@ def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bo
             )
         if timed_out and settled is not None and settled.fold.child_addressees is not None:
             exchange.fold.child_addressees = settled.fold.child_addressees
+        if timed_out and settled is not None and settled.fold.child_count is not None:
+            exchange.fold.child_count = settled.fold.child_count
     return timed_out, stop_pending
 
 
@@ -3386,6 +3388,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
         metadata={
             "transport": TRANSPORT_INJECT,
             "child_addressees": None if fold.child_addressees is None else list(fold.child_addressees),
+            "child_count": fold.child_count,
             "final_message": fold.deliverable,
             "task_id": exchange.task_id,
             "conversation": exchange.conversation,
@@ -3701,6 +3704,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
             child_addressees=result.metadata.get("child_addressees"),
+            child_count=result.metadata.get("child_count"),
         )
         _write_chat_shape(result)
         return result
