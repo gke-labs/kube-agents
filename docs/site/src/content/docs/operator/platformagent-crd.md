@@ -247,7 +247,7 @@ here; add the key to the agent Secret and restart the pod.
 
 `type` names the harness the session pods' worker image runs. Absent is `claude-code`, which is also the only value the CRD accepts today. Leave it out for Claude Code.
 
-The operator passes a set value to the gateway as `A2A_SESSION_HARNESS`, so an install without it keeps the gateway it had. Setting or removing it rolls the A2A gateway once. The gateway passes it to each session pod it spawns as `A2A_HARNESS`.
+The operator passes a set value to the gateway as `A2A_SESSION_HARNESS`, so an install without it keeps the gateway it had. Setting or removing a supported value rolls the A2A gateway once. The gateway passes it to each session pod it spawns as `A2A_HARNESS`.
 
 If the CRD admits a value this operator or gateway doesn't know, as it can after a rollback that leaves the CRD newer, the gateway keeps serving and session pods run the default harness. That is said loudly. The PlatformAgent's `SessionHarness` condition is `False` with reason `SessionHarnessNotSupported`, a Warning event is written, and a gateway that receives such a value logs an error. The condition clears once the value is supported or removed. The gateway is shared by every conversation, so it falls back instead of stopping, unlike an AgentProfile with an unsupported type, which only loses its own pool.
 
